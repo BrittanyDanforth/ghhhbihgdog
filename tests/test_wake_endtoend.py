@@ -128,8 +128,7 @@ def mint_pair(port, artifact_dir, kdf="interactive"):
         [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
          "--out", d, "--bind", "127.0.0.1", "--pair-port", str(pport),
          "--mac", "aa:bb:cc:dd:ee:ff", "--broadcast", "255.255.255.255",
-         "--artifact-dir", str(artifact_dir),
-         "--amount-ladder", "0.01", "0.02", "0.05"],
+         "--artifact-dir", str(artifact_dir)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, cwd=d)
     # Wait for the listener rather than sleeping a guess: a fixed sleep here
@@ -243,7 +242,7 @@ try:
     print("== receive_and_quote, both halves, real HTTP ==")
     _cinfo = {}
     p1, out1, err1, ran1, text1 = cycle("receive_and_quote",
-                                        {"amount_slot": 2}, _bay,
+                                        {"amount_sat": 5000000}, _bay,
                                         info_out=_cinfo)
     check("the two boxes showed the SAME pairing code, and it is the one the "
           "operator compares",
@@ -288,10 +287,19 @@ try:
           len(ran1) == 2
           and os.path.basename(ran1[0][0][1]) == "create_receive_wallet"
           and os.path.basename(ran1[1][0][1]) == "thor_swap_preparer")
-    check("the AMOUNT came off the ThinkPad's ladder by index and rode in the "
-          "ENVIRONMENT, never on argv",
-          ran1[1][1].get("GS_SWAP_AMOUNTS") == "0.05"
-          and not any("0.05" in a for a in ran1[1][0]))
+    # THE AMOUNT REACHES THE CHILD AS BITCOIN, FROM SATOSHIS ON THE WIRE, AND
+    # IN THE ENVIRONMENT. Three separate things, and the middle one is the one
+    # a refactor breaks silently: str(5000000) is also a valid-looking value
+    # for GS_SWAP_AMOUNTS and would quote a swap for five million bitcoin.
+    # This used to read "came off the ThinkPad's ladder by index"; the ladder
+    # is gone and the note carries the figure the operator typed.
+    check("the AMOUNT arrived as satoshis, reached the child as BITCOIN, and "
+          "rode in the ENVIRONMENT rather than on argv",
+          ran1[1][1].get("GS_SWAP_AMOUNTS") == "0.05000000"
+          and not any("0.05" in a for a in ran1[1][0])
+          and not any("5000000" in a for a in ran1[1][0]))
+    check("...and it is the amount the note asked for, not a default",
+          P.btc_to_sat(ran1[1][1]["GS_SWAP_AMOUNTS"]) == 5_000_000)
     check("...and the swap destination is a bundle THIS BOOT minted, not "
           "anything the doorbell named",
           "--dest-from-receive-wallet" in ran1[1][0]
@@ -460,11 +468,13 @@ try:
              "a RELATIVE artifact dir: the agent runs under systemd, whose "
              "working directory is '/', and that is mounted read-only",
              "relative"),
-            (("--amount-ladder", "0.01", "0", "0.05"),
-             "a zero rung on the amount ladder", "positive"),
-            (("--amount-ladder", *(["0.01"] * 9)),
-             "a ladder longer than the wire's slot range, whose extra rungs "
-             "no note could ever select", "never be selected"),
+            # THE LADDER'S TWO REFUSALS USED TO BE HERE -- a zero rung, and
+            # a ladder longer than the wire's slot range. Both are gone with
+            # the ladder itself; the flag no longer exists, so argparse
+            # refuses it before any of this tool's own validation runs.
+            (("--amount-ladder", "0.01"),
+             "a flag that was removed, rather than accepting and ignoring it",
+             "unrecognized arguments"),
             (("--account-ceiling", "0"), "a zero account ceiling", "at least"),
             (("--daily-wake-budget", "0"), "a zero wake budget", "between"),
             (("--mac", "not-a-mac"), "a MAC that is not a MAC", "MAC address"),

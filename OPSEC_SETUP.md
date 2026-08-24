@@ -4,11 +4,31 @@ This is the hardware/network layout for running GhostSpiral **without**
 leaving the spend key on a box that stays online, and **without** the
 home ISP seeing Tor guards.
 
+### Three parts, and it is worth naming them
+
+The repository reads as one pile of scripts. It is three jobs stacked, and
+almost every design argument in this file is about the seam between two of
+them:
+
+| | what it is | what runs it |
+|---|---|---|
+| **Swapper** | Bitcoin in → Monero out, onto a subaddress minted for this one payment. | `create_receive_wallet`, `thor_swap_preparer`, `receive_watch` |
+| **Mixer** | Takes what landed and separates it from where it goes: fan-out, DAG hops, delays, one account per output, then the exit. | `GhostSpiral` |
+| **Service** | Makes the first two usable from a phone without the spend key being on a machine that is online. | `gs_telegram_pager` → `gs_doorbell` → `gs_wake_agent` |
+
+The **swapper is the weak part and always has been** — ThorChain sees the BTC
+deposit and the XMR destination in one transaction, and no amount of work on
+the other two fixes it (§6b). The **mixer is the part that actually does
+something**, and it is the reason the vault has to power on at all. The
+**service exists to keep those two apart from each other**: the phone can
+start a mix and can never sign one.
+
 The Telegram **pager** — the phone-to-Pi trigger — **is** now in this repo:
-`gs_telegram_pager`. It triggers and it does not carry: the only things it can
-ask for are the three wake jobs, the only parameters it can send are a bounded
-integer or a 4-hex handle, and the only thing it can say back is which job
-finished and that handle (§8).
+`gs_telegram_pager`. It triggers and it does not carry: it can ask for the
+five wake jobs and nothing else; its parameters are a bounded integer, a
+4-hex handle, a deposit amount in satoshis, a mixing depth, and — for a
+withdrawal only — the destination address the operator typed; and the only
+thing it can say back is which job finished and that handle (§8).
 The **wake channel** between the Pi and
 the ThinkPad *is* shipped: `gs_wake_keys`, `gs_doorbell` and
 `gs_wake_agent`. So the vault can sit powered off for weeks and be woken
@@ -685,14 +705,24 @@ Steps 1–2 are `gs_telegram_pager`. Step 3 onward is `gs_doorbell` and
 `gs_wake_agent`. You can still do steps 1–2 by hand — the pager only pokes the
 doorbell, so anything it does you can do from a terminal.
 
-1. Phone: `/recv` then `/depo` to the throwaway account. **A SLOT, not
-   an amount**: the ladder lives on the ThinkPad and the Pi's keyfile does not
-   contain it, so the Pi cannot turn "0.05" into a slot and is never given the
-   chance to send a number (§8).
+1. Phone: `/recv` then `/deposit` to the throwaway account. **It asks for the
+   amount you are about to send**, in BTC, and puts it on the wire as an exact
+   satoshi count.
 
-   `/depo` on its own asks which slot and then confirms, because the one
-   command that spends a wake and quotes real money should not be a single
-   keystroke. `/depo 2` still works in one shot. The confirm is a small sum —
+   This used to be a SLOT — an index into a ladder of amounts held in the
+   ThinkPad's keyfile — specifically so the Pi could never turn "0.05" into
+   anything. That property was real and it was guarding the wrong thing: the
+   operator is quoting a swap for the amount they are *about to send*, and a
+   rung is that amount only if it happened to be foreseen at pairing time.
+   Every other time it quoted a number that was not the number. The figure is
+   a Bitcoin transaction and is public on two chains before the mix even
+   starts; the pager deletes the operator's own messages; and the thing the Pi
+   still cannot do — name the destination subaddress, which is minted inside
+   the job on the vault — was always the half that mattered.
+
+   `/deposit` asks the amount and then confirms, because the one command that
+   spends a wake and quotes real money should not be a single keystroke. The
+   confirm is a small sum —
    it stops a pocket-dial or a message pasted into the wrong chat, and it is
    **not** a security control: anyone holding the phone can read it and answer
    it. The bounds that matter are the 24 h wake budget and the account
@@ -805,8 +835,7 @@ to be right or the job fails **after the money has moved**:
 #    signing step, hours later, with the money already on-chain.
 python3 gs_wake_keys pair \
     --allow-withdraw \
-    --wallet-file /var/lib/gs/spend.wallet \
-    --amount-ladder 0.01 0.02 0.05
+    --wallet-file /var/lib/gs/spend.wallet
 
 # 2. The password, in a root-owned 0400 file. Never a flag, never on an argv:
 #    /proc/<pid>/cmdline is 0444 and every local account can read it.
@@ -886,6 +915,120 @@ same “memo never leaves the machine except to the sender.”
 | Real-name Telegram | **No** |
 
 
+### 6b. Tails, a no-log VPN, an XMR-paid VPS, a residential proxy — on top of this?
+
+The proposal, in full: run the workstation on Tails (or Kali, or any Linux)
+behind a no-log VPN; rent a VPS with Monero; reach that VPS only from Tails;
+and put a third-world residential proxy on the far end. Stack all of it on top
+of the three boxes above.
+
+**Net verdict: one part is fine, one part is neutral, and two parts make this
+setup worse rather than better.** The reasoning matters more than the verdict,
+because the mistake underneath it recurs.
+
+**The mistake is counting hops instead of counting observers.** Each thing
+added here is a party that sees something. Tor is already the multi-hop
+system, and its actual guarantee is not "three hops" — it is that *no single
+relay sees both ends*. Wrapping paid intermediaries around it does not extend
+that property; it reintroduces exactly the single observer Tor exists to
+remove, and this time it is one you have a payment relationship with. A chain
+is not stronger for being longer when every added link can see.
+
+Taken one at a time:
+
+**Tails — fine, for a role this design does not have.** Amnesia and
+forced-Tor are real properties and they are worth having. But there is no
+"workstation" here: the phone triggers, the Pi relays, the vault signs. Tails
+cannot be the vault — the vault needs a persistent wallet file, keyfile,
+artifact directory and a systemd unit that runs at boot, and defeating
+amnesia with Persistent Storage gets you a LUKS volume, which is what §3
+already specifies. It cannot usefully be the Pi either, which holds nothing by
+construction and is already the amnesic box in spirit. Where Tails *is* worth
+it: the pairing ceremony (§8) and anything you do with the throwaway Telegram
+account, because both are one-off sessions where leaving nothing behind is the
+whole requirement. Adding it there costs nothing. Adding it as a fourth
+always-on box costs a box.
+
+**A second no-log VPN — neutral at best.** Mullvad is already in the path,
+and "no-log" is a claim rather than a property: unverifiable from outside,
+falsified in court more than once across the industry. Mullvad is close to the
+best available version of that claim (no accounts, cash and XMR accepted,
+seized servers that yielded nothing), and stacking a second provider does not
+change *who sees what*. Both providers see the same fact — that this
+connection goes to Tor — and the first one already sees it. You buy latency
+and a second company that can be asked.
+
+**A VPS paid in XMR — actively worse, and this is the important one.** Paying
+in Monero hides *who rented the box*. It does nothing about *what the box
+is*, and what it is is a computer you do not control:
+
+- The hypervisor can read the guest's RAM and image its disk at any time,
+  with no notice and no trace inside the guest. Encryption at rest does not
+  help against a host that can read the key out of memory.
+- The datacentre sees every packet in and out.
+- The IP is static, long-lived and datacentre-ASN — a single durable
+  identifier that everything the box ever does has in common.
+
+This design's premise, stated in the first line of this file, is not leaving
+the spend key on a box that stays online. A VPS is the most online a box can
+be. It is strictly worse than the Pi for the doorbell role — the Pi is
+hardware in your hand — and it is disqualifying for the vault role. A VPS
+earns its place when you need an always-on *inbound* service; §8 deliberately
+has none, because `gs_telegram_pager` long-polls outward and listens on
+nothing.
+
+**"Tails inside the VPS" — a category error.** Tails' guarantees are amnesia,
+forced Tor, and physical control of the machine. In a guest on someone else's
+hypervisor the amnesia is theatre: the host can snapshot RAM and disk whenever
+it likes. You keep every inconvenience and lose the guarantee that paid for
+it. (Reaching a VPS *from* Tails is the sane reading and is fine as far as it
+goes — it keeps your home IP off the box. It does not make the box trusted.)
+
+**A third-world residential proxy — the worst item on the list.** Residential
+proxy pools are, overwhelmingly, other people's devices, enrolled by an SDK
+bundled into a free app. Concretely:
+
+- **The operator sees your traffic.** TLS hides the contents; it does not
+  hide destination, timing or volume. You are paying an adversary for a
+  vantage point over yourself, and their business is selling access to other
+  people's homes — assume logs.
+- **The exit is shared and rotating.** Your session is pooled with whatever
+  else that address is doing, which on these networks is frequently fraud.
+  That gets addresses flagged and puts your traffic in the same bucket as
+  traffic under active investigation.
+- **It undoes Tor.** Terminating a Tor circuit into a proxy you personally
+  paid for reunites both ends at one party who knows your payment identity.
+  That is the precise thing Tor is built to prevent.
+- **"Third-world" selects the wrong variable.** The instinct is that a distant
+  jurisdiction will not cooperate. But the entity holding the logs here is the
+  proxy *vendor*, not a government, and the jurisdictions in question tend to
+  have weaker data-protection law and more direct state access to operators,
+  not less. You are choosing the place where the records are easiest to get.
+
+**What would actually move the needle**, in descending order — none of it is
+about hops:
+
+1. **The swap is still the link.** ThorChain ties the BTC deposit to the XMR
+   destination and nothing in this file fixes it (see the header, and the
+   `receive_and_quote` job). Acquiring BTC without KYC — or receiving XMR
+   directly and skipping the swap — dominates every question about proxies. If
+   the BTC came from a named exchange, the rest is decoration.
+2. **The phone.** Traffic to Telegram at 03:12 correlates with a vault that
+   powers on at 03:12. The pager already goes out over Tor; the handset,
+   the SIM and the account are the part still exposed. A Tails session and a
+   throwaway account bought with cash are worth more here than any VPS.
+3. **The physical layer.** Whether the Pi's SD card is actually encrypted
+   (§3 — an unencrypted card hands over your Mullvad private key and your Tor
+   guard set), and where the spend USB physically is. These beat every network
+   trick in the table above.
+4. **Time correlation.** Power draw, fan noise and Tor traffic all start when
+   the vault wakes. The mandatory 5–20 min jitter (§5) blunts it; nothing
+   erases it.
+
+The short version: this design's strength is the small number of parties who
+can see anything, and every item in the proposed stack adds one. Spend the
+effort on the swap and the phone.
+
 ## 7. Checks before you call it live
 
 - [ ] `rfkill` on the Pi shows wifi/bt **blocked**
@@ -950,7 +1093,7 @@ only public keys cross the LAN.
 ```bash
 # 1. on the ThinkPad. It generates its key, prints the exact command
 #    to run on the Pi, and waits.
-python3 gs_wake_keys pair --amount-ladder 0.01 0.02 0.05
+python3 gs_wake_keys pair
 
 # 2. on the Pi, using the address the ThinkPad just printed
 python3 gs_doorbell pair 192.168.1.20
@@ -993,7 +1136,17 @@ it. Everything else is automatic:
 # on the Pi, one process per poke — the job goes in on STDIN, never
 # argv, and the passphrase is asked for on the terminal, so neither is
 # ever in /proc/<pid>/cmdline
-echo '{"job":"receive_and_quote","amount_slot":2}' | \
+# amount_sat is SATOSHIS — 5000000 is 0.05 BTC. It used to be
+# "amount_slot":2, an index into a ladder of amounts in the ThinkPad's
+# keyfile; that ladder is gone, because a rung is the right amount only
+# if the amount was foreseen when you paired the boxes.
+echo '{"job":"receive_and_quote","amount_sat":5000000}' | \
+    python3 gs_doorbell wake --key /etc/gs_wake_pi.key
+
+# a withdrawal takes where it goes and how deep to mix it (1, 2 or 3 —
+# see gs_wake_proto.WITHDRAW_DEPTHS). The vault refuses this entirely
+# unless its own keyfile was paired with --allow-withdraw (§5 4b).
+echo '{"job":"withdraw","exit_to":"4...","depth":2}' | \
     python3 gs_doorbell wake --key /etc/gs_wake_pi.key
 
 # on the ThinkPad, as a systemd oneshot at boot (see systemd/ in this repo)
@@ -1166,15 +1319,32 @@ The one real cost, stated plainly: to run unattended it needs
 SD card as the sealed keyfile and effectively unseals it. A pager you start by
 hand, typing the passphrase, does not. That is the trade; make it knowingly.
 
-The wake channel can ask for three jobs and no others — `receive_new`,
-`receive_and_quote`, `watch`. There is deliberately no job that takes an
-XMR destination: a doorbell that can name one turns “they can wake and
-spam quotes, not spend” into “you read a valid memo off your own vault,
-send real BTC, and ThorChain delivers to the attacker.” Every parameter
-is a bounded integer or a 4-hex handle; the amount is an INDEX into a
-ladder that lives on the ThinkPad, so the Pi never sends a number and
-never a flag, a path or a proxy. The ThinkPad composes every argument
-itself.
+The wake channel can ask for five jobs and no others — `receive_new`,
+`receive_and_quote`, `watch`, `swap_status`, `withdraw`.
+
+**Exactly one of them takes an XMR destination, and this paragraph used to say
+none did.** The old rule was absolute: a doorbell that can name a destination
+turns “they can wake and spam quotes, not spend” into “you read a valid memo
+off your own vault, send real BTC, and ThorChain delivers to the attacker.”
+That reasoning still holds *for the deposit side*, and the deposit side still
+obeys it — `receive_and_quote` mints its destination inside the job, on the
+vault, and the Pi cannot name, select or influence it.
+
+`withdraw` breaks the rule on purpose and pays for it three ways: the vault
+refuses the job outright unless its own keyfile was paired with
+`--allow-withdraw` (physical access, absent from every keyfile written before
+the job existed); the address is validated at the pager, at the doorbell and
+again at the vault with a real checksum immediately before it is used; and it
+travels in the environment, never on an argv. The alternative was a documented
+cycle that ends with the money on a subaddress whose full address the swap
+already published in a Bitcoin OP_RETURN, and an operator holding a phone that
+cannot do anything about it. “Go to the vault” is not an answer when the
+reason the vault is far away is that it is a vault. Every other parameter
+is a bounded integer, a 4-hex handle, or — for `withdraw` alone — an XMR
+address checked three times and never put on an argv. The deposit amount is
+a bounded satoshi count and the mixing depth is a key of a three-row table;
+neither can be a flag, a path or a proxy. The ThinkPad composes every
+argument itself.
 
 `watch` takes only a handle that came from `receive_and_quote`. A handle
 from `receive_new` is refused, for two reasons: `--count N` mints N

@@ -191,23 +191,37 @@ def _wizard_params(answers):
     return seen
 
 
-for _slot in range(8):
-    _wizard_params(["/depo", str(_slot), "<confirm>"])
-for _hostile in (XMR, MEMO, BTC, "0.05", "-1", "8", "2 3", "²", "٢",
-                 "2; /depo 7", "‮2", "٧", "2\n7", "x" * 500):
+_LEGAL = {"0.0001": 10_000, "0.05": 5_000_000, "1": 100_000_000,
+          "2.5": 250_000_000, "100": 10_000_000_000}
+for _typed in _LEGAL:
+    _wizard_params(["/depo", _typed, "<confirm>"])
+for _hostile in (XMR, MEMO, BTC, "-1", "1e9", "0.05 0.05", "²", "٢",
+                 "0.05; /depo 7", "‮2", "٧", "0.05\n7", "x" * 500,
+                 "0,05", "0.000000001", "999999", "١٢٣", "１"):
     _wizard_params(["/depo", _hostile, "<confirm>"])
-    _wizard_params(["/depo", "2", _hostile])
-# NOT "exactly eight jobs": '٢' is Arabic-Indic two, isdecimal() accepts it and
-# int() reads it as 2, so it legitimately produces slot 2. The first version of
-# this check listed it as hostile and went red on correct behaviour. The real
-# invariant is that EVERY job the wizard can produce is one key holding an
-# in-range slot, and that all eight are reachable.
-check("every job the wizard produces is a single in-range slot, whatever was "
-      "typed at it",
-      all(set(pa) == {"amount_slot"} and pa["amount_slot"] in range(8)
+    _wizard_params(["/depo", "0.05", _hostile])
+# EXACTLY THE LEGAL SET, and '٢' is now on the hostile side of that line.
+#
+# This check used to say the opposite in as many words: "NOT 'exactly eight
+# jobs': '٢' is Arabic-Indic two, isdecimal() accepts it and int() reads it as
+# 2, so it legitimately produces slot 2." That was a correct reading of the
+# code and a defensible call while the parameter was a LADDER INDEX -- picking
+# rung 2 by an unusual keystroke is a curiosity, not a loss.
+#
+# It stopped being defensible when the parameter became money. The same
+# property that made "٢" a harmless way to say slot 2 made "１" a way to say
+# ONE WHOLE BITCOIN through a character that renders as a slightly wide 1 --
+# and Python's \d, str.isdecimal(), int(), float() and Decimal() all agree
+# with it. So the amount parser is pinned to [0-9] and every one of the 455
+# non-ASCII decimal digits is refused here.
+check("every job the wizard produces is a single in-range satoshi count, "
+      "whatever was typed at it",
+      all(set(pa) == {"amount_sat"}
+          and P.DEPOSIT_MIN_SAT <= pa["amount_sat"] <= P.DEPOSIT_MAX_SAT
           for _, pa in _wiz))
-check("...and all eight slots are reachable, so nothing above is vacuous",
-      {pa["amount_slot"] for _, pa in _wiz} == set(range(8)))
+check("...and the amounts produced are EXACTLY the legal ones typed, so no "
+      "hostile string reached the wire as a number",
+      {pa["amount_sat"] for _, pa in _wiz} == set(_LEGAL.values()))
 check("...every wizard-produced job is receive_and_quote",
       {j for j, _ in _wiz} == {"receive_and_quote"})
 check("...and every value is a plain int, never a string or a bool",
@@ -278,7 +292,7 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
     _sent.clear()
     pg.doorbell = lambda _o=_out, _hh=_h: types.SimpleNamespace(
         run_wake=lambda a, k, j, p: _FakePending(_o, _hh))
-    _pv.poke(111, "receive_and_quote", {"amount_slot": 2})
+    _pv.poke(111, "receive_and_quote", {"amount_sat": 5000000})
     _text = "\n".join(t for _, t in _sent)
     check(f"outcome {_out}: no XMR address reaches the chat", XMR not in _text)
     check(f"outcome {_out}: no swap memo reaches the chat", MEMO not in _text)

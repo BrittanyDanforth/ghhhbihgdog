@@ -235,7 +235,7 @@ check("a non-boolean plain_slip is refused rather than being truthy",
 def pending(job="receive_and_quote", params=None):
     return DB.Pending({"secret": bytes(PI).hex(),
                        "peer_public": bytes(VAULT.public_key).hex()},
-                      job, params or {"amount_slot": 2})
+                      job, params or {"amount_sat": 5000000})
 
 
 def m3(pend, **over):
@@ -494,7 +494,7 @@ def _drive(result, job="receive_and_quote", params=None):
                          "outcome": staticmethod(lambda: "done")})()
     pg._DOORBELL[0] = type("D", (), {
         "run_wake": staticmethod(lambda a, k, j, p: fin)})()
-    _p.poke(111, job, params or {"amount_slot": 2})
+    _p.poke(111, job, params or {"amount_sat": 5000000})
     return list(_sent)
 
 

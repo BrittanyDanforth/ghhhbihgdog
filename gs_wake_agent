@@ -169,14 +169,41 @@ def disarm_deadman() -> None:
         pass
 
 
-#: How many mix outputs a WITHDRAW composes, pinned rather than inherited.
-#:
-#: The job's budget in gs_wake_proto is computed for this value: GhostSpiral's
-#: estimate_runtime at the slow end of the --hop-delay window answers ~4.5 h
-#: here and ~6.2 h at 40. Leaving it to GhostSpiral's own default would make
-#: this job's runtime -- and therefore whether it is SIGKILLed mid-spend -- a
-#: property of a default in another file that nobody would think to check.
-WITHDRAW_WALLETS = 10
+def withdraw_wallets(depth) -> int:
+    """How many mix outputs a WITHDRAW composes, for one chosen depth.
+
+    A LOOKUP IN A CLOSED TABLE, not arithmetic on the note's value. This was
+    `WITHDRAW_WALLETS = 10`, one pinned number for every withdrawal, and that
+    single constant is what made the job refuse most real deposits: the mix
+    floor rises with the hop count, so at 10 the tool would not move anything
+    under 0.2936 XMR while at 3 it goes down to 0.1748. The depth was the one
+    dial that decides whether a given pile can be mixed AT ALL, and it was
+    welded shut.
+
+    It is a table and not an int off the wire because the budget in
+    gs_wake_proto is sized from the deepest row of that same table: any depth
+    the note can name is a depth the vault can finish, and a depth outside it
+    would be a run that run_child SIGKILLs mid-spend. The schema bounds it
+    too (_int_range(1, 3)); this is the second of the two, on the side that
+    holds the money, and it raises rather than defaulting -- a KeyError here
+    would be caught and reported, but a silent fallback to some default depth
+    would spend at a hop count nobody chose.
+
+    EXACT, and deliberately not `int(depth)`. Coercing first accepts 2.5 as
+    depth 2 and True as depth 1, rounding to a hop count the operator did not
+    pick, on the one job that spends. The schema refuses both already; this
+    refuses them again rather than trusting that it did, which is the whole
+    reason for checking twice.
+    """
+    if isinstance(depth, bool) or not isinstance(depth, int) \
+            or depth not in proto.WITHDRAW_DEPTHS:
+        raise Refused(
+            "bad_depth",
+            f"the note asked for mixing depth {depth!r}, which is not one of "
+            f"{sorted(proto.WITHDRAW_DEPTHS)}. The vault's budget is sized "
+            f"from that table, so a depth outside it is a run that gets "
+            f"killed part way through spending.")
+    return proto.WITHDRAW_DEPTHS[depth][0]
 
 #: The transient timer extend_deadman starts. Named so a human can find it.
 DEADMAN_EXT_UNIT = "gs-wake-deadman-ext"
@@ -654,20 +681,22 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  "--count", str(int(params["count"])),
                  "--output-dir", str(artifact_dir)]]
     if job == "receive_and_quote":
-        ladder = key.get("amount_ladder") or []
-        slot = int(params["amount_slot"])
-        # BOTH ENDS. This read `slot >= len(ladder)`, so a NEGATIVE slot indexed
-        # from the far end -- ladder[-1] is the largest rung -- and the refusal
-        # never fired. Nothing in this file stopped it; the only thing that did
-        # was _int_range(0, 7) two files away in the job schema, which is a
-        # real check and is also somebody else's. A bounds check that only
-        # bounds one side is the kind that reads as complete.
-        if not 0 <= slot < len(ladder):
-            raise Refused("empty_slot",
-                          f"the note asked for amount slot {slot} and this "
-                          f"machine's ladder has {len(ladder)} rung(s). The "
-                          f"ladder lives here, not on the doorbell — add the "
-                          f"amount with physical access if you meant it.")
+        # RE-CHECKED HERE, and the bounds come from the protocol rather than
+        # from a literal typed in this file. The predecessor of this branch
+        # read a ladder slot and checked `slot >= len(ladder)` -- one end only
+        # -- so a NEGATIVE slot indexed from the far end (ladder[-1] is the
+        # largest rung) and the refusal never fired. What actually stopped it
+        # was _int_range two files away, which is a real check and is also
+        # somebody else's. The lesson survives the ladder's removal: this is
+        # the box that acts on the number, so it bounds the number, and it
+        # bounds BOTH ends by asking the schema rather than by restating it.
+        _amt = params["amount_sat"]
+        try:
+            proto.JOBS["receive_and_quote"]["schema"]["amount_sat"](_amt)
+        except Exception as e:                               # noqa: BLE001
+            raise Refused("bad_amount",
+                          f"the note's deposit amount is not one this "
+                          f"machine will quote: {e}")
         return [
             [sys.executable, _tool("create_receive_wallet"),
              "--tor-proxy", proxy, "--rpc", rpc,
@@ -767,14 +796,17 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  "--receive-wallet", str(bundle),
                  "--wallet-file", str(_wf),
                  "--dag-mixing",
-                 # PINNED, because the budget is computed FOR this number.
-                 # Leaving it to GhostSpiral's default made the job's runtime
+                 # FROM THE OPERATOR'S CHOSEN DEPTH, via a closed table --
+                 # never GhostSpiral's own default, and never a raw number off
+                 # the note. Leaving it to the default made the job's runtime
                  # a property of a default in another file: at --wallets 20
-                 # the same run takes 4.2 h and at 40 it takes 6.2 h, and
-                 # nothing here would have noticed either. The budget and this
-                 # value are one setting and a test recomputes one from the
-                 # other.
-                 "--wallets", str(WITHDRAW_WALLETS),
+                 # the same run takes 13.1 h and at 40 it takes far longer,
+                 # and nothing here would have noticed either. Depth and
+                 # budget are one setting: gs_wake_proto sizes budget_s from
+                 # the deepest row of this same table, and
+                 # tests/test_wake_agent.py recomputes both from GhostSpiral's
+                 # arithmetic so they cannot drift apart.
+                 "--wallets", str(withdraw_wallets(params["depth"])),
                  "--output", str(artifact_dir)]]
     raise Refused("unknown_job", "no argv template for this job")
 
@@ -1554,8 +1586,18 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                               f"{len(new)}. Refusing to quote a swap without "
                               f"knowing which address it pays.")
             argv[argv.index("--dest-from-receive-wallet") + 1] = new[0]
-            env_extra["GS_SWAP_AMOUNTS"] = str(
-                key["amount_ladder"][int(params["amount_slot"])])
+            # THE AMOUNT, AS A DECIMAL BTC STRING, IN THE ENVIRONMENT.
+            # thor_swap_preparer reads GS_SWAP_AMOUNTS through env_or_argv and
+            # prefers it over argv for the reason gs_common.env_or_argv's
+            # docstring records: /proc/<pid>/cmdline is 0444.
+            #
+            # sat_to_btc and not str(): the wire carries an exact integer
+            # count of satoshis precisely so that no float or locale ever
+            # touches this number, and str() on that int would hand the
+            # preparer a satoshi count where it expects bitcoin -- a hundred
+            # million times the intended swap, quoted without complaint.
+            env_extra["GS_SWAP_AMOUNTS"] = proto.sat_to_btc(
+                params["amount_sat"])
             handles[handle] = {"bundle": new[0], "minted": 1,
                                "slip": str(artifact_dir /
                                            f"thor_pairs_{handle}.json")}

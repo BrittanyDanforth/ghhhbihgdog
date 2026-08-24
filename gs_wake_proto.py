@@ -1500,11 +1500,124 @@ def pair_responder(sock, my_sk, my_pub: bytes, my_info: dict, ask,
 # hands that bundle to --dest-from-receive-wallet. The Pi cannot name, select
 # or influence an address.
 #
-# The amount is an INDEX INTO A LADDER held in the ThinkPad's keyfile, never a
-# number on the wire. A finite parameter space is exhaustively testable and has
-# no numeric parsing surface at all. The stated cost: quoting an amount that is
-# not on the ladder requires editing the ThinkPad's keyfile, which requires
-# physical access. That is the intended direction of friction.
+# THE AMOUNT IS A COUNT OF SATOSHIS, and it used to be an index into a ladder
+# held in the ThinkPad's keyfile. The ladder's argument was a good one -- a
+# finite parameter space is exhaustively testable and has no numeric parsing
+# surface at all -- and it was answering the wrong question.
+#
+# What the operator is doing is quoting a swap for the amount they are ABOUT
+# TO SEND. A ladder can only answer that if the amount was foreseen and
+# written into the keyfile with physical access, and the rung they pick is
+# otherwise a quote for a number that is not the number. "The intended
+# direction of friction" was friction against being correct.
+#
+# What the ladder actually bought was that the Pi never learned an amount, and
+# that is worth less here than it looks:
+#
+#   * The amount is a BITCOIN transaction. It is public on the Bitcoin chain
+#     and again in the ThorChain swap before the mix ever starts. The ladder
+#     hid it from an adversary holding the Pi who could not correlate a chain
+#     -- and that adversary learns nothing from the Pi either way.
+#   * It does not survive on the Pi. gs_telegram_pager burns the operator's
+#     own messages (see its `burn` list) and Convo lives in process memory
+#     with a three-minute deadline and is not in anything Limits.save writes.
+#   * receive_and_quote SPENDS NOTHING. It mints a receive subaddress and asks
+#     for a quote. A stolen phone naming a huge amount achieves a wrong quote
+#     and a burnt wake, not a payment -- so the ladder was not bounding a
+#     spend, which is the only thing that would have justified the friction.
+#
+# The parsing surface the ladder avoided is answered by not having one:
+# btc_to_sat below is integer string arithmetic with no float and no Decimal,
+# and what crosses the wire is a plain bounded int -- the same shape the
+# ladder index was, carrying the number that is actually true.
+
+#: Satoshis in one bitcoin. Named because `100000000` in an expression is a
+#: digit-count nobody verifies at a glance.
+SATS_PER_BTC = 100_000_000
+
+#: What a typed deposit amount must fall between, in satoshis.
+#:
+#: THESE ARE TYPO GUARDS AND NOT PROTOCOL MINIMUMS, which matters because a
+#: number in a constant reads like an authority. The real lower bound is
+#: whatever ThorChain's outbound fee makes uneconomic that day, and the real
+#: upper bound is judgement about how large a single swap should ever be;
+#: neither is knowable here and both move. These bounds exist to catch the
+#: hand that meant 0.05 and typed 5 -- wide enough never to obstruct a real
+#: deposit, narrow enough that a slipped decimal point lands outside.
+DEPOSIT_MIN_SAT = 10_000              # 0.0001 BTC
+DEPOSIT_MAX_SAT = 10_000_000_000      # 100 BTC
+
+
+#: What btc_to_sat accepts: plain decimal BTC, at most 8 places.
+#:
+#: NO EXPONENT, NO SIGN, NO SEPARATOR, NO SPACE. Each is a way for a string to
+#: look like one number and parse as another, and this repo has already paid
+#: for a float on a money path once (see gs_common.env_or_argv).
+#:
+#: [0-9] AND NOT \d, and this was a real defect and not a style preference.
+#: Python's \d matches every Unicode decimal digit, and int() converts them
+#: all -- so "１", FULLWIDTH DIGIT ONE, passed the pattern and parsed as
+#: one whole bitcoin. It renders as a slightly wide "1" and a phone keyboard
+#: set to a CJK layout emits it without being asked twice. Driven before the
+#: fix: it was accepted for 100,000,000 satoshis. This is the same family as
+#: the bug step_convo's docstring records ("²".isdigit() is True), except
+#: that one raised and this one quietly agreed.
+_BTC_RE = re.compile(r"[0-9]{1,9}(?:\.[0-9]{1,8})?\Z")
+
+
+def btc_to_sat(text) -> int:
+    """A decimal BTC string to an exact satoshi count, or raise WakeError.
+
+    INTEGER STRING ARITHMETIC, no float and no Decimal. float(0.07) is not
+    7000000 satoshis and never will be; Decimal would be correct but would
+    make this module's "importing nothing but the stdlib" claim carry a money
+    parser it does not need. Splitting on the dot and padding the fraction to
+    eight places is exact by construction.
+
+    NINE DECIMAL PLACES IS AN ERROR, not something to round. Bitcoin has eight
+    and a ninth means the operator is thinking in a different unit or has
+    mistyped; silently truncating it would spend a different amount than the
+    one they read back.
+    """
+    s = text if isinstance(text, str) else ""
+    s = s.strip()
+    if not _BTC_RE.match(s):
+        raise WakeError("expected a plain BTC amount like 0.05, at most 8 "
+                        "decimal places")
+    whole, _dot, frac = s.partition(".")
+    sat = int(whole) * SATS_PER_BTC + int(frac.ljust(8, "0") or "0")
+    if not DEPOSIT_MIN_SAT <= sat <= DEPOSIT_MAX_SAT:
+        raise WakeError(f"expected between {btc_display(DEPOSIT_MIN_SAT)} and "
+                        f"{btc_display(DEPOSIT_MAX_SAT)} BTC")
+    return sat
+
+
+def sat_to_btc(sat) -> str:
+    """An exact satoshi count back to the decimal BTC string tools read.
+
+    Always eight places, so the output is a fixed shape rather than one that
+    varies with the value -- thor_swap_preparer hands it to decimal_env, which
+    wants a decimal string, and "0.05000000" and "0.05" are the same number
+    while only one of them has a length that depends on the amount.
+    """
+    whole, frac = divmod(int(sat), SATS_PER_BTC)
+    return f"{whole}.{frac:08d}"
+
+
+def btc_display(sat) -> str:
+    """The same amount, for a human to read. NEVER for a tool to parse.
+
+    sat_to_btc's fixed eight places are right for the environment variable and
+    wrong for a chat: "Deposit 0.05000000 BTC" is six characters of noise on
+    the line an operator is being asked to check, and a confirm that is
+    tiresome to read is a confirm that gets answered without being read.
+
+    Trailing zeros only. The value is identical -- 0.05 and 0.05000000 are the
+    same number of satoshis -- so this cannot show an amount other than the
+    one being sent, which is the only property a confirm line needs.
+    """
+    s = sat_to_btc(sat)
+    return s.rstrip("0").rstrip(".") if "." in s else s
 
 #: Bounded integer parameter: (lo, hi) inclusive.
 def _int_range(lo, hi):
@@ -1566,6 +1679,50 @@ def _xmr_address_field(v):
 _xmr_address_field.spec = "xmr address ^[48][base58]{94,105}$"
 
 
+#: THE DEPTHS THE SERVICE OFFERS, and the numbers are the whole point.
+#:
+#: A single fixed depth is not "always this private" -- it is a FLOOR on what
+#: can be mixed at all. mix_minimum_xmr is a curve: 0.1748 XMR at three wallets
+#: and 0.2936 at ten. Hard-coding ten refuses every deposit under 0.2936 XMR,
+#: after the swap has already settled, which is most of what a person sends.
+#:
+#: AND THE TOOL MUST NOT PICK IT FROM THE BALANCE. That was tried here and is
+#: worse than either extreme: the fan-out's output count is PUBLIC, so a depth
+#: derived from the amount makes that public count a direct readout of a lower
+#: bound on the deposit. A depth the operator chose leaks nothing about the
+#: amount, because it is not a function of it. It is also the thing they are
+#: choosing to buy, and a service that picks it for them has removed the only
+#: decision that was theirs to make.
+#:
+#: (wallets, worst-case seconds). The seconds come from GhostSpiral's own
+#: _runtime_terms at the SLOW end of DEFAULT_HOP_DELAY -- 180-720s per
+#: transaction, about thirty draws a run -- never at its median.
+#: tests/test_wake_agent.py recomputes both and fails if either drifts.
+WITHDRAW_DEPTHS = {
+    1: (3, 22080),     # 6.1h  -- the floor, so small deposits are possible
+    2: (10, 32160),    # 8.9h
+    3: (20, 46560),    # 12.9h
+}
+
+#: What each depth needs, in words the operator reads before choosing.
+#:
+#: NO XMR FIGURE APPEARS HERE, and that is a constraint rather than a choice.
+#: The real minimum is GhostSpiral.mix_minimum_xmr at that hop count, it moves
+#: with the network fee, and the box that draws this menu is the PAGER --
+#: which may not import GhostSpiral and may not have it on disk at all (see
+#: gs_telegram_pager's USAGE_FEE_LABEL for the same argument). A number
+#: frozen in here would therefore be a quote nobody can honour and nothing
+#: can check. So the menu says which end of the range each depth sits at,
+#: which is the part that is true regardless of the fee, and the vault -- the
+#: box that CAN ask -- is what refuses a deposit too small for the depth it
+#: was given.
+WITHDRAW_DEPTH_NOTE = {
+    1: "3 hops · ~6h · lowest minimum",
+    2: "10 hops · ~9h",
+    3: "20 hops · ~13h · highest minimum",
+}
+
+
 JOBS = {
     # Mint receive subaddresses. Spends nothing.
     "receive_new": {
@@ -1575,8 +1732,16 @@ JOBS = {
     },
     # Mint ONE receive subaddress and quote a swap TO IT. The destination is
     # minted inside the job; the Pi never supplies one. See above.
+    #
+    # THE AMOUNT IS THE ONE BEING SENT, in satoshis, and it replaced an index
+    # into a ladder in the vault's keyfile. The long argument for the change
+    # is above _int_range; the short one is that a quote for a rung the
+    # operator picked off a list is a quote for a number that is not the
+    # number they are about to send, and a swap quoted for the wrong amount is
+    # simply wrong.
     "receive_and_quote": {
-        "schema": {"amount_slot": _int_range(0, 7)},
+        "schema": {"amount_sat": _int_range(DEPOSIT_MIN_SAT,
+                                            DEPOSIT_MAX_SAT)},
         "tools": ("create_receive_wallet", "thor_swap_preparer"),
         "budget_s": 1800,
     },
@@ -1636,7 +1801,7 @@ JOBS = {
     # is absent from every keyfile that existed before this job did -- so an
     # upgraded pair does not silently gain the ability to spend.
     "withdraw": {
-        # ONE FIELD: WHERE IT GOES. Nothing else.
+        # TWO FIELDS: WHERE IT GOES, AND HOW DEEP.
         #
         # It used to take a HANDLE as well -- the 4-hex label of a receive
         # bundle a /depo had minted -- so a withdrawal was only possible for
@@ -1649,34 +1814,42 @@ JOBS = {
         # The vault finds the funded output itself now (see
         # gs_wake_agent._funded_entry). It is the machine holding the wallet;
         # asking a phone to name an account index was asking the wrong box.
-        "schema": {"exit_to": _xmr_address_field},
+        #
+        # `depth` is the SECOND thing that is genuinely theirs to decide, and
+        # shipping without it made the job refuse most real deposits: the mix
+        # floor is a function of the hop count (GhostSpiral.mix_minimum_xmr
+        # answers 0.1748 XMR at 3 wallets and 0.2936 at 10), so a hard-coded
+        # 10 was a hard floor on what could be withdrawn at all. See
+        # WITHDRAW_DEPTHS for why it is a small closed set and not a number.
+        "schema": {"exit_to": _xmr_address_field,
+                   "depth": _int_range(1, 3)},
         "tools": ("GhostSpiral",),
-        # SIX HOURS, SIZED FROM THE WORST CASE AND NOT THE MEDIAN, and the
-        # first version of this got that wrong in the direction that costs
-        # money.
+        # SIZED FOR THE DEEPEST DEPTH OFFERED, and this number was wrong.
         #
-        # It was 14400 (4 h), chosen against GhostSpiral's estimate_runtime
-        # reporting "~3.2h" for the settings this job composes. That figure is
-        # a MEDIAN: --hop-delay draws uniformly from 60-300 s per transaction
-        # and a run makes about thirty of those draws. Asking the same
-        # estimator for the slow end -- estimate_runtime(..., (300, 300)) --
-        # answers ~4.5 h. So a run that drew high was over budget, and over
-        # budget here is not a late report: run_child SIGTERMs the process
-        # group and then SIGKILLs it, mid-mix, with the money already moving.
+        # It was 21600 (6h), computed against a hop-delay window of (300,300).
+        # DEFAULT_HOP_DELAY is (180, 720). At the real slow end even the
+        # SHALLOWEST depth needs 6.1h, so the shipped budget could not cover
+        # any run at all -- and over budget is not a late report: run_child
+        # SIGTERMs the process group and then SIGKILLs it, mid-mix, with the
+        # money already moving. Every withdrawal would have been killed.
         #
-        # 21600 clears the 4.5 h worst case with room. It is checked against
-        # the estimator rather than asserted -- tests/test_wake_agent.py
-        # recomputes the worst case from GhostSpiral's own arithmetic and
-        # fails if it no longer fits, so the two numbers cannot drift apart
-        # the way these two did.
+        # It is the deepest entry in WITHDRAW_DEPTHS plus a quarter, and it is
+        # a CEILING rather than a duration: the agent powers off as soon as
+        # the job finishes, so choosing depth 1 does not keep the vault up for
+        # depth 3's budget.
         #
-        # The cost is real and belongs here rather than in a doc: the vault is
-        # powered on, with an unlocked spend wallet, for up to six hours. That
-        # is far and away the longest any job keeps it up, and it is the power
-        # and network signature this design otherwise spends its effort
-        # hiding. It buys the one thing worth more, which is not being killed
-        # half way through spending.
-        "budget_s": 21600,
+        # WHY A QUARTER ON TOP OF A NUMBER THAT IS ALREADY A CEILING. The
+        # seconds in WITHDRAW_DEPTHS bound the hop delays exactly -- they
+        # assume every one of ~58 draws lands on the slow end of (180, 720),
+        # which cannot be exceeded. The confirmation term cannot: it is
+        # FANOUT_CONFIRM_POLL_ESTIMATE, an ESTIMATE of how long the chain
+        # takes to confirm, and a slow chain is not bounded by anything in
+        # this repo. The margin covers that term, and it is deliberately
+        # generous in the cheap direction: a budget too long only matters if
+        # the job also hangs, and the deadman still fires; a budget too short
+        # SIGKILLs a mix mid-spend, which is the one failure nothing here can
+        # undo.
+        "budget_s": int(max(t for _w, t in WITHDRAW_DEPTHS.values()) * 1.25),
     },
 }
 
@@ -1684,6 +1857,7 @@ JOBS = {
 #: opt-in on the vault. A tuple rather than a flag on each job, so the agent's
 #: gate and the doorbell's window sizing read the same list.
 SPENDING_JOBS = ("withdraw",)
+
 
 #: THE VAULT'S MANDATORY JITTER, DECLARED WHERE BOTH BOXES CAN SEE IT.
 #:

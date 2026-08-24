@@ -138,17 +138,27 @@ SLIP_RETRY_S = 20
 #
 #  WHAT IT CANNOT DO, BY CONSTRUCTION RATHER THAN BY DISCIPLINE.
 #
-#  The wizard asks for a ladder SLOT and never for an amount, and it could not
-#  offer amounts if it wanted to: the ladder lives in the ThinkPad's keyfile
-#  and the Pi's holds secret, peer_public, target_mac, wol_broadcast, wol_port,
-#  listen_host and listen_port -- no ladder, no amounts. So this box can say
-#  "slot 2" and is structurally incapable of saying "0.05". That is the
-#  property, not a rule someone has to keep following.
+#  THE WIZARD ASKS FOR THE AMOUNT, and this paragraph used to say the opposite
+#  at some length: that it asks for a ladder SLOT, that it "could not offer
+#  amounts if it wanted to", and that being "structurally incapable of saying
+#  0.05" was the property rather than a rule to follow.
 #
-#  What reaches the wire after all the conversation is byte-identical to what
-#  `/depo 2` produces today: ("receive_and_quote", {"amount_slot": N}). No new
-#  job, no new schema field, no new keyfile field, so no re-pairing and no
-#  half-upgraded pair.
+#  It was a real property and it was protecting the wrong thing. The operator
+#  is quoting a swap for the amount they are about to send; a rung off a list
+#  is that amount only if it was foreseen and written into the vault's keyfile
+#  with physical access, and every other time the quote was for a number that
+#  was not the number. gs_wake_proto, above _int_range, has the full argument
+#  and the three reasons the Pi learning an amount costs less than it reads
+#  like -- the short one being that the figure is a Bitcoin transaction and is
+#  public on two chains before the mix starts.
+#
+#  What this box still cannot do is name a DESTINATION for a deposit: the
+#  receive subaddress is minted inside the job on the vault, and the Pi never
+#  supplies one. That was always the load-bearing half.
+#
+#  What reaches the wire after all the conversation is one key holding one
+#  bounded int: ("receive_and_quote", {"amount_sat": N}), in satoshis, so no
+#  float and no locale ever touch it.
 #
 #  IN MEMORY, NEVER ON THE CARD. The --state file holds Limits and lives on the
 #  same SD card as the sealed keyfile; a half-finished /depo does not belong
@@ -196,14 +206,14 @@ USAGE_FEE_LABEL = "1.1%"
 #: Descriptions are what a stranger would need, not what the author remembers:
 #: "depo" and "slot 0-7" meant nothing to anyone who had not read the source.
 BOT_COMMANDS = [
-    ("deposit", "get an address to send Bitcoin to"),
+    ("deposit", "get an address to send Bitcoin to — asks the amount"),
     ("status", "can I start one right now"),
     # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
     # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
     # so "3 min" would be a figure they never once observe.
     ("check", "has my payment arrived yet (10-25 min)"),
     ("wait", "wait for it to arrive (up to 2h)"),
-    ("send", "send mixed funds out — asks for the address"),
+    ("send", "send mixed funds out — asks the address, then how deep"),
     ("settings", "what this will do, and where each part is decided"),
     ("cancel", "drop whatever I was half-way through"),
     ("help", "this list"),
@@ -591,17 +601,27 @@ class Convo:
     other shape. `exit_to` is set in exactly one place, from a value
     proto's address field has already accepted.
 
-    `step` is DERIVED, not stored, per kind: a depo awaits its slot iff slot is
-    None; a withdraw awaits its handle iff handle is None and then its address
-    iff exit_to is None. That is not brevity -- it makes "at the confirm step
-    with nothing to confirm" unrepresentable rather than merely untested.
+    `step` is DERIVED, not stored, per kind: a depo awaits its amount iff
+    amount is None; a withdraw awaits its address iff exit_to is None and then
+    its depth iff depth is None. That is not brevity -- it makes "at the
+    confirm step with nothing to confirm" unrepresentable rather than merely
+    untested.
+
+    THE TWO NUMBERS ARE INTS, deliberately, and that is what lets the one-
+    string rule survive them. `amount` is a count of SATOSHIS and `depth` is a
+    key of proto.WITHDRAW_DEPTHS; neither is a decimal string, so neither can
+    carry "1e9", a locale comma, or free text wearing a number's clothes. The
+    parsing happens once, at the step that reads it, and what survives into
+    this struct is already an integer or the conversation is already dead.
     """
 
-    __slots__ = ("kind", "slot", "handle", "exit_to", "expect", "deadline")
+    __slots__ = ("kind", "amount", "depth", "handle", "exit_to", "expect",
+                 "deadline")
 
     def __init__(self, clock, kind="depo"):
         self.kind = kind
-        self.slot = None
+        self.amount = None
+        self.depth = None
         self.handle = None
         self.exit_to = None
         self.expect = None
@@ -615,11 +635,18 @@ class Convo:
     def alive(self, clock) -> bool:
         return clock() < self.deadline
 
-    def awaiting_slot(self) -> bool:
-        return self.kind == "depo" and self.slot is None
+    def awaiting_amount(self) -> bool:
+        return self.kind == "depo" and self.amount is None
 
     def awaiting_address(self) -> bool:
         return self.kind == "withdraw" and self.exit_to is None
+
+    def awaiting_depth(self) -> bool:
+        # ORDERED, and the address gate comes first: both are None at the
+        # start of a /send, so asking these in the wrong order would ask for a
+        # depth before there is anywhere to send it.
+        return (self.kind == "withdraw" and self.exit_to is not None
+                and self.depth is None)
 
 
 def _confirm_question(rng):
@@ -757,71 +784,102 @@ class Pager:
         the ladder, the depth and the destination are not, and a /settings
         that woke the vault would spend a wake to answer a question.
         """
-        labs = self._labels()
         lines = ["What a run does, and who decides it.", ""]
-        lines.append("  amounts     " + (", ".join(labs) if labs
-                                         else "not named — pair with "
-                                              "--amount-labels"))
-        lines.append(f"  wake budget {self.limits.daily_cap} a day, "
+        lines.append("You choose, per job:")
+        # NO FIGURES, and the bounds are deliberately not printed here even
+        # though they are a constant of the software rather than anything
+        # about this operator. tests/test_depo_wizard.py asserts that no
+        # decimal appears in this reply, and the honest way past a check like
+        # that is not to loosen it: /deposit states the range at the moment it
+        # asks, which is when the operator needs it, and /settings is read at
+        # times when a number in the transcript buys nothing.
+        lines.append("  deposit amount  in BTC, typed at /deposit")
+        # DRAWN FROM THE TABLE, not listed here. A second hand-written copy of
+        # the depth menu is a second thing to forget to update, and this one
+        # would be wrong in the direction that reads as authoritative.
+        lines.append("  mixing depth    "
+                     + ", ".join(f"{d} ({proto.WITHDRAW_DEPTH_NOTE[d]})"
+                                 for d in sorted(proto.WITHDRAW_DEPTHS))
+                     + ", asked at /send")
+        lines.append("  destination     the address you reply with at /send")
+        lines.append("")
+        lines.append("Fixed here:")
+        lines.append(f"  wake budget     {self.limits.daily_cap} a day, "
                      f"{len(self.limits.recent())} used")
         lines.append("")
         lines.append("Set on the machine, not here:")
-        lines.append("  how much each amount is")
-        lines.append("  mixing depth and delay")
+        lines.append("  hop delay, and the depth ceiling")
         lines.append("  whether sending out is allowed at all")
         lines.append("")
-        lines.append("None of it changes from this chat. A message that could "
-                     "turn the mixing down is a message worth stealing the "
-                     "phone for.")
+        lines.append("Nothing in the last group changes from this chat. A "
+                     "message that could turn the mixing down is a message "
+                     "worth stealing the phone for.")
         return "\n".join(lines)
 
-    def _labels(self) -> list:
-        """The operator's own words for the ladder rungs, in order.
-
-        Empty when the pairing set none, which is the old behaviour and the
-        reason this exists: "Which slot? Reply 0-7" is a question nobody who
-        had not read the source could answer.
-        """
-        v = (self.key or {}).get("amount_labels") or []
-        return [str(x) for x in v if str(x).strip()][:8]
-
     def _amount_question(self) -> str:
-        """What to ask, in the operator's words if they gave any."""
-        labs = self._labels()
-        if not labs:
-            # NO LABELS PAIRED. Say what the number MEANS rather than just
-            # naming its range: "0-7" alone is the question that started this.
-            return ("How much? Reply with the position of the amount in the "
-                    "list you set up — 0 is the first. /cancel to stop.\n"
-                    "(Pair with --amount-labels to be asked by name instead.)")
-        return ("How much? Reply with one:\n"
-                + "\n".join(f"  {i}  {l}" for i, l in enumerate(labs))
-                + "\nReply with the word or the number. /cancel to stop.")
+        """What to ask for a deposit: the amount, in the operator's own figures.
 
-    def _slot_from(self, word: str):
-        """A slot from either the number or the operator's own word, or None.
+        THIS USED TO OFFER A LIST OF NICKNAMES -- "0 small, 1 medium, 2 large"
+        -- because the wire carried an index into a ladder of amounts held in
+        the vault's keyfile. Two things were wrong with it and only one was
+        cosmetic. The cosmetic one: nobody can answer "which slot?" without
+        having read the source. The real one: the operator is quoting a swap
+        for the amount they are ABOUT TO SEND, and a rung is that amount only
+        if it happened to be foreseen and written into a keyfile with physical
+        access. Every other time, it quoted a number that was not the number.
 
-        BOTH FORMS, because the labels are a convenience and the numbers are
-        what the wire has always carried -- an operator who has typed "2" for
-        months should not be told it is now wrong.
-
-        Matched case-insensitively and on the whole word: a label is a short
-        word the operator chose, and a prefix match would make "s" ambiguous
-        between "small" and "standard" without saying so.
+        The bounds are named because a refusal that only says "out of range"
+        makes the operator guess at the range. They are stated as BTC because
+        that is the unit being sent; the satoshi count is an implementation
+        detail of the wire and never appears in the chat.
         """
-        w = (word or "").strip().lower()
-        labs = self._labels()
-        for i, l in enumerate(labs):
-            if w == str(l).strip().lower():
-                return i
-        if w.isdecimal():
-            n = int(w)
-            # Bounded by the LABELS when there are any -- offering three and
-            # accepting eight is offering a choice that is not there.
-            hi = (len(labs) - 1) if labs else 7
-            if 0 <= n <= hi:
-                return n
-        return None
+        return (f"How much? Reply with the BTC amount you are about to send "
+                f"— for example 0.05.\n"
+                f"Anything from {proto.btc_display(proto.DEPOSIT_MIN_SAT)} to "
+                f"{proto.btc_display(proto.DEPOSIT_MAX_SAT)}. /cancel to stop.")
+
+    def _depth_question(self) -> str:
+        """The mixing-depth menu, drawn from the protocol's own table.
+
+        BUILT FROM proto.WITHDRAW_DEPTHS RATHER THAN TYPED HERE. The vault
+        sizes its budget from that same table and refuses any depth outside
+        it, so a menu written by hand here could offer a fourth option that
+        every withdrawal then died on.
+
+        NO XMR MINIMUM IS SHOWN, and it is not an oversight -- see
+        WITHDRAW_DEPTH_NOTE. The real floor is GhostSpiral.mix_minimum_xmr at
+        that hop count, it moves with the network fee, and this box may not
+        have GhostSpiral on disk. Saying "lowest minimum" is true whatever the
+        fee is doing; printing "0.1748 XMR" would be a quote this box cannot
+        stand behind.
+        """
+        return ("How deep? Reply with one:\n"
+                + "\n".join(f"  {d}  {proto.WITHDRAW_DEPTH_NOTE[d]}"
+                            for d in sorted(proto.WITHDRAW_DEPTHS))
+                + "\n\nDeeper mixes better and needs a bigger balance to do "
+                  "it — the fees come out of the same pile.\n"
+                  "/cancel to stop.")
+
+    def _depth_from(self, word: str):
+        """A depth from what was typed, or None. Never raises.
+
+        ASCII DIGITS ONLY, and not str.isdecimal(), which is what this was
+        written with first. isdecimal() is True for all 455 Unicode decimal
+        digits and int() converts every one of them, so "１" -- FULLWIDTH
+        DIGIT ONE, which a CJK phone keyboard emits without being asked --
+        selected depth 1 through a pattern that was supposed to accept "1".
+        Harmless at this particular gate and not at the one next to it: the
+        same shape let a fullwidth digit through as a BTC amount, which is
+        driven and recorded at gs_wake_proto._BTC_RE.
+
+        The membership test is against the protocol's table rather than a
+        range literal, so this cannot accept a depth the vault will refuse.
+        """
+        w = (word or "").strip()
+        if not w or not all(c in "0123456789" for c in w):
+            return None
+        n = int(w)
+        return n if n in proto.WITHDRAW_DEPTHS else None
 
     def step_convo(self, chat_id: int, text: str) -> bool:
         """Advance a live conversation. True if this message was consumed.
@@ -859,26 +917,37 @@ class Pager:
         if word.startswith("/"):
             del self.convos[chat_id]
             return False
-        if c.awaiting_slot():
-            # EITHER THE WORD OR THE NUMBER. _slot_from does the isdecimal
-            # check (not isdigit: isdecimal is what int() accepts) and bounds
-            # the number by the labels when there are any.
-            _s = self._slot_from(word)
-            if _s is None:
+        if c.awaiting_amount():
+            # THE AMOUNT THEY ARE ACTUALLY SENDING, parsed by the PROTOCOL's
+            # own function -- the same one the vault's schema bounds against,
+            # so this box cannot accept a figure the wire will refuse and
+            # leave the operator having spent a wake on a rejection.
+            #
+            # NOT lower-cased: the parser takes ASCII digits and one dot, and
+            # case cannot occur in a value it accepts. Passed as typed, minus
+            # the ends, so the refusal is about what they wrote.
+            try:
+                _amt = proto.btc_to_sat(text.strip())
+            except Exception as _e:                          # noqa: BLE001
                 del self.convos[chat_id]
-                self.send(chat_id, "no: I did not recognise that. Cancelled — "
-                                   "start again with /deposit.")
+                # THE REASON, AND NOT WHAT THEY TYPED. Echoing the figure back
+                # on a failure would put an amount in the transcript for a
+                # deposit that is not going to happen.
+                self.send(chat_id, f"no: {_e}. Cancelled — start again with "
+                                   f"/deposit.")
                 return True
-            c.slot = _s
+            c.amount = _amt
             # DEADLINE UNTOUCHED. See Convo: it is absolute from creation, so
             # answering slowly does not buy another full window.
             q, c.expect = _confirm_question(self.rng)
-            # THE OPERATOR'S OWN WORD BACK, so the confirm is about something
-            # they recognise. Falls back to the number when nothing is paired.
-            _labs = self._labels()
-            _named = (_labs[c.slot] if c.slot < len(_labs) else f"#{c.slot}")
+            # THE AMOUNT BACK, NORMALISED, and this is the point of the whole
+            # change: the operator confirms the number they are about to send
+            # rather than a rung's nickname. Rendered through btc_display so
+            # what they confirm is what the vault will quote -- if those two
+            # ever disagreed, this is the line that would show it.
             self.send(chat_id,
-                      f"Deposit — {_named}. This wakes the machine.\n\n{q}")
+                      f"Deposit {proto.btc_display(c.amount)} BTC. "
+                      f"This wakes the machine.\n\n{q}")
             return True
         if c.awaiting_address():
             # CHECKED HERE AND AGAIN AT THE VAULT. This gate is the protocol's
@@ -904,14 +973,36 @@ class Pager:
                 self.send(chat_id, "no: bad address. Cancelled.")
                 return True
             c.exit_to = _a
+            # NOT THE CONFIRM YET. The depth is the second thing that is
+            # genuinely the operator's to decide, and it used to be a constant
+            # in gs_wake_agent -- which meant every withdrawal mixed through
+            # ten hops whether the pile could afford it or not. The mix floor
+            # rises with the hop count, so that one constant was a floor on
+            # what could be withdrawn AT ALL.
+            self.send(chat_id, self._depth_question())
+            return True
+        if c.awaiting_depth():
+            _d = self._depth_from(word)
+            if _d is None:
+                del self.convos[chat_id]
+                self.send(chat_id, "no: I did not recognise that. Cancelled — "
+                                   "start again with /send.")
+                return True
+            c.depth = _d
             q, c.expect = _confirm_question(self.rng)
             # NEITHER THE ADDRESS NOR AN AMOUNT. The address is already in the
             # transcript once and repeating it would make it twice, on the one
             # surface with no masker. There is no amount to state: the vault
             # decides what it is spending when it looks, and this box has never
             # been told a balance.
+            #
+            # THE DEPTH IS SAID BACK, because it is the one thing here the
+            # operator chose from a list and could have mistyped, and unlike
+            # the address it reveals nothing -- it is a property of the
+            # service, not of the money.
             self.send(chat_id,
-                      f"Send to the address you just sent — this SPENDS."
+                      f"Send to the address you just sent, "
+                      f"{proto.WITHDRAW_DEPTH_NOTE[_d]} — this SPENDS."
                       f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
@@ -920,8 +1011,8 @@ class Pager:
         # fresh sum. Questions are unlimited and free. The number bounds a
         # pocket-dial, which is what CONFIRM_NOTE claims and all it claims.
         # Logged so a burst of failures is at least visible in the chain.
-        kind, slot, expect = c.kind, c.slot, c.expect
-        exit_to = c.exit_to
+        kind, amount, expect = c.kind, c.amount, c.expect
+        exit_to, depth = c.exit_to, c.depth
         del self.convos[chat_id]
         if not word.isdecimal() or int(word) != expect:
             integrity_log("pager", "convo_confirm_failed")
@@ -929,12 +1020,12 @@ class Pager:
                                "woken. Start again.")
             return True
         if kind == "withdraw":
-            self.commit_withdraw(chat_id, exit_to)
+            self.commit_withdraw(chat_id, exit_to, depth)
             return True
-        self.commit_convo(chat_id, slot)
+        self.commit_convo(chat_id, amount)
         return True
 
-    def commit_withdraw(self, chat_id: int, exit_to) -> None:
+    def commit_withdraw(self, chat_id: int, exit_to, depth) -> None:
         """Turn a finished withdraw conversation into a job.
 
         Same shape as commit_convo and for the same reason: what reaches the
@@ -948,7 +1039,7 @@ class Pager:
         next to what it guards.
         """
         job = "withdraw"
-        params = {"exit_to": exit_to}
+        params = {"exit_to": exit_to, "depth": depth}
         _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
         if set(params) != set(_schema):
             integrity_log("pager", "convo_commit_mismatch")
@@ -963,7 +1054,7 @@ class Pager:
             return
         self.start_job(chat_id, job, params)
 
-    def commit_convo(self, chat_id: int, slot: int) -> None:
+    def commit_convo(self, chat_id: int, amount: int) -> None:
         """Turn a finished conversation into a job. THE ONLY WAY IT BECOMES ONE.
 
         THIS USED TO ROUND-TRIP THROUGH parse_command, composing the text an
@@ -982,16 +1073,26 @@ class Pager:
         typed here -- the vault applies that same schema, so agreeing with it
         is the property, and agreeing with a copy of it is not.
 
+        THE BOUNDS ARE NO LONGER RESTATED HERE. This used to end with
+        `0 <= params["amount_slot"] <= 7`, a copy of the schema's range in the
+        file that also holds the schema -- so the two could disagree only by
+        someone editing one, which is exactly what happened when the ladder
+        became an amount. Calling the schema's own check is the version that
+        cannot drift, and it is the thing the paragraph above already claimed
+        was happening.
+
         An explicit comparison and not `assert`, because python -O removes
         asserts and this is the last thing standing between a conversation and
         a wake.
         """
-        job, params = "receive_and_quote", {"amount_slot": int(slot)}
+        job, params = "receive_and_quote", {"amount_sat": amount}
         _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
-        if (set(params) != set(_schema)
-                or not isinstance(params["amount_slot"], int)
-                or isinstance(params["amount_slot"], bool)
-                or not 0 <= params["amount_slot"] <= 7):
+        try:
+            if set(params) != set(_schema):
+                raise ValueError("key set")
+            for _k, _check in _schema.items():
+                _check(params[_k])
+        except Exception:                                    # noqa: BLE001
             integrity_log("pager", "convo_commit_mismatch")
             self.send(chat_id, "no: internal check failed, nothing was woken.")
             return

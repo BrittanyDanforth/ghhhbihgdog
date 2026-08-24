@@ -4,7 +4,7 @@
 Runs on the Raspberry Pi that OPSEC_SETUP.md §3 defines by what it must never
 hold: spend key, view key, wallet_*.json, thor_pairs.json, memo, seed.
 
-    echo '{"job":"receive_and_quote","amount_slot":2}' | \
+    echo '{"job":"receive_and_quote","amount_sat":5000000}' | \
         gs_doorbell wake --key /etc/gs_wake_pi.key
 
 ONE POKE IS ONE PROCESS, and there is no daemon.
@@ -41,9 +41,12 @@ difference is argued rather than asserted.
 THE JOB COMES IN ON STDIN, NEVER ON argv.
 /proc/<pid>/cmdline is mode 0444 and every local account can read it. This repo
 has the scar written into gs_common.env_or_argv's docstring -- the wallet
-password, then the off-ramp amount, then the BTC entry address. A job carries
-an amount SLOT rather than an amount, so the leak would be small; "small" is
-how the previous three got shipped.
+password, then the off-ramp amount, then the BTC entry address. This used to
+add that a job carries an amount SLOT rather than an amount, "so the leak
+would be small; 'small' is how the previous three got shipped" -- and then the
+ladder was removed and a job began carrying the real amount in satoshis. The
+sentence survives its own example: stdin is why that is not a leak, and the
+reason to keep it on stdin got stronger, not weaker.
 
 WHAT THIS PROGRAM MAY NOT IMPORT
 gs_common, GhostSpiral, monero, stem, psutil, requests. Not one of them is
@@ -804,15 +807,21 @@ def read_job_from_stdin(stream=None) -> tuple:
     if not raw.strip():
         raise Doorbell(
             'no job on stdin. Pipe one in, e.g.\n'
-            '    echo \'{"job":"receive_and_quote","amount_slot":2}\' | '
+            '    echo \'{"job":"receive_and_quote","amount_sat":5000000}\' | '
             'gs_doorbell wake --key /etc/gs_wake_pi.key')
     body = proto.parse_body(raw.encode() if isinstance(raw, str) else raw)
     job = body.get("job")
     if not isinstance(job, str) or job not in proto.JOBS:
+        # THE LIST, AND NOTHING ABOUT WHAT IS NOT ON IT. This used to end "It
+        # cannot ask for anything that spends — the mix needs the spend USB
+        # and a person", which was true when every job here only minted and
+        # watched. `withdraw` exists now, this list prints it, and the
+        # sentence denied what the line above it offered. What actually gates
+        # a spend is the VAULT's keyfile (`allow_withdraw`, set with physical
+        # access), so the claim did not belong on the Pi in the first place.
         raise Doorbell(
             f"no such job. This doorbell can ask for: "
-            f"{', '.join(sorted(proto.JOBS))}. It cannot ask for anything that "
-            f"spends — the mix needs the spend USB and a person.")
+            f"{', '.join(sorted(proto.JOBS))}.")
     spec = proto.JOBS[job]
     got = set(body) - {"job"}
     want = set(spec["schema"])
@@ -856,18 +865,11 @@ def build_cli() -> argparse.ArgumentParser:
                    help="the port this doorbell will answer wakes on. Default "
                         "0 = pick a random high port, so no two installs of "
                         "this public repository share one.")
-    # THE WORDS THE CHAT WILL OFFER, in ladder order. Optional: without them
-    # the wizard falls back to asking for a number, which is what it always
-    # did and what nobody could answer.
-    #
-    # NOT amounts, and the pairing refuses one that looks like a number for
-    # exactly that reason -- a label is a category the operator recognises,
-    # and a decimal on this card is the thing the vault's ladder exists to
-    # keep off it.
-    p.add_argument("--amount-labels", nargs="*", default=[], metavar="WORD",
-                   help="words for the ladder rungs, in order (e.g. small "
-                        "medium large). The chat offers these instead of "
-                        "'slot 0-7'. Never amounts.")
+    # --amount-labels IS GONE. It named the rungs of the vault's amount
+    # ladder so the chat could offer words instead of "slot 0-7"; the ladder
+    # itself is gone and the chat now asks for the amount. A pairing that
+    # still passes the flag gets argparse's own "unrecognized arguments"
+    # rather than silently writing a field nothing reads.
     p.add_argument("--kdf", default=proto.DEFAULT_KDF,
                    choices=sorted(proto.KDF_PROFILES),
                    help=f"passphrase hardening for the keyfile (default: "
@@ -1051,25 +1053,6 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
         raise Doorbell("the ThinkPad did not send the MAC to wake. Nothing "
                        "was written.")
 
-    # getattr, not args.amount_labels: this function is called by tests and by
-    # any caller that built its own namespace, and a new optional flag must not
-    # make a pairing that worked yesterday raise AttributeError today.
-    _labels = list(getattr(args, "amount_labels", None) or [])
-    for _lb in _labels:
-        # \Z, NOT $. This repo has a rule and a test for it: `$` also matches
-        # before a trailing newline, so the two are not the same anchor. Here
-        # the value is stripped first, which makes them agree on every input
-        # -- and using the loose one anyway is how a validator that MEANT to
-        # be strict gets copied into a place where the difference bites.
-        if re.match(r"^[0-9.,]+\Z", str(_lb).strip()):
-            raise Doorbell(
-                f"--amount-labels {_lb!r} is a number. Labels are WORDS -- a "
-                f"decimal on this card is the value the vault's ladder exists "
-                f"to keep off it. Use something like 'small'.")
-        if len(str(_lb)) > 24 or not str(_lb).strip():
-            raise Doorbell(
-                f"--amount-labels {_lb!r} is empty or too long to read in a "
-                f"chat. Keep them short words.")
     payload = {
         "role": "pi",
         "secret": sk.encode().hex(),
@@ -1080,21 +1063,20 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
         "target_mac": info["mac"],
         "wol_broadcast": info["broadcast"],
         "wol_port": 9,
-        # WORDS, NEVER AMOUNTS, and that distinction is the whole reason this
-        # can live on the Pi at all.
+        # NO AMOUNT LADDER AND NO LABELS FOR ONE, and both used to be here.
         #
-        # The ladder is on the vault and always will be: this box must not be
-        # able to turn "0.05" into anything, and OPSEC_SETUP says so. But the
-        # consequence was a chat that asked "Which slot? Reply 0-7" -- a
-        # question nobody who had not read the source could answer, about a
-        # number that means nothing on its own.
+        # The card carried `amount_labels` -- the operator's words for the
+        # rungs of a ladder of amounts held on the vault -- because the chat
+        # otherwise asked "Which slot? Reply 0-7", a question nobody who had
+        # not read the source could answer. Numbers were refused on this card
+        # deliberately: a decimal here is the value the ladder existed to keep
+        # off the Pi.
         #
-        # A LABEL is not an amount. "small" tells a reader of this card that
-        # the owner had a category called small; it does not tell them what it
-        # is worth, and it cannot be turned into a number by anything here.
-        # Positional: the Nth label names slot N, so the mapping lives in the
-        # order and there is no second table to keep in step.
-        "amount_labels": _labels,
+        # The ladder is gone (gs_wake_proto, above _int_range, argues why: a
+        # rung is only the right amount if the amount was foreseen), so the
+        # labels name nothing. They are removed rather than left to rot,
+        # because a field on a sealed card that no longer means anything is a
+        # field the next person has to work out the meaning of.
     }
     print()
     print(f"  [*] Sealing the keyfile ({args.kdf}). This is deliberately slow.")
@@ -1159,7 +1141,7 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
     print("  Poke it like this - the job goes in on a pipe, the passphrase is")
     print("  asked for on the terminal, and neither is ever on a command line:")
     print()
-    print(f"      echo '{{\"job\":\"receive_and_quote\",\"amount_slot\":2}}' | \\")
+    print(f"      echo '{{\"job\":\"receive_and_quote\",\"amount_sat\":5000000}}' | \\")
     print(f"          python3 gs_doorbell wake --key {keypath}")
     return 0
 

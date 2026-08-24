@@ -316,7 +316,7 @@ recs = [
             "window": "b" * 32}),
     P.seal(VAULT, _eph.public_key, P.TAG_M2,
            {"job_id": "c" * 32, "challenge": "a" * 64,
-            "job": "receive_and_quote", "amount_slot": 7}),
+            "job": "receive_and_quote", "amount_sat": 5_000_000}),
     P.seal(VAULT, DELIVERY.public_key, P.TAG_M3,
            {"job_id": "c" * 32, "challenge": "a" * 64, "status": "done",
             "handle": "A3F1", "slip": "", "plain": {}, "phase": ""}),
@@ -449,7 +449,7 @@ PI = NP.PrivateKey.generate()
 def pending(job="receive_and_quote", params=None):
     return DB.Pending({"secret": bytes(PI).hex(),
                        "peer_public": bytes(VAULT.public_key).hex()},
-                      job, params or {"amount_slot": 2})
+                      job, params or {"amount_sat": 5000000})
 
 
 def m3(pend, **over):
@@ -551,7 +551,7 @@ pg.Pager.poke.__wrapped__ if False else None
 pg._DOORBELL[0] = type("D", (), {
     "run_wake": staticmethod(lambda a, k, j, p: _done)})()
 _pager.key = {}
-_pager.poke(111, "receive_and_quote", {"amount_slot": 2})
+_pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 
 _chat = "\n".join(_sent)
 for label, secret in (("the XMR destination", XMR), ("the swap memo", MEMO),
@@ -583,7 +583,7 @@ check("NON-VACUITY -- the blob and the handle are both there, so the reply "
 pg.SLIP_RETRY_S = 0                     # no real sleeping in a suite
 _sent.clear()
 _ok_send[0] = False
-_pager.poke(111, "receive_and_quote", {"amount_slot": 2})
+_pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 _failtext = "\n".join(t for t in _sent if t != BLOB)
 check("a blob that does not send is RETRIED once before anyone is told bad "
       "news -- one lost POST is not a reason to send someone to the vault",
@@ -612,7 +612,7 @@ check("...and sends them to /depo for a fresh quote, since this one expires",
 # THE RETRY MUST NOT FIRE WHEN THE FIRST SEND WORKED.
 _sent.clear()
 _ok_send[0] = True
-_pager.poke(111, "receive_and_quote", {"amount_slot": 2})
+_pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 check("a blob that sends first time is sent exactly ONCE",
       _sent.count(BLOB) == 1)
 
@@ -644,7 +644,7 @@ pg.safe_post = lambda url, payload, proxies=None: (
 _sent.clear()
 _done.result = {"status": "done", "handle": "A3F1", "slip": "",
                 "plain": {}, "phase": ""}
-_pager.poke(111, "receive_and_quote", {"amount_slot": 2})
+_pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 # THE NO-KEY PATH IS THE HANDLE, AND NOTHING ELSE. This asserted the reply
 # said "Read the address and memo on the vault." -- a sentence naming the
 # machine, sent on every job, telling the operator where their own hardware is.

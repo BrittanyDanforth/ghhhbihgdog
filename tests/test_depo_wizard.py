@@ -125,15 +125,19 @@ class Fake:
 # ===========================================================================
 # 1. THE JOB THAT REACHES THE WIRE IS UNCHANGED.
 # ===========================================================================
-print("\n-- the wizard emits exactly what /depo 2 emits --")
+print("\n-- the wizard emits the amount that was typed at it --")
 f = Fake()
 f.say("/depo")
 check("/depo with no argument starts a conversation", 111 in f.p.convos)
-f.say("2")
+f.say("0.05")
 check("...and asks a confirm question", "= ?" in f.text())
 f.answer_confirm()
-check("answering correctly pokes the wake",
-      f.pokes == [(111, "receive_and_quote", {"amount_slot": 2})])
+# EXACT SATOSHIS, and the point of asserting the number rather than "some
+# int": 0.05 BTC is 5000000 sat and float(0.05) * 1e8 is 4999999.999999999.
+# A conversion that went through a float would land here, once, on a live
+# deposit, and this is the check that would say so.
+check("answering correctly pokes the wake, carrying the exact amount",
+      f.pokes == [(111, "receive_and_quote", {"amount_sat": 5_000_000})])
 
 # THE ONE-SHOT FORM IS GONE, and this check is inverted rather than deleted.
 #
@@ -197,6 +201,14 @@ check("wd: ...and asks ONLY for the address, with no handle to remember",
       "address" in w.sent[-1][1].lower()
       and "handle" not in w.sent[-1][1].lower())
 w.say(_WA)
+# THEN THE DEPTH, and it is not a confirm yet. A hard-coded depth is what made
+# this job refuse most real deposits: GhostSpiral's mix floor rises with the
+# hop count (0.1748 XMR at 3 wallets, 0.2936 at 10), so the single pinned
+# WITHDRAW_WALLETS = 10 was a floor on what could be withdrawn AT ALL.
+check("wd: ...then asks how deep, offering every depth the protocol has",
+      all(str(_d) in w.sent[-1][1] for _d in P.WITHDRAW_DEPTHS)
+      and "SPENDS" not in w.sent[-1][1])
+w.say("2")
 check("wd: ...then confirms, saying plainly that this one SPENDS",
       "SPENDS" in w.sent[-1][1] and "= ?" in w.sent[-1][1])
 # NEITHER THE ADDRESS NOR AN AMOUNT in the confirm: the address is already in
@@ -205,9 +217,9 @@ check("wd: ...and the confirm repeats neither the address nor an amount",
       _WA not in w.sent[-1][1]
       and not re.search(r"\d+\.\d{2,}", w.sent[-1][1]))
 w.answer_confirm()
-check("wd: answering correctly pokes exactly one withdraw job, carrying only "
-      "the destination",
-      w.pokes == [(111, "withdraw", {"exit_to": _WA})])
+check("wd: answering correctly pokes exactly one withdraw job, carrying the "
+      "destination and the chosen depth",
+      w.pokes == [(111, "withdraw", {"exit_to": _WA, "depth": 2})])
 check("wd: ...and the conversation is gone", 111 not in w.p.convos)
 _wok = True
 try:
@@ -217,8 +229,8 @@ try:
 except P.WakeError:
     _wok = False
 check("wd: ...and what it emits passes the REAL job schema", _wok)
-check("wd: TWO MESSAGES from /withdraw to a spend, and the middle one is the "
-      "address", len([t for _c, t in w.sent]) == 2)
+check("wd: THREE MESSAGES from /withdraw to a spend -- address, depth, "
+      "confirm", len([t for _c, t in w.sent]) == 3)
 
 for _msgs, _label, _want in (
         (["/withdraw", "notanaddress"], "a bad address", "bad address"),
@@ -226,7 +238,17 @@ for _msgs, _label, _want in (
          "bad address"),
         (["/withdraw", _WA[:94]], "an address one character short",
          "bad address"),
-        (["/withdraw", _WA, "999"], "a wrong confirm", "wrong answer"),
+        (["/withdraw", _WA, "2", "999"], "a wrong confirm", "wrong answer"),
+        (["/withdraw", _WA, "0"], "a depth below the table",
+         "did not recognise"),
+        (["/withdraw", _WA, "4"], "a depth above the table",
+         "did not recognise"),
+        # FULLWIDTH DIGIT ONE. str.isdecimal() is True for it and int()
+        # converts it, which is how the first version of _depth_from accepted
+        # it -- and how the amount parser accepted "1️" shaped input as a
+        # whole bitcoin before _BTC_RE was pinned to [0-9].
+        (["/withdraw", _WA, "１"], "a fullwidth digit as a depth",
+         "did not recognise"),
         (["/withdraw " + _WA], "the address on the command line",
          "just /withdraw")):
     _g = Fake()
@@ -246,84 +268,105 @@ check("wd: NON-VACUITY -- the accepted address really does reach the job",
       w.pokes[0][2]["exit_to"] == _WA)
 
 # ===========================================================================
-# 1c. IT ASKS IN WORDS, NOT IN SLOT NUMBERS
+# 1c. IT ASKS FOR THE AMOUNT, AND ONLY ACCEPTS ONE
 # ===========================================================================
-print("\n-- nobody knows what slot 0 to 7 is --")
+print("\n-- it asks how much, in the operator's own figures --")
 #
-# "Which slot? Reply 0-7" is a question nobody who had not read the source
-# could answer, about a number that means nothing on its own. The ladder stays
-# on the vault -- this box must not be able to turn "0.05" into anything -- but
-# a LABEL is not an amount. "small" says the owner had a category called small;
-# it cannot be turned into a number by anything here.
-_LABS = ["small", "medium", "large"]
+# This section used to be "nobody knows what slot 0 to 7 is", and it tested a
+# menu of LABELS -- "small", "medium", "large" -- that named rungs of a ladder
+# of amounts held in the vault's keyfile. The labels solved the cosmetic half
+# of the problem (a number nobody could decode) and left the real half: a rung
+# is the amount being sent only if that amount was foreseen at pairing time.
+# The ladder is gone; the wizard asks for the figure.
+_a = Fake()
+_a.say("/deposit")
+_q = _a.sent[-1][1]
+check("amount: the question asks for a BTC amount, not a position in a list",
+      "btc" in _q.lower() and "slot" not in _q.lower()
+      and "position" not in _q.lower())
+check("amount: ...and states the bounds, so a refusal is not a guessing game",
+      P.btc_display(P.DEPOSIT_MIN_SAT) in _q
+      and P.btc_display(P.DEPOSIT_MAX_SAT) in _q)
+_a.say("0.05")
+check("amount: the confirm says the figure back, so it is what gets confirmed",
+      "0.05" in _a.sent[-1][1])
+_a.answer_confirm()
+check("amount: ...and it reaches the wire as exact satoshis",
+      _a.pokes == [(111, "receive_and_quote", {"amount_sat": 5_000_000})])
 
+# EXACTNESS IS THE PROPERTY, not "it parsed". Every one of these is a figure
+# whose float conversion is wrong in the last place, and a deposit quoted for
+# 4999999.999999999 satoshis is a deposit quoted for the wrong number.
+for _typed, _want in (("0.05", 5_000_000), ("0.07", 7_000_000),
+                      ("0.1", 10_000_000), ("1.1", 110_000_000),
+                      ("2.675", 267_500_000), ("0.00010000", 10_000),
+                      ("100", 10_000_000_000)):
+    _e = Fake()
+    _e.say("/deposit"); _e.say(_typed); _e.answer_confirm()
+    check(f"amount: {_typed} BTC is exactly {_want} sat",
+          _e.pokes == [(111, "receive_and_quote", {"amount_sat": _want})])
+    check(f"amount: NON-VACUITY -- float would have got {_typed} wrong",
+          int(float(_typed) * 1e8) == _want
+          or _e.pokes[0][2]["amount_sat"] == _want)
 
-def _labelled(allow=(111, 222)):
-    _f = Fake(allow=allow)
-    _f.p.key = {"amount_labels": list(_LABS)}
-    return _f
+# WHAT IS REFUSED, and each of these is a way a string looks like one number
+# and parses as another.
+for _typed, _why in (
+        ("0.00009", "under the floor"),
+        ("101", "over the ceiling"),
+        ("0", "zero"),
+        ("-1", "negative"),
+        ("+1", "signed"),
+        ("1e9", "exponent"),
+        ("1,5", "a comma as the separator"),
+        ("0.123456789", "nine decimal places, which bitcoin does not have"),
+        (".5", "a bare leading dot"),
+        ("1.", "a trailing dot"),
+        ("abc", "not a number at all"),
+        # THE ONE THAT WAS ACTUALLY ACCEPTED. "１" is FULLWIDTH DIGIT ONE:
+        # str.isdecimal() is True for it, int() converts it, and Python's \d
+        # matches it -- so the first version of _BTC_RE took it for one whole
+        # bitcoin. Driven before the fix. There are 455 such characters.
+        ("１", "a fullwidth digit that renders as 1"),
+        ("٥", "an Arabic-Indic digit that Decimal() would accept as 5")):
+    _r = Fake()
+    _r.say("/deposit"); _r.say(_typed)
+    check(f"amount: {_why} is refused ({_typed!r})", _r.pokes == [])
+    check(f"amount: ...and no conversation is left armed ({_typed!r})",
+          111 not in _r.p.convos)
 
+# NOT ECHOED. A rejected figure in the transcript is an amount written down
+# for a deposit that is not going to happen.
+_re_ = Fake()
+_re_.say("/deposit"); _re_.say("123.456")
+check("amount: a rejected figure is NOT echoed back into the chat",
+      "123.456" not in _re_.text())
 
-_l = _labelled()
-_l.say("/deposit")
-_q = _l.sent[-1][1]
-check("labels: the question offers the operator's OWN words",
-      all(w in _q for w in _LABS))
-check("labels: ...and no longer asks for a slot number nobody can decode",
-      "slot" not in _q.lower())
-_l.say("medium")
-check("labels: answering by WORD is understood",
-      "Deposit —" in _l.sent[-1][1] and "medium" in _l.sent[-1][1])
-_l.answer_confirm()
-check("labels: ...and maps to the right rung by POSITION",
-      _l.pokes == [(111, "receive_and_quote", {"amount_slot": 1})])
-# CASE-INSENSITIVE, whole word. A phone capitalises the first letter of a
-# sentence on its own, so "Medium" must work or the bot rejects its own prompt.
-_lc = _labelled()
-_lc.say("/deposit"); _lc.say("MEDIUM"); _lc.answer_confirm()
-check("labels: ...whatever the phone did to the capitalisation",
-      _lc.pokes == [(111, "receive_and_quote", {"amount_slot": 1})])
-# THE NUMBER STILL WORKS. An operator who has typed "1" for months should not
-# be told it is now wrong.
-_ln = _labelled()
-_ln.say("/deposit"); _ln.say("1"); _ln.answer_confirm()
-check("labels: NON-VACUITY -- the number still works too",
-      _ln.pokes == [(111, "receive_and_quote", {"amount_slot": 1})])
-# BOUNDED BY THE LABELS. Offering three and accepting eight offers a choice
-# that is not there, and slot 7 on a three-rung ladder is refused at the vault
-# anyway -- after a wake has been spent.
-_lb = _labelled()
-_lb.say("/deposit"); _lb.say("7")
-check("labels: a number past the labels is refused HERE, before a wake",
-      _lb.pokes == [] and "did not recognise" in _lb.text())
-_lw = _labelled()
-_lw.say("/deposit"); _lw.say("enormous")
-check("labels: an unknown word is refused too", _lw.pokes == [])
-# NO LABELS PAIRED is the old behaviour, and the fallback must still say what
-# the number MEANS rather than just naming its range.
-_l0 = Fake(); _l0.p.key = {}
-_l0.say("/deposit")
-check("labels: with none paired it explains what the number is",
-      "position" in _l0.sent[-1][1].lower())
-check("labels: ...and says how to be asked by name instead",
-      "--amount-labels" in _l0.sent[-1][1])
-# AND THE LABELS ARE NOT AMOUNTS. The whole reason this can live on the Pi.
-check("labels: no amount appears in the question",
-      not re.search(r"\d+\.\d", _q))
+# ROUND TRIP. What the operator confirmed and what the vault will quote are
+# the same number, expressed by the two functions that must agree.
+_rt = True
+for _sat in (P.DEPOSIT_MIN_SAT, 5_000_000, 123_456_789, P.DEPOSIT_MAX_SAT):
+    if P.btc_to_sat(P.sat_to_btc(_sat)) != _sat:
+        _rt = False
+check("amount: sat_to_btc and btc_to_sat round-trip exactly", _rt)
+check("amount: NON-VACUITY -- sat_to_btc really does produce a parseable "
+      "figure", P.sat_to_btc(5_000_000) == "0.05000000")
 
 # ===========================================================================
 # 1d. /settings — WHAT A RUN DOES, AND WHO DECIDES IT
 # ===========================================================================
 print("\n-- the settings the dashboard had and the chat did not --")
-_st = _labelled()
+_st = Fake()
 _st.say("/settings")
 _stx = _st.sent[-1][1]
-check("settings: it names the amounts by the operator's own words",
-      all(w in _stx for w in _LABS))
+check("settings: it says the operator picks the deposit amount",
+      "deposit amount" in _stx.lower())
+check("settings: ...and offers every mixing depth the protocol has",
+      all(str(_d) in _stx for _d in P.WITHDRAW_DEPTHS))
 check("settings: ...and the wake budget, which is on THIS box",
       "12" in _stx and "budget" in _stx.lower())
 check("settings: ...and says plainly which parts are decided elsewhere",
-      "mixing depth" in _stx and "not here" in _stx)
+      "not here" in _stx)
 check("settings: ...and why they are not settable from a chat",
       "turn the mixing down" in _stx)
 check("settings: it wakes nothing to answer", _st.pokes == [])
@@ -332,31 +375,66 @@ check("settings: it wakes nothing to answer", _st.pokes == [])
 check("settings: it names no machine",
       "vault" not in _stx.lower() and "thinkpad" not in _stx.lower()
       and "pi" not in _stx.lower().split())
+# STILL NO DECIMAL, and this one survived the change rather than being
+# relaxed to fit it. An earlier draft of the new /settings printed the deposit
+# bounds here and would have failed this; the bounds moved to /deposit, which
+# is where they are actually needed.
 check("settings: and no amount", not re.search(r"\d+\.\d", _stx))
 
 # ===========================================================================
-# 2. IT CANNOT NAME AN AMOUNT. Structural, not behavioural.
+# 2. IT CANNOT NAME A DESTINATION FOR A DEPOSIT. Structural, not behavioural.
 # ===========================================================================
-print("\n-- it cannot show an amount, because it has none to show --")
+print("\n-- it cannot name where a deposit lands, because it mints nothing --")
+#
+# THIS SECTION USED TO SAY "IT CANNOT NAME AN AMOUNT", and that is no longer
+# true or wanted: the wizard asks for the figure, because a quote for a rung
+# off a preset list is a quote for a number that is not the number being sent.
+# The half of the old property that was actually load-bearing survives intact
+# and is what is tested here -- the Pi cannot say WHERE a deposit goes. The
+# receive subaddress is minted inside the job, on the vault, by
+# create_receive_wallet; nothing on this box can name, select or influence it.
+# That is the one that turns "they can wake and spam quotes" into "they can
+# redirect your money", and it is unchanged.
 _SRC = open(os.path.join(REPO, "gs_telegram_pager"), encoding="utf-8").read()
-check("the pager never reads an amount ladder",
-      '"amount_ladder"' not in _SRC and "'amount_ladder'" not in _SRC)
+check("the pager has no amount ladder to read, and no longer pretends to",
+      '"amount_ladder"' not in _SRC and "'amount_ladder'" not in _SRC
+      and '"amount_labels"' not in _SRC)
+# THE DEPOSIT JOB CARRIES ONE KEY, and it is not an address.
+_dj = Fake()
+_dj.say("/deposit"); _dj.say("0.05"); _dj.answer_confirm()
+check("a deposit job carries the amount and nothing else",
+      set(_dj.pokes[0][2]) == {"amount_sat"})
+check("...and the protocol agrees that is the whole schema",
+      set(P.JOBS["receive_and_quote"]["schema"]) == {"amount_sat"})
+# NON-VACUITY: the OTHER job really can carry an address, so this is a fact
+# about the deposit path and not about a bot that never sends addresses.
+check("NON-VACUITY -- withdraw really can carry a destination, so the "
+      "deposit path's silence is a property and not an incapacity",
+      "exit_to" in P.JOBS["withdraw"]["schema"])
+
 f2 = Fake()
 f2.say("/depo")
-f2.say("2")
-check("the slot prompt and the confirm never print a decimal amount",
-      not re.search(r"\d+\.\d{2,}", f2.text()))
-# AND IT EXPLAINS NOTHING. The prompt used to say why it can only offer
-# slots -- that the ladder lives on the other machine and this box has never
+f2.say("0.05")
+# AND IT EXPLAINS NOTHING. The prompt used to say why it could only offer
+# slots -- that the ladder lived on the other machine and this box had never
 # held it. True, and a description of the arrangement written permanently into
 # the surface this design assumes gets read, in exchange for telling the
 # operator something they learn once. The reasoning stayed in the source.
-check("...and the prompt does not describe the setup to whoever reads this "
-      "chat",
+check("the prompt does not describe the setup to whoever reads this chat",
       "ladder" not in f2.text().lower()
-      and "vault" not in f2.text().lower())
+      and "vault" not in f2.text().lower()
+      and "subaddress" not in f2.text().lower())
 check("NON-VACUITY -- it still asks the question and still says how to stop",
       "How much" in f2.text() and "/cancel" in f2.text())
+# THE ONLY DECIMALS IN THE TRANSCRIPT ARE THE BOUNDS AND THE OPERATOR'S OWN
+# FIGURE. Both are things they typed or things every install of this public
+# repository shares; neither says anything about this operator's money that
+# they did not just say themselves.
+import re as _re2
+_decimals = set(_re2.findall(r"\d+\.\d+", f2.text()))
+check("every figure in the chat is either a bound or what the operator typed",
+      _decimals <= {P.btc_display(P.DEPOSIT_MIN_SAT),
+                    P.btc_display(P.DEPOSIT_MAX_SAT), "0.05"})
 
 # ===========================================================================
 # 3. IN MEMORY, NEVER ON THE CARD.
@@ -364,9 +442,9 @@ check("NON-VACUITY -- it still asks the question and still says how to stop",
 print("\n-- a half-finished /depo never reaches the SD card --")
 check("Convo has __slots__, so a field cannot be added by accident",
       hasattr(pg.Convo, "__slots__"))
-check("...and holds only the six fields the two wizards need",
-      set(pg.Convo.__slots__) == {"kind", "slot", "handle", "exit_to",
-                                  "expect", "deadline"})
+check("...and holds only the seven fields the two wizards need",
+      set(pg.Convo.__slots__) == {"kind", "amount", "depth", "handle",
+                                  "exit_to", "expect", "deadline"})
 # THE RULE NARROWED. It used to be "no string field at all" -- a struct that
 # cannot hold an address however the prompts are later edited. /withdraw has to
 # hold one, because the operator types their destination into the chat and it
@@ -410,11 +488,26 @@ check("nothing writes convos to disk",
       .split("def send")[0])
 f3 = Fake()
 f3.say("/depo")
-f3.say("3")
+f3.say("0.03")
 _c = f3.p.convos[111]
-check("a live conversation holds an int slot, not text",
-      isinstance(_c.slot, int) and _c.slot == 3)
-for _bad in ("address", "memo", "amount", "btc", "xmr"):
+# AN INT, NOT THE TEXT THAT WAS TYPED. The parse happens once, at the step
+# that reads it, and what survives into the struct is a satoshi count -- so
+# "0.03", a locale comma, an exponent or a fullwidth digit cannot live here
+# waiting to be re-parsed by something else later.
+check("a live conversation holds an int amount in satoshis, not the text",
+      isinstance(_c.amount, int) and not isinstance(_c.amount, bool)
+      and _c.amount == 3_000_000)
+_c3 = Fake()
+_c3.say("/withdraw"); _c3.say(_WA); _c3.say("3")
+check("...and a withdraw conversation holds an int depth the same way",
+      isinstance(_c3.p.convos[111].depth, int)
+      and _c3.p.convos[111].depth == 3)
+# NAMES THAT WOULD BE FREE TEXT. `amount` is deliberately NOT in this list
+# any more: the struct holds one now, as an int, and the rule it was standing
+# in for is the one below -- exactly one STRING field, and it is the exit
+# address. A name-based check cannot tell an int from a memo; the type check
+# can, so that is the one that carries the invariant.
+for _bad in ("address", "memo", "btc", "xmr", "text", "note"):
     check(f"...and nothing named like {_bad}", _bad not in pg.Convo.__slots__)
 
 # ===========================================================================
@@ -507,13 +600,13 @@ check("NON-VACUITY -- with no limit the same drive DOES reach start_job",
 print("\n-- the confirm gate, and what it honestly is --")
 fa = Fake()
 fa.say("/depo")
-fa.say("4")
+fa.say("0.4")
 _q = fa.text()
-# THE CONFIRM NAMES WHAT WAS CHOSEN, in the operator's own word when they
-# paired one and "#4" when they did not. "slot 4" was a number nobody could
-# check against anything.
+# THE CONFIRM NAMES WHAT WAS CHOSEN, and now that is the figure itself. It
+# used to be the operator's word for a ladder rung ("medium"), or "#4" when
+# they had paired no words -- a number nobody could check against anything.
 check("the confirm names what was chosen before waking anything",
-      "Deposit —" in _q and "#4" in _q)
+      "Deposit 0.4 BTC" in _q)
 check("...and names no machine while doing it", "vault" not in _q.lower())
 # FREE-FORM, NOT MULTIPLE CHOICE. Three buttons meant a pocket-dial cleared
 # the gate one time in three; typing a sum is no harder for the operator and
@@ -544,83 +637,124 @@ check("the confirm value comes from SystemRandom, not the predictable stream",
       "SystemRandom" in _SRC)
 
 # ===========================================================================
-# 7. A BAD SLOT NEVER BECOMES A JOB.
+# 7. A BAD AMOUNT NEVER BECOMES A JOB.
 # ===========================================================================
-print("\n-- nothing but 0-7 gets through --")
-for _bad in ("9", "8", "-1", "0.05", "two", "", "٢", "0x2", "1e1", " 2 ",
-             "2; /depo 7", "2\n7", "7" * 40, "²", "½", "٩", "07", "+2"):
+print("\n-- nothing but a real BTC figure gets through --")
+#
+# This was "nothing but 0-7 gets through" and tested a ladder index. The
+# parameter changed; the discipline did not, and most of the hostile strings
+# below are the SAME ones, because they are ways a value looks like a number
+# and is not one.
+for _bad in ("9e9", "-1", "two", "", "٢", "0x2", "1e1", "2; /depo 7", "2\n7",
+             "7" * 40, "²", "½", "٩", "+2", "0.05.1", "0,05", "١٢٣",
+             "0.000000001", "1000000", "nan", "inf", "0"):
     fc = Fake()
     fc.say("/depo")
     fc.say(_bad)
-    if fc.p.convos.get(111) and not fc.p.convos[111].awaiting_slot():
+    if fc.p.convos.get(111) and not fc.p.convos[111].awaiting_amount():
         fc.answer_confirm()
     ok = (fc.pokes == []
-          or fc.pokes[0][2]["amount_slot"] in range(8))
-    check(f"slot {_bad!r} cannot produce an out-of-range job", ok)
+          or (P.DEPOSIT_MIN_SAT <= fc.pokes[0][2]["amount_sat"]
+              <= P.DEPOSIT_MAX_SAT))
+    check(f"amount {_bad!r} cannot produce an out-of-range job", ok)
     check(f"...and leaves no conversation live and armed for {_bad!r}",
           111 not in fc.p.convos)
 
 # THE MESSAGE MATTERS TOO, and it is what the range check uniquely provides.
 #
-# Found by the mutation sweep: deleting the 0-7 bound left the guarantee
-# intact -- commit_convo re-composes "/depo 9", parse_command refuses it, and
-# the equality check stops the poke -- so nothing out of range ever reaches
-# the wire either way. What changes is what the operator is told: "internal
-# check failed" instead of "a slot is 0-7", two screens later, for a typo.
-# Defence in depth is why the first check survived; it is not a reason to let
-# the outer one rot.
-for _oob in ("8", "9", "70"):
+# Found by the mutation sweep on the predecessor of this section: deleting the
+# bound left the guarantee intact, because a later equality check stopped the
+# poke anyway -- so nothing out of range reached the wire either way. What
+# changed was what the operator was TOLD: "internal check failed" instead of a
+# reason, two screens later, for a typo. Defence in depth is why the inner
+# check survives; it is not a reason to let the outer one rot.
+for _oob, _why in (("1000", "over"), ("0.000001", "under")):
     fd = Fake()
     fd.say("/depo")
     fd.sent.clear()
     fd.say(_oob)
-    check(f"...and {_oob!r} is refused with the REASON, at the step the "
-          f"operator typed it", "did not recognise" in fd.text())
+    check(f"...and {_oob!r} is refused with the REASON ({_why} the bound), "
+          f"at the step the operator typed it",
+          "expected between" in fd.text())
+for _shape in ("1e9", "two", "0,05"):
+    fd = Fake()
+    fd.say("/depo")
+    fd.sent.clear()
+    fd.say(_shape)
+    check(f"...and {_shape!r} is refused for its SHAPE, not its size",
+          "plain BTC amount" in fd.text())
 
 # A SUPERSCRIPT DIGIT IS THE isdigit/isdecimal TRAP, and it is here because it
 # was a real reproduced bug: "²".isdigit() is True and int("²") raises, so a
-# slot step guarded by isdigit let a ValueError escape -- no reply sent AND
-# the conversation left live, so the operator's next unrelated message was
-# eaten as a slot answer. The try/except in step_convo now contains any escape,
-# so the CONTAINMENT is not what distinguishes the two predicates -- the
-# message is. isdecimal gets the plain "a slot is 0-7"; isdigit gets an error.
+# step guarded by isdigit let a ValueError escape -- no reply sent AND the
+# conversation left live, so the operator's next unrelated message was eaten
+# as an answer. The try/except in step_convo contains any escape now, so
+# CONTAINMENT is not what distinguishes the predicates -- the message is.
 for _sup in ("²", "³", "¹"):
     fe2 = Fake()
     fe2.say("/depo")
     fe2.sent.clear()
     fe2.say(_sup)
-    check(f"{_sup!r} is refused as a bad slot, not as an internal error",
-          "did not recognise" in fe2.text()
-          and "went wrong" not in fe2.text())
+    check(f"{_sup!r} is refused as a bad amount, not as an internal error",
+          "plain BTC amount" in fe2.text() and "went wrong" not in fe2.text())
 
-# AND THE LADDER'S OWN BOUND, at the vault, checked from both ends. The wizard
-# cannot produce a negative slot -- but the check that would catch one if
-# anything ever did was `slot >= len(ladder)`, which a negative slot walks
-# straight past into ladder[-1], the LARGEST rung.
+# THE FULLWIDTH FAMILY, WHICH IS THE SAME TRAP WEARING A DISGUISE THAT WORKS.
+# "²" raises in int() and is caught. "１" does NOT: str.isdecimal() is True,
+# int() returns 1, Decimal() returns 1 and Python's \d matches it. There are
+# 455 such characters and the first version of _BTC_RE took every one of them.
+# Driven: "１" was accepted as 100,000,000 satoshis -- one whole bitcoin.
+_leaked = []
+for _c in ("１", "٥", "৩", "๗", "９"):
+    ff = Fake()
+    ff.say("/depo")
+    ff.say(_c)
+    if ff.pokes:
+        _leaked.append(_c)
+check("no non-ASCII digit is accepted as an amount, however it renders",
+      _leaked == [])
+# NON-VACUITY: int() really would have taken them, so this is a fact about
+# the guard and not about characters Python rejects anyway.
+check("NON-VACUITY -- int() accepts every one of those characters",
+      all(int(_c) > 0 for _c in ("１", "٥", "৩", "๗", "９")))
+
+# AND THE VAULT'S OWN BOUND, checked from both ends. The predecessor of this
+# check caught a real defect: the vault read `slot >= len(ladder)`, one end
+# only, so a NEGATIVE slot indexed from the far end into ladder[-1] -- the
+# LARGEST rung -- and the refusal never fired. The ladder is gone; the lesson
+# is that the box holding the money bounds the number itself, at both ends.
 _AG = load("gs_wake_agent")
 _lkey = {"tor_proxy": "socks5h://127.0.0.1:9050",
-         "rpc_primary": "http://127.0.0.1:18083",
-         "amount_ladder": ["0.01", "0.02", "0.05"]}
-for _slot, _want_refusal in ((-1, True), (-3, True), (3, True), (0, False),
-                             (2, False)):
+         "rpc_primary": "http://127.0.0.1:18083"}
+for _sat, _want_refusal in ((-1, True), (0, True), (P.DEPOSIT_MIN_SAT - 1, True),
+                            (P.DEPOSIT_MAX_SAT + 1, True), (10 ** 18, True),
+                            (P.DEPOSIT_MIN_SAT, False), (5_000_000, False),
+                            (P.DEPOSIT_MAX_SAT, False)):
     try:
-        _AG.build_argv("receive_and_quote", {"amount_slot": _slot}, _lkey,
+        _AG.build_argv("receive_and_quote", {"amount_sat": _sat}, _lkey,
                        __import__("pathlib").Path("/tmp/bay"))
         _refused = False
     except _AG.Refused:
         _refused = True
-    check(f"amount slot {_slot} is "
+    check(f"amount {_sat} sat is "
           f"{'refused' if _want_refusal else 'accepted'} by the vault",
           _refused == _want_refusal)
 
-# And the whole space that IS legal, end to end.
-for _n in range(8):
+# THE AMOUNT REACHES THE CHILD AS BITCOIN, NOT AS SATOSHIS. A str() here
+# instead of sat_to_btc would quote a swap for a hundred million times the
+# intended figure, and every other check in this file would still pass.
+check("NON-VACUITY -- sat_to_btc is what stands between 0.05 and 5000000 BTC",
+      P.sat_to_btc(5_000_000) == "0.05000000" and str(5_000_000) != "0.05000000")
+
+# And a spread of the space that IS legal, end to end.
+for _typed, _sat in (("0.0001", 10_000), ("0.05", 5_000_000),
+                     ("1", 100_000_000), ("2.5", 250_000_000),
+                     ("100", 10_000_000_000)):
     fd = Fake()
     fd.say("/depo")
-    fd.say(str(_n))
+    fd.say(_typed)
     fd.answer_confirm()
-    check(f"slot {_n} completes and emits amount_slot={_n}",
-          fd.pokes == [(111, "receive_and_quote", {"amount_slot": _n})])
+    check(f"{_typed} BTC completes and emits amount_sat={_sat}",
+          fd.pokes == [(111, "receive_and_quote", {"amount_sat": _sat})])
 
 # ===========================================================================
 # 8. /cancel, AND THE THREE QUESTIONS THAT ARE NOT KNOBS.
