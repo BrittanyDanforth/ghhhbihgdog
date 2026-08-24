@@ -135,10 +135,22 @@ f.answer_confirm()
 check("answering correctly pokes the wake",
       f.pokes == [(111, "receive_and_quote", {"amount_slot": 2})])
 
+# THE ONE-SHOT FORM IS GONE, and this check is inverted rather than deleted.
+#
+# `/depo 2` was one keystroke from a wake and a real quote -- which makes the
+# confirm the wizard exists for optional, and optional is the same as absent.
+# It also put the digit in the transcript ATTACHED to the word, on one line,
+# permanently; the wizard's answer is a bare "2" that says nothing alone.
+#
+# An argument is REFUSED, not ignored: silently dropping it would run a
+# different slot from the one typed.
 g = Fake()
 g.say("/depo 2")
-check("...and /depo 2 in one shot produces the IDENTICAL job",
-      g.pokes == f.pokes)
+check("/depo with an argument wakes nothing", g.pokes == [])
+check("...and says to use the wizard instead of failing silently",
+      "just /depo" in g.text())
+check("...and starts no conversation either, so the digit is not half-used",
+      111 not in g.p.convos)
 check("the conversation is gone once it has poked", 111 not in f.p.convos)
 
 # THE INVARIANT, checked against the protocol rather than by eye: whatever the
@@ -275,20 +287,34 @@ check("a real command mid-conversation is NOT eaten by the wizard",
 check("...and the abandoned conversation is dropped rather than left live",
       111 not in f8.p.convos)
 
-# THE RATE LIMIT APPLIES TO BOTH PATHS, which is the point of one start_job.
+# THE RATE LIMIT IS ON THE ONE PATH THERE IS. It used to be checked on both
+# the wizard and the one-shot form, because the point of a single start_job is
+# that a limit cannot apply to one and not the other. The one-shot form is
+# gone, so the wizard is the only producer -- and the gate still has to be on
+# it, which is what this now proves.
 f9 = Fake()
 f9.p.start_job = f9._real_start
-f9.limited[0] = "rate limited, 42s left"
+f9.limited[0] = "wait 42s"
 f9.say("/depo 2")
-check("the rate limit refuses the one-shot form",
-      "rate limited" in f9.text())
+check("an argument to /depo wakes nothing even before the limit is consulted",
+      not f9.p.busy.locked() and "just /depo" in f9.text())
 f9.sent.clear()
 f9.say("/depo")
 f9.say("2")
 f9.answer_confirm()
-check("...and refuses the WIZARD too, at the same gate",
-      "rate limited" in f9.text())
-check("...and neither path started a wake", not f9.p.busy.locked())
+check("the rate limit refuses the WIZARD, which is the only path to a wake",
+      "wait 42s" in f9.text())
+check("...and no wake was started", not f9.p.busy.locked())
+# NON-VACUITY: with the limit lifted, the SAME drive does reach a wake -- so
+# the refusal above is the limit and not the wizard being broken.
+f9b = Fake()
+f9b.p.start_job = f9b._real_start
+f9b.limited[0] = ""
+f9b.say("/depo")
+f9b.say("2")
+f9b.answer_confirm()
+check("NON-VACUITY -- with no limit the same drive DOES reach start_job",
+      f9b.recorded == [1])
 
 # ===========================================================================
 # 6. THE CONFIRM GATE.

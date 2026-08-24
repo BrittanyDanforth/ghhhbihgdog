@@ -1362,7 +1362,9 @@ MUTATIONS = [
  # while the money is simply still in flight.
  ("money still in flight goes back to being reported as a failed vault",
   "gs_wake_agent",
-  '        if rc != 0 and job == "swap_status" and not hard:',
+  # Re-anchored: the excuse covers both watching jobs now, because a watch
+  # that ran its window and saw money confirming is not a failed job either.
+  '        if rc != 0 and job in ("swap_status", "watch") and not hard:',
   "        if False:",
   ["test_plain_slip"]),
 
@@ -1426,7 +1428,9 @@ MUTATIONS = [
  # arrived, and the operator stops watching for it.
  ("a probe goes back to reporting the previous probe's answer",
   "gs_wake_agent",
-  '    if job == "swap_status":\n        try:\n'
+  # Re-anchored: `watch` writes the same status file now, so the clear has to
+  # cover it or a 110-minute wait reports a three-minute probe's stale answer.
+  '    if job in ("swap_status", "watch"):\n        try:\n'
   '            (artifact_dir / STATUS_FILE).unlink()\n',
   '    if False:\n        try:\n'
   '            (artifact_dir / STATUS_FILE).unlink()\n',
@@ -2235,6 +2239,74 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- a phase outranks the outcome ---------------------------------------
+ #
+ # Three gates each dropped it, and fixing any one alone changes nothing --
+ # which is why a /watch whose money was still confirming reported
+ # "watch: failed." after the vault had already powered off.
+ ("a non-zero rc is a failure for watch again", "gs_wake_agent",
+  '        if rc != 0 and job in ("swap_status", "watch") and not hard:',
+  '        if rc != 0 and job == "swap_status" and not hard:',
+  ["test_plain_slip"]),
+
+ ("the phase is thrown away unless the job finished", "gs_wake_agent",
+  '            "phase": phase}',
+  '            "phase": phase if done else ""}',
+  ["test_plain_slip"]),
+
+ ("a watch reports the answer a probe left behind hours ago", "gs_wake_agent",
+  '    if job in ("swap_status", "watch"):\n'
+  "        try:\n"
+  "            (artifact_dir / STATUS_FILE).unlink()",
+  '    if job == "swap_status":\n'
+  "        try:\n"
+  "            (artifact_dir / STATUS_FILE).unlink()",
+  ["test_plain_slip"]),
+
+ ("the pager only renders a phase on a finished job", "gs_telegram_pager",
+  "        if _early and out != \"done\":",
+  "        if False:",
+  ["test_plain_slip"]),
+
+ # ---- the wizard is the only path, and the card holds no map -------------
+ #
+ # `/depo 2` was one keystroke from a wake and a real quote, which makes the
+ # confirm the wizard exists for optional -- and it put the digit in the
+ # transcript attached to the word, permanently.
+ ("/depo goes back to waking on one keystroke", "gs_telegram_pager",
+  '        if arg:\n            return "", {}, "just /depo — it asks"\n'
+  '        return "", {}, "depo_wizard"',
+  '        if not arg:\n            return "", {}, "depo_wizard"\n'
+  "        if not arg.isdecimal():\n"
+  '            return "", {}, "slot 0-7"\n'
+  "        s = int(arg)\n"
+  "        if not 0 <= s <= 7:\n"
+  '            return "", {}, "slot must be 0-7"\n'
+  '        return "receive_and_quote", {"amount_slot": s}, ""',
+  ["test_depo_wizard"]),
+
+ # The one file the pager persists held a float per poke: the exact second the
+ # operator asked for a quote, for every quote in 24 hours, on the SD card.
+ ("the SD card holds exact wake timestamps again", "gs_telegram_pager",
+  "    STAMP_BUCKET_S = 300",
+  "    STAMP_BUCKET_S = 1",
+  ["test_telegram_pager"]),
+
+ # systemctl prints Description to anyone who can read the unit.
+ ("the Pi's unit names the toolchain in systemctl again",
+  "systemd/gs-telegram-pager.service.example",
+  "Description=Relay",
+  "Description=GhostSpiral Telegram pager (Pi side)",
+  ["test_telegram_pager"]),
+
+ # Without a UMask the log is created world-readable on the one box that is
+ # meant to hold nothing.
+ ("the Pi's log goes back to world-readable",
+  "systemd/gs-telegram-pager.service.example",
+  "UMask=0077",
+  "# UMask unset",
+  ["test_telegram_pager"]),
+
  # ---- three more things the chat did not need to say ---------------------
  #
  # /status printed the poke count for the last 24 hours and busy True/False:

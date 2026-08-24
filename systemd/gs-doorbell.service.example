@@ -1,74 +1,51 @@
-# The Pi side is NOT a daemon and this file is an EXAMPLE, not an install.
+# EXAMPLE, not an install. Read every line, then write your own.
 #
-# gs_doorbell is one process per poke: it binds, wakes, hands over one job,
-# hears back and exits. There is deliberately no always-listening service --
-# that would just move the 24/7 socket from the vault to the doorbell, which is
-# the thing this whole feature exists to stop.
+# WHY THIS FILE IS SHORT. It used to explain what the doorbell is, what a
+# trigger may and may not report, and which section of the design says so. All
+# true, and all of it sat permanently on the SD card of the box that is meant
+# to hold nothing -- readable by anyone who images that card, without running
+# anything. The reasoning is in OPSEC_SETUP.md and in gs_doorbell's own
+# docstring, on the machine that has the source.
 #
-# The trigger INTO the Pi is now shipped: gs_telegram_pager, and
-# systemd/gs-telegram-pager.service.example. The warning it was written under
-# still stands and is the reason that tool has no word for an address, a memo
-# or an amount -- OPSEC_SETUP.md §8: do NOT wire a Telegram bot that prints the
-# memo. A trigger that reports a 4-hex handle is a trigger; one that reports a
-# memo has thrown away the reason to own a Pi.
+# NOT A DAEMON. One process per poke: it binds, wakes, hands over one job,
+# hears back and exits. There is deliberately no always-listening service.
 #
-# If you wrap a trigger, it must run AFTER the tunnel, and fail with it:
+# NAMES ARE YOURS TO CHANGE. Every path and the unit name are examples; nothing
+# in the tools depends on them. If this box must not be identifiable by what is
+# on it, rename them and pass the new paths.
 [Unit]
-Description=EXAMPLE ONLY - a wrapper that pokes gs_doorbell
+# Neutral on purpose: systemctl prints this to anyone who can read the unit.
+Description=Relay trigger
 After=wg-quick@wg0.service tor.service
 Requires=wg-quick@wg0.service
 
 [Service]
 Type=oneshot
-# NO CORE DUMPS, FROM execve ONWARD.
-#
-# The tools suppress this themselves at module import (gs_common's first
-# executable statement; gs_console and gs_doorbell carry their own, because
-# neither may import gs_common). That covers every third-party and crypto
-# import -- nacl/libsodium, requests, tenacity -- but it CANNOT cover the
-# window before the interpreter runs any of our code: exec, dynamic linking,
-# site.py, and the entry script's own `import hashlib, decimal`. No Python
-# statement is early enough for that; the launcher is.
-#
-# It matters here because the secret arrives in the ENVIRONMENT
-# (GS_WAKE_PASSPHRASE), so it is in the process image from execve --
-# a dump taken at ANY point after that contains it. Driven: with
-# `ulimit -c unlimited` and the variable set, a SIGABRT wrote a 5 MB core and
-# the secret was in it.
 LimitCORE=0
-# NOTHING TO THE JOURNAL. gs_doorbell overrides BaseHTTPRequestHandler's
-# log_message to a no-op so requests are not journalled -- and then this unit
-# journalled the tool's own stdout instead, which names the job ("waiting for
-# the vault to collect job receive_and_quote"), the handle it got back and the
-# minute all of it happened. Straight onto the SD card of the one box that is
-# supposed to hold nothing, in a file that survives the process by design.
-#
-# A refusal is still visible: run the command by hand and you see everything.
-# This only silences the unattended path, which is the one nobody reads and
-# that writes to persistent storage.
+# Nothing to the journal: it is persistent storage on this card, and this
+# process's stdout names the job and the handle. Run it by hand and you see
+# everything.
 StandardOutput=null
 StandardError=null
+# Every file this writes is owner-only.
+UMask=0077
 # The passphrase for the sealed keyfile. In the ENVIRONMENT, never on argv:
-# /proc/<pid>/cmdline is mode 0444 and every local account can read it, while
-# /proc/<pid>/environ is 0400. Point this at a root-owned 0400 file:
-#   EnvironmentFile=/etc/gs-wake.env        <- GS_WAKE_PASSPHRASE=...
-# and understand what you have done: that file is on the same unencrypted SD
-# card as everything else unless you have encrypted the Pi (OPSEC_SETUP.md §3),
-# so an unattended trigger converts the sealed keyfile back into a plaintext
-# one. A doorbell poked by a person who types the passphrase does not.
+# /proc/<pid>/cmdline is 0444 and every local account can read it, while
+# /proc/<pid>/environ is 0400. Point this at a root-owned 0400 file -- and
+# understand the trade, which OPSEC_SETUP.md states: unless the card itself is
+# encrypted, an unattended trigger converts the sealed keyfile back into a
+# plaintext one. A doorbell poked by a person who types the passphrase does not.
 #EnvironmentFile=/etc/gs-wake.env
 # THE JOB GOES IN ON STDIN, NEVER ON ARGV -- and the line that used to be here
 # said exactly that while doing the opposite:
 #
 #   ExecStart=/bin/sh -c 'echo "{...}" | python3 gs_doorbell wake --key ...'
 #
-# /proc/<pid>/cmdline is mode 0444 and EVERY LOCAL ACCOUNT CAN READ IT. That
-# shell's argv held the whole job -- the job name and the amount slot -- for
-# as long as the poke lasted, two lines under a comment promising it did not.
-# gs_doorbell has no --job flag precisely so this cannot happen, and the
-# example smuggled one back in through a shell.
-#
-# systemd can open the file itself. No shell, no pipeline, nothing on an argv:
-#   /etc/gs-wake-job.json   root:root 0600   {"job":"receive_and_quote","amount_slot":2}
+# That shell's argv held the whole job for as long as the poke lasted, two
+# lines under a comment promising it did not. gs_doorbell has no --job flag
+# precisely so this cannot happen, and the example smuggled one back in through
+# a shell. systemd can open the file itself: no shell, no pipeline, nothing on
+# an argv.
+#   /etc/gs-wake-job.json   root:root 0600
 StandardInput=file:/etc/gs-wake-job.json
-ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_doorbell wake --key /etc/gs_wake_pi.key
+ExecStart=/usr/bin/python3 /opt/gs/gs_doorbell wake --key /etc/gs_wake_pi.key
