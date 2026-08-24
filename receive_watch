@@ -67,6 +67,7 @@ from gs_common import (
     bech32_checksum_ok,
     instruction_field_safe,
     atomic_write_json,
+    wipe_will_erase, wipe_miss_reason,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -479,6 +480,52 @@ def _write_result_json(args, r: dict) -> None:
     path = getattr(args, "result_json", "") or ""
     if not path:
         return
+    # THE WIPE WARNING, WHICH THIS PATH DID NOT HAVE IN EITHER HALF.
+    #
+    # --result-json is free-form, exactly like exit_strategy_simulator's
+    # --outfile and thor_swap_preparer's --outfile, and both of those warn when
+    # paranoia_mode would not erase what they just wrote. This one wrote 0600
+    # and said nothing, so an operator running the tool by hand
+    # (`receive_watch --result-json ~/arrived.json`) got a file that survives
+    # every sweep and no indication of it.
+    #
+    # It is not a small file to leave behind: `unlocked` and `total` are the
+    # ARRIVAL AMOUNT in XMR. This toolchain keeps amounts out of the integrity
+    # chain on the stated grounds that "the amount deanonymises the hop it is
+    # meant to hide", and gs_wake_status.json -- which is this same file, under
+    # the name gs_wake_agent gives it -- is on the wipe list for that reason.
+    # So the danger was already understood; only the hand-run path was missed,
+    # because under the agent the name happens to match.
+    _p = Path(path)
+    if not wipe_will_erase(_p):
+        try:
+            _dir = _p.resolve().parent
+        except OSError:
+            _dir = _p.parent
+        _why = wipe_miss_reason(_p)
+        _what = ("This file holds the ARRIVAL AMOUNT in XMR (unlocked and "
+                 "total), which is the figure the mix exists to detach from "
+                 "you.")
+        if _why == "name":
+            print(f"  [!] {_p} sits in a directory paranoia_mode DOES search, "
+                  f"but its NAME matches none of the artifact patterns, so the "
+                  f"sweep walks past it.")
+            print(f"  [!] {_what} Name it gs_wake_status.json and the sweep "
+                  f"will find it — --search-dir will NOT help, the directory "
+                  f"is already searched.")
+        elif _why == "location":
+            print(f"  [!] {_p} is outside every directory paranoia_mode "
+                  f"searches.")
+            print(f"  [!] {_what} The wipe will NOT find it — erase it "
+                  f"yourself, or pass --search-dir {_dir} to paranoia_mode.")
+        else:
+            print(f"  [!] {_p} is outside every directory paranoia_mode "
+                  f"searches, AND its name matches none of the artifact "
+                  f"patterns. Both halves fail.")
+            print(f"  [!] {_what} Erase it yourself, or name it "
+                  f"gs_wake_status.json AND pass --search-dir {_dir} to "
+                  f"paranoia_mode — either one alone is not enough.")
+        integrity_log("receive", f"result_json_not_wiped:{_why}")
     try:
         atomic_write_json(
             {"state": r.get("state", ""),
@@ -897,7 +944,10 @@ def main():
                          "a program can read. The five outcomes this tool "
                          "distinguishes collapse into three exit codes, and a "
                          "caller that needs the difference cannot get it from "
-                         "the exit code or from parsing this output.")
+                         "the exit code or from parsing this output. It "
+                         "records the arrival AMOUNT, so name it "
+                         "gs_wake_status.json (or somewhere paranoia_mode "
+                         "sweeps) — you are warned at write time if not.")
     ap.add_argument("--stall-min", type=int, default=STALL_MINUTES_DEFAULT,
                     help="after funds arrive, how long the balance may sit "
                          f"unchanged before reporting a shortfall (default {STALL_MINUTES_DEFAULT})")

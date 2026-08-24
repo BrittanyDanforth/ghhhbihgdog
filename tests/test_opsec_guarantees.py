@@ -639,6 +639,88 @@ check("plans: ...and only under __main__, so importing the module for its "
       < _pf_src.find("atexit.register(_report_surviving_plans)"))
 
 
+# ===========================================================================
+#  wipe_miss_reason must answer the question wipe_will_erase was asked
+# ===========================================================================
+#
+# wipe_will_erase deliberately selects GS_ARTIFACT_DIR_PATTERNS for a directory
+# and GS_ARTIFACT_FILE_PATTERNS otherwise -- its own docstring says "A directory
+# is judged by the directory patterns, the way the sweep does". wipe_miss_reason
+# exists only to explain THAT function's answer, and it carried a second inline
+# copy of the name test that always used the FILE patterns.
+#
+# So a directory whose name is a real GS_ARTIFACT_DIR_PATTERNS entry, sitting
+# somewhere the sweep does not reach, was reported as "both" -- which tells the
+# operator no name like theirs is ever swept, so moving it cannot help. The
+# opposite of the truth, about the one remedy that would have worked.
+print("\n-- the wipe's two answers come from one rule --")
+import gs_common as _GW                                      # noqa: E402
+
+_wd = Path(tempfile.mkdtemp())
+_outside = Path(tempfile.mkdtemp()) / "elsewhere"
+_outside.mkdir(parents=True, exist_ok=True)
+_prev_home = os.environ.get("HOME")
+os.environ["HOME"] = str(_wd)
+try:
+    _deep = _wd / "gs"
+    _deep.mkdir(parents=True, exist_ok=True)
+    # A directory NAME that is really on the sweep's directory list, so only
+    # the location can be at fault.
+    _dirname = _GW.GS_ARTIFACT_DIR_PATTERNS[2]               # "tx_staging"
+    check("wipe/reason: the fixture uses a REAL directory pattern, so 'name' "
+          "is genuinely not the problem",
+          "*" not in _dirname and _dirname in _GW.GS_ARTIFACT_DIR_PATTERNS)
+
+    for _label, _p, _isdir, _want in (
+            ("a staging DIR outside the roots", _outside / _dirname, True,
+             "location"),
+            ("a staging DIR two levels down", _deep / _dirname, True,
+             "location"),
+            ("a DIR with an unswept name, at a root", _wd / "my_notes", True,
+             "name"),
+            ("a FILE with a swept name, outside", _outside / "thor_pairs.json",
+             False, "location"),
+            ("a FILE with an unswept name, at a root", _wd / "my_notes.json",
+             False, "name"),
+    ):
+        if _isdir:
+            _p.mkdir(parents=True, exist_ok=True)
+        else:
+            _p.write_text("{}")
+        check(f"wipe/reason: {_label} -> {_want!r}",
+              _GW.wipe_miss_reason(_p) == _want)
+
+    # NON-VACUITY (a): a target the sweep DOES erase gets "" from both, or the
+    # rows above are just a function that never says "".
+    _hit_dir = _wd / _dirname
+    _hit_dir.mkdir(parents=True, exist_ok=True)
+    _hit_file = _wd / "thor_pairs.json"
+    _hit_file.write_text("{}")
+    check("wipe/reason: NON-VACUITY -- a directory the sweep really erases "
+          "gets no reason at all",
+          _GW.wipe_will_erase(_hit_dir) and _GW.wipe_miss_reason(_hit_dir) == "")
+    check("wipe/reason: NON-VACUITY -- and so does a file it really erases",
+          _GW.wipe_will_erase(_hit_file)
+          and _GW.wipe_miss_reason(_hit_file) == "")
+    # NON-VACUITY (b): "both" is still reachable, so the two rows above are not
+    # passing because the function stopped being able to say it.
+    check("wipe/reason: NON-VACUITY -- 'both' is still reachable for a target "
+          "that fails on name AND location",
+          _GW.wipe_miss_reason(_outside / "my_notes.json") == "both")
+    # THE SHARED RULE ITSELF: one implementation, not two that can drift. This
+    # is what the inline copy defeated, so it is checked directly.
+    _gcs = Path(os.path.join(REPO, "gs_common.py")).read_text()
+    check("wipe/reason: ONE name rule -- wipe_miss_reason no longer carries a "
+          "second copy that hard-codes the FILE patterns",
+          _gcs.count("GS_ARTIFACT_DIR_PATTERNS if res.is_dir()") == 1
+          and "named = _wipe_name_matches(res)" in _gcs)
+finally:
+    if _prev_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _prev_home
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

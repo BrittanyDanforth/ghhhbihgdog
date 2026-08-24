@@ -1121,6 +1121,156 @@ check("the pairing tool's own 'next step' command is conditional on whether "
 check("...and prints the working form when it is not",
       "HOME={_ad}" in _keys_src)
 
+# ===========================================================================
+#  THE ARTIFACT DIRECTORY'S MODE, WHICH THE FILES INSIDE DO NOT FIX
+# ===========================================================================
+#
+# run_job created artifact_dir with a bare `mkdir(parents=True, exist_ok=True)`
+# -- 0777 & ~umask, measured 0755, and the shipped unit sets no UMask=. The
+# files inside are 0600, but the LISTING is the leak: thor_pairs_*.json,
+# wallet_*.json, the job log and the status file all name themselves, so a
+# local account learns how many swaps were arranged, when, and that this
+# machine runs a Monero cold-signing operation at all.
+#
+# Driven with a REAL unprivileged uid rather than by reading the mode, because
+# "0755" is a number and "another account could list your swaps" is the claim.
+print("\n== the artifact directory is not world-listable ==")
+import stat as _stat_m                                       # noqa: E402
+
+
+def _nobody_can_list(d):
+    """Fork, drop to uid 65534, return what it could list (or the errno)."""
+    _r, _w = os.pipe()
+    _pid = os.fork()
+    if _pid == 0:
+        os.close(_r)
+        try:
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+            assert os.geteuid() == 65534
+            _names = sorted(os.listdir(d))
+        except Exception as _e:                              # noqa: BLE001
+            _names = [f"<{type(_e).__name__}>"]
+        os.write(_w, json.dumps(_names).encode())
+        os.close(_w)
+        os._exit(0)
+    os.close(_w)
+    _buf = b""
+    while True:
+        _c = os.read(_r, 4096)
+        if not _c:
+            break
+        _buf += _c
+    os.close(_r)
+    os.waitpid(_pid, 0)
+    return json.loads(_buf or "[]")
+
+
+_CAN_DROP_WA = os.geteuid() == 0
+check("artifact-dir: the checks below can drop privileges (running as root, "
+      "so uid 65534 is reachable)", _CAN_DROP_WA)
+if _CAN_DROP_WA:
+    _um = os.umask(0o022)                                    # the systemd default
+    try:
+        # (a) A directory the agent CREATES, two levels deep so the parents are
+        #     covered too -- mkdir(parents=True) applies `mode` only to the
+        #     final component, which is one of the two things secure_mkdir
+        #     handles that a bare mkdir does not.
+        _base = Path(tempfile.mkdtemp())
+        os.chmod(_base, 0o755)
+        _ad = _base / "var" / "lib" / "ghostspiral"
+        A.secure_mkdir(_ad, narrow_existing=False)
+        (_ad / "thor_pairs_ab.json").write_text("{}")
+        (_ad / "gs_wake_job.log").write_text("x")
+        check("artifact-dir: a directory the agent creates is 0700",
+              _stat_m.S_IMODE(_ad.stat().st_mode) == 0o700)
+        check("artifact-dir: ...and so is every parent it had to create",
+              _stat_m.S_IMODE(_ad.parent.stat().st_mode) == 0o700)
+        check("artifact-dir: ...so another account cannot list this run's "
+              "artifacts", _nobody_can_list(_ad) == ["<PermissionError>"])
+        # NON-VACUITY: the bare mkdir this replaces really was listable, under
+        # the same umask, in the same place.
+        _b2 = Path(tempfile.mkdtemp())
+        os.chmod(_b2, 0o755)
+        _ad2 = _b2 / "var" / "lib" / "ghostspiral"
+        _ad2.mkdir(parents=True, exist_ok=True)
+        (_ad2 / "thor_pairs_ab.json").write_text("{}")
+        (_ad2 / "gs_wake_job.log").write_text("x")
+        check("artifact-dir: NON-VACUITY -- a bare mkdir really does leave it "
+              "0755 and listable",
+              _stat_m.S_IMODE(_ad2.stat().st_mode) == 0o755
+              and _nobody_can_list(_ad2) == ["gs_wake_job.log",
+                                             "thor_pairs_ab.json"])
+        _acode = code_only(os.path.join(REPO, "gs_wake_agent"))
+        check("artifact-dir: ...and run_job uses secure_mkdir, not the bare "
+              "call", "secure_mkdir(artifact_dir, narrow_existing=False)"
+              in _acode
+              and "artifact_dir.mkdir(" not in _acode)
+
+        # (b) A PRE-EXISTING directory is left alone at creation -- it may be
+        #     the operator's own cwd, since artifact_dir defaults to "." -- and
+        #     narrowed in preflight, after wipe_covers has established that
+        #     this tool owns it.
+        _ex = Path(tempfile.mkdtemp())
+        os.chmod(_ex, 0o755)
+        A.secure_mkdir(_ex, narrow_existing=False)
+        check("artifact-dir: a PRE-EXISTING directory is NOT chmod'ed at "
+              "creation -- it might be the operator's cwd",
+              _stat_m.S_IMODE(_ex.stat().st_mode) == 0o755)
+        (_ex / "thor_pairs_ab.json").write_text("{}")
+        A._AGENT_LOG[0] = _ex / "gs_wake_job.log"
+        _probes = {"unit_is_active": lambda u: True,
+                   "removable_devices": lambda: [],
+                   "resource_check": lambda a, b: True,
+                   "tor_bootstrapped": lambda p: True,
+                   "wipe_covers": lambda p: True}
+        A.preflight({"tor_proxy": "socks5h://127.0.0.1:9"}, _ex,
+                    dry_run=True, probes=_probes)
+        check("artifact-dir: ...and preflight narrows it to 0700 once "
+              "wipe_covers says this tool owns it",
+              _stat_m.S_IMODE(_ex.stat().st_mode) == 0o700)
+        check("artifact-dir: ...and says so, because the PREVIOUS runs' "
+              "artifacts were listable and this chmod does not undo that",
+              "was mode 0755" in (_ex / "gs_wake_job.log").read_text()
+              and "earlier runs" in (_ex / "gs_wake_job.log").read_text())
+        check("artifact-dir: ...and nobody can list it now",
+              _nobody_can_list(_ex) == ["<PermissionError>"])
+
+        # NON-VACUITY: preflight must NOT narrow a directory it refused, or it
+        # is chmod'ing a directory that is not this tool's territory.
+        _nx = Path(tempfile.mkdtemp())
+        os.chmod(_nx, 0o755)
+        A._AGENT_LOG[0] = _nx / "gs_wake_job.log"
+        _refused = False
+        try:
+            A.preflight({"tor_proxy": "x"}, _nx, dry_run=True,
+                        probes={**_probes, "wipe_covers": lambda p: False})
+        except A.Refused:
+            _refused = True
+        check("artifact-dir: NON-VACUITY -- a directory outside the wipe roots "
+              "is refused and left UNTOUCHED",
+              _refused and _stat_m.S_IMODE(_nx.stat().st_mode) == 0o755)
+        # NON-VACUITY: an already-0700 directory must not produce the warning,
+        # or the operator learns to ignore it.
+        _ok = Path(tempfile.mkdtemp())
+        os.chmod(_ok, 0o700)
+        A._AGENT_LOG[0] = _ok / "gs_wake_job.log"
+        A.preflight({"tor_proxy": "socks5h://127.0.0.1:9"}, _ok,
+                    dry_run=True, probes=_probes)
+        check("artifact-dir: NON-VACUITY -- an already-0700 directory produces "
+              "no warning",
+              not (_ok / "gs_wake_job.log").exists()
+              or "was mode" not in (_ok / "gs_wake_job.log").read_text())
+    finally:
+        os.umask(_um)
+        A._AGENT_LOG[0] = None
+
+check("artifact-dir: the shipped unit also sets UMask=0077, for files a "
+      "woken job's CHILD creates without naming a mode",
+      "UMask=0077" in (Path(REPO) / "systemd" / "gs-wake-agent.service").read_text())
+
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

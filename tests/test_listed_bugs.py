@@ -63,6 +63,7 @@ check here has a NON-VACUITY partner: the normal path must still work, or
      reported PAID with a whole swap missing. It also printed "(--expect-xmr
      without --pairs)" on a run that passed --pairs.
 """
+import ast
 import contextlib
 import http.server
 import importlib.machinery
@@ -70,8 +71,10 @@ import importlib.util
 import io
 import json
 import os
+import re
 import socket
 import sys
+import tokenize
 import tempfile
 import threading
 import time
@@ -106,7 +109,118 @@ def load(name):
     return mod
 
 
+# ===========================================================================
+#  CORE-DUMP PROBES RUN FIRST, AND THEY HAVE TO
+# ===========================================================================
+#
+# gs_common suppresses core dumps at import with setrlimit(RLIMIT_CORE, (0,0)),
+# which lowers the HARD limit -- and a lowered hard limit cannot be raised
+# again by anyone, root included (measured: `ValueError: not allowed to raise
+# maximum limit` as uid 0). It is inherited by every descendant.
+#
+# So the instant this file loads gs_doorbell or gs_wake_agent below, this
+# process and every subprocess it will ever spawn are pinned at 0, and a probe
+# can no longer observe a child STARTING with dumps enabled. The first version
+# of these checks ran after those loads and their non-vacuity partners went red
+# for exactly that reason -- the fixture could not reach the state it was
+# asserting about.
+#
+# Running them here, before the first gs_common-importing load, is not tidiness:
+# it is the only point in this file where the observation is still possible.
+_CORE_PROBE_SRC = r"""
+import importlib.machinery, importlib.util, contextlib, io, os, resource, signal, sys
+REPO = "@REPO@"
+sys.path.insert(0, REPO)
+os.environ["GS_WALLET_PASSWORD"] = "spend-key-password"
+def core():
+    return resource.getrlimit(resource.RLIMIT_CORE)[0]
+def load(n):
+    ld = importlib.machinery.SourceFileLoader(n, os.path.join(REPO, n))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
+    ld.exec_module(m)
+    return m
+which = sys.argv[1]
+before = core()
+m = load(which)
+imported = core()
+with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+    try:
+        if which == "gs_console":
+            sys.argv = [which, "--not-a-real-flag"]; m.main()
+        else:
+            m.main(["--not-a-real-flag"])
+    except SystemExit:
+        pass
+after = core()
+try:
+    os.kill(os.getpid(), signal.SIGINT); ctrlc = "BROKEN"
+except KeyboardInterrupt:
+    ctrlc = "works"
+print("%s %s %s %s" % (before, imported, after, ctrlc))
+""".replace("@REPO@", REPO)
+
+_IMPORT_PROBE_SRC = r"""
+import builtins, importlib.machinery, importlib.util, os, resource, sys
+REPO = "@REPO@"
+sys.path.insert(0, REPO)
+RISKY = {"nacl", "requests", "tenacity", "monero", "psutil", "stem", "gs_wake_proto"}
+seen = {}
+_real = builtins.__import__
+def spy(name, *a, **k):
+    t = name.split(".")[0]
+    if t in RISKY and t not in seen:
+        seen[t] = resource.getrlimit(resource.RLIMIT_CORE)[0]
+    return _real(name, *a, **k)
+builtins.__import__ = spy
+tool = sys.argv[1]
+ld = importlib.machinery.SourceFileLoader(tool, os.path.join(REPO, tool))
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
+ld.exec_module(m)
+builtins.__import__ = _real
+bad = sorted(k for k, v in seen.items() if v != 0)
+print("|".join(bad) + "#" + str(len(seen)))
+""".replace("@REPO@", REPO)
+
+import subprocess                                            # noqa: E402
+
+
+def _run_probe(src, tool):
+    with tempfile.TemporaryDirectory() as _t:
+        _p = os.path.join(_t, "probe.py")
+        open(_p, "w").write(src)
+        r = subprocess.run(
+            ["bash", "-c",
+             "ulimit -c unlimited; GS_WAKE_PASSPHRASE=x exec "
+             + sys.executable + " " + _p + " " + tool],
+            capture_output=True, text=True, timeout=180, cwd=_t)
+    out = (r.stdout or "").strip().splitlines()
+    return out[-1] if out else ""
+
+
+CORE_RESULTS = {t: _run_probe(_CORE_PROBE_SRC, t).split()
+                for t in ("gs_doorbell", "gs_console")}
+IMPORT_RESULTS = {}
+for _t in ("gs_console", "gs_doorbell", "GhostSpiral", "airgap_tx_signer",
+           "receive_watch", "thor_swap_preparer"):
+    _line = _run_probe(_IMPORT_PROBE_SRC, _t)
+    if "#" in _line:
+        _b, _n = _line.rsplit("#", 1)
+        IMPORT_RESULTS[_t] = ([x for x in _b.split("|") if x], int(_n))
+    else:
+        IMPORT_RESULTS[_t] = (None, None)
+
+
 import gs_wake_proto as P                                    # noqa: E402
+# ONE ALIAS FOR gs_common, IMPORTED UNCONDITIONALLY.
+#
+# There were four -- C, GSC, GSC, GSC -- all naming the same cached
+# module object, and one of them (GSC) was bound INSIDE `if _CAN_DROP:`,
+# i.e. only when this suite runs as root. Section 13 then used it
+# unconditionally, so on any non-root runner the whole file died with
+# NameError before reaching a third of its checks. A suite that silently
+# requires root is a suite most people cannot run, and four names for one
+# import is how the conditional one went unnoticed.
+import gs_common as GSC                                      # noqa: E402
 from srcutil import fail_loudly_on_crash                     # noqa: E402
 
 _finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILURES),
@@ -847,60 +961,9 @@ for _ex5 in (_D("0.95"), _D("1.10"), _D("2")):
 print("\n-- the two long-lived servers do not write core dumps --")
 import subprocess                                            # noqa: E402,F811
 
-_CORE_PROBE = r'''
-import importlib.machinery, importlib.util, contextlib, io, os, resource, signal, sys
-REPO = %r
-sys.path.insert(0, REPO)
-os.environ["GS_WALLET_PASSWORD"] = "spend-key-password"
-def core():
-    return resource.getrlimit(resource.RLIMIT_CORE)[0]
-def load(n):
-    ld = importlib.machinery.SourceFileLoader(n, os.path.join(REPO, n))
-    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
-    ld.exec_module(m)
-    return m
-which = sys.argv[1]
-before = core()
-m = load(which)
-imported = core()
-with contextlib.suppress(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
-     contextlib.redirect_stdout(io.StringIO()):
-    if which == "gs_console":
-        sys.argv = [which, "--not-a-real-flag"]
-        m.main()
-    else:
-        m.main(["--not-a-real-flag"])
-after = core()
-# The fix must not have installed the flag-setting SIGINT handler: both of
-# these end in a blocking loop inside `except KeyboardInterrupt`.
-try:
-    os.kill(os.getpid(), signal.SIGINT)
-    ctrlc = "BROKEN"
-except KeyboardInterrupt:
-    ctrlc = "works"
-print("%%s %%s %%s %%s" %% (before, imported, after, ctrlc))
-''' % (REPO,)
-
-
-def _core_probe(which):
-    """(rlimit_before, rlimit_after_import, rlimit_after_main, ctrl_c) from a
-    child started with core dumps ENABLED."""
-    with tempfile.TemporaryDirectory() as _t:
-        p = os.path.join(_t, "probe.py")
-        open(p, "w").write(_CORE_PROBE)
-        r = subprocess.run(
-            ["bash", "-c", f"ulimit -c unlimited; exec {sys.executable} {p} {which}"],
-            capture_output=True, text=True, timeout=180, cwd=_t)
-    out = (r.stdout or "").strip().splitlines()
-    if not out:
-        return None, r.stderr
-    parts = out[-1].split()
-    return parts, r.stderr
-
-
 for _srv, _what in (("gs_doorbell", "the Pi's X25519 secret"),
                     ("gs_console", "the wallet spend password")):
-    _p, _err = _core_probe(_srv)
+    _p = CORE_RESULTS.get(_srv) or None
     check(f"core dumps: the {_srv} probe ran (it is the fixture, not the "
           f"subject)", _p is not None and len(_p) == 4)
     if not _p or len(_p) != 4:
@@ -910,14 +973,59 @@ for _srv, _what in (("gs_doorbell", "the Pi's X25519 secret"),
     # enabled, every check below passes for the wrong reason.
     check(f"NON-VACUITY: the {_srv} child really started with core dumps "
           f"ENABLED (rlimit={_before})", _before != "0")
-    check(f"core dumps: REPRODUCED -- merely importing {_srv} leaves them "
-          f"allowed, so nothing at module scope suppresses them",
-          _imported != "0")
-    check(f"core dumps: {_srv}.main() suppresses them BEFORE it parses argv, "
-          f"so {_what} is never dumpable", _after == "0")
+    # BOTH OF THESE WERE WRONG, IN OPPOSITE DIRECTIONS, AND THE SECOND ONE
+    # BLOCKED THE REPAIR OF THE FIRST.
+    #
+    # The old pair asserted (a) that merely IMPORTING the module leaves dumps
+    # allowed -- "so nothing at module scope suppresses them" -- and (b) that
+    # main() suppressing them makes the secret "never dumpable".
+    #
+    # (b) is false: the secret arrives in the ENVIRONMENT, so it is in the
+    # process image from execve, and the whole IMPORT PHASE ran with dumps
+    # enabled. Driven -- a SIGABRT during the import of gs_console wrote a 5 MB
+    # core file with the wallet password in it twice.
+    #
+    # And (a) is the worse one: it PINNED the defect. Moving the suppression to
+    # module scope -- the actual fix -- makes it go red, so the next person to
+    # do the right thing gets a failing check named "REPRODUCED", telling them
+    # they broke something. A test that certifies a guarantee the code does not
+    # have is bad; one that mechanically resists the repair is worse.
+    check(f"core dumps: {_srv} suppresses them AT IMPORT, before its own heavy "
+          f"imports -- not at the top of main(), which leaves the import phase "
+          f"open with {_what} already in the environment", _imported == "0")
+    check(f"core dumps: ...and they are still suppressed after main() runs",
+          _after == "0")
     check(f"core dumps: ...and {_srv} did NOT gain the flag-setting SIGINT "
           f"handler -- it ends in a blocking loop inside `except "
           f"KeyboardInterrupt`, and that still fires", _ctrlc == "works")
+
+# THE GUARANTEE, STATED AS WHAT IT ACTUALLY IS. "Never dumpable" is not
+# achievable from Python: exec, dynamic linking and site.py all run before our
+# first statement, and so does the entry script's own `import hashlib, decimal`.
+# What IS achievable, and what this pins, is that no THIRD-PARTY or CRYPTO
+# module is ever imported while dumps are still allowed -- those are the
+# imports that run foreign C code and can take a fatal signal. The window
+# before the interpreter reaches us belongs to the launcher, and the systemd
+# units set LimitCORE=0 for it.
+for _tool, (_bad, _n) in sorted(IMPORT_RESULTS.items()):
+    check(f"core dumps: the import probe ran for {_tool} (fixture, not subject)",
+          _bad is not None)
+    if _bad is None:
+        continue
+    check(f"core dumps: {_tool} imports NO third-party or crypto module while "
+          f"dumps are still allowed ({_bad or 'none did'})", not _bad)
+# NON-VACUITY: the probe must actually be WATCHING something, or "none did" is
+# just what an empty observation looks like.
+_watched = [t for t, (_b, n) in IMPORT_RESULTS.items() if (n or 0) > 0]
+check(f"NON-VACUITY: the probe really observes risky imports happening "
+      f"({sorted(_watched)})", len(_watched) >= 3)
+# ...and the launcher covers what no Python statement can reach.
+for _u in ("systemd/gs-wake-agent.service",
+           "systemd/gs-doorbell.service.example",
+           "systemd/gs-telegram-pager.service.example"):
+    check(f"core dumps: {_u.split('/')[-1]} sets LimitCORE=0 for the window "
+          f"before the interpreter runs any of our code",
+          "LimitCORE=0" in Path(os.path.join(REPO, _u)).read_text())
 
 # THE TRAP THE OBVIOUS FIX WALKS INTO, driven rather than argued. Adding
 # install_signal_handlers() to those two would have suppressed the dumps AND
@@ -998,11 +1106,49 @@ check("core dumps: gs_console still imports no gs_common, and gs_common still "
       and _re5.search(r"^import requests", _SRC["gs_common.py"], _re5.M))
 # The claim that started this: install_signal_handlers no longer asserts a
 # coverage it does not have.
+# SCOPED TO THE DOCSTRING, not to the file. This read `"gs_console" in
+# _SRC["gs_common.py"]` -- satisfied by either name appearing anywhere in three
+# thousand lines, including in an unrelated comment or in the wipe-pattern
+# list. The claim under test is about what install_signal_handlers' OWN
+# docstring says, so that is what is read.
+_ISH_DOC = ""
+for _n in ast.walk(ast.parse(_SRC["gs_common.py"])):
+    if isinstance(_n, ast.FunctionDef) and _n.name == "install_signal_handlers":
+        _ISH_DOC = ast.get_docstring(_n) or ""
+check("core dumps: the docstring under test was actually found, so the checks "
+      "below are reading something", len(_ISH_DOC) > 200)
+# FLATTENED, and that is not cosmetic. This asserted
+#     "the one hook that reliably covers them all" not in _ISH_DOC
+# and passed -- while the docstring contains that exact phrase, wrapped across
+# two lines. It was passing on the line break, not on the claim, and would have
+# gone on passing if the docstring had asserted the coverage outright in two
+# lines instead of one.
+#
+# The real guarantee is not "the phrase is absent" -- it is quoted deliberately,
+# as the thing this docstring used to say. It is "the phrase appears only as
+# history, with the correction attached".
+_ISH_FLAT = _re5.sub(r"\s+", " ", _ISH_DOC)
+check("core dumps: NON-VACUITY -- the phrase really is in the docstring, and "
+      "the unflattened check could not see it",
+      "the one hook that reliably covers them all" in _ISH_FLAT
+      and "the one hook that reliably covers them all" not in _ISH_DOC)
 check("core dumps: install_signal_handlers no longer claims to cover EVERY "
-      "script",
-      "the one hook that reliably covers them all" not in _SRC["gs_common.py"]
-      and "gs_console" in _SRC["gs_common.py"]
-      and "gs_doorbell" in _SRC["gs_common.py"])
+      "script -- the old phrase survives only as a quoted correction",
+      'used to say it was -- "the one hook that reliably covers them all"'
+      in _ISH_FLAT
+      and "THAT IS NOT EVERY SCRIPT" in _ISH_FLAT
+      and "gs_console" in _ISH_FLAT
+      and "gs_doorbell" in _ISH_FLAT)
+# NON-VACUITY: the names must be scarce enough in the docstring that finding
+# them there means something -- and absent from a docstring that never
+# mentioned them, which is what the old check could not tell apart.
+check("core dumps: NON-VACUITY -- the file-wide search the old check did would "
+      "pass on a docstring that named neither",
+      "gs_console" in _SRC["gs_common.py"]
+      and "gs_console" not in (ast.get_docstring(
+          next(_n for _n in ast.walk(ast.parse(_SRC["gs_common.py"]))
+               if isinstance(_n, ast.FunctionDef)
+               and _n.name == "disable_core_dumps")) or ""))
 # NON-VACUITY: every OTHER tool must still take the shared hook, or the two
 # local copies are the start of a spread rather than two named exceptions.
 _MISSING = [t for t in
@@ -1070,7 +1216,6 @@ def _as_nobody(fn_src, *paths):
 
 
 if _CAN_DROP:
-    import gs_common as _GC                                  # noqa: E402
 
     def _probe(d):
         from gs_common import secure_delete_file as _sdf
@@ -1145,7 +1290,7 @@ if _CAN_DROP:
     _kd = Path(tempfile.mkdtemp())
     os.chmod(_kd, 0o777)
     _kf = _kd / "gs_wake_thinkpad.key"
-    _GC.atomic_write_json(
+    GSC.atomic_write_json(
         P.lock_keyfile({"role": "thinkpad", "secret": "ab" * 32}, b"",
                        role="thinkpad"), _kf, perms=0o400)
     os.chown(_kf, 65534, 65534)
@@ -1153,7 +1298,7 @@ if _CAN_DROP:
           "it", (os.stat(_kf).st_mode & 0o777) == 0o400)
     check("wipe/0400: ...and it really is in the wipe list",
           any(__import__("fnmatch").fnmatch(_kf.name, _p)
-              for _p in _GC.GS_ARTIFACT_FILE_PATTERNS))
+              for _p in GSC.GS_ARTIFACT_FILE_PATTERNS))
     _W = _as_nobody(_wake_probe, str(_kf))
     check(f"wipe/0400: paranoia_mode's sweep primitive now ERASES the wake "
           f"keypair it lists ({_W})",
@@ -1202,7 +1347,7 @@ if _CAN_DROP:
         _inner = _sd / "m"
         _inner.mkdir()
         _dkf = _inner / "gs_delivery.key"
-        _GC.atomic_write_json(P.lock_keyfile(
+        GSC.atomic_write_json(P.lock_keyfile(
             {"role": "delivery",
              "delivery_secret": bytes(_NP2.PrivateKey.generate()).hex(),
              "vault_public": bytes(_NP2.PrivateKey.generate().public_key).hex()},
@@ -1218,7 +1363,14 @@ if _CAN_DROP:
             check(f"wipe/0400: `gs_delivery_key shred` in {_label} REFUSES "
                   f"rather than printing 'destroyed'",
                   _S.get("exists") is True
-                  and "could NOT be destroyed" in _S.get("said", "")
+                  # THREE messages now, one per state. This branch is the
+                  # unlink-denied one, where the overwrite SUCCEEDED -- so the
+                  # honest wording is "was OVERWRITTEN but could not be
+                  # removed", not the old "could NOT be destroyed / nothing was
+                  # overwritten", which was false for exactly this case.
+                  and "was OVERWRITTEN but could not be removed"
+                      in _S.get("said", "")
+                  and "IS GONE" in _S.get("said", "")
                   and "[+]" not in _S.get("said", ""))
         os.chmod(_inner, 0o755)
 
@@ -1271,7 +1423,6 @@ check("wipe/0400: NON-VACUITY -- the slice really is secure_delete_file's body",
 # message ("~/gs/my_notes.json covers=True NO match -> NEVER erased") and the
 # message still spoke only about the directory.
 print("\n-- the wipe warning names which half of the test failed --")
-import gs_common as _GC9                                     # noqa: E402
 
 _w9 = Path(tempfile.mkdtemp()).resolve()
 _prev_home, _prev_cwd = os.environ.get("HOME"), os.getcwd()
@@ -1290,7 +1441,7 @@ try:
     for _rel, _want in _cases.items():
         _p = _w9 / _rel
         _p.write_text("{}")
-        _got = _GC9.wipe_miss_reason(_p)
+        _got = GSC.wipe_miss_reason(_p)
         if _got != _want:
             _bad9.append((_rel, _got, _want))
     check(f"wipe reason: every case is classified correctly "
@@ -1302,8 +1453,8 @@ try:
     # And it must agree with the predicate it explains: "" exactly when the
     # sweep would erase the file.
     _dis = [r for r in _cases
-            if (_GC9.wipe_miss_reason(_w9 / r) == "")
-            != bool(_GC9.wipe_will_erase(_w9 / r))]
+            if (GSC.wipe_miss_reason(_w9 / r) == "")
+            != bool(GSC.wipe_will_erase(_w9 / r))]
     check(f"wipe reason: '' means exactly what wipe_will_erase means "
           f"({_dis or 'agrees on all four'})", not _dis)
 finally:
@@ -1342,7 +1493,7 @@ check("wipe reason: create_receive_wallet still picks its own matching name, "
       "so its location-only message stays correct",
       'f"wallet_{secure_hex(8)}.json"' in _crw
       and any(__import__("fnmatch").fnmatch("wallet_deadbeef.json", _p)
-              for _p in _GC9.GS_ARTIFACT_FILE_PATTERNS))
+              for _p in GSC.GS_ARTIFACT_FILE_PATTERNS))
 # ONE IMPLEMENTATION. The reason must not become a fourth inline copy of the
 # root list -- that is the drift wipe_covers was extracted to stop.
 for _t9 in ("exit_strategy_simulator", "thor_swap_preparer",
@@ -1501,9 +1652,40 @@ check("ess/amount: NON-VACUITY -- an ordinary amount still passes validation "
       "and reaches the Tor gate",
       "implausibly large" not in _OK and "not a number" not in _OK
       and "Tor" in _OK)
+_ESS_SRC = Path(os.path.join(REPO, "exit_strategy_simulator")).read_text()
 check("ess/amount: the shared validator is used, not a fourth hand-rolled "
-      "parse", "decimal_env(\"GS_EXIT_AMOUNT\"" in
-      Path(os.path.join(REPO, "exit_strategy_simulator")).read_text())
+      "parse", "decimal_env(_src, _amt, positive=True," in _ESS_SRC
+      and "max_value=XMR_ABSURD_TOTAL" in _ESS_SRC)
+# The label is no longer the hard-coded variable name, and that is a BEHAVIOUR
+# worth driving rather than a string worth grepping: decimal_env puts the label
+# at the front of every refusal it writes, so hard-coding "GS_EXIT_AMOUNT" sent
+# an operator who typed a bad POSITIONAL to go unset a variable they never set.
+
+
+def _ess_positional(v):
+    """What the shipped CLI says about a bad positional, with NO env set."""
+    _e = {k: x for k, x in os.environ.items() if k != "GS_EXIT_AMOUNT"}
+    _e["PYTHONPATH"] = REPO
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO, "exit_strategy_simulator"),
+         v, "--tor-proxy", "socks5h://127.0.0.1:9"],
+        capture_output=True, text=True, timeout=120, env=_e,
+        cwd=tempfile.mkdtemp())
+    return (r.stdout + r.stderr)
+
+
+# 1e400, not "abc": argparse's own type=decimal_arg rejects a non-number before
+# main() runs, so a bad positional has to be one that PARSES to reach the line
+# under test. 1e400 is finite and positive and fails only on max_value.
+_APOS = _ess_positional("1e400")
+check("ess/amount: a bad POSITIONAL is diagnosed as the off-ramp amount, not "
+      "as an environment variable the operator never set",
+      "The off-ramp amount is implausibly large" in _APOS
+      and "GS_EXIT_AMOUNT is" not in _APOS)
+# NON-VACUITY: when the variable really IS the source, it must still be named,
+# or the check above passes on a tool that never mentions it at all.
+check("ess/amount: NON-VACUITY -- a bad ENV value is still diagnosed by "
+      "variable name", "GS_EXIT_AMOUNT is implausibly large" in _A400)
 
 # (b) THE ORACLE DIAGNOSIS.
 _ESS.integrity_log = lambda *a, **k: None
@@ -1529,16 +1711,26 @@ def _all_down(u, p):
     raise ConnectionError("no route")
 
 
+def _both(cg_exc, bisq):
+    """CoinGecko fails one way, Bisq another. Returns the refusal text."""
+    def _sg(u, p):
+        if "coingecko" in u:
+            raise cg_exc
+        if isinstance(bisq, Exception):
+            raise bisq
+        return bisq
+    return _oracle(_sg)
+
+
+_BISQ_NOXMR = {"data": [{"currencyCode": "USD", "price": 60000.0},
+                        {"currencyCode": "EUR", "price": 55000.0}]}
 _NOXMR = _oracle(_cg_down)
 check("ess/oracle: REPRODUCED -- a Bisq reply that parses but carries no XMR "
       "market no longer reports a Tor problem",
       "did not fail on the network" in _NOXMR)
 check("ess/oracle: ...and it names WHICH market was missing and what did come "
-      "back", "carried no XMR market" in _NOXMR and "btc_usd" in _NOXMR)
-check("ess/oracle: ...and the remedy no longer contradicts the diagnosis by "
-      "saying 'Check Tor connectivity' right after 'not the network'",
-      "Tor is not the problem" in _NOXMR
-      and "Check Tor connectivity" not in _NOXMR)
+      "back",
+      "carried no XMR market at all" in _NOXMR and "btc_usd" in _NOXMR)
 _NET = _oracle(_all_down)
 check("ess/oracle: NON-VACUITY -- a genuine network failure STILL says to "
       "check Tor", "Check Tor connectivity" in _NET
@@ -1546,7 +1738,65 @@ check("ess/oracle: NON-VACUITY -- a genuine network failure STILL says to "
 # The 200-char clip: the diagnosis this file composes must survive to the
 # operator. A 60-char clip cut it at "carried no XMR".
 check("ess/oracle: the composed diagnosis is not truncated before its useful "
-      "half", "(got:" in _NOXMR)
+      "half", "codes returned:" in _NOXMR)
+
+# ABSENT vs UNUSABLE. `prices` is only populated when the price ALSO passes the
+# (0, ABSURD_RATE] guard, so the message inferred "no XMR market" from an entry
+# that WAS there and quoted 0, or a negative, or 1e30.
+for _bad, _shape in ((0, "zero"), (-1, "negative"), (1e30, "above ABSURD_RATE")):
+    _UNUSABLE = _both(ConnectionError("cg"),
+                      {"data": [{"currencyCode": "XMR", "price": _bad},
+                                {"currencyCode": "USD", "price": 60000.0}]})
+    check(f"ess/oracle: an XMR market quoting a {_shape} price is reported as "
+          f"a bad PRICE, not as a missing market",
+          "DID carry an XMR market" in _UNUSABLE
+          and "carried no XMR market" not in _UNUSABLE)
+# NON-VACUITY: a genuinely absent market must still be called absent, or the
+# checks above pass on a tool that never says "missing" at all.
+check("ess/oracle: NON-VACUITY -- a genuinely absent market is still reported "
+      "as absent, and names the codes that DID come back",
+      "carried no XMR market at all" in _NOXMR
+      and "codes returned: EUR, USD" in _NOXMR)
+
+# THE REMEDY FOLLOWS BOTH DIAGNOSES. It was computed from the Bisq failure
+# alone, so a run where CoinGecko never got a packet back and Bisq answered
+# with an unusable payload printed "Tor is not the problem".
+_MIXED = _both(ConnectionError("cg down"), _BISQ_NOXMR)
+check("ess/oracle: REPRODUCED -- CoinGecko's failure is now reported too, not "
+      "swallowed into the integrity chain",
+      "CoinGecko was tried first and failed on the NETWORK" in _MIXED)
+check("ess/oracle: ...and the mixed case no longer says 'Tor is not the "
+      "problem' about a run whose first oracle was unreachable",
+      "CHECK BOTH" in _MIXED and "Tor is not the problem" not in _MIXED)
+_BOTH_NET = _both(ConnectionError("cg"), ConnectionError("bisq"))
+_BOTH_FMT = _both(ValueError("cg json"), _BISQ_NOXMR)
+# THE OTHER MIXED CASE, and it is the one that separates the two conditions.
+# With Bisq dying on the NETWORK and CoinGecko on the payload, a remedy
+# computed from the Bisq failure alone says "Check Tor connectivity" -- which
+# is half right and hides that the other oracle answered fine and sent
+# something unusable. Only this shape tells `_network` apart from
+# `_network and _cg_net`; the first mixed case above gives the same answer
+# either way, so a test with only that one cannot see the difference.
+_MIXED2 = _both(ValueError("cg json"), ConnectionError("bisq down"))
+check("ess/oracle: the OTHER mixed case is caught too -- Bisq unreachable "
+      "while CoinGecko answered with something unusable",
+      "CHECK BOTH" in _MIXED2
+      and "Check Tor connectivity and retry." not in _MIXED2)
+check("ess/oracle: ...and it names CoinGecko's failure as a RESPONSE problem, "
+      "not a network one",
+      "CoinGecko was tried first and failed on the response" in _MIXED2)
+check("ess/oracle: NON-VACUITY -- both-network still says exactly 'Check Tor "
+      "connectivity'",
+      "Check Tor connectivity" in _BOTH_NET and "CHECK BOTH" not in _BOTH_NET)
+check("ess/oracle: NON-VACUITY -- both-payload still says exactly 'Tor is not "
+      "the problem'",
+      "Tor is not the problem" in _BOTH_FMT and "CHECK BOTH" not in _BOTH_FMT)
+check("ess/oracle: ...and the three remedies are mutually exclusive, so one "
+      "run never prints two",
+      all(["Check Tor connectivity" in _t,
+           "Tor is not the problem" in _t,
+           "CHECK BOTH" in _t].count(True) == 1
+          for _t in (_BOTH_NET, _BOTH_FMT, _MIXED, _MIXED2)))
 
 # ===========================================================================
 #  12. A "LIVE" PRICE THAT VALUED THE HOLDING AT NOTHING
@@ -1613,33 +1863,92 @@ check("ess/zero: ...and the screen never printed 'Value : 0.00'",
       "Value       : 0.00" not in _o12)
 # NON-VACUITY: a realistic rate must still produce a plan, or the check above
 # passes on a tool that refuses everything.
-_o12b, _rc12b, _p12b = _ess_run(0.005, 33000.0)
+# A NON-ROUND TRUE RATE, deliberately. The old fixture used 0.005 * 33000 =
+# exactly 165, so "the stored coarse rate" and "the true spot rate" were the
+# same number and no check here could tell them apart -- the coarsening could
+# have been deleted entirely and this block would have stayed green.
+# 0.00251937 * 65432.10 = 164.8476697770, which rounds to a different figure.
+#
+# .quantize(Decimal("0.01")) because that is what fetch_prices ACTUALLY hands
+# back: the Bisq branch derives xmr_usd = xmr_btc * btc_usd and stores it at
+# cent precision, so the raw product (164.8476697770) is not a rate this tool
+# ever holds. Computing the expected screen figure from the raw product missed
+# the printed one by three cents -- small, and a test that "nearly" matches is
+# a test that will be loosened next time instead of read.
+_TRUE12 = (Decimal("0.00251937") * Decimal("65432.10")).quantize(Decimal("0.01"))
+_o12b, _rc12b, _p12b = _ess_run(0.00251937, 65432.10)
 check("ess/zero: NON-VACUITY -- a realistic rate still valuates and writes "
       "the plan", _rc12b == "returned" and _p12b.exists()
       and "Value" in _o12b)
 _j12 = json.loads(_p12b.read_text())
-# THE COARSENING. The exact figure is still PRINTED; the file stores whole
-# units, so the inversion cannot hand back the rate at cent precision.
-check("ess/coarse: the terminal still shows the exact figure the operator "
-      "needs", "2199.43" in _o12b)
-check("ess/coarse: ...while the FILE stores whole units, so the rate cannot "
-      "be inverted at cent precision",
-      _j12["amount_out_fiat"] == "2199"
-      and "." not in _j12["amount_out_fiat"])
 _net12 = Decimal(_j12["net_xmr"])
+# THE COARSENING. The exact figure is still PRINTED; the file stores a figure
+# derived from the coarsened rate, so inverting it returns that rate and not
+# the spot rate the 10-minute timestamp bucket exists to hide.
+# RECOMPUTED FROM THE FILE'S OWN FULL-PRECISION FIELDS, not from net_xmr.
+# net_xmr is stored at 4dp and the screen figure comes from the full-precision
+# net, so `net_xmr * rate` misses by a few cents -- the rate multiplies the
+# rounding. gross, fee_pct and slippage_pct are all in the file at full
+# precision and net is exactly `gross - gross*fee - gross*slip` (the identity
+# the amount_out_fiat comment names as the inversion), so this is exact and
+# needs no tolerance.
+_netfull12 = (Decimal(_j12["amount_in_xmr"])
+              - Decimal(_j12["amount_in_xmr"]) * Decimal(_j12["fee_pct"])
+              - Decimal(_j12["amount_in_xmr"]) * Decimal(_j12["slippage_pct"]))
+_screen12 = str((_netfull12 * _TRUE12).quantize(Decimal("0.01")))
+check(f"ess/coarse: the terminal still shows the exact figure the operator "
+      f"needs ({_screen12}), computed from the TRUE rate",
+      _screen12 in _o12b)
+check("ess/coarse: NON-VACUITY -- the coarse figure the FILE stores is a "
+      "different number, so the check above is not matching that",
+      _j12["amount_out_fiat"] != _screen12)
 _rec12 = Decimal(_j12["amount_out_fiat"]) / _net12
-check(f"ess/coarse: the inversion now recovers {_rec12.quantize(Decimal('0.0001'))} "
-      f"instead of the true 165 -- two orders of magnitude coarser",
-      abs(_rec12 - Decimal("165")) > Decimal("0.001"))
-# NON-VACUITY: at CENT precision it really would have come back exact, which is
-# what makes the coarsening worth anything.
-_cent12 = (_net12 * Decimal("165")).quantize(Decimal("0.01")) / _net12
-check("ess/coarse: NON-VACUITY -- at cent precision the same inversion "
-      "returns the rate to 4dp", abs(_cent12 - Decimal("165")) < Decimal("0.001"))
+_stored12 = Decimal(_j12["oracle_prices"]["xmr_usd"])
+check(f"ess/coarse: inverting amount_out_fiat recovers {_rec12.quantize(Decimal('0.0001'))}"
+      f" -- the COARSE rate already stored beside it, not the true "
+      f"{_TRUE12.quantize(Decimal('0.0001'))}",
+      abs(_rec12 - _stored12) < Decimal("0.01")
+      and abs(_rec12 - _TRUE12) > Decimal("0.1"))
+# NON-VACUITY: computed from the TRUE rate at cent precision -- what this field
+# used to hold -- the same inversion comes back exact, which is what makes
+# deriving it from the coarsened rate worth anything.
+_cent12 = (_net12 * _TRUE12).quantize(Decimal("0.01")) / _net12
+check("ess/coarse: NON-VACUITY -- from the true rate at cent precision the "
+      "same inversion returns the spot rate to 4dp",
+      abs(_cent12 - _TRUE12) < Decimal("0.001"))
+# AND THE FIELD THAT USED TO BE EXEMPT. Whole-unit rounding is an ABSOLUTE
+# blur, so btc_usd at ~65000 kept eight significant figures while xmr_usd at
+# ~165 kept three -- the note claimed neither handed back a spot rate.
+_btc12 = Decimal(_j12["oracle_prices"]["btc_usd"])
+_btc_blur = abs(_btc12 - Decimal("65432.10")) / Decimal("65432.10")
+check(f"ess/coarse: btc_usd is blurred RELATIVELY too ({_btc_blur * 100:.4f}%), "
+      f"not left at whole units where it pinned the instant to seconds",
+      _btc_blur > Decimal("0.0001"))
+check("ess/coarse: NON-VACUITY -- whole-unit rounding really would have left "
+      "btc_usd essentially exact",
+      abs(Decimal("65432.10").quantize(Decimal("1")) - Decimal("65432.10"))
+      / Decimal("65432.10") < Decimal("0.00001"))
+check("ess/coarse: ...and the XMR rate is unchanged by the switch, so the "
+      "field the coarsening was written for did not regress",
+      _stored12 == _TRUE12.quantize(Decimal("1")))
+# THE ZERO IT USED TO INVENT. Rounding the PRODUCT to whole units wrote "0"
+# for a holding genuinely worth 0.40 -- one step after the guard that refuses
+# a zero valuation. Deriving from the rate cannot do that.
+_o12c, _rc12c, _p12c = _ess_run(0.00251937, 65432.10, gross="0.0025")
+check("ess/coarse: a small but real holding is not recorded as nothing",
+      _rc12c == "returned" and _p12c.exists()
+      and Decimal(json.loads(_p12c.read_text())["amount_out_fiat"]) > 0)
+check("ess/coarse: NON-VACUITY -- rounding the product to whole units, which "
+      "is what this replaced, really would have written 0 for it",
+      (Decimal("0.0025") * _TRUE12).quantize(Decimal("1")) == 0)
 check("ess/coarse: the note states a LIMIT rather than claiming the "
       "timestamp is protected",
-      "treat the" in _j12["oracle_prices_note"]
+      "Residual" in _j12["oracle_prices_note"]
       and "approximate" in _j12["oracle_prices_note"])
+check("ess/coarse: ...and it names the RELATIVE blur, which is the property "
+      "whole units did not have",
+      "significant" in _j12["oracle_prices_note"]
+      and "btc_usd" in _j12["oracle_prices_note"])
 
 
 # ===========================================================================
@@ -1654,6 +1963,7 @@ check("ess/coarse: the note states a LIMIT rather than claiming the "
 # can ever be opened.
 print("\n-- the delivery key refusal reads the key it is talking about --")
 _DK = load("gs_delivery_key")
+_DK_SRC13 = Path(os.path.join(REPO, "gs_delivery_key")).read_text()
 import nacl.public as _NP13                                  # noqa: E402
 
 
@@ -1666,7 +1976,7 @@ def _dk_states(file_key, vault_key, with_pub=True):
         b"pw", kdf="interactive", role="delivery")
     if with_pub:
         _c["delivery_public"] = bytes(file_key.public_key).hex()
-    _GC.atomic_write_json(_c, _out, perms=0o400)
+    GSC.atomic_write_json(_c, _out, perms=0o400)
     _v = _d / "vault.key"
     _pl = {"role": "thinkpad",
            "secret": bytes(_NP13.PrivateKey.generate()).hex()}
@@ -1701,12 +2011,57 @@ check("dk/identity: REPRODUCED -- a file holding a DIFFERENT key no longer "
 check("dk/identity: ...and it prints BOTH keys so the operator can see which "
       "is which", _MIS.count("...") >= 2 and "the vault seals to :" in _MIS)
 _MATCH = _dk_states(_A13, _A13)
-check("dk/identity: NON-VACUITY -- the MATCHING key still gets the 'seals to "
-      "it' sentence", "already exists and the vault seals to it" in _MATCH)
+# "RECORDS", not "is". The head field is outside the sealed box, so a match is
+# what the file CLAIMS -- see _refuse_existing. The sentence changed with it.
+check("dk/identity: NON-VACUITY -- the MATCHING key still gets its own "
+      "sentence, and it no longer overstates what a head field proves",
+      "RECORDS the delivery key this vault seals to" in _MATCH
+      and "is NOT the delivery key" not in _MATCH)
 _UNK = _dk_states(_B13, _A13, with_pub=False)
 check("dk/identity: a keyfile minted before the public field says the answer "
       "is UNKNOWN rather than guessing",
       "CANNOT be" in _UNK and "checked from here" in _UNK)
+# ...AND SAYS WHICH KIND OF UNKNOWN. _file_delivery_public returned a bare ""
+# and swallowed every failure into it, so this branch stated ONE cause -- "it
+# was minted before that field existed" -- for six different shapes. Three of
+# them are the TAMPERED-head shape, where an explanation that closes the
+# question is worse than none.
+_DKP = _DK._file_delivery_public
+_d13u = Path(tempfile.mkdtemp())
+
+
+def _dk_why(body):
+    _p = _d13u / "k.json"
+    _p.write_text(body)
+    return _DKP(_p)[1]
+
+
+for _body, _want, _shape in (
+        (json.dumps({"v": 1, "sealed": "aa"}), "absent",
+         "the field is genuinely missing -- the only shape it described"),
+        (json.dumps({"v": 1, "delivery_public": "ab" * 16}), "malformed",
+         "a truncated hex value: a head somebody edited"),
+        (json.dumps({"v": 1, "delivery_public": "not-hex"}), "malformed",
+         "a non-hex value"),
+        (json.dumps({"v": 1, "delivery_public": 12345}), "malformed",
+         "a number where a hex string belongs"),
+        ("{{{ truncated", "unreadable", "the file does not parse at all"),
+        ("", "unreadable", "the file is empty")):
+    check(f"dk/identity: UNKNOWN is reported as {_want!r} -- {_shape}",
+          _dk_why(_body) == _want)
+# NON-VACUITY: a real, well-formed public key still comes back with no reason,
+# or "reports a cause" would be true of a function that always reports one.
+check("dk/identity: NON-VACUITY -- a well-formed head returns the key and NO "
+      "reason",
+      _DKP.__call__ and _dk_why(
+          json.dumps({"v": 1, "delivery_public": "ab" * 32})) == ""
+      and _DK._file_delivery_public(_d13u / "k.json")[0] == "ab" * 32)
+# And the operator-facing sentence must carry the distinction, not just the
+# return value -- the whole defect was in what was PRINTED.
+check("dk/identity: ...and the refusal no longer asserts 'minted before that "
+      "field existed' for a head that was edited",
+      "was minted before that field existed" not in _DK_SRC13
+      or "delivery_public field at all" in _DK_SRC13)
 _NOV = _dk_states(_B13, None)
 check("dk/identity: NON-VACUITY -- the 'vault names no delivery key' branch "
       "is untouched", "does NOT name a delivery" in _NOV)
@@ -1790,27 +2145,338 @@ check("relay/delay: the manifest reader takes the same rule minus the cap it "
       _BX.delay_is_sane(10 ** 12, cap=False)
       and not _BX.delay_is_sane(-1, cap=False)
       and not _BX.delay_is_sane(3600.9, cap=False))
-_BXS = Path(os.path.join(REPO, "broadcast_signed_xmr")).read_text()
+# THE THIRD READER. GhostSpiral sizes the kill timeout it gives the broadcast
+# child from the same field, reading the UNSIGNED plan off local disk -- the
+# weakest of the three boundaries -- and it was the one still coercing. It does
+# not mis-time a transaction; it defeats the timeout that kills a hung child.
+_GS_TXS = [{"delay": 300}, {"delay": 300}]
+
+
+def _timeout_old(ptxs):
+    """The shipped expression, kept so the claim below is measured."""
+    return sum(max(0, int(t.get("delay") or 0)) for t in ptxs)
+
+
+def _timeout_new(ptxs):
+    """What GhostSpiral does now: refuse rather than coerce."""
+    total = 0
+    for t in ptxs:
+        d = t.get("delay") or 0
+        if not GSC.delay_is_sane(d):
+            raise ValueError(d)
+        total += d
+    return total
+
+
+for _v, _cost in ((10 ** 12, "~31,700 years -- the child is never killed"),
+                  ("604800", "a week bought with a string"),
+                  (True, "a bool"), (3600.9, "a float"), (-500, "a negative")):
+    check(f"relay/delay: a plan delay of {_v!r} no longer sizes the kill "
+          f"timeout ({_cost})",
+          not GSC.delay_is_sane(_v))
+check("relay/delay: REPRODUCED -- the shipped expression turned 10**12 into a "
+      "31,700-year broadcast timeout",
+      _timeout_old([{"delay": 10 ** 12}]) == 10 ** 12)
+_fallback_applies = False
+try:
+    _timeout_new([{"delay": 10 ** 12}])
+except ValueError:
+    _fallback_applies = True
+check("relay/delay: ...and the replacement raises instead, so the caller's "
+      "conservative fallback applies", _fallback_applies)
+check("relay/delay: NON-VACUITY -- a sane plan is summed exactly as before",
+      _timeout_new(_GS_TXS) == _timeout_old(_GS_TXS) == 600)
+_GSS = Path(os.path.join(REPO, "GhostSpiral")).read_text()
+check("relay/delay: ...and GhostSpiral takes the SHARED rule rather than a "
+      "third private copy",
+      "delay_is_sane(_d)" in _GSS
+      and "isinstance(value, bool)" not in _GSS)
+
+# THE WRITER, WHICH ACCEPTED WHAT THE READER REFUSES. airgap_tx_signer puts
+# `delay` verbatim into unsigned_manifest.json and carries it verbatim into
+# signed_manifest_v1.json, and neither of its two validators looked at it --
+# while broadcast calls that manifest "the sign->relay trust boundary" and
+# refuses the same values there. Signing is the air-gapped, manual half of this
+# toolchain, so the refusal landed after every blob had been built.
+_SGN = load("airgap_tx_signer")
+_SGN_TX = {"src": "addr", "src_index": 1, "dst": "d", "amt": "1.0"}
+
+
+def _signer_takes(delay, entries=False):
+    _t = dict(_SGN_TX)
+    if delay is not None:
+        _t["delay"] = delay
+    try:
+        if entries:
+            _od = tempfile.mkdtemp()
+            _f = os.path.join(_od, "tx_0.unsigned")
+            Path(_f).write_text("x")
+            _SGN._validate_manifest_entries(
+                [{"idx": 0, "file": _f, "hash": "a" * 64,
+                  **({} if delay is None else {"delay": delay})}], Path(_od))
+        else:
+            _SGN._validate_plan([_t], phase="create")
+        return True
+    except SystemExit:
+        return False
+
+
+for _v, _why in _HOSTILE:
+    check(f"relay/delay: the SIGNER refuses {_v!r} too, so the batch is not "
+          f"built before the relay rejects it ({_why})",
+          not _signer_takes(_v))
+    check(f"relay/delay: ...and its manifest validator refuses {_v!r} as well, "
+          f"for a manifest edited between create and sign",
+          not _signer_takes(_v, entries=True))
+# NON-VACUITY: the signer must still accept every legitimate shape, or it would
+# refuse every plan and the checks above would be meaningless.
+for _v in (None, 0, 300, 604800):
+    check(f"relay/delay: NON-VACUITY -- the signer still accepts {_v!r}",
+          _signer_takes(_v) and _signer_takes(_v, entries=True))
+check("relay/delay: NON-VACUITY -- the signer's bound is the SHARED one, so "
+      "the two tools cannot disagree about the edge",
+      _signer_takes(GSC.MAX_PLANNED_DELAY)
+      and not _signer_takes(GSC.MAX_PLANNED_DELAY + 1))
+_SGS = Path(os.path.join(REPO, "airgap_tx_signer")).read_text()
+check("relay/delay: ...and the signer imports the rule rather than restating "
+      "it", "delay_is_sane, MAX_PLANNED_DELAY," in _SGS
+      and "isinstance(value, bool)" not in _SGS)
+
+# THE COPY THAT MATTERS. _canonical_plan covers `delay` and says why --
+# "broadcast reads it from the manifest, so a swapped delay changes relay
+# timing, which is an OPSEC property worth detecting" -- but the fingerprint is
+# computed over the PLAN and broadcast reads the MANIFEST. Editing
+# entries[i]["delay"] leaves the plan untouched, so the fingerprint matched
+# perfectly and the relay schedule was rewritten anyway.
+def _signing_manifest(mani_delays, plan_delays=(300, 300)):
+    _od = Path(tempfile.mkdtemp())
+    _plan = [{"src": "a", "src_index": _i, "dst": "d", "amt": "1.0",
+              **({} if _d is None else {"delay": _d})}
+             for _i, _d in enumerate(plan_delays)]
+    _entries = []
+    for _i, _d in enumerate(mani_delays):
+        _f = _od / f"tx_{_i}.unsigned"
+        _f.write_text("x")
+        _e = {"idx": _i, "file": str(_f), "hash": "a" * 64}
+        if _d is not None:
+            _e["delay"] = _d
+        _entries.append(_e)
+    (_od / "unsigned_manifest.json").write_text(json.dumps(
+        {"plan_fingerprint": _SGN._compute_plan_fingerprint(_plan),
+         "entries": _entries}))
+    try:
+        _SGN._load_signing_manifest(_od, _plan)
+        return ""
+    except SystemExit as _e:
+        return str(_e)
+
+
+_SWAP = _signing_manifest([300, 86400])
+check("relay/delay: REPRODUCED -- a manifest-only delay edit leaves the plan "
+      "fingerprint MATCHING, so nothing before this caught it",
+      "fingerprint mismatch" not in _SWAP)
+check("relay/delay: ...and it is refused now, naming both values",
+      "different 'delay' than the plan" in _SWAP
+      and "plan says 300s, manifest says 86400s" in _SWAP)
+check("relay/delay: ...and the refusal explains why the fingerprint could not "
+      "see it", "computed over the PLAN" in _SWAP)
+check("relay/delay: a DELETED manifest delay is caught too -- 0 is a schedule, "
+      "not an absence",
+      "plan says 300s, manifest says 0s" in _signing_manifest([300, None]))
+# NON-VACUITY: an agreeing manifest must still load, and an absent delay on
+# BOTH sides must not be read as a mismatch (phase_create writes 0 for it).
+check("relay/delay: NON-VACUITY -- a manifest that agrees with its plan still "
+      "loads", _signing_manifest([300, 300]) == "")
+check("relay/delay: NON-VACUITY -- an absent plan delay against the 0 "
+      "phase_create writes is NOT a mismatch",
+      _signing_manifest([0, 0], plan_delays=(None, None)) == ""
+      and _signing_manifest([None, None], plan_delays=(None, None)) == "")
+check("relay/delay: ...and the _canonical_plan docstring no longer implies "
+      "covering the field is the whole protection",
+      "the MANIFEST" in _SGS and "_load_signing_manifest" in _SGS)
+
 # CODE, NOT PROSE. `'int(tx["delay"])' not in src` went red against a correct
 # fix, because the docstring and the inline comment both QUOTE the old
-# expression to explain what changed. Strip comment and docstring lines first
-# -- the same trap as the "from gs_common" check earlier in this file.
-_BXCODE = "\n".join(
-    l for l in _BXS.splitlines()
-    if l.strip() and not l.strip().startswith("#"))
-check("relay/delay: ONE implementation -- neither reader spells the rule out "
-      "again",
-      _BXCODE.count("isinstance(value, bool) or not isinstance(value, int)") == 1
-      and 'by_idx[pos] = int(' not in _BXCODE)
-check("relay/delay: NON-VACUITY -- the comments still QUOTE the old "
-      "expression, which is why the naive check had to go",
-      'int(tx["delay"])' in _BXS)
-check("relay/delay: ...and both readers call it",
+# expression to explain what changed.
+#
+# STRIPPED WITH tokenize, NOT BY LINE PREFIX. The previous version dropped only
+# lines whose stripped form starts with "#" and its own comment claimed it
+# stripped "comment and docstring lines" -- docstrings were left in entirely.
+# It passed anyway because the one docstring quoting the old expression lived
+# in the same file as the code being searched and the needle happened not to
+# collide. That is a coincidence, not a check: any future docstring quoting a
+# construct this asserts is absent would fail it for the wrong reason, which is
+# exactly the trap the comment was written about.
+_BXS = Path(os.path.join(REPO, "broadcast_signed_xmr")).read_text()
+_GCS = Path(os.path.join(REPO, "gs_common.py")).read_text()
+
+
+def _code_only(src: str) -> str:
+    """Source with comments AND docstrings removed, by tokenising it."""
+    out, prev_end, prev_type = [], (1, 0), tokenize.INDENT
+    for ttype, tstr, (srow, scol), (erow, ecol), _ in tokenize.generate_tokens(
+            io.StringIO(src).readline):
+        if srow > prev_end[0]:
+            prev_end = (srow, 0)
+        _drop = (ttype == tokenize.COMMENT
+                 # A STRING that follows a line break or an indent IS the whole
+                 # statement -- a docstring or a bare string expression.
+                 or (ttype == tokenize.STRING and prev_type in (
+                     tokenize.INDENT, tokenize.NEWLINE, tokenize.NL,
+                     tokenize.DEDENT, tokenize.ENCODING)))
+        if not _drop:
+            if scol > prev_end[1] and srow == prev_end[0]:
+                out.append(" " * (scol - prev_end[1]))
+            out.append(tstr)
+        if ttype not in (tokenize.NL, tokenize.COMMENT):
+            prev_type = ttype
+        prev_end = (erow, ecol)
+    return "".join(out)
+
+
+_BXCODE, _GCCODE, _GSCODE = _code_only(_BXS), _code_only(_GCS), _code_only(_GSS)
+check("relay/delay: ONE implementation, and it lives where all THREE readers "
+      "can reach it",
+      _GCCODE.count("isinstance(value, bool) or not isinstance(value, int)") == 1
+      and "isinstance(value, bool) or not isinstance(value, int)" not in _BXCODE
+      and "isinstance(value, bool) or not isinstance(value, int)" not in _GSCODE)
+check("relay/delay: ...and no reader coerces any more",
+      'by_idx[pos] = int(' not in _BXCODE
+      and 'max(0, int(t.get("delay")' not in _GSCODE)
+# NON-VACUITY, IN BOTH DIRECTIONS. The prose must still quote the old
+# expressions (or the history is gone), and the stripper must actually be
+# removing them (or the checks above are passing on a no-op).
+check("relay/delay: NON-VACUITY -- the prose still QUOTES the old expressions, "
+      "which is why the naive check had to go",
+      'int(tx["delay"])' in _GCS and 'max(0, int(t.get("delay")' in _GSS)
+check("relay/delay: NON-VACUITY -- the tokenising stripper really removes "
+      "them, which line-prefix stripping did not",
+      'int(tx["delay"])' not in _GCCODE
+      and 'max(0, int(t.get("delay")' not in _GSCODE)
+check("relay/delay: NON-VACUITY -- and it leaves real code alone",
+      "def delay_is_sane(value, cap: bool = True) -> bool:" in _GCCODE)
+check("relay/delay: ...and both relay readers call it",
       "delay_is_sane(delay, cap=False)" in _BXS
       and 'delay_is_sane(tx["delay"])' in _BXS)
 check("relay/delay: the fallback DISCARDS a bad candidate rather than exiting "
       "-- a stray plan in ./unsigned must not stop a good relay",
       "by_idx = {}\n                        break" in _BXS)
+
+# ===========================================================================
+#  15. THE THREE FINDINGS FROM THE THIN-COVERAGE AUDIT, AND FOUR OF MY OWN
+# ===========================================================================
+print("\n-- the slip's timestamp, GPG, and counting the chain --")
+
+# (a) gs_unseal: "I cannot tell how old this is" is not "it is fresh". `t` came
+#     off the pairs file unchecked, so a float/str/bool/absent value made `age`
+#     None -- no age line, no stale warning, and EXIT 0 on a quote that a real
+#     int would have flagged as stale with exit 1.
+_US15 = load("gs_unseal")
+_D15 = "4" + "A" * 94
+
+
+def _slip15(t, now):
+    _b = {"b": "0.01", "d": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+          "m": f"=:XMR.XMR:{_D15}:0/1/0", "a": _D15, "x": "1.2", "h": "ab12"}
+    if t is not None:
+        _b["t"] = t
+    _o = io.StringIO()
+    with contextlib.redirect_stdout(_o):
+        _rc = _US15.show(_b, now=now)
+    return _rc, _o.getvalue()
+
+
+_now15 = 1_700_000_000.0
+_STALE = int(_now15 - 10800)                       # three hours old
+_rc_int, _o_int = _slip15(_STALE, _now15)
+check("slip/age: a real int timestamp still reports the age and flags a "
+      "3-hour-old quote", _rc_int == 1 and "~180 min ago" in _o_int
+      and "MINUTES OLD" in _o_int)
+for _label, _t in (("a float", float(_STALE)), ("a string", str(_STALE)),
+                   ("a bool", True), ("absent", None)):
+    _rc, _o = _slip15(_t, _now15)
+    check(f"slip/age: REPRODUCED -- with {_label} the SAME 3-hour-old quote "
+          f"used to print no age and exit 0; it now says UNKNOWN and exits "
+          f"non-zero", _rc == 1 and "UNKNOWN" in _o
+          and "CANNOT BE ESTABLISHED" in _o)
+    check(f"slip/age: ...and it says WHY ({_label})",
+          "timestamp is" in _o)
+# NON-VACUITY: a fresh quote must still pass cleanly, or "exit 1" is just what
+# this tool always does now.
+_rc_f, _o_f = _slip15(int(_now15 - 120), _now15)
+check("slip/age: NON-VACUITY -- a fresh quote still exits 0 with a real age",
+      _rc_f == 0 and "~2 min ago" in _o_f and "UNKNOWN" not in _o_f)
+# A slip stamped in the FUTURE is unusable too -- every "N minutes old" from it
+# is fiction.
+_rc_fut, _o_fut = _slip15(int(_now15 + 3600), _now15)
+check("slip/age: a slip stamped in the FUTURE is treated as unknown, not as "
+      "fresh", _rc_fut == 1 and "FUTURE" in _o_fut)
+# ...and the vault refuses to seal one at all, where the operator can see why.
+_AG15 = load("gs_wake_agent")
+check("slip/age: the vault validates `ts` before sealing, so a malformed "
+      "pairs file is caught on the machine that can show it",
+      "the quoted pair's 'ts' is not a usable timestamp"
+      in Path(os.path.join(REPO, "gs_wake_agent")).read_text())
+
+# (b) thor_swap_preparer: gnupg.GPG() raises OSError when the gpg BINARY is
+#     absent -- not ImportError -- so the handler missed it, and the PLAINTEXT
+#     bundle was already on disk.
+_TS15 = Path(os.path.join(REPO, "thor_swap_preparer")).read_text()
+check("gpg: the capability is checked at STARTUP, before any quote is fetched "
+      "or plaintext written",
+      "--gpg-recipient given but GPG cannot run" in _TS15
+      and "Nothing has been fetched or written yet" in _TS15)
+check("gpg: ...and the check is an ImportError branch AND a constructor "
+      "branch, because an absent binary raises OSError not ImportError",
+      "except ImportError:" in _TS15 and "gpg_unusable:" in _TS15)
+check("gpg: every failure in the encrypt block now names the plaintext, not "
+      "just the two somebody thought of",
+      "gpg_broke_late:" in _TS15 and "gpg_write_failed:" in _TS15
+      and "PARTIAL file" in _TS15)
+# NON-VACUITY: the constructor really does raise OSError, so the branch is not
+# guarding an impossible case.
+try:
+    import gnupg as _g15
+    try:
+        _g15.GPG(gpgbinary="/nonexistent/gpg")
+        _raised = "nothing"
+    except BaseException as _e15:
+        _raised = type(_e15).__name__
+    check(f"gpg: NON-VACUITY -- an absent binary really raises OSError, which "
+          f"`except ImportError` cannot catch (got {_raised})",
+          _raised == "OSError")
+except ImportError:
+    check("gpg: NON-VACUITY skipped -- python-gnupg is not installed here",
+          False)
+
+# (c) COUNTING THE CHAIN. chain_safe redacts the digits, so a per-index kind
+#     writes N byte-identical lines and N is the batch size -- the run-structure
+#     value chain_safe promises to withhold. Three sites in each of the two
+#     sibling swap paths were still doing it.
+for _f15, _stage in (("thor_swap_preparer", "thor"), ("GhostSpiral", "stage2")):
+    _src15 = Path(os.path.join(REPO, _f15)).read_text()
+    for _kind in ("expected_output_unreadable", "slippage_warn",
+                  "memo_dest_mismatch"):
+        check(f"chain/count: {_f15} logs {_kind} ONCE, not once per chunk",
+              f'integrity_log_once("{_stage}", "{_kind}")' in _src15
+              and f'{_kind}_{{i}}' not in _src15
+              and f'{_kind}_{{idx}}' not in _src15)
+# NON-VACUITY: the ABORTING per-index writes must be untouched -- exactly one
+# is ever written, so they carry no count and the index is useful there.
+check("chain/count: NON-VACUITY -- the aborting per-index writes still carry "
+      "their index (they can only ever fire once)",
+      'integrity_log("thor", f"slippage_ABORT_{i}:dev={deviation:.4f}")'
+      in Path(os.path.join(REPO, "thor_swap_preparer")).read_text()
+      and 'integrity_log("thor", f"no_deposit_{i}")'
+      in Path(os.path.join(REPO, "thor_swap_preparer")).read_text())
+# ...and memo_dest_mismatch is the subtle one: it is written BEFORE the abort
+# check, so with --allow-unbound-memo the run continues and it repeats.
+check("chain/count: memo_dest_mismatch is logged before the abort check, "
+      "which is why --allow-unbound-memo made it repeat",
+      "integrity_log_once(\"thor\", \"memo_dest_mismatch\")\n"
+      "            if not args.allow_unbound_memo:"
+      in Path(os.path.join(REPO, "thor_swap_preparer")).read_text())
+
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

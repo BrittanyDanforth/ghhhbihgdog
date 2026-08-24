@@ -185,9 +185,47 @@ def show(body: dict, now: float = None) -> int:
             "    name, and it cannot be undone or recalled.\n"
             "    DO NOT SEND ANYTHING. Go to the vault and check the slip there.")
 
+    # "I CANNOT TELL HOW OLD THIS IS" IS NOT "IT IS FRESH", and this treated
+    # them as the same thing by saying nothing.
+    #
+    # `t` comes off the slip, which the vault built from the thor_pairs JSON on
+    # its disk -- and seal_slip_for_delivery only checked that the field was
+    # not None, never that it was a usable time. So a float, a numeric string,
+    # a bool or an absent field all landed here, `age` stayed None, and the
+    # block below printed no age line and reached no staleness check. Driven,
+    # the SAME quote three hours old:
+    #
+    #     t = int   -> "Quoted: ~180 min ago", stale warning, exit 1
+    #     t = float -> no age line, no warning,               exit 0
+    #     t = str   -> no age line, no warning,               exit 0
+    #     t absent  -> no age line, no warning,               exit 0
+    #
+    # The exit code flipped on the TYPE of a field, so anything scripted around
+    # this read a three-hour-old quote as fine, and the operator got a
+    # complete, authoritative "send exactly X to Y" block with the one control
+    # that says "this has expired" silently missing.
+    #
+    # UNKNOWN IS REPORTED AND TREATED AS NOT-FRESH. This tool exists because
+    # the operator cannot walk to the vault; there is no second place to check
+    # the age. Refusing outright would be wrong -- the slip authenticated, the
+    # deposit address is real, and a quote with a broken clock field is still
+    # payable if it IS fresh -- so it prints, says plainly that the age is
+    # unknown, and exits non-zero exactly as a stale quote does.
+    #
+    # A NEGATIVE AGE is unusable too: a slip stamped in the future means the
+    # vault's clock and this machine's disagree, and every "N minutes old"
+    # computed from it is fiction. Same treatment.
     age = None
-    if isinstance(ts, int) and not isinstance(ts, bool):
+    ts_bad = ""
+    if isinstance(ts, bool) or not isinstance(ts, int):
+        ts_bad = ("absent" if ts is None
+                  else f"not a whole number of seconds ({type(ts).__name__})")
+    else:
         age = int((now if now is not None else time.time()) - ts)
+        if age < 0:
+            ts_bad = (f"stamped {abs(age) // 60} min in the FUTURE -- this "
+                      f"machine's clock and the vault's disagree")
+            age = None
 
     bar = "=" * 62
     print()
@@ -203,12 +241,30 @@ def show(body: dict, now: float = None) -> int:
     if age is not None:
         mins = age // 60
         print(f"  Quoted:        ~{mins} min ago")
+    else:
+        # NAMED IN THE BLOCK, not omitted from it. A missing line reads as
+        # "nothing to say"; this is a thing to say.
+        print(f"  Quoted:        UNKNOWN — the slip's timestamp is {ts_bad}")
     print(f"  {bar}")
     print()
     print("  The memo goes in an OP_RETURN output, in the same transaction, in")
     print("  PUBLIC and forever. Electrum: Tools -> Pay to many / OP_RETURN.")
     print("  A payment without the memo is a payment ThorChain cannot route.")
-    if age is not None and age > STALE_WARN_S:
+    if age is None:
+        print()
+        print(f"  [!] HOW OLD THIS QUOTE IS CANNOT BE ESTABLISHED: its "
+              f"timestamp is {ts_bad}.")
+        print(f"      Quotes expire, so treat this exactly as you would an old "
+              f"one -- poke")
+        print(f"      /depo again and send against a slip whose age you can "
+              f"read. A late swap")
+        print(f"      can be refunded minus fees, or filled at a rate you did "
+              f"not agree to.")
+        print(f"      (The slip itself is intact: it authenticated as sealed "
+              f"by your vault, so")
+        print(f"      this is a malformed field, not a forged slip.)")
+        return 1
+    if age > STALE_WARN_S:
         print()
         print(f"  [!] THIS QUOTE IS ~{age // 60} MINUTES OLD and quotes expire.")
         print(f"      Poke /depo again for a fresh one rather than sending")

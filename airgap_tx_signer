@@ -42,6 +42,7 @@ from gs_common import (
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
     secure_delete_or_warn,
     secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
+    delay_is_sane, MAX_PLANNED_DELAY,
 )
 
 def _validate_plan(plan: List[dict], phase: str = "create") -> None:
@@ -89,6 +90,34 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         # defaulted to 0 -- account 0's subaddress 0 is the wallet's PRIMARY
         # address, so a malformed value must stop the run, not silently spend
         # the operator's identity.
+        # THE PER-TX DELAY, CHECKED HERE BECAUSE THE RELAY WILL CHECK IT LATER.
+        #
+        # This tool writes `delay` verbatim into unsigned_manifest.json and
+        # carries it verbatim into signed_manifest_v1.json, and neither
+        # _validate_plan nor _validate_manifest_entries ever looked at it --
+        # while broadcast_signed_xmr refuses a manifest delay that is a bool, a
+        # float, a numeric string, a negative or above MAX_PLANNED_DELAY, and
+        # calls the manifest "the sign->relay trust boundary" when it does.
+        #
+        # So the WRITER accepted what the READER refuses. The cost is not
+        # abstract: signing is the air-gapped, manual, slow half of this
+        # toolchain, and the refusal lands at relay time -- after every blob is
+        # built and signed on a machine the operator has to walk back to.
+        # Refusing here costs them a one-line edit before any of that.
+        #
+        # delay_is_sane from gs_common, which is where it now lives precisely
+        # so a third reader could take it rather than write a fourth copy.
+        _dly = tx.get("delay")
+        if _dly is not None and not delay_is_sane(_dly):
+            sys.exit(
+                f"[!] Schema error at TX {i}: 'delay' is {_dly!r}, which is "
+                f"not a broadcast delay.\n"
+                f"    It must be a non-negative int of at most "
+                f"{MAX_PLANNED_DELAY}s (7 days) -- not a bool, a float or a\n"
+                f"    numeric string. broadcast_signed_xmr refuses exactly "
+                f"this, so signing the batch\n"
+                f"    first would only move the refusal to relay time, after "
+                f"every blob is built.")
         ai = tx.get("account_index")
         if ai is not None and (not isinstance(ai, int) or isinstance(ai, bool)
                                or ai < 0):
@@ -301,9 +330,15 @@ def _canonical_plan(plan: List[dict]) -> list:
       src_index    -- WHICH output is spent (becomes subaddr_indices)
       dst / amt    -- single-destination DAG hop
       destinations -- multi-destination fan-out, order-sensitive
-      delay        -- per-TX broadcast delay; broadcast reads it from the
-                      manifest, so a swapped delay changes relay timing, which
-                      is an OPSEC property worth detecting
+      delay        -- per-TX broadcast delay. Covering it here detects a
+                      swapped delay in the PLAN, and that is all it can do:
+                      broadcast reads the delay from the MANIFEST, and this
+                      fingerprint is computed over the plan, so a
+                      manifest-only edit matches it perfectly. The manifest's
+                      copy is checked against the plan's separately, in
+                      _load_signing_manifest -- this line used to imply that
+                      covering
+                      the field here was the whole protection, and it was not
       sweep        -- whether this entry sends the WHOLE subaddress balance.
                       It must be covered: flipping it turns a fixed-amount hop
                       into "send everything", which is a completely different
@@ -434,6 +469,24 @@ def _validate_manifest_entries(entries: List[dict], outdir: Path) -> None:
         if not isinstance(h, str) or len(h) != 64:
             sys.exit(f"[!] Manifest entry {n}: 'hash' must be a 64-char sha256 hex "
                      f"digest, got {h!r}")
+
+        # THE DELAY, AT THE SECOND PLACE IT CAN ARRIVE. _validate_plan catches
+        # a bad delay in the PLAN; this catches one in an unsigned manifest
+        # that was hand-edited or damaged between create and sign, which is the
+        # gap the plan check cannot see. phase_sign copies this field straight
+        # into signed_manifest_v1.json, so a value refused at relay time would
+        # otherwise be carried across the air gap first.
+        _d = entry.get("delay")
+        if _d is not None and not delay_is_sane(_d):
+            sys.exit(
+                f"[!] Manifest entry {n}: 'delay' is {_d!r}, which is not a "
+                f"broadcast delay.\n"
+                f"    It must be a non-negative int of at most "
+                f"{MAX_PLANNED_DELAY}s (7 days). This field is copied\n"
+                f"    verbatim into the signed manifest, and "
+                f"broadcast_signed_xmr refuses it there --\n"
+                f"    regenerate with --phase create rather than signing a "
+                f"batch the relay will reject.")
 
 
 #: How many times to rebuild an exact-consume peel chasing a matching fee.
@@ -1089,6 +1142,52 @@ def _load_signing_manifest(outdir, plan: list) -> list:
             f"    intermediate subaddress while reporting success.\n"
             f"    If phase create reported failures, fix the cause and re-run "
             f"--phase create."
+        )
+
+    # THE DELAY THE RELAY WILL ACTUALLY READ, cross-checked against the plan
+    # the fingerprint just authenticated.
+    #
+    # _canonical_plan covers `delay`, and its docstring says why: "broadcast
+    # reads it from the manifest, so a swapped delay changes relay timing,
+    # which is an OPSEC property worth detecting". But the fingerprint is
+    # computed over the PLAN, and broadcast reads the MANIFEST. Editing
+    # entries[i]["delay"] in unsigned_manifest.json changes the value phase_sign
+    # copies into signed_manifest_v1.json and leaves the plan untouched -- so
+    # the fingerprint matches perfectly, every entry is individually
+    # well-formed, the index set is complete, and the timing this covers was
+    # rewritten anyway. The field was covered; the copy of it that matters was
+    # not.
+    #
+    # Same shape as the completeness check above: the fingerprint proves the
+    # plan, and the manifest needs its own agreement with it. Refuse rather
+    # than reconcile -- a manifest whose delays disagree with its plan is not
+    # something phase_create can produce, and picking either value silently
+    # chooses somebody's relay schedule.
+    #
+    # phase_create writes `tx.get("delay", 0)`, so an absent plan delay is a
+    # manifest 0 and the two must be normalised the same way before comparing.
+    _dmis = []
+    for _e in entries:
+        _plan_d = plan[_e["idx"]].get("delay") or 0
+        _mani_d = _e.get("delay") or 0
+        if _plan_d != _mani_d:
+            _dmis.append((_e["idx"], _plan_d, _mani_d))
+    if _dmis:
+        integrity_log("signer", f"manifest_delay_mismatch:{len(_dmis)}")
+        sys.exit(
+            f"[!] {len(_dmis)} manifest entr(y/ies) carry a different 'delay' "
+            f"than the plan they were built from:\n"
+            + "".join(f"      TX {_i}: plan says {_p}s, manifest says {_m}s\n"
+                      for _i, _p, _m in _dmis[:5])
+            + f"    The plan fingerprint cannot see this -- it is computed over "
+              f"the PLAN, and the\n"
+              f"    relay reads the MANIFEST, so a manifest-only edit matches "
+              f"the fingerprint and\n"
+              f"    still rewrites when each transaction goes out. Those delays "
+              f"are what keeps the\n"
+              f"    batch from relaying as one timing cluster.\n"
+              f"    Re-run --phase create rather than signing a schedule "
+              f"nobody planned."
         )
     return entries
 

@@ -84,8 +84,11 @@ import gs_wake_proto as proto                                # noqa: E402
 ROLE = "delivery"
 
 
-def _file_delivery_public(path: Path) -> str:
+def _file_delivery_public(path: Path) -> tuple:
     """The delivery PUBLIC key recorded beside a sealed delivery keyfile.
+
+    Returns (public_hex, why) -- why is "" on success, else the reason there is
+    no usable value: "absent", "malformed" or "unreadable".
 
     Stored in the container HEAD, unencrypted, because it is not a secret --
     the vault's own keyfile already holds it in plaintext, which is the whole
@@ -94,16 +97,46 @@ def _file_delivery_public(path: Path) -> str:
     is A delivery key" WITHOUT the passphrase for the file, which the operator
     may well not have to hand when they are being warned about it.
 
-    "" when the field is absent, which is every keyfile minted before this
-    existed. The caller must treat that as UNKNOWN and say so, never as a
-    match: guessing here is the exact defect this function was added to fix.
+    THE REASON IS RETURNED BECAUSE THE CALLER STATED ONE AS FACT. This returned
+    a bare "" and swallowed every failure into it, and _refuse_existing then
+    printed "it was minted before that field existed" -- a specific cause, in a
+    confident sentence, about a file it had not established anything about.
+    Driven, six shapes reaching that one sentence:
+
+        field genuinely absent          ''   <- the only one it described
+        field present, truncated hex    ''
+        field present, not hex at all   ''
+        field present, a number         ''
+        file is not JSON (corrupt)      ''
+        file is empty                   ''
+
+    Three of those are the TAMPERING shape -- a head someone edited -- and
+    telling the operator "it is just an old keyfile" about an altered file is
+    worse than saying nothing, because it is an explanation that closes the
+    question. This function's own docstring already said the caller "must treat
+    that as UNKNOWN and say so, never as a match"; unknown has causes, and
+    naming the wrong one is the same defect in a smaller place.
     """
     try:
-        head = json.loads(path.read_text())
-        v = (head or {}).get("delivery_public") or ""
-        return v if isinstance(v, str) and len(bytes.fromhex(v)) == 32 else ""
+        raw = path.read_text()
     except Exception:                                        # noqa: BLE001
-        return ""
+        return "", "unreadable"
+    try:
+        head = json.loads(raw)
+    except Exception:                                        # noqa: BLE001
+        return "", "unreadable"
+    if not isinstance(head, dict) or "delivery_public" not in head:
+        return "", "absent"
+    v = head.get("delivery_public")
+    if not v:
+        # Present but empty/null is not the same as never written, and it is
+        # not something this tool produces.
+        return "", "malformed"
+    try:
+        ok = isinstance(v, str) and len(bytes.fromhex(v)) == 32
+    except Exception:                                        # noqa: BLE001
+        ok = False
+    return (v, "") if ok else ("", "malformed")
 
 
 def _refuse_existing(path: Path, vault_names_one: bool,
@@ -126,7 +159,7 @@ def _refuse_existing(path: Path, vault_names_one: bool,
     if not path.exists():
         return
     if vault_names_one:
-        _file_pub = _file_delivery_public(path)
+        _file_pub, _why = _file_delivery_public(path)
         if _file_pub and vault_public and _file_pub != vault_public:
             sys.exit(
                 f"[!] {path} already exists, and it is NOT the delivery key "
@@ -141,23 +174,69 @@ def _refuse_existing(path: Path, vault_names_one: bool,
                 f"vault will seal to,\n"
                 f"    or restore the real one if you still have it.")
         if not _file_pub:
+            # THE CAUSE IS REPORTED, NOT GUESSED. This said "it was minted
+            # before that field existed" for all of absent / malformed /
+            # unreadable, and only the first of those is that. The other two
+            # are the shape a TAMPERED or damaged head takes, and an
+            # explanation that closes the question is worse there than none.
+            _cause = {
+                "absent": ("it records no delivery_public field at all, which "
+                           "is how every keyfile minted before that field "
+                           "existed looks"),
+                "malformed": ("it HAS a delivery_public field and the value is "
+                              "not a 32-byte hex public key -- this tool never "
+                              "writes that, so the header has been edited or "
+                              "damaged"),
+                "unreadable": ("it could not be read or parsed as JSON at all, "
+                               "so nothing about its contents is established"),
+            }.get(_why, "the recorded public key could not be established")
+            integrity_log("delivery", f"refuse_existing_unknown:{_why or 'other'}")
             sys.exit(
                 f"[!] {path} already exists and this vault names a delivery "
-                f"key, but this\n"
-                f"    file records no public key, so whether they are the SAME "
-                f"key CANNOT be\n"
-                f"    checked from here -- it was minted before that field "
-                f"existed, and the\n"
-                f"    secret inside is sealed.\n"
+                f"key, but whether\n"
+                f"    they are the SAME key CANNOT be checked from here: "
+                f"{_cause}.\n"
+                f"    The secret inside is sealed, so nothing here can settle "
+                f"it without the\n"
+                f"    passphrase.\n"
                 f"    Confirm it with `show --key {path}` and compare against "
                 f"the vault, or move\n"
                 f"    it aside and run `new --replace`. Refusing to overwrite "
                 f"it either way.")
+        # "RECORDS", NOT "IS", AND THAT DISTINCTION IS THE WHOLE POINT.
+        #
+        # The first version of this branch said "already exists and the vault
+        # seals to it" on the strength of the head field matching -- and the
+        # head is OUTSIDE the sealed box, so anyone who can write the file can
+        # put any value there. Driven: a file whose sealed secret is B, with a
+        # head claiming A, against a vault sealing to A, printed exactly that
+        # sentence. Which is the same confident false statement this function
+        # was rewritten to remove, reached by tampering instead of by accident.
+        #
+        # The head field can carry the MISMATCH branch above safely, because
+        # both readings of a mismatch -- a genuinely different key, or a
+        # tampered head -- end in "do not trust this file". It cannot carry
+        # this one: a match is only evidence if the field is authentic, and
+        # nothing here has the passphrase to check that.
+        #
+        # So this says what is actually known, and points at the command that
+        # CAN check it. _open_delivery verifies the head against the sealed
+        # secret whenever the file is opened, so `show` settles it.
         sys.exit(
-            f"[!] {path} already exists and the vault seals to it.\n"
-            f"    Refusing to overwrite it: replacing this file makes every\n"
-            f"    future slip unopenable, and it fails at the moment a swap is\n"
-            f"    quoted and money is waiting on it.\n"
+            f"[!] {path} already exists and RECORDS the delivery key this "
+            f"vault seals to.\n"
+            f"    That match is what the file's header claims, and the header "
+            f"is outside the\n"
+            f"    sealed box -- so it is a label, not proof. `show --key "
+            f"{path}` opens the\n"
+            f"    file and checks the label against the secret inside; this "
+            f"cannot, because it\n"
+            f"    has no passphrase.\n"
+            f"    Refusing to overwrite it either way: replacing this file "
+            f"makes every future\n"
+            f"    slip unopenable, and it fails at the moment a swap is quoted "
+            f"and money is\n"
+            f"    waiting on it.\n"
             f"    To re-key deliberately: move this aside and run `new "
             f"--replace`.\n"
             f"    Slips already sent become unreadable either way.")
@@ -369,15 +448,84 @@ def cmd_shred(args) -> int:
     # its own 0400 file before overwriting, so the success path works; this
     # check is what makes the failure path honest.
     if not secure_delete_file(path):
-        integrity_log("delivery", "key_shred_FAILED")
+        # "NOTHING WAS OVERWRITTEN" WAS A GUESS, AND IN THE COMMONEST FAILURE
+        # IT IS THE OPPOSITE OF WHAT HAPPENED.
+        #
+        # secure_delete_file overwrites the extent FIRST and unlinks second, so
+        # a failure can land on either side of that. When the directory denies
+        # unlink -- removable media mounted read-only, or a directory the
+        # operator does not own, which is exactly where this file is told to
+        # live -- the overwrite SUCCEEDS and the unlink fails. Driven: a 657
+        # byte keyfile came back 657 bytes of ZEROS, and the first version of
+        # this message told the operator "Nothing was overwritten. The delivery
+        # secret is still on this machine."
+        #
+        # Both halves false, and false in the direction that costs them
+        # everything: believing they still hold the key, they shred the copy on
+        # the sending machine, or simply never re-key -- and every future slip
+        # is unopenable, discovered at the moment a swap is quoted and money is
+        # waiting on it.
+        #
+        # WHICH ONE HAPPENED IS READABLE WITHOUT A PASSPHRASE. An intact keyfile
+        # is a sealed JSON container; an overwritten one is not JSON at all. So
+        # ask the file rather than assert.
+        # THREE STATES, and the first draft of this asserted two. "The file is
+        # still on disk" is itself a claim -- secure_delete_file also returns
+        # False when its opening lstat fails, i.e. when the file is not there
+        # at all -- so it is checked rather than assumed, for the same reason
+        # the overwrite is.
+        _exists = path.exists()
+        _still_a_key = False
+        if _exists:
+            try:
+                _still_a_key = proto.keyfile_is_sealed(
+                    json.loads(path.read_text()))
+            except Exception:                                # noqa: BLE001
+                _still_a_key = False
+        integrity_log("delivery",
+                      "key_shred_FAILED_gone" if not _exists
+                      else "key_shred_FAILED_intact" if _still_a_key
+                      else "key_shred_FAILED_after_overwrite")
+        if not _exists:
+            sys.exit(
+                f"[!] The shred reported FAILURE, and {path} is not there any "
+                f"more.\n"
+                f"    Those two do not normally go together: something removed "
+                f"it out from under\n"
+                f"    this command, or the path changed while it ran. Nothing "
+                f"here can say whether\n"
+                f"    the contents were overwritten first.\n"
+                f"    TREAT THE COPY ON THE SENDING MACHINE AS YOUR ONLY ONE "
+                f"and verify it opens\n"
+                f"    there now: `gs_unseal --key <file> --self-test`.")
+        if _still_a_key:
+            sys.exit(
+                f"[!] {path} could NOT be destroyed, and it is still there "
+                f"INTACT.\n"
+                f"    It still opens as a sealed delivery key, so nothing was "
+                f"overwritten and the\n"
+                f"    delivery secret is still on this machine -- the one place "
+                f"it is not supposed\n"
+                f"    to live.\n"
+                f"    Check that you own the file and can write to its "
+                f"directory, then run this\n"
+                f"    again. If the media is read-only, destroy the media.")
         sys.exit(
-            f"[!] {path} could NOT be destroyed, and it is still there.\n"
-            f"    Nothing was overwritten. The delivery secret is still on "
-            f"this machine,\n"
-            f"    which is the one place it is not supposed to live.\n"
-            f"    Check that you own the file and can write to its directory, "
-            f"then run this again.\n"
-            f"    If the media is read-only, destroy the media.")
+            f"[!] {path} was OVERWRITTEN but could not be removed.\n"
+            f"    The file is still on disk and it is now a husk: it no longer "
+            f"parses as a\n"
+            f"    sealed keyfile, so the delivery secret THAT WAS IN IT IS "
+            f"GONE. This copy is\n"
+            f"    destroyed even though the filename remains.\n"
+            f"    YOU ARE NOW RELYING ENTIRELY ON THE COPY YOU MADE ON THE "
+            f"SENDING MACHINE.\n"
+            f"    Verify it opens there NOW -- `gs_unseal --key <file> "
+            f"--self-test` -- before\n"
+            f"    anything else. If it does not, no future slip can be opened "
+            f"and there is no\n"
+            f"    recovery.\n"
+            f"    Then delete the husk by hand; it holds nothing, but it names "
+            f"what it was.")
     integrity_log("delivery", "key_shredded")
     print(f"  [+] {path} destroyed.")
     return 0
@@ -408,6 +556,44 @@ def _open_delivery(path: Path, args) -> dict:
             ok = False
         if not ok:
             sys.exit(f"[!] {path} carries no usable {f}.")
+    # THE LABEL MUST MATCH THE KEY IT LABELS.
+    #
+    # delivery_public lives in the container HEAD, unencrypted, so
+    # _refuse_existing can compare it without a passphrase. That is what makes
+    # it useful and it is also what makes it forgeable: the head is outside the
+    # sealed box, so anyone who can write the file can set it to anything.
+    # Driven -- a file whose sealed secret was B, with a head claiming A,
+    # against a vault sealing to A -- and _refuse_existing's match branch said
+    # "the vault seals to it". Which is the confident false statement that
+    # branch was rewritten to stop making.
+    #
+    # HERE is where it can actually be settled, because here there IS a
+    # passphrase and the secret is in hand. Deriving the public key from the
+    # sealed secret and comparing costs one scalar multiplication and turns the
+    # head field from a claim into a checked one -- for `show`, which is the
+    # command _refuse_existing now points the operator at, and for `shred`,
+    # which must never destroy a file on the strength of a forged label.
+    #
+    # ABSENT IS FINE, MISMATCHED IS NOT. Every keyfile minted before the field
+    # existed has no head entry, and those still open normally; only a head
+    # that is PRESENT and WRONG is refused, because that cannot happen by age.
+    _head_pub = (container.get("delivery_public") or "")
+    if _head_pub:
+        import nacl.public
+        _real = bytes(nacl.public.PrivateKey(
+            bytes.fromhex(payload["delivery_secret"])).public_key).hex()
+        if _head_pub != _real:
+            sys.exit(
+                f"[!] {path} has been TAMPERED WITH.\n"
+                f"    Its header labels it   : {str(_head_pub)[:16]}...\n"
+                f"    The sealed secret is   : {_real[:16]}...\n"
+                f"    The header is outside the sealed box, so a mismatch means "
+                f"someone edited\n"
+                f"    the label -- the secret itself is intact and "
+                f"Poly1305-authenticated, or it\n"
+                f"    would not have opened at all. Something wanted this file "
+                f"to be taken for a\n"
+                f"    key it is not. Do not use it; find out what wrote to it.")
     return payload
 
 

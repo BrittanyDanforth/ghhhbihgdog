@@ -235,6 +235,23 @@ _EXEMPT = {
     # "tx_staging" -- a GS_ARTIFACT_DIR_PATTERNS entry, so the whole tree goes.
     # Matched by DIRECTORY, not by name; that is why the name check misses it.
     "bcast_progress.json": "lives under tx_staging/, erased as a directory",
+    # The OPERATOR'S OWN MONERO WALLET, the default for --wallet-file. Written
+    # by monero-wallet-cli, not by anything here, and sweeping it would destroy
+    # the wallet the whole toolchain exists to spend from -- the same reason
+    # gs_delivery.key is exempt, with more at stake.
+    "offline.wallet": "the operator's wallet file; this toolchain never writes "
+                      "or wipes it",
+}
+
+#: Names that match the scan's shape but are not artifacts at all: source files
+#: and external binaries this toolchain READS. Separate from _EXEMPT, which
+#: means "an artifact we deliberately do not wipe" -- collapsing the two would
+#: make the exemption list a place to hide a real artifact.
+_NOT_ARTIFACTS = {
+    "gs_common.py": "this repo's own source",
+    "tumble.py": "JoinMarket's tumbler, named in a comment about a wrong path",
+    "tumbler.py": "JoinMarket's tumbler script, an INPUT this tool executes",
+    "tor.exe": "the Tor binary on Windows, a path gs_console searches",
 }
 
 
@@ -242,12 +259,32 @@ def _erased_by_name(name):
     return any(_fn.fnmatch(name, p) for p in _gsc_w.GS_ARTIFACT_FILE_PATTERNS)
 
 
+# A BLACKLIST, NOT A WHITELIST, and that is the whole repair. This read
+#
+#     r'"([a-z0-9_]+\.(?:json|log|hex|key))"'
+#
+# -- an enumeration of the extensions somebody had thought of. accounts_count
+# .txt is the toolchain's only .txt artifact, written by airgap_tx_signer one
+# line after the outputs_export.hex that IS swept, into the same directory, and
+# matched by no wipe pattern. This scan exists so that a new artifact "lands
+# here as a red check until somebody classifies it", and instead the .txt was
+# INVISIBLE to it: not unaccounted, just never looked at. A whitelist of
+# extensions cannot do the job this check is for, because the next artifact
+# will have the next extension.
+#
+# So: any extension, and the two things that shape rules out are ruled out by
+# RULE rather than by list. The extension must start with a LETTER, which drops
+# every decimal literal ("0.0001", "65432.10") without naming them; and .py/
+# .exe names go in _NOT_ARTIFACTS with a reason, the same as any exemption.
+_ARTIFACT_LITERAL = _re.compile(r'"([a-z0-9_]+\.[a-z][a-z0-9]{0,5})"')
 _seen, _unaccounted = {}, []
 for _t in _TOOLS:
     _src = open(os.path.join(REPO, _t)).read()
     # Only literals that look like a written artifact, and only where the file
     # is a NAME rather than a URL path or a doc reference.
-    for _m in _re.finditer(r'"([a-z0-9_]+\.(?:json|log|hex|key))"', _src):
+    for _m in _ARTIFACT_LITERAL.finditer(_src):
+        if _m.group(1) in _NOT_ARTIFACTS:
+            continue
         _seen.setdefault(_m.group(1), set()).add(_t)
 for _name, _who in sorted(_seen.items()):
     if _erased_by_name(_name) or _name in _EXEMPT:
@@ -263,6 +300,64 @@ check(f"NON-VACUITY: the scan found artifact filenames to check "
 check("NON-VACUITY: ...including the one that was missing, which is now "
       "erased by name", "gs_wake_status.json" in _seen
       and _erased_by_name("gs_wake_status.json"))
+# NON-VACUITY: the widened scan must actually SEE the extension the old one
+# enumerated past, or this is the same check with longer comments.
+check("NON-VACUITY: the scan now sees the .txt artifact the extension "
+      "whitelist made invisible", "accounts_count.txt" in _seen)
+check("...and accounts_count.txt is erased by name",
+      _erased_by_name("accounts_count.txt"))
+check("NON-VACUITY: a fabricated artifact name is NOT erased, so "
+      "_erased_by_name is not answering True to everything",
+      not _erased_by_name("some_new_artifact.txt"))
+
+# ---------------------------------------------------------------------------
+# THE NAMES BUILT AT RUNTIME, which the literal scan structurally cannot see.
+#
+# Half this toolchain's artifacts are f-strings -- f"thor_pairs_{handle}.json",
+# f"unsigned_exit_{secure_hex(6)}.json", f"tx_{idx}.signed" -- and a scan over
+# string literals walks straight past every one. They are meant to be covered
+# by GLOB patterns rather than by exact names, and they are; but "they are" was
+# an unverified claim, so the next one added would have been too.
+#
+# Substituting * for each {...} turns the f-string into the narrowest glob that
+# can describe what it produces, which is exactly what the wipe list has to
+# match.
+_RUNTIME_NAME = _re.compile(
+    r'f"([a-z0-9_]*\{[a-z0-9_.\[\]()]+\}[a-z0-9_{}]*\.[a-z][a-z0-9]{0,5})"')
+#: f-strings that are a SUFFIX concatenated onto another artifact's stem, not a
+#: whole filename. The scan cannot tell the difference from the literal alone,
+#: so each one is classified here with the name it actually composes to -- and
+#: that composed name is checked against the wipe list below, so this is a
+#: statement of shape, not a way out of the check.
+_RUNTIME_FRAGMENTS = {
+    # GhostSpiral:8339 -- str(peel_file)[:-5] + f"_peel{i}.json", and peel_file
+    # is the fanout plan (GhostSpiral:7554, unsigned_fanout_{plan_tag}.json).
+    "_peel*.json": "unsigned_fanout_*_peel*.json",
+}
+_runtime, _runtime_bad = {}, []
+for _t in _TOOLS:
+    _src = open(os.path.join(REPO, _t)).read()
+    for _m in _RUNTIME_NAME.finditer(_src):
+        _g = _re.sub(r"\{[^}]*\}", "*", _m.group(1))
+        if _g.rsplit(".", 1)[-1] in ("py", "exe"):
+            continue                     # source/binaries, per _NOT_ARTIFACTS
+        _runtime.setdefault(_RUNTIME_FRAGMENTS.get(_g, _g), set()).add(_t)
+# Every classification must still describe something the scan actually found,
+# or the dict becomes a place to park a name nobody checks.
+check(f"every runtime-name classification still matches a live f-string "
+      f"({sorted(set(_RUNTIME_FRAGMENTS.values()) - set(_runtime)) or 'all present'})",
+      not (set(_RUNTIME_FRAGMENTS.values()) - set(_runtime)))
+for _g, _who in sorted(_runtime.items()):
+    # Substitute a concrete token for the * so fnmatch has something to chew.
+    if not _erased_by_name(_g.replace("*", "X")):
+        _runtime_bad.append((_g, sorted(_who)))
+check(f"every artifact name BUILT AT RUNTIME is erased by a glob "
+      f"(unaccounted: {_runtime_bad or 'none'})", not _runtime_bad)
+check(f"NON-VACUITY: the runtime scan found names to check "
+      f"({len(_runtime)} globs)", len(_runtime) >= 5)
+check("NON-VACUITY: ...including the peel chain's derived name, which is a "
+      "suffix appended to another artifact's stem rather than a literal",
+      _erased_by_name("unsigned_fanout_ab12_peel3.json"))
 # ...and every exemption must still be a real artifact somebody writes, or the
 # list becomes a place to hide things.
 check(f"every exemption still corresponds to a filename in the source "

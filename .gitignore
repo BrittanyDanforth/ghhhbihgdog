@@ -89,6 +89,12 @@ gs_wake_*.key
 # offline wallet can sign spends of earlier rounds. Maps the wallet holdings.
 outputs_export.hex
 
+# Written by airgap_tx_signer one line after outputs_export.hex, into the same
+# directory: the online wallet's account count, which the offline wallet has to
+# match. GhostSpiral puts every output in its own account, so this number is a
+# running tally of how many outputs this wallet has handled.
+accounts_count.txt
+
 # The Pi/vault wake channel. The .key files hold an X25519 SECRET each; the
 # state file is the job ledger; the handles file maps a handle to the bundle
 # and slip it names. Suffixed patterns, NOT "gs_wake_*" -- that would shadow

@@ -41,6 +41,22 @@ Requires=wg-quick@wg0.service tor.service
 
 [Service]
 Type=simple
+# NO CORE DUMPS, FROM execve ONWARD.
+#
+# The tools suppress this themselves at module import (gs_common's first
+# executable statement; gs_console and gs_doorbell carry their own, because
+# neither may import gs_common). That covers every third-party and crypto
+# import -- nacl/libsodium, requests, tenacity -- but it CANNOT cover the
+# window before the interpreter runs any of our code: exec, dynamic linking,
+# site.py, and the entry script's own `import hashlib, decimal`. No Python
+# statement is early enough for that; the launcher is.
+#
+# It matters here because the secret arrives in the ENVIRONMENT
+# (the bot token, and the handles it relays), so it is in the process image from execve --
+# a dump taken at ANY point after that contains it. Driven: with
+# `ulimit -c unlimited` and the variable set, a SIGABRT wrote a 5 MB core and
+# the secret was in it.
+LimitCORE=0
 # NOTHING TO THE JOURNAL, for the same reason as the doorbell's unit: the
 # pager's own stdout names the job it is running and the handle it got back,
 # and the journal is persistent storage on the SD card of the box that is

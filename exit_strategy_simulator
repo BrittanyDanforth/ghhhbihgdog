@@ -64,7 +64,7 @@ screen while the full plan still goes to the 0600 JSON file.
 """
 from __future__ import annotations
 import argparse, os, sys, time
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Dict
 
@@ -101,6 +101,78 @@ METHODS: Dict[str, Dict] = {
 }
 
 
+#: The largest fiat-per-unit rate this tool will treat as a price. A rate is a
+#: third-party number and it multiplies the operator's holding, so it needs the
+#: same ceiling their own amount got -- that lesson was applied to
+#: GS_EXIT_AMOUNT and not to the value the oracle sends.
+#:
+#: DRIVEN: an oracle answering xmr_usd = 1e25 sailed past every check here
+#: (finite, positive) and reached `(net * fiat_rate).quantize(Decimal("0.01"))`,
+#: which raised decimal.InvalidOperation -- an uncaught traceback out of the
+#: middle of main(), after Tor was verified and the fetch had been made over it.
+#: Identical crash, identical cause, opposite input.
+#:
+#: One billion currency units per coin: far above any price either asset has
+#: ever had or plausibly could, and far below the precision cliff. This is a
+#: SANITY CEILING, not a plausibility band -- it says "that is not a price at
+#: all", never "that price looks wrong", which is the distinction this file
+#: draws everywhere else (see the removed liquidity_estimate).
+ABSURD_RATE = Decimal("1000000000")
+
+
+#: Significant figures kept in the plan file's coarsened prices.
+#:
+#: THREE, chosen so xmr_usd is unchanged from the whole-unit rounding this
+#: replaces (164.83 -> 165, either way) while btc_usd stops being exempt.
+ORACLE_SIGFIGS = 3
+
+
+def coarsen_rate(v: Decimal) -> Decimal:
+    """Blur a price by a fixed RELATIVE amount, not a fixed absolute one.
+
+    oracle_prices and amount_out_fiat are coarsened so the 10-minute timestamp
+    bucket cannot be inverted from a spot rate. That was done with
+    `.quantize(Decimal("1"))` -- round to whole currency units -- and whole
+    units are an ABSOLUTE granularity applied to fields whose magnitudes differ
+    by three orders of magnitude. The blur is 0.5/price, so the bigger the
+    number the less of it there is, and `oracle_prices` carries btc_usd right
+    beside xmr_usd. Measured, at a calm 0.05%/10min drift:
+
+        field       true        whole unit   rel. err    instant pinned to
+        xmr_usd       164.83           165   0.30334%    +/- 60.67 min
+        btc_usd     65432.10         65432   0.00076%    +/-  0.15 min
+        btc_usd    118940.55        118941   0.00042%    +/-  0.08 min
+
+    So the field the coarsening was written for was protected and the field
+    beside it handed the instant back to NINE SECONDS -- under a note claiming
+    "neither hands back a full-precision spot rate". This is the same shape as
+    the defect recorded on amount_out_fiat below: one field in the dict quietly
+    undoing the protection the next one advertises.
+
+    Significant figures are magnitude-independent: the granularity is one unit
+    in the third digit whatever the exponent, so the relative blur stays inside
+    (0.1%, 1%] for every price. The same table at 3 sig figs reads +/-60.67,
+    +/-15.28 and +/-84.08 minutes -- all at or beyond the bucket width.
+
+    It also cannot INVENT A ZERO, which whole units could: xmr_btc = 0.00251937
+    quantizes to whole units as 0, and a rate of zero is the one output this
+    file refuses to produce (see the fiat_val guard in main()). Three
+    significant figures of a positive number are still positive.
+
+    Returned in FIXED notation. `Decimal("65432.10").quantize(Decimal("1E+2"))`
+    is Decimal("6.54E+4") and str()s that way, which is what would have landed
+    in the JSON; re-reading the formatted text normalises the exponent so the
+    file says 65400 and arithmetic on the result is unchanged.
+    """
+    v = Decimal(str(v))
+    if not v.is_finite() or v == 0:
+        return v
+    # adjusted() is floor(log10(|v|)), so this is one unit in the
+    # ORACLE_SIGFIGS-th significant digit.
+    step = Decimal(1).scaleb(v.adjusted() - (ORACLE_SIGFIGS - 1))
+    return Decimal(format(v.quantize(step, rounding=ROUND_HALF_EVEN), "f"))
+
+
 def fetch_prices(proxy):
     """Fetch XMR and BTC prices. Falls back to Bisq price oracle if CoinGecko fails."""
     try:
@@ -119,31 +191,53 @@ def fetch_prices(proxy):
         # serves a made-up price", and a zero rate silently values the entire
         # holding at 0.00. Falling through to Bisq is the right response, and
         # is what the sibling would already have done.
-        bad = [k for k, v in out.items() if v <= 0]
+        bad = [k for k, v in out.items() if not (0 < v <= ABSURD_RATE)]
         if bad:
-            raise ValueError(f"non-positive rate(s) from CoinGecko: {bad}")
+            raise ValueError(
+                f"rate(s) from CoinGecko outside (0, {ABSURD_RATE}]: {bad}")
         out["source"] = "coingecko"
         return out
     except Exception as e:
         integrity_log("exit", f"coingecko_fail:{type(e).__name__}")
+        # KEPT, NOT DISCARDED. The diagnosis below was computed from the BISQ
+        # failure alone, so "The Bisq fallback did not fail on the network" was
+        # the whole story an operator got -- accurate about Bisq, and silent
+        # about a CoinGecko attempt that may well have died on a dead Tor
+        # circuit moments earlier. Two oracles failed; the message named one.
+        _cg_err = e
 
     # Fallback: Bisq price oracle (returns all market prices)
     try:
         j = safe_get(BISQ_PRICE_URL, proxy)
         prices = {}
+        # WHICH CODES CAME BACK, separately from which produced a usable rate.
+        # The refusal below inferred "it carried no XMR market" from `prices`,
+        # which is only populated when the price ALSO passes the (0, ABSURD]
+        # guard -- so an XMR entry quoting 0, a negative, or 1e30 was reported
+        # as an ABSENT market. Driven, all three: "it carried no XMR market"
+        # about a response that carried one. That sends the operator to look
+        # for a market that is there, instead of at the price that is not a
+        # price -- in the block whose entire purpose is naming the ACTUAL
+        # failure rather than the plausible one.
+        seen_codes = set()
         for entry in j.get("data", []):
             code = entry.get("currencyCode", "")
             price = entry.get("price", 0)
-            if code == "XMR" and price > 0:
+            if code:
+                seen_codes.add(code)
+            # 0 < price <= ABSURD_RATE, not `price > 0`. The ceiling belongs
+            # on every branch that accepts a third-party number, or the sibling
+            # keeps the hole the other one closed.
+            if code == "XMR" and 0 < price <= ABSURD_RATE:
                 # Bisq quotes altcoin markets as BTC-per-unit (BTC per XMR).
                 prices["xmr_btc"] = Decimal(str(price))
-            elif code == "USD" and price > 0:
+            elif code == "USD" and 0 < price <= ABSURD_RATE:
                 # Bisq quotes fiat as fiat-per-BTC (USD per BTC). Do NOT invert:
                 # xmr_usd = xmr_btc[BTC/XMR] * btc_usd[USD/BTC] = USD/XMR. The
                 # old 1.0/price made btc_usd = BTC/USD, so the product came out
                 # ~9 orders of magnitude too small and quantized to 0.00.
                 prices["btc_usd"] = Decimal(str(price))
-            elif code == "EUR" and price > 0:
+            elif code == "EUR" and 0 < price <= ABSURD_RATE:
                 prices["btc_eur"] = Decimal(str(price))
 
         if "xmr_btc" in prices and "btc_usd" in prices:
@@ -175,11 +269,24 @@ def fetch_prices(proxy):
         #
         # A renamed currencyCode key is exactly how this arrives in practice,
         # and it sends the operator to debug the one thing that is fine.
-        _bisq_err = ValueError(
-            f"Bisq answered and the response parsed, but it carried no "
-            f"{'XMR' if 'xmr_btc' not in prices else 'USD'} market "
-            f"(got: {', '.join(sorted(prices)) or 'no usable markets at all'})")
-        integrity_log("exit", "bisq_oracle_missing_market")
+        _want = "XMR" if "xmr_btc" not in prices else "USD"
+        if _want in seen_codes:
+            # The market IS there; its price is what this tool will not use.
+            _bisq_err = ValueError(
+                f"Bisq answered and the response parsed, and it DID carry "
+                f"{'an' if _want == 'XMR' else 'a'} {_want} market -- but the "
+                f"price it quoted is not one this "
+                f"tool will use (it must be greater than 0 and at most "
+                f"{ABSURD_RATE}). Usable markets: "
+                f"{', '.join(sorted(prices)) or 'none'}")
+            integrity_log("exit", "bisq_oracle_unusable_price")
+        else:
+            _bisq_err = ValueError(
+                f"Bisq answered and the response parsed, but it carried no "
+                f"{_want} market at all (codes returned: "
+                f"{', '.join(sorted(seen_codes)) or 'none'}; usable markets: "
+                f"{', '.join(sorted(prices)) or 'none'})")
+            integrity_log("exit", "bisq_oracle_missing_market")
     except Exception as e:
         integrity_log("exit", f"bisq_oracle_fail:{type(e).__name__}")
         _bisq_err = e
@@ -193,6 +300,10 @@ def fetch_prices(proxy):
         _e = _bisq_err
     except NameError:
         _e = None
+    try:
+        _cge = _cg_err
+    except NameError:
+        _cge = None
     _network = _e is None or isinstance(
         _e, (OSError, ConnectionError, TimeoutError))
     if not _network:
@@ -204,6 +315,16 @@ def fetch_prices(proxy):
         _why = (f"\n    The Bisq fallback did not fail on the network: it failed "
                 f"on the\n    response ({type(_e).__name__}: {str(_e)[:200]}). "
                 f"That is a payload/format\n    problem, not a connectivity one.")
+    # BOTH ORACLES ARE NAMED, because both of them failed and the headline says
+    # so. When Bisq died on the payload and CoinGecko died on the network, the
+    # only diagnosis printed was "not a connectivity one" -- true of Bisq, and
+    # the reason to check Tor was in the half that was never shown.
+    _cg_net = _cge is not None and isinstance(
+        _cge, (OSError, ConnectionError, TimeoutError))
+    if _cge is not None:
+        _why += (f"\n    CoinGecko was tried first and failed "
+                 f"{'on the NETWORK' if _cg_net else 'on the response'} "
+                 f"({type(_cge).__name__}: {str(_cge)[:120]}).")
     sys.exit(
         "[!] All price oracles failed (CoinGecko + Bisq).\n"
         "    Cannot generate exit plan without prices." + _why + "\n"
@@ -212,9 +333,22 @@ def fetch_prices(proxy):
         # followed by "check Tor connectivity" -- so the paragraph that exists
         # to stop the operator debugging Tor ended by telling them to. The
         # remedy now follows the diagnosis.
-        + ("    Check Tor connectivity and retry." if _network else
+        #
+        # AND IT FOLLOWS BOTH DIAGNOSES, because there are two oracles and the
+        # headline says both failed. This was computed from the Bisq failure
+        # alone, so the mixed case -- CoinGecko unreachable, Bisq answering
+        # with a payload this tool cannot use -- printed "Tor is not the
+        # problem" on a run whose first oracle never got a packet back. Three
+        # states, three remedies; the mixed one is the whole reason the
+        # CoinGecko error is kept rather than discarded.
+        + ("    Check Tor connectivity and retry." if _network and _cg_net else
            "    Tor is not the problem; retry, or check whether the oracle's\n"
-           "    response format has changed.")
+           "    response format has changed." if not _network and not _cg_net
+           else
+           "    CHECK BOTH: one oracle was unreachable and the other "
+           "answered.\n"
+           "    Tor may be down for some destinations, and the oracle that "
+           "did answer\n    sent something this tool cannot use.")
     )
 
 
@@ -265,12 +399,15 @@ def main():
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
     ap.add_argument("--redact", action="store_true",
-                    help="mask amounts and values on the terminal (the full plan "
-                         "is still written to the 0600 JSON file). Use when "
+                    help="mask amounts and values on the terminal. Use when "
                          "screen-sharing or in a shoulder-surfing risk. It masks "
                          "the DIGITS, not the digit COUNT -- a 3-digit holding "
                          "still shows as ###.#### -- so it hides the exact figure, "
-                         "not the order of magnitude.")
+                         "not the order of magnitude. NOTE: the plan file records "
+                         "the fiat value computed from the WHOLE-UNIT rate, not "
+                         "the exact one, so under --redact the exact fiat figure "
+                         "is not on the screen and not in the file either -- "
+                         "re-run without --redact if you need to read it.")
     ap.add_argument("--outfile", default="exitplan_v1.json")
     args = ap.parse_args()
 
@@ -311,7 +448,15 @@ def main():
     # max_value is what closes it: XMR_ABSURD_TOTAL is 100,000,000 XMR against
     # a ~18.4M supply, so no real holding is refused and no arithmetic below
     # can overflow the Decimal context.
-    args.amount = decimal_env("GS_EXIT_AMOUNT", _amt, positive=True,
+    # THE LABEL NAMES THE SOURCE THE VALUE ACTUALLY CAME FROM. env_or_argv
+    # returns the POSITIONAL argument when the variable is unset, so hard-coding
+    # "GS_EXIT_AMOUNT" told an operator who typed `exit_strategy_simulator abc`
+    # that their ENVIRONMENT was wrong -- sending them to unset a variable they
+    # never set. decimal_env puts this string at the front of every refusal it
+    # writes, so it is the whole diagnosis.
+    _src = ("GS_EXIT_AMOUNT" if os.environ.get("GS_EXIT_AMOUNT")
+            else "The off-ramp amount")
+    args.amount = decimal_env(_src, _amt, positive=True,
                               max_value=XMR_ABSURD_TOTAL)
 
     if not args.tor_proxy:
@@ -398,13 +543,22 @@ def main():
     # only thing asserted here is arithmetic: a positive amount times a real
     # rate cannot round to zero, so if it did, one of the two was not real.
     if fiat_rate <= 0 or fiat_val <= 0:
+        # THE RATE, NEVER THE HOLDING. The first version of this interpolated
+        # {net} and {fiat_val} at full precision and printed them
+        # unconditionally -- bypassing --redact, which exists so the magnitudes
+        # can be kept off a shared screen, and doing it in a message the
+        # operator cannot suppress. _m() (the masker every other amount line
+        # goes through) is not even defined this early in main().
+        #
+        # It is also unnecessary: the rate alone says what is wrong, and the
+        # rate is the ORACLE's number, not the operator's secret.
         sys.exit(
-            f"[!] The {prices.get('source', '?')} rate values {net} XMR at "
-            f"{fiat_val} {args.currency.upper()}.\n"
+            f"[!] The {prices.get('source', '?')} rate is "
+            f"{fiat_rate} {args.currency.upper()}/XMR, which values this "
+            f"holding at nothing.\n"
             f"    A positive holding at a real rate cannot round to zero, so "
-            f"the rate\n"
-            f"    ({fiat_rate} {args.currency.upper()}/XMR) is not a real one. "
-            f"Refusing to report it as live.\n"
+            f"that is not a\n"
+            f"    real rate. Refusing to report it as live.\n"
             f"    Re-run to get a fresh quote; if it persists, the oracle's "
             f"response format has changed."
         )
@@ -433,13 +587,14 @@ def main():
                                 else "not_supplied_assumed_zero"),
         "net_xmr": str(net.quantize(Decimal("0.0001"))),
         "currency": args.currency,
-        # COARSENED TOO, AND THIS IS THE FIELD THAT UNDID THE ONE BELOW.
+        # COMPUTED FROM THE COARSENED RATE, and this is the field that undid
+        # the one below.
         #
-        # oracle_prices is rounded to whole units so the 10-minute timestamp
-        # bucket cannot be inverted from a full-precision spot rate. This field
-        # was written at CENT precision beside amount_in_xmr, fee_pct and
-        # slippage_pct -- all at full precision -- and net is a pure function
-        # of those three. So the rate came straight back out:
+        # oracle_prices is coarsened so the 10-minute timestamp bucket cannot
+        # be inverted from a full-precision spot rate. This field was written
+        # at CENT precision from the TRUE rate, beside amount_in_xmr, fee_pct
+        # and slippage_pct -- all at full precision -- and net is a pure
+        # function of those three. So the rate came straight back out:
         #
         #     rate = amount_out_fiat / (gross - gross*fee_pct - gross*slip_pct)
         #
@@ -447,49 +602,75 @@ def main():
         # inversion returned 164.8318. The coarsening two lines down was
         # decorative for whichever currency the run actually used.
         #
-        # WHAT ROUNDING THIS BUYS, MEASURED, NOT ASSERTED. Cent precision
-        # recovers the rate to 0.005/net; whole units, to 0.5/net:
+        # ROUNDING THE TRUE VALUE was the first repair and it was wrong twice.
+        # It still leaked, because rounding the PRODUCT to whole units recovers
+        # the rate to 0.5/net -- 0.0375 at 13.37 XMR, 0.0005 at 1000 XMR, which
+        # still separates minutes. And it INVENTED A ZERO: driven, a holding
+        # genuinely worth 0.40 USD printed "Value: 0.40 USD" and wrote
+        # "amount_out_fiat": "0" into the file -- a real valuation recorded as
+        # nothing, by the rounding added to protect it, one step after the
+        # guard that exists to stop exactly that.
         #
-        #     gross      recovery err @ cents    @ whole units
-        #     0.05 XMR   0.100                   10.03    <- worse than +/-0.5
-        #     0.5  XMR   0.010                    1.00    <- worse than +/-0.5
-        #     13.37 XMR  0.000375                 0.0375
-        #     100  XMR   0.000050                 0.0050
-        #     1000 XMR   0.000005                 0.0005
+        # WHAT THE OPERATOR LOSES, stated properly. An earlier version said
+        # "The operator loses nothing: the exact figure is still PRINTED" --
+        # false under --redact, where the terminal shows ####.#### and the file
+        # no longer holds it either, so the exact figure is NOWHERE. That is a
+        # real (small) cost of running redacted, and it belongs in --redact's
+        # own help rather than being denied here.
         #
-        # So this closes it outright for holdings under ~1 XMR and costs two
-        # orders of magnitude everywhere else -- but it does NOT close it for a
-        # large holding, where 0.0005 still separates minutes. Saying so is the
-        # point: the note below used to claim a protection this file defeated
-        # in the next field, and a claim is worse than a measured limit.
+        # Multiplying by the rate ALREADY IN oracle_prices closes both. The
+        # figure carries no information that field does not (invert it and you
+        # get the coarsened rate back, which is what is stored beside it), and
+        # coarsen_rate cannot return zero for a positive rate, so the guard
+        # above is not undone one field later.
         #
-        # The operator loses nothing: the exact figure is still PRINTED. This
-        # is the audit record, and "which venue and rate the plan assumed" is
-        # answered to the whole unit either way.
-        "amount_out_fiat": str(fiat_val.quantize(Decimal("1"))),
-        "amount_out_fiat_precision": "whole units; the exact figure is printed, "
-                                     "not stored -- cents would re-establish "
-                                     "the coarsened rate below",
-        # COARSENED to whole currency units, to match the coarsened timestamp
-        # above. `timestamp` is floored to a 10-minute bucket specifically to
-        # blur when this plan was made -- and then this field recorded four
-        # live spot prices at full precision from that same instant. Spot
-        # prices move continuously, so anyone with price history can invert
-        # them to the minute and undo the coarsening, in the same file, two
-        # lines apart. Whole units are plenty for auditing which venue and rate
-        # the plan assumed.
-        "oracle_prices": {k: str(Decimal(str(v)).quantize(Decimal("1")))
+        # THE SAME coarsen_rate AS oracle_prices, deliberately -- the whole
+        # property above is "no information that field does not carry", and it
+        # holds only while the two agree. This read `.quantize(Decimal("1"))`
+        # inline, duplicating the rule rather than sharing it, which is how the
+        # first version of this pair drifted apart in the first place.
+        "amount_out_fiat": str((net * coarsen_rate(fiat_rate))
+                               .quantize(Decimal("0.01"))),
+        "amount_out_fiat_note": f"computed from the same {ORACLE_SIGFIGS}"
+                                f"-significant-figure rate stored in "
+                                f"oracle_prices, not from the spot rate, so "
+                                f"inverting it returns that rate and nothing "
+                                f"finer. The exact figure is on the terminal "
+                                f"(unless --redact was given, which masks it "
+                                f"there and stores nothing finer here).",
+        # COARSENED to match the coarsened timestamp above. `timestamp` is
+        # floored to a 10-minute bucket specifically to blur when this plan was
+        # made -- and then this field recorded four live spot prices at full
+        # precision from that same instant. Spot prices move continuously, so
+        # anyone with price history can invert them to the minute and undo the
+        # coarsening, in the same file, two lines apart.
+        #
+        # BY SIGNIFICANT FIGURES, NOT WHOLE UNITS -- see coarsen_rate. Whole
+        # units left btc_usd (~65000, four of these keys are BTC rates) blurred
+        # by 0.00076%, which pins the instant to nine seconds; the note under
+        # this field claimed the opposite. Three significant figures is plenty
+        # for auditing which venue and rate the plan assumed, and is the same
+        # answer as before for the XMR rates.
+        "oracle_prices": {k: str(coarsen_rate(Decimal(str(v))))
                           for k, v in prices.items() if k != "source"},
-        # STATED AS A LIMIT, NOT A GUARANTEE. The old wording -- "full
-        # precision would re-establish the timestamp this plan coarsens" --
-        # read as a closed protection while amount_out_fiat above was handing
-        # the same rate back at cent precision. Both fields are coarsened now
-        # and the residual is named rather than implied.
-        "oracle_prices_note": "rounded to whole units, as is amount_out_fiat, "
-                              "so neither hands back a full-precision spot "
-                              "rate; a large holding can still narrow the rate "
-                              "from the whole-unit fiat value, so treat the "
-                              "10-minute timestamp bucket as approximate",
+        # STATED AS A LIMIT, NOT A GUARANTEE. This has now been wrong twice in
+        # the same direction, so the wording names what is actually left.
+        # First it claimed "full precision would re-establish the timestamp
+        # this plan coarsens" while amount_out_fiat handed the same rate back
+        # at cent precision; then it said "rounded to whole units, so neither
+        # hands back a full-precision spot rate" while btc_usd was rounded to
+        # eight significant figures by that very rule. The residual now is the
+        # coarsened rate itself: in a fast market a 1% blur is worth only a few
+        # minutes, which is narrower than the bucket it is protecting.
+        "oracle_prices_note": f"rounded to {ORACLE_SIGFIGS} significant "
+                              f"figures -- a RELATIVE blur, so a large-"
+                              f"magnitude rate such as btc_usd is coarsened as "
+                              f"much as a small one; amount_out_fiat is "
+                              f"computed from these same figures and adds "
+                              f"nothing. Residual: in a fast market even this "
+                              f"blur can narrow the instant to less than the "
+                              f"10-minute bucket, so treat that timestamp as "
+                              f"approximate rather than as a floor",
         "price_source": prices.get("source", "unknown"),
         # Was "liquidity_guidance", carrying a size-bucketed guess. A consumer
         # reading that key got an invented verdict in the same shape as the
