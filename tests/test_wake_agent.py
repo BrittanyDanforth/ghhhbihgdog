@@ -1027,7 +1027,7 @@ _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
 _XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 _sample = {"receive_new": {"count": 1}, "receive_and_quote": {"amount_slot": 0},
            "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
-           "withdraw": {"handle": "A3F1", "exit_to": _XMR_SAMPLE}}
+           "withdraw": {"exit_to": _XMR_SAMPLE}}
 # Asserted rather than assumed: this loop runs over P.JOBS, so a job added
 # without a sample here KeyErrors and kills the suite -- which mutation_sweep
 # scores NO-RESULT, not CAUGHT. A missing sample should read as one red line.
@@ -1093,9 +1093,9 @@ _saved_il = A.integrity_log
 try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
-        A._dispatch("withdraw",
-                    {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
-                    _k, _wdir, "A3F1", _capture, "job-1")
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE},
+                    _k, _wdir, "A3F1", _capture, "job-1",
+                    funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
 finally:
     A.integrity_log = _saved_il
 
@@ -1111,9 +1111,75 @@ check("dispatch: and NOWHERE on the argv the child is executed with",
 check("dispatch: not even a 16-character prefix of it, which is enough to "
       "confirm an address a watcher already suspects",
       not any(_XMR_SAMPLE[:16] in str(x) for x in _wargv))
-check("dispatch: the argv names the mix and the bundle this handle points at",
+# NOT ASSUMING THE HANDLE. _dispatch REDRAWS it when it collides with one
+# already in the handles file, and the bundle name follows the handle -- so a
+# test that hard-codes A3F1 here passes or fails on whether the fixture
+# happened to collide, which is not the property.
+check("dispatch: the argv names the mix and the bundle the VAULT found",
       os.path.basename(_wargv[1]) == "GhostSpiral"
-      and str(_wdir / "wallet_recv_1.json") in _wargv)
+      and any(os.path.basename(a).startswith("wallet_withdraw_")
+              and a.endswith(".json") for a in _wargv))
+# THE POINTER IS WRITTEN FROM WHAT THE WALLET SAID, and it points at the
+# account the vault found -- not at a subaddress this job minted. Minting one
+# would be a second account for the wipe to miss and a second address for
+# nothing; the money is already somewhere.
+_bp = [a for a in _wargv
+       if os.path.basename(a).startswith("wallet_withdraw_")][0]
+_bundle_json = json.loads(open(_bp, encoding="utf-8").read())
+check("dispatch: the pointer names the account the wallet reported funded",
+      _bundle_json["account_index"] == 9
+      and _bundle_json["subaddress_index"] == 4)
+check("dispatch: ...and is a real receive bundle, so one loader reads it",
+      _bundle_json["schema"] == "gs_receive_wallet_v1"
+      and _bundle_json["address"] == _XMR_SAMPLE)
+# gs_common's strict loader must accept it, or the mix refuses at stage 0.
+from gs_common import load_receive_bundle as _lrb                # noqa: E402
+_loaded = _lrb(_bp)
+check("dispatch: ...and gs_common's own strict loader accepts it",
+      _loaded["account_index"] == 9 and _loaded["subaddress_index"] == 4)
+check("dispatch: the pointer is 0600", oct(os.stat(_bp).st_mode)[-3:] == "600")
+# AND IT IS WIPED. Named wallet_* deliberately: gs_withdraw_*.json matched
+# NOTHING in GS_ARTIFACT_FILE_PATTERNS, so it would have sat in the artifact
+# directory naming an account of this wallet through every paranoia_mode run.
+import fnmatch as _fn                                            # noqa: E402
+from gs_common import GS_ARTIFACT_FILE_PATTERNS as _PATS         # noqa: E402
+check("dispatch: ...and its NAME matches the wipe list, so paranoia_mode "
+      "takes it",
+      any(_fn.fnmatch(os.path.basename(_bp), _p) for _p in _PATS))
+check("dispatch: NON-VACUITY -- the name it nearly had would NOT have been "
+      "wiped, which is the defect this pins",
+      not any(_fn.fnmatch("gs_withdraw_A3F1.json", _p) for _p in _PATS))
+# NOTHING TO WITHDRAW IS A REFUSAL, not a mix planned around an empty wallet.
+_seen.clear()
+_saved_il2 = A.integrity_log
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE}, _k, _wdir, "B2C4",
+                    _capture, "job-5", funded=lambda: None)
+    check("dispatch: an empty wallet is refused", False)
+except A.Refused as _e5:
+    check("dispatch: an empty wallet is refused", True)
+    check("dispatch: ...and says a confirming payment is not spendable yet",
+          "confirming" in str(_e5))
+    check("dispatch: ...and ran no child at all", _seen == [])
+finally:
+    A.integrity_log = _saved_il2
+
+# THE LARGEST SINGLE OUTPUT, never a sum. Summing subaddresses would mean a
+# first transaction spending inputs from all of them -- permanent public proof
+# they share an owner, which is what the rest of the pipeline avoids.
+_pick = A._funded_entry({}, injected=lambda: (3, 1, "A", 10))
+check("funded: the helper returns what it was given", _pick == (3, 1, "A", 10))
+_ASRC2 = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("funded: it takes the LARGEST single output and never sums",
+      "if best is None or _amt > best[3]:" in _ASRC2
+      and "sum(" not in _ASRC2.split("def _funded_entry")[1].split("def ")[0])
+check("funded: ...and only UNLOCKED balance, since a locked one cannot be "
+      "spent and a mix planned around it fails with money already moved",
+      '"unlocked_balance"' in _ASRC2.split("def _funded_entry")[1].split("def ")[0])
+check("funded: ...and a bool is not an amount (True == 1)",
+      "isinstance(_amt, bool)" in _ASRC2)
 # NON-VACUITY: the capture really ran and really saw an environment, so the
 # absences above are absences from something.
 check("dispatch: NON-VACUITY -- the child was handed a real argv and a real "
@@ -1143,7 +1209,7 @@ check("dispatch: NON-VACUITY -- ...and that ordinary job really ran a child, "
 # succeeded, so the money has already moved when it stops.
 print("\n== the spending job can actually sign ==")
 _kw = dict(_k)
-_wargv2 = A.build_argv("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+_wargv2 = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE},
                        _kw, _wdir, bundle=str(_wdir / "wallet_recv_1.json"),
                        slip=None, handle="A3F1")[0]
 check("sign: the composed argv names the wallet to sign with",
@@ -1157,7 +1223,7 @@ check("sign: ...from the KEYFILE, never from the job parameters — a note that 
 _kn = dict(_k)
 _kn.pop("wallet_file", None)
 try:
-    A.build_argv("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+    A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE},
                  _kn, _wdir, bundle="b", slip=None, handle="A3F1")
     check("sign: a keyfile with no wallet file is refused", False)
 except A.Refused as _e:
@@ -1224,7 +1290,7 @@ check("budget: NON-VACUITY -- the budget this replaced (4h) would NOT have "
       "fit, which is the defect this check exists for", 4.0 < _worst_h)
 # THE WALLET COUNT IS PINNED, or the estimate above is about a run nobody
 # composes. At 20 the same job takes 4.2h and at 40 it takes 6.2h.
-_pin_argv = A.build_argv("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+_pin_argv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE},
                          _k, _wdir, bundle="b", slip=None, handle="A3F1")[0]
 check("budget: the composed argv PINS --wallets rather than inheriting a "
       "default from another file",
@@ -1266,8 +1332,9 @@ check("bound: ...and the fan-out's change rests in that same account",
 _CRW = open(os.path.join(REPO, "create_receive_wallet"), encoding="utf-8").read()
 check("bound: each receive gets its OWN account, so deposits do not pool",
       "create_fresh_account" in _CRW)
-check("bound: the job names exactly one handle, so it resolves one bundle",
-      list(P.JOBS["withdraw"]["schema"]) == ["handle", "exit_to"])
+check("bound: the job carries ONLY a destination — no handle to remember, "
+      "and no account for a chat message to name",
+      list(P.JOBS["withdraw"]["schema"]) == ["exit_to"])
 # NON-VACUITY: there is no AMOUNT field anywhere on this path, so nothing lets
 # a caller ask for more than the bundle holds -- and nothing lets them ask for
 # less either, which is worth knowing.
@@ -1364,8 +1431,9 @@ try:
     A.integrity_log = lambda *a, **k: None
     os.environ["GS_WALLET_PASSWORD"] = "spend-secret"
     with contextlib.redirect_stdout(io.StringIO()):
-        A._dispatch("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
-                    _kw, _wdir, "A3F1", _capture, "job-3")
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE},
+                    _kw, _wdir, "A3F1", _capture, "job-3",
+                    funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
     check("env: the spending step IS handed the password",
           _seen and _seen[0][1].get("GS_WALLET_PASSWORD") == "spend-secret")
     _seen.clear()

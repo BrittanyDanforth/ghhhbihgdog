@@ -1459,9 +1459,13 @@ MUTATIONS = [
   # Re-anchored: the confirm step reads both wizards' fields now, but the
   # property is the same one -- the conversation is deleted BEFORE the answer
   # is checked, so a wrong answer cannot be retried against the same sum.
-  "        handle, exit_to = c.handle, c.exit_to\n"
+  # Re-anchored: the withdraw wizard no longer collects a handle, so the
+  # confirm step reads one field. The property is unchanged -- the
+  # conversation is deleted BEFORE the answer is checked, so a wrong answer
+  # cannot be retried against the same sum.
+  "        exit_to = c.exit_to\n"
   "        del self.convos[chat_id]\n",
-  "        handle, exit_to = c.handle, c.exit_to\n",
+  "        exit_to = c.exit_to\n",
   ["test_depo_wizard"]),
 
  # A real command typed mid-flow must not be swallowed as an answer.
@@ -2242,6 +2246,40 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- the vault finds its own money, and leaves nothing behind ----------
+ #
+ # /withdraw used to take a 4-hex handle naming a bundle a /depo had minted,
+ # so only money that arrived through this tool's own deposit flow could be
+ # withdrawn -- and the operator had to remember which label named which pile.
+ # The machine holding the wallet is the one that can see where the money is.
+ ("the withdraw job goes back to demanding a handle", "gs_wake_proto.py",
+  '        "schema": {"exit_to": _xmr_address_field},',
+  '        "schema": {"handle": _handle_field, "exit_to": _xmr_address_field},',
+  ["test_wake_agent"]),
+
+ # Summing subaddresses would mean a first transaction spending inputs from
+ # all of them -- permanent public proof they share an owner, which is what
+ # the rest of the pipeline spends hours avoiding.
+ ("the withdrawal merges every funded output into one spend", "gs_wake_agent",
+  "                if best is None or _amt > best[3]:",
+  "                if True:",
+  ["test_wake_agent"]),
+
+ # A locked balance cannot be spent, and a mix planned around one fails
+ # partway with money already moved.
+ ("a withdrawal is planned around a locked balance", "gs_wake_agent",
+  '                _amt = _sub.get("unlocked_balance")',
+  '                _amt = _sub.get("balance")',
+  ["test_wake_agent"]),
+
+ # gs_withdraw_*.json matched NOTHING in GS_ARTIFACT_FILE_PATTERNS, so the
+ # pointer would have sat in the artifact directory naming an account of this
+ # wallet through every paranoia_mode run.
+ ("the withdraw pointer is named so the wipe misses it", "gs_wake_agent",
+  '        bundle = str(artifact_dir / f"wallet_withdraw_{handle}.json")',
+  '        bundle = str(artifact_dir / f"gs_withdraw_{handle}.json")',
+  ["test_wake_agent"]),
+
  # ---- the budget has to fit the WORST case, not the median --------------
  #
  # It was 14400s (4h), chosen against estimate_runtime's "~3.2h" -- a MEDIAN.
@@ -2346,8 +2384,11 @@ MUTATIONS = [
  # command was `--receive-wallet None` -- a mix pointed at a bundle that does
  # not exist, on the one job that spends.
  ("the spending job runs against an unresolved bundle", "gs_wake_agent",
-  '    if job in ("watch", "swap_status", "withdraw"):',
-  '    if job in ("watch", "swap_status"):',
+  # Re-anchored: withdraw no longer resolves a handle at all -- the vault
+  # finds its own funded output. What must not regress is that it REFUSES
+  # rather than mixing against an empty wallet.
+  "        if not _found:",
+  "        if False:",
   ["test_wake_agent"]),
 
  # The gate that refuses a flag, a path, a URL or a shell fragment.

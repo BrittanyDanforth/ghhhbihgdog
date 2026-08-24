@@ -188,23 +188,27 @@ _WA = "4" + "Ad" * 47
 w = Fake()
 w.say("/withdraw")
 check("wd: /withdraw starts a conversation", 111 in w.p.convos)
-check("wd: ...and asks for the handle FIRST, not the address",
-      "handle" in w.sent[-1][1].lower()
-      and "address" not in w.sent[-1][1].lower())
-w.say("A3F1")
-check("wd: ...then for the address", "address" in w.sent[-1][1].lower())
+# STRAIGHT TO THE ADDRESS. It used to ask for a 4-character handle first --
+# the label of a bundle a /depo had minted -- so a withdrawal was only
+# possible for money that arrived through this tool's own deposit flow, and
+# the operator had to remember which label named which pile. The vault finds
+# its own funded output now.
+check("wd: ...and asks ONLY for the address, with no handle to remember",
+      "address" in w.sent[-1][1].lower()
+      and "handle" not in w.sent[-1][1].lower())
 w.say(_WA)
 check("wd: ...then confirms, saying plainly that this one SPENDS",
       "SPENDS" in w.sent[-1][1] and "= ?" in w.sent[-1][1])
-# THE HANDLE, NOT THE ADDRESS, IN THE CONFIRM. It is already in the transcript
-# once; repeating it would make it twice, on the surface with no masker.
-check("wd: ...and the confirm repeats the HANDLE and not the address",
-      "A3F1" in w.sent[-1][1] and _WA not in w.sent[-1][1])
+# NEITHER THE ADDRESS NOR AN AMOUNT in the confirm: the address is already in
+# the transcript once, and this box has never been told a balance.
+check("wd: ...and the confirm repeats neither the address nor an amount",
+      _WA not in w.sent[-1][1]
+      and not re.search(r"\d+\.\d{2,}", w.sent[-1][1]))
 w.answer_confirm()
-check("wd: answering correctly pokes exactly one withdraw job",
-      w.pokes == [(111, "withdraw", {"handle": "A3F1", "exit_to": _WA})])
+check("wd: answering correctly pokes exactly one withdraw job, carrying only "
+      "the destination",
+      w.pokes == [(111, "withdraw", {"exit_to": _WA})])
 check("wd: ...and the conversation is gone", 111 not in w.p.convos)
-# THE REAL SCHEMA, through validate_job -- the same gate the vault applies.
 _wok = True
 try:
     P.validate_job({"job_id": P.new_job_id(),
@@ -213,16 +217,16 @@ try:
 except P.WakeError:
     _wok = False
 check("wd: ...and what it emits passes the REAL job schema", _wok)
+check("wd: TWO MESSAGES from /withdraw to a spend, and the middle one is the "
+      "address", len([t for _c, t in w.sent]) == 2)
 
-# EVERY WAY IT REFUSES, driven. Each leaves no conversation and no poke.
 for _msgs, _label, _want in (
-        (["/withdraw", "zzzz"], "a handle that is not 4 hex", "handle is 4"),
-        (["/withdraw", "A3F1", "notanaddress"], "a bad address", "bad address"),
-        (["/withdraw", "A3F1", "-" + _WA[1:]], "an address shaped like a flag",
+        (["/withdraw", "notanaddress"], "a bad address", "bad address"),
+        (["/withdraw", "-" + _WA[1:]], "an address shaped like a flag",
          "bad address"),
-        (["/withdraw", "A3F1", _WA[:94]], "an address one character short",
+        (["/withdraw", _WA[:94]], "an address one character short",
          "bad address"),
-        (["/withdraw", "A3F1", _WA, "999"], "a wrong confirm", "wrong answer"),
+        (["/withdraw", _WA, "999"], "a wrong confirm", "wrong answer"),
         (["/withdraw " + _WA], "the address on the command line",
          "just /withdraw")):
     _g = Fake()
@@ -231,11 +235,8 @@ for _msgs, _label, _want in (
     check(f"wd: {_label} wakes nothing", _g.pokes == [])
     check(f"wd: ...and says why ({_want!r})", _want in _g.text())
     check(f"wd: ...and leaves no conversation armed", 111 not in _g.p.convos)
-# THE VALUE IS NEVER ECHOED BACK. A near-miss of the operator's own
-# destination in the transcript is the same disclosure as the address.
 _ge = Fake()
 _ge.say("/withdraw")
-_ge.say("A3F1")
 _ge.say(_WA[:60])
 check("wd: a rejected address is NOT echoed back into the chat",
       _WA[:60] not in _ge.text() and _WA[:16] not in _ge.text())
