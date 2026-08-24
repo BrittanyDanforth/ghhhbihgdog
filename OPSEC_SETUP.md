@@ -787,10 +787,44 @@ doorbell, so anything it does you can do from a terminal.
 
 ### 4b. `/withdraw`, and what it costs
 
-Off by default. `gs_wake_agent` refuses the job outright unless **this
-machine's own keyfile** says `allow_withdraw`, which is written by re-pairing
-with `--allow-withdraw` — physical access to both boxes, the same bar the
-amount ladder sits behind. A keyfile written before this existed does not have
+**Set up once, then never touch the vault again.** There is no per-withdrawal
+approval step and there is not meant to be: you pair once with the flags
+below, and after that `/withdraw` runs from the phone with the vault
+untouched. What the one-time setup costs is three things, and all three have
+to be right or the job fails **after the money has moved**:
+
+```bash
+# 1. Pair with the two flags. --wallet-file is REQUIRED with --allow-withdraw
+#    and the pairing refuses without it, because a mix that does not know
+#    which wallet to sign with relays its fan-out and THEN dies at the
+#    signing step, hours later, with the money already on-chain.
+python3 gs_wake_keys pair \
+    --allow-withdraw \
+    --wallet-file /var/lib/gs/spend.wallet \
+    --amount-ladder 0.01 0.02 0.05
+
+# 2. The password, in a root-owned 0400 file. Never a flag, never on an argv:
+#    /proc/<pid>/cmdline is 0444 and every local account can read it.
+printf 'GS_WALLET_PASSWORD=%s\n' 'your-password' > /etc/gs-wake-spend.env
+chmod 0400 /etc/gs-wake-spend.env
+#    then uncomment the EnvironmentFile line in systemd/gs-wake-agent.service
+
+# 3. The vault's monero-wallet-rpc must serve that SPEND-CAPABLE wallet at
+#    boot. A view-only wallet can plan a mix and cannot sign one.
+```
+
+That third line is the whole trade in one sentence: the vault stops being a
+view-only machine. Everything below is what that costs.
+
+The password reaches the mix and **nothing else**. `run_child` strips every
+`GS_` variable out of the environment it inherits and puts back only what the
+dispatcher hands that step, so `thor_swap_preparer` and `create_receive_wallet`
+never see it. Without that scrub, an `EnvironmentFile` here would hand the
+spend password to every child of every job — which is the defect GhostSpiral's
+own `_child_env` exists to prevent, one layer up.
+
+`gs_wake_agent` refuses the job outright unless **this machine's own keyfile**
+says `allow_withdraw`. A keyfile written before this existed does not have
 the field, and absent means no: upgrading the code does not give a pager the
 ability to spend.
 

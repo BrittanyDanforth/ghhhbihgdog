@@ -169,6 +169,15 @@ def disarm_deadman() -> None:
         pass
 
 
+#: How many mix outputs a WITHDRAW composes, pinned rather than inherited.
+#:
+#: The job's budget in gs_wake_proto is computed for this value: GhostSpiral's
+#: estimate_runtime at the slow end of the --hop-delay window answers ~4.5 h
+#: here and ~6.2 h at 40. Leaving it to GhostSpiral's own default would make
+#: this job's runtime -- and therefore whether it is SIGKILLed mid-spend -- a
+#: property of a default in another file that nobody would think to check.
+WITHDRAW_WALLETS = 10
+
 #: The transient timer extend_deadman starts. Named so a human can find it.
 DEADMAN_EXT_UNIT = "gs-wake-deadman-ext"
 
@@ -731,10 +740,41 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
         # nothing else on the wallet. --dag-mixing because a withdrawal the
         # operator cannot supervise should take the stronger of the two shapes
         # rather than the faster one; the budget is sized for it.
+        # --wallet-file IS NOT OPTIONAL HERE, and leaving it out is what made
+        # the first version of this job unable to complete at all.
+        #
+        # GhostSpiral's Round 1 runs `airgap_tx_signer --phase sign
+        # --wallet-file <path>` with the password in the environment. Both
+        # arguments have DEFAULTS -- "offline.wallet" and "" -- so composing
+        # neither does not fail loudly: the mix plans, veils, relays a fan-out,
+        # waits out its confirmations, and dies hours later at "phase 'sign'
+        # produced no signed TX files". Every earlier stage succeeded, so the
+        # money has already moved on-chain when it stops.
+        #
+        # The path comes from THIS MACHINE'S keyfile, like every other path
+        # here. It is not a job parameter and must never become one: a wake
+        # note that could name a wallet file could name any file on the vault.
+        _wf = key.get("wallet_file")
+        if not _wf:
+            raise Refused(
+                "no_wallet_file",
+                "this machine's keyfile does not say which wallet to sign "
+                "with, so the mix would relay a fan-out and then fail at the "
+                "signing step with the money already moved. Re-pair with "
+                "--wallet-file.")
         return [[sys.executable, _tool("GhostSpiral"),
                  "--tor-proxy", proxy, "--rpc-primary", rpc,
                  "--receive-wallet", str(bundle),
+                 "--wallet-file", str(_wf),
                  "--dag-mixing",
+                 # PINNED, because the budget is computed FOR this number.
+                 # Leaving it to GhostSpiral's default made the job's runtime
+                 # a property of a default in another file: at --wallets 20
+                 # the same run takes 4.2 h and at 40 it takes 6.2 h, and
+                 # nothing here would have noticed either. The budget and this
+                 # value are one setting and a test recomputes one from the
+                 # other.
+                 "--wallets", str(WITHDRAW_WALLETS),
                  "--output", str(artifact_dir)]]
     raise Refused("unknown_job", "no argv template for this job")
 
@@ -800,6 +840,25 @@ def run_child(argv: list, env_extra: dict, budget_s: int,
     if runner is not None:
         return runner(argv, env_extra, budget_s)
     env = dict(os.environ)
+    # EVERY GS_ VARIABLE IS STRIPPED, AND ONLY env_extra PUTS ANY BACK.
+    #
+    # This was `dict(os.environ)` and nothing else, so every child of every job
+    # inherited the agent's whole environment. That was harmless while the unit
+    # set no GS_ variables -- and it stops being harmless the moment one is
+    # needed: adding GS_WALLET_PASSWORD to the unit so the mix can sign would
+    # hand the spend password to thor_swap_preparer, to create_receive_wallet,
+    # and to anything else a job runs.
+    #
+    # GhostSpiral's own _child_env exists for exactly this, one layer up, and
+    # its docstring says why: "a third-party child that logs or dumps its
+    # environment would leak it". gs_console's _child_env does the same with an
+    # allow-list per action. This is the third copy of that rule, at the layer
+    # that actually spawns the processes.
+    #
+    # An ALLOW-LIST BY CONSTRUCTION: the only way a GS_ variable reaches a
+    # child is for the dispatcher to have put it in env_extra for THAT step.
+    for _k in [k for k in env if k.startswith("GS_")]:
+        env.pop(_k, None)
     env["PYTHONUNBUFFERED"] = "1"
     env.update(env_extra or {})
     sink = None
@@ -1400,6 +1459,20 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
             _dest = proto.JOBS["withdraw"]["schema"]["exit_to"](
                 params["exit_to"])
             env_extra["GS_EXIT_TO"] = _dest
+            # THE SPEND PASSWORD, TO THIS CHILD AND NO OTHER.
+            #
+            # run_child strips every GS_ variable from the inherited
+            # environment, so the unit may hold GS_WALLET_PASSWORD without
+            # handing it to thor_swap_preparer or create_receive_wallet. This
+            # is the one step that needs it, and it is put back only here.
+            #
+            # An EMPTY password is a legitimate configuration -- a wallet with
+            # no password -- so this cannot distinguish "not set" from "set to
+            # nothing", and does not try. What it must not do is silently pass
+            # nothing when the operator meant to pass something, and the
+            # preflight refusal above is where that is caught.
+            env_extra["GS_WALLET_PASSWORD"] = os.environ.get(
+                "GS_WALLET_PASSWORD", "")
         # WHO IS WATCHING DECIDES WHERE THE OUTPUT GOES.
         #
         # The diversion exists because systemd journals whatever the children

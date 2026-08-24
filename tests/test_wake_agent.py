@@ -26,6 +26,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -1016,7 +1018,12 @@ print("\n== the job whitelist is unreachable from a note ==")
 # job instead.
 _argvs = []
 _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
-      "rpc_primary": "http://127.0.0.1:18083", "amount_ladder": ["0.01"]}
+      "rpc_primary": "http://127.0.0.1:18083", "amount_ladder": ["0.01"],
+      # The spending job refuses to compose without this -- see "the spending
+      # job can actually sign" below. A fixture missing it made the whole
+      # sweep-over-JOBS loop raise instead of reporting, which is the
+      # NO-RESULT outcome mutation_sweep scores as no verdict at all.
+      "wallet_file": "/var/lib/gs/spend.wallet"}
 _XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 _sample = {"receive_new": {"count": 1}, "receive_and_quote": {"amount_slot": 0},
            "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
@@ -1125,6 +1132,254 @@ check("dispatch: NON-VACUITY -- an ordinary job sets no GS_EXIT_TO at all",
       _seen and "GS_EXIT_TO" not in _seen[0][1])
 check("dispatch: NON-VACUITY -- ...and that ordinary job really ran a child, "
       "so the absence is from something", _seen and len(_seen[0][0]) > 3)
+
+# ---- THE JOB HAS TO BE ABLE TO SIGN --------------------------------------
+#
+# GhostSpiral's Round 1 runs `airgap_tx_signer --phase sign --wallet-file
+# <path>` with the password in the environment. BOTH have defaults --
+# "offline.wallet" and "" -- so composing neither does not fail loudly: the mix
+# plans, veils, relays a fan-out, waits out its confirmations, and dies HOURS
+# later at "phase 'sign' produced no signed TX files". Every earlier stage
+# succeeded, so the money has already moved when it stops.
+print("\n== the spending job can actually sign ==")
+_kw = dict(_k)
+_wargv2 = A.build_argv("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+                       _kw, _wdir, bundle=str(_wdir / "wallet_recv_1.json"),
+                       slip=None, handle="A3F1")[0]
+check("sign: the composed argv names the wallet to sign with",
+      "--wallet-file" in _wargv2
+      and _wargv2[_wargv2.index("--wallet-file") + 1] == "/var/lib/gs/spend.wallet")
+check("sign: ...from the KEYFILE, never from the job parameters — a note that "
+      "could name a wallet file could name any file on the vault",
+      "wallet_file" not in P.JOBS["withdraw"]["schema"])
+# A KEYFILE WITH NO WALLET FILE IS REFUSED, at composition, before anything
+# runs -- rather than discovered after the fan-out has relayed.
+_kn = dict(_k)
+_kn.pop("wallet_file", None)
+try:
+    A.build_argv("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+                 _kn, _wdir, bundle="b", slip=None, handle="A3F1")
+    check("sign: a keyfile with no wallet file is refused", False)
+except A.Refused as _e:
+    check("sign: a keyfile with no wallet file is refused", True)
+    check("sign: ...and says the money would already have moved",
+          "already moved" in str(_e))
+# NON-VACUITY: with the field present the same call composes fine, so the
+# refusal is about the field and not about build_argv being broken.
+check("sign: NON-VACUITY -- with the field present it composes",
+      "--wallet-file" in _wargv2)
+
+# ---- THE BUDGET IS COMPUTED FROM THE WORST CASE, NOT ASSERTED -----------
+#
+# This is the check that would have caught the defect it exists for. The
+# withdraw budget was 14400s (4h), chosen against GhostSpiral's estimate_runtime
+# reporting "~3.2h" for the settings the job composes -- which is a MEDIAN.
+# --hop-delay draws uniformly from 60-300s and a run makes about thirty of
+# those draws; the slow end answers ~4.5h. So a run that drew high went over
+# budget, and over budget is not a late report: run_child SIGTERMs the process
+# group and then SIGKILLs it, mid-mix, with the money already moving.
+#
+# Two constants in two files cannot be kept in step by hand. This recomputes
+# one from the other, using GhostSpiral's OWN arithmetic, so a change to
+# either end goes red here.
+print("\n== the spending job's budget fits its own worst case ==")
+_gld = importlib.machinery.SourceFileLoader(
+    "gs_for_estimate", os.path.join(REPO, "GhostSpiral"))
+_GS = importlib.util.module_from_spec(
+    importlib.util.spec_from_loader(_gld.name, _gld))
+_gld.exec_module(_GS)
+
+def _hours(window, wallets=None):
+    """GhostSpiral's own estimate, as a number rather than its "~3.2h" text.
+
+    The output count is derived from `wallets` HERE rather than read from a
+    module-level constant: the first version took only the window, so changing
+    _wargs.wallets for the 40-wallet partner left the output count at 10 and
+    the check compared a number against itself.
+    """
+    _w = A.WITHDRAW_WALLETS if wallets is None else wallets
+    _a = types.SimpleNamespace(dag_mixing=True, deep=2, peel=False,
+                               wallets=_w, split=1, hop_delay=None,
+                               exit_to=["x"])
+    _t = _GS.estimate_runtime(_a, 1, _w + _GS.DECOY_MAX, window)
+    return float(re.search(r"([\d.]+)\s*h", _t).group(1))
+
+
+_median_h = _hours((60, 300))
+_worst_h = _hours((300, 300))
+_budget_h = P.JOBS["withdraw"]["budget_s"] / 3600.0
+check(f"budget: the worst case ({_worst_h}h) fits inside the budget "
+      f"({_budget_h}h)", _budget_h > _worst_h)
+# THE MARGIN IS THE POINT. Fitting exactly is what the deadman did, and a sum
+# of thirty random draws does not respect an exact fit.
+check(f"budget: ...with real margin, not exactly ({_budget_h}h vs "
+      f"{_worst_h}h)", _budget_h >= _worst_h * 1.25)
+# NON-VACUITY 1: the worst case is genuinely worse than the median, so this is
+# not two names for the same number.
+check(f"budget: NON-VACUITY -- the worst case really is worse than the median "
+      f"({_worst_h}h vs {_median_h}h)", _worst_h > _median_h * 1.2)
+# NON-VACUITY 2: the OLD budget would have failed this check. Stated as a
+# number rather than a memory, so the check is demonstrably able to say no.
+check("budget: NON-VACUITY -- the budget this replaced (4h) would NOT have "
+      "fit, which is the defect this check exists for", 4.0 < _worst_h)
+# THE WALLET COUNT IS PINNED, or the estimate above is about a run nobody
+# composes. At 20 the same job takes 4.2h and at 40 it takes 6.2h.
+_pin_argv = A.build_argv("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+                         _k, _wdir, bundle="b", slip=None, handle="A3F1")[0]
+check("budget: the composed argv PINS --wallets rather than inheriting a "
+      "default from another file",
+      "--wallets" in _pin_argv
+      and _pin_argv[_pin_argv.index("--wallets") + 1] == str(A.WITHDRAW_WALLETS))
+# NON-VACUITY 3: raising it really would break the fit, so pinning it matters.
+_big_h = _hours((300, 300), wallets=40)
+check(f"budget: NON-VACUITY -- at 40 wallets the same job would NOT fit "
+      f"({_big_h}h vs {_budget_h}h), which is why the count is pinned",
+      _big_h > _budget_h)
+# AND THE BACKSTOP IS LONGER THAN THE BUDGET, or it becomes the killer.
+check("budget: the deadman extension outlasts the budget it protects",
+      P.result_budget_s("withdraw") + 600 > P.JOBS["withdraw"]["budget_s"])
+
+# ---- WHAT BOUNDS A WITHDRAWAL, NOW THAT ONE CAN HAPPEN ------------------
+#
+# The operator asked for no per-withdrawal host step, and there is none. So the
+# question is what stops whoever holds the phone from taking everything, and
+# the answer is structural rather than a policy anyone has to remember:
+#
+#   * create_receive_wallet issues a FRESH ACCOUNT per receive, so each deposit
+#     sits in its own account.
+#   * GhostSpiral in receive mode is PINNED to the bundle's account -- the
+#     entry set is exactly that one subaddress and mix_account_index returns
+#     `receive_account_index if receive_mode else None`.
+#   * /withdraw names ONE handle, which resolves to ONE bundle.
+#
+# So a withdrawal reaches one deposit. Taking a second is a second wake against
+# the same daily budget. That was already true and nobody depended on it; the
+# withdraw job depends on it now, so it is pinned here.
+print("\n== a withdrawal reaches one deposit, not the wallet ==")
+_G_SRC = open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read()
+check("bound: receive mode pins the mix to the BUNDLE's account",
+      "return receive_account_index if receive_mode else None" in _G_SRC)
+check("bound: ...and the entry set is that one subaddress, not the account",
+      "ENTRY_SET = [(receive_entry_addr, receive_account_index," in _G_SRC)
+check("bound: ...and the fan-out's change rests in that same account",
+      "bal_account = receive_account_index if receive_mode else 0" in _G_SRC)
+_CRW = open(os.path.join(REPO, "create_receive_wallet"), encoding="utf-8").read()
+check("bound: each receive gets its OWN account, so deposits do not pool",
+      "create_fresh_account" in _CRW)
+check("bound: the job names exactly one handle, so it resolves one bundle",
+      list(P.JOBS["withdraw"]["schema"]) == ["handle", "exit_to"])
+# NON-VACUITY: there is no AMOUNT field anywhere on this path, so nothing lets
+# a caller ask for more than the bundle holds -- and nothing lets them ask for
+# less either, which is worth knowing.
+check("bound: NON-VACUITY -- no job schema takes an amount at all",
+      not any("amount" in k for sp in P.JOBS.values() for k in sp["schema"]
+              if k != "amount_slot"))
+check("bound: NON-VACUITY -- and the daily cap really exists to bound the "
+      "second withdrawal", "daily_wake_budget" in open(
+          os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read())
+
+# ---- AND THE PAIRING REFUSES A KEYFILE THAT COULD NOT SIGN --------------
+#
+# --allow-withdraw without --wallet-file writes a keyfile whose withdraw job
+# relays a fan-out and THEN fails at the signing step. Refused at pairing,
+# where both flags are in one place and the cost is a re-typed command --
+# rather than discovered hours in, with the money already moved.
+_kt = subprocess.run(
+    [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+     "--allow-withdraw"],
+    capture_output=True, text=True, timeout=60)
+check("pair: --allow-withdraw without --wallet-file is refused",
+      _kt.returncode != 0
+      and "needs --wallet-file" in (_kt.stdout + _kt.stderr))
+check("pair: ...and says what it would have cost, not just that it is missing",
+      "already moved" in (_kt.stdout + _kt.stderr))
+_kr = subprocess.run(
+    [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+     "--allow-withdraw", "--wallet-file", "relative.wallet"],
+    capture_output=True, text=True, timeout=60)
+check("pair: a RELATIVE wallet path is refused too — the agent runs from a "
+      "unit with its own WorkingDirectory",
+      _kr.returncode != 0
+      and "is relative" in (_kr.stdout + _kr.stderr))
+# NON-VACUITY: pairing WITHOUT --allow-withdraw does not demand a wallet file,
+# so this refusal is about the combination and not a new mandatory flag.
+_kp = subprocess.run(
+    [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair", "--help"],
+    capture_output=True, text=True, timeout=60)
+check("pair: NON-VACUITY -- --wallet-file is optional on its own",
+      _kp.returncode == 0 and "--wallet-file" in _kp.stdout
+      and "needs --wallet-file" not in _kp.stdout)
+
+# ---- THE PASSWORD REACHES THAT CHILD AND NO OTHER ------------------------
+#
+# run_child used to be `env = dict(os.environ)` and nothing else, so every
+# child of every job inherited the agent's whole environment. Harmless while
+# the unit set no GS_ variables -- and it stops being harmless the moment one
+# is needed: putting GS_WALLET_PASSWORD in the unit so the mix can sign would
+# hand the spend password to thor_swap_preparer and to create_receive_wallet.
+_saved_env = {k: os.environ.get(k)
+              for k in ("GS_WALLET_PASSWORD", "GS_EXIT_TO", "GS_BTC_ENTRY")}
+try:
+    os.environ["GS_WALLET_PASSWORD"] = "spend-secret"
+    os.environ["GS_EXIT_TO"] = "inherited-not-given"
+    os.environ["GS_BTC_ENTRY"] = "bc1qLEAK"
+    _edir = Path(tempfile.mkdtemp(prefix="envscrub_"))
+    A.run_child(["/usr/bin/env"], {"GS_EXIT_TO": "given"}, 20,
+                log_path=_edir / "out.log")
+    _child_gs = sorted(l for l in (_edir / "out.log").read_text().splitlines()
+                       if l.startswith("GS_"))
+    check("env: a child sees ONLY the GS_ variables it was handed",
+          _child_gs == ["GS_EXIT_TO=given"])
+    check("env: ...so the spend password does not reach a child that was not "
+          "given it", not any("spend-secret" in l for l in _child_gs))
+    check("env: ...and an INHERITED value never shadows or survives beside the "
+          "one that was given",
+          "GS_EXIT_TO=inherited-not-given" not in _child_gs)
+    check("env: ...and no other GS_ variable from the unit leaks either",
+          not any("bc1qLEAK" in l for l in _child_gs))
+    # NON-VACUITY 1: the non-GS_ environment still reaches the child, or this
+    # is a wipe rather than a scrub and every tool would break.
+    _all = (_edir / "out.log").read_text()
+    check("env: NON-VACUITY -- PATH still reaches the child, so this is a "
+          "scrub and not a wipe", "PATH=" in _all)
+    check("env: NON-VACUITY -- and the marker the agent sets is still there",
+          "PYTHONUNBUFFERED=1" in _all)
+    # NON-VACUITY 2: the variables really WERE set in the parent, so the
+    # absences above are absences from something.
+    check("env: NON-VACUITY -- the parent really did hold all three",
+          os.environ.get("GS_WALLET_PASSWORD") == "spend-secret"
+          and os.environ.get("GS_BTC_ENTRY") == "bc1qLEAK")
+finally:
+    for _k2, _v2 in _saved_env.items():
+        if _v2 is None:
+            os.environ.pop(_k2, None)
+        else:
+            os.environ[_k2] = _v2
+
+# AND THE DISPATCHER PUTS IT BACK, for the spending step only.
+_seen.clear()
+_saved_il = A.integrity_log
+_saved_pw = os.environ.get("GS_WALLET_PASSWORD")
+try:
+    A.integrity_log = lambda *a, **k: None
+    os.environ["GS_WALLET_PASSWORD"] = "spend-secret"
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("withdraw", {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+                    _kw, _wdir, "A3F1", _capture, "job-3")
+    check("env: the spending step IS handed the password",
+          _seen and _seen[0][1].get("GS_WALLET_PASSWORD") == "spend-secret")
+    _seen.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("swap_status", {"handle": "A3F1"}, _kw, _wdir, "A3F1",
+                    _capture, "job-4")
+    check("env: NON-VACUITY -- an ordinary step is NOT",
+          _seen and "GS_WALLET_PASSWORD" not in _seen[0][1])
+finally:
+    A.integrity_log = _saved_il
+    if _saved_pw is None:
+        os.environ.pop("GS_WALLET_PASSWORD", None)
+    else:
+        os.environ["GS_WALLET_PASSWORD"] = _saved_pw
 check("...with the vault's own proxy and rpc in every one of them",
       all("socks5h://127.0.0.1:9050" in a for a in _argvs))
 check("...and the only tools it can spawn are the four in JOBS, with the mix "

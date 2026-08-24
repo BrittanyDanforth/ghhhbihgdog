@@ -2242,6 +2242,68 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- the budget has to fit the WORST case, not the median --------------
+ #
+ # It was 14400s (4h), chosen against estimate_runtime's "~3.2h" -- a MEDIAN.
+ # --hop-delay draws 60-300s about thirty times; the slow end is ~4.5h. A run
+ # that drew high went over, and over budget is not a late report: run_child
+ # SIGTERMs the process group and then SIGKILLs it, mid-mix, with the money
+ # already moving.
+ ("the spending budget goes back to fitting only the median",
+  "gs_wake_proto.py",
+  '        "budget_s": 21600,',
+  '        "budget_s": 14400,',
+  ["test_wake_agent"]),
+
+ # At 20 wallets the same job takes 4.2h and at 40 it takes 6.2h. Leaving the
+ # count to another file's default makes whether the mix is killed mid-spend a
+ # property nobody would think to check.
+ ("the mix inherits its wallet count from another file's default",
+  "gs_wake_agent",
+  '                 "--wallets", str(WITHDRAW_WALLETS),\n',
+  "",
+  ["test_wake_agent"]),
+
+ # ---- the spending job has to be able to SIGN ---------------------------
+ #
+ # GhostSpiral's Round 1 signs with `--wallet-file <path>` and a password in
+ # the environment. BOTH have defaults, so composing neither does not fail
+ # loudly: the mix plans, veils, relays a fan-out, waits out its confirmations,
+ # and dies HOURS later at "produced no signed TX files" -- with the money
+ # already moved on-chain.
+ ("the mix is composed without a wallet to sign with", "gs_wake_agent",
+  '                 "--wallet-file", str(_wf),\n',
+  "",
+  ["test_wake_agent"]),
+
+ ("a keyfile with no wallet file is accepted anyway", "gs_wake_agent",
+  '        if not _wf:\n            raise Refused(',
+  "        if False:\n            raise Refused(",
+  ["test_wake_agent"]),
+
+ # Every child of every job inherited the agent's whole environment. Harmless
+ # until a GS_ variable is needed -- and then it hands the spend password to
+ # thor_swap_preparer and create_receive_wallet.
+ ("every child inherits the agent's whole environment again",
+  "gs_wake_agent",
+  '    for _k in [k for k in env if k.startswith("GS_")]:\n'
+  "        env.pop(_k, None)",
+  "    pass",
+  ["test_wake_agent"]),
+
+ ("the spending step is not handed the password it needs", "gs_wake_agent",
+  '            env_extra["GS_WALLET_PASSWORD"] = os.environ.get(\n'
+  '                "GS_WALLET_PASSWORD", "")',
+  "            pass",
+  ["test_wake_agent"]),
+
+ # --allow-withdraw without --wallet-file writes a keyfile whose withdraw job
+ # relays a fan-out and then fails at signing.
+ ("pairing accepts a withdraw keyfile that cannot sign", "gs_wake_keys",
+  "    if args.allow_withdraw and not args.wallet_file:",
+  "    if False:",
+  ["test_wake_agent"]),
+
  # ---- the one job that spends -------------------------------------------
  #
  # /withdraw is the first job that drives a spending tool, carries free text,
