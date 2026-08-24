@@ -70,6 +70,16 @@ pg._DOORBELL[0] = DB
 P = load("gs_wake_proto.py")
 import nacl.public as NP                                     # noqa: E402
 
+#: The pager's source, read once. Several checks below read it rather than
+#: driving, because the branch they are about (a job-result reply, a poll-loop
+#: guard) needs a whole wake to reach.
+_SRC_PG_EARLY = open(os.path.join(REPO, "gs_telegram_pager"),
+                     encoding="utf-8").read()
+
+#: The vault's real pre-job jitter, read from the protocol rather than copied,
+#: so the help text's quoted round trip cannot drift away from it.
+_AG_JIT = (P.VAULT_JITTER_LO_S, P.VAULT_JITTER_HI_S)
+
 XMR = ("44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSs"
        "aBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A")
 MEMO = f"=:XMR.XMR:{XMR}:0/1/0"
@@ -281,17 +291,30 @@ _lim = pg.Limits(__import__("pathlib").Path(_st), 300, 2)
 check("a fresh limiter allows a poke", _lim.why_not() == "")
 _lim.record()
 check("...and then the interval blocks the next one",
-      "rate limited" in _lim.why_not())
+      _lim.why_not() != "" and _lim.why_not().startswith("wait "))
 _lim.min_interval = 0
 _lim.record()
-check("the daily cap blocks once it is reached", "24h" in _lim.why_not())
+check("the daily cap blocks once it is reached",
+      _lim.why_not() != "" and "limit" in _lim.why_not())
 _lim2 = pg.Limits(__import__("pathlib").Path(_st), 0, 2)
 check("A RESTART IS NOT A BYPASS: the counters reload from disk",
-      len(_lim2.recent()) == 2 and "24h" in _lim2.why_not())
+      len(_lim2.recent()) == 2 and _lim2.why_not() != "")
 check("...and the state file is 0600, since it names when you woke the vault",
       oct(os.stat(_st).st_mode)[-3:] == "600")
-check("the limits say they are courtesy, not the real bound -- the vault's "
-      "own 24h budget is", "courtesy" in _lim2.why_not())
+# THE HONEST NOTE MOVED OUT OF THE CHAT. This asserted the refusal SAID it
+# was a courtesy limit and that the real bound was the 24h wake budget -- true,
+# useful once, and a description of the architecture written permanently into
+# the readable surface, on the message an operator sees most often after a
+# mistyped command. The note is still made, in the source and in
+# OPSEC_SETUP.md, where it costs nothing.
+check("the refusal does NOT describe the wake architecture to whoever reads "
+      "this chat",
+      not any(w in _lim2.why_not().lower()
+              for w in ("courtesy", "vault", "24h", "budget", "real")))
+check("NON-VACUITY -- the source still records that this is a courtesy limit, "
+      "so the honesty was moved and not deleted",
+      "courtesy" in open(os.path.join(REPO, "gs_telegram_pager"),
+                         encoding="utf-8").read())
 
 
 print("\n== replay: an update is never handled twice ==")
@@ -502,6 +525,549 @@ for _armed in ("run_wake", "load_key", "Pager(", "sendMessage"):
 check("...and main() returns from the --whoami branch BEFORE the keyfile is "
       "read",
       _wsrc.index("return whoami(") < _wsrc.index("doorbell().load_key("))
+
+
+# ===========================================================================
+#  FOUR DEFECTS THAT BROKE NO EXISTING CHECK
+# ===========================================================================
+print("\n== the poll loop, the lock, and the digits ==")
+
+# 1. THE BUSY LOCK, WEDGED FOREVER BY A FULL SD CARD.
+#
+# The release guard started at Thread.start(). limits.record() and
+# integrity_log() both write to the same card and both run AFTER acquire() and
+# BEFORE that try -- so a full or read-only card leaves `busy` held by nobody,
+# and every later poke answers "a wake is already running" for the life of the
+# process. On a headless box, with no way to wake anything and no clue why.
+import threading as _th2
+
+
+def _wedge_pager(fail_on):
+    p = pg.Pager.__new__(pg.Pager)
+    p.proxies, p.token, p.key = {"http": "x"}, "T", {}
+    p.args = types.SimpleNamespace()
+    p.allow, p.ignored, p.convos = {111}, 0, {}
+    p.busy = _th2.Lock()
+    p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
+    p.burn, p.burn_after, p.burn_now = [], 0, False
+    sent = []
+    p.send = lambda c, t: (sent.append(t), True)[1]
+
+    def _rec():
+        if fail_on == "record":
+            raise OSError(28, "No space left on device")
+    p.limits = types.SimpleNamespace(why_not=lambda: "", record=_rec,
+                                     recent=lambda: [], daily_cap=12,
+                                     offset=0, save=lambda: None)
+    return p, sent
+
+
+_wp, _ws = _wedge_pager("record")
+_saved_il = pg.integrity_log
+# THE CALL MUST NOT ESCAPE, and catching it here is not politeness. Without
+# the release guard, record() raises straight out of start_job -- so a suite
+# that let it propagate would DIE with a traceback instead of reporting, and a
+# mutation sweep scores a crashed suite NO-RESULT, never CAUGHT. Proven: this
+# block reported NO-RESULT until the exception was caught and turned into a
+# failing check with its own words.
+_wp_raised = ""
+try:
+    pg.integrity_log = lambda *a, **k: None
+    _wp.start_job(111, "receive_new", {"count": 1})
+except BaseException as _e:                                  # noqa: BLE001
+    _wp_raised = f"{type(_e).__name__}: {_e}"
+finally:
+    pg.integrity_log = _saved_il
+check(f"lock: a failing state write is handled inside start_job, not raised "
+      f"at the caller ({_wp_raised or 'no exception'})",
+      _wp_raised == "")
+check("lock: a state write that fails does NOT leave the wake lock held",
+      not _wp.busy.locked())
+check("lock: ...and the operator is told, rather than left guessing",
+      any("could not start" in t for t in _ws))
+# NON-VACUITY: the lock is really taken on the happy path, so "not locked"
+# above means released and not never-acquired.
+_wp2, _ws2 = _wedge_pager(None)
+_started = []
+_saved_thread = pg.threading.Thread
+try:
+    pg.integrity_log = lambda *a, **k: None
+    pg.threading.Thread = lambda **k: types.SimpleNamespace(
+        start=lambda: _started.append(1))
+    _wp2.start_job(111, "receive_new", {"count": 1})
+finally:
+    pg.threading.Thread = _saved_thread
+    pg.integrity_log = _saved_il
+check("lock: NON-VACUITY -- a healthy poke DOES take the lock and start the "
+      "worker", _wp2.busy.locked() and _started == [1])
+
+# 2. A NON-DICT UPDATE MUST NOT KILL THE PROCESS.
+#
+# run() reads upd.get("update_id") in the FOR HEADER, which is outside the
+# per-update try -- so one bare string in the result list raises
+# AttributeError, systemd restarts, the offset was never advanced past that
+# batch, and the pager crash-loops.
+_up = pg.Pager.__new__(pg.Pager)
+_up.proxies, _up.token = {"http": "x"}, "T"
+_up.poll_failures = 0
+_up.limits = types.SimpleNamespace(offset=0, save=lambda: None)
+_saved_get = pg.safe_get
+try:
+    pg.safe_get = lambda url, proxies=None: {
+        "ok": True, "result": [{"update_id": 1}, "junk", None, 7,
+                               {"update_id": 2}]}
+    _got = _up.updates()
+finally:
+    pg.safe_get = _saved_get
+check("updates: a malformed element is filtered, not raised",
+      _got == [{"update_id": 1}, {"update_id": 2}])
+check("updates: NON-VACUITY -- the good elements still come through",
+      len(_got) == 2)
+
+# 3. AN UPDATE WITH NO USABLE id IS SKIPPED, NOT HANDLED FOREVER.
+#
+# The offset is what confirms an update to Telegram. One that can never
+# advance the offset is redelivered on every poll -- so handling it means
+# acting on one message for the life of the process.
+_lp = pg.Pager.__new__(pg.Pager)
+_lp.proxies, _lp.token, _lp.poll_failures = {"http": "x"}, "T", 0
+_lp.ignored = 0
+_lp.limits = types.SimpleNamespace(offset=0, save=lambda: None)
+_handled = []
+_lp.handle = lambda u: _handled.append(u)
+_ticks = [0]
+
+
+def _one_batch(url, proxies=None):
+    _ticks[0] += 1
+    if _ticks[0] > 1:
+        raise KeyboardInterrupt
+    return {"ok": True, "result": [{"update_id": "NaN", "message": {}},
+                                   {"update_id": True, "message": {}},
+                                   {"update_id": 5, "message": {}}]}
+
+
+try:
+    pg.safe_get = _one_batch
+    pg.integrity_log = lambda *a, **k: None
+    _b = _lp.updates()
+    for _u in _b:
+        _uid = _u.get("update_id")
+        if isinstance(_uid, int) and not isinstance(_uid, bool):
+            _lp.limits.offset = max(_lp.limits.offset, _uid + 1)
+        else:
+            _lp.ignored += 1
+            continue
+        _lp.handle(_u)
+finally:
+    pg.safe_get = _saved_get
+    pg.integrity_log = _saved_il
+check("updates: an update with a non-int id is skipped, not handled",
+      [u["update_id"] for u in _handled] == [5])
+check("updates: ...and True is not accepted as an id (True == 1 would move "
+      "the cursor to 2)", _lp.ignored == 2 and _lp.limits.offset == 6)
+# The source-level half, because the loop above is a paraphrase of run():
+check("updates: run() itself excludes bool from the id check",
+      "isinstance(uid, int) and not isinstance(uid, bool)" in _SRC_PG_EARLY)
+
+# 4. isdecimal, NOT isdigit -- the bug the wizard documents as fixed and
+#    parse_command never got. "²".isdigit() is True and int("²") RAISES, so a
+#    typo escaped parse_command as a ValueError: handle() is inside run()'s
+#    per-update try, so the operator got NO reply and it was counted as a
+#    dropped update.
+for _sup in ("/recv ²", "/depo ²", "/recv ³", "/depo ½"):
+    _raised = False
+    try:
+        _j, _p, _e = pg.parse_command(_sup)
+    except Exception:                                        # noqa: BLE001
+        _raised = True
+    check(f"digits: {_sup!r} is REFUSED, not raised",
+          not _raised and _j == "" and _e)
+# NON-VACUITY: ordinary digits still work, and so does the Arabic-Indic form
+# the wizard's own test says legitimately reads as a slot.
+check("digits: NON-VACUITY -- plain digits still parse",
+      pg.parse_command("/recv 4")[1] == {"count": 4}
+      and pg.parse_command("/depo 3")[1] == {"amount_slot": 3})
+check("digits: NON-VACUITY -- Arabic-Indic digits still parse, as the wizard "
+      "already decided they legitimately do",
+      pg.parse_command("/depo ٢")[1] == {"amount_slot": 2})
+# CODE, NOT PROSE. A substring ban punishes the comments that explain the
+# fix -- the same trap the addr_index guard fell into. Every remaining mention
+# of isdigit in this file is a note saying why isdecimal is used instead.
+import ast as _ast_pg
+_pg_calls = {n.func.attr for n in _ast_pg.walk(_ast_pg.parse(_SRC_PG_EARLY))
+             if isinstance(n, _ast_pg.Call)
+             and isinstance(n.func, _ast_pg.Attribute)}
+check("digits: no isdigit() is CALLED anywhere — that predicate is wider than "
+      "int() accepts",
+      "isdigit" not in _pg_calls)
+check("digits: NON-VACUITY -- isdecimal() IS called, so the guard exists",
+      "isdecimal" in _pg_calls)
+check("digits: NON-VACUITY -- and the prose still explains why, which a "
+      "substring ban would have forbidden",
+      "isdigit" in _SRC_PG_EARLY)
+
+
+# ===========================================================================
+#  THREE MORE THINGS THE CHAT DID NOT NEED TO SAY
+# ===========================================================================
+print("\n== /status, the manual, and the machine's own job names ==")
+import types as _ty3
+import threading as _th3
+
+
+def _plain_pager(busy=False, why=""):
+    p = pg.Pager.__new__(pg.Pager)
+    p.proxies, p.token, p.key = {"http": "x"}, "T", {}
+    p.args = _ty3.SimpleNamespace()
+    p.allow, p.ignored, p.convos = {111}, 4, {}
+    p.busy = _th3.Lock()
+    if busy:
+        p.busy.acquire()
+    p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
+    p.burn, p.burn_after, p.burn_now = [], 0, False
+    p.limits = _ty3.SimpleNamespace(why_not=lambda: why, record=lambda: None,
+                                    recent=lambda: [1, 2, 3], daily_cap=12,
+                                    offset=0, save=lambda: None)
+    seen = []
+    p.send = lambda c, t: (seen.append(t), True)[1]
+    return p, seen
+
+
+# 1. /status printed the poke COUNT for the last 24h and busy True/False.
+#    The count is how many deposits were started today. `busy` is whether the
+#    machine is powered on AT THIS MOMENT -- the single most useful fact to
+#    anyone deciding when to knock on a door -- and both sat permanently in the
+#    transcript, on a command that exists to answer "can I send one".
+_sp, _ss = _plain_pager()
+_sp.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                        "message_id": 1, "text": "/status"}})
+check("status: an idle pager answers 'ready'", _ss == ["ready"])
+_sp2, _ss2 = _plain_pager(busy=True)
+_sp2.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                         "message_id": 1, "text": "/status"}})
+check("status: a busy one says wait, not that the machine is powered on",
+      _ss2 == ["wait"])
+check("status: neither answer carries a poke count or a power state",
+      not any(w in " ".join(_ss + _ss2).lower()
+              for w in ("24h", "poke", "busy", "true", "false", "/12")))
+# NON-VACUITY: the two states really are distinguishable, so this is not one
+# constant string.
+check("status: NON-VACUITY -- idle and busy give DIFFERENT answers",
+      _ss != _ss2)
+# ...and a rate limit still wins, because that is the more actionable answer.
+_sp3, _ss3 = _plain_pager(why="wait 42s")
+_sp3.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                         "message_id": 1, "text": "/status"}})
+check("status: a rate limit is reported over 'ready'", _ss3 == ["wait 42s"])
+
+# 2. THE WHOLE MANUAL ON EVERY TYPO. f"no: {err}\n\n{HELP}" put the full
+#    command list -- including the memo line -- back into the chat on each
+#    mistake.
+_hp, _hs = _plain_pager()
+_hp.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                        "message_id": 1, "text": "/nope"}})
+check("help: a typo is answered with the error alone",
+      len(_hs) == 1 and _hs[0].startswith("no:"))
+check("help: ...and does not reprint the command list",
+      "OP_RETURN" not in _hs[0] and "/watch" not in _hs[0])
+# NON-VACUITY: /help itself still prints it, once, on request.
+_hp2, _hs2 = _plain_pager()
+_hp2.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                         "message_id": 1, "text": "/help"}})
+check("help: NON-VACUITY -- /help still prints the command list on request",
+      any("/watch" in t for t in _hs2))
+
+# 3. THE MACHINE'S OWN JOB NAME. OPSEC_SETUP section 5 step 5 specifies
+#    "depo ready · slip A3F1"; the code sent "receive_and_quote ready".
+check("names: the chat name for the quote job is the short one the doc "
+      "specifies", pg.chat_name("receive_and_quote") == "depo")
+check("names: ...and every job the protocol has HAS a chat name",
+      all(j in pg.CHAT_NAME for j in P.JOBS))
+check("names: NON-VACUITY -- an unknown job falls back to its own name "
+      "rather than raising on the reply that says a wake landed",
+      pg.chat_name("something_new") == "something_new")
+check("names: no reply interpolates the raw job identifier any more",
+      'f"{job}' not in _SRC_PG_EARLY)
+
+# 4. THE HELP MUST DESCRIBE WHAT THE COMMANDS ACTUALLY DO.
+#    "/status counters" survived the change that stopped it printing counters,
+#    and "/check ~5 min" quoted the probe's own three-minute window while every
+#    wake first serves a random 5-20 minutes of jitter before the job starts --
+#    understating the round trip by two to seven times, on the command an
+#    operator reaches for when money has not appeared.
+check("help: /status is described as what it now answers, not as counters",
+      "counters" not in pg.HELP)
+check("help: /check's quoted time includes the wake jitter it always waits",
+      "10-25 min" in pg.HELP)
+_jit_lo, _jit_hi = _AG_JIT
+check(f"help: ...and that figure is consistent with the real jitter "
+      f"({_jit_lo // 60}-{_jit_hi // 60} min) plus the 3-minute probe",
+      _jit_lo // 60 + 3 <= 10 and 25 >= _jit_hi // 60 + 3)
+# NON-VACUITY: the help still lists the commands, so this is not passing on an
+# emptied string.
+check("help: NON-VACUITY -- every command is still listed",
+      all(c in pg.HELP for c in ("/depo", "/recv", "/check", "/watch",
+                                 "/cancel", "/status")))
+
+
+# ===========================================================================
+#  CHAT TEXT THAT ARRIVES THROUGH A VARIABLE
+# ===========================================================================
+print("\n== text that reaches the chat without being a literal at send() ==")
+#
+# A source scan for string literals at self.send() call sites cannot see a
+# string that arrives in a variable. Two did, and both said things the
+# transcript should not carry:
+#
+#   * Limits.why_not() -- sent verbatim as f"no: {why}" -- named the operator's
+#     machine AND described the wake budget protecting it ("the vault's own 24h
+#     budget is the real one"). That is a sentence about the architecture, on
+#     the message an operator sees most often after a mistyped command.
+#   * gs_doorbell refuses a bind with the Pi's own listen host and port in the
+#     text, and poke() forwards that exception straight to Telegram.
+_vlim = pg.Limits.__new__(pg.Limits)
+_vlim.min_interval, _vlim.daily_cap = 300, 12
+_vlim.last_poke, _vlim.pokes = __import__("time").time(), []
+_why = _vlim.why_not()
+check("varchat: the rate-limit reply says what to do and nothing else",
+      _why.startswith("wait ") and _why.endswith("s"))
+check("varchat: ...and names no machine and no budget architecture",
+      not any(w in _why.lower()
+              for w in ("vault", "24h", "budget", "courtesy", "real one")))
+_vlim2 = pg.Limits.__new__(pg.Limits)
+_vlim2.min_interval, _vlim2.daily_cap = 0, 2
+_vlim2.last_poke = 0
+_vlim2.pokes = [__import__("time").time()] * 5
+_why2 = _vlim2.why_not()
+check("varchat: the daily-cap reply is the same shape",
+      _why2 and "vault" not in _why2.lower() and "courtesy" not in _why2.lower())
+# NON-VACUITY: it still REFUSES, and still says something. A why_not() that
+# returned "" would pass every check above and would also remove the limit.
+check("varchat: NON-VACUITY -- both are still refusals with a reason",
+      bool(_why) and bool(_why2))
+_vlim3 = pg.Limits.__new__(pg.Limits)
+_vlim3.min_interval, _vlim3.daily_cap = 300, 12
+_vlim3.last_poke, _vlim3.pokes = 0, []
+check("varchat: NON-VACUITY -- an allowed poke returns '' rather than a "
+      "reason, so the two are distinguishable", _vlim3.why_not() == "")
+
+# THE DOORBELL'S BIND REFUSAL, forwarded to the chat by poke(). _redact runs
+# over it, and until now it stripped only token-shaped text.
+for _host in ("192.168.1.50:9999", "0.0.0.0:41234", "10.0.0.5:18081",
+              "pi.local:9999"):
+    _msg = f"cannot listen on {_host} (Address already in use)"
+    _red = pg._redact(_msg)
+    check(f"varchat: {_host} does not survive into the chat",
+          _host not in _red and "<host:port>" in _red)
+# NON-VACUITY: the operator still learns what went wrong.
+check("varchat: NON-VACUITY -- the reason survives, only the address goes",
+      "already in use" in pg._redact("cannot listen on 1.2.3.4:9 (Address "
+                                     "already in use)"))
+# NON-VACUITY: ordinary replies are not mangled by the new rule.
+for _plain in ("burned 3/7.", "pokes in last 24h: 3/12", "wait 30s",
+               "A3F1: landed and spendable. The swap is done."):
+    check(f"varchat: NON-VACUITY -- {_plain!r} passes through untouched",
+          pg._redact(_plain) == _plain)
+# ...and the token rule still works, which the new one sits beside.
+check("varchat: NON-VACUITY -- a bot token is still stripped",
+      pg._redact("bot123456789:AAEEabcdefghijklmnopqrstuvwxyz01")
+      == "bot<token>")
+
+
+# ===========================================================================
+#  BURN AFTER READING
+# ===========================================================================
+print("\n== the chat can be emptied, and only from the host ==")
+#
+# The transcript is assumed read. Making the replies boring was the first half;
+# removing them afterwards is the second. Neither replaces the other -- a
+# message that says nothing is safe whether or not the delete lands.
+#
+# THE TRIGGER IS NOT A CHAT COMMAND, and that is the design rather than an
+# omission. "/wipe" would put the word into the very transcript it empties -- a
+# line in the operator's own hand saying there was something here worth
+# deleting -- and would hand a stolen phone the power to destroy the operator's
+# own record of what that phone did.
+import signal as _sig
+import types as _ty2
+
+
+class _BurnPager:
+    """A Pager with the network replaced, so deletes are counted not sent."""
+
+    def __init__(self, burn_after=0, refuse=()):
+        p = pg.Pager.__new__(pg.Pager)
+        p.proxies, p.token, p.key = {"http": "x"}, "T", {}
+        p.args = _ty2.SimpleNamespace()
+        p.allow = {111}
+        p.busy = __import__("threading").Lock()
+        p.ignored = 0
+        p.convos = {}
+        p.clock = lambda: 0.0
+        p.rng = __import__("random").SystemRandom()
+        p.limits = _ty2.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                        recent=lambda: [], daily_cap=12,
+                                        offset=0, save=lambda: None)
+        p.burn, p.burn_after, p.burn_now = [], burn_after, False
+        self.deleted = []
+        self.refuse = set(refuse)
+        p.delete_message = self._del
+        self.p = p
+
+    def _del(self, cid, mid):
+        if mid in self.refuse:
+            return False
+        self.deleted.append((cid, mid))
+        return True
+
+
+# 1. THE OPERATOR'S OWN COMMANDS ARE TRACKED, and they are the half that
+#    matters: the replies are boring by design, but "/depo 2" at 03:12 is not.
+_b = _BurnPager()
+_b.p.send = lambda c, t: True
+_b.p.handle({"update_id": 1,
+             "message": {"chat": {"id": 111}, "message_id": 900,
+                         "text": "/status"}})
+check("burn: the operator's own command message is tracked for deletion",
+      any(m == 900 for _c, m, _t in _b.p.burn))
+# NON-VACUITY: a chat that is NOT allowlisted must not be tracked -- deleting
+# there is an action taken for somebody who was refused.
+_b2 = _BurnPager()
+_b2.p.send = lambda c, t: True
+_b2.p.handle({"update_id": 1,
+              "message": {"chat": {"id": 999}, "message_id": 901,
+                          "text": "/status"}})
+check("burn: NON-VACUITY -- a chat that is not allowlisted is not tracked",
+      _b2.p.burn == [] and _b2.p.ignored == 1)
+
+# 2. THE BOT'S OWN REPLIES ARE TRACKED, from whatever Telegram answers with.
+_b3 = _BurnPager()
+_sent_ids = [4242]
+pg_saved_post = pg.safe_post
+try:
+    pg.safe_post = lambda url, payload, proxies=None: {
+        "ok": True, "result": {"message_id": _sent_ids[0]}}
+    _ok = _b3.p.send(111, "hello")
+finally:
+    pg.safe_post = pg_saved_post
+check("burn: a reply that landed is tracked by its message_id",
+      _ok and any(m == 4242 for _c, m, _t in _b3.p.burn))
+# NON-VACUITY: a malformed answer must not raise -- the reply DID land, and
+# turning that into a failure is the more expensive direction.
+_b4 = _BurnPager()
+try:
+    pg.safe_post = lambda url, payload, proxies=None: {"ok": True}
+    _ok2 = _b4.p.send(111, "hello")
+    _raised = False
+except Exception:
+    _raised = True
+finally:
+    pg.safe_post = pg_saved_post
+check("burn: NON-VACUITY -- an answer with no message_id costs the delete, "
+      "not the reply", _ok2 and not _raised and _b4.p.burn == [])
+
+# 3. EXPIRY. Old messages go, recent ones stay.
+_b5 = _BurnPager(burn_after=60)
+_now = __import__("time").time()
+_b5.p.burn = [(111, 1, _now - 3600), (111, 2, _now - 5), (111, 3, _now - 120)]
+_gone = _b5.p.burn_expired(60)
+check("burn: messages past the deadline are deleted", _gone == 2
+      and sorted(m for _c, m in _b5.deleted) == [1, 3])
+check("burn: ...and one inside it is kept",
+      [m for _c, m, _t in _b5.p.burn] == [2])
+# NON-VACUITY: with the feature off, nothing is deleted however old.
+_b6 = _BurnPager(burn_after=0)
+_b6.p.burn = [(111, 1, _now - 999999)]
+check("burn: NON-VACUITY -- with --burn-after 0 nothing is deleted at all",
+      _b6.p.burn_expired(0) == 0 and _b6.deleted == []
+      and len(_b6.p.burn) == 1)
+
+# 4. A REFUSED DELETE IS DROPPED, NOT RETRIED FOREVER. Telegram refuses past
+#    48h and that refusal is permanent; retrying every tick would turn one
+#    refusal into a permanent stream of requests over Tor.
+_b7 = _BurnPager(burn_after=1, refuse={7})
+_b7.p.burn = [(111, 7, _now - 99), (111, 8, _now - 99)]
+_b7.p.burn_expired(1)
+check("burn: a refused delete is dropped rather than retried on every tick",
+      _b7.p.burn == [] and _b7.deleted == [(111, 8)])
+
+# 5. THE SIGNAL. It sets a flag and does no I/O -- a handler runs between
+#    bytecodes and can arrive inside safe_post.
+_b8 = _BurnPager()
+_b8.p.burn = [(111, 11, _now), (111, 12, _now)]
+check("burn: SIGUSR1 does not delete anything itself", not _b8.p.burn_now)
+_b8.p.arm_burn(_sig.SIGUSR1, None)
+check("burn: ...it sets a flag the loop reads", _b8.p.burn_now
+      and _b8.deleted == [])
+_g, _t = _b8.p.burn_all()
+check("burn: ...and burn_all then deletes everything tracked",
+      (_g, _t) == (2, 2) and _b8.p.burn == [])
+# HONEST ARITHMETIC: gone and tried differ when Telegram refuses, and the
+# operator needs both numbers rather than the word "wiped".
+_b9 = _BurnPager(refuse={21})
+_b9.p.burn = [(111, 21, _now), (111, 22, _now)]
+check("burn: burn_all reports gone AND tried, because they differ",
+      _b9.p.burn_all() == (1, 2))
+# ONE CHAT ONLY when a chat is named: burning another chat's history is an
+# action on a conversation the caller is not in.
+_b10 = _BurnPager()
+_b10.p.burn = [(111, 31, _now), (222, 32, _now)]
+_b10.p.burn_all(111)
+check("burn: burning one chat leaves another chat's messages alone",
+      _b10.deleted == [(111, 31)]
+      and [m for _c, m, _t in _b10.p.burn] == [32])
+
+# 6. NO CHAT COMMAND DOES THIS. The word must not exist in the parser.
+for _w in ("/wipe", "/burn", "/delete", "/destruct"):
+    _j, _p, _e = pg.parse_command(_w)
+    check(f"burn: {_w} is not a command", _j == "" and _e not in
+          ("wipe", "burn", "delete"))
+_SRC_PG = open(os.path.join(REPO, "gs_telegram_pager"), encoding="utf-8").read()
+check("burn: ...and the source has no chat-command branch for it either",
+      '"/wipe"' not in _SRC_PG and '"/burn"' not in _SRC_PG)
+
+# 7. NOTHING NEW REACHES THE SD CARD. The message list is a log of exactly
+#    when the operator was active, which is the thing the card must not hold.
+check("control: Limits.save exists, so the check below reads a real function",
+      "def save" in _SRC_PG)
+check("burn: the tracked-message list is never written to state",
+      "burn" not in _SRC_PG.split("def save")[1].split("\n    def ")[0])
+# NON-VACUITY: save DOES write something, so this is not passing on an empty
+# function body.
+check("burn: NON-VACUITY -- save really does persist the cursor and counters",
+      "offset" in _SRC_PG.split("def save")[1].split("\n    def ")[0])
+
+# 8. A --burn-after past Telegram's window is REFUSED, not clamped: it would
+#    never fire, and the chat would look like it was being emptied.
+_rc = None
+try:
+    pg.main(["--chat-id", "1", "--burn-after", str(pg.TG_DELETE_WINDOW_S + 1)])
+except SystemExit as _e:
+    _rc = str(_e)
+check("burn: a --burn-after past the 48h window is refused with the reason",
+      _rc and "deletion window" in _rc)
+_rc2 = None
+try:
+    pg.main(["--chat-id", "1", "--burn-after", "-5"])
+except SystemExit as _e:
+    _rc2 = str(_e)
+check("burn: ...and a negative one is refused too",
+      _rc2 and "negative" in _rc2)
+# NON-VACUITY: a value INSIDE the window must get past this gate. It still
+# exits -- there is no Tor here -- but for a different reason, which proves the
+# two refusals above are about --burn-after and not about main() always dying.
+_rc3 = None
+try:
+    pg.main(["--chat-id", "1", "--burn-after", "600"])
+except SystemExit as _e:
+    _rc3 = str(_e)
+except Exception as _e:                                      # noqa: BLE001
+    _rc3 = f"{type(_e).__name__}: {_e}"
+check("burn: NON-VACUITY -- a value inside the window passes this gate and "
+      f"fails later for its own reason ({str(_rc3)[:40]!r})",
+      _rc3 is not None and "deletion window" not in str(_rc3)
+      and "negative" not in str(_rc3))
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

@@ -648,8 +648,14 @@ _pager.poke(111, "receive_and_quote", {"amount_slot": 2})
 # THE NO-KEY PATH IS THE HANDLE, AND NOTHING ELSE. This asserted the reply
 # said "Read the address and memo on the vault." -- a sentence naming the
 # machine, sent on every job, telling the operator where their own hardware is.
+# THE CHAT NAME, NOT THE INTERNAL ONE. OPSEC_SETUP section 5 step 5 specifies
+# "depo ready · slip A3F1"; the code sent "receive_and_quote ready · slip A3F1"
+# -- the pipeline's own identifier for the job, in the vocabulary of the
+# machine rather than of the person reading a phone.
 check("with no delivery key the reply is the handle line and nothing more",
-      any(t.strip() == "receive_and_quote ready · slip A3F1" for t in _sent))
+      any(t.strip() == "depo ready · slip A3F1" for t in _sent))
+check("...and it uses the short name the doc specifies, not the internal one",
+      not any("receive_and_quote" in t for t in _sent))
 check("...and it names no machine", not any("vault" in t.lower() for t in _sent))
 check("...and no empty message is sent in place of the blob", len(_sent) == 1)
 

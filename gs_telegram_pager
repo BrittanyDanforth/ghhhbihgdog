@@ -166,6 +166,28 @@ CONFIRM_CHOICES = 3
 #: drift into a number that is not the rate being charged.
 USAGE_FEE_LABEL = "1.1%"
 
+#: The internal job name is not the chat name.
+#:
+#: OPSEC_SETUP.md section 5 step 5 says the chat gets "depo ready · slip A3F1".
+#: What it actually got was "receive_and_quote ready · slip A3F1" -- the
+#: pipeline's own identifier, which is longer, names two tools' worth of work,
+#: and is the vocabulary of the machine rather than of the person reading a
+#: phone. Mapped here so the doc and the code say the same thing.
+#:
+#: .get(job, job) rather than a lookup that can fail: a job added later without
+#: a chat name should read oddly, not crash the reply that says a wake landed.
+CHAT_NAME = {
+    "receive_and_quote": "depo",
+    "receive_new": "recv",
+    "swap_status": "check",
+    "watch": "watch",
+}
+
+
+def chat_name(job: str) -> str:
+    """What to call a job in the chat."""
+    return CHAT_NAME.get(job, job)
+
 CONFIRM_NOTE = (
     "This gate stops a pocket-dial and a message pasted into the wrong "
     "chat. It is NOT a security control: anyone holding this phone can read "
@@ -229,10 +251,20 @@ HELP = (
     "/depo       start — asks which slot, then confirms\n"
     "/depo <s>   same, in one shot, slot 0-7\n"
     "/recv [n]   1-4 addresses to receive on (default 1)\n"
-    "/check <h>  has it arrived? (~5 min)\n"
-    "/watch <h>  wait up to 110 min for it\n"
+    # BOTH NUMBERS INCLUDE THE JITTER, because the operator waits it.
+    #
+    # "/check ~5 min" was the probe's own three-minute window and nothing else.
+    # Every wake first serves a random 5-20 minutes (gs_wake_agent's JITTER,
+    # which decorrelates boot from the swap) BEFORE the job starts, so the real
+    # round trip is 8-23 minutes -- understating it by two to seven times, on
+    # the command an operator reaches for when they are already anxious about
+    # money that has not appeared.
+    "/check <h>  has it arrived? (10-25 min)\n"
+    "/watch <h>  wait for it (up to 2h)\n"
     "/cancel     drop a half-finished /depo\n"
-    "/status     counters\n"
+    # NOT "counters". It answers ready / wait, because a poke count and a
+    # power state are not things this chat should carry.
+    "/status     can I send one now\n"
     "/fee /speed /exit\n"
     "\n"
     "Memo goes in an OP_RETURN — desktop wallet, not a phone."
@@ -296,6 +328,18 @@ def _redact(text: str) -> str:
     """
     out = re.sub(r"\bbot\d{6,}:[A-Za-z0-9_-]{20,}", "bot<token>", str(text))
     out = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}", "<token>", out)
+    # AND THE LAN ADDRESSES, because this runs over text that reaches the CHAT
+    # and not only the journal. gs_doorbell refuses a bind with
+    # f"cannot listen on {listen_host}:{listen_port} ({e.strerror})", and poke()
+    # forwards that exception straight to Telegram -- so a Pi whose port was
+    # already in use published its own listen address into the transcript.
+    #
+    # A host:port is the shape, whatever the host looks like: an IPv4 literal,
+    # "0.0.0.0", a hostname. Replaced rather than dropped so the operator
+    # reading the journal still sees that a bind was the problem.
+    out = re.sub(r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9](?:[A-Za-z0-9-]"
+                 r"*[A-Za-z0-9])?(?:\.[A-Za-z0-9-]+)*):\d{1,5}\b",
+                 "<host:port>", out)
     # An exception's text is not always this program's words: a server can
     # shape a chunk of it, and requests puts response detail into some of
     # them. Same one-line rule as the username, for the same reason.
@@ -364,13 +408,20 @@ class Limits:
         """'' if a poke is allowed, else the reason to send back."""
         now = time.time()
         gap = now - self.last_poke
+        # THESE ARE CHAT TEXT. why_not()'s return value is sent verbatim --
+        # `self.send(cid, f"no: {why}")` -- so it belongs to the transcript,
+        # and it did not look like it: a source scan for literals at send()
+        # call sites cannot see a string that arrives through a variable. This
+        # one named the operator's machine AND described the wake budget that
+        # protects it ("the vault's own 24h budget is the real one"), which is
+        # a sentence about the architecture in the readable surface, on the
+        # message an operator sees most often after a mistyped command.
+        #
+        # "wait Ns" is the whole of what they can act on.
         if gap < self.min_interval:
-            return (f"rate limited, {int(self.min_interval - gap)}s left "
-                    f"(courtesy limit; the vault's own 24h budget is the "
-                    f"real one)")
+            return f"wait {int(self.min_interval - gap)}s"
         if len(self.recent()) >= self.daily_cap:
-            return (f"{self.daily_cap} pokes already in the last 24h "
-                    f"(courtesy limit)")
+            return "daily limit reached"
         return ""
 
     def record(self) -> None:
@@ -405,7 +456,14 @@ def parse_command(text: str) -> tuple:
     if cmd == "/recv":
         n = 1
         if arg:
-            if not arg.isdigit():
+            # isdecimal, NOT isdigit, and the wizard already carries the note
+            # explaining why -- it just never reached here. "²".isdigit() is
+            # True and int("²") RAISES, so this guard let a ValueError escape
+            # parse_command: handle() is inside run()'s per-update try, so the
+            # operator got NO reply at all to a typo and the message was
+            # counted as a dropped update. Driven: parse_command("/recv ²")
+            # raised ValueError before this line changed.
+            if not arg.isdecimal():
                 return "", {}, "count must be a number 1-4"
             n = int(arg)
         if not 1 <= n <= 4:
@@ -417,7 +475,9 @@ def parse_command(text: str) -> tuple:
         # has to be remembered, not because the one-shot form is wrong.
         if not arg:
             return "", {}, "depo_wizard"
-        if not arg.isdigit():
+        # isdecimal for the same reason as /recv above: int() accepts exactly
+        # the strings isdecimal() matches, and isdigit() is wider.
+        if not arg.isdecimal():
             return "", {}, "give a ladder SLOT 0-7, not an amount"
         s = int(arg)
         if not 0 <= s <= 7:
@@ -512,6 +572,30 @@ class Pager:
         self.convos = {}
         self.clock = time.monotonic
         self.rng = random.SystemRandom()
+        #: (chat_id, message_id, wall_clock_sent) for every message this
+        #: process has put in a chat -- ITS OWN REPLIES AND THE OPERATOR'S
+        #: COMMANDS -- that it may still be able to delete.
+        #:
+        #: IN MEMORY, like convos and for the same reason: the SD card is the
+        #: leak this whole box is designed around, and a list of message ids
+        #: with timestamps is a log of exactly when the operator was active.
+        #: A restart drops it, which loses the ability to burn what was already
+        #: sent -- the correct direction to lose in, since the alternative is
+        #: writing that log down.
+        #:
+        #: WALL CLOCK, not self.clock. self.clock is time.monotonic, which is
+        #: the right thing for conversation deadlines and the wrong thing here:
+        #: Telegram's 48-hour deletion window is measured against real time, so
+        #: a monotonic reading cannot be compared to it.
+        self.burn = []
+        #: Seconds a message may stay in the chat before this deletes it.
+        #: 0 disables, which is the default: a bot that silently removes the
+        #: operator's own messages would be a surprise, and the surprise lands
+        #: on the one channel they use when they cannot reach the machine.
+        self.burn_after = int(getattr(args, "burn_after", 0) or 0)
+        #: Set by SIGUSR1; cleared by the poll loop when it has acted. See
+        #: arm_burn for why the trigger is a signal and not a chat command.
+        self.burn_now = False
 
     # -- the /depo wizard -----------------------------------------------
     def _reap(self) -> None:
@@ -663,14 +747,131 @@ class Pager:
         cannot walk to, for a quote that expires while they wait.
         """
         try:
-            safe_post(self._url("sendMessage"),
-                      {"chat_id": chat_id, "text": text,
-                       "disable_web_page_preview": True},
-                      proxies=self.proxies)
+            _r = safe_post(self._url("sendMessage"),
+                           {"chat_id": chat_id, "text": text,
+                            "disable_web_page_preview": True},
+                           proxies=self.proxies)
+            # REMEMBER IT SO IT CAN BE BURNED. Failing to record an id is not
+            # an error the operator can act on -- the reply DID land, which is
+            # what this returns -- so a malformed answer costs the ability to
+            # delete that one message and nothing else.
+            self._remember(chat_id, _r)
             return True
         except Exception as e:                               # noqa: BLE001
             print(f"  [!] reply failed: {_redact(e)}")
             return False
+
+    def arm_burn(self, *_a) -> None:
+        """SIGUSR1: burn every tracked message on the next tick.
+
+        THE TRIGGER IS ON THE HOST, NOT IN THE CHAT, and that is the whole
+        design of it. A /wipe command would put the word "wipe" in the very
+        transcript it is meant to empty -- a message that says, permanently and
+        in the operator's own hand, that there was something here worth
+        deleting. It would also hand a stolen phone the power to destroy the
+        operator's own record of what that phone had been used for.
+
+        So it is a signal to the process on the box:
+
+            kill -USR1 $(pidof -x gs_telegram_pager)
+            systemctl kill -s USR1 gs-telegram-pager
+
+        Nothing is typed into Telegram, nothing new is written to the SD card,
+        and the ability to do it is exactly the ability to run a command on the
+        host -- which is a level of access that already implies far more than
+        this.
+
+        A FLAG, NOT THE WORK. Signal handlers run between bytecodes and can
+        arrive inside safe_post; doing network I/O here would re-enter requests
+        from a handler. The poll loop does it, one tick later at worst.
+        """
+        self.burn_now = True
+
+    def _remember(self, chat_id: int, res) -> None:
+        """Record a message this process can later delete. Never raises.
+
+        Tolerant of every shape a proxied or older Bot API can answer with,
+        because the only cost of not recording one is that it does not get
+        burned -- and raising here would turn a successful reply into a failed
+        one, which is the more expensive direction by far.
+        """
+        try:
+            mid = ((res or {}).get("result") or {}).get("message_id")
+            if isinstance(mid, int) and not isinstance(mid, bool):
+                self.burn.append((int(chat_id), mid, time.time()))
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    def delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Ask Telegram to remove one message. False if it would not.
+
+        WHAT THIS IS AND IS NOT. It removes the message from the chat for both
+        sides. It does NOT reach a copy someone already forwarded, a screenshot,
+        a device that cached it, or whatever Telegram keeps server-side that an
+        operator cannot see. This whole channel is built on the assumption that
+        the transcript is read by somebody else; burning it afterwards is
+        defence in depth on top of that assumption, never a replacement for it.
+        That is why the reply vocabulary was made boring FIRST -- a message
+        that says nothing is safe whether or not this call succeeds.
+        """
+        try:
+            safe_post(self._url("deleteMessage"),
+                      {"chat_id": chat_id, "message_id": int(message_id)},
+                      proxies=self.proxies)
+            return True
+        except Exception as e:                               # noqa: BLE001
+            # EXPECTED, ROUTINELY. Telegram refuses a delete for reasons that
+            # are not failures of this program: the message is over 48 hours
+            # old, it was already deleted, or the chat no longer exists. Quiet
+            # by default; the caller counts and reports the total.
+            print(f"  [!] delete refused: {_redact(e)[:120]}")
+            return False
+
+    def burn_expired(self, older_than: float) -> int:
+        """Delete every tracked message older than `older_than` seconds.
+
+        Called from the poll loop, so a chat left alone still empties itself.
+
+        DROPPED FROM THE LIST WHATEVER TELEGRAM SAYS. A refused delete is
+        almost always permanent -- past the 48-hour window, or already gone --
+        and retrying it every ten seconds for the life of the process would
+        turn one refusal into a permanent stream of requests over Tor. The
+        count is returned so a caller can say what happened.
+        """
+        if older_than <= 0 or not self.burn:
+            return 0
+        now = time.time()
+        keep, gone = [], 0
+        for cid, mid, sent in self.burn:
+            if now - sent < older_than:
+                keep.append((cid, mid, sent))
+                continue
+            if self.delete_message(cid, mid):
+                gone += 1
+        self.burn = keep
+        return gone
+
+    def burn_all(self, chat_id: int = None) -> tuple:
+        """Delete everything tracked (optionally for one chat). (gone, tried).
+
+        Returns both numbers because they differ for a reason the operator
+        needs: anything Telegram has held for more than 48 hours cannot be
+        deleted by a bot at all, so "3 of 7" is the honest answer and "wiped"
+        would not be.
+        """
+        keep, gone, tried = [], 0, 0
+        for cid, mid, sent in self.burn:
+            if chat_id is not None and cid != int(chat_id):
+                keep.append((cid, mid, sent))
+                continue
+            tried += 1
+            if not self.delete_message(cid, mid):
+                # NOT KEPT. See burn_expired: a refusal here is not transient.
+                pass
+            else:
+                gone += 1
+        self.burn = keep
+        return gone, tried
 
     def updates(self) -> list:
         url = (f"{self._url('getUpdates')}?timeout={POLL_HOLD_S}"
@@ -698,7 +899,19 @@ class Pager:
         if not isinstance(d, dict) or not d.get("ok"):
             return []
         out = d.get("result")
-        return out if isinstance(out, list) else []
+        if not isinstance(out, list):
+            return []
+        # EVERY ELEMENT MUST BE A DICT, checked HERE and not by the caller.
+        #
+        # The loop reads upd.get("update_id") on each element. A result list
+        # carrying a bare string or a null -- from a proxied or misbehaving
+        # API, or a future Bot API shape -- raises AttributeError in the FOR
+        # HEADER of run(), which is outside the per-update try, so it kills the
+        # process. systemd restarts it, the offset was never advanced past that
+        # batch, the same element comes back, and the pager crash-loops until
+        # somebody looks. Filtered rather than raised: a batch of ten updates
+        # with one malformed element must still deliver the other nine.
+        return [u for u in out if isinstance(u, dict)]
 
     # -- the poke -------------------------------------------------------
     def poke(self, chat_id: int, job: str, params: dict) -> None:
@@ -715,7 +928,7 @@ class Pager:
             pending = db.run_wake(self.args, self.key, job, params)
         except BaseException as e:                           # noqa: BLE001
             integrity_log("pager", f"wake_failed:{job}")
-            self.send(chat_id, f"{job}: failed to start — {_redact(e)[:160]}")
+            self.send(chat_id, f"{chat_name(job)}: failed to start — {_redact(e)[:160]}")
             return
         out = pending.outcome()
         integrity_log("pager", f"outcome:{job}:{out}")
@@ -740,7 +953,7 @@ class Pager:
                 # it. Two messages: the memo must be copied alone (see below).
                 lines = proto.plain_lines(plain)
                 body, memo = lines[:-1], lines[-1]
-                self.send(chat_id, f"{job} ready · slip {h}\n\n"
+                self.send(chat_id, f"{chat_name(job)} ready · slip {h}\n\n"
                                    + "\n".join(body).rstrip())
                 # THE MEMO ALONE IN ITS OWN MESSAGE. Tap-and-hold copies a
                 # WHOLE Telegram message, and this string has to reach a wallet
@@ -766,7 +979,7 @@ class Pager:
                 # this is still the original vocabulary: §5 step 5, "Telegram
                 # gets `depo ready · slip A3F1`". No address, no memo, no
                 # amount.
-                self.send(chat_id, f"{job} ready · slip {h}")
+                self.send(chat_id, f"{chat_name(job)} ready · slip {h}")
                 return
             # A SEALED SLIP CAME BACK. This process cannot read it: it is
             # sealed to the delivery key, which exists on neither this box nor
@@ -799,7 +1012,7 @@ class Pager:
                 time.sleep(SLIP_RETRY_S)
                 ok = self.send(chat_id, slip)
             if ok:
-                self.send(chat_id, f"{job} ready · slip {h}")
+                self.send(chat_id, f"{chat_name(job)} ready · slip {h}")
             else:
                 integrity_log("pager", "slip_undelivered")
                 # NOT "/watch {h}". That was the first version of this line and
@@ -810,18 +1023,18 @@ class Pager:
                 # ThorChain quote expires anyway, so the honest instruction is
                 # to ask for a new one.
                 self.send(chat_id,
-                          f"{job} ready · slip {h}\n"
+                          f"{chat_name(job)} ready · slip {h}\n"
                           f"Did not get through, twice — and it expires. "
                           f"/depo again for a fresh one.")
         elif out == "refused":
-            self.send(chat_id, f"{job}: refused.")
+            self.send(chat_id, f"{chat_name(job)}: refused.")
         elif out == "failed":
-            self.send(chat_id, f"{job}: failed.")
+            self.send(chat_id, f"{chat_name(job)}: failed.")
         elif out == "expired_uncollected":
-            self.send(chat_id, f"{job}: not collected. Nothing was handed "
+            self.send(chat_id, f"{chat_name(job)}: not collected. Nothing was handed "
                                f"over.")
         else:
-            self.send(chat_id, f"{job}: no result. Check before trying again.")
+            self.send(chat_id, f"{chat_name(job)}: no result. Check before trying again.")
 
     def _worker(self, chat_id: int, job: str, params: dict) -> None:
         try:
@@ -849,6 +1062,18 @@ class Pager:
         # a reply to something nobody typed.
         if not isinstance(msg.get("text"), str):
             return
+        # THE OPERATOR'S OWN MESSAGE IS TRACKED TOO, and it is the half that
+        # matters more. The bot's replies are deliberately boring; the COMMANDS
+        # are what say a swap was quoted at 03:12 and again at 03:40. Recorded
+        # here rather than in send(), because nothing this program sends
+        # produced it.
+        #
+        # AFTER the allowlist and the is-it-text gates, so a stranger's traffic
+        # never enters this list -- deleting a message in a chat that is not
+        # allowlisted is an action taken on behalf of somebody who was refused.
+        _mid = msg.get("message_id")
+        if isinstance(_mid, int) and not isinstance(_mid, bool):
+            self.burn.append((cid, _mid, time.time()))
         # A LIVE CONVERSATION GETS FIRST REFUSAL on the message, because a bare
         # "2" is an answer and not a command. It hands back anything starting
         # with "/" (and drops itself when it does), so a real command is never
@@ -885,10 +1110,21 @@ class Pager:
             self.send(cid, HELP)
             return
         if err == "status":
-            self.send(cid, f"pokes in last 24h: {len(self.limits.recent())}/"
-                           f"{self.limits.daily_cap}\n"
-                           f"ignored messages: {self.ignored}\n"
-                           f"busy: {self.busy.locked()}")
+            # WHETHER A COMMAND WILL BE ACCEPTED, and nothing else.
+            #
+            # This printed the poke count for the last 24 hours and
+            # "busy: True/False". The count is how many deposits were started
+            # today; busy is whether the machine is powered on AT THIS MOMENT,
+            # which is the single most useful fact to anyone deciding when to
+            # knock on a door. Both sat permanently in the transcript, on a
+            # command that exists to answer "can I send one".
+            #
+            # "ready" or "wait Ns" answers that and discloses no history and no
+            # power state -- a busy pager and a rate-limited one both say wait,
+            # which is also true.
+            _why = self.limits.why_not()
+            self.send(cid, _why if _why
+                      else ("wait" if self.busy.locked() else "ready"))
             return
         if err:
             # A BARE NUMBER WITH NO LIVE CONVERSATION is the commonest way to
@@ -896,11 +1132,21 @@ class Pager:
             # wrong answer to it. It means the operator walked away, came back
             # past the TTL, and typed the slot they had already decided on.
             # Tell them that, rather than making them work it out.
-            if msg["text"].strip().isdigit():
+            # isdecimal here too. This one only decides WHICH refusal is
+            # printed, so the old predicate could not raise -- but a
+            # superscript would have been told "unknown command" plus the whole
+            # help text instead of "your /depo expired", which is the answer
+            # this branch exists to give.
+            if msg["text"].strip().isdecimal():
                 self.send(cid, "no live /depo — it expired or was cancelled. "
                                "Start again with /depo, or /depo <slot>.")
                 return
-            self.send(cid, f"no: {err}\n\n{HELP}")
+            # THE ERROR, NOT THE MANUAL. Appending HELP to every typo put the
+            # full command list -- including the memo line -- into the chat
+            # again on each mistake, which is the same paragraph repeated into
+            # the readable surface for no new information. /help still exists
+            # and still prints it once, on request.
+            self.send(cid, f"no: {err}")
             return
         self.start_job(cid, job, params)
 
@@ -927,22 +1173,31 @@ class Pager:
         if not self.busy.acquire(blocking=False):
             self.send(cid, "no: a wake is already running")
             return
-        self.limits.record()
-        integrity_log("pager", f"poke:{job}")
-        self.send(cid, f"{job}: working. This takes a while.")
-        # RELEASE IT IF THE THREAD NEVER STARTS. The worker releases `busy` in
-        # its own finally, so a Thread.start() that raises leaves the lock held
-        # by nobody -- and every later poke answers "a wake is already running"
-        # for the life of the process. Reproduced with a Thread whose start()
-        # raises RuntimeError("can't start new thread"), which is exactly what
-        # a 1 GB Pi under memory pressure does.
+        # RELEASE IT IF ANYTHING BETWEEN HERE AND THE THREAD RAISES.
+        #
+        # The guard used to start at Thread.start(), on the reasoning that a
+        # start() which raises leaves the lock held by nobody -- true, and it
+        # is the same for the three statements ABOVE it, which were outside the
+        # try. limits.record() writes the state file, so a full or read-only SD
+        # card raises there; integrity_log appends to a hash chain on the same
+        # card. Either one leaves `busy` acquired and never released, and every
+        # later poke answers "a wake is already running" for the life of the
+        # process -- on a headless box, with the operator unable to wake
+        # anything and no clue why.
+        #
+        # The try ENDS at start(). Once the thread is running the worker's own
+        # finally owns the lock, and a release here would free a lock the
+        # worker still thinks it holds.
         try:
+            self.limits.record()
+            integrity_log("pager", f"poke:{job}")
+            self.send(cid, f"{chat_name(job)}: working. This takes a while.")
             threading.Thread(target=self._worker, args=(cid, job, params),
                              daemon=True).start()
         except BaseException as e:                           # noqa: BLE001
             self.busy.release()
             integrity_log("pager", "worker_start_failed")
-            self.send(cid, f"{job}: could not start the wake — {_redact(e)[:120]}")
+            self.send(cid, f"{chat_name(job)}: could not start the wake — {_redact(e)[:120]}")
 
     def run(self) -> int:
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s), "
@@ -950,15 +1205,52 @@ class Pager:
         while not shutdown_requested():
             for upd in self.updates():
                 uid = upd.get("update_id")
-                if isinstance(uid, int):
+                if isinstance(uid, int) and not isinstance(uid, bool):
                     # Advance the cursor BEFORE acting: a message that crashes
                     # the handler must not be replayed on every restart.
                     self.limits.offset = max(self.limits.offset, uid + 1)
                     self.limits.save()
+                else:
+                    # NOT SILENTLY HANDLED ANYWAY. An update whose update_id is
+                    # not an int can never be confirmed to Telegram, because
+                    # the offset is what confirms it -- so it is redelivered on
+                    # every single poll, and handling it each time means one
+                    # message acted on forever. Skipped instead, and counted,
+                    # so a real change in the Bot API shows up as a rising
+                    # counter rather than as a pager that has quietly become a
+                    # loop. `bool` is excluded because True == 1 and would
+                    # advance the cursor to 2.
+                    self.ignored += 1
+                    integrity_log("pager", "update_without_id")
+                    continue
                 try:
                     self.handle(upd)
                 except Exception as e:                       # noqa: BLE001
                     print(f"  [!] update dropped: {_redact(e)[:200]}")
+            # EVERY TICK, INCLUDING THE QUIET ONES, and that is the point:
+            # updates() long-polls for POLL_HOLD_S and returns an empty list
+            # when nothing was said, so a chat nobody touches still empties
+            # itself on schedule. Hooking this to message arrival instead would
+            # leave the last conversation of the night sitting there until the
+            # next one.
+            #
+            # OUTSIDE the per-update try: a delete that fails is already
+            # swallowed by delete_message, and a bug here must not be reported
+            # as "update dropped" about a message that was handled fine.
+            if self.burn_now:
+                # CLEARED FIRST. If burn_all raises, a flag left set would
+                # retry the whole list on every tick for the life of the
+                # process -- a permanent stream of delete requests over Tor
+                # from one signal.
+                self.burn_now = False
+                _g, _t = self.burn_all()
+                integrity_log("pager", "burn_signal")
+                print(f"  [*] burn: {_g}/{_t} message(s) deleted"
+                      + ("" if _g == _t
+                         else "; the rest are past Telegram's 48h window"))
+            _burned = self.burn_expired(self.burn_after)
+            if _burned:
+                integrity_log("pager", "messages_burned")
         print("  [*] Shutdown requested.")
         return 0
 
@@ -1046,14 +1338,41 @@ def build_cli():
     ap.add_argument("--daily-cap", type=int, default=DEFAULT_DAILY_CAP,
                     help="courtesy pokes per 24h. The vault's own keyfile "
                          "budget is the real bound.")
+    ap.add_argument("--burn-after", type=int, default=0, metavar="SECONDS",
+                    help="Delete every message in an allowlisted chat -- this "
+                         "bot's replies AND the operator's commands -- this "
+                         "many seconds after it was sent. 0 (default) keeps "
+                         "them. Telegram only lets a bot delete for 48h, so a "
+                         "value above 172800 cannot work and is refused. This "
+                         "does not reach a forward, a screenshot or a cached "
+                         "copy: it is defence in depth on a channel already "
+                         "written to say nothing.")
     ap.add_argument("--no-jitter", action="store_true",
                     help="passed through to the wake: skip the pre-WOL delay")
     return ap
 
 
+#: Telegram refuses deleteMessage for anything older than 48 hours. A
+#: --burn-after above it is a setting that silently never fires, which reads as
+#: "messages are being burned" while nothing is.
+TG_DELETE_WINDOW_S = 172800
+
+
 def main(argv=None) -> int:
     install_signal_handlers()
     args = build_cli().parse_args(argv)
+    # REFUSED, NOT CLAMPED. A --burn-after past Telegram's 48-hour deletion
+    # window is a setting that never fires: every message reaches the deadline
+    # already too old to delete, so the operator is told nothing and believes
+    # the chat is being emptied. Silently clamping it would be a second lie --
+    # the value they typed is not the value that ran.
+    if args.burn_after < 0:
+        sys.exit("[!] --burn-after cannot be negative. 0 disables it.")
+    if args.burn_after > TG_DELETE_WINDOW_S:
+        sys.exit(f"[!] --burn-after {args.burn_after}s is past Telegram's "
+                 f"{TG_DELETE_WINDOW_S}s deletion window, so nothing would "
+                 f"ever be deleted and the chat would look like it was being "
+                 f"emptied. Pick something under that, or 0 to keep messages.")
     try:
         proto.require_nacl()
     except proto.WakeError as e:
@@ -1095,7 +1414,22 @@ def main(argv=None) -> int:
         sys.exit(f"[!] cannot create {st.parent}: {e.strerror}")
 
     integrity_log("pager", "start")
-    return Pager(args, token, key, proxies).run()
+    _pager = Pager(args, token, key, proxies)
+    # SIGUSR1 BURNS THE CHAT. Registered here rather than in __init__ because
+    # a Pager built by a test must not install a process-wide handler -- the
+    # same rule _report_surviving_plans follows in GhostSpiral.
+    #
+    # Best-effort: a platform without SIGUSR1 loses the trigger and keeps the
+    # pager, which is the right way round. --burn-after still works there.
+    try:
+        import signal as _sig
+        _sig.signal(_sig.SIGUSR1, _pager.arm_burn)
+        print("  [*] SIGUSR1 burns this chat's tracked messages "
+              "(kill -USR1). No chat command does it: the word would sit in "
+              "the transcript it was meant to empty.")
+    except (AttributeError, ValueError, OSError):
+        pass
+    return _pager.run()
 
 
 if __name__ == "__main__":

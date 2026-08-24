@@ -627,7 +627,26 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  # stdin closed the prompt cannot fire, and omitting the flag
                  # is the only value under which the tool cannot print a mix
                  # command.
-                 "--timeout-min", "110"]]
+                 "--timeout-min", "110",
+                 # AND IT REPORTS WHAT IT SAW, for the same reason swap_status
+                 # does. Without this, receive_watch exits non-zero when the
+                 # 110 minutes run out and the pager says "watch: failed." --
+                 # about money that is simply still in flight. That is the
+                 # exact sentence swap_status was built to stop saying, on the
+                 # command an operator uses when they are least able to check
+                 # anything themselves.
+                 #
+                 # The path is composed from the keyfile's artifact_dir and a
+                 # fixed name, like the swap_status one: no operator input
+                 # reaches it. Both jobs writing one file is safe because the
+                 # pager runs one wake at a time and reads the file
+                 # immediately.
+                 #
+                 # --stall-min is left at its default (30), which is inside
+                 # this 110-minute window; passing 110 would make the shortfall
+                 # check unable to fire at all and receive_watch warns about
+                 # exactly that.
+                 "--result-json", str(artifact_dir / STATUS_FILE)]]
     if job == "swap_status":
         # LOOK, DO NOT WAIT. Three minutes inside a 300 s budget: enough for
         # the wallet to answer, and the vault is off again before the wake is
@@ -1079,8 +1098,16 @@ _PHASE_OF_STATE = {
 
 
 def _phase_of(job: str, artifact_dir: Path, reader=None) -> str:
-    """The one word a status probe earned, or "". NEVER raises."""
-    if job != "swap_status":
+    """The one word a status probe earned, or "". NEVER raises.
+
+    BOTH WATCHING JOBS, not just the short one. `watch` used to be excluded
+    here, so a 110-minute wait that ended with the money still in flight came
+    back to the operator as "watch: failed." -- money that has not arrived
+    reported as a failure of the machine, which is the precise sentence
+    swap_status exists to stop saying. Both now write the same status file and
+    both are read the same way.
+    """
+    if job not in ("swap_status", "watch"):
         return ""
     try:
         out = (reader or _read_json)(Path(artifact_dir) / STATUS_FILE) or {}

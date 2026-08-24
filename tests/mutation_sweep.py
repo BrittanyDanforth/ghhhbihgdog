@@ -2235,6 +2235,146 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- three more things the chat did not need to say ---------------------
+ #
+ # /status printed the poke count for the last 24 hours and busy True/False:
+ # how many deposits were started today, and whether the machine is powered on
+ # at this moment. Both permanent, in a transcript, on a command whose whole
+ # job is to answer "can I send one".
+ ("/status discloses the wake count and the power state again",
+  "gs_telegram_pager",
+  "            _why = self.limits.why_not()\n"
+  "            self.send(cid, _why if _why\n"
+  '                      else ("wait" if self.busy.locked() else "ready"))',
+  '            self.send(cid, f"pokes in last 24h: {len(self.limits.recent())}/"\n'
+  '                           f"{self.limits.daily_cap}\\n"\n'
+  '                           f"busy: {self.busy.locked()}")',
+  ["test_telegram_pager"]),
+
+ ("every typo reprints the whole command list again", "gs_telegram_pager",
+  '            self.send(cid, f"no: {err}")',
+  '            self.send(cid, f"no: {err}\\n\\n{HELP}")',
+  ["test_telegram_pager"]),
+
+ # OPSEC_SETUP section 5 step 5 specifies "depo ready · slip A3F1".
+ ("the chat goes back to the machine's own job identifiers",
+  "gs_telegram_pager",
+  '    "receive_and_quote": "depo",',
+  '    "receive_and_quote": "receive_and_quote",',
+  ["test_sealed_slip"]),
+
+ # Every wake serves 5-20 min of jitter BEFORE the job starts, so a "~5 min"
+ # round trip understated it by two to seven times.
+ ("/check's quoted time forgets the jitter it always waits",
+  "gs_telegram_pager",
+  '    "/check <h>  has it arrived? (10-25 min)\\n"',
+  '    "/check <h>  has it arrived? (~5 min)\\n"',
+  ["test_telegram_pager"]),
+
+ # ---- chat text that arrives through a variable --------------------------
+ #
+ # A source scan for literals at send() call sites cannot see a string that
+ # gets there in a variable. Two did.
+ ("the rate-limit refusal describes the wake architecture again",
+  "gs_telegram_pager",
+  '            return f"wait {int(self.min_interval - gap)}s"',
+  '            return (f"rate limited, {int(self.min_interval - gap)}s left "\n'
+  '                    f"(courtesy limit; the vault\'s own 24h budget is the "\n'
+  '                    f"real one)")',
+  ["test_telegram_pager"]),
+
+ # gs_doorbell refuses a bind with the Pi's own listen host and port in the
+ # text, and poke() forwards that exception straight to Telegram.
+ ("the Pi's listen address reaches the chat again", "gs_telegram_pager",
+  '    out = re.sub(r"\\b(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[A-Za-z0-9](?:[A-Za-z0-9-]"',
+  '    out = re.sub(r"(?!x)x" or r"\\b(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[A-Za-z0-9](?:[A-Za-z0-9-]"',
+  ["test_telegram_pager"]),
+
+ # ---- four defects that broke no existing check --------------------------
+
+ # limits.record() and integrity_log() both write the SD card and both ran
+ # after acquire() and outside the release guard. A full card leaves the wake
+ # lock held by nobody for the life of the process.
+ ("a failed state write wedges the wake lock forever", "gs_telegram_pager",
+  "        try:\n            self.limits.record()\n"
+  '            integrity_log("pager", f"poke:{job}")',
+  '        self.limits.record()\n        integrity_log("pager", f"poke:{job}")\n'
+  "        try:",
+  ["test_telegram_pager"]),
+
+ # run() reads upd.get("update_id") in the FOR HEADER, outside the per-update
+ # try, so one bare string in the batch kills the process -- and the offset was
+ # never advanced past it, so it crash-loops.
+ ("a malformed update element kills the pager", "gs_telegram_pager",
+  "        return [u for u in out if isinstance(u, dict)]",
+  "        return out",
+  ["test_telegram_pager"]),
+
+ # The offset is what confirms an update. One that can never advance it is
+ # redelivered on every poll, so handling it means acting on one message
+ # forever.
+ ("an update with no usable id is handled on every poll, forever",
+  "gs_telegram_pager",
+  "                if isinstance(uid, int) and not isinstance(uid, bool):",
+  "                if True:",
+  ["test_telegram_pager"]),
+
+ # "²".isdigit() is True and int("²") RAISES. The wizard documents this fix;
+ # parse_command never got it, so a typo escaped as a ValueError and the
+ # operator got no reply at all.
+ ("parse_command goes back to isdigit, which int() does not accept",
+  "gs_telegram_pager",
+  "            if not arg.isdecimal():\n"
+  '                return "", {}, "count must be a number 1-4"',
+  "            if not arg.isdigit():\n"
+  '                return "", {}, "count must be a number 1-4"',
+  ["test_telegram_pager"]),
+
+ # receive_watch exits non-zero on timeout, so a watch that ran out of time was
+ # reported as "watch: failed." -- money still in flight, called a failure.
+ ("a watch that ran out of time is a failure again", "gs_wake_agent",
+  '                 "--timeout-min", "110",',
+  '                 "--timeout-min", "110"] + [] or [',
+  ["test_wake_agent"]),
+
+ ("only swap_status may report a phase again", "gs_wake_agent",
+  '    if job not in ("swap_status", "watch"):',
+  '    if job != "swap_status":',
+  ["test_wake_agent"]),
+
+ # ---- burn after reading ------------------------------------------------
+ #
+ # Making the replies boring was the first half; removing them afterwards is
+ # the second. Neither replaces the other.
+ ("the operator's own commands are no longer tracked for deletion",
+  "gs_telegram_pager",
+  "        _mid = msg.get(\"message_id\")\n"
+  "        if isinstance(_mid, int) and not isinstance(_mid, bool):\n"
+  "            self.burn.append((cid, _mid, time.time()))",
+  "        _mid = msg.get(\"message_id\")",
+  ["test_telegram_pager"]),
+
+ ("a refused delete is retried on every tick, forever, over Tor",
+  "gs_telegram_pager",
+  "            if self.delete_message(cid, mid):\n                gone += 1\n        self.burn = keep\n        return gone",
+  "            if self.delete_message(cid, mid):\n                gone += 1\n            else:\n                keep.append((cid, mid, sent))\n        self.burn = keep\n        return gone",
+  ["test_telegram_pager"]),
+
+ # A --burn-after past Telegram's window never fires, so the chat only LOOKS
+ # like it is being emptied.
+ ("a burn-after that can never fire is accepted instead of refused",
+  "gs_telegram_pager",
+  "    if args.burn_after > TG_DELETE_WINDOW_S:",
+  "    if False:",
+  ["test_telegram_pager"]),
+
+ # The signal handler must not do network I/O: it runs between bytecodes and
+ # can arrive inside safe_post.
+ ("the burn signal does the work inside the handler", "gs_telegram_pager",
+  "        self.burn_now = True",
+  "        self.burn_all()",
+  ["test_telegram_pager"]),
+
  # ---- chat text that lives in another file is still chat text ------------
  #
  # PHASE_LINES are defined in gs_wake_proto and sent verbatim by the pager
