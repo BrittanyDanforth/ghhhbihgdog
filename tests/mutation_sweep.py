@@ -2227,6 +2227,48 @@ MUTATIONS = [
   '        _acct = create_fresh_account(rpc, label="usage fee")',
   ["test_dag_entry"]),
 
+ # ---- /fee predates --usage-fee and answers about something else ---------
+ #
+ # It answers about the BITCOIN network fee and the swap's slippage floor. Now
+ # that a thing called a usage fee exists, someone typing /fee to ask about
+ # theirs gets a confident answer about something else, and silence about their
+ # own reads as "not built". It is named there only to say it is not there --
+ # this channel is designed on the assumption the transcript gets read, and the
+ # rate is what divides a cash-out back into a deposit.
+ # ---- the bot says the answer and stops -----------------------------------
+ #
+ # Two drafts explained instead of answering: where each knob really lives, why
+ # it is not settable, what loosening it would cost -- and, worst, a sentence
+ # saying the omission was deliberate because the transcript is assumed read.
+ # Every one of those is a description of the arrangement, written permanently
+ # into the readable surface, bought by telling the operator what they know.
+ ("/fee goes back to explaining instead of answering", "gs_telegram_pager",
+  'FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee."',
+  'FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Set at the vault when you run '
+  'the mix; this channel deliberately cannot read or change it."',
+  ["test_depo_wizard"]),
+
+ ("the help text goes back to describing the setup", "gs_telegram_pager",
+  '    "Memo goes in an OP_RETURN — desktop wallet, not a phone."',
+  '    "Memo goes in an OP_RETURN — desktop wallet, not a phone.\\n"\n'
+  '    "What comes back depends on the VAULT\'s keyfile: a handle, a sealed "\n'
+  '    "slip for gs_unseal, or the address in the clear."',
+  ["test_depo_wizard"]),
+
+ ("the confirm names the machine it is about to wake", "gs_telegram_pager",
+  '            self.send(chat_id, f"slot {c.slot} — confirm.\\n\\n{q}")',
+  '            self.send(chat_id, f"slot {c.slot} — this will WAKE THE VAULT "\n'
+  '                               f"and quote a swap.\\n\\n{q}")',
+  ["test_depo_wizard"]),
+
+ # The label is copied rather than imported (the phone-side box has no reason
+ # to carry the pipeline), so the copy is what can drift.
+ ("the rate the bot prints drifts from the rate charged",
+  "gs_telegram_pager",
+  'USAGE_FEE_LABEL = "1.1%"',
+  'USAGE_FEE_LABEL = "1%"',
+  ["test_depo_wizard"]),
+
  # ---- the doc's list of env-carried values must be the code's list -------
  #
  # OPSEC_SETUP's paragraph confesses that GS_EXIT_TO "was missing from that

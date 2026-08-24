@@ -563,8 +563,15 @@ check("the sealed blob DOES reach the chat -- otherwise none of this delivers",
 check("the blob is sent ALONE, so tap-and-hold copies it and nothing else",
       BLOB in _sent)
 check("the handle still reaches the chat", "A3F1" in _chat)
-check("and the chat says where to open it",
-      "gs_unseal" in _chat)
+# AND IT NAMES NO TOOL. This used to assert the reply said "gs_unseal it on
+# the machine you send the BTC from". Useful exactly once -- the operator
+# turned this mode on themselves, in a keyfile, so they know what the blob is
+# -- and after that it is a tool name repeated into the readable surface on
+# every single job, forever.
+check("and it names no tool to open it with", "gs_unseal" not in _chat)
+check("NON-VACUITY -- the blob and the handle are both there, so the reply "
+      "still carries everything the operator needs",
+      BLOB in _chat and "A3F1" in _chat)
 
 # A DROPPED SEND MUST NOT LEAVE A PROMISE WITH NOTHING BEHIND IT.
 #
@@ -583,8 +590,12 @@ check("a blob that does not send is RETRIED once before anyone is told bad "
       _sent.count(BLOB) == 2)
 check("...and not more than once: a retry storm holds the busy lock for the "
       "whole rate-limit window", _sent.count(BLOB) == 2)
+# CASE-INSENSITIVE, because the sentence was shortened and the check was
+# pinned to its exact capitalisation. What matters is that the reply says the
+# thing did not arrive, not which letter is capital.
 check("when both attempts fail, the reply says so rather than pointing at a "
-      "message that is not there", "did NOT get through" in _failtext)
+      "message that is not there",
+      "did not get through" in _failtext.lower())
 check("...and does not claim the slip is below it",
       "↑ sealed slip" not in _failtext)
 check("...and still gives the handle, so the job is not lost",
@@ -634,8 +645,12 @@ _sent.clear()
 _done.result = {"status": "done", "handle": "A3F1", "slip": "",
                 "plain": {}, "phase": ""}
 _pager.poke(111, "receive_and_quote", {"amount_slot": 2})
-check("with no delivery key the old message is exactly what it was",
-      any("Read the address and memo on the vault." in t for t in _sent))
+# THE NO-KEY PATH IS THE HANDLE, AND NOTHING ELSE. This asserted the reply
+# said "Read the address and memo on the vault." -- a sentence naming the
+# machine, sent on every job, telling the operator where their own hardware is.
+check("with no delivery key the reply is the handle line and nothing more",
+      any(t.strip() == "receive_and_quote ready · slip A3F1" for t in _sent))
+check("...and it names no machine", not any("vault" in t.lower() for t in _sent))
 check("...and no empty message is sent in place of the blob", len(_sent) == 1)
 
 # ===========================================================================

@@ -3135,6 +3135,14 @@ check("fee/own: NON-VACUITY -- an address the wallet does NOT hold keys to is "
 check("fee/own: NON-VACUITY -- ...and gets the reuse warning, not the "
       "in-wallet one",
       "collect from every run" in _fout2 and "THIS WALLET" not in _fout2)
+# ONE STATEMENT PER RUN. The refusal used to print AFTER the reuse warning, so
+# a waived run said "the usage fee goes to a FIXED address you supplied" and
+# then, four lines later, "NO USAGE FEE TAKEN" -- two claims about the same run
+# that cannot both be true, leaving the operator to work out which won. Found
+# by reading every branch's real output side by side rather than one at a time.
+check("fee/own: a waived in-wallet address does NOT also get the reuse "
+      "warning — the run would be making two contradictory statements",
+      "collect from every run" not in _oout)
 # AN ERROR IS THE EXPECTED ANSWER FOR A FOREIGN ADDRESS. monero-wallet-rpc
 # answers get_address_index for an address it does not own with an ERROR, not
 # with a null result -- so treating "unknown" as "ours" would waive the fee on

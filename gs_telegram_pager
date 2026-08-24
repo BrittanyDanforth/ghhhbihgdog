@@ -158,6 +158,14 @@ MAX_CONVOS = 16
 #: be the dishonest part. See CONFIRM_NOTE.
 CONFIRM_CHOICES = 3
 
+#: The usage-fee rate, as the ONE string this channel may say about it.
+#:
+#: Not imported from GhostSpiral: this runs on the phone-side box, which has
+#: no reason to carry the pipeline and may not have it on disk at all. Copied,
+#: and a test compares it against GhostSpiral.USAGE_FEE_PCT so the copy cannot
+#: drift into a number that is not the rate being charged.
+USAGE_FEE_LABEL = "1.1%"
+
 CONFIRM_NOTE = (
     "This gate stops a pocket-dial and a message pasted into the wrong "
     "chat. It is NOT a security control: anyone holding this phone can read "
@@ -182,23 +190,19 @@ CONFIRM_NOTE = (
 #: chat transcript that is assumed to leak. These say WHERE, which is what the
 #: operator on a phone actually needs, and stop. The detail is in
 #: OPSEC_SETUP.md, which lives on the machine that has it.
-FEE_ANSWER = (
-    "Fee: your sending wallet's choice — the vault never sends BTC, it only "
-    "quotes. The swap's own price protection is a refusal threshold set at "
-    "the vault, deliberately not settable from here: loosening it is how a "
-    "bad-price route gets accepted."
-)
-SPEED_ANSWER = (
-    "Speed: not settable, by anyone, today. The quote comes back with its "
-    "routing already fixed, so there is nothing here or at the vault to turn. "
-    "Making it selectable is a change to how quotes are requested, not a chat "
-    "setting."
-)
-EXIT_ANSWER = (
-    "Exit route: set at the vault, when you run the mix. This channel cannot "
-    "name or select a destination — that is the whole reason the channel "
-    "exists, and the one rule it does not bend."
-)
+#: SAY THE ANSWER, THEN STOP. These used to be paragraphs -- where each knob
+#: really lives, why it is not settable, what loosening it would cost. Every
+#: one of those sentences is a description of the setup, written into the one
+#: surface this whole design assumes gets read, in exchange for telling the
+#: operator something they already know. A reader who has the transcript and
+#: nothing else learns the shape of the operation from the explanations, not
+#: from the answers.
+#:
+#: So: the answer, and nothing around it. The reasoning stayed here, in source,
+#: on the machine that has the source.
+FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee."
+SPEED_ANSWER = "Not settable here."
+EXIT_ANSWER = "Not settable here."
 
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
@@ -210,23 +214,28 @@ DEFAULT_DAILY_CAP = 12
 #: `$` also matches before a trailing newline (see gs_common's validators).
 HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 
+#: WHAT IT DOES, NOT HOW ANY OF IT WORKS.
+#:
+#: This listed the commands and then explained the setup: which keyfile decides
+#: what comes back, that a sealed slip exists and what unseals it, which
+#: machine must not be used to send. All true, all useful to the operator
+#: exactly once, and all of it a description of the arrangement sitting
+#: permanently in the surface this design assumes is read by someone else.
+#:
+#: The memo line stays, in its shortest form. It is not an explanation, it is
+#: the difference between a payment arriving and a payment being unrecoverable,
+#: and the operator needs it at the moment they are about to send.
 HELP = (
-    "GhostSpiral pager\n"
-    "/depo       quote a swap — asks which slot, then confirms\n"
+    "/depo       start — asks which slot, then confirms\n"
     "/depo <s>   same, in one shot, slot 0-7\n"
-    "/recv [n]   mint n receive subaddresses (1-4, default 1)\n"
-    "/check <h>  has my payment arrived? (~5 min, then it powers off)\n"
-    "/watch <h>  wait up to 110 min for it (blocks everything else)\n"
+    "/recv [n]   1-4 addresses to receive on (default 1)\n"
+    "/check <h>  has it arrived? (~5 min)\n"
+    "/watch <h>  wait up to 110 min for it\n"
     "/cancel     drop a half-finished /depo\n"
-    "/status     counters only\n"
-    "/fee /speed /exit   where those are really set — not settable here\n"
+    "/status     counters\n"
+    "/fee /speed /exit\n"
     "\n"
-    "WHAT COMES BACK depends on the VAULT's keyfile, not on this box:\n"
-    "nothing readable, a SEALED slip for gs_unseal, or the deposit\n"
-    "address and memo in the clear.\n"
-    "\n"
-    "The memo needs an OP_RETURN. No phone wallet can do that —\n"
-    "use Electrum or Sparrow on a desktop. Any desktop; not the vault."
+    "Memo goes in an OP_RETURN — desktop wallet, not a phone."
 )
 
 
@@ -548,11 +557,7 @@ class Pager:
             return
         self.convos[chat_id] = Convo(self.clock)
         self.send(chat_id,
-                  "Which ladder SLOT? Reply 0-7.\n"
-                  "\n"
-                  "A slot, not an amount: the ladder lives on the vault and "
-                  "this box has never held it, so it cannot show you the "
-                  "sizes. /cancel to stop.")
+                  "Which slot? Reply 0-7. /cancel to stop.")
 
     def step_convo(self, chat_id: int, text: str) -> bool:
         """Advance a live conversation. True if this message was consumed.
@@ -602,8 +607,7 @@ class Pager:
             # DEADLINE UNTOUCHED. See Convo: it is absolute from creation, so
             # answering slowly does not buy another full window.
             q, c.expect = _confirm_question(self.rng)
-            self.send(chat_id, f"slot {c.slot} — this will WAKE THE VAULT and "
-                               f"quote a swap.\n\n{q}")
+            self.send(chat_id, f"slot {c.slot} — confirm.\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
         # that is all it is: a wrong answer cancels, and nothing stops the
@@ -748,17 +752,21 @@ class Pager:
                     if not self.send(chat_id, memo):
                         integrity_log("pager", "memo_undelivered")
                         self.send(chat_id,
-                                  f"The MEMO did not get through, twice. Do "
-                                  f"NOT send the BTC without it — it would be "
-                                  f"unroutable. Poke /depo again.")
+                                  # SHORT, BUT NOT VAGUE. This is the one
+                                  # message where cutting a word costs
+                                  # money rather than privacy: sent
+                                  # without the memo the transfer does
+                                  # not arrive and does not come back.
+                                  f"MEMO did not get through, twice. Do "
+                                  f"NOT send without it — unroutable. "
+                                  f"/depo again.")
                 return
             if not slip:
                 # NO DELIVERY KEY IS CONFIGURED, so there is nothing to send and
                 # this is still the original vocabulary: §5 step 5, "Telegram
                 # gets `depo ready · slip A3F1`". No address, no memo, no
                 # amount.
-                self.send(chat_id, f"{job} ready · slip {h}\n"
-                                   f"Read the address and memo on the vault.")
+                self.send(chat_id, f"{job} ready · slip {h}")
                 return
             # A SEALED SLIP CAME BACK. This process cannot read it: it is
             # sealed to the delivery key, which exists on neither this box nor
@@ -791,9 +799,7 @@ class Pager:
                 time.sleep(SLIP_RETRY_S)
                 ok = self.send(chat_id, slip)
             if ok:
-                self.send(chat_id, f"{job} ready · slip {h}\n"
-                                   f"↑ sealed slip. gs_unseal it on the "
-                                   f"machine you send the BTC from.")
+                self.send(chat_id, f"{job} ready · slip {h}")
             else:
                 integrity_log("pager", "slip_undelivered")
                 # NOT "/watch {h}". That was the first version of this line and
@@ -805,21 +811,17 @@ class Pager:
                 # to ask for a new one.
                 self.send(chat_id,
                           f"{job} ready · slip {h}\n"
-                          f"The sealed slip did NOT get through, twice. The "
-                          f"job ran and the quote is on the vault — but it is "
-                          f"unpayable from here, and quotes expire. Poke "
+                          f"Did not get through, twice — and it expires. "
                           f"/depo again for a fresh one.")
         elif out == "refused":
-            self.send(chat_id, f"{job}: vault REFUSED. Reason is on the vault.")
+            self.send(chat_id, f"{job}: refused.")
         elif out == "failed":
-            self.send(chat_id, f"{job}: vault ran it and it FAILED. "
-                               f"Reason is on the vault.")
+            self.send(chat_id, f"{job}: failed.")
         elif out == "expired_uncollected":
-            self.send(chat_id, f"{job}: nothing collected it. Vault may be "
-                               f"off or without Tor. Nothing was handed over.")
+            self.send(chat_id, f"{job}: not collected. Nothing was handed "
+                               f"over.")
         else:
-            self.send(chat_id, f"{job}: collected but never reported back. "
-                               f"CHECK THE VAULT before poking again.")
+            self.send(chat_id, f"{job}: no result. Check before trying again.")
 
     def _worker(self, chat_id: int, job: str, params: dict) -> None:
         try:
@@ -927,7 +929,7 @@ class Pager:
             return
         self.limits.record()
         integrity_log("pager", f"poke:{job}")
-        self.send(cid, f"{job}: waking the vault. This takes a while.")
+        self.send(cid, f"{job}: working. This takes a while.")
         # RELEASE IT IF THE THREAD NEVER STARTS. The worker releases `busy` in
         # its own finally, so a Thread.start() that raises leaves the lock held
         # by nobody -- and every later poke answers "a wake is already running"

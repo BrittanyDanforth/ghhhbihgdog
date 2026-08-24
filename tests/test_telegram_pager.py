@@ -263,9 +263,14 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
     check(f"outcome {_out}: no BTC deposit address reaches the chat",
           BTC not in _text)
     if _out == "done":
-        check("a finished job reports the 4-hex handle and says where the "
-              "address actually is",
-              "A3F1" in _text and "on the vault" in _text)
+        # THE HANDLE IS THE WHOLE REPLY. This also required the words "on
+        # the vault" -- a sentence naming the operator's own machine, sent on
+        # every finished job, into the surface this design assumes is read.
+        # The handle is what §8's own example carries: "depo ready · slip
+        # A3F1".
+        check("a finished job reports the 4-hex handle", "A3F1" in _text)
+        check("...and names no machine while doing it",
+              "vault" not in _text.lower())
 pg.doorbell = _real_doorbell
 
 
@@ -433,8 +438,11 @@ check("...and the whole conversation still contains no XMR address",
       XMR not in _chat)
 check("...no memo", MEMO not in _chat)
 check("...and no BTC deposit address", BTC not in _chat)
-check("...and it tells the operator where the address actually is",
-      "on the vault" in _chat)
+check("...and it names no machine to go and read it on",
+      "vault" not in _chat.lower())
+check("NON-VACUITY -- the reply is a real one, so the absences above are "
+      "absences from a message that was actually sent",
+      "ready" in _chat and "A3F1" in _chat)
 
 
 # ===========================================================================
