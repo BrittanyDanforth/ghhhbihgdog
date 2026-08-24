@@ -276,6 +276,11 @@ SCHEMA = {
     #: spreading the withdrawal is the point: one address re-joins off-chain
     #: everything the run separated on-chain.
     "exit_to":      ("list_re", XMR_RE),
+    #: THE OPERATOR'S CUT. The switch and the fraction are settings; the
+    #: ADDRESS is not, and it does not travel the same way -- see secret_env.
+    "mix_cut":      ("bool", None),
+    "mix_cut_pct":  ("re", DEC_RE),
+    "mix_cut_address": ("re", XMR_RE),
 }
 
 #: Most destinations anyone can sensibly hand-manage, and a hard bound on how
@@ -434,6 +439,16 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         a += ["--hop-delay", str(p["hop_delay"])]
     if p.get("dag_mixing"):
         a.append("--dag-mixing")
+    # THE SWITCH AND THE FRACTION ONLY. --mix-cut-address is the operator's own
+    # address collecting a slice of every run, which makes it exactly as
+    # sensitive as --exit-to -- so it goes in GS_MIX_CUT_ADDRESS (see
+    # secret_env) and never onto a command line that `ps` can read. The
+    # percentage is a setting, not an identifier, and it is already visible in
+    # the amounts.
+    if p.get("mix_cut"):
+        a.append("--mix-cut")
+    if p.get("mix_cut_pct"):
+        a += ["--mix-cut-pct", str(p["mix_cut_pct"])]
     if p.get("peel"):
         a.append("--peel")
     for flag, key in (("--rpc-primary", "rpc_primary"), ("--rpc-daemon", "rpc_daemon"),
@@ -673,7 +688,7 @@ PASSWORD_ACTIONS = {"run_pipeline"}
 #: the reason the variable reaches that child at all.
 ACTION_SECRETS = {
     "run_pipeline": {"GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_EXIT_TO",
-                     "GS_EXPECT_TOTAL_XMR"},
+                     "GS_EXPECT_TOTAL_XMR", "GS_MIX_CUT_ADDRESS"},
     "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO"},
 }
 _JOB_SEQ = [0]
@@ -722,6 +737,12 @@ def secret_env(params: dict) -> dict:
         env["GS_EXPECT_TOTAL_XMR"] = str(params["expect_total_xmr"])
     if params.get("exit_to"):
         env["GS_EXIT_TO"] = " ".join(params["exit_to"])
+    # THE CUT DESTINATION, same class as the exit destination and for a
+    # stronger reason: it collects from every run that uses it, so it is the
+    # one address that could re-join what all of them separated. GhostSpiral's
+    # own help for the flag says to prefer the variable.
+    if params.get("mix_cut_address"):
+        env["GS_MIX_CUT_ADDRESS"] = str(params["mix_cut_address"])
     return env
 
 
@@ -1266,6 +1287,71 @@ def run_eta(p: dict) -> str:
         return ""
 
 
+def limits_note(p: dict) -> str:
+    """What the smallest and largest workable amounts are, for THESE settings.
+
+    THE FOUR MONEY FIELDS ON THIS PAGE HAD NO BOUNDS AT ALL. `split`, `wallets`
+    and `deep` are `type="number"` with min and max; `btc_amount`, `swap_btc`
+    and the two `expect_total_xmr` boxes are bare inputs behind a regex that
+    accepts literal zero, and the server checks only that a value is PRESENT.
+    So the page put a bound on every count it asks for and none on the money.
+
+    Computed by calling the shipped mix_minimum_xmr, exactly as run_eta calls
+    the shipped estimate_runtime and _run_totals calls the shipped
+    compute_fee_budget: the page and the run must not be able to disagree about
+    what the run will accept. Returns "" rather than a guess when GhostSpiral
+    cannot be loaded -- the same rule the other two follow.
+
+    THE MINIMUM MOVES, which is why this is recomputed per preview rather than
+    baked into the HTML. It rises with --wallets (every mix output reserves its
+    own fees), falls without --dag-mixing (an output that never hops reserves
+    one transaction fewer), and rises again with the operator's cut -- which
+    below about fifteen wallets is the binding constraint, not the mix, because
+    a cut worth less than the fee to move it cannot be collected at all.
+
+    THE MAXIMUM IS REPORTED AS THE NON-ANSWER IT IS. XMR_ABSURD_TOTAL is a
+    sanity ceiling against a Decimal overflow, not a policy: quoting it alone
+    would tell an operator the limit is 100,000,000 XMR when the real ceiling
+    is their balance and the swap's liquidity. This tool knows neither and does
+    not invent them, so the sentence says that instead of a number.
+
+    AT THE FALLBACK FEE. The real per-transaction fee comes from the daemon and
+    this runs with no socket open, so the figure is computed at
+    FALLBACK_FEE_BY_PRIORITY -- exact at priority 1 and an UNDERSTATEMENT at 2,
+    3 and 4, where the fee is 4x, 20x and 200x. Said in the note rather than
+    implied by a bare number.
+    """
+    try:
+        g = _ghost()
+        from decimal import Decimal as _D
+        w = max(1, int(p.get("wallets") or 10))
+        prio = int(p.get("fee_priority") or 1)
+        fee = g.FALLBACK_FEE_BY_PRIORITY.get(prio, g.FALLBACK_FEE_XMR)
+        dag = bool(p.get("dag_mixing"))
+        exit_set = bool(p.get("exit_to"))
+        base = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set)
+        out = (f"Minimum {base} XMR to mix at {w} wallets"
+               f"{'' if dag else ' (no DAG mixing)'}")
+        if p.get("mix_cut"):
+            _pct = p.get("mix_cut_pct")
+            cut = _D(str(_pct)) if _pct else g.MIX_CUT_PCT
+            withcut = g.mix_minimum_xmr(fee, w, dag_mixing=dag,
+                                        exit_set=exit_set, cut_pct=cut)
+            out += (f", {withcut} XMR with the "
+                    f"{(cut * 100).normalize()}% cut")
+            if withcut > base:
+                out += (f" — the cut raises it because a cut worth less than "
+                        f"{g.hop_fee_reserve(fee)} XMR could never be spent")
+        out += (f". Figured at the fallback fee for priority {prio} "
+                f"({fee} XMR/tx); your daemon's real fee decides the run.")
+        out += (" No maximum is enforced beyond a sanity ceiling — what "
+                "actually limits you is your wallet balance and the swap's "
+                "liquidity, and this tool knows neither.")
+        return out
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None, shape=None):
     """Real per-priority fees from the operator's own daemon, or none at all.
 
@@ -1789,7 +1875,8 @@ class H(BaseHTTPRequestHandler):
                 "argv": argv, "pretty": " ".join(shlex.quote(x) for x in argv),
                 "problems": c["errors"] + why,
                 "notes": run_notes(c["params"]),
-                "eta": run_eta(c["params"])}))
+                "eta": run_eta(c["params"]),
+                "limits": limits_note(c["params"])}))
         if self.path == "/api/fees":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(
@@ -2063,7 +2150,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <h2 id="h2-2">Step 2 · Payment</h2>
     <div id="send-fields">
       <div class="f"><label for="btc_entry">BTC entry</label><input id="btc_entry" placeholder="bc1q…"></div>
-      <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" placeholder="0.05"></div>
+      <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" placeholder="0.05">
+        <span class="d limits"></span></div>
       <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="8" value="1"></div>
       <label class="chk"><input type="checkbox" id="joinmarket">
         <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
@@ -2083,7 +2171,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
            the code already had. -->
       <div class="f" style="margin-top:10px"><label for="expect_total_xmr_send">Total XMR expected
         <span class="d">optional — overrides the total summed from the quotes</span></label>
-        <input id="expect_total_xmr_send" placeholder="4.0"></div>
+        <input id="expect_total_xmr_send" placeholder="4.0">
+        <span class="d limits"></span></div>
     </div>
     <div id="recv-fields" hidden>
       <p class="lead"><b>The sender pays Bitcoin. You receive Monero.</b> Three steps, in order —
@@ -2105,7 +2194,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         is irreversible. The memo is checked to actually name your address before any
         instructions are printed.
         <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay</label>
-          <input id="swap_btc" placeholder="0.05"></div>
+          <input id="swap_btc" placeholder="0.05">
+          <span class="d limits"></span></div>
         <div class="f"><label for="pairs_file">Save quote to</label>
           <input id="pairs_file" placeholder="thor_pairs.json"></div>
         <div class="stepacts" data-acts="swap_quote"></div>
@@ -2122,7 +2212,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         <div class="stepacts" data-acts="watch_receive"></div>
         <div class="f" style="margin-top:10px"><label for="expect_total_xmr">Total XMR expected
           <span class="d">all swaps to this address</span></label>
-          <input id="expect_total_xmr" placeholder="4.0"></div>
+          <input id="expect_total_xmr" placeholder="4.0">
+        <span class="d limits"></span></div>
         <div class="f"><label for="split_recv">Number of swaps
           <span class="d">paying that total</span></label>
           <input id="split_recv" type="number" min="1" max="8" value="1"></div>
@@ -2219,6 +2310,30 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       is often still well-formed, and a send has no confirmation step and no
       reversal.</p>
       <div id="exitnote" class="warnbox" hidden></div>
+
+      <h3 style="margin-top:18px">Your cut</h3>
+      <label class="chk"><input type="checkbox" id="mix_cut">
+        <span>Keep a share of every deposit<span class="d">paid as one more
+        destination on the fan-out, to a FRESH account and subaddress minted
+        for this run</span></span></label>
+      <div class="f"><label for="mix_cut_pct">Fraction
+        <span class="d">default 0.011 = 1.1%</span></label>
+        <input id="mix_cut_pct" placeholder="0.011"></div>
+      <div class="f"><label for="mix_cut_address">Send the cut here instead
+        <span class="d">optional — a fixed address of your own</span></label>
+        <input id="mix_cut_address" placeholder="4… (leave empty to mint a fresh one each run)"></div>
+      <p class="lead mut-s"><b>What a fixed address costs.</b> One address
+      collecting from every run is the address reuse this toolchain refuses
+      everywhere else, and mixing does not retract it. Leave the box empty and
+      a new account and subaddress are minted per run, so no two runs share a
+      collection point.</p>
+      <p class="lead mut-s"><b>What no setting here can fix.</b> The cut is a
+      published fraction of the deposit. Wherever you eventually spend it,
+      whoever you spend it with sees an amount — and dividing it by the
+      fraction gives them the deposit it came from. Spending several cuts in
+      one transaction proves those runs share an owner, the same way the exit
+      does. The cut is safe on the chain; it is your <i>cash-out</i> that
+      carries it.</p>
     </div>
     <div class="stepnav"><button class="bk" data-go="2">← Back</button><button class="nx" data-go="4">Next →</button></div>
   </section>
@@ -2430,6 +2545,12 @@ function collect(){
   expect_total_xmr: mode==='receive' ? v('expect_total_xmr')
                                      : v('expect_total_xmr_send'),
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
+  // THE CUT. The switch and the fraction ride on argv; the address does
+  // not -- pipeline_argv puts it in GS_MIX_CUT_ADDRESS instead, the same
+  // way the exit destination travels. Collected here all the same, so the
+  // preview and the minimum underneath the amount boxes both see it.
+  mix_cut:c('mix_cut'), mix_cut_pct:v('mix_cut_pct'),
+  mix_cut_address:v('mix_cut_address'),
   // THE FIELD EXISTED, THE SCHEMA ACCEPTED IT, THE PRESETS SET IT, AND THIS
   // NEVER SENT IT. --hop-delay was added to SCHEMA so a dashboard run could
   // express it, then to every preset so the strong ones stopped shipping the
@@ -2540,6 +2661,12 @@ async function sync(){
  // delay dropdown used to carry hand-written run lengths that were out by 20x
  // because --hop-delay is per TRANSACTION -- see run_eta.
  if($('#eta')) $('#eta').textContent=r.eta||'';
+ // THE BOUNDS ON THE MONEY FIELDS. Recomputed here rather than baked into the
+ // HTML because the minimum moves with --wallets, --dag-mixing and the cut --
+ // see limits_note. The four amount inputs are the only fields on this page
+ // that ask for a quantity without stating one.
+ document.querySelectorAll('.limits').forEach(function(el){
+   el.textContent=r.limits||''; });
  if($('#notes')) $('#notes').innerHTML=(r.notes||[]).map(n=>`<li>${esc(n)}</li>`).join('');
  const ok=!r.problems.length;
  $('#armbox').style.display=ok?'':'none';
@@ -2550,7 +2677,10 @@ async function sync(){
 }
 // Network/OPSEC fields re-trigger the preflight; everything else just re-syncs.
 const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_relay']);
-const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing','exit_to','split','split_recv']);
+const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing','exit_to','split','split_recv',
+  // The cut moves the MINIMUM, not the fee -- but the minimum is rendered
+  // from the same /api/preview round trip, so it has to re-fire here too.
+  'mix_cut','mix_cut_pct']);
 // TEXTAREA TOO. exit_to is the page's only <textarea>, and this selector did
 // not name it -- so the ONE field that changes the run's size the most was the
 // one field whose edits recomputed nothing. Measured on the shipped page at the

@@ -7,6 +7,7 @@ Confirmed to FAIL against the pre-fix build.
 """
 import sys, os, json, time, socket, threading, subprocess, tempfile
 import contextlib, io
+import re as _re_c
 import importlib.util, importlib.machinery
 import http.client
 
@@ -1194,11 +1195,23 @@ def test_fee_panel_answers_the_setting_the_operator_is_changing():
     check("fee panel: the endpoint forwards the whole parameter set as the "
           "shape",
           'c["params"])))' in open(os.path.join(REPO, "gs_console")).read())
+    # THE SET'S CONTENTS, NOT ITS FORMATTING. This matched the whole
+    # `const FEE_FIELDS=new Set([...]);` line as one literal, so adding a field
+    # to it -- the thing this check exists to encourage -- turned it red, and
+    # so would rewrapping it. What the fee panel needs is that every field
+    # which changes the run's shape is in the set; extra fields are not a
+    # regression.
+    _ff = _re_c.search(r"const FEE_FIELDS=new Set\(\[(.*?)\]\);",
+                       c.PAGE, _re_c.S)
+    _ffs = set(_re_c.findall(r"'([a-z_]+)'", _ff.group(1))) if _ff else set()
     check("fee panel: ...and the page refetches when the shape changes, not "
           "only on wallets/deep",
-          "const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing',"
-          "'exit_to','split','split_recv']);" in c.PAGE
+          {"wallets", "deep", "peel", "dag_mixing", "exit_to", "split",
+           "split_recv"} <= _ffs
           and "if(FEE_FIELDS.has(el.id)) scheduleFees();" in c.PAGE)
+    check("fee panel: NON-VACUITY -- the set was actually parsed out of the "
+          "page, so the check above is not comparing against an empty set",
+          len(_ffs) >= 7)
     # Per-tx must stay per-tx: it is the number that legitimately does not move.
     check("fee panel: the per-transaction figure is unchanged by wallets/deep",
           per == [0.0024, 0.0094, 0.038, 0.48])
@@ -2020,6 +2033,78 @@ def run_all():
         for f in FAILURES:
             print(f"    - {f}")
     return FAIL
+
+
+def test_the_money_fields_finally_state_their_bounds():
+    """The four amount inputs were the only fields asking for a quantity
+    without saying what the bounds were.
+
+    `split`, `wallets` and `deep` are type="number" with min and max;
+    `btc_amount`, `swap_btc` and the two `expect_total_xmr` boxes were bare
+    inputs behind a regex that accepts literal zero, and the server checked
+    only that a value was PRESENT. So the page bounded every COUNT it asked
+    for and no MONEY.
+    """
+    c = load_console()
+    base = {"wallets": 10, "dag_mixing": True, "exit_to": ["x"]}
+    note = c.limits_note(base)
+    check("limits: the amount fields get a minimum at the point of asking",
+          "Minimum" in note and "XMR" in note)
+    check("limits: ...and it is the pipeline's own figure, not a rounder one "
+          "invented for the page",
+          str(c._ghost().mix_minimum_xmr(
+              c._ghost().FALLBACK_FEE_XMR, 10,
+              dag_mixing=True, exit_set=True)) in note)
+    # THE MINIMUM MOVES, which is the whole reason it is recomputed per preview
+    # rather than baked into the HTML.
+    check("limits: it rises with --wallets, because every mix output reserves "
+          "its own fees",
+          c.limits_note({**base, "wallets": 60}) != note)
+    check("limits: ...and falls without --dag-mixing, because an output that "
+          "never hops reserves one transaction fewer",
+          c.limits_note({**base, "dag_mixing": False}) != note)
+    # THE CUT RAISES IT, and below about fifteen wallets the cut is what binds
+    # -- a page showing only the mixing minimum would name a figure at which
+    # the operator's own cut is uncollectable.
+    _cut = c.limits_note({**base, "mix_cut": True})
+    check("limits: enabling the cut raises the stated minimum", _cut != note)
+    check("limits: ...and says WHY, rather than just showing a bigger number",
+          "could never be spent" in _cut)
+    check("limits: NON-VACUITY -- without the cut that explanation is absent",
+          "could never be spent" not in note)
+    # THE MAXIMUM IS REPORTED AS THE NON-ANSWER IT IS. Quoting the sanity
+    # ceiling alone would tell an operator the limit is 100,000,000 XMR.
+    check("limits: the maximum says what actually limits the operator instead "
+          "of quoting a Decimal-overflow ceiling",
+          "wallet balance" in note and "liquidity" in note
+          and "100000000" not in note)
+    # THE FEE ASSUMPTION IS STATED, because this runs with no socket open and
+    # priority 4 is 200x the fee it assumes.
+    check("limits: the fee it assumed is named, not implied",
+          "fallback fee" in note and "real fee decides" in note)
+    check("limits: NON-VACUITY -- a higher priority really does move the "
+          "figure, so naming the assumption matters",
+          c.limits_note({**base, "fee_priority": 4}) != note)
+    # FAIL HONEST: no GhostSpiral, no number -- the rule live_fees and run_eta
+    # both follow.
+    _real = c._GHOST[0]
+    try:
+        c._GHOST[0] = object()          # has no mix_minimum_xmr
+        check("limits: returns nothing rather than a guess when the pipeline "
+              "cannot be loaded", c.limits_note(base) == "")
+    finally:
+        c._GHOST[0] = _real
+    # AND IT REACHES THE PAGE. A note nothing renders is not a note.
+    check("limits: the preview endpoint carries it",
+          '"limits": limits_note(c["params"])' in _src_console())
+    check("limits: ...and the page has somewhere to put it, on every money "
+          "field", _src_console().count('class="d limits"') == 4)
+    check("limits: ...and the JS actually renders it",
+          "querySelectorAll('.limits')" in c.PAGE)
+
+
+def _src_console():
+    return open(os.path.join(REPO, "gs_console")).read()
 
 
 if __name__ == "__main__":

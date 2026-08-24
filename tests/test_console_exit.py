@@ -22,6 +22,7 @@ malformed or duplicated destinations must be refused BEFORE anything runs.
 """
 import json
 import os
+import re as _re_ce
 import socket
 import subprocess
 import sys
@@ -252,8 +253,32 @@ try:
     _src = open(os.path.join(REPO, "gs_console")).read()
     check("claim: shell=False everywhere (no shell=True anywhere)",
           "shell=True" not in _src)
-    check("claim: no built-in fee table to fall back on",
-          not any(t in _src for t in ("FEE_TABLE", "DEFAULT_FEE", "FALLBACK_FEE")))
+    # NO FEE CONSTANT OF ITS OWN -- which is not the same as never naming one.
+    #
+    # This forbade the SUBSTRING "FALLBACK_FEE" anywhere in the file, and the
+    # guarantee it stands for is that the console cannot carry a fee number
+    # that drifts from the pipeline's. Reading GhostSpiral's through _ghost()
+    # is the opposite of that: it is the same pattern _run_totals and run_eta
+    # already use, and its whole point is that there is nothing to drift. The
+    # console's own docstring calls copying "the single-source-of-truth mistake
+    # this repo has already paid for twice".
+    #
+    # So the check is on an ASSIGNMENT, not a mention. `X = ...` in gs_console
+    # is a second copy; `g.X` is a read-through.
+    _fee_defs = _re_ce.findall(
+        r"^\s*(FEE_TABLE|DEFAULT_FEE\w*|FALLBACK_FEE\w*)\s*=", _src,
+        _re_ce.M)
+    check(f"claim: no built-in fee table to fall back on "
+          f"(defines: {_fee_defs or 'none'})", not _fee_defs)
+    check("claim: NON-VACUITY -- the pattern really does catch an assignment, "
+          "so the check above is not passing on a regex that matches nothing",
+          _re_ce.findall(r"^\s*(FALLBACK_FEE\w*)\s*=",
+                         "FALLBACK_FEE_XMR = 1\n", _re_ce.M) == ["FALLBACK_FEE_XMR"])
+    # A third check here tried to assert every MENTION is a `g.`-qualified
+    # read. It failed on the comment above, which names the constant to explain
+    # the rule -- the same prose-versus-code trap the relay/delay checks in
+    # test_listed_bugs had to be rewritten for. The assignment check is the
+    # guarantee; a check that trips on its own explanation is worse than none.
 
     # ---- THE PREFLIGHT MUST NOT CLAIM WHAT IT DID NOT ESTABLISH ---------
     #

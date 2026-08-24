@@ -35,7 +35,7 @@ import ast as _ast
 import secrets
 import secrets as _secretsmod
 import sys
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2693,6 +2693,338 @@ check("shape: build_distribution_plan calls it where the mode is decided",
 check("shape: ...and the DAG-off notice it mirrors is still there",
       "Run with --dag-mixing to" in _sh_src)
 
+
+# ===========================================================================
+#  min_fanout_usable: a minimum an operator can actually be TOLD
+# ===========================================================================
+#
+# compute_fanout_amounts draws random weights, so its exact threshold moves
+# seed to seed. A UI that shows "minimum X" is making a promise, and a figure
+# that happens to work for one draw is not one. These checks hold the helper to
+# "funds on EVERY draw", and pin the margin it pays for that.
+print("\n-- the minimum a UI is allowed to display --")
+_MFU_FEE = ghost.FALLBACK_FEE_XMR
+_mfu_rng = secrets.SystemRandom()
+_MFU_N = (3, 5, 10, 20, 40, 60)          # 3 = MIN_WALLETS, 60 = the CLI's max
+
+
+def _mfu_funds(usable, n, draws=150):
+    """How many of `draws` real SystemRandom plans this usable actually funds."""
+    return sum(1 for _ in range(draws)
+               if len(ghost.compute_fanout_amounts(
+                   usable, n, _MFU_FEE, True, rng=_mfu_rng)) == n)
+
+
+for _n in _MFU_N:
+    _m = ghost.min_fanout_usable(_n, _MFU_FEE, True)
+    check(f"min: --wallets {_n} at {_m} XMR funds the fan-out on every draw",
+          _mfu_funds(_m, _n) == 150)
+
+# NON-VACUITY (a): the bound must be a BOUND, not a number so large that any
+# value passes. One DUST tick below it, the smallest step the grid allows, the
+# plan must still be fundable -- i.e. the helper is not wildly over-reserving.
+for _n in (10, 60):
+    _m = ghost.min_fanout_usable(_n, _MFU_FEE, True)
+    check(f"min: NON-VACUITY -- --wallets {_n} is not over-reserved; one tick "
+          f"below still funds, so the margin is small",
+          _mfu_funds(_m - ghost.DUST_XMR, _n, draws=60) == 60)
+
+# NON-VACUITY (b): well below the bound it must FAIL, or "funds on every draw"
+# is a claim about a function that never refuses anything.
+for _n in (10, 60):
+    _m = ghost.min_fanout_usable(_n, _MFU_FEE, True)
+    check(f"min: NON-VACUITY -- --wallets {_n} at HALF the bound is refused",
+          _mfu_funds(_m / 2, _n, draws=40) == 0)
+
+# THE DISTINCTNESS STAIRCASE IS THE CONSTRAINT THAT BITES, and a bound derived
+# from the fundability floor alone is wrong in the dangerous direction. At
+# --wallets 60 the staircase needs 60*59/2 = 1770 DUST ticks = 0.177 XMR, more
+# than min_exit_fundable asks for. This pins that the helper accounts for it.
+_floor_only = (ghost.min_exit_fundable(_MFU_FEE, True) * Decimal(60)
+               / ghost.FANOUT_SPEND_FRACTION)
+check("min: the bound exceeds the fundability floor alone, because the "
+      "distinctness staircase costs more than the floor at 60 wallets",
+      ghost.min_fanout_usable(60, _MFU_FEE, True) > _floor_only)
+check("min: NON-VACUITY -- the floor-only figure really is insufficient, so "
+      "the line above is not a tautology",
+      _mfu_funds(_floor_only.quantize(ghost.DUST_XMR), 60, draws=40) == 0)
+
+# Degenerate inputs must not raise -- a UI may ask before the operator has
+# chosen a wallet count.
+check("min: a zero/negative wallet count returns 0 rather than raising",
+      ghost.min_fanout_usable(0, _MFU_FEE, True) == 0
+      and ghost.min_fanout_usable(-5, _MFU_FEE, True) == 0)
+# ...and the DAG-off branch is a real, smaller floor, not the same number.
+check("min: --dag-mixing off has its OWN smaller floor, since an output that "
+      "never hops reserves one fewer transaction",
+      ghost.min_fanout_usable(10, _MFU_FEE, False)
+      < ghost.min_fanout_usable(10, _MFU_FEE, True))
+check("min: NON-VACUITY -- the dag-off bound still funds a dag-off plan",
+      sum(1 for _ in range(60)
+          if len(ghost.compute_fanout_amounts(
+              ghost.min_fanout_usable(10, _MFU_FEE, False), 10, _MFU_FEE,
+              False, rng=_mfu_rng)) == 10) == 60)
+
+# ===========================================================================
+#  mix_minimum_xmr: the figure a UI is allowed to print, cut included
+# ===========================================================================
+print("\n-- the balance minimum, decoys and the operator's cut included --")
+_MM_CUT = Decimal("0.011")               # the shipped operator cut
+
+# THE ASSUMPTION THE WHOLE HELPER RESTS ON. mix_minimum_xmr reads the fee
+# reserve out of compute_fee_budget at an arbitrary balance, which is only
+# legitimate because total_fees does not depend on the balance. Pinned here
+# rather than believed, because every figure below is wrong if it stops holding.
+_mm_fees = {b: ghost.compute_fee_budget(Decimal(b), _MFU_FEE, 10, peel=False,
+                                        dag_mixing=True, exit_set=True)[1]
+            for b in ("0.3", "1", "10", "1000")}
+check("min: total_fees does not depend on the balance, which is what lets the "
+      "helper read the reserve out at any balance",
+      len(set(_mm_fees.values())) == 1)
+check("min: ...and usable is exactly balance minus that reserve",
+      all(ghost.compute_fee_budget(Decimal(b), _MFU_FEE, 10, peel=False,
+                                   dag_mixing=True, exit_set=True)[0]
+          == Decimal(b) - _mm_fees[b] for b in _mm_fees))
+
+# DECOYS. The fan-out funds wallets + randint(DECOY_MIN, DECOY_MAX), drawn at
+# run time, so a minimum computed from `wallets` alone is short by up to
+# DECOY_MAX outputs and survives only a lucky draw.
+check("min: the balance minimum accounts for the decoys the operator does not "
+      "choose, so it exceeds one computed from --wallets alone",
+      ghost.mix_minimum_xmr(_MFU_FEE, 10)
+      > ghost.min_fanout_usable(10, _MFU_FEE, True))
+check("min: NON-VACUITY -- the decoy count is really drawn above zero, so the "
+      "line above is not comparing a number to itself",
+      ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
+
+
+def _mm_survives(bal, wallets, cut=None, draws=120):
+    """Take the cut, hold back the fees, and see if the fan-out really funds."""
+    _, _fees, _ = ghost.compute_fee_budget(bal, _MFU_FEE, wallets, peel=False,
+                                           dag_mixing=True, exit_set=True)
+    _cut = (bal * cut).quantize(ghost.DUST_XMR) if cut else Decimal(0)
+    _usable = bal - _fees - _cut
+    _n = wallets + ghost.DECOY_MAX
+    return sum(1 for _ in range(draws)
+               if len(ghost.compute_fanout_amounts(
+                   _usable, _n, _MFU_FEE, True, rng=_mfu_rng)) == _n)
+
+
+for _w in (3, 10, 20, 60):
+    _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, cut_pct=_MM_CUT)
+    check(f"min: --wallets {_w} at {_b} XMR still funds the fan-out on every "
+          f"draw AFTER the 1.1% cut is taken",
+          _mm_survives(_b, _w, _MM_CUT) == 120)
+    check(f"min: ...and the cut it yields ({(_b * _MM_CUT).quantize(ghost.DUST_XMR)}) "
+          f"is worth more than the fee to spend it",
+          (_b * _MM_CUT).quantize(ghost.DUST_XMR)
+          > ghost.hop_fee_reserve(_MFU_FEE))
+
+# THE CUT IS THE BINDING CONSTRAINT AT A DEFAULT RUN, and that is the finding
+# worth pinning: an operator reading only the mixing minimum would be told a
+# figure at which their own cut is uncollectable.
+check("min: enabling the cut RAISES the minimum at the default --wallets 10",
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=_MM_CUT)
+      > ghost.mix_minimum_xmr(_MFU_FEE, 10))
+check("min: ...and at --wallets 10 it is the CUT that binds, not the mix -- "
+      "the raised figure is the spendability floor, not the mixing one",
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=_MM_CUT)
+      == ((ghost.hop_fee_reserve(_MFU_FEE) + ghost.DUST_XMR)
+          / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP))
+# NON-VACUITY: at a LARGE wallet count the mix binds again, so the max() is a
+# real choice between two constraints rather than one that always wins.
+check("min: NON-VACUITY -- at --wallets 60 the MIX binds instead, so the "
+      "helper is choosing between two constraints",
+      ghost.mix_minimum_xmr(_MFU_FEE, 60, cut_pct=_MM_CUT)
+      > ((ghost.hop_fee_reserve(_MFU_FEE) + ghost.DUST_XMR)
+         / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP))
+# NON-VACUITY: well below the minimum the cut really is uncollectable, or
+# "spendable at the minimum" is a claim about a threshold that never bites.
+check("min: NON-VACUITY -- at a balance below the minimum the cut is worth "
+      "less than the fee to move it, which is why the floor exists",
+      (Decimal("0.2") * _MM_CUT).quantize(ghost.DUST_XMR)
+      < ghost.hop_fee_reserve(_MFU_FEE))
+check("min: a cut of zero or None leaves the mixing minimum untouched",
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=Decimal(0))
+      == ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=None)
+      == ghost.mix_minimum_xmr(_MFU_FEE, 10))
+
+# ===========================================================================
+#  THE OPERATOR'S CUT
+# ===========================================================================
+print("\n-- the operator's cut --")
+import contextlib as _ctx_c                                  # noqa: E402
+_CUT_A1 = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+_CUT_A2 = "43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2FuaqXMqLrVtED1kV2Z77b6NGE6FFTCm"
+
+
+class _CutArgs:
+    pass
+
+
+def _cut_args(**kw):
+    a = _CutArgs()
+    a.mix_cut = True
+    a.mix_cut_pct = None
+    a.mix_cut_address = None
+    a.exit_to = None
+    a.btc_entry = None
+    a.wallets = 10
+    a.dag_mixing = True
+    a.peel = False
+    a.split = 1
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def _resolve_cut(a):
+    """resolve_mix_cut with the chain silenced. Returns "" or the refusal."""
+    _old = ghost.integrity_log
+    ghost.integrity_log = lambda *x, **y: None
+    for _v in ("GS_MIX_CUT_ADDRESS", "GS_MIX_CUT_PCT"):
+        os.environ.pop(_v, None)
+    try:
+        with _ctx_c.redirect_stdout(io.StringIO()):
+            ghost.resolve_mix_cut(a)
+        return ""
+    except SystemExit as e:
+        return str(e)
+    finally:
+        ghost.integrity_log = _old
+
+
+# OFF BY DEFAULT. A run that was not asked to skim must not skim, and this is
+# the check that a future default flip has to walk past.
+check("cut: no cut is taken unless it is asked for",
+      _resolve_cut(_cut_args(mix_cut=False)) == ""
+      and _cut_args(mix_cut=False).mix_cut_pct is None)
+_a = _cut_args()
+check("cut: --mix-cut alone takes the shipped default",
+      _resolve_cut(_a) == "" and _a.mix_cut_pct == ghost.MIX_CUT_PCT)
+check("cut: NON-VACUITY -- the shipped default really is 1.1%",
+      ghost.MIX_CUT_PCT == Decimal("0.011"))
+
+# THE TWO COMBINATIONS THAT CHARGE AND NEVER PAY. Both were real: the peel
+# branch of build_distribution_plan has no cut destination while the deduction
+# is unconditional, and a split cut is checked against the total but paid as N
+# separate outputs. Refused, not patched -- the same answer --split N --peel
+# already gets.
+check("cut: --peel is REFUSED, because only the fan-out branch pays a cut and "
+      "the deduction is unconditional",
+      "--mix-cut with --peel is refused" in _resolve_cut(_cut_args(peel=True)))
+check("cut: --split > 1 is REFUSED, because a partial relay pays a partial "
+      "cut and each chunk's share can be individually unspendable",
+      "is refused" in _resolve_cut(_cut_args(split=4)))
+# NON-VACUITY: both flags must still work on their own, or the refusals are
+# just disabling features.
+check("cut: NON-VACUITY -- --peel without a cut is untouched",
+      _resolve_cut(_cut_args(mix_cut=False, peel=True)) == "")
+check("cut: NON-VACUITY -- --split 4 without a cut is untouched",
+      _resolve_cut(_cut_args(mix_cut=False, split=4)) == "")
+check("cut: NON-VACUITY -- --mix-cut on a --split 1 run is allowed",
+      _resolve_cut(_cut_args(split=1)) == "")
+
+# THE ADDRESS REFUSALS.
+check("cut: an address with no --mix-cut is refused rather than guessed at",
+      "was given but --mix-cut was not"
+      in _resolve_cut(_cut_args(mix_cut=False, mix_cut_address=_CUT_A1)))
+check("cut: a cut address that is ALSO an exit destination is refused -- then "
+      "it is not a cut, it is a transaction paying you your own money",
+      "also an --exit-to destination"
+      in _resolve_cut(_cut_args(mix_cut_address=_CUT_A1, exit_to=[_CUT_A1])))
+check("cut: NON-VACUITY -- a cut address with a DIFFERENT exit is accepted",
+      _resolve_cut(_cut_args(mix_cut_address=_CUT_A1,
+                             exit_to=[_CUT_A2])) == "")
+check("cut: a malformed cut address is refused",
+      "Bad --mix-cut-address"
+      in _resolve_cut(_cut_args(mix_cut_address="nope")))
+for _bad, _why in ((Decimal("0"), "zero"), (Decimal("-0.1"), "negative"),
+                   (ghost.MIX_CUT_PCT_MAX + Decimal("0.01"), "above the ceiling")):
+    check(f"cut: a {_why} fraction is refused",
+          _resolve_cut(_cut_args(mix_cut_pct=_bad)) != "")
+check("cut: NON-VACUITY -- a fraction AT the ceiling is accepted, so the bound "
+      "is not off by one",
+      _resolve_cut(_cut_args(mix_cut_pct=ghost.MIX_CUT_PCT_MAX)) == "")
+
+# THE RATE TRAVELS LIKE THE ADDRESS. An override is a per-operator constant and
+# argv is world-readable; the address went through env_or_argv and the rate did
+# not.
+_gsrc = open(os.path.join(REPO, "GhostSpiral")).read()
+check("cut: the fraction goes through env_or_argv, like every other value "
+      "argv would publish to ps",
+      'env_or_argv("GS_MIX_CUT_PCT"' in _gsrc)
+check("cut: ...and so does the destination",
+      'env_or_argv("GS_MIX_CUT_ADDRESS"' in _gsrc)
+
+
+class _CutRPC:
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        return ("4" + "z" * 94, 3)
+
+
+def _plan_cut(bal, **kw):
+    """plan_operator_cut with a stub wallet. Returns (addr, amt, printed)."""
+    _old_log, _old_acct = ghost.integrity_log, ghost.create_fresh_account
+    ghost.integrity_log = lambda *x, **y: None
+    ghost.create_fresh_account = lambda rpc, label="": 7
+    a = _cut_args(**kw)
+    # `or` would swallow an explicit Decimal(0) -- which is the one value this
+    # helper is asked for when checking that "no cut" really mints nothing.
+    a.mix_cut_pct = (kw["mix_cut_pct"] if "mix_cut_pct" in kw
+                     else ghost.MIX_CUT_PCT)
+    _b = io.StringIO()
+    try:
+        with _ctx_c.redirect_stdout(_b):
+            _addr, _amt = ghost.plan_operator_cut(
+                _CutRPC(), a, bal, ghost.FALLBACK_FEE_XMR)
+        return _addr, _amt, _b.getvalue()
+    finally:
+        ghost.integrity_log, ghost.create_fresh_account = _old_log, _old_acct
+
+
+_addr, _amt, _out = _plan_cut(Decimal("1"))
+check("cut: a 1 XMR deposit yields exactly 1.1%", _amt == Decimal("0.0110"))
+check("cut: ...paid to a FRESHLY MINTED account, not a reused address -- the "
+      "reuse this toolchain refuses in three other places",
+      bool(_addr) and "freshly minted" in _out)
+check("cut: ...and the operator is TOLD the account and the amount, because "
+      "the wallet is the only authoritative record that they were paid",
+      "account 7" in _out and "0.0110" in _out)
+
+# BELOW THE SPENDABILITY FLOOR: WAIVE, NEVER ABORT. This ran after the swap, so
+# "nothing has been spent" was false of the deposit -- the BTC is through
+# ThorChain and the XMR sits on an address the memo names in a public
+# OP_RETURN. Aborting to protect a fee strands it.
+_addr2, _amt2, _out2 = _plan_cut(Decimal("0.30"))
+check("cut: below the spendability floor the cut is WAIVED and the mix goes "
+      "ahead", _addr2 is None and _amt2 == 0)
+check("cut: ...and the operator is told why, with the figure that would have "
+      "worked", "NO CUT TAKEN" in _out2 and "at least" in _out2)
+check("cut: ...and it does NOT claim nothing has been spent, which is false "
+      "of the deposit by the time this runs",
+      "Nothing has been spent" not in _out2)
+# NON-VACUITY: the floor must actually bite somewhere, or "waived" is a branch
+# that never runs.
+check("cut: NON-VACUITY -- the waive is a real threshold, not a dead branch",
+      _plan_cut(Decimal("1"))[0] is not None
+      and _plan_cut(Decimal("0.30"))[0] is None)
+check("cut: no cut asked for means no cut and no minting",
+      _plan_cut(Decimal("1"), mix_cut=False, mix_cut_pct=Decimal(0))[0] is None)
+
+# ROUND_DOWN, so the operator never takes more than the fraction they named.
+_, _amt3, _ = _plan_cut(Decimal("0.33333333333"))
+check("cut: the cut is rounded DOWN, so it never exceeds the stated fraction",
+      _amt3 <= Decimal("0.33333333333") * ghost.MIX_CUT_PCT)
+
+# A STATIC ADDRESS IS ACCEPTED AND WARNED ABOUT, because it is the operator's
+# choice and the cost is theirs -- but it is stated where it happens.
+_addr4, _amt4, _out4 = _plan_cut(Decimal("1"), mix_cut_address=_CUT_A1)
+check("cut: a static address is used as given", _addr4 == _CUT_A1)
+check("cut: ...and the reuse it causes is stated at the moment it happens",
+      "collect from every run" in _out4)
+check("cut: NON-VACUITY -- the freshly minted path does NOT print that warning",
+      "collect from every run" not in _out)
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
