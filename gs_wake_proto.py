@@ -686,14 +686,31 @@ def phase_is_known(word) -> bool:
 #: is written to read as ordinary, because it is the answer the operator will
 #: get most often and the old code delivered it as "the vault ran it and it
 #: FAILED" while their money was simply still in flight.
+#: THESE ARE CHAT TEXT, and they live in the wrong file to look like it.
+#:
+#: gs_telegram_pager sends them verbatim -- `f"{h}: {PHASE_LINES.get(phase)}"`
+#: -- so every word here lands in the transcript. The source-level guard that
+#: strips machine names from the pager's replies reads string literals in
+#: gs_telegram_pager and could not see these: two of them said "check it on
+#: the vault" and "the vault's wallet is not scanning", which is the operator's
+#: own hardware named in the readable surface, twice, on the two answers most
+#: likely to be asked for when something has gone wrong.
+#:
+#: The information survives without the noun. "Check before mixing" is the same
+#: instruction; the operator knows which machine is theirs.
 PHASE_LINES = {
     "not_yet": "nothing on the address yet. Normal — ask again in a while.",
     "arriving": "something arrived and is still confirming. Ask again shortly.",
+    # "Done." WAS TOO SHORT AND SAID SOMETHING FALSE. Shortening this from
+    # "The swap is done" to "Done" changed which noun it was about: the
+    # swap has landed, the mix has NOT run, and the mix is the entire
+    # point. An operator reading "Done" on the surface they check most is
+    # being told the job finished when the money is sitting un-mixed. It
+    # says which step ended, without naming the one that has not.
     "landed": "landed and spendable. The swap is done.",
-    "short": "money arrived but it is UNDER what was quoted, and it has "
-             "stopped growing. Check it on the vault before mixing.",
-    "stuck": "the vault's wallet is not scanning, so this says NOTHING about "
-             "your money. Check the vault.",
+    "short": "arrived, but UNDER what was quoted, and it has stopped growing. "
+             "Check before going further.",
+    "stuck": "not scanning, so this says NOTHING about your money. Check.",
 }
 
 

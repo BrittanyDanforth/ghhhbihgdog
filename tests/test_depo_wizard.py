@@ -567,7 +567,18 @@ def _sent_strings(tree):
     return out
 
 
+# AND THE TEXT THAT LIVES IN ANOTHER FILE. The first version of this scan read
+# gs_telegram_pager and stopped there -- which missed PHASE_LINES entirely.
+# Those live in gs_wake_proto and the pager sends them verbatim
+# (`f"{h}: {proto.PHASE_LINES.get(phase, phase)}"`), and two of them named the
+# operator's own machine on the two answers most likely to be asked for when
+# something has gone wrong. A scan scoped to one file reads as covering the
+# reply vocabulary and covers the part of it that happens to be local.
 _all_sent = _sent_strings(_pg_tree)
+_all_sent += [(0, v) for v in P.PHASE_LINES.values()]
+check("control: the scan reaches the phase lines too, which live in another "
+      "file and are sent verbatim",
+      any(t in P.PHASE_LINES.values() for _l, t in _all_sent))
 check(f"control: the scan found the bot's reply vocabulary "
       f"({len(_all_sent)} literals), so the checks below read something",
       len(_all_sent) >= 30)
