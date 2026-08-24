@@ -6993,18 +6993,14 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
         return None, Decimal(0), None
     addr = getattr(args, "usage_fee_address", None)
     if addr:
-        # The operator's own external address, reused every run by
-        # construction. Said once, here, where it is actually about to happen.
-        integrity_log("usagefee", "to_static_address")
-        print(f"  [!] The usage fee goes to a FIXED address you supplied. It "
-              f"will "
-              f"collect from every run\n"
-              f"      that uses it, which is the address reuse this toolchain "
-              f"refuses everywhere\n"
-              f"      else -- and mixing does not retract it. Drop "
-              f"--usage-fee-address to have a\n"
-              f"      fresh account and subaddress minted per run instead.")
-        # AND IT MUST NOT BE AN ADDRESS OF THIS WALLET.
+        # THE REFUSAL IS TESTED FIRST, and the order is not cosmetic. Warning
+        # "the usage fee goes to a FIXED address you supplied" and then, four
+        # lines later, "NO USAGE FEE TAKEN" is two statements about the same
+        # run that cannot both be true, and the operator has to work out which
+        # one won. Found by reading the real output of every branch side by
+        # side rather than each one on its own.
+        #
+        # IT MUST NOT BE AN ADDRESS OF THIS WALLET.
         #
         # An earlier version of this returned here with the note "the exit only
         # ever enumerates accounts THIS RUN made, and a fixed external address
@@ -7058,6 +7054,19 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
                   f"      --usage-fee-address and let a fresh account be "
                   f"minted per run.")
             return None, Decimal(0), None
+        # The operator's own external address, reused every run by
+        # construction. Said once, here, where it is actually about to happen
+        # -- and only once the fee is definitely being taken, so this is never
+        # a warning about something that then does not occur.
+        integrity_log("usagefee", "to_static_address")
+        print(f"  [!] The usage fee goes to a FIXED address you supplied. It "
+              f"will "
+              f"collect from every run\n"
+              f"      that uses it, which is the address reuse this toolchain "
+              f"refuses everywhere\n"
+              f"      else -- and mixing does not retract it. Drop "
+              f"--usage-fee-address to have a\n"
+              f"      fresh account and subaddress minted per run instead.")
         # No pair: the wallet does not know this address, so it is outside the
         # accounts the exit enumerates and there is nothing to hold.
         return addr, cut, None

@@ -491,8 +491,21 @@ for _label, _secret in (("the deposit address", BTC), ("the memo", MEMO),
                         ("the amount", AMOUNT), ("the destination", XMR)):
     check(f"with plaintext OFF, {_label} does not reach the chat",
           _secret not in _chat_off)
-check("...and the operator is told where it is instead",
-      "on the vault" in _chat_off)
+# WHAT IT SAYS INSTEAD IS THE HANDLE, AND ONLY THE HANDLE.
+#
+# This used to assert the reply said "Read the address and memo on the vault".
+# True and useless: the operator knows where their own machine is, and the
+# sentence names it, in the surface this whole design assumes gets read. The
+# handle is the pointer -- §8's own example of what this channel should carry
+# is "depo ready · slip A3F1" and nothing more.
+check("...and what it says instead is the handle, which is the pointer",
+      "A3F1" in _chat_off)
+check("...and it does not name the machine to go and read it on",
+      "vault" not in _chat_off.lower())
+# NON-VACUITY: the reply is a real reply, not an empty string that trivially
+# contains no secrets and no machine name.
+check("NON-VACUITY -- the plaintext-off reply is a real message",
+      _chat_off.strip() and "ready" in _chat_off)
 
 # THE STATUS REPLY.
 for _w in ("not_yet", "arriving", "landed", "short", "stuck"):

@@ -175,9 +175,17 @@ f2.say("/depo")
 f2.say("2")
 check("the slot prompt and the confirm never print a decimal amount",
       not re.search(r"\d+\.\d{2,}", f2.text()))
-check("...and the wizard says WHY it can only offer slots",
-      "ladder lives on the vault" in f2.text()
-      or "has never held it" in f2.text())
+# AND IT EXPLAINS NOTHING. The prompt used to say why it can only offer
+# slots -- that the ladder lives on the other machine and this box has never
+# held it. True, and a description of the arrangement written permanently into
+# the surface this design assumes gets read, in exchange for telling the
+# operator something they learn once. The reasoning stayed in the source.
+check("...and the prompt does not describe the setup to whoever reads this "
+      "chat",
+      "ladder" not in f2.text().lower()
+      and "vault" not in f2.text().lower())
+check("NON-VACUITY -- it still asks the question and still says how to stop",
+      "0-7" in f2.text() and "/cancel" in f2.text())
 
 # ===========================================================================
 # 3. IN MEMORY, NEVER ON THE CARD.
@@ -291,7 +299,7 @@ fa.say("/depo")
 fa.say("4")
 _q = fa.text()
 check("the confirm repeats the slot before waking anything", "slot 4" in _q)
-check("...and says plainly that this wakes the vault", "WAKE THE VAULT" in _q)
+check("...and names no machine while doing it", "vault" not in _q.lower())
 # FREE-FORM, NOT MULTIPLE CHOICE. Three buttons meant a pocket-dial cleared
 # the gate one time in three; typing a sum is no harder for the operator and
 # is not guessable. The expected value is therefore never rendered anywhere.
@@ -415,18 +423,32 @@ check("/cancel with nothing running says so rather than lying",
 
 # THEY ANSWER "WHERE", AND DELIBERATELY NAME NO IDENTIFIER.
 #
-# An earlier draft answered each by naming the environment variable, the CLI
-# flag, the tool and the memo field it lives in. Accurate, useful to somebody
-# standing at the vault with the source open -- and a map of the vault's
-# control surface typed into a transcript this whole feature assumes will
-# leak. The operator on a phone needs to know it is not settable here and
-# where it is; the rest is in OPSEC_SETUP.md, on the machine that has it.
-for _cmd, _where in (("/fee", "sending wallet"), ("/speed", "not settable"),
-                     ("/exit", "at the vault")):
+# THE ANSWER, AND NOTHING AROUND IT.
+#
+# Two drafts got this wrong in the same direction. The first named the
+# environment variable, the CLI flag, the tool and the memo field each knob
+# lives in. The second dropped the names but kept the paragraphs: where it is
+# really decided, why it is not settable, what loosening it would cost, and --
+# worst -- a sentence explaining that the omission was deliberate because the
+# transcript is assumed read. Every one of those is a description of the
+# arrangement, sitting permanently in the readable surface, bought by telling
+# the operator something they already know.
+#
+# So the test is now a CEILING, not a needle: the reply is short, and it names
+# nothing. A needle check cannot fail on a paragraph that grows around it,
+# which is exactly how the second draft passed.
+_ANSWER_MAX = 40
+for _cmd in ("/fee", "/speed", "/exit"):
     ff = Fake()
     ff.say(_cmd)
-    check(f"{_cmd} says where it is really decided ({_where!r})",
-          _where in ff.text())
+    _r = ff.text().strip()
+    check(f"{_cmd} answers in one short line ({len(_r)} chars)",
+          0 < len(_r) <= _ANSWER_MAX)
+    check(f"...and {_cmd} names no machine, tool or file",
+          not any(w in _r.lower() for w in
+                  ("vault", "thinkpad", "keyfile", "gs_", "thorchain",
+                   "opsec", "deliberate", "transcript", "cash-out",
+                   "deposit", "swap", "mix")))
     check(f"...and {_cmd} wakes nothing", ff.pokes == [])
 for _leak in ("GS_EXIT_TO", "max-slippage", "thor_swap_preparer",
               "interval", "quantity", "gs_wake_agent", "amount_ladder",
@@ -451,6 +473,124 @@ check("...and is NOT reachable from the pager",
 check("/exit's claim holds: no job schema takes a destination",
       not any("dest" in k or "exit" in k or "addr" in k
               for s in P.JOBS.values() for k in s["schema"]))
+
+# THE USAGE FEE IS NAMED ONLY TO SAY IT IS NOT HERE.
+#
+# "/fee" predates --usage-fee and answers about the BITCOIN network fee and the
+# swap's slippage floor. Now that a thing called a usage fee exists, someone
+# typing /fee to ask about theirs gets a confident answer about something else,
+# and silence about their own reads as "not built".
+_fh = Fake()
+_fh.say("/fee")
+_fee_reply = _fh.text().strip()
+check("/fee names the usage fee and its rate, and says nothing else",
+      _fee_reply == f"{pg.USAGE_FEE_LABEL} usage fee.")
+# THE RATE IS THE ONE NUMBER THIS CHANNEL MAY CARRY, and it is a decision
+# rather than an oversight: the operator asked for it, having been told what it
+# costs (an observed cash-out divided by the rate is the deposit behind it).
+# So the test asserts it appears HERE and nowhere else, which is the part that
+# is enforceable.
+check("...and the rate it prints is the rate GhostSpiral actually charges, "
+      "not a copy that has drifted",
+      pg.USAGE_FEE_LABEL
+      == f"{(load('GhostSpiral').USAGE_FEE_PCT * 100).normalize()}%")
+# AND THE CLAIM MUST BE TRUE BY CONSTRUCTION, not by policy: gs_wake_agent's
+# argv table decides what can run at all, and GhostSpiral is not in it -- so no
+# usage-fee line can reach this channel however the pager behaves.
+_agent = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("/fee's new claim holds: the wake agent cannot spawn GhostSpiral, so its "
+      "output can never reach this chat",
+      '_tool("GhostSpiral")' not in _agent)
+check("NON-VACUITY -- the agent DOES spawn other tools by that same helper, so "
+      "the absence above is an absence from a real table",
+      '_tool("receive_watch")' in _agent
+      and '_tool("thor_swap_preparer")' in _agent)
+# ...and NO OTHER command carries the rate. /fee is the one place it may
+# appear, so a rate that turns up in /help or a job reply is a second copy
+# nobody asked for.
+for _c in ("/help", "/status", "/speed", "/exit"):
+    _fr = Fake()
+    _fr.say(_c)
+    check(f"{_c} does not repeat the fee rate",
+          pg.USAGE_FEE_LABEL not in _fr.text() and "0.011" not in _fr.text())
+check("NON-VACUITY -- /fee DOES carry it, so the checks above are about the "
+      "other commands and not about a rate that is never printed",
+      pg.USAGE_FEE_LABEL in _fee_reply)
+
+# ===========================================================================
+# 8b. EVERY STRING THIS BOT CAN SEND, NOT JUST THE ONES A TEST HAPPENS TO DRIVE.
+# ===========================================================================
+#
+# The checks above drive commands and read the replies. That covers what they
+# drive and nothing else -- and the verbose drafts this suite kept re-catching
+# were never in the commands under test, they were in the JOB-RESULT branches
+# (refused, failed, expired, undelivered) which need a whole wake to reach.
+#
+# So this reads the SOURCE instead: every string literal passed to self.send(),
+# plus the constants that are sent whole. A word that has no business in a
+# transcript is a word the operator can never accidentally publish.
+print("\n-- what it is capable of saying, read from the source --")
+import ast as _ast
+
+# WORD BOUNDARIES, not substrings. "tor" inside "history" or "storage" would
+# fail a future message that is perfectly fine, and a check that cries wolf is
+# a check someone deletes.
+#
+# OP_RETURN is deliberately NOT on this list. It is the one mechanism word the
+# operator needs at the moment they send, and leaving it out costs the payment
+# rather than costing privacy: without the memo attached the transfer is
+# unroutable and the funds do not come back.
+_BANNED = ("vault", "thinkpad", "keyfile", "gs_unseal", "thorchain",
+           "subpoena", "deliberate", "transcript", "cash-out", "ladder",
+           "ghostspiral", "monero", "xmr", "wallet-rpc", "tor")
+_BANNED_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _BANNED) + r")\b", re.I)
+_pg_tree = _ast.parse(_SRC)
+
+
+def _sent_strings(tree):
+    """Every literal the bot can put on the wire, with its line."""
+    out = []
+    for n in _ast.walk(tree):
+        if isinstance(n, _ast.Call) and getattr(n.func, "attr", "") == "send":
+            for arg in n.args[1:2]:
+                for x in _ast.walk(arg):
+                    if isinstance(x, _ast.Constant) and isinstance(x.value, str):
+                        out.append((n.lineno, x.value))
+    for name in ("HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER"):
+        for n in tree.body:
+            if isinstance(n, _ast.Assign) and getattr(
+                    n.targets[0], "id", "") == name:
+                for x in _ast.walk(n.value):
+                    if isinstance(x, _ast.Constant) and isinstance(x.value, str):
+                        out.append((n.lineno, x.value))
+    return out
+
+
+_all_sent = _sent_strings(_pg_tree)
+check(f"control: the scan found the bot's reply vocabulary "
+      f"({len(_all_sent)} literals), so the checks below read something",
+      len(_all_sent) >= 30)
+_hits = [(ln, _BANNED_RE.search(t).group(0), t[:60])
+         for ln, t in _all_sent if _BANNED_RE.search(t)]
+check(f"no reply this bot can send names a machine, a tool or the operation "
+      f"({_hits})", _hits == [])
+# NON-VACUITY: the scanner really does catch these words -- proven on a string
+# built here, not hoped for.
+_synth = _ast.parse('def f():\n    self.send(1, "read it on the vault")\n')
+check("NON-VACUITY -- the scan flags a banned word when one is present",
+      any(_BANNED_RE.search(t) for _l, t in _sent_strings(_synth)))
+# NON-VACUITY on the boundaries: an innocent word that merely CONTAINS a
+# banned one must pass, or the check starts failing on messages that are fine.
+check("NON-VACUITY -- ...and does not fire on 'history' or 'storage', which "
+      "merely contain one",
+      not _BANNED_RE.search("check your history and storage"))
+# A CEILING, because the drafts did not add banned words, they added
+# paragraphs. The longest legitimate reply is /help.
+_longest = max((len(t), ln, t[:50]) for ln, t in _all_sent)
+check(f"no single reply literal runs past 400 characters "
+      f"(longest {_longest[0]} at line {_longest[1]})",
+      _longest[0] <= 400)
 
 # ===========================================================================
 # 9. AN UNALLOWLISTED CHAT CANNOT START ONE.
