@@ -41,6 +41,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -591,6 +592,39 @@ check("watch: NON-VACUITY -- a failure that saw nothing still says failed",
 _mr = _drive_out(_res("refused", ""), "refused")
 check("watch: NON-VACUITY -- and a refusal still says refused",
       _mr == ["watch: refused."])
+
+# ---- A FAILED WITHDRAWAL SAYS THE ONE THING THE OPERATOR CAN ACT ON -----
+#
+# "withdraw: failed." was the entire message, delivered after a boot and 5-20
+# minutes of mandatory jitter, and it left no next move. The commonest cause
+# is the one the depth menu exists for: the mix minimum rises with the hop
+# count, so a balance that cannot fund 20 hops can often fund 3, and
+# GhostSpiral refuses at stage 4 with nothing spent -- on the vault's console,
+# which is the machine nobody is standing at.
+_mw = _drive_out(_res("failed", ""), "failed", job="withdraw")
+check("withdraw: a failure points at the depth, which is the one thing the "
+      "operator can change",
+      len(_mw) == 1 and "shallower" in _mw[0] and "/send" in _mw[0])
+check("withdraw: ...and still says it failed, rather than burying that",
+      "failed" in _mw[0])
+# A HINT, NOT A DIAGNOSIS. This box has never been told a balance and must not
+# claim to know why the run died -- so the sentence is hedged and carries no
+# figure. A confident cause would be an invented one.
+check("withdraw: ...and does not claim to know that WAS the cause",
+      "may be" in _mw[0])
+check("withdraw: ...and states no balance, because this box has none",
+      not re.search(r"\d+\.\d", _mw[0]))
+# NON-VACUITY: the advice is specific to the job that HAS a depth. Offering it
+# on a deposit would be a confident answer to a question nobody asked.
+for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
+    _mo = _drive_out(_res("failed", ""), "failed", job=_j)
+    check(f"{_j}: NON-VACUITY -- no depth advice on a job that has no depth",
+          "shallower" not in _mo[0])
+# AND A REFUSAL IS NOT A FAILURE. A withdrawal the vault refused outright
+# (allow_withdraw off, deadman too short) has nothing to do with the balance.
+_mwr = _drive_out(_res("refused", ""), "refused", job="withdraw")
+check("withdraw: NON-VACUITY -- a refusal gets no depth advice either",
+      _mwr == ["withdraw: refused."])
 # NON-VACUITY 2: a DONE outcome still takes the ordinary path.
 _md = _drive_out(_res("done", "landed"), "done")
 check("watch: NON-VACUITY -- a done outcome still reports its phase the way "

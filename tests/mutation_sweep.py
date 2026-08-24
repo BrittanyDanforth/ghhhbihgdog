@@ -2605,6 +2605,24 @@ MUTATIONS = [
   '        return "receive_and_quote", {"amount_sat": 5000000}, ""',
   ["test_depo_wizard"]),
 
+ # "withdraw: failed." was the whole message after a boot and 5-20 minutes of
+ # jitter, with no next move in it. The commonest cause is the one the depth
+ # menu exists for, and GhostSpiral says so on the console nobody is standing
+ # at.
+ ("a failed withdrawal goes back to saying nothing the operator can act on",
+  "gs_telegram_pager",
+  '                     "shallower one." if job == "withdraw" else "")',
+  '                     "shallower one." if False else "")',
+  ["test_plain_slip"]),
+
+ # The hedge is load-bearing: this box has never been told a balance and must
+ # not claim to know why a run died.
+ ("the failure hint claims to know the cause it is only guessing at",
+  "gs_telegram_pager",
+  '            _tail = (" It may be too deep for the balance — the deeper "',
+  '            _tail = (" It was too deep for the balance — the deeper "',
+  ["test_plain_slip"]),
+
  # The one file the pager persists held a float per poke: the exact second the
  # operator asked for a quote, for every quote in 24 hours, on the SD card.
  ("the SD card holds exact wake timestamps again", "gs_telegram_pager",
