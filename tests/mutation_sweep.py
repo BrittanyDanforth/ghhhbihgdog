@@ -119,9 +119,13 @@ MUTATIONS = [
   ["test_dag_entry"]),
 
  ("the clean-exit message tests the container, not the counts", "GhostSpiral",
-  # Re-anchored: the held breakdown gained a third kind (a stopped peel
-  # chain's undistributed remainder), so the condition names three counts.
-  "        elif _relayed and not (_held_entry or _held_change or _held_remainder):",
+  # Re-anchored twice: the held breakdown gained a third kind (a stopped peel
+  # chain's undistributed remainder) and then a fourth (the operator's usage
+  # fee), so the condition names four counts. Each addition has had to be made
+  # here too, and the one that is not would announce a clean exit over value
+  # the run deliberately kept back.
+  "        elif _relayed and not (_held_entry or _held_change or _held_remainder\n"
+  "                               or _held_fee):",
   "        elif _relayed and not _held:",
   ["test_exit_withdraw"]),
 
@@ -190,6 +194,8 @@ MUTATIONS = [
   '            return "entry"\n'
   '        if pair in _remainder_set:\n'
   '            return "remainder"\n'
+  '        if pair in _fee_set:\n'
+  '            return "usagefee"\n'
   '        return "change"',
   '        return "entry"',
   ["test_exit_withdraw"]),
@@ -2068,7 +2074,7 @@ MUTATIONS = [
  # The cut is deducted unconditionally but only the FAN-OUT branch pays it, so
  # --peel took 1.1% and paid nobody: the residue landed on the veil carrier and
  # the exit swept it to --exit-to.
- ("--mix-cut --peel goes back to charging a cut it never pays",
+ ("--usage-fee --peel goes back to charging a cut it never pays",
   "GhostSpiral",
   '    if getattr(args, "peel", False):\n        sys.exit(',
   '    if False:\n        sys.exit(',
@@ -2076,14 +2082,14 @@ MUTATIONS = [
 
  # A split cut is checked against the TOTAL and paid as N separate outputs,
  # each of which can be individually below the fee to move it.
- ("--mix-cut --split N goes back to a cut that may be unspendable per chunk",
+ ("--usage-fee --split N goes back to a cut that may be unspendable per chunk",
   "GhostSpiral",
   '    if int(getattr(args, "split", 1) or 1) > 1:\n'
   "        sys.exit(\n"
-  '            f"[!] --mix-cut with --split "',
+  '            f"[!] --usage-fee with --split "',
   '    if False:\n'
   "        sys.exit(\n"
-  '            f"[!] --mix-cut with --split "',
+  '            f"[!] --usage-fee with --split "',
   ["test_dag_entry"]),
 
  # This branch used to sys.exit with "Nothing has been spent" -- true of
@@ -2091,24 +2097,26 @@ MUTATIONS = [
  # on an address the swap memo names in a public OP_RETURN.
  ("the unspendable-cut branch goes back to aborting after the swap",
   "GhostSpiral",
-  '        print(f"  [!] NO CUT TAKEN.',
-  '        sys.exit(f"  [!] NO CUT TAKEN.',
+  '        print(f"  [!] NO USAGE FEE TAKEN. {(pct * 100).normalize()}% of this "',
+  '        sys.exit(f"  [!] NO USAGE FEE TAKEN. {(pct * 100).normalize()}% of this "',
   ["test_dag_entry"]),
 
  # The cut account was minted, paid, and mentioned nowhere -- and the wallet
  # balance is the only authoritative record that the operator was paid.
  ("the cut is taken again without telling the operator where it went",
   "GhostSpiral",
-  '    print(f"  [*] CUT: {cut} XMR',
-  '    _unused = (f"  [*] CUT: {cut} XMR',
+  '    print(f"  [*] USAGE FEE: {cut} XMR',
+  '    _unused = (f"  [*] USAGE FEE: {cut} XMR',
   ["test_dag_entry"]),
 
  # A fixed cut address is the reuse this repo refuses by sys.exit in three
  # other places; minting per run is what removes the cross-run join key.
  ("the cut goes back to one account instead of a fresh one per run",
   "GhostSpiral",
-  '    _acct = create_fresh_account(rpc, label="")',
-  "    _acct = 0",
+  # Re-anchored: the two mints moved inside a try/except this turn, so a
+  # wallet that refuses them waives the fee instead of killing a settled run.
+  '        _acct = create_fresh_account(rpc, label="")',
+  "        _acct = 0",
   ["test_dag_entry"]),
 
  # The distinctness staircase needs n(n-1)/2 DUST ticks -- 0.177 XMR at 60
@@ -2123,8 +2131,8 @@ MUTATIONS = [
  # A cut worth exactly the fee to move it is worth nothing once moved.
  ("the cut spendability floor goes back to being one tick short",
   "GhostSpiral",
-  "        need = max(need, (hop_fee_reserve(fee_xmr) + DUST_XMR) / cut_pct)",
-  "        need = max(need, hop_fee_reserve(fee_xmr) / cut_pct)",
+  "        need = max(need, (hop_fee_reserve(fee_xmr) + DUST_XMR) / usage_pct)",
+  "        need = max(need, hop_fee_reserve(fee_xmr) / usage_pct)",
   ["test_dag_entry"]),
 
  # The fan-out funds wallets + randint(DECOY_MIN, DECOY_MAX), drawn at run
@@ -2139,9 +2147,224 @@ MUTATIONS = [
  # quantity without stating one.
  ("the console stops telling the operator the minimum",
   "gs_console",
-  '                "limits": limits_note(c["params"])}))',
-  '                "limits": ""}))',
+  '                "limits": limits_note(c["params"]),',
+  '                "limits": "",',
   ["test_console"]),
+
+ # The badge is the operator's only sight of the three numbers at the moment
+ # they choose to spend -- the note is further up the page, above the fold.
+ ("the spend buttons stop carrying the minimum, maximum and fee",
+  "gs_console",
+  '                "badge": limits_badge(c["params"])}))',
+  '                "badge": ""}))',
+  ["test_console"]),
+
+ # ---- the usage fee is kept out of the exit by TWO locks -----------------
+ #
+ # The first is an omission: nothing puts the fee account in addr_index, so
+ # _exit_account_list cannot name it. The second is this hold. Each mutation
+ # below removes ONE of them, which is the only way to tell a live guard from
+ # a guard that has been inert since it was written.
+
+ # main() is where the pair produced in stage 4 meets the exit that must
+ # refuse it. A producer and a consumer that are each correct in isolation is
+ # not a wired pipeline -- the ENTRY hold proved that, twice.
+ ("the fee pair never leaves main(), so the exit is never told to refuse it",
+  "GhostSpiral",
+  "                                 exit_fee_hold=([_fee_pair] if _fee_pair\n"
+  "                                                else []),",
+  "                                 exit_fee_hold=[],",
+  ["test_dag_entry"]),
+
+ ("_stage5_run drops the fee pair instead of folding it into the hold",
+  "GhostSpiral",
+  "        for _fp in (exit_fee_hold or ()):",
+  "        for _fp in ():",
+  ["test_exit_withdraw"]),
+
+ # Riding on entry_pairs would classify the fee as the swap ENTRY, and every
+ # one of ENTRY's remedies is wrong for it: no public memo names the fee, and
+ # it is not value waiting to be mixed. Telling the operator to feed their own
+ # fee back through a run spends the fee on fees.
+ ("the fee is reported as a distribution change, losing its own remedy",
+  "GhostSpiral",
+  '        if pair in _fee_set:\n            return "usagefee"',
+  "        if False:\n            return \"usagefee\"",
+  ["test_exit_withdraw"]),
+
+ # ---- the mint can fail, and the swap has already settled ----------------
+ #
+ # create_fresh_account raises rather than defaulting to account 0. Uncaught,
+ # that takes main() down at stage 4 -- after the BTC is through ThorChain and
+ # the XMR is on an address a public OP_RETURN names. Same outcome the
+ # below-floor branch stopped producing; this was the door beside it.
+ ("a wallet that will not mint the fee account kills the run again",
+  "GhostSpiral",
+  '        integrity_log("usagefee", "waived_mint_failed")',
+  "        raise",
+  ["test_dag_entry"]),
+
+ # ---- the accounts no other warning reaches ------------------------------
+ #
+ # report_holdings says "SPEND THEM ONE ACCOUNT AT A TIME" over the run's
+ # accounts, and the fee account is deliberately not one of them. Each fee is
+ # a FIXED FRACTION of one deposit, so merging two does not merely link them,
+ # it measures the runs behind them.
+ ("the fee accounts go back to getting no spend-hygiene warning at all",
+  "GhostSpiral",
+  '    print(f"      SPEND IT ON ITS OWN. Every run mints another of these, and "',
+  '    _unused = (f"      SPEND IT ON ITS OWN. Every run mints another of these, and "',
+  ["test_dag_entry"]),
+
+ # ---- labels are written INTO the wallet file ----------------------------
+ #
+ # paranoia_mode never deletes the wallet file; it is the only thing that can
+ # still spend the money. So a label outlives every artifact wipe, and a
+ # labelled fee account does the analyst's arithmetic for them.
+ ("the fee account is labelled, and the label outlives every wipe",
+  "GhostSpiral",
+  '        _acct = create_fresh_account(rpc, label="")',
+  '        _acct = create_fresh_account(rpc, label="usage fee")',
+  ["test_dag_entry"]),
+
+ # ---- the doc's list of env-carried values must be the code's list -------
+ #
+ # OPSEC_SETUP's paragraph confesses that GS_EXIT_TO "was missing from that
+ # list for as long as the list existed, and the sentence above was false
+ # because of it". The same drift then happened twice more, silently:
+ # GS_EXPECT_TOTAL_XMR and the two usage-fee variables were added to
+ # secret_env and never to the doc. Derived from the code now, so it cannot.
+ ("the env-carried list goes back to being a hand-written snapshot",
+  "gs_console",
+  '    if params.get("usage_fee") and params.get("usage_fee_pct"):\n'
+  '        env["GS_USAGE_FEE_PCT"] = str(params["usage_fee_pct"])',
+  '    if params.get("usage_fee") and params.get("usage_fee_pct"):\n'
+  '        env["GS_UNDOCUMENTED_SECRET"] = str(params["usage_fee_pct"])',
+  ["test_env_leaks"]),
+
+ # ---- the only durable pointer to the operator's own money ---------------
+ #
+ # plan_usage_fee prints the account and subaddress ONCE, in stage 4. Nothing
+ # else carries it: the fee account is kept out of addr_index (so the exit
+ # cannot sweep it), which keeps it out of report_holdings; the plan file has
+ # the address but not the index, and a completed run wipes that plan; the
+ # integrity chain carries structure only. gs_console keeps child output in a
+ # 5000-line ring and drops 1500 at a time, so on a long run that one line goes.
+ ("the run never restates where the usage fee landed", "GhostSpiral",
+  '        integrity_log("usagefee", "restated_at_end")',
+  "        return",
+  ["test_units"]),
+
+ # BEFORE the sys.exit, deliberately: a fee taken in stage 4 survives a run
+ # that fails in stage 5, and that is the run with the longest scrollback.
+ ("the fee reminder is lost on exactly the runs that need it", "GhostSpiral",
+  "    if fee_pair:\n"
+  '        integrity_log("usagefee", "restated_at_end")',
+  "    if fee_pair and not incomplete:\n"
+  '        integrity_log("usagefee", "restated_at_end")',
+  ["test_units"]),
+
+ ("main() stops handing the fee pair to the final report", "GhostSpiral",
+  "                          fee_pair=_fee_pair,",
+  "                          fee_pair=None,",
+  ["test_dag_entry"]),
+
+ # ---- a static fee address inside this wallet is the exit's to sweep -----
+ #
+ # _exit_account_list = addr_index's accounts + change_accounts + bal_account,
+ # and bal_account is account 0 in send mode -- the wallet's PRE-EXISTING
+ # primary account, which the run did not make. _funded_subaddresses walks
+ # every subaddress of it. So "an address this run did not create" is not the
+ # same as "an address the exit will not touch", and the likeliest paste of all
+ # is the one it gets wrong.
+ ("a static fee address inside the wallet is paid and then swept out",
+  "GhostSpiral",
+  "        _own = _wallet_owns_address(rpc, addr)",
+  "        _own = None",
+  ["test_dag_entry"]),
+
+ # An error from get_address_index is what a REAL wallet answers for a foreign
+ # address, so it must mean "not ours". Treating it as ours waives the fee on
+ # every correct configuration.
+ ("a foreign fee address is mistaken for one of this wallet's",
+  "GhostSpiral",
+  "    except Exception:                                        # noqa: BLE001\n"
+  "        return None\n"
+  '    _ix = (res or {}).get("index") if isinstance(res, dict) else None',
+  "    except Exception:                                        # noqa: BLE001\n"
+  "        return (0, 0)\n"
+  '    _ix = (res or {}).get("index") if isinstance(res, dict) else None',
+  ["test_dag_entry"]),
+
+ # ---- the page has no masker, and it was rendering 48 of 95 characters ---
+ #
+ # /api/preview fires on every keystroke, and every prefix of a CORRECT address
+ # fails the regex -- so this is ordinary typing, not an error path. The exit
+ # list shows 16 and scrub_address shows 16; this showed 48, the longest
+ # disclosure of an address anywhere in the toolchain.
+ ("a rejected address is echoed back into the DOM at full length",
+  "gs_console",
+  '                    errs.append(f"{k} is not a valid {k.replace(\'_\', \' \')}: "\n'
+  '                                f"{s[:16]}…")',
+  '                    errs.append(f"{k} is not a valid {k.replace(\'_\', \' \')}: "\n'
+  '                                f"{s[:48]}")',
+  ["test_console"]),
+
+ ("address fields go back onto the generic echo branch", "gs_console",
+  '    "usage_fee_address": ("addr_re", XMR_RE),',
+  '    "usage_fee_address": ("re", XMR_RE),',
+  ["test_console"]),
+
+ # ---- the public output count must match what an analyst counts ---------
+ #
+ # The fan-out notice quoted the MIX destination count while --usage-fee builds
+ # one more output than that. This is the paragraph whose entire subject is
+ # that the output count is public, so the operator has nothing to check the
+ # figure against -- an off-by-one there is the one wrong number they cannot
+ # catch.
+ ("the announced fan-out output count forgets the fee output", "GhostSpiral",
+  "    _real = int(n_outputs) + (1 if fee_out else 0)",
+  "    _real = int(n_outputs)",
+  ["test_dag_entry"]),
+
+ # --peel and --usage-fee are refused together (the peel branch has no fee
+ # destination and would deduct without paying). Advising the switch without
+ # saying that sends the operator to a sys.exit on their next run.
+ ("the shape notice offers a --peel run that will be refused", "GhostSpiral",
+  '        print("      NOT ON THIS RUN, though: --peel and --usage-fee are "',
+  '        _unused = ("      NOT ON THIS RUN, though: --peel and --usage-fee are "',
+  ["test_dag_entry"]),
+
+ # ---- the rate is the divisor, and argv is where it used to sit ----------
+ #
+ # /proc/<pid>/cmdline is 0444, every account on the host, for the life of the
+ # run. A local reader sees argv and NOT the amounts -- those are inside RingCT
+ # and inside plan files under a 0700 directory -- so argv was the ONLY
+ # disclosure of the number that turns an observed cash-out back into a
+ # deposit. GhostSpiral routes the rate through env_or_argv for exactly this
+ # reason; the console handed it straight back.
+ ("the console publishes the fee rate to ps again", "gs_console",
+  '    if p.get("usage_fee"):\n        a.append("--usage-fee")',
+  '    if p.get("usage_fee"):\n        a.append("--usage-fee")\n'
+  '    if p.get("usage_fee_pct"):\n'
+  '        a += ["--usage-fee-pct", str(p["usage_fee_pct"])]',
+  ["test_console"]),
+
+ # An env-supplied rate IS "skim" to resolve_usage_fee -- env is the preferred
+ # channel, so requiring the argv flag too would defeat having it. Drop the
+ # checkbox from this gate and a rate left in the field makes the run skim
+ # while the page shows no fee at all.
+ ("a rate left in the field skims with the box unticked", "gs_console",
+  '    if params.get("usage_fee") and params.get("usage_fee_pct"):',
+  '    if params.get("usage_fee_pct"):',
+  ["test_console"]),
+
+ ("the fee subaddress is labelled, which the wallet file also keeps",
+  "GhostSpiral",
+  '        addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")',
+  '        addr, _idx = rpc.new_subaddress_indexed(account_index=_acct,\n'
+  '                                                label="usage fee")',
+  ["test_dag_entry"]),
 
 ]
 
@@ -2275,10 +2498,56 @@ def control(suites) -> dict:
     return out
 
 
+def anchors_ok(selection) -> list:
+    """Every anchor, read against the PRISTINE source. Returns the rotten ones.
+
+    Milliseconds, and it runs FIRST -- which is the whole point. The tally at
+    the bottom of this file already exits 1 on a SKIP, but only after every
+    mutation has been applied, copied and run: hours, for a fact that is
+    available before the first copy is made. So nobody ever paid to learn it,
+    and anchors rotted in the dark.
+
+    Five had, when this was written: two named a print() whose text had been
+    renamed ("CUT" -> "USAGE FEE"), two named lines that had since grown a
+    fourth held-output kind, and one named a dict entry that gained a sibling.
+    All five reported SKIP, all five would have been read as coverage, and the
+    guarantees behind them -- including "the operator is told where their fee
+    went" -- were unswept for two turns.
+
+    Reads each file ONCE and counts: an anchor that matches zero times names
+    source that no longer exists, and one that matches twice mutates a place
+    the author did not choose.
+    """
+    cache, rotten = {}, []
+    for i, mut in selection:
+        _name, _file, _find = mut[0], mut[1], mut[2]
+        if _file not in cache:
+            cache[_file] = open(os.path.join(REPO, _file)).read()
+        n = cache[_file].count(_find)
+        if n != 1:
+            rotten.append((i, n, _name, _file))
+    return rotten
+
+
 if __name__ == "__main__":
     only = set(sys.argv[1:])
     _sel = [m for i, m in enumerate(MUTATIONS) if not only or str(i) in only]
+    # BEFORE the control run, and long before the first repo copy: a rotten
+    # anchor is a guarantee that goes unswept, and finding that out at the end
+    # of a multi-hour sweep is how five of them survived two turns.
+    _rot = anchors_ok([(i, m) for i, m in enumerate(MUTATIONS)
+                       if not only or str(i) in only])
+    if _rot:
+        print(f"[!] {len(_rot)} anchor(s) no longer match the source exactly "
+              f"once. Each is a guarantee this sweep would report SKIP for, "
+              f"i.e. NOT swept:")
+        for _i, _n, _nm, _f in _rot:
+            print(f"    #{_i} matches {_n}x in {_f}: {_nm}")
+        print("    Re-anchor them against the current source before running "
+              "the sweep; a tally with SKIPs in it is not coverage.")
+        sys.exit(1)
     _suites = {s for m in _sel for s in m[4]}
+    print(f"[anchors] all {len(_sel)} anchor(s) match the source exactly once")
     print(f"[control] {len(_suites)} suite(s) on an UNMUTATED copy — a suite "
           f"that is already red cannot catch anything")
     _ctl = control(_suites)

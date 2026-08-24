@@ -281,7 +281,7 @@ DECOY_MAX = 7
 # ---------------------------------------------------------------------------
 #  THE OPERATOR'S CUT
 # ---------------------------------------------------------------------------
-#: Fraction of the deposit the operator keeps, when --mix-cut is on. OFF by
+#: Fraction of the deposit the operator keeps, when --usage-fee is on. OFF by
 #: default: a run that has not been asked to skim must not skim.
 #:
 #: WHERE IT IS TAKEN, AND WHY NOWHERE ELSE WOULD DO. As one more destination on
@@ -295,7 +295,7 @@ DECOY_MAX = 7
 #:     And the ThorChain memo publishes ENTRY in a plaintext OP_RETURN, so a
 #:     BTC-side marker does not stay on the BTC side: it labels which Monero
 #:     entry addresses are this operator's. Refused outright -- see
-#:     resolve_mix_cut.
+#:     resolve_usage_fee.
 #:   * AS AN EXTRA --exit-to. Costs nothing and does not work: the exit is one
 #:     sweep_all per subaddress and the fan-out amounts are deliberately
 #:     unequal, so an extra destination takes whole OUTPUTS, not a fraction.
@@ -312,11 +312,11 @@ DECOY_MAX = 7
 #: destination moves it to 291 and changes no shape CLASS -- and it is not the
 #: entry output's first spend either, because build_entry_veils is. That is the
 #: whole reason this placement is cheap and the others are not.
-MIX_CUT_PCT = Decimal("0.011")
-#: A sanity ceiling on --mix-cut-pct, in the sense ABSURD_RATE is one: it says
+USAGE_FEE_PCT = Decimal("0.011")
+#: A sanity ceiling on --usage-fee-pct, in the sense ABSURD_RATE is one: it says
 #: "that is not a cut", never "that cut looks greedy". A quarter of the deposit
 #: is far above any real fee and far below anything that breaks the arithmetic.
-MIX_CUT_PCT_MAX = Decimal("0.25")
+USAGE_FEE_PCT_MAX = Decimal("0.25")
 
 # FALLBACK FEE, and the old value here was not conservative -- it was 48x LOW.
 #
@@ -1137,7 +1137,7 @@ def min_fanout_usable(fanout_count: int, fee_xmr: Decimal,
 
 def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
                     dag_mixing: bool = True, exit_set: bool = True,
-                    chunks: int = 1, cut_pct: Decimal = None) -> Decimal:
+                    chunks: int = 1, usage_pct: Decimal = None) -> Decimal:
     """The smallest WALLET BALANCE that completes a mix and delivers it.
 
     This is the number an operator can be shown when something asks how much
@@ -1161,7 +1161,7 @@ def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
     on it.
 
     THE OPERATOR'S CUT, when one is taken, and it binds more often than it
-    looks. `cut_pct` of the balance is removed before the fan-out is planned,
+    looks. `usage_pct` of the balance is removed before the fan-out is planned,
     so the balance has to be larger by that fraction -- but the constraint that
     actually bites is that the cut must be SPENDABLE. An output worth less than
     the fee to spend it is unspendable by anyone (see exit_is_fundable), so a
@@ -1186,14 +1186,14 @@ def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
         Decimal(1), fee_xmr, w, peel=False, dag_mixing=dag_mixing,
         exit_set=exit_set, chunks=chunks)
     need = min_fanout_usable(n, fee_xmr, dag_mixing) + total_fees
-    if cut_pct and cut_pct > 0:
-        need = need / (Decimal(1) - cut_pct)
+    if usage_pct and usage_pct > 0:
+        need = need / (Decimal(1) - usage_pct)
         # STRICTLY ABOVE the cost of moving it, not equal to it. An output
         # worth exactly the fee to spend it is worth nothing once spent, so
-        # `hop_fee_reserve / cut_pct` is one tick short of a collectable cut --
+        # `hop_fee_reserve / usage_pct` is one tick short of a collectable cut --
         # driven, and it is the figure a UI would otherwise print as the
         # minimum.
-        need = max(need, (hop_fee_reserve(fee_xmr) + DUST_XMR) / cut_pct)
+        need = max(need, (hop_fee_reserve(fee_xmr) + DUST_XMR) / usage_pct)
     return need.quantize(DUST_XMR, rounding=ROUND_UP)
 
 
@@ -3996,21 +3996,21 @@ def build_cli() -> argparse.ArgumentParser:
                           "the flag to spread the withdrawal across several "
                           "destinations. Without it nothing is withdrawn and "
                           "the funds stay on this wallet.")
-    cli.add_argument("--mix-cut", action="store_true",
-                     help=f"Keep {(MIX_CUT_PCT * 100).normalize()}%% of the deposit as the "
-                          f"operator's cut, paid as one more destination on "
+    cli.add_argument("--usage-fee", action="store_true",
+                     help=f"Keep {(USAGE_FEE_PCT * 100).normalize()}%% of the deposit as your "
+                          f"USAGE FEE, paid as one more destination on "
                           f"the fan-out. By default it goes to a FRESH "
                           f"account and subaddress minted for this run, so no "
                           f"address collects from two runs. XMR side only -- "
-                          f"there is no BTC-side cut and there will not be "
-                          f"one; see --mix-cut-address.")
-    cli.add_argument("--mix-cut-pct", type=decimal_arg, metavar="FRACTION",
-                     help=f"Override the cut (default {MIX_CUT_PCT} = "
-                          f"{(MIX_CUT_PCT * 100).normalize()}%%). Ceiling "
-                          f"{MIX_CUT_PCT_MAX}. Implies --mix-cut.")
-    cli.add_argument("--mix-cut-address", metavar="XMR_ADDRESS",
-                     help="Send the cut to THIS address instead of a freshly "
-                          "minted one. Prefer GS_MIX_CUT_ADDRESS=... : an "
+                          f"there is no BTC-side fee and there will not be "
+                          f"one; see --usage-fee-address.")
+    cli.add_argument("--usage-fee-pct", type=decimal_arg, metavar="FRACTION",
+                     help=f"Override the usage fee (default {USAGE_FEE_PCT} = "
+                          f"{(USAGE_FEE_PCT * 100).normalize()}%%). Ceiling "
+                          f"{USAGE_FEE_PCT_MAX}. Implies --usage-fee.")
+    cli.add_argument("--usage-fee-address", metavar="XMR_ADDRESS",
+                     help="Send the usage fee to THIS address instead of a freshly "
+                          "minted one. Prefer GS_USAGE_FEE_ADDRESS=... : an "
                           "argv address is world-readable via ps and "
                           "/proc/<pid>/cmdline (mode 444). Note what it costs: "
                           "one address collecting a slice of every run is the "
@@ -5270,7 +5270,8 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
     return dag_plan
 
 
-def announce_distribution_shape(args, n_outputs: int) -> None:
+def announce_distribution_shape(args, n_outputs: int,
+                                fee_out: bool = False) -> None:
     """Say that the default distribution leaves ONE distinctive transaction.
 
     --dag-mixing announces itself when it is OFF ("Run with --dag-mixing to add
@@ -5341,8 +5342,28 @@ def announce_distribution_shape(args, n_outputs: int) -> None:
     if getattr(args, "peel", False):
         return
     integrity_log("stage4", "distribution_mode:fanout_default")
+    # THE COUNT INCLUDES THE USAGE FEE, because the chain does.
+    #
+    # This said "{n_outputs} outputs" while a run with --usage-fee builds
+    # n_outputs + 1 -- the fee is one more destination on the same
+    # transaction. Off by one is not a rounding error here: this is the
+    # paragraph whose entire subject is that the output count is PUBLIC, so a
+    # figure that does not match what an analyst will count is the one wrong
+    # number the operator cannot check against anything.
+    _real = int(n_outputs) + (1 if fee_out else 0)
     print(f"  [*] Distribution: ONE fan-out transaction creating "
-          f"{n_outputs} outputs at once (the default).")
+          f"{_real} outputs at once (the default).")
+    if fee_out:
+        # AND WHY THE EXTRA ONE IS NOT A TELL. The output count is public, so
+        # an operator who has just been told the fee adds to it deserves the
+        # rest of the reasoning rather than a number and a silence.
+        print(f"      {n_outputs} of those are the mix; the last is your "
+              f"usage fee. It does not give the transaction a shape of its "
+              f"own: the mix count is already --wallets plus a random "
+              f"{DECOY_MIN}-{DECOY_MAX} decoys drawn at run time, so one more "
+              f"output lands inside a spread the run was making anyway. What "
+              f"an analyst reads off the chain is a number in that range, not "
+              f"a number with a fee in it.")
     print(f"      That transaction is visibly different from the ~2-output "
           f"payments around it — its output count, its tx_extra length and "
           f"its fee are all public, and all three scale with the number of "
@@ -5359,6 +5380,16 @@ def announce_distribution_shape(args, n_outputs: int) -> None:
     print(f"      It is much slower — each one is confirmation-gated, so "
           f"roughly {n_outputs} * 20 min — and it is the stronger choice when "
           f"time is not the constraint.")
+    if fee_out:
+        # DO NOT OFFER A SWITCH THAT WILL BE REFUSED. --peel and --usage-fee
+        # are mutually exclusive (see _refuse_fee_combinations: the peel branch
+        # of build_distribution_plan has no fee destination at all, so a peel
+        # run would charge the fee and pay nobody). Advising the switch without
+        # saying that sends the operator to a sys.exit on their next run.
+        print("      NOT ON THIS RUN, though: --peel and --usage-fee are "
+              "refused together, because the peeling chain has no destination "
+              "to pay the fee to and would deduct it without paying it. To "
+              "peel, drop the usage fee for that run.")
 
 
 def resolve_exit_destinations(args) -> None:
@@ -5696,7 +5727,7 @@ def resolve_btc_amount(args) -> None:
             f"{fmt_btc(amt.quantize(SATOSHI_BTC, rounding=ROUND_DOWN) + SATOSHI_BTC)}.")
 
 
-def resolve_mix_cut(args) -> None:
+def resolve_usage_fee(args) -> None:
     """Validate the operator's cut, before anything is fetched or spent.
 
     Mirrors resolve_exit_destinations deliberately: same env-first rule, same
@@ -5708,10 +5739,10 @@ def resolve_mix_cut(args) -> None:
     FOUR REFUSALS, and each is a thing that would otherwise be discovered after
     the money moved:
 
-      * A CUT WITH NOWHERE TO GO. --mix-cut-pct without a destination is a
+      * A CUT WITH NOWHERE TO GO. --usage-fee-pct without a destination is a
         request to skim into nothing.
       * AN OUT-OF-BAND PERCENTAGE. Zero or negative is not a cut; above
-        MIX_CUT_PCT_MAX is not one either. Sanity ceiling, not a judgement --
+        USAGE_FEE_PCT_MAX is not one either. Sanity ceiling, not a judgement --
         see the constant.
       * THE CUT ADDRESS IS AN EXIT DESTINATION. Then the cut is not a cut: it
         lands with the mixed funds, in the same wallet, and the operator has
@@ -5725,7 +5756,7 @@ def resolve_mix_cut(args) -> None:
     public and exact, and the ThorChain memo publishes ENTRY in a plaintext
     OP_RETURN -- so a cut taken there is both readable to six significant
     figures and attached, on the public chain, to the Monero address it was
-    meant to be unlinked from. See MIX_CUT_PCT. The cut is XMR-side only, and
+    meant to be unlinked from. See USAGE_FEE_PCT. The cut is XMR-side only, and
     the flag names say so.
     """
     # THE RATE GOES THROUGH env_or_argv TOO. The address did and the rate did
@@ -5734,52 +5765,52 @@ def resolve_mix_cut(args) -> None:
     # is a per-operator constant, and putting it on argv publishes it to `ps`
     # and to every local account for the life of the run, next to amounts it
     # divides exactly into.
-    _pct_given = env_or_argv("GS_MIX_CUT_PCT",
-                             getattr(args, "mix_cut_pct", None),
-                             "The cut fraction")
-    _addr = env_or_argv("GS_MIX_CUT_ADDRESS",
-                        getattr(args, "mix_cut_address", None),
-                        "The cut destination")
-    args.mix_cut_address = _addr or None
-    if not args.mix_cut_address:
+    _pct_given = env_or_argv("GS_USAGE_FEE_PCT",
+                             getattr(args, "usage_fee_pct", None),
+                             "The usage-fee fraction")
+    _addr = env_or_argv("GS_USAGE_FEE_ADDRESS",
+                        getattr(args, "usage_fee_address", None),
+                        "The usage-fee destination")
+    args.usage_fee_address = _addr or None
+    if not args.usage_fee_address:
         # A fresh account+subaddress is minted per run instead (see stage 4),
         # which is the no-reuse default. Nothing to validate here.
-        args.mix_cut_pct = (Decimal(str(_pct_given)) if _pct_given is not None
+        args.usage_fee_pct = (Decimal(str(_pct_given)) if _pct_given is not None
                             else None)
-        if args.mix_cut_pct is None and getattr(args, "mix_cut", False):
-            args.mix_cut_pct = MIX_CUT_PCT
-        _check_cut_pct(args)
-        _refuse_cut_combinations(args)
+        if args.usage_fee_pct is None and getattr(args, "usage_fee", False):
+            args.usage_fee_pct = USAGE_FEE_PCT
+        _check_fee_pct(args)
+        _refuse_fee_combinations(args)
         return
-    if not getattr(args, "mix_cut", False) and _pct_given is None:
+    if not getattr(args, "usage_fee", False) and _pct_given is None:
         sys.exit(
-            "[!] A cut destination was given but --mix-cut was not.\n"
+            "[!] A usage-fee destination was given but --usage-fee was not.\n"
             "    Refusing to guess: an address alone does not say whether this "
             "run should skim.\n"
-            "    Add --mix-cut to take the default "
-            f"{(MIX_CUT_PCT * 100).normalize()}% , or drop the address.")
-    args.mix_cut_pct = (Decimal(str(_pct_given)) if _pct_given is not None
-                        else MIX_CUT_PCT)
-    _check_cut_pct(args)
-    validate_xmr_address(args.mix_cut_address, "--mix-cut-address")
-    _refuse_cut_combinations(args)
+            "    Add --usage-fee to take the default "
+            f"{(USAGE_FEE_PCT * 100).normalize()}% , or drop the address.")
+    args.usage_fee_pct = (Decimal(str(_pct_given)) if _pct_given is not None
+                        else USAGE_FEE_PCT)
+    _check_fee_pct(args)
+    validate_xmr_address(args.usage_fee_address, "--usage-fee-address")
+    _refuse_fee_combinations(args)
     for _d in (getattr(args, "exit_to", None) or []):
-        if _d == args.mix_cut_address:
+        if _d == args.usage_fee_address:
             sys.exit(
-                f"[!] --mix-cut-address is also an --exit-to destination "
+                f"[!] --usage-fee-address is also an --exit-to destination "
                 f"({scrub_address(_d)}).\n"
-                f"    Then it is not a cut: the skim lands in the same place "
+                f"    Then it is not a fee: it lands in the same place "
                 f"as the mixed funds,\n"
                 f"    having paid a transaction to move your money to itself. "
-                f"Give the cut its own\n"
-                f"    address, or drop --mix-cut.")
-    if args.mix_cut_address == (getattr(args, "btc_entry", None) or object()):
-        sys.exit("[!] --mix-cut-address is the BTC entry address. That is a "
+                f"Give the usage fee its own\n"
+                f"    address, or drop --usage-fee.")
+    if args.usage_fee_address == (getattr(args, "btc_entry", None) or object()):
+        sys.exit("[!] --usage-fee-address is the BTC entry address. That is a "
                  "copy-paste slip, not a destination.")
-    integrity_log("cut", "cut_address_validated")
+    integrity_log("usagefee", "address_validated")
 
 
-def _refuse_cut_combinations(args) -> None:
+def _refuse_fee_combinations(args) -> None:
     """The two shapes where the cut is charged and never paid.
 
     Both were REAL in the first version of this feature, both silent, and both
@@ -5787,7 +5818,7 @@ def _refuse_cut_combinations(args) -> None:
     gives to `--split N --peel`, and for the identical reason: the code has no
     representation for a partial one.
 
-      * --peel. plan_operator_cut deducts the cut from the balance
+      * --peel. plan_usage_fee deducts the cut from the balance
         unconditionally, but only the FAN-OUT branch of build_distribution_plan
         builds a cut destination; the peel branch has no reference to it at
         all. So a peel run charges the cut, pays nobody, and leaves the residue
@@ -5808,43 +5839,43 @@ def _refuse_cut_combinations(args) -> None:
     outputs and the cut exist under one txid or nothing was spent. "The mix
     started" and "the operator was paid" are the same event.
     """
-    if not getattr(args, "mix_cut_pct", None):
+    if not getattr(args, "usage_fee_pct", None):
         return
     if getattr(args, "peel", False):
         sys.exit(
-            "[!] --mix-cut with --peel is refused.\n"
-            "    The peel planner has no cut destination, so the cut would be "
+            "[!] --usage-fee with --peel is refused.\n"
+            "    The peel planner has no fee destination, so the fee would be "
             "deducted from the\n"
             "    balance and paid to nobody -- the residue lands on the veil "
             "carrier and the exit\n"
             "    sweeps it to your --exit-to. Charged and never paid, "
             "silently.\n"
-            "    Use --peel without --mix-cut, or --mix-cut without --peel.")
+            "    Use --peel without --usage-fee, or --usage-fee without --peel.")
     if int(getattr(args, "split", 1) or 1) > 1:
         sys.exit(
-            f"[!] --mix-cut with --split "
+            f"[!] --usage-fee with --split "
             f"{int(getattr(args, 'split', 1) or 1)} is refused.\n"
-            f"    The cut would be split across that many fan-out "
+            f"    The fee would be split across that many fan-out "
             f"transactions. A partial relay\n"
-            f"    pays a partial cut, and the spendability floor is checked "
+            f"    pays a partial fee, and the spendability floor is checked "
             f"against the total while\n"
             f"    you would receive one output per chunk -- each of which can "
             f"be worth less than the\n"
-            f"    fee to move it. Take the cut on a --split 1 run.")
+            f"    fee to move it. Take the usage fee on a --split 1 run.")
 
 
-def _check_cut_pct(args) -> None:
+def _check_fee_pct(args) -> None:
     """The percentage band. Split out so both branches above take one rule."""
-    _p = getattr(args, "mix_cut_pct", None)
+    _p = getattr(args, "usage_fee_pct", None)
     if _p is None:
         return
     if _p <= 0:
-        sys.exit(f"[!] --mix-cut-pct must be positive (got {_p}). A zero cut "
-                 f"is the default already -- leave --mix-cut off.")
-    if _p > MIX_CUT_PCT_MAX:
+        sys.exit(f"[!] --usage-fee-pct must be positive (got {_p}). A zero fee "
+                 f"is the default already -- leave --usage-fee off.")
+    if _p > USAGE_FEE_PCT_MAX:
         sys.exit(
-            f"[!] --mix-cut-pct {_p} is above the ceiling of "
-            f"{MIX_CUT_PCT_MAX}.\n"
+            f"[!] --usage-fee-pct {_p} is above the ceiling of "
+            f"{USAGE_FEE_PCT_MAX}.\n"
             f"    That is a sanity bound, not an opinion about your fee: above "
             f"it the remainder\n"
             f"    stops being able to fund the mix it is supposed to pay for.")
@@ -6566,7 +6597,7 @@ def report_holdings(rpc, accounts, entry_account=None) -> list:
 
 
 def report_completion(rpc, incomplete, accounts, spent_plans=(),
-                      withheld=(), entry_account=None) -> None:
+                      withheld=(), entry_account=None, fee_pair=None) -> None:
     """Say what actually happened, then say where the money is. Exits non-zero
     on an incomplete run.
 
@@ -6596,6 +6627,40 @@ def report_completion(rpc, incomplete, accounts, spent_plans=(),
     after a run that still counts as complete.
     """
     print()
+    # THE USAGE FEE, SAID AGAIN AT THE END, and this is durability rather than
+    # repetition.
+    #
+    # plan_usage_fee prints the account and subaddress once, in stage 4. That
+    # is the ONLY record anywhere: the fee account is deliberately kept out of
+    # addr_index (so the exit cannot sweep it), which also keeps it out of
+    # report_holdings' enumeration below; the plan file holds the ADDRESS but
+    # not the index, and a run that completes securely wipes that plan by
+    # design; and the integrity chain carries structure only, never an account
+    # number. Meanwhile gs_console keeps child output in a 5000-line ring and
+    # drops 1500 at a time, and a stage-4 line has stages 4 and 5 printing over
+    # it. So the one pointer to the operator's own money could be evicted from
+    # the only surface carrying it.
+    #
+    # BEFORE the incomplete branch, which sys.exits: a fee taken in stage 4
+    # survives a run that fails in stage 5, and that is exactly the run whose
+    # scrollback is longest.
+    #
+    # SEPARATE FROM THE HOLDINGS COUNT, not folded into it. report_holdings
+    # says "THIS RUN'S FUNDS ARE IN N SEPARATE ACCOUNTS ... SPEND THEM ONE
+    # ACCOUNT AT A TIME"; the fee is not one of those N, it is not mixed, and
+    # it must not be spent alongside them.
+    if fee_pair:
+        integrity_log("usagefee", "restated_at_end")
+        print(f"  [*] YOUR USAGE FEE is on account {fee_pair[0]}, subaddress "
+              f"{fee_pair[1]} of this wallet.")
+        print(f"      Write that down — nothing else does. It is not one of "
+              f"the accounts listed below, it is not in any plan file, and it "
+              f"is not on the integrity chain.")
+        print(f"      It never went through the fan-out or the hop rounds, so "
+              f"do NOT spend it together with the mixed outputs or with "
+              f"another run's fee: each fee is a fixed fraction of its own "
+              f"deposit, so one transaction spending two of them proves a "
+              f"common owner AND divides back into two deposit sizes.")
     if incomplete:
         integrity_log("main", f"pipeline_incomplete:{len(incomplete)}")
         print("  [!] GhostSpiral finished, but the mix is NOT what was planned:")
@@ -6711,14 +6776,14 @@ def limits_report(args) -> dict:
         int(getattr(args, "fee_priority", 1) or 1), FALLBACK_FEE_XMR)
     dag = bool(getattr(args, "dag_mixing", False))
     exit_set = bool(getattr(args, "exit_to", None))
-    cut = getattr(args, "mix_cut_pct", None) or MIX_CUT_PCT
+    cut = getattr(args, "usage_fee_pct", None) or USAGE_FEE_PCT
     rows = {}
     for w in range(MIN_WALLETS, MAX_WALLETS + 1):
         rows[str(w)] = {
             "min_xmr": str(mix_minimum_xmr(fee, w, dag_mixing=dag,
                                            exit_set=exit_set)),
             "min_xmr_with_cut": str(mix_minimum_xmr(
-                fee, w, dag_mixing=dag, exit_set=exit_set, cut_pct=cut)),
+                fee, w, dag_mixing=dag, exit_set=exit_set, usage_pct=cut)),
         }
     return {
         "schema": "gs_limits_v1",
@@ -6729,10 +6794,11 @@ def limits_report(args) -> dict:
                      "guide and an understatement at higher priorities"),
         "dag_mixing": dag,
         "exit_set": exit_set,
-        "cut_pct": str(cut),
+        "usage_pct": str(cut),
         "cut_spend_floor_xmr": str(hop_fee_reserve(fee)),
-        "cut_note": (f"a cut worth less than {hop_fee_reserve(fee)} XMR cannot "
-                     f"be spent by anyone, so below the with-cut minimum the "
+        "cut_note": (f"a usage fee worth less than {hop_fee_reserve(fee)} XMR "
+                     f"cannot "
+                     f"be spent by anyone, so below the with-fee minimum the "
                      f"run is refused rather than taking a fee that cannot be "
                      f"collected"),
         "by_wallets": rows,
@@ -6776,16 +6842,84 @@ def maybe_print_limits() -> bool:
     _lp.add_argument("--fee-priority", type=int, default=1)
     _lp.add_argument("--dag-mixing", action="store_true")
     _lp.add_argument("--exit-to", action="append")
-    _lp.add_argument("--mix-cut-pct", type=decimal_arg)
+    _lp.add_argument("--usage-fee-pct", type=decimal_arg)
     _la, _ = _lp.parse_known_args()
     print(json.dumps(limits_report(_la), indent=2))
     return True
 
 
-def plan_operator_cut(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
-    """Decide the operator's cut and where it lands. Returns (address, amount).
+def _wallet_owns_address(rpc, addr: str):
+    """(major, minor) if THIS wallet holds the keys to `addr`, else None.
 
-    (None, 0) when no cut was asked for, which is the default.
+    Exists for one question plan_usage_fee has to ask about a static
+    --usage-fee-address and cannot answer from the flags: is the operator's fee
+    destination inside the very wallet the run is emptying? _exit_account_list
+    includes bal_account, which is account 0 in send mode -- the wallet's
+    pre-existing primary account -- so "an address the run did not create" is
+    NOT the same as "an address the exit will not touch".
+
+    NONE ON ANY ERROR, deliberately, and this is the opposite of the usual
+    fail-closed rule here for a measured reason: monero-wallet-rpc answers
+    get_address_index for a foreign address with an ERROR, not with a null
+    result. An error is therefore the EXPECTED answer for a correctly-supplied
+    external destination, and treating it as "unknown, so refuse" would waive
+    the fee on every correct configuration. The failure this guards is the
+    operator pasting their own address, and that case answers successfully.
+
+    A malformed answer is also None: the address is already validated by
+    validate_xmr_address, so a lookup that succeeds without an index is a
+    wallet not saying what it was asked, and guessing "ours" from it would
+    waive a fee that was fine.
+    """
+    try:
+        res = rpc.raw_request("get_address_index", {"address": addr})
+    except Exception:                                        # noqa: BLE001
+        return None
+    _ix = (res or {}).get("index") if isinstance(res, dict) else None
+    if not isinstance(_ix, dict):
+        return None
+    _maj, _min = _ix.get("major"), _ix.get("minor")
+    if isinstance(_maj, bool) or isinstance(_min, bool):
+        return None
+    if not isinstance(_maj, int) or not isinstance(_min, int):
+        return None
+    return (_maj, _min)
+
+
+def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
+    """Decide the operator's cut and where it lands.
+
+    Returns (address, amount, pair), where `pair` is the (account, subaddress)
+    the cut was minted on, or None when it went to an address this run did not
+    create. (None, 0, None) when no cut was asked for, which is the default.
+
+    FOUR WAYS TO TAKE NOTHING, and every one of them WAIVES rather than exits.
+    This runs after stage4_await_swap, so the BTC is already through ThorChain
+    and the XMR is sitting on an address a public OP_RETURN names: a sys.exit
+    here strands a settled swap on a pipeline with no auto-resume, which is
+    strictly worse for everyone than skipping one run's fee. The four are: no
+    fee asked for; a cut below the cost of ever spending it; a wallet that will
+    not mint the account to put it on; and a static destination that turns out
+    to be inside THIS wallet, where the exit would sweep it out again.
+
+    THE PAIR EXISTS FOR THE EXIT TO REFUSE. Nothing here writes the cut into
+    addr_index -- that omission is what keeps the exit from sweeping it, and a
+    test walks this function's AST to assert the name is never USED (prose does
+    not count, or the paragraph explaining the rule would break it). But a hold
+    built out of an omission is a hold that a later change
+    silently removes: add the cut to addr_index for any reason, and
+    _exit_account_list picks it up, the exit sweeps the operator's own fee to
+    --exit-to, and NOTHING SAYS SO. Handing the pair back lets stage 4 name it
+    in exit_hold as well, so the same mistake becomes a withheld-value report
+    with the address on it instead of a quiet payment to the wrong place.
+
+    It is not merely bookkeeping. The cut is a direct output of the fan-out --
+    no veil, no hop rounds -- so sweeping it to --exit-to would put UNMIXED
+    value on the destination beside the mixed outputs, which is the leak the
+    ENTRY, change and remainder holds all already exist for. It is worse than
+    those, because this output's size is a FIXED FRACTION of the deposit:
+    anyone watching --exit-to could divide by the rate and read the deposit
+    off it.
 
     A FRESH ACCOUNT AND SUBADDRESS PER RUN, unless the operator named an
     address. This is the whole reason the cut is affordable in OPSEC terms and
@@ -6816,9 +6950,9 @@ def plan_operator_cut(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
     remainder stays with the mix, which is the direction that cannot surprise
     the depositor.
     """
-    pct = getattr(args, "mix_cut_pct", None)
+    pct = getattr(args, "usage_fee_pct", None)
     if not pct or pct <= 0:
-        return None, Decimal(0)
+        return None, Decimal(0), None
     cut = (bal * pct).quantize(DUST_XMR, rounding=ROUND_DOWN)
     _spend_cost = hop_fee_reserve(fee_xmr)
     if cut <= _spend_cost:
@@ -6838,13 +6972,14 @@ def plan_operator_cut(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
         # instructions are printed, where "nothing has been spent" is true of
         # the deposit too -- and limits_note/--print-limits put the same figure
         # in front of the operator before they send anything.
-        integrity_log("cut", "cut_waived_below_spend_cost")
+        integrity_log("usagefee", "waived_below_spend_cost")
         _need = mix_minimum_xmr(
             fee_xmr, args.wallets,
             dag_mixing=bool(getattr(args, "dag_mixing", False)),
             exit_set=bool(getattr(args, "exit_to", None)),
-            cut_pct=pct)
-        print(f"  [!] NO CUT TAKEN. {(pct * 100).normalize()}% of this deposit "
+            usage_pct=pct)
+        print(f"  [!] NO USAGE FEE TAKEN. {(pct * 100).normalize()}% of this "
+              f"deposit "
               f"is {cut} XMR, which is not more\n"
               f"      than the {_spend_cost} XMR it costs to move one output — "
               f"a fee you could never\n"
@@ -6855,23 +6990,111 @@ def plan_operator_cut(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
               f"      going ahead in full; the swap has already happened and "
               f"aborting now would\n"
               f"      strand it on an address the swap memo names publicly.")
-        return None, Decimal(0)
-    addr = getattr(args, "mix_cut_address", None)
+        return None, Decimal(0), None
+    addr = getattr(args, "usage_fee_address", None)
     if addr:
         # The operator's own external address, reused every run by
         # construction. Said once, here, where it is actually about to happen.
-        integrity_log("cut", "cut_to_static_address")
-        print(f"  [!] The cut goes to a FIXED address you supplied. It will "
+        integrity_log("usagefee", "to_static_address")
+        print(f"  [!] The usage fee goes to a FIXED address you supplied. It "
+              f"will "
               f"collect from every run\n"
               f"      that uses it, which is the address reuse this toolchain "
               f"refuses everywhere\n"
               f"      else -- and mixing does not retract it. Drop "
-              f"--mix-cut-address to have a\n"
+              f"--usage-fee-address to have a\n"
               f"      fresh account and subaddress minted per run instead.")
-        return addr, cut
-    _acct = create_fresh_account(rpc, label="")
-    addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")
-    integrity_log("cut", "cut_subaddress_minted")
+        # AND IT MUST NOT BE AN ADDRESS OF THIS WALLET.
+        #
+        # An earlier version of this returned here with the note "the exit only
+        # ever enumerates accounts THIS RUN made, and a fixed external address
+        # is in none of them". That is FALSE, and the counter-example is the
+        # likeliest paste of all. _exit_account_list returns addr_index's
+        # accounts PLUS change_accounts PLUS bal_account -- and bal_account is
+        # `receive_account_index if receive_mode else 0`, i.e. account 0, the
+        # wallet's pre-existing primary account, which the run did not make.
+        # _funded_subaddresses then walks EVERY subaddress of it. So a fee sent
+        # to the wallet's own primary address, or to any subaddress of the
+        # receive account, is in the exit's withdrawal set: it goes to
+        # --exit-to as unmixed value whose size is a fixed fraction of the
+        # deposit, which is precisely the disclosure the whole placement
+        # argument exists to avoid. Subaddress 0 of that account is worse
+        # still -- it is the fan-out's change address, so the change sweep
+        # moves the fee INTO the mix and the operator never sees it.
+        #
+        # WAIVED, NOT REFUSED, for the reason both branches above waive: this
+        # runs after stage4_await_swap, so a sys.exit strands a settled swap on
+        # an address a public OP_RETURN names. One run's fee is the cheaper
+        # loss, and waiving creates no output at all, so there is nothing left
+        # for the exit or the change sweep to move.
+        #
+        # AN RPC ERROR IS THE NORMAL ANSWER HERE, not a failure:
+        # monero-wallet-rpc answers get_address_index for a FOREIGN address
+        # with an error ("Address doesn't belong to the wallet"), which is the
+        # expected case for a correctly-supplied external destination. So an
+        # error means "not ours" and the fee proceeds -- the status quo. Only a
+        # successful lookup, which can only happen for an address this wallet
+        # holds the keys to, waives.
+        _own = _wallet_owns_address(rpc, addr)
+        if _own is not None:
+            integrity_log("usagefee", "waived_address_in_wallet")
+            print(f"  [!] NO USAGE FEE TAKEN — the address you gave is one of "
+                  f"THIS WALLET's own\n"
+                  f"      (account {_own[0]}, subaddress {_own[1]}), and this "
+                  f"is the wallet the run is\n"
+                  f"      mixing out of. The exit enumerates account "
+                  f"{_own[0]} among others and would have\n"
+                  f"      swept the fee to your --exit-to destination: unmixed "
+                  f"value, sized at a fixed\n"
+                  f"      fraction of the deposit, landing beside the mixed "
+                  f"outputs. On subaddress 0 it\n"
+                  f"      is worse: that is where the fan-out's change lands, "
+                  f"so the change sweep moves\n"
+                  f"      your fee to a fresh address of this run — which "
+                  f"goes into addr_index, and\n"
+                  f"      straight out to --exit-to with everything else.\n"
+                  f"      The mix is going ahead in full. Use an address "
+                  f"OUTSIDE this wallet, or drop\n"
+                  f"      --usage-fee-address and let a fresh account be "
+                  f"minted per run.")
+            return None, Decimal(0), None
+        # No pair: the wallet does not know this address, so it is outside the
+        # accounts the exit enumerates and there is nothing to hold.
+        return addr, cut, None
+    # WAIVED IF THE MINT FAILS, for the same reason the below-floor branch
+    # waives -- and this door was left open when that one was closed.
+    #
+    # create_fresh_account RAISES (it refuses an absent, non-int, or zero
+    # account_index rather than defaulting to the wallet's primary account),
+    # and new_subaddress_indexed validates its answer the same way. Uncaught,
+    # either one takes down main() with a traceback at stage 4 -- AFTER
+    # stage4_await_swap, so the BTC is already through ThorChain and the XMR is
+    # sitting on ENTRY, an address a public OP_RETURN memo names. That is the
+    # exact outcome the "Nothing has been spent" abort was removed for,
+    # reached through the RPC instead of through the arithmetic.
+    #
+    # Nothing is half-done on this path. The account may exist, but it is empty
+    # and unreferenced: the cut is only ever paid as a destination on the
+    # fan-out plan, and that is built later, from the values returned here.
+    # Waiving costs one run's fee; raising costs a settled swap.
+    try:
+        _acct = create_fresh_account(rpc, label="")
+        addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")
+    except Exception as _e:
+        integrity_log("usagefee", "waived_mint_failed")
+        print(f"  [!] NO USAGE FEE TAKEN — the wallet would not mint an "
+              f"account to put it on:\n"
+              f"      {_e}\n"
+              f"      The mix is going ahead in full. The swap has already "
+              f"settled, so stopping\n"
+              f"      here would strand it on an address the swap memo names "
+              f"publicly, and one\n"
+              f"      run's fee is the cheaper loss. If it repeats, the "
+              f"wallet-rpc is the thing to\n"
+              f"      look at — every later stage of this run mints accounts "
+              f"too.")
+        return None, Decimal(0), None
+    integrity_log("usagefee", "subaddress_minted")
     # SAY IT, AND SAY WHERE. The first version printed nothing at all on this
     # branch: the cut account was minted, paid, and never mentioned -- not on
     # the terminal, not in report_holdings, which lists "THIS RUN'S FUNDS ARE
@@ -6879,21 +7102,47 @@ def plan_operator_cut(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
     # cannot check they were paid against a number they were never given, and
     # the wallet is the only authoritative record; this line is what makes a
     # discrepancy noticeable at all.
-    print(f"  [*] CUT: {cut} XMR ({(pct * 100).normalize()}% of the deposit) "
+    print(f"  [*] USAGE FEE: {cut} XMR ({(pct * 100).normalize()}% of the "
+          f"deposit) "
           f"goes to a freshly minted\n"
           f"      account {_acct}, subaddress {_idx}, as one more destination "
           f"on the fan-out.\n"
           f"      It is not mixed and it is not swept by the exit — it is "
           f"yours where it lands.")
-    return addr, cut
+    # SPEND HYGIENE, HERE, because nothing else covers these accounts.
+    #
+    # report_holdings prints "SPEND THEM ONE ACCOUNT AT A TIME" over the run's
+    # accounts -- and this account is not one of them. It is deliberately kept
+    # out of addr_index so the exit cannot sweep it, which also keeps it out of
+    # the holdings report, so the accounts that accumulate run after run are
+    # the only ones the warning never reaches. They are also the ones most
+    # exposed to it: a fee is small, small piles invite being collected
+    # together, and the operator collecting them is the same person every time.
+    #
+    # And the merge costs more here than anywhere else in the run. Every mixed
+    # output is an arbitrary amount; each of these is a FIXED FRACTION of one
+    # deposit. Spending two together proves common ownership (any transaction
+    # does that) AND hands over two amounts that divide by a known rate into
+    # two deposit sizes -- so the merge does not just link the fees, it
+    # measures the runs behind them.
+    print(f"      SPEND IT ON ITS OWN. Every run mints another of these, and "
+          f"each one is\n"
+          f"      exactly {(pct * 100).normalize()}% of that run's deposit. A "
+          f"single transaction spending two of\n"
+          f"      them proves they share an owner AND lets anyone divide by "
+          f"the rate to read\n"
+          f"      both deposits off it. One account per transaction, and not "
+          f"into the same\n"
+          f"      destination as your mixed output.")
+    return addr, cut, (int(_acct), int(_idx))
 
 
 def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                             fanout_dests, fanout_by_addr, _dest_slices,
                             fee_xmr, bal_account, fanout_count,
                             _delay_window, _secrets, bal,
-                            usable, cut_addr=None,
-                            cut_amt=Decimal(0)) -> tuple:
+                            usable, fee_addr=None,
+                            fee_amt=Decimal(0)) -> tuple:
     """Build the plan that spends the carriers. Returns
     (fanout_plan, change_accounts, distribution_mode, fanout_by_addr).
 
@@ -6925,7 +7174,8 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
     distribution_mode = "peel" if args.peel else "fanout"
     # Say what shape the chain will show. Here, where the mode is decided and
     # the output count is known -- not in main(), which is at its size gate.
-    announce_distribution_shape(args, fanout_count)
+    announce_distribution_shape(args, fanout_count,
+                                fee_out=bool(fee_addr and fee_amt > 0))
     # ONE DISTRIBUTION PER CHUNK, and this is what keeps the invariant.
     #
     # A single distribution spending N carriers would be a CONVERGENCE: the
@@ -7088,20 +7338,20 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # most a DUST_XMR tick per chunk -- the same treatment split_btc_amount
         # gives its satoshi remainder, for the same reason: it has to go
         # somewhere and a fixed choice is the only one that cannot be a draw.
-        _cut_by_chunk = []
-        if cut_addr and cut_amt > 0:
+        _fee_by_chunk = []
+        if fee_addr and fee_amt > 0:
             _n_src = len(SPEND_SOURCES)
-            _per = (cut_amt / Decimal(_n_src)).quantize(DUST_XMR,
+            _per = (fee_amt / Decimal(_n_src)).quantize(DUST_XMR,
                                                         rounding=ROUND_DOWN)
-            _cut_by_chunk = [_per] * _n_src
-            _cut_by_chunk[-1] = cut_amt - _per * Decimal(_n_src - 1)
+            _fee_by_chunk = [_per] * _n_src
+            _fee_by_chunk[-1] = fee_amt - _per * Decimal(_n_src - 1)
         for _si, (_src_addr, _src_acct, _src_idx) in enumerate(SPEND_SOURCES):
             _slice = _dest_slices[_si]
             _dests = [{"address": a, "amount": str(fanout_by_addr[a])}
                       for a in _slice]
-            if _cut_by_chunk and _cut_by_chunk[_si] > 0:
-                _dests.append({"address": cut_addr,
-                               "amount": str(_cut_by_chunk[_si])})
+            if _fee_by_chunk and _fee_by_chunk[_si] > 0:
+                _dests.append({"address": fee_addr,
+                               "amount": str(_fee_by_chunk[_si])})
             fanout_plan.append({
                 "src": _src_addr,
                 "src_index": _src_idx,
@@ -7109,13 +7359,13 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                 "destinations": _dests,
                 "delay": hop_delay(_delay_window),
             })
-        if cut_addr:
+        if fee_addr:
             # STRUCTURE, NOT THE AMOUNT. The cut is a fixed fraction of the
             # deposit, so logging it would put the deposit on a chain that
             # persists -- the one quantity every other integrity_log call on
             # this path is careful to leave out. That the run took a cut, and
             # across how many chunks, is safe; how much is not.
-            integrity_log("cut", f"cut_on_fanout:{len(_cut_by_chunk)}_chunks")
+            integrity_log("usagefee", f"on_fanout:{len(_fee_by_chunk)}_chunks")
         # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
         # amount. integrity_chain.log persists on disk, and the exact fan-out
         # amount is the single most linkable quantity in the whole pipeline:
@@ -7678,7 +7928,7 @@ def main():
     resolve_exit_destinations(args)
     # AFTER the exit destinations, because one of its refusals compares against
     # them: a cut address that is also an exit address is not a cut.
-    resolve_mix_cut(args)
+    resolve_usage_fee(args)
     resolve_split(args)
     resolve_swap_arrival(args)
 
@@ -7955,9 +8205,10 @@ def main():
         # PRE-VEIL, because that is the deposit. The veil reserve is a cost of
         # mixing; the cut is a share of what arrived, and an operator quoting
         # 1.1% means 1.1% of what was sent, not of what survived the plumbing.
-        _cut_addr, _cut_amt = plan_operator_cut(rpc_primary, args, bal, fee_xmr)
-        if _cut_addr:
-            bal = bal - _cut_amt
+        _fee_addr, _fee_amt, _fee_pair = plan_usage_fee(
+            rpc_primary, args, bal, fee_xmr)
+        if _fee_addr:
+            bal = bal - _fee_amt
         # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
         # give a chain analyst one value and one shape to cluster and follow.
         (ENTRY_SET_FUNDED, _entry_unlocked, bal, usable,
@@ -8027,7 +8278,7 @@ def main():
             args, rpc_primary, addr_index, SPEND_SOURCES, fanout_dests,
             fanout_by_addr, _dest_slices, fee_xmr, bal_account,
             fanout_count, _delay_window, _secrets, bal, usable,
-            cut_addr=_cut_addr, cut_amt=_cut_amt)
+            fee_addr=_fee_addr, fee_amt=_fee_amt)
 
         # Subaddresses that will receive a fan-out output, with the (account, index)
         # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
@@ -8122,6 +8373,11 @@ def main():
                                      addr_index, change_accounts, bal_account),
                                  exit_hold=_exit_hold_list(args, addr_index,
                                                            ENTRY_ADDRS),
+                                 # Defence in depth on an isolation that is
+                                 # otherwise only an omission -- see the note
+                                 # in _stage5_run where this joins _hold.
+                                 exit_fee_hold=([_fee_pair] if _fee_pair
+                                                else []),
                                  dag_dst_index=_dag_ix,
                                  sweep_targets=_sweep_tg)
 
@@ -8141,6 +8397,9 @@ def main():
                           # output into `incomplete`, through a new door.
                           # _exit_hold_list, three lines up, already treats a
                           # missing ENTRY as "nothing to hold".
+                          # The only durable pointer to the operator's own
+                          # fee -- see the note in report_completion.
+                          fee_pair=_fee_pair,
                           entry_account=[a for a, _ in ENTRY_PAIRS])
 
 
@@ -9485,14 +9744,14 @@ def _funded_subaddresses(rpc, accounts) -> tuple:
 
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                           delay_window=None, hold=(), entry_pairs=(),
-                          remainder_pairs=()) -> tuple:
+                          remainder_pairs=(), fee_pairs=()) -> tuple:
     """ACTUALLY SPEND THE MIXED FUNDS OUT.
     Returns (relayed, failed, skipped, held, unclean), where `held` is a
-    {"entry": n, "change": n, "remainder": n} breakdown -- NOT a count. The
-    caller words its report from it: the three are different addresses with
-    different reasons and different remedies. Test the numbers, never the
-    dict: a populated dict is always truthy, and `not held` in the caller
-    silenced the clean-exit message entirely.
+    {"entry": n, "change": n, "remainder": n, "usagefee": n} breakdown -- NOT a
+    count. The caller words its report from it: the four are different
+    addresses with different reasons and different remedies. Test the numbers,
+    never the dict: a populated dict is always truthy, and `not held` in the
+    caller silenced the clean-exit message entirely.
 
     `remainder_pairs` is the third kind, and it is the largest: the carrier a
     PEELING CHAIN stopped on holds everything the chain had left to distribute
@@ -9500,6 +9759,16 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     would print the change sweep's remedy -- "The change sweep would have
     moved it once, to a fresh address" -- about a mode that has no change
     sweeps at all.
+
+    `fee_pairs` is the fourth and the only one that should never fire: the
+    usage fee is minted on an account plan_usage_fee keeps out of addr_index
+    entirely, so the exit does not enumerate it and there is nothing to hold.
+    Named anyway, because that safety is an OMISSION -- one line added to
+    addr_index anywhere would put the operator's own cut in exit_accounts and
+    sweep it to --exit-to in silence. With the pair here the same mistake
+    prints an address and a reason instead. It gets its own kind rather than
+    riding on `entry_pairs` because every one of ENTRY's remedies is wrong for
+    it: no public memo names it, and it is not waiting to be mixed.
 
     THIS IS THE EXIT, and it moves real value. Everything before it only
     rearranges coins inside one wallet; until this runs, the operator still
@@ -9627,15 +9896,21 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     # search key the entry veil exists to hide.
     _entry_set = {(int(_a), int(_i)) for _a, _i in (entry_pairs or ())}
     _remainder_set = {(int(_a), int(_i)) for _a, _i in (remainder_pairs or ())}
+    _fee_set = {(int(_a), int(_i)) for _a, _i in (fee_pairs or ())}
 
     def _held_kind(pair):
-        """Which of the three a held output is. ENTRY wins a tie: it is the
+        """Which of the four a held output is. ENTRY wins a tie: it is the
         only one whose address a public memo names, so if a pair were somehow
-        in two sets the strictest description is the right one."""
+        in two sets the strictest description is the right one. The usage fee
+        is tested before CHANGE and after the other two for the same reason --
+        it is the mildest of the four, so anything it collides with outranks
+        it, but a fee address is never a distribution's change."""
         if pair in _entry_set:
             return "entry"
         if pair in _remainder_set:
             return "remainder"
+        if pair in _fee_set:
+            return "usagefee"
         return "change"
 
     #: What each kind IS, in the operator's words. One place, because the
@@ -9643,8 +9918,9 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     #: different things when only the first was updated.
     _HELD_WHAT = {"entry": "the swap ENTRY",
                   "remainder": "the peel chain's UNDISTRIBUTED balance",
+                  "usagefee": "YOUR OWN USAGE FEE",
                   "change": "a distribution CHANGE"}
-    _held_kinds = {"entry": 0, "change": 0, "remainder": 0}
+    _held_kinds = {"entry": 0, "change": 0, "remainder": 0, "usagefee": 0}
     # EVERY HELD ADDRESS THIS HAS ALREADY NAMED, so the straggler passes below
     # cannot report one twice. A held output is never withdrawn -- that is what
     # holding it means -- so it is STILL FUNDED on every later re-read, and the
@@ -9691,6 +9967,27 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                       "value on the same address as the mixed outputs, which "
                       "tells whoever watches that address that all of it is "
                       "one owner's.")
+            elif _kind == "usagefee":
+                # THIS BRANCH IS A BUG REPORT, not an advisory. The fee account
+                # is not in addr_index, so _exit_account_list cannot name it and
+                # _funded_subaddresses never reads it -- reaching here means
+                # something put it back. Say that, because the operator's next
+                # question is why their own money is being described as
+                # withheld, and the honest answer is that the exit was one
+                # omission away from paying it to --exit-to.
+                print("      This is the usage fee this run took for you, and "
+                      "the "
+                      "exit is not supposed to be able to see it at all — it "
+                      "was minted on an account deliberately left out of the "
+                      "run's index. Seeing it here means something added it "
+                      "back, and the hold is the only reason it did not go to "
+                      "your exit destination.")
+                print("      Sending it there would have been the worst of the "
+                      "four: it never went through a veil or a hop round, so "
+                      "it is unmixed value landing beside the mixed outputs — "
+                      "and its size is a fixed fraction of the deposit, so "
+                      "anyone watching that destination could divide by the "
+                      "rate and read what was deposited.")
             elif _is_entry:
                 print("      It landed after the run had planned — usually a "
                       "swap chunk that settled late. The swap memo names that "
@@ -9706,13 +10003,28 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                       "that far. It is an output of the transaction that spent "
                       "your swapped funds, so withdrawing it publishes that "
                       "link in one hop.")
-            print("      It is safe where it is. To mix it: mint a fresh "
-                  "receive wallet (create_receive_wallet), send this balance "
-                  "to it as ONE ordinary transfer — that hop is the entry "
-                  "veil done by hand, and its destination is in no public "
-                  "memo — then run this again with --receive-wallet on that "
-                  "bundle. Note the account and subaddress above; nothing "
-                  "writes them down for you.")
+            if _kind == "usagefee":
+                # NOT the mix-it-again remedy. The other three are value that
+                # was meant to go through the pipeline and did not; this is
+                # value that was never meant to. Telling the operator to feed
+                # their own fee back through a run would spend the fee on
+                # fees, and the fresh-receive-wallet hop is pointless for an
+                # output no public memo names.
+                print("      It is safe where it is, and it is not waiting on "
+                      "anything: it is yours, on an account of your own "
+                      "wallet, and it was never meant to be mixed. Note the "
+                      "account and subaddress above — this output is not in "
+                      "the holdings report either, and nothing else writes it "
+                      "down for you. Spend it on its own, in its own "
+                      "transaction, never together with another run's fee.")
+            else:
+                print("      It is safe where it is. To mix it: mint a fresh "
+                      "receive wallet (create_receive_wallet), send this "
+                      "balance to it as ONE ordinary transfer — that hop is "
+                      "the entry veil done by hand, and its destination is in "
+                      "no public memo — then run this again with "
+                      "--receive-wallet on that bundle. Note the account and "
+                      "subaddress above; nothing writes them down for you.")
         # ONE BUNDLE EACH, said ONCE, after the per-output advice above.
         #
         # That advice is printed inside the loop, so an operator holding two
@@ -9747,7 +10059,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             # memo does not name, with the wrong remedy attached. Same defect
             # the per-output lines above were fixed for; this line was left
             # asserting the old single kind.
-            _only = [_k for _k in ("entry", "remainder", "change")
+            _only = [_k for _k in ("entry", "remainder", "usagefee", "change")
                      if _held_kinds[_k]]
             print(f"  [!] EXIT: nothing was withdrawn — the only funded "
                   f"output(s) are the unmixed ones on "
@@ -9989,7 +10301,14 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                   f" address (account {_la} / subaddr {_li}) while this exit "
                   f"was running, and was NOT withdrawn — for the same reason "
                   f"the held outputs above were not. It is safe where it is; "
-                  f"mix it with a fresh receive wallet as described above.")
+                  # The mix-it-again remedy is wrong for the fee, here for the
+                  # same reason it is wrong in the enumeration above -- and
+                  # this line is reached on its own, by an output the first
+                  # pass never saw, so it cannot borrow that branch.
+                  + ("spend it on its own, and not with another run's fee."
+                     if _lkind == "usagefee"
+                     else "mix it with a fresh receive wallet as described "
+                          "above."))
         if _late_held:
             integrity_log("exit", "withheld_unmixed")
         _late = [t for t in _late
@@ -10027,6 +10346,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 change_accounts=None,
                 delay_window=None, veil_file=None, veil_target=None,
                 veil_need=None, exit_accounts=None, exit_hold=None,
+                exit_fee_hold=None,
                 dag_dst_index=None, sweep_targets=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
@@ -10483,6 +10803,17 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # code would trust the bookkeeping of the step being checked, and would
         # miss the residual case where the sweep relayed but left value behind.
         _hold = list(exit_hold or ())
+        # AND THE USAGE FEE, which the exit should never have been able to see
+        # in the first place -- plan_usage_fee keeps its account out of
+        # addr_index, so _exit_account_list does not name it and
+        # _funded_subaddresses does not read it. Held anyway: that safety is
+        # an omission, and an omission is exactly the kind of guard a later
+        # change removes without noticing. Costs nothing while the omission
+        # holds (a pair that is never enumerated is never matched), and turns
+        # the day it stops holding into a named withheld output instead of the
+        # operator's own cut arriving at --exit-to in silence.
+        for _fp in (exit_fee_hold or ()):
+            _hold.append((int(_fp[0]), int(_fp[1])))
         for _cj in (change_sweep_jobs or ()):
             _hold.append((int(_cj[0]), int(_cj[1])))
         # EVERY CHANGE ACCOUNT, NOT ONLY THE ONES THAT GOT A SWEEP JOB.
@@ -10514,11 +10845,13 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             args, exit_accounts or [], args.exit_to, staging_dir, proxy,
             _exit_meta, delay_window, hold=_hold,
             entry_pairs=list(exit_hold or ()),
-            remainder_pairs=([_stuck_carrier] if _stuck_carrier else []))
+            remainder_pairs=([_stuck_carrier] if _stuck_carrier else []),
+            fee_pairs=list(exit_fee_hold or ()))
         _held_entry = (_held or {}).get("entry", 0)
         _held_change = (_held or {}).get("change", 0)
         _held_remainder = (_held or {}).get("remainder", 0)
-        if _held_entry or _held_change or _held_remainder:
+        _held_fee = (_held or {}).get("usagefee", 0)
+        if _held_entry or _held_change or _held_remainder or _held_fee:
             # WITHHELD, NOT INCOMPLETE, and the distinction is not cosmetic.
             #
             # This started life in `incomplete`, which reads as "the mix is not
@@ -10563,6 +10896,18 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                     "through no fan-out and no hop round at all. It is the "
                     "same money _run_peel_chain told you to distribute by "
                     "hand")
+            if _held_fee:
+                # ITS OWN LINE, and it is a regression report. The exit cannot
+                # normally see this account at all (plan_usage_fee keeps it out
+                # of addr_index), so if it is here, the isolation that keeps
+                # the operator's cut out of --exit-to has been broken
+                # somewhere upstream and the hold was the last thing standing.
+                withheld.append(
+                    "your own USAGE FEE was NOT withdrawn — the exit should "
+                    "not be able to see that account at all, so something has "
+                    "put it back in this run's index; the hold is why it did "
+                    "not go to your exit destination, where its size alone "
+                    "would have given away the deposit")
         if _failed or _skipped:
             incomplete.append(
                 f"the exit withdrew {_relayed} output(s) but {_failed + _skipped} "
@@ -10585,11 +10930,14 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             withheld.append(
                 f"{_unclean} withdrawn output(s) still hold value or could not "
                 f"be verified empty")
-        # NOT `not _held`. _held is a {"entry": n, "change": n} breakdown now,
-        # and a two-key dict is ALWAYS truthy -- so this branch, the only place
-        # a clean exit is announced, could never be reached after the return
-        # type changed. Count, never test the container.
-        elif _relayed and not (_held_entry or _held_change or _held_remainder):
+        # NOT `not _held`. _held is a {"entry": n, "change": n, ...} breakdown
+        # now, and a populated dict is ALWAYS truthy -- so this branch, the only
+        # place a clean exit is announced, could never be reached after the
+        # return type changed. Count, never test the container. EVERY count:
+        # each kind added since has had to be added here too, and the one that
+        # is not would announce a clean exit over withheld value.
+        elif _relayed and not (_held_entry or _held_change or _held_remainder
+                               or _held_fee):
             print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
                   f"its own transaction. The wallet was re-read afterwards and "
                   f"nothing further is funded on this run's accounts.")

@@ -461,12 +461,27 @@ hop returned nothing to the account.
 running process's arguments — while `/proc/<pid>/environ` is **0400**. So the
 console hands its children the sensitive values through the environment, not
 argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
-`GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination), and
+`GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination),
+`GS_EXPECT_TOTAL_XMR` (how much XMR this run is waiting for),
+`GS_USAGE_FEE_ADDRESS` and `GS_USAGE_FEE_PCT` (see below), and
 `GS_WALLET_PASSWORD` as before. (`GS_EXIT_AMOUNT` was listed here too and never
 was: `exit_strategy_simulator` reads it when you run that tool by hand, but the
 console has never set it. A list of protections is worth nothing if entries can
 sit on it unearned, which is the same defect as the sentence below once was.) The command preview the page shows you is
 the real argv, which is why no secret appears in it.
+
+`GS_USAGE_FEE_PCT` is on that list for a reason that is easy to talk yourself
+out of. The console used to compose `--usage-fee-pct 0.011` onto argv under a
+comment saying the percentage "is a setting, not an identifier, and it is
+already visible in the amounts". Both halves are wrong. A local reader of
+`/proc/<pid>/cmdline` sees argv and does **not** see the amounts — those are
+inside RingCT and inside plan files under a `0700` directory — so argv was not
+a second copy of something public, it was the only disclosure of the number
+that turns an observed cash-out back into the deposit behind it. The switch
+`--usage-fee` still rides on argv: it is a boolean whose name is in the
+public source. `GS_USAGE_FEE_ADDRESS` is the stronger case of the same rule —
+one address collecting a slice of every run is the single value that could
+re-join what all of those runs separated.
 
 `GS_EXIT_TO` was missing from that list for as long as the list existed, and
 the sentence above was false because of it: the console composed

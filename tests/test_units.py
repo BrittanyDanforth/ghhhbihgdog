@@ -3363,6 +3363,52 @@ check("holdings: an incomplete run reports the shortfall, not a balance table",
       "NOT what was planned" in _buf5.getvalue()
       and "SEPARATE ACCOUNTS" not in _buf5.getvalue())
 
+# THE USAGE FEE IS RESTATED AT THE END, and it is the only durable pointer.
+#
+# plan_usage_fee prints the account and subaddress ONCE, in stage 4. Nothing
+# else carries it: the fee account is kept out of addr_index (so the exit
+# cannot sweep it), which keeps it out of the holdings enumeration; the plan
+# file has the address but not the index, and a completed run wipes that plan;
+# the integrity chain carries structure only. Meanwhile gs_console keeps child
+# output in a 5000-line ring and drops 1500 at a time, and stages 4 and 5 print
+# heavily over a stage-4 line. So the one pointer to the operator's own money
+# could be evicted from the only surface carrying it.
+_buf6 = _io.StringIO()
+with _ctx.redirect_stdout(_buf6):
+    ghost.report_completion(_BalRpc({4: 1}), [], [4], fee_pair=(9, 2))
+_fee_end = _buf6.getvalue()
+check("holdings/fee: a completed run restates where the usage fee landed",
+      "account 9, subaddress 2" in _fee_end)
+check("holdings/fee: ...and says nothing else records it",
+      "nothing else does" in _fee_end)
+check("holdings/fee: ...and that it is NOT one of the mixed accounts listed",
+      "not one of the accounts listed below" in _fee_end)
+check("holdings/fee: ...and must not be merged with another run's fee",
+      "another run's fee" in _fee_end and "common owner" in _fee_end)
+# ON AN INCOMPLETE RUN TOO, and deliberately BEFORE the sys.exit: a fee taken
+# in stage 4 survives a run that fails in stage 5, and that is exactly the run
+# whose scrollback is longest.
+_buf7 = _io.StringIO()
+try:
+    with _ctx.redirect_stdout(_buf7):
+        ghost.report_completion(_BalRpc({4: 1}), ["peel chain relayed 2/6"],
+                                [4], fee_pair=(9, 2))
+except SystemExit:
+    pass
+check("holdings/fee: an INCOMPLETE run still says where the fee is — it was "
+      "taken in stage 4 and the failure was later",
+      "account 9, subaddress 2" in _buf7.getvalue())
+# NON-VACUITY: a run with no fee says none of it, so the lines above belong to
+# the fee and are not printed on every run.
+_buf8 = _io.StringIO()
+with _ctx.redirect_stdout(_buf8):
+    ghost.report_completion(_BalRpc({4: 1}), [], [4])
+check("holdings/fee: NON-VACUITY -- a run that took no fee says nothing about "
+      "one", "YOUR USAGE FEE" not in _buf8.getvalue())
+check("holdings/fee: NON-VACUITY -- ...and still prints the ordinary holdings "
+      "report, so the fixture really ran",
+      "SEPARATE ACCOUNT" in _buf8.getvalue().upper())
+
 # parse_jm_amounts AGAINST JOINMARKET'S REAL OUTPUT FORMAT.
 #
 # Fixing stage1's argv without this would have moved the failure one step
