@@ -762,6 +762,50 @@ check("polls: NON-VACUITY -- with nothing running it DOES still stop, which "
 check("polls: ...and it stops on the next poll once the wake finishes, so "
       "this is a delay and not a licence to run deaf", _stops_after)
 
+# 4b. EVERY COMMAND THAT WORKS IS PUBLISHED, AND EVERY PUBLISHED ONE WORKS.
+#
+# /receive, /fee, /speed and /exit were all handled in parse_command, all had
+# answers, and NONE of them was in BOT_COMMANDS -- so setMyCommands never
+# published them and HELP (built from that same list) never mentioned them.
+# The operator had to already know they existed and how they were spelled,
+# which publish_commands' own docstring calls "indistinguishable from a bot
+# that does not work". A four-command blind spot survived a green suite.
+_HANDLED_ERRS = {"depo_wizard", "withdraw_wizard", "settings", "fee", "speed",
+                 "exit", "cancel", "help", "status"}
+_unresolved = []
+for _c, _desc in pg.BOT_COMMANDS:
+    _job, _params, _err = pg.parse_command(f"/{_c}")
+    # A command "resolves" if it starts a job, opens a wizard, or is one of
+    # the answers handle() dispatches on. "handle must be 4 hex characters" is
+    # a resolved command asking for its argument, not an unknown one.
+    if not (_job or _err in _HANDLED_ERRS or "handle" in _err):
+        _unresolved.append(_c)
+check(f"menu: every published command resolves in parse_command "
+      f"({len(pg.BOT_COMMANDS)} of them)", _unresolved == [])
+# AND THE OTHER DIRECTION, which is the one that was broken. Aliases are
+# deliberately unpublished -- one spelling in the menu, several accepted --
+# so they are named here rather than inferred.
+_ALIASES = {"depo", "dep", "recv", "withdraw", "stop", "watch", "start"}
+_pub = {c for c, _ in pg.BOT_COMMANDS}
+_handled = set(re.findall(r'cmd (?:==|in) \(?"/([a-z]+)"', _SRC_PG_EARLY))
+_handled |= set(re.findall(r'"/([a-z]+)"[,)]',
+                           _SRC_PG_EARLY.split("def parse_command")[1]
+                           .split("\ndef ")[0]))
+check("menu: every command parse_command handles is published or a named alias",
+      sorted(_handled - _pub - _ALIASES) == [])
+# NON-VACUITY: the scrape really did find the commands, so this is not two
+# empty sets agreeing.
+check("menu: NON-VACUITY -- the handled set was actually populated",
+      len(_handled) >= 12 and "fee" in _handled and "settings" in _handled)
+# AND THE ANSWERS POINT AT PUBLISHED SPELLINGS. EXIT_ANSWER said "see
+# /withdraw", which parse_command accepts but the menu never offers.
+for _name, _txt in (("EXIT_ANSWER", pg.EXIT_ANSWER),
+                    ("SPEED_ANSWER", pg.SPEED_ANSWER),
+                    ("FEE_ANSWER", pg.FEE_ANSWER)):
+    _pointed = set(re.findall(r"/([a-z]+)", _txt))
+    check(f"menu: {_name} points only at published commands "
+          f"({sorted(_pointed) or 'none'})", _pointed <= _pub)
+
 # 5. "WORKING. THIS TAKES A WHILE." IS NOT A NUMBER ANYONE CAN WAIT OUT.
 #
 # That was the message for EVERY job, and the jobs are not alike: a status

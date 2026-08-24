@@ -365,8 +365,20 @@ check("settings: ...and offers every mixing depth the protocol has",
       all(str(_d) in _stx for _d in P.WITHDRAW_DEPTHS))
 check("settings: ...and the wake budget, which is on THIS box",
       "12" in _stx and "budget" in _stx.lower())
-check("settings: ...and says plainly which parts are decided elsewhere",
-      "not here" in _stx)
+# THE MEANING, NOT ONE PHRASE. This tested for the literal "not here", which
+# the reply happened to contain; the reply now separates "set on the machine"
+# from "fixed in the software" because the old version claimed the hop delay
+# was a machine setting when it is settable NOWHERE. Both headings have to be
+# there, or one of those groups has gone back to being a single vague bucket.
+check("settings: ...and says plainly which parts are decided elsewhere, "
+      "separating what a person can change from what nobody can",
+      "set on the machine" in _stx.lower()
+      and "fixed in the software" in _stx.lower())
+check("settings: ...and does not claim the hop delay is a machine setting, "
+      "because there is no keyfile field for it and no --hop-delay composed",
+      "delay" in _stx.lower()
+      and _stx.lower().index("fixed in the software")
+      < _stx.lower().index("the delay between hops"))
 check("settings: ...and why they are not settable from a chat",
       "turn the mixing down" in _stx)
 check("settings: it wakes nothing to answer", _st.pokes == [])
@@ -823,9 +835,15 @@ check("...and is NOT reachable from the pager",
 # the check proved no job schema took a destination. /withdraw takes one now,
 # by reply, per withdrawal -- so the old check would have kept a FALSE answer
 # green, which is the drift this file exists to catch.
-check("/exit points at the command that does set it",
-      "/withdraw" in pg.EXIT_ANSWER
+# /send, NOT /withdraw. This asserted the alias: parse_command accepts both
+# spellings but only /send is in BOT_COMMANDS, so the answer was pointing the
+# operator at a command the "/" menu never offers -- and the check was
+# pinning it there.
+check("/exit points at the command that does set it, by its PUBLISHED name",
+      "/send" in pg.EXIT_ANSWER
       and "not settable" not in pg.EXIT_ANSWER.lower())
+check("/exit: ...and that name is one the menu actually offers",
+      "send" in {_c for _c, _d in pg.BOT_COMMANDS})
 check("...and exactly one job schema takes a destination, not several",
       [j for j in P.JOBS
        if any("exit" in k or "dest" in k or "addr" in k

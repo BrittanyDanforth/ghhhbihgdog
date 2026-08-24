@@ -2687,6 +2687,32 @@ MUTATIONS = [
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
+ # /receive, /fee, /speed and /exit all worked, all had answers, and none was
+ # in BOT_COMMANDS -- so setMyCommands never published them and HELP never
+ # mentioned them. A four-command blind spot that a green suite never saw.
+ ("a working command goes back to being invisible in the menu and the help",
+  "gs_telegram_pager",
+  '    ("fee", "what this keeps"),\n',
+  "",
+  ["test_telegram_pager"]),
+
+ # EXIT_ANSWER pointed the operator at /withdraw -- a spelling parse_command
+ # accepts but the "/" menu never offers.
+ ("an answer goes back to pointing at a command the menu does not offer",
+  "gs_telegram_pager",
+  'EXIT_ANSWER = "Per withdrawal — see /send."',
+  'EXIT_ANSWER = "Per withdrawal — see /withdraw."',
+  ["test_telegram_pager"]),
+
+ # The vault's keyfile is the only place gs_wake_agent looks for the usage-fee
+ # destination, and nothing wrote the field: the address branch was
+ # unreachable code.
+ ("the usage-fee destination goes back to being unsettable",
+  "gs_wake_keys",
+  '        "usage_fee_address": str(args.usage_fee_address or ""),\n',
+  "",
+  ["test_wake_agent"]),
+
  # GhostSpiral refuses rather than guessing a fee it could not fetch (the
  # fallback measured 38-58x low), so a wrong or missing --rpc-daemon failed
  # every woken withdrawal at stage 0 with nothing the operator could change.
