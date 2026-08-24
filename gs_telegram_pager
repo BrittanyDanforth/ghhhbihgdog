@@ -1416,7 +1416,31 @@ class Pager:
         elif out == "refused":
             self.send(chat_id, f"{chat_name(job)}: refused.")
         elif out == "failed":
-            self.send(chat_id, f"{chat_name(job)}: failed.")
+            # A FAILED WITHDRAWAL GETS THE ONE THING THE OPERATOR CAN ACT ON.
+            #
+            # "withdraw: failed." is the whole message they get after waiting
+            # out a boot and 5-20 minutes of mandatory jitter, and it leaves
+            # them with no next move. The commonest cause is the one the depth
+            # menu exists for: the mix minimum rises with the hop count, so a
+            # balance that cannot fund 20 hops can often fund 3, and
+            # GhostSpiral refuses at stage 4 with nothing spent. Its own
+            # message says exactly that -- and it says it on the vault's
+            # console, which is the machine nobody is standing at.
+            #
+            # A STATIC HINT, NOT A DIAGNOSIS, and the difference is deliberate.
+            # This box does not know why the run failed and must not guess: it
+            # has never been told a balance, and reading one back into the chat
+            # is the thing /settings refuses to do. So it names the cause the
+            # operator can do something about and says nothing about which
+            # actually occurred. "may be" is doing real work in that sentence.
+            #
+            # Withdrawals only. The deposit jobs mint and quote; a depth is not
+            # a thing they have, and offering this advice there would be a
+            # confident answer to a question nobody asked.
+            _tail = (" It may be too deep for the balance — the deeper "
+                     "options need more to work with. /send again and pick a "
+                     "shallower one." if job == "withdraw" else "")
+            self.send(chat_id, f"{chat_name(job)}: failed.{_tail}")
         elif out == "expired_uncollected":
             self.send(chat_id, f"{chat_name(job)}: not collected. Nothing was handed "
                                f"over.")
