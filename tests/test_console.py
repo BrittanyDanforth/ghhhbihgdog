@@ -2066,7 +2066,7 @@ def test_the_money_fields_finally_state_their_bounds():
     # THE CUT RAISES IT, and below about fifteen wallets the cut is what binds
     # -- a page showing only the mixing minimum would name a figure at which
     # the operator's own cut is uncollectable.
-    _cut = c.limits_note({**base, "mix_cut": True})
+    _cut = c.limits_note({**base, "usage_fee": True})
     check("limits: enabling the cut raises the stated minimum", _cut != note)
     check("limits: ...and says WHY, rather than just showing a bigger number",
           "could never be spent" in _cut)
@@ -2101,6 +2101,235 @@ def test_the_money_fields_finally_state_their_bounds():
           "field", _src_console().count('class="d limits"') == 4)
     check("limits: ...and the JS actually renders it",
           "querySelectorAll('.limits')" in c.PAGE)
+
+
+def test_the_spend_button_carries_the_three_numbers():
+    """Min, max and usage fee on the button that actually spends.
+
+    The long note lives under the amount fields, which is where an amount is
+    typed. The spend button is pressed four wizard steps later, and it is the
+    last surface before real transactions are signed -- so the three figures
+    that decide whether the run is viable belong there too.
+    """
+    c = load_console()
+    base = {"wallets": 10, "dag_mixing": True, "exit_to": ["x"]}
+    off = c.limits_badge(base)
+    on = c.limits_badge({**base, "usage_fee": True})
+    for _label, _b in (("fee off", off), ("fee on", on)):
+        check(f"badge: {_label} states all three -- minimum, maximum, "
+              f"usage fee",
+              "Min " in _b and "Max " in _b and "Usage fee" in _b)
+    check("badge: the fee is named as a USAGE FEE, which is what the flags "
+          "call it", "Usage fee" in on and "cut" not in on.lower())
+    check("badge: with the fee off it says so rather than going blank -- a run "
+          "that is not skimming should say that on the button that spends",
+          "Usage fee off" in off)
+    check("badge: with the fee on it states the RATE", "1.1%" in on)
+    # THE RATE, NOT THE AMOUNT. The fee is a fixed fraction of the deposit, so
+    # an amount rendered into the DOM puts the deposit size on the page a
+    # second time, recoverable by one division. The page has no masker there.
+    check("badge: it shows the percentage and never an XMR fee amount, which "
+          "would put the deposit size in the DOM",
+          "%" in on and " XMR" in on and on.count(" XMR") == 1)
+    # The minimum on the button must be the SAME number the long note gives --
+    # two surfaces disagreeing about the floor is worse than one.
+    _note = c.limits_note({**base, "usage_fee": True})
+    _min = c._ghost().mix_minimum_xmr(
+        c._ghost().FALLBACK_FEE_XMR, 10, dag_mixing=True, exit_set=True,
+        usage_pct=c._ghost().USAGE_FEE_PCT)
+    check("badge: the button and the note quote the SAME minimum",
+          str(_min) in on and str(_min) in _note)
+    check("badge: NON-VACUITY -- enabling the fee really moves that number, so "
+          "the agreement above is not two constants",
+          on != off and str(_min) not in off)
+    check("badge: the maximum says what actually limits the operator rather "
+          "than quoting the Decimal sanity ceiling",
+          "your balance" in on and "100000000" not in on)
+    # Fail honest, the rule live_fees and run_eta both follow.
+    _real = c._GHOST[0]
+    try:
+        c._GHOST[0] = object()
+        check("badge: returns nothing rather than a guess when the pipeline "
+              "cannot be loaded", c.limits_badge(base) == "")
+    finally:
+        c._GHOST[0] = _real
+    # And it reaches the button.
+    _src = _src_console()
+    check("badge: the preview endpoint carries it",
+          '"badge": limits_badge(c["params"])' in _src)
+    check("badge: only the SPENDS button gets it -- a check or a preview has "
+          "no amount to bound", "a.risk==='spends'?'<span class=\"ds lim\"" in _src)
+    check("badge: ...and the JS fills it", "querySelectorAll('.lim')" in c.PAGE)
+
+
+def test_a_rejected_address_is_not_echoed_back_at_full_length():
+    """The page has no masker, and it was rendering 48 of 95 characters.
+
+    /api/preview is bound to `input`, so it fires on every keystroke -- and
+    every intermediate prefix of a CORRECT address fails the regex. That is
+    not a rare error path, it is ordinary typing, and clean()'s generic "re"
+    branch put 48 characters of the value into the DOM each time.
+
+    Measured against the two things in this toolchain that already handle
+    addresses: the exit list shows 16, and gs_common.scrub_address -- whose
+    docstring says it "NEVER returns the full value" -- shows 16. gs_console
+    has ZERO uses of scrub_address and --redact does not reach it, so 48 was
+    the longest disclosure of an address on any surface here.
+
+    btc_entry is on the same branch and is worse: a bech32 address is short
+    enough that 48 characters is the WHOLE of it, and secret_env calls the
+    Bitcoin entry one of "the two values that tie a run to a Bitcoin
+    identity".
+    """
+    c = load_console()
+    A = ("4AdUndXHHZ6cfufTMvppY6JwXNouMBzSkbLYfpAV5Usx3skxNgYeYTRj5Uzqt"
+         "ReoS44qo9mtmXCqY45DJ852K5Jv2684Rge")
+
+    def echoed(field, value):
+        errs = c.clean({field: value})["errors"]
+        return errs[0] if errs else ""
+
+    # MID-TYPING, not a truncated paste: this is the case that actually fires.
+    _typing = echoed("usage_fee_address", A[:60])
+    check("echo: a half-typed fee address is not echoed at 48 characters",
+          A[:48] not in _typing and A[:17] not in _typing)
+    check("echo: ...it is cut to the 16 the exit list and scrub_address use",
+          A[:16] in _typing)
+    check("echo: a truncated PASTE is cut the same way",
+          A[:16] in echoed("usage_fee_address", A[:94])
+          and A[:17] not in echoed("usage_fee_address", A[:94]))
+    check("echo: the BTC entry is cut too — at 48 characters a bech32 address "
+          "was echoed whole",
+          A[:16] in echoed("btc_entry", A[:60])
+          and A[:17] not in echoed("btc_entry", A[:60]))
+    # NON-VACUITY: the rejection still HAPPENS and still names the field, so
+    # this did not pass by clean() quietly dropping the problem.
+    check("echo: NON-VACUITY -- the value is still rejected, and the message "
+          "still names which field",
+          _typing and "usage_fee_address" in _typing)
+    # NON-VACUITY: a VALID address is accepted and reaches params, so the
+    # branch is not refusing everything.
+    _ok = c.clean({"usage_fee_address": A})
+    check("echo: NON-VACUITY -- a valid address is accepted and carried",
+          not _ok["errors"] and _ok["params"].get("usage_fee_address") == A)
+    # NON-VACUITY: a non-address field still echoes enough to debug, so this is
+    # a judgement about identity-bearing values rather than blanket truncation.
+    _tor = echoed("tor_proxy", "not-a-proxy-url-that-is-long-enough-to-debug")
+    check("echo: NON-VACUITY -- a non-address field still shows enough to "
+          "debug, so this is not blanket truncation",
+          "long-enough-to-debug" in _tor)
+    # THE CLASS, NOT THE INSTANCE: no address field may sit on the generic
+    # branch, or the next one added inherits the 48-character echo.
+    _addr_fields = [k for k, (kind, _s) in c.SCHEMA.items()
+                    if kind == "re" and ("address" in k or k == "btc_entry")]
+    check("echo: no address field is left on the generic 're' branch",
+          _addr_fields == [])
+    check("echo: NON-VACUITY -- the addr_re kind is actually in use",
+          any(kind == "addr_re" for kind, _s in c.SCHEMA.values()))
+
+
+def test_the_fee_rate_never_reaches_a_command_line():
+    """GS_USAGE_FEE_PCT, not --usage-fee-pct.
+
+    The console composed `--usage-fee-pct 0.011` onto the child's argv under a
+    comment claiming "the percentage is a setting, not an identifier, and it is
+    already visible in the amounts". Both halves are wrong, and GhostSpiral's
+    own resolve_usage_fee says so: it routes the rate through env_or_argv
+    precisely because an OVERRIDE is a per-operator constant, and putting it on
+    a command line publishes it to `ps` "next to amounts it divides exactly
+    into".
+
+    And a local reader of /proc/<pid>/cmdline (0444, every account on the host)
+    sees argv and NOT the amounts -- those are inside RingCT and inside plan
+    files under a 0700 directory. So argv was not a second copy of something
+    already public; it was the only disclosure of the divisor that turns an
+    observed cash-out back into a deposit size. env_or_argv was given the rate
+    for this exact reason and the console handed it straight back.
+    """
+    c = load_console()
+    p = {"btc_entry": "bc1x", "usage_fee": True, "usage_fee_pct": "0.02",
+         "wallets": 10}
+    # pipeline_argv returns (argv, problems); only the argv is the surface
+    # /proc/<pid>/cmdline exposes.
+    argv = c.pipeline_argv(p)[0]
+    check("fee rate: the RATE is not on the child's command line",
+          "--usage-fee-pct" not in argv and "0.02" not in argv)
+    check("fee rate: ...it goes through the environment instead",
+          c.secret_env(p).get("GS_USAGE_FEE_PCT") == "0.02")
+    check("fee rate: ...and the pipeline is allowed to receive it",
+          "GS_USAGE_FEE_PCT" in c.ACTION_SECRETS["run_pipeline"])
+    # The SWITCH stays on argv: it is a boolean whose name is in the public
+    # source, and GhostSpiral reads args.usage_fee to tell "skim at the default
+    # rate" from "do not skim".
+    check("fee rate: the switch itself is still passed, or nothing skims",
+          "--usage-fee" in argv)
+    # NON-VACUITY: pipeline_argv is composing a real command, so the absence
+    # above is an absence from something rather than from nothing.
+    check("fee rate: NON-VACUITY -- the argv this was read from is a real "
+          "one, so the absences above are absences from something",
+          "GhostSpiral" in argv and "--wallets" in argv)
+    # THE CHECKBOX GATE, which is load-bearing rather than tidy. An env-supplied
+    # rate is treated by resolve_usage_fee as "skim" -- env is the PREFERRED
+    # channel, so requiring the argv flag as well would defeat having it. A rate
+    # left in the field with the box unticked would therefore make a run skim
+    # while the page showed no fee at all.
+    _unticked = {"btc_entry": "bc1x", "usage_fee_pct": "0.02", "wallets": 10}
+    check("fee rate: a rate left in the field with the box UNTICKED sets no "
+          "variable — otherwise the run skims while the page says it does not",
+          "GS_USAGE_FEE_PCT" not in c.secret_env(_unticked))
+    check("fee rate: ...and composes no switch either",
+          "--usage-fee" not in c.pipeline_argv(_unticked)[0])
+    # NON-VACUITY on the gate: ticking the box with no rate is the DEFAULT-rate
+    # case, which must still work and must still set no variable.
+    _default = {"btc_entry": "bc1x", "usage_fee": True, "wallets": 10}
+    check("fee rate: ticking the box with no rate skims at the default, with "
+          "nothing to leak",
+          "--usage-fee" in c.pipeline_argv(_default)[0]
+          and "GS_USAGE_FEE_PCT" not in c.secret_env(_default))
+    # The DESTINATION was already env-only; assert it here too so the two
+    # halves of the fee's argv surface are checked in one place.
+    _withaddr = {**p, "usage_fee_address": "4" + "z" * 94}
+    check("fee rate: the DESTINATION is env-only as well",
+          "4" + "z" * 94 not in c.pipeline_argv(_withaddr)[0]
+          and c.secret_env(_withaddr).get("GS_USAGE_FEE_ADDRESS")
+          == "4" + "z" * 94)
+
+
+def test_sensitive_inputs_do_not_go_into_browser_history():
+    """autocomplete/spellcheck on the fields that carry an identity.
+
+    Only the arm box had autocomplete="off". btc_entry is the sender's own
+    Bitcoin address, exit_to is the final destination -- the one address the
+    whole pipeline exists to keep unlinked -- and the amount boxes are
+    magnitudes. A browser remembers all of them in a profile that paranoia_mode
+    cannot reach and a wipe does not touch.
+
+    spellcheck matters separately: some browsers send the contents of a
+    spellchecked field to a remote service. exit_to already had it off; nothing
+    else did.
+    """
+    _src = _src_console()
+    _sensitive = ["btc_entry", "usage_fee_address", "btc_amount", "swap_btc",
+                  "expect_total_xmr_send", "expect_total_xmr", "usage_fee_pct",
+                  "receive_wallet", "pairs_file", "wallet_file", "exit_to"]
+    for _fid in _sensitive:
+        _tag = _re_c.search(r'<(?:input|textarea) id="%s"[^>]*>' % _fid, _src)
+        check(f"input: {_fid} is not remembered by the browser",
+              bool(_tag) and 'autocomplete="off"' in _tag.group(0))
+        check(f"input: ...and {_fid} is not sent to a spellchecker",
+              bool(_tag) and 'spellcheck="false"' in _tag.group(0))
+    for _fid in ("btc_entry", "usage_fee_address", "exit_to"):
+        _tag = _re_c.search(r'<(?:input|textarea) id="%s"[^>]*>' % _fid, _src)
+        check(f"input: ...and {_fid} is not autocapitalised or 'corrected', "
+              f"which mangles an address",
+              bool(_tag) and 'autocapitalize="off"' in _tag.group(0)
+              and 'autocorrect="off"' in _tag.group(0))
+    # NON-VACUITY: the fields that carry no identity are left alone, so this is
+    # a judgement about sensitivity and not a blanket rewrite.
+    for _fid in ("wallets", "deep", "split"):
+        _tag = _re_c.search(r'<input id="%s"[^>]*>' % _fid, _src)
+        check(f"input: NON-VACUITY -- {_fid} is a count and is untouched",
+              bool(_tag) and 'autocomplete="off"' not in _tag.group(0))
 
 
 def _src_console():

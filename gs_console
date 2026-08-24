@@ -206,7 +206,7 @@ def _js_xmr_re() -> str:
 
 SCHEMA = {
     "mode":         ("choice", ["send", "receive"]),
-    "btc_entry":    ("re", BTC_RE),
+    "btc_entry":    ("addr_re", BTC_RE),
     "receive_wallet": ("re", PATH_RE),
     "pairs_file":   ("re", PATH_RE),
     "swap_btc":     ("re", DEC_RE),
@@ -278,9 +278,9 @@ SCHEMA = {
     "exit_to":      ("list_re", XMR_RE),
     #: THE OPERATOR'S CUT. The switch and the fraction are settings; the
     #: ADDRESS is not, and it does not travel the same way -- see secret_env.
-    "mix_cut":      ("bool", None),
-    "mix_cut_pct":  ("re", DEC_RE),
-    "mix_cut_address": ("re", XMR_RE),
+    "usage_fee":      ("bool", None),
+    "usage_fee_pct":  ("re", DEC_RE),
+    "usage_fee_address": ("addr_re", XMR_RE),
 }
 
 #: Most destinations anyone can sensibly hand-manage, and a hard bound on how
@@ -338,6 +338,39 @@ def clean(params: dict) -> dict:
                 s = str(v).strip()
                 if s and not spec.match(s):
                     errs.append(f"{k} is not a valid {k.replace('_',' ')}: {s[:48]}")
+                elif s:
+                    out[k] = s
+            elif kind == "addr_re":
+                # SAME VALIDATION, SHORTER ECHO. An address field cannot use
+                # the plain "re" branch above, and it is not a style point.
+                #
+                # /api/preview is bound to `input`, so it fires on every
+                # keystroke -- and every intermediate prefix of a CORRECT
+                # address fails the regex. That is not a rare error path, it is
+                # ordinary typing, and the "re" branch renders 48 of the 95
+                # characters into the DOM each time. Measured beside the two
+                # things that already handle addresses: the exit list shows 16,
+                # and gs_common.scrub_address, whose docstring says it "NEVER
+                # returns the full value", shows 16. This page has NO masker at
+                # all (zero uses of scrub_address anywhere in it) and --redact
+                # does not reach it, so 48 characters was the longest
+                # disclosure of an address on any surface in the toolchain.
+                #
+                # 48 is not spendable, but it is confirmation-grade: it is
+                # enough to match an address a third party already suspects,
+                # which is the whole question a fee address answers.
+                #
+                # A KIND rather than a fix to the one field, because "re" with
+                # XMR_RE is the pattern the next address field will copy.
+                s = str(v).strip()
+                if s and not spec.match(s):
+                    # The field's own name, not "Monero address": btc_entry is
+                    # on this kind too, and for a stronger reason -- a bech32
+                    # address is short enough that 48 characters was the WHOLE
+                    # of it, and secret_env calls the Bitcoin entry one of "the
+                    # two values that tie a run to a Bitcoin identity".
+                    errs.append(f"{k} is not a valid {k.replace('_', ' ')}: "
+                                f"{s[:16]}…")
                 elif s:
                     out[k] = s
             elif kind == "list_re":
@@ -439,16 +472,25 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         a += ["--hop-delay", str(p["hop_delay"])]
     if p.get("dag_mixing"):
         a.append("--dag-mixing")
-    # THE SWITCH AND THE FRACTION ONLY. --mix-cut-address is the operator's own
-    # address collecting a slice of every run, which makes it exactly as
-    # sensitive as --exit-to -- so it goes in GS_MIX_CUT_ADDRESS (see
-    # secret_env) and never onto a command line that `ps` can read. The
-    # percentage is a setting, not an identifier, and it is already visible in
-    # the amounts.
-    if p.get("mix_cut"):
-        a.append("--mix-cut")
-    if p.get("mix_cut_pct"):
-        a += ["--mix-cut-pct", str(p["mix_cut_pct"])]
+    # THE SWITCH ONLY. Both the destination and the RATE go by environment --
+    # GS_USAGE_FEE_ADDRESS and GS_USAGE_FEE_PCT, see secret_env.
+    #
+    # The rate used to be composed here, under a comment saying "the percentage
+    # is a setting, not an identifier, and it is already visible in the
+    # amounts". Both halves are wrong, and GhostSpiral's own resolve_usage_fee
+    # says so in as many words: an OVERRIDE is a per-operator constant, and a
+    # local reader of /proc/<pid>/cmdline (0444, every account on the host) can
+    # see argv but NOT the amounts -- those are in RingCT and in plan files
+    # under a 0700 directory. So argv was the one surface that disclosed it,
+    # and it discloses the exact divisor that turns a later cash-out back into
+    # a deposit size. env_or_argv was given the rate for precisely this reason
+    # and then the console handed it straight back to `ps`.
+    #
+    # The switch stays: it is a boolean whose name is in the public source, and
+    # resolve_usage_fee reads args.usage_fee to tell "skim at the default rate"
+    # from "do not skim".
+    if p.get("usage_fee"):
+        a.append("--usage-fee")
     if p.get("peel"):
         a.append("--peel")
     for flag, key in (("--rpc-primary", "rpc_primary"), ("--rpc-daemon", "rpc_daemon"),
@@ -688,7 +730,8 @@ PASSWORD_ACTIONS = {"run_pipeline"}
 #: the reason the variable reaches that child at all.
 ACTION_SECRETS = {
     "run_pipeline": {"GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_EXIT_TO",
-                     "GS_EXPECT_TOTAL_XMR", "GS_MIX_CUT_ADDRESS"},
+                     "GS_EXPECT_TOTAL_XMR", "GS_USAGE_FEE_ADDRESS",
+                     "GS_USAGE_FEE_PCT"},
     "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO"},
 }
 _JOB_SEQ = [0]
@@ -741,8 +784,20 @@ def secret_env(params: dict) -> dict:
     # stronger reason: it collects from every run that uses it, so it is the
     # one address that could re-join what all of them separated. GhostSpiral's
     # own help for the flag says to prefer the variable.
-    if params.get("mix_cut_address"):
-        env["GS_MIX_CUT_ADDRESS"] = str(params["mix_cut_address"])
+    if params.get("usage_fee_address"):
+        env["GS_USAGE_FEE_ADDRESS"] = str(params["usage_fee_address"])
+    # THE RATE, for the reason pipeline_argv no longer composes it: a local
+    # reader of /proc/<pid>/cmdline sees argv and not amounts, so argv was the
+    # only place this divisor was exposed at all.
+    #
+    # GATED ON THE CHECKBOX, and that gate is load-bearing. A rate left in the
+    # field with the box unticked would otherwise set GS_USAGE_FEE_PCT on its
+    # own -- and resolve_usage_fee treats an env-supplied rate as "skim",
+    # because env is the PREFERRED channel and requiring the argv flag as well
+    # would defeat the point of having it. So the box would be off, the page
+    # would show no fee, and the run would take one.
+    if params.get("usage_fee") and params.get("usage_fee_pct"):
+        env["GS_USAGE_FEE_PCT"] = str(params["usage_fee_pct"])
     return env
 
 
@@ -1287,6 +1342,52 @@ def run_eta(p: dict) -> str:
         return ""
 
 
+def limits_badge(p: dict) -> str:
+    """The same three numbers, short enough to sit on the button.
+
+    ON THE BUTTON, because that is where the operator commits. The long note
+    under the amount fields is read while typing an amount; the spend button is
+    pressed minutes later, after four wizard steps, and it is the last surface
+    before real transactions are signed. The three figures that decide whether
+    the run is even viable belong there too.
+
+    MINIMUM, MAXIMUM, USAGE FEE -- in that order, all three always present.
+    "Max: none" is a real answer and a more useful one than the sanity ceiling:
+    quoting 100,000,000 XMR would read as a limit when the actual ceiling is a
+    balance this tool cannot see. "Fee: off" is likewise a statement, not a
+    blank -- a run that is not skimming should say so on the button that spends.
+
+    THE PERCENTAGE, NOT THE AMOUNT. The rate is a setting and is already in the
+    source; the amount is a fixed fraction of the deposit, so rendering it into
+    the DOM would put the deposit size on the page in a second place, derivable
+    by one division. The page has no masker on that surface and --redact does
+    not reach it. The percentage says everything the operator needs to check
+    and discloses nothing the flags do not.
+    """
+    try:
+        g = _ghost()
+        from decimal import Decimal as _D
+        w = max(1, int(p.get("wallets") or 10))
+        prio = int(p.get("fee_priority") or 1)
+        fee = g.FALLBACK_FEE_BY_PRIORITY.get(prio, g.FALLBACK_FEE_XMR)
+        dag = bool(p.get("dag_mixing"))
+        exit_set = bool(p.get("exit_to"))
+        pct = None
+        if p.get("usage_fee"):
+            _p = p.get("usage_fee_pct")
+            pct = _D(str(_p)) if _p else g.USAGE_FEE_PCT
+        low = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set,
+                                usage_pct=pct)
+        # "your balance" rather than the sanity ceiling. Quoting 100,000,000
+        # XMR would read as the limit; the real one is a balance and a swap
+        # liquidity this tool cannot see, and saying that is the honest answer.
+        return (f"Min {low} XMR · Max your balance · Usage fee "
+                f"{(pct * 100).normalize()}%" if pct else
+                f"Min {low} XMR · Max your balance · Usage fee off")
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 def limits_note(p: dict) -> str:
     """What the smallest and largest workable amounts are, for THESE settings.
 
@@ -1332,15 +1433,21 @@ def limits_note(p: dict) -> str:
         base = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set)
         out = (f"Minimum {base} XMR to mix at {w} wallets"
                f"{'' if dag else ' (no DAG mixing)'}")
-        if p.get("mix_cut"):
-            _pct = p.get("mix_cut_pct")
-            cut = _D(str(_pct)) if _pct else g.MIX_CUT_PCT
+        if p.get("usage_fee"):
+            _pct = p.get("usage_fee_pct")
+            cut = _D(str(_pct)) if _pct else g.USAGE_FEE_PCT
             withcut = g.mix_minimum_xmr(fee, w, dag_mixing=dag,
-                                        exit_set=exit_set, cut_pct=cut)
+                                        exit_set=exit_set, usage_pct=cut)
+            # "USAGE FEE", NOT "CUT", HERE TOO. The badge on the spend button
+            # says "Usage fee" and this line said "cut" about the same number
+            # on the same page. The flags are --usage-fee/--usage-fee-pct and
+            # the terminal disclosure says USAGE FEE; one surface using a
+            # different word for it is how an operator reads two settings where
+            # there is one.
             out += (f", {withcut} XMR with the "
-                    f"{(cut * 100).normalize()}% cut")
+                    f"{(cut * 100).normalize()}% usage fee")
             if withcut > base:
-                out += (f" — the cut raises it because a cut worth less than "
+                out += (f" — the usage fee raises it because a fee worth less than "
                         f"{g.hop_fee_reserve(fee)} XMR could never be spent")
         out += (f". Figured at the fallback fee for priority {prio} "
                 f"({fee} XMR/tx); your daemon's real fee decides the run.")
@@ -1876,7 +1983,8 @@ class H(BaseHTTPRequestHandler):
                 "problems": c["errors"] + why,
                 "notes": run_notes(c["params"]),
                 "eta": run_eta(c["params"]),
-                "limits": limits_note(c["params"])}))
+                "limits": limits_note(c["params"]),
+                "badge": limits_badge(c["params"])}))
         if self.path == "/api/fees":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(
@@ -2051,6 +2159,8 @@ border:1px solid var(--line);border-radius:9px;padding:10px 11px;color:var(--ink
 .act .top{display:flex;gap:7px;align-items:center}
 .act .nm{font-size:12.5px;font-weight:600}
 .act .ds{font-size:11px;color:var(--mut);line-height:1.32}
+.act .lim{font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--acc);
+  letter-spacing:.01em;margin-top:2px}
 .act .go{margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:9px;letter-spacing:.08em;
 text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap;background:var(--accs);color:var(--acc)}
 .act.spends{border-color:var(--err);grid-column:1/-1}
@@ -2149,8 +2259,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
   <section class="step" data-step="2" hidden>
     <h2 id="h2-2">Step 2 · Payment</h2>
     <div id="send-fields">
-      <div class="f"><label for="btc_entry">BTC entry</label><input id="btc_entry" placeholder="bc1q…"></div>
-      <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" placeholder="0.05">
+      <div class="f"><label for="btc_entry">BTC entry</label><input id="btc_entry" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="bc1q…"></div>
+      <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" autocomplete="off" spellcheck="false" placeholder="0.05">
         <span class="d limits"></span></div>
       <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="8" value="1"></div>
       <label class="chk"><input type="checkbox" id="joinmarket">
@@ -2171,7 +2281,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
            the code already had. -->
       <div class="f" style="margin-top:10px"><label for="expect_total_xmr_send">Total XMR expected
         <span class="d">optional — overrides the total summed from the quotes</span></label>
-        <input id="expect_total_xmr_send" placeholder="4.0">
+        <input id="expect_total_xmr_send" autocomplete="off" spellcheck="false" placeholder="4.0">
         <span class="d limits"></span></div>
     </div>
     <div id="recv-fields" hidden>
@@ -2184,7 +2294,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         leaves your machine.
         <div class="stepacts" data-acts="make_receive"></div>
         <div class="f" style="margin-top:10px"><label for="receive_wallet">Wallet JSON <span class="d">from step 1</span></label>
-          <input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
+          <input id="receive_wallet" autocomplete="off" spellcheck="false" placeholder="wallet_ab12cd34.json"></div>
       </div></div>
 
       <div class="rstep"><span class="rn">2</span><div>
@@ -2194,10 +2304,10 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         is irreversible. The memo is checked to actually name your address before any
         instructions are printed.
         <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay</label>
-          <input id="swap_btc" placeholder="0.05">
+          <input id="swap_btc" autocomplete="off" spellcheck="false" placeholder="0.05">
           <span class="d limits"></span></div>
         <div class="f"><label for="pairs_file">Save quote to</label>
-          <input id="pairs_file" placeholder="thor_pairs.json"></div>
+          <input id="pairs_file" autocomplete="off" spellcheck="false" placeholder="thor_pairs.json"></div>
         <div class="stepacts" data-acts="swap_quote"></div>
         <p class="lead" style="margin-top:8px">The swap provider necessarily learns
         "this BTC deposit → this XMR address". Tor hides who asked, not the link itself —
@@ -2212,7 +2322,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         <div class="stepacts" data-acts="watch_receive"></div>
         <div class="f" style="margin-top:10px"><label for="expect_total_xmr">Total XMR expected
           <span class="d">all swaps to this address</span></label>
-          <input id="expect_total_xmr" placeholder="4.0">
+          <input id="expect_total_xmr" autocomplete="off" spellcheck="false" placeholder="4.0">
         <span class="d limits"></span></div>
         <div class="f"><label for="split_recv">Number of swaps
           <span class="d">paying that total</span></label>
@@ -2298,6 +2408,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       they share an owner and undo the run.</p>
       <div class="f" style="grid-template-columns:1fr">
         <textarea id="exit_to" rows="3" spellcheck="false"
+          autocomplete="off" autocapitalize="off" autocorrect="off"
           placeholder="4… or 8… (one per line; leave empty to withdraw nothing)"></textarea>
       </div>
       <p class="lead"><b>Leave it empty and nothing is withdrawn</b> — the funds
@@ -2311,28 +2422,28 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       reversal.</p>
       <div id="exitnote" class="warnbox" hidden></div>
 
-      <h3 style="margin-top:18px">Your cut</h3>
-      <label class="chk"><input type="checkbox" id="mix_cut">
-        <span>Keep a share of every deposit<span class="d">paid as one more
+      <h3 style="margin-top:18px">Your usage fee</h3>
+      <label class="chk"><input type="checkbox" id="usage_fee">
+        <span>Keep a usage fee from every deposit<span class="d">paid as one more
         destination on the fan-out, to a FRESH account and subaddress minted
         for this run</span></span></label>
-      <div class="f"><label for="mix_cut_pct">Fraction
+      <div class="f"><label for="usage_fee_pct">Fraction
         <span class="d">default 0.011 = 1.1%</span></label>
-        <input id="mix_cut_pct" placeholder="0.011"></div>
-      <div class="f"><label for="mix_cut_address">Send the cut here instead
+        <input id="usage_fee_pct" autocomplete="off" spellcheck="false" placeholder="0.011"></div>
+      <div class="f"><label for="usage_fee_address">Send the usage fee here instead
         <span class="d">optional — a fixed address of your own</span></label>
-        <input id="mix_cut_address" placeholder="4… (leave empty to mint a fresh one each run)"></div>
+        <input id="usage_fee_address" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="4… (leave empty to mint a fresh one each run)"></div>
       <p class="lead mut-s"><b>What a fixed address costs.</b> One address
       collecting from every run is the address reuse this toolchain refuses
       everywhere else, and mixing does not retract it. Leave the box empty and
       a new account and subaddress are minted per run, so no two runs share a
       collection point.</p>
-      <p class="lead mut-s"><b>What no setting here can fix.</b> The cut is a
+      <p class="lead mut-s"><b>What no setting here can fix.</b> The usage fee is a
       published fraction of the deposit. Wherever you eventually spend it,
       whoever you spend it with sees an amount — and dividing it by the
-      fraction gives them the deposit it came from. Spending several cuts in
+      fraction gives them the deposit it came from. Spending several fees in
       one transaction proves those runs share an owner, the same way the exit
-      does. The cut is safe on the chain; it is your <i>cash-out</i> that
+      does. The fee is safe on the chain; it is your <i>cash-out</i> that
       carries it.</p>
     </div>
     <div class="stepnav"><button class="bk" data-go="2">← Back</button><button class="nx" data-go="4">Next →</button></div>
@@ -2344,7 +2455,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <div class="f"><label for="tor_proxy">Tor proxy</label><input id="tor_proxy" value="socks5h://127.0.0.1:9050"></div>
     <div class="f"><label for="rpc_primary">Wallet RPC</label><input id="rpc_primary" value="http://127.0.0.1:18083"></div>
     <div class="f"><label for="rpc_daemon">Daemon RPC</label><input id="rpc_daemon" value="http://127.0.0.1:18081"></div>
-    <div class="f"><label for="wallet_file">Wallet file</label><input id="wallet_file" value="offline.wallet"></div>
+    <div class="f"><label for="wallet_file">Wallet file</label><input id="wallet_file" autocomplete="off" spellcheck="false" value="offline.wallet"></div>
     <div id="pwnote" class="warnbox"></div>
     <div id="pfstatus" class="pfbox"></div>
     <div class="pfbtns">
@@ -2545,12 +2656,15 @@ function collect(){
   expect_total_xmr: mode==='receive' ? v('expect_total_xmr')
                                      : v('expect_total_xmr_send'),
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
-  // THE CUT. The switch and the fraction ride on argv; the address does
-  // not -- pipeline_argv puts it in GS_MIX_CUT_ADDRESS instead, the same
-  // way the exit destination travels. Collected here all the same, so the
-  // preview and the minimum underneath the amount boxes both see it.
-  mix_cut:c('mix_cut'), mix_cut_pct:v('mix_cut_pct'),
-  mix_cut_address:v('mix_cut_address'),
+  // THE USAGE FEE. Only the SWITCH rides on argv. The address and the rate
+  // both travel by environment -- GS_USAGE_FEE_ADDRESS and GS_USAGE_FEE_PCT,
+  // see secret_env -- the same way the exit destination does: /proc/<pid>/
+  // cmdline is world-readable and the rate is the divisor that turns a
+  // cash-out back into a deposit size. Collected here all the same, so the
+  // preview, the minimum under the amount boxes and the badge on the spend
+  // button all see them.
+  usage_fee:c('usage_fee'), usage_fee_pct:v('usage_fee_pct'),
+  usage_fee_address:v('usage_fee_address'),
   // THE FIELD EXISTED, THE SCHEMA ACCEPTED IT, THE PRESETS SET IT, AND THIS
   // NEVER SENT IT. --hop-delay was added to SCHEMA so a dashboard run could
   // express it, then to every preset so the strong ones stopped shipping the
@@ -2667,6 +2781,10 @@ async function sync(){
  // that ask for a quantity without stating one.
  document.querySelectorAll('.limits').forEach(function(el){
    el.textContent=r.limits||''; });
+ // AND ON THE BUTTON THAT SPENDS. The note above is read while typing an
+ // amount; this is read at the moment of committing, four steps later.
+ document.querySelectorAll('.lim').forEach(function(el){
+   el.textContent=r.badge||''; });
  if($('#notes')) $('#notes').innerHTML=(r.notes||[]).map(n=>`<li>${esc(n)}</li>`).join('');
  const ok=!r.problems.length;
  $('#armbox').style.display=ok?'':'none';
@@ -2680,7 +2798,7 @@ const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_
 const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing','exit_to','split','split_recv',
   // The cut moves the MINIMUM, not the fee -- but the minimum is rendered
   // from the same /api/preview round trip, so it has to re-fire here too.
-  'mix_cut','mix_cut_pct']);
+  'usage_fee','usage_fee_pct']);
 // TEXTAREA TOO. exit_to is the page's only <textarea>, and this selector did
 // not name it -- so the ONE field that changes the run's size the most was the
 // one field whose edits recomputed nothing. Measured on the shipped page at the
@@ -2779,7 +2897,8 @@ function actButton(id){
  return `<button class="act ${a.risk}" data-id="${id}" ${a.risk==='spends'?'disabled':''}>
    <span class="top"><span class="dot" id="dot-${id}"></span><span class="nm">${esc(a.label)}</span>
     <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></span>
-   <span class="ds">${esc(a.desc)}</span></button>`;
+   <span class="ds">${esc(a.desc)}</span>
+   ${a.risk==='spends'?'<span class="ds lim" id="lim-'+id+'"></span>':''}</button>`;
 }
 $$('.stepacts').forEach(box=>{
  box.classList.add('ops');

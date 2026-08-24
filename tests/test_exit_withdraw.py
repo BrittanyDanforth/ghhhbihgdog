@@ -399,7 +399,7 @@ check("control: a single held ENTRY output does not get the "
 # ENTRY for both -- sending the operator to look at an address the swap does
 # not name.
 check("exit: ...and the breakdown says it was an ENTRY hold, not a change one",
-      _h2 == {"entry": 1, "change": 0, "remainder": 0})
+      _h2 == {"entry": 1, "change": 0, "remainder": 0, "usagefee": 0})
 
 # THE OTHER SIDE OF THE BREAKDOWN. Every held-output test passed a pair that
 # WAS an entry, so hard-coding the counter to "entry" survived a mutation
@@ -467,7 +467,7 @@ check("change hold: ...and is NOT told it 'never moves' — the exit used to "
 
 
 check("exit: a held output that is NOT an entry is counted as CHANGE",
-      _ch2 == {"entry": 0, "change": 1, "remainder": 0})
+      _ch2 == {"entry": 0, "change": 1, "remainder": 0, "usagefee": 0})
 check("exit: ...and described as a distribution change address, not as ENTRY",
       "distribution CHANGE" in _chg_out.getvalue()
       and "swap ENTRY" not in _chg_out.getvalue())
@@ -487,6 +487,84 @@ check("exit: ...and told what to do with it instead of spending it by hand",
 # The amount is printed so the operator knows what is sitting there. It is on
 # an address the memo already names, so this leaks nothing they do not have.
 check("exit: ...and how much is sitting there", "1 XMR" in _held_msg)
+
+
+# ---- the fourth kind: the operator's own usage fee ------------------------
+#
+# The fee is minted on an account plan_usage_fee keeps out of addr_index, so
+# _exit_account_list cannot name it and the exit never enumerates it. That
+# makes this hold INERT today -- and inert is the point: it is a second lock on
+# a door whose first lock is an OMISSION, and an omission is what a later
+# change deletes without noticing. One line adding the fee account to
+# addr_index (to make report_holdings list it, say) would put the operator's
+# own cut in exit_accounts and sweep it to --exit-to in silence.
+#
+# So the scenario below is the one that must not happen: the fee account IS
+# enumerated. With the hold, it is refused and named. Without it, it leaves.
+def _drive_fee_hold(*, hold_it):
+    """Run the exit with the fee account funded and enumerated."""
+    _sv = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+    _r = _Recorder()
+    try:
+        ghost._run_round = _r
+        ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+        ghost._change_residue = lambda *a, **k: 0
+        ghost.connect_rpc = lambda *a, **k: _BalRPC(
+            {7: {1: 3_000_000_000_000}, 99: {5: 11_000_000_000}})
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        _s = os.path.join(_tf.mkdtemp(prefix="exitfee_"), "tx_staging")
+        os.makedirs(_s, exist_ok=True)
+        _o = io.StringIO()
+        with contextlib.redirect_stdout(_o):
+            _res = ghost._run_exit_withdrawals(
+                _args, [7, 99], [A1], _s, None, {}, (0, 0),
+                hold=([(99, 5)] if hold_it else []),
+                entry_pairs=[], fee_pairs=[(99, 5)])
+        return _res, [t for _rd in _r.rounds for t in _rd], _o.getvalue()
+    finally:
+        (ghost._run_round, ghost._wait_for_change_settled,
+         ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+         ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay) = _sv
+
+
+_fres, _ftxs, _fout = _drive_fee_hold(hold_it=True)
+check("exit/fee: the usage fee is NOT withdrawn to --exit-to",
+      (99, 5) not in [(t["account_index"], t["src_index"]) for t in _ftxs])
+check("exit/fee: ...and is counted under its OWN kind, not as ENTRY or change",
+      _fres[3] == {"entry": 0, "change": 0, "remainder": 0, "usagefee": 1})
+check("exit/fee: ...and named as the operator's own fee, not as a swap entry",
+      "YOUR OWN USAGE FEE" in _fout and "swap ENTRY" not in _fout)
+check("exit/fee: ...and told the exit was not supposed to see it at all, "
+      "because reaching this branch means the isolation broke upstream",
+      "not supposed to be able to see it" in _fout)
+check("exit/fee: ...and told what sending it would have cost — unmixed value "
+      "beside the mixed outputs, at a size that divides back to the deposit",
+      "fixed fraction of the deposit" in _fout)
+# THE REMEDY MUST NOT BE THE MIX-IT-AGAIN ONE. The other three kinds are value
+# that was meant to go through the pipeline and did not; this is value that
+# was never meant to. "Mint a fresh receive wallet and run this again" would
+# spend the fee on fees.
+check("exit/fee: ...and is NOT told to feed their own fee back through a run",
+      "--receive-wallet" not in _fout and "spend it on its own" in _fout.lower())
+check("exit/fee: ...while the MIXED output still leaves",
+      [(t["account_index"], t["src_index"]) for t in _ftxs] == [(7, 1)])
+# NON-VACUITY, and this is the whole point of the second lock: with the hold
+# removed and nothing else changed, the fee is swept to the exit destination.
+# The check above is therefore about the hold, not about an account the
+# fixture never funded.
+_nres, _ntxs, _nout = _drive_fee_hold(hold_it=False)
+check("exit/fee: NON-VACUITY -- without the hold the fee IS swept to "
+      "--exit-to, which is exactly the silent payment this prevents",
+      (99, 5) in [(t["account_index"], t["src_index"]) for t in _ntxs]
+      and _nres[3]["usagefee"] == 0)
+check("exit/fee: NON-VACUITY -- ...and it lands on the operator's exit "
+      "destination, not somewhere harmless",
+      [t["dst"] for t in _ntxs if t["account_index"] == 99] == [A1])
 
 # The hold list itself: ENTRY, and only when the veil actually ran.
 _ai = {"ENTRYADDR": (3, 1), "mixaddr": (4, 1)}
@@ -627,7 +705,7 @@ finally:
      ghost.secure_delay) = _saved5
 check("ALL HELD: when the held ENTRY output is the ONLY funded one the hold is "
       "still reported, not a silent clean exit",
-      _hh == {"entry": 1, "change": 0, "remainder": 0} and _hr == 0)
+      _hh == {"entry": 1, "change": 0, "remainder": 0, "usagefee": 0} and _hr == 0)
 check("ALL HELD: ...and the operator is told nothing was withdrawn",
       "nothing was withdrawn" in _hout.getvalue())
 
@@ -701,18 +779,26 @@ check("UNCLEAN: an output whose balance could not be re-read is unclean too",
 # a {"entry": n, "change": n} breakdown, and a two-key dict is ALWAYS truthy,
 # so `not _held` was permanently False and the clean-exit message could never
 # print at all. A grep for the old text would have gone green on that.
-def _drive_stage5_exit(residue, hold=(), entry_pairs=()):
+_S5_RET = {}
+
+
+def _drive_stage5_exit(residue, hold=(), entry_pairs=(), fee_hold=()):
     """Run the REAL _stage5_run exit block. Returns its stdout."""
     saved = (ghost._run_round, ghost._wait_for_change_settled,
              ghost._change_residue, ghost.connect_rpc, ghost.newnym,
              ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
              ghost._wait_for_fanout_confirm, ghost._run_change_sweeps)
+    _bal = {4: {1: 5_000_000_000_000}, 3: {1: 1_000_000_000_000}}
+    # Fund whatever is held, or "held" is a hold over an empty address and
+    # every check about it passes for the wrong reason. 3/1 is already funded,
+    # so the existing callers are unaffected.
+    for _fa, _fi in list(fee_hold) + list(hold):
+        _bal.setdefault(_fa, {}).setdefault(_fi, 11_000_000_000)
     try:
         ghost._run_round = lambda *a, **k: 1
         ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
         ghost._change_residue = lambda *a, **k: residue
-        ghost.connect_rpc = lambda *a, **k: _BalRPC(
-            {4: {1: 5_000_000_000_000}, 3: {1: 1_000_000_000_000}})
+        ghost.connect_rpc = lambda *a, **k: _BalRPC(_bal)
         ghost.newnym = lambda *a, **k: None
         ghost.tor_recheck = lambda *a, **k: None
         ghost.integrity_log = lambda *a, **k: None
@@ -724,12 +810,18 @@ def _drive_stage5_exit(residue, hold=(), entry_pairs=()):
         os.makedirs(_st, exist_ok=True)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            ghost._stage5_run(_a, _plan, None, [], _st, None, 1,
+            # STASHED, not returned: the withheld REPORT is a return value,
+            # not stdout -- report_completion prints it back in main() -- so a
+            # stdout-only driver cannot see whether the run named what it kept.
+            _S5_RET["ret"] = ghost._stage5_run(
+                              _a, _plan, None, [], _st, None, 1,
                               distribution_mode="fanout",
                               change_target=None, change_sweep_jobs=None,
                               delay_window=(0, 0),
-                              exit_accounts=[4] + [p[0] for p in hold],
-                              exit_hold=list(hold))
+                              exit_accounts=([4] + [p[0] for p in hold]
+                                             + [p[0] for p in fee_hold]),
+                              exit_hold=list(hold),
+                              exit_fee_hold=list(fee_hold))
         return buf.getvalue()
     finally:
         (ghost._run_round, ghost._wait_for_change_settled,
@@ -750,6 +842,41 @@ check("UNCLEAN: ...and says the value has NOT left the wallet",
 _held_out = _drive_stage5_exit(0, hold=[(3, 1)], entry_pairs=[(3, 1)])
 check("UNCLEAN: an exit that WITHHELD an output does not announce EXIT "
       "COMPLETE either", "EXIT COMPLETE" not in _held_out)
+
+# THE FEE HOLD, THROUGH _stage5_run RATHER THAN HANDED IN BY HAND.
+#
+# The ENTRY hold taught this the expensive way: a producer and a consumer that
+# are each correct in isolation is not a wired pipeline. Emptying the ENTRY
+# hold at EITHER call site restored the exact sweep it exists to prevent, and
+# both test files stayed green, because nothing drove the join. So the fee hold
+# is driven where main() joins it -- _stage5_run's own kwarg -- and asserted on
+# what comes out.
+_fee_s5 = _drive_stage5_exit(0, fee_hold=[(98, 4)])
+check("UNCLEAN/fee: _stage5_run honours exit_fee_hold — the fee is withheld, "
+      "not swept", "YOUR OWN USAGE FEE" in _fee_s5)
+check("UNCLEAN/fee: ...so a run that withheld it does not announce EXIT "
+      "COMPLETE over it", "EXIT COMPLETE" not in _fee_s5)
+_fee_wh = " | ".join(_S5_RET["ret"][1])
+check("UNCLEAN/fee: ...and the withheld-value report names which kind it was, "
+      "and that the exit should not have seen it",
+      "USAGE FEE was NOT withdrawn" in _fee_wh
+      and "should not be able to see that account" in _fee_wh)
+check("UNCLEAN/fee: ...as WITHHELD and not as INCOMPLETE — an incomplete run "
+      "skips the plan-file wipe and leaves every hop in plaintext on disk",
+      _S5_RET["ret"][0] == [])
+# NON-VACUITY: the SAME funded account with the hold not passed IS swept, so
+# the check above is about the kwarg and not about an account this fixture
+# never enumerates.
+_fee_s5_off = _drive_stage5_exit(0, hold=[(98, 4)])
+check("UNCLEAN/fee: NON-VACUITY -- the SAME funded account, held through the "
+      "ordinary exit_hold instead, is described as the swap ENTRY: the wrong "
+      "risk, the wrong remedy, and proof that exit_fee_hold is what supplies "
+      "the kind rather than the account number",
+      "swap ENTRY" in _fee_s5_off
+      and "YOUR OWN USAGE FEE" not in _fee_s5_off)
+check("UNCLEAN/fee: NON-VACUITY -- ...including the mix-it-again advice, which "
+      "is exactly what must not be printed about a fee",
+      "--receive-wallet" in _fee_s5_off)
 
 
 
@@ -1467,7 +1594,7 @@ check("peel remainder: the exit does NOT withdraw it",
 check("peel remainder: ...while the mixed output still leaves",
       [(t["account_index"], t["src_index"]) for t in _rm_txs] == [(61, 1)])
 check("peel remainder: ...counted under its own kind, not as change",
-      _rmres[3] == {"entry": 0, "change": 0, "remainder": 1})
+      _rmres[3] == {"entry": 0, "change": 0, "remainder": 1, "usagefee": 0})
 check("peel remainder: ...and named as the peel chain's undistributed balance",
       "UNDISTRIBUTED balance" in _rmtxt)
 check("peel remainder: ...not as a distribution CHANGE, whose remedy is a "
@@ -1498,10 +1625,11 @@ try:
     ghost._run_round = lambda *a, **k: 1
 
     def _cap_exit(a, accounts, dests, stg, proxy, meta, dw=None, hold=(),
-                  entry_pairs=(), remainder_pairs=()):
+                  entry_pairs=(), remainder_pairs=(), fee_pairs=()):
         _s5_seen["hold"] = list(hold)
         _s5_seen["remainder"] = list(remainder_pairs)
-        return (1, 0, 0, {"entry": 0, "change": 0, "remainder": 1}, 0)
+        return (1, 0, 0, {"entry": 0, "change": 0, "remainder": 1,
+                          "usagefee": 0}, 0)
     ghost._run_exit_withdrawals = _cap_exit
 
     _s5dir = Path(tempfile.mkdtemp(prefix="s5peel_"))

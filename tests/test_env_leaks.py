@@ -85,15 +85,24 @@ A2 = ("43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2FuaqXM"
 # ==========================================================================
 print("=== what a third-party child is handed ===")
 
+# THE FEE VARIABLES ARE IN THIS LIST, and they were not. The suite named
+# every GS_ variable that existed when it was written and then stopped
+# growing: GS_USAGE_FEE_ADDRESS and GS_USAGE_FEE_PCT were added later and
+# nothing here would have noticed either one reaching a third-party child.
+# The address is the one that collects from every run that uses it, and the
+# rate is the divisor that turns an observed cash-out back into a deposit.
 _saved = {k: os.environ.get(k) for k in
           ("GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_EXPECT_TOTAL_XMR",
-           "GS_EXIT_TO", "GS_WALLET_PASSWORD")}
+           "GS_EXIT_TO", "GS_WALLET_PASSWORD",
+           "GS_USAGE_FEE_ADDRESS", "GS_USAGE_FEE_PCT")}
 try:
     os.environ["GS_BTC_ENTRY"] = "bc1qOPERATORS_OWN_BITCOIN_ADDRESS"
     os.environ["GS_BTC_AMOUNT"] = "0.4213"
     os.environ["GS_EXPECT_TOTAL_XMR"] = "12.7431"
     os.environ["GS_EXIT_TO"] = A1
     os.environ["GS_WALLET_PASSWORD"] = "spend-key-password"
+    os.environ["GS_USAGE_FEE_ADDRESS"] = A2
+    os.environ["GS_USAGE_FEE_PCT"] = "0.011"
 
     _third = ghost._child_env()
     _leaked = {k: v for k, v in _third.items() if k.startswith("GS_")}
@@ -105,12 +114,17 @@ try:
     check("...nor the exit destination", "GS_EXIT_TO" not in _third)
     check("...nor the wallet password (which was the only one ever removed)",
           "GS_WALLET_PASSWORD" not in _third)
+    check("...nor the usage-fee destination, which collects from every run "
+          "that uses it", "GS_USAGE_FEE_ADDRESS" not in _third)
+    check("...nor the usage-fee RATE, which divides an observed cash-out "
+          "back into a deposit size", "GS_USAGE_FEE_PCT" not in _third)
 
     # Non-vacuity: the variables really are set, so an empty result means
     # scrubbed rather than never-present.
     check("control: the variables ARE in this process's environment",
           all(os.environ.get(k) for k in
-              ("GS_BTC_ENTRY", "GS_EXPECT_TOTAL_XMR", "GS_EXIT_TO")))
+              ("GS_BTC_ENTRY", "GS_EXPECT_TOTAL_XMR", "GS_EXIT_TO",
+               "GS_USAGE_FEE_ADDRESS", "GS_USAGE_FEE_PCT")))
 
     # The sign child is the one exception, and gets ONLY the password.
     _sign = ghost._child_env("spend-key-password")
@@ -215,6 +229,28 @@ check("nothing sensitive is left anywhere in the rendered command",
 _doc = open(os.path.join(REPO, "OPSEC_SETUP.md"), encoding="utf-8").read()
 check("OPSEC_SETUP lists GS_EXIT_TO among the values passed by environment",
       "GS_EXIT_TO" in _doc)
+# EVERY VARIABLE THE CONSOLE ACTUALLY SETS, derived from secret_env rather than
+# listed by hand. GS_EXIT_TO was missing from that paragraph "for as long as
+# the list existed", and the sentence around it was false because of it. A
+# hand-written check would have gone stale the same way: the two usage-fee
+# variables were added later and nothing compared the doc to the code.
+_console_src = open(os.path.join(REPO, "gs_console"), encoding="utf-8").read()
+_se_fn = _console_src[_console_src.index("def secret_env("):]
+_se_fn = _se_fn[:_se_fn.index("\ndef ")]
+_se_vars = sorted(set(re.findall(r'env\["(GS_[A-Z_]+)"\]', _se_fn)))
+check(f"control: secret_env sets several GS_ variables ({len(_se_vars)}), so "
+      f"the check below is comparing against something",
+      len(_se_vars) >= 5)
+_undocumented = [v for v in _se_vars if v not in _doc]
+check(f"OPSEC_SETUP names EVERY variable secret_env sets, not a snapshot of "
+      f"the ones that existed when the paragraph was written "
+      f"(missing: {_undocumented})",
+      _undocumented == [])
+# NON-VACUITY: a variable that is NOT set by secret_env is not required to be
+# there, so this is a comparison and not "the doc mentions lots of strings".
+check("NON-VACUITY -- the check reads secret_env's real assignments, so a "
+      "variable it does not set is not demanded of the doc",
+      "GS_WALLET_PASSWORD" not in _se_vars)
 
 
 

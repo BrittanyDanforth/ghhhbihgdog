@@ -475,7 +475,7 @@ check("two DIFFERENT late-held addresses are both reported",
       _etxt.count("account 55 / subaddr 1") == 1
       and _etxt.count("account 66 / subaddr 0") == 1)
 check("...each under its own kind, so the remedy printed matches the address",
-      _eres[3] == {"entry": 1, "change": 1, "remainder": 0})
+      _eres[3] == {"entry": 1, "change": 1, "remainder": 0, "usagefee": 0})
 
 # And an address held from the INITIAL snapshot must not gain a second,
 # wrongly-worded report from the re-read: it did not arrive "while this exit

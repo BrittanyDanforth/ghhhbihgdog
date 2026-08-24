@@ -2655,16 +2655,37 @@ print("\n=== the distribution says what shape it leaves ===")
 _sh_saved = ghost.integrity_log
 ghost.integrity_log = lambda *a, **k: None
 try:
-    def _shape(peel, n):
+    def _shape(peel, n, fee_out=False):
         _o = io.StringIO()
         with contextlib.redirect_stdout(_o):
             ghost.announce_distribution_shape(
-                types.SimpleNamespace(peel=peel), n)
+                types.SimpleNamespace(peel=peel), n, fee_out=fee_out)
         return _o.getvalue()
 
     _d = _shape(False, 8)
     check("shape: the default fan-out announces itself",
           "ONE fan-out transaction creating 8 outputs" in _d)
+    # THE COUNT MUST MATCH WHAT AN ANALYST WILL COUNT. This paragraph's whole
+    # subject is that the output count is public, and it quoted the MIX count
+    # while --usage-fee builds one more output than that. Off by one is the
+    # one wrong number the operator has nothing to check against.
+    _dfee = _shape(False, 8, fee_out=True)
+    check("shape/fee: with a usage fee the announced count is the REAL one, "
+          "not the mix count",
+          "creating 9 outputs" in _dfee
+          and "creating 8 outputs" not in _dfee)
+    check("shape/fee: ...and says which output the extra one is",
+          "8 of those are the mix" in _dfee and "usage fee" in _dfee)
+    check("shape/fee: ...and why it is not a shape of its own — the mix count "
+          "is already randomised over a wider range than one output",
+          "decoys drawn at run time" in _dfee)
+    check("shape/fee: ...and does not send the operator to a --peel run that "
+          "will be refused",
+          "refused together" in _dfee)
+    # NON-VACUITY: without the fee, none of that is printed, so the lines above
+    # are the fee branch's and not boilerplate on every run.
+    check("shape/fee: NON-VACUITY -- a run with no fee says none of it",
+          "of those are the mix" not in _d and "refused together" not in _d)
     check("shape: ...naming all three public tells, not just the output count",
           "output count" in _d and "tx_extra" in _d and "fee" in _d)
     check("shape: ...correcting the veil notice rather than repeating it",
@@ -2685,9 +2706,11 @@ finally:
 # the same as not announcing.
 from srcutil import code_only as _code_only_dg                  # noqa: E402
 _sh_src = " ".join(_code_only_dg(os.path.join(REPO, "GhostSpiral")).split())
-check("shape: build_distribution_plan calls it where the mode is decided",
+check("shape: build_distribution_plan calls it where the mode is decided, "
+      "and tells it whether this run carries a fee output",
       'distribution_mode = "peel" if args.peel else "fanout" '
-      "announce_distribution_shape(args, fanout_count)" in _sh_src)
+      "announce_distribution_shape(args, fanout_count, "
+      "fee_out=bool(fee_addr and fee_amt > 0))" in _sh_src)
 # Symmetry with the notice it was modelled on: both must exist, or the pair
 # reads as "DAG matters, peel does not".
 check("shape: ...and the DAG-off notice it mirrors is still there",
@@ -2811,7 +2834,7 @@ def _mm_survives(bal, wallets, cut=None, draws=120):
 
 
 for _w in (3, 10, 20, 60):
-    _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, cut_pct=_MM_CUT)
+    _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, usage_pct=_MM_CUT)
     check(f"min: --wallets {_w} at {_b} XMR still funds the fan-out on every "
           f"draw AFTER the 1.1% cut is taken",
           _mm_survives(_b, _w, _MM_CUT) == 120)
@@ -2824,18 +2847,18 @@ for _w in (3, 10, 20, 60):
 # worth pinning: an operator reading only the mixing minimum would be told a
 # figure at which their own cut is uncollectable.
 check("min: enabling the cut RAISES the minimum at the default --wallets 10",
-      ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=_MM_CUT)
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=_MM_CUT)
       > ghost.mix_minimum_xmr(_MFU_FEE, 10))
 check("min: ...and at --wallets 10 it is the CUT that binds, not the mix -- "
       "the raised figure is the spendability floor, not the mixing one",
-      ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=_MM_CUT)
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=_MM_CUT)
       == ((ghost.hop_fee_reserve(_MFU_FEE) + ghost.DUST_XMR)
           / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP))
 # NON-VACUITY: at a LARGE wallet count the mix binds again, so the max() is a
 # real choice between two constraints rather than one that always wins.
 check("min: NON-VACUITY -- at --wallets 60 the MIX binds instead, so the "
       "helper is choosing between two constraints",
-      ghost.mix_minimum_xmr(_MFU_FEE, 60, cut_pct=_MM_CUT)
+      ghost.mix_minimum_xmr(_MFU_FEE, 60, usage_pct=_MM_CUT)
       > ((ghost.hop_fee_reserve(_MFU_FEE) + ghost.DUST_XMR)
          / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP))
 # NON-VACUITY: well below the minimum the cut really is uncollectable, or
@@ -2845,28 +2868,28 @@ check("min: NON-VACUITY -- at a balance below the minimum the cut is worth "
       (Decimal("0.2") * _MM_CUT).quantize(ghost.DUST_XMR)
       < ghost.hop_fee_reserve(_MFU_FEE))
 check("min: a cut of zero or None leaves the mixing minimum untouched",
-      ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=Decimal(0))
-      == ghost.mix_minimum_xmr(_MFU_FEE, 10, cut_pct=None)
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=Decimal(0))
+      == ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=None)
       == ghost.mix_minimum_xmr(_MFU_FEE, 10))
 
 # ===========================================================================
-#  THE OPERATOR'S CUT
+#  THE OPERATOR'S USAGE FEE
 # ===========================================================================
-print("\n-- the operator's cut --")
+print("\n-- the operator's usage fee --")
 import contextlib as _ctx_c                                  # noqa: E402
-_CUT_A1 = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
-_CUT_A2 = "43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2FuaqXMqLrVtED1kV2Z77b6NGE6FFTCm"
+_FEE_A1 = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+_FEE_A2 = "43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2FuaqXMqLrVtED1kV2Z77b6NGE6FFTCm"
 
 
-class _CutArgs:
+class _FeeArgs:
     pass
 
 
-def _cut_args(**kw):
-    a = _CutArgs()
-    a.mix_cut = True
-    a.mix_cut_pct = None
-    a.mix_cut_address = None
+def _fee_args(**kw):
+    a = _FeeArgs()
+    a.usage_fee = True
+    a.usage_fee_pct = None
+    a.usage_fee_address = None
     a.exit_to = None
     a.btc_entry = None
     a.wallets = 10
@@ -2878,15 +2901,15 @@ def _cut_args(**kw):
     return a
 
 
-def _resolve_cut(a):
-    """resolve_mix_cut with the chain silenced. Returns "" or the refusal."""
+def _resolve_fee(a):
+    """resolve_usage_fee with the chain silenced. Returns "" or the refusal."""
     _old = ghost.integrity_log
     ghost.integrity_log = lambda *x, **y: None
-    for _v in ("GS_MIX_CUT_ADDRESS", "GS_MIX_CUT_PCT"):
+    for _v in ("GS_USAGE_FEE_ADDRESS", "GS_USAGE_FEE_PCT"):
         os.environ.pop(_v, None)
     try:
         with _ctx_c.redirect_stdout(io.StringIO()):
-            ghost.resolve_mix_cut(a)
+            ghost.resolve_usage_fee(a)
         return ""
     except SystemExit as e:
         return str(e)
@@ -2896,66 +2919,66 @@ def _resolve_cut(a):
 
 # OFF BY DEFAULT. A run that was not asked to skim must not skim, and this is
 # the check that a future default flip has to walk past.
-check("cut: no cut is taken unless it is asked for",
-      _resolve_cut(_cut_args(mix_cut=False)) == ""
-      and _cut_args(mix_cut=False).mix_cut_pct is None)
-_a = _cut_args()
-check("cut: --mix-cut alone takes the shipped default",
-      _resolve_cut(_a) == "" and _a.mix_cut_pct == ghost.MIX_CUT_PCT)
-check("cut: NON-VACUITY -- the shipped default really is 1.1%",
-      ghost.MIX_CUT_PCT == Decimal("0.011"))
+check("fee: no cut is taken unless it is asked for",
+      _resolve_fee(_fee_args(usage_fee=False)) == ""
+      and _fee_args(usage_fee=False).usage_fee_pct is None)
+_a = _fee_args()
+check("fee: --usage-fee alone takes the shipped default",
+      _resolve_fee(_a) == "" and _a.usage_fee_pct == ghost.USAGE_FEE_PCT)
+check("fee: NON-VACUITY -- the shipped default really is 1.1%",
+      ghost.USAGE_FEE_PCT == Decimal("0.011"))
 
 # THE TWO COMBINATIONS THAT CHARGE AND NEVER PAY. Both were real: the peel
 # branch of build_distribution_plan has no cut destination while the deduction
 # is unconditional, and a split cut is checked against the total but paid as N
 # separate outputs. Refused, not patched -- the same answer --split N --peel
 # already gets.
-check("cut: --peel is REFUSED, because only the fan-out branch pays a cut and "
+check("fee: --peel is REFUSED, because only the fan-out branch pays a cut and "
       "the deduction is unconditional",
-      "--mix-cut with --peel is refused" in _resolve_cut(_cut_args(peel=True)))
-check("cut: --split > 1 is REFUSED, because a partial relay pays a partial "
+      "--usage-fee with --peel is refused" in _resolve_fee(_fee_args(peel=True)))
+check("fee: --split > 1 is REFUSED, because a partial relay pays a partial "
       "cut and each chunk's share can be individually unspendable",
-      "is refused" in _resolve_cut(_cut_args(split=4)))
+      "is refused" in _resolve_fee(_fee_args(split=4)))
 # NON-VACUITY: both flags must still work on their own, or the refusals are
 # just disabling features.
-check("cut: NON-VACUITY -- --peel without a cut is untouched",
-      _resolve_cut(_cut_args(mix_cut=False, peel=True)) == "")
-check("cut: NON-VACUITY -- --split 4 without a cut is untouched",
-      _resolve_cut(_cut_args(mix_cut=False, split=4)) == "")
-check("cut: NON-VACUITY -- --mix-cut on a --split 1 run is allowed",
-      _resolve_cut(_cut_args(split=1)) == "")
+check("fee: NON-VACUITY -- --peel without a cut is untouched",
+      _resolve_fee(_fee_args(usage_fee=False, peel=True)) == "")
+check("fee: NON-VACUITY -- --split 4 without a cut is untouched",
+      _resolve_fee(_fee_args(usage_fee=False, split=4)) == "")
+check("fee: NON-VACUITY -- --usage-fee on a --split 1 run is allowed",
+      _resolve_fee(_fee_args(split=1)) == "")
 
 # THE ADDRESS REFUSALS.
-check("cut: an address with no --mix-cut is refused rather than guessed at",
-      "was given but --mix-cut was not"
-      in _resolve_cut(_cut_args(mix_cut=False, mix_cut_address=_CUT_A1)))
-check("cut: a cut address that is ALSO an exit destination is refused -- then "
+check("fee: an address with no --usage-fee is refused rather than guessed at",
+      "was given but --usage-fee was not"
+      in _resolve_fee(_fee_args(usage_fee=False, usage_fee_address=_FEE_A1)))
+check("fee: a cut address that is ALSO an exit destination is refused -- then "
       "it is not a cut, it is a transaction paying you your own money",
       "also an --exit-to destination"
-      in _resolve_cut(_cut_args(mix_cut_address=_CUT_A1, exit_to=[_CUT_A1])))
-check("cut: NON-VACUITY -- a cut address with a DIFFERENT exit is accepted",
-      _resolve_cut(_cut_args(mix_cut_address=_CUT_A1,
-                             exit_to=[_CUT_A2])) == "")
-check("cut: a malformed cut address is refused",
-      "Bad --mix-cut-address"
-      in _resolve_cut(_cut_args(mix_cut_address="nope")))
+      in _resolve_fee(_fee_args(usage_fee_address=_FEE_A1, exit_to=[_FEE_A1])))
+check("fee: NON-VACUITY -- a cut address with a DIFFERENT exit is accepted",
+      _resolve_fee(_fee_args(usage_fee_address=_FEE_A1,
+                             exit_to=[_FEE_A2])) == "")
+check("fee: a malformed cut address is refused",
+      "Bad --usage-fee-address"
+      in _resolve_fee(_fee_args(usage_fee_address="nope")))
 for _bad, _why in ((Decimal("0"), "zero"), (Decimal("-0.1"), "negative"),
-                   (ghost.MIX_CUT_PCT_MAX + Decimal("0.01"), "above the ceiling")):
-    check(f"cut: a {_why} fraction is refused",
-          _resolve_cut(_cut_args(mix_cut_pct=_bad)) != "")
-check("cut: NON-VACUITY -- a fraction AT the ceiling is accepted, so the bound "
+                   (ghost.USAGE_FEE_PCT_MAX + Decimal("0.01"), "above the ceiling")):
+    check(f"fee: a {_why} fraction is refused",
+          _resolve_fee(_fee_args(usage_fee_pct=_bad)) != "")
+check("fee: NON-VACUITY -- a fraction AT the ceiling is accepted, so the bound "
       "is not off by one",
-      _resolve_cut(_cut_args(mix_cut_pct=ghost.MIX_CUT_PCT_MAX)) == "")
+      _resolve_fee(_fee_args(usage_fee_pct=ghost.USAGE_FEE_PCT_MAX)) == "")
 
 # THE RATE TRAVELS LIKE THE ADDRESS. An override is a per-operator constant and
 # argv is world-readable; the address went through env_or_argv and the rate did
 # not.
 _gsrc = open(os.path.join(REPO, "GhostSpiral")).read()
-check("cut: the fraction goes through env_or_argv, like every other value "
+check("fee: the fraction goes through env_or_argv, like every other value "
       "argv would publish to ps",
-      'env_or_argv("GS_MIX_CUT_PCT"' in _gsrc)
-check("cut: ...and so does the destination",
-      'env_or_argv("GS_MIX_CUT_ADDRESS"' in _gsrc)
+      'env_or_argv("GS_USAGE_FEE_PCT"' in _gsrc)
+check("fee: ...and so does the destination",
+      'env_or_argv("GS_USAGE_FEE_ADDRESS"' in _gsrc)
 
 
 class _CutRPC:
@@ -2963,32 +2986,37 @@ class _CutRPC:
         return ("4" + "z" * 94, 3)
 
 
-def _plan_cut(bal, **kw):
-    """plan_operator_cut with a stub wallet. Returns (addr, amt, printed)."""
+def _plan_fee(bal, _mint=None, **kw):
+    """plan_usage_fee with a stub wallet. Returns (addr, amt, printed, pair).
+
+    `_mint` replaces create_fresh_account, so a caller can make the mint FAIL
+    the way a real wallet-rpc does -- that path aborted the whole run after the
+    swap had settled, and nothing exercised it.
+    """
     _old_log, _old_acct = ghost.integrity_log, ghost.create_fresh_account
     ghost.integrity_log = lambda *x, **y: None
-    ghost.create_fresh_account = lambda rpc, label="": 7
-    a = _cut_args(**kw)
+    ghost.create_fresh_account = _mint or (lambda rpc, label="": 7)
+    a = _fee_args(**kw)
     # `or` would swallow an explicit Decimal(0) -- which is the one value this
     # helper is asked for when checking that "no cut" really mints nothing.
-    a.mix_cut_pct = (kw["mix_cut_pct"] if "mix_cut_pct" in kw
-                     else ghost.MIX_CUT_PCT)
+    a.usage_fee_pct = (kw["usage_fee_pct"] if "usage_fee_pct" in kw
+                     else ghost.USAGE_FEE_PCT)
     _b = io.StringIO()
     try:
         with _ctx_c.redirect_stdout(_b):
-            _addr, _amt = ghost.plan_operator_cut(
+            _addr, _amt, _pair = ghost.plan_usage_fee(
                 _CutRPC(), a, bal, ghost.FALLBACK_FEE_XMR)
-        return _addr, _amt, _b.getvalue()
+        return _addr, _amt, _b.getvalue(), _pair
     finally:
         ghost.integrity_log, ghost.create_fresh_account = _old_log, _old_acct
 
 
-_addr, _amt, _out = _plan_cut(Decimal("1"))
-check("cut: a 1 XMR deposit yields exactly 1.1%", _amt == Decimal("0.0110"))
-check("cut: ...paid to a FRESHLY MINTED account, not a reused address -- the "
+_addr, _amt, _out, _pair = _plan_fee(Decimal("1"))
+check("fee: a 1 XMR deposit yields exactly 1.1%", _amt == Decimal("0.0110"))
+check("fee: ...paid to a FRESHLY MINTED account, not a reused address -- the "
       "reuse this toolchain refuses in three other places",
       bool(_addr) and "freshly minted" in _out)
-check("cut: ...and the operator is TOLD the account and the amount, because "
+check("fee: ...and the operator is TOLD the account and the amount, because "
       "the wallet is the only authoritative record that they were paid",
       "account 7" in _out and "0.0110" in _out)
 
@@ -2996,35 +3024,541 @@ check("cut: ...and the operator is TOLD the account and the amount, because "
 # "nothing has been spent" was false of the deposit -- the BTC is through
 # ThorChain and the XMR sits on an address the memo names in a public
 # OP_RETURN. Aborting to protect a fee strands it.
-_addr2, _amt2, _out2 = _plan_cut(Decimal("0.30"))
-check("cut: below the spendability floor the cut is WAIVED and the mix goes "
+_addr2, _amt2, _out2, _pair2 = _plan_fee(Decimal("0.30"))
+check("fee: below the spendability floor the cut is WAIVED and the mix goes "
       "ahead", _addr2 is None and _amt2 == 0)
-check("cut: ...and the operator is told why, with the figure that would have "
-      "worked", "NO CUT TAKEN" in _out2 and "at least" in _out2)
-check("cut: ...and it does NOT claim nothing has been spent, which is false "
+check("fee: ...and the operator is told why, with the figure that would have "
+      "worked", "NO USAGE FEE TAKEN" in _out2 and "at least" in _out2)
+check("fee: ...and it does NOT claim nothing has been spent, which is false "
       "of the deposit by the time this runs",
       "Nothing has been spent" not in _out2)
 # NON-VACUITY: the floor must actually bite somewhere, or "waived" is a branch
 # that never runs.
-check("cut: NON-VACUITY -- the waive is a real threshold, not a dead branch",
-      _plan_cut(Decimal("1"))[0] is not None
-      and _plan_cut(Decimal("0.30"))[0] is None)
-check("cut: no cut asked for means no cut and no minting",
-      _plan_cut(Decimal("1"), mix_cut=False, mix_cut_pct=Decimal(0))[0] is None)
+check("fee: NON-VACUITY -- the waive is a real threshold, not a dead branch",
+      _plan_fee(Decimal("1"))[0] is not None
+      and _plan_fee(Decimal("0.30"))[0] is None)
+check("fee: no cut asked for means no cut and no minting",
+      _plan_fee(Decimal("1"), usage_fee=False, usage_fee_pct=Decimal(0))[0] is None)
 
 # ROUND_DOWN, so the operator never takes more than the fraction they named.
-_, _amt3, _ = _plan_cut(Decimal("0.33333333333"))
-check("cut: the cut is rounded DOWN, so it never exceeds the stated fraction",
-      _amt3 <= Decimal("0.33333333333") * ghost.MIX_CUT_PCT)
+_, _amt3, _, _ = _plan_fee(Decimal("0.33333333333"))
+check("fee: the cut is rounded DOWN, so it never exceeds the stated fraction",
+      _amt3 <= Decimal("0.33333333333") * ghost.USAGE_FEE_PCT)
 
 # A STATIC ADDRESS IS ACCEPTED AND WARNED ABOUT, because it is the operator's
 # choice and the cost is theirs -- but it is stated where it happens.
-_addr4, _amt4, _out4 = _plan_cut(Decimal("1"), mix_cut_address=_CUT_A1)
-check("cut: a static address is used as given", _addr4 == _CUT_A1)
-check("cut: ...and the reuse it causes is stated at the moment it happens",
+_addr4, _amt4, _out4, _pair4 = _plan_fee(Decimal("1"),
+                                         usage_fee_address=_FEE_A1)
+check("fee: a static address is used as given", _addr4 == _FEE_A1)
+check("fee: ...and the reuse it causes is stated at the moment it happens",
       "collect from every run" in _out4)
-check("cut: NON-VACUITY -- the freshly minted path does NOT print that warning",
+check("fee: NON-VACUITY -- the freshly minted path does NOT print that warning",
       "collect from every run" not in _out)
+
+# ---- A STATIC ADDRESS INSIDE THIS WALLET IS THE ONE THE EXIT SWEEPS -------
+#
+# This branch used to return with the note "the exit only ever enumerates
+# accounts THIS RUN made, and a fixed external address is in none of them".
+# False, and the counter-example is the likeliest paste of all:
+# _exit_account_list returns addr_index's accounts PLUS change_accounts PLUS
+# bal_account, and bal_account is `receive_account_index if receive_mode else
+# 0` -- account 0, the wallet's pre-existing primary account, which the run did
+# not make. _funded_subaddresses then walks EVERY subaddress of it.
+#
+# So the fee would go to --exit-to: unmixed value, sized at a fixed fraction of
+# the deposit, landing beside the mixed outputs. On subaddress 0 of that
+# account it is worse -- that is where the fan-out's change lands, so the
+# change sweep moves it to a fresh address which build_change_sweep_jobs puts
+# in addr_index, and out it goes with everything else.
+print("\n-- a static fee address that belongs to this wallet --")
+
+
+class _OwnedRPC:
+    """A wallet that recognises the address as its own account 0."""
+
+    def raw_request(self, method, params=None):
+        if method == "get_address_index":
+            return {"index": {"major": 0, "minor": 0}}
+        raise AssertionError(method)
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        raise AssertionError("must not mint: the fee is waived")
+
+
+class _ForeignRPC:
+    """A real wallet's answer for an address it does not hold keys to:
+    get_address_index ERRORS. That is the EXPECTED case for a correct
+    external destination, which is why an error means 'not ours'."""
+
+    def raw_request(self, method, params=None):
+        raise RuntimeError("Address doesn't belong to the wallet")
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        raise AssertionError("must not mint: a static address was given")
+
+
+def _plan_static(rpc, **kw):
+    _ol, _oa = ghost.integrity_log, ghost.create_fresh_account
+    ghost.integrity_log = lambda *x, **y: None
+    ghost.create_fresh_account = lambda r, label="": 7
+    try:
+        a = _fee_args(usage_fee_address=_FEE_A1, **kw)
+        a.usage_fee_pct = ghost.USAGE_FEE_PCT
+        _b = io.StringIO()
+        with _ctx_c.redirect_stdout(_b):
+            _r = ghost.plan_usage_fee(rpc, a, Decimal("1"),
+                                      ghost.FALLBACK_FEE_XMR)
+        return _r + (_b.getvalue(),)
+    finally:
+        ghost.integrity_log, ghost.create_fresh_account = _ol, _oa
+
+
+_oa, _oamt, _opair, _oout = _plan_static(_OwnedRPC())
+check("fee/own: a static fee address inside THIS wallet takes no fee at all",
+      _oa is None and _oamt == 0 and _opair is None)
+check("fee/own: ...and says which account and subaddress it resolved to, so "
+      "the operator can see what they pasted",
+      "account 0, subaddress 0" in _oout)
+check("fee/own: ...and names the actual consequence — the exit would have "
+      "swept it to the operator's destination",
+      "swept the fee to your --exit-to" in _oout)
+check("fee/own: ...and WAIVES rather than aborting: the swap has settled by "
+      "the time this runs",
+      "NO USAGE FEE TAKEN" in _oout and "going ahead in full" in _oout)
+# NON-VACUITY, and this is the check that matters: the SAME address with a
+# wallet that does not know it is used as given. Without this the waive above
+# would pass just as well if the branch refused every static address.
+_fa, _famt2, _fpair2, _fout2 = _plan_static(_ForeignRPC())
+check("fee/own: NON-VACUITY -- an address the wallet does NOT hold keys to is "
+      "used exactly as given, which is the ordinary case",
+      _fa == _FEE_A1 and _famt2 > 0 and _fpair2 is None)
+check("fee/own: NON-VACUITY -- ...and gets the reuse warning, not the "
+      "in-wallet one",
+      "collect from every run" in _fout2 and "THIS WALLET" not in _fout2)
+# AN ERROR IS THE EXPECTED ANSWER FOR A FOREIGN ADDRESS. monero-wallet-rpc
+# answers get_address_index for an address it does not own with an ERROR, not
+# with a null result -- so treating "unknown" as "ours" would waive the fee on
+# every correct configuration.
+check("fee/own: the lookup treats an RPC error as 'not ours', because that is "
+      "what a real wallet answers for a foreign address",
+      ghost._wallet_owns_address(_ForeignRPC(), _FEE_A1) is None)
+check("fee/own: ...and a successful lookup as 'ours'",
+      ghost._wallet_owns_address(_OwnedRPC(), _FEE_A1) == (0, 0))
+
+
+class _JunkRPC:
+    def raw_request(self, method, params=None):
+        return {"index": {"major": "zero", "minor": None}}
+
+
+check("fee/own: a lookup that succeeds without a usable index is 'not ours' — "
+      "the address is already format-validated, so guessing 'ours' would "
+      "waive a fee that was fine",
+      ghost._wallet_owns_address(_JunkRPC(), _FEE_A1) is None)
+check("fee/own: ...and a bare True is not an index either (True == 1)",
+      ghost._wallet_owns_address(
+          type("R", (), {"raw_request": lambda s, m, p=None: {
+              "index": {"major": True, "minor": True}}})(), _FEE_A1) is None)
+# THE CLAIM THE FIX RESTS ON, driven rather than asserted: bal_account really
+# is in the exit's account list, and _funded_subaddresses really does walk it.
+check("fee/own: NON-VACUITY -- account 0 (bal_account in send mode) IS in the "
+      "exit's account list, which is why an in-wallet fee address is exposed",
+      0 in ghost._exit_account_list({f"4{'m' * 94}": (5, 1)}, [], 0))
+
+# ---- AND THE FEE ADDRESS ITSELF IS NEVER PRINTED --------------------------
+#
+# It is off the terminal today only because plan_usage_fee CHOSE to print
+# "account N, subaddress M" instead -- strictly better than a scrubbed address,
+# since indices disclose nothing outside the operator's own wallet. But that is
+# one function's discipline, not a barrier, and the most plausible benign next
+# edit is "print the address so I can check it in a block explorer". That puts
+# 95 characters into gs_console's in-memory job buffer and into the DOM, on a
+# page with NO masker (zero uses of scrub_address) that --redact does not
+# reach. scrub_address is tested for what it RETURNS and never for whether it
+# is used.
+print("\n-- the fee address never reaches a pane with no masker --")
+_GTREE_P = _ast.parse(Path(REPO, "GhostSpiral").read_text())
+
+
+def _gfn_p(name):
+    return [n for n in _ast.walk(_GTREE_P)
+            if isinstance(n, _ast.FunctionDef) and n.name == name][0]
+
+
+def _bare_address_prints(fn):
+    """f-string prints in `fn` that interpolate an address name RAW.
+
+    Wrapped in scrub_address is fine -- that is the contract. What this finds
+    is the bare name inside an f-string that goes to print().
+    """
+    _names = {"addr", "fee_addr", "_fee_addr", "usage_fee_address"}
+    _bad = []
+    for _n in _ast.walk(fn):
+        if not (isinstance(_n, _ast.Call)
+                and isinstance(_n.func, _ast.Name) and _n.func.id == "print"):
+            continue
+        for _a in _ast.walk(_n):
+            if not isinstance(_a, _ast.FormattedValue):
+                continue
+            _v = _a.value
+            # scrub_address(x) / gs_common.scrub_address(x) -> allowed.
+            if isinstance(_v, _ast.Call):
+                _f = _v.func
+                _fn_name = (_f.id if isinstance(_f, _ast.Name)
+                            else getattr(_f, "attr", ""))
+                if _fn_name in ("scrub_address", "chain_safe"):
+                    continue
+            for _x in _ast.walk(_v):
+                if isinstance(_x, _ast.Name) and _x.id in _names:
+                    _bad.append(_ast.unparse(_v))
+    return _bad
+
+
+for _fname in ("plan_usage_fee", "resolve_usage_fee",
+               "_wallet_owns_address"):
+    check(f"fee/print: {_fname} prints no fee address unscrubbed",
+          _bare_address_prints(_gfn_p(_fname)) == [])
+# NON-VACUITY 1: the checker CAN see a bare interpolation. Built here rather
+# than hoped for, so a walker that silently matches nothing cannot pass.
+_synth = _ast.parse('def f():\n    print(f"{fee_addr}")\n').body[0]
+check("fee/print: NON-VACUITY -- the checker flags a bare address print when "
+      "there is one",
+      _bare_address_prints(_synth) == ["fee_addr"])
+# NON-VACUITY 2: ...and does NOT flag the wrapped form, so it distinguishes
+# the two rather than banning the word.
+_synth_ok = _ast.parse(
+    'def f():\n    print(f"{scrub_address(fee_addr)}")\n').body[0]
+check("fee/print: NON-VACUITY -- ...and passes the scrub_address-wrapped form",
+      _bare_address_prints(_synth_ok) == [])
+# NON-VACUITY 3: the one place in the pipeline that legitimately shows a fee
+# address to the operator does wrap it, so the contract is live in the source
+# and not merely unexercised.
+check("fee/print: NON-VACUITY -- resolve_usage_fee's own refusal DOES name the "
+      "address, through scrub_address",
+      "scrub_address(_d)" in _ast.unparse(_gfn_p("resolve_usage_fee")))
+
+# ===========================================================================
+#  THE TRAP: the exit must never sweep the usage fee back to --exit-to
+# ===========================================================================
+#
+# _exit_account_list is built from addr_index.values() + change_accounts +
+# [bal_account], and create_carriers adds its accounts to addr_index with the
+# comment "SO THE EXIT CAN SEE IT". plan_usage_fee deliberately does NOT --
+# the fee is already at its destination and must stay there.
+#
+# That makes the obvious next change a money bug: adding the fee account to
+# addr_index so report_holdings can list it would hand the operator's fee
+# straight to --exit-to, which is usually somewhere else entirely. Nothing
+# about that change looks wrong, so it is pinned here.
+print("\n-- the exit does not sweep the usage fee --")
+_FEE_ACCT = 99
+
+
+class _FeeRPC:
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        return ("4" + "q" * 94, 5)
+
+
+def _fee_and_exit_accounts():
+    """Take a fee, then ask the exit which accounts it would empty."""
+    _old_log, _old_acct = ghost.integrity_log, ghost.create_fresh_account
+    ghost.integrity_log = lambda *x, **y: None
+    ghost.create_fresh_account = lambda rpc, label="": _FEE_ACCT
+    a = _fee_args()
+    a.usage_fee_pct = ghost.USAGE_FEE_PCT
+    # A realistic addr_index: three mix subaddresses on their own accounts.
+    _ai = {f"4{'m' * 94}{i}": (i, 1) for i in range(3)}
+    try:
+        with _ctx_c.redirect_stdout(io.StringIO()):
+            _addr, _amt, _pair = ghost.plan_usage_fee(
+                _FeeRPC(), a, Decimal("1"), ghost.FALLBACK_FEE_XMR)
+        return (_addr, _amt, _ai, ghost._exit_account_list(_ai, [], 0),
+                _pair)
+    finally:
+        ghost.integrity_log, ghost.create_fresh_account = _old_log, _old_acct
+
+
+_faddr, _famt, _ai, _exit_accts, _fpair = _fee_and_exit_accounts()
+check("fee/exit: the fee was actually taken, so the check below is about a "
+      "real payment", bool(_faddr) and _famt > 0)
+check("fee/exit: the fee ACCOUNT is not in the exit's sweep list -- the exit "
+      "would send it to --exit-to, which is not where the fee goes",
+      _FEE_ACCT not in _exit_accts)
+check("fee/exit: ...and the fee ADDRESS never entered addr_index, which is "
+      "what keeps it out",
+      _faddr not in _ai)
+# NON-VACUITY: the mix accounts ARE in the list, so this is not a function
+# that returns nothing.
+check("fee/exit: NON-VACUITY -- the mix accounts ARE swept, so the exit list "
+      "is real", all(_i in _exit_accts for _i in range(3)))
+# NON-VACUITY: putting the fee account in addr_index really would sweep it --
+# i.e. the trap is a live one, not a hypothetical.
+check("fee/exit: NON-VACUITY -- adding the fee account to addr_index WOULD "
+      "sweep it, which is why plan_usage_fee must not",
+      _FEE_ACCT in ghost._exit_account_list(
+          {**_ai, _faddr: (_FEE_ACCT, 5)}, [], 0))
+# ...and the source-level guard, so the trap is caught by reading too.
+_GTREE = _ast.parse(Path(REPO, "GhostSpiral").read_text())
+
+
+def _gfn(name):
+    return [n for n in _ast.walk(_GTREE)
+            if isinstance(n, _ast.FunctionDef) and n.name == name][0]
+
+
+def _touches(fn, name):
+    """Does this function actually USE `name` -- as a variable, an argument,
+    an attribute or a keyword?
+
+    NOT `name in ast.dump(fn)`, which was the first version and which reads
+    the DOCSTRING too. The docstring of plan_usage_fee now explains at length
+    why the fee is kept out of addr_index, so the substring test started
+    failing on the comment that documents the very property it checks. A test
+    that forbids naming the thing is a test that punishes explaining it.
+    """
+    for n in _ast.walk(fn):
+        if isinstance(n, _ast.Name) and n.id == name:
+            return True
+        if isinstance(n, _ast.arg) and n.arg == name:
+            return True
+        if isinstance(n, _ast.Attribute) and n.attr == name:
+            return True
+        if isinstance(n, _ast.keyword) and n.arg == name:
+            return True
+    return False
+
+
+_pf_fn = _gfn("plan_usage_fee")
+check("fee/exit: plan_usage_fee never touches addr_index in CODE",
+      not _touches(_pf_fn, "addr_index"))
+check("fee/exit: NON-VACUITY -- build_peel_stage_plan DOES touch it (its "
+      "own comment says \"SO THE EXIT CAN SEE IT\"), so the check above "
+      "distinguishes the two",
+      _touches(_gfn("build_peel_stage_plan"), "addr_index"))
+# NON-VACUITY on the reader itself: it must not be a function that says "no"
+# to everything, and it must not be fooled by prose. plan_usage_fee's
+# docstring names addr_index repeatedly and its code does not -- which is
+# exactly the pair `in ast.dump()` could not tell apart.
+check("fee/exit: NON-VACUITY -- _touches finds a name plan_usage_fee DOES use",
+      _touches(_pf_fn, "cut") and _touches(_pf_fn, "integrity_log"))
+check("fee/exit: NON-VACUITY -- and the docstring alone does not fool it: "
+      "plan_usage_fee's prose names addr_index while its code does not",
+      "addr_index" in (_ast.get_docstring(_pf_fn) or ""))
+
+# ---- THE SECOND LOCK: the pair the exit is told to refuse -----------------
+#
+# Everything above proves the fee is safe BY OMISSION -- nothing puts it in
+# addr_index, so nothing enumerates it. That is a guard made of absence, and
+# absence is what a later change deletes without noticing: one line adding the
+# fee account to addr_index (to make report_holdings list it, say) puts the
+# operator's own cut in exit_accounts and sweeps it to --exit-to in silence.
+#
+# So plan_usage_fee also HANDS BACK the pair, main() passes it to _stage5_run
+# as exit_fee_hold, and _run_exit_withdrawals refuses it by name. Inert while
+# the omission holds. Loud the day it does not.
+check("fee/hold: the minted cut reports the (account, subaddress) it landed on",
+      _pair == (7, 3))
+check("fee/hold: ...and it is the same account the operator was told about",
+      f"account {_pair[0]}" in _out and f"subaddress {_pair[1]}" in _out)
+check("fee/hold: a static address reports NO pair — this run did not create "
+      "it, so it can name no account, and the exit never enumerates it anyway",
+      _pair4 is None and _addr4 == _FEE_A1)
+check("fee/hold: a waived cut reports no pair either", _pair2 is None)
+check("fee/hold: and no cut at all reports no pair",
+      _plan_fee(Decimal("1"), usage_fee=False,
+                usage_fee_pct=Decimal(0))[3] is None)
+# THE WIRING, read from the source: a producer and a consumer that are each
+# correct in isolation is not a wired pipeline -- the ENTRY hold learned that
+# the expensive way (emptying it at either call site restored the exact sweep
+# it exists to prevent, and both test files stayed green).
+_S5_SRC = Path(REPO, "GhostSpiral").read_text()
+check("fee/hold: main() passes the pair on to _stage5_run",
+      "exit_fee_hold=([_fee_pair] if _fee_pair" in _S5_SRC)
+check("fee/hold: _stage5_run folds it into the hold the exit honours",
+      "for _fp in (exit_fee_hold or ()):" in _S5_SRC
+      and "fee_pairs=list(exit_fee_hold or ())" in _S5_SRC)
+check("fee/hold: _run_exit_withdrawals takes fee_pairs as its own kind, not "
+      "folded into entry_pairs — every ENTRY remedy is wrong for the fee",
+      "fee_pairs=()" in _S5_SRC and '"usagefee": "YOUR OWN USAGE FEE"' in _S5_SRC)
+# AND THE SAME PAIR REACHES THE FINAL REPORT, which is the only durable record
+# of where the operator's own money went: the fee account is out of addr_index
+# (so report_holdings never lists it), the plan file has no index, and a
+# completed run wipes that plan.
+check("fee/hold: main() also hands the pair to the end-of-run report",
+      "fee_pair=_fee_pair," in _S5_SRC)
+
+# ---- THE MINT CAN FAIL, AND THE SWAP HAS ALREADY SETTLED ------------------
+#
+# create_fresh_account RAISES rather than defaulting to account 0, and
+# new_subaddress_indexed validates its answer the same way. Uncaught, either
+# takes main() down with a traceback at stage 4 -- which is AFTER
+# stage4_await_swap, so the BTC is through ThorChain and the XMR is sitting on
+# an address a public OP_RETURN names. That is the exact outcome the
+# below-floor branch stopped doing; this door was left open beside it.
+print("\n-- a wallet that will not mint the fee account --")
+
+
+def _boom(rpc, label=""):
+    raise RuntimeError("wallet refused create_account")
+
+
+_maddr, _mamt, _mout, _mpair = _plan_fee(Decimal("1"), _mint=_boom)
+check("fee/mint: a wallet that will not mint the fee account WAIVES the cut",
+      _maddr is None and _mamt == 0 and _mpair is None)
+check("fee/mint: ...and does not raise, because the swap has already settled "
+      "by the time this runs",
+      "NO USAGE FEE TAKEN" in _mout)
+check("fee/mint: ...and says the mix is going ahead, so the operator does not "
+      "kill a run that is still fine",
+      "going ahead in full" in _mout)
+check("fee/mint: ...and reports the wallet's own reason rather than swallowing "
+      "it", "refused create_account" in _mout)
+# NON-VACUITY: the same call with a working wallet DOES take the fee, so the
+# waive is a response to the failure and not the helper's normal answer.
+check("fee/mint: NON-VACUITY -- the same deposit with a working wallet takes "
+      "the cut", _addr is not None and _amt > 0)
+
+
+class _BadSubRPC:
+    """Mints the account, then refuses the subaddress. The second half of the
+    same failure, and it is a different call with its own validation."""
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        raise RuntimeError("create_address returned no address_index")
+
+
+_old_l, _old_a = ghost.integrity_log, ghost.create_fresh_account
+ghost.integrity_log = lambda *x, **y: None
+ghost.create_fresh_account = lambda rpc, label="": 7
+try:
+    _sa = _fee_args()
+    _sa.usage_fee_pct = ghost.USAGE_FEE_PCT
+    _sb = io.StringIO()
+    with _ctx_c.redirect_stdout(_sb):
+        _s_addr, _s_amt, _s_pair = ghost.plan_usage_fee(
+            _BadSubRPC(), _sa, Decimal("1"), ghost.FALLBACK_FEE_XMR)
+    _sout = _sb.getvalue()
+finally:
+    ghost.integrity_log, ghost.create_fresh_account = _old_l, _old_a
+check("fee/mint: a wallet that mints the account but refuses the SUBADDRESS "
+      "waives too — the account exists but is empty and unreferenced",
+      _s_addr is None and _s_amt == 0 and _s_pair is None)
+check("fee/mint: ...and says so rather than raising",
+      "NO USAGE FEE TAKEN" in _sout)
+
+# ---- SPEND HYGIENE, ON THE ACCOUNTS NOTHING ELSE COVERS -------------------
+#
+# report_holdings prints "SPEND THEM ONE ACCOUNT AT A TIME" over the run's
+# accounts -- and the fee account is deliberately not one of them, so the
+# accounts that accumulate run after run were the only ones the warning never
+# reached. They are also the ones where merging costs most: every mixed output
+# is an arbitrary amount, but each of these is a FIXED FRACTION of one deposit,
+# so spending two together does not merely link the fees, it measures the runs
+# behind them.
+check("fee/hygiene: the minted disclosure says to spend the fee on its own",
+      "SPEND IT ON ITS OWN" in _out)
+check("fee/hygiene: ...and gives the reason that is specific to a fee — the "
+      "fixed rate divides back to the deposit",
+      "divide by the rate" in _out and "share an owner" in _out)
+check("fee/hygiene: ...and says not to send it where the mixed output goes",
+      "same" in _out and "destination as your mixed output" in _out)
+# NON-VACUITY: the waived branch mints nothing, so it must NOT print advice
+# about an account that does not exist.
+check("fee/hygiene: NON-VACUITY -- a waived cut prints no such advice, so the "
+      "line above is the minting branch's and not boilerplate",
+      "SPEND IT ON ITS OWN" not in _out2)
+
+# ---- NOTHING IS LABELLED, because labels are written into the wallet file --
+#
+# paranoia_mode deliberately never deletes the wallet file -- it is the only
+# thing that can still spend the money -- so anything written INTO it outlives
+# every artifact wipe the toolchain performs. An account labelled "usage fee"
+# or "cut 1.1%" would survive a seizure that erases the plans, the logs and the
+# staging directory, and it would do the analyst's arithmetic for them: it
+# names which account is the operator's revenue and, with the rate in the
+# label, what the deposit was.
+#
+# Both mints, because there are two: the account and the subaddress inside it.
+_LABELS = {"acct": None, "sub": None}
+
+
+class _LabelRPC:
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        _LABELS["sub"] = label
+        return ("4" + "z" * 94, 3)
+
+
+_old_l2, _old_a2 = ghost.integrity_log, ghost.create_fresh_account
+ghost.integrity_log = lambda *x, **y: None
+
+
+def _label_acct(rpc, label=""):
+    _LABELS["acct"] = label
+    return 7
+
+
+ghost.create_fresh_account = _label_acct
+try:
+    _la = _fee_args()
+    _la.usage_fee_pct = ghost.USAGE_FEE_PCT
+    with _ctx_c.redirect_stdout(io.StringIO()):
+        ghost.plan_usage_fee(_LabelRPC(), _la, Decimal("1"),
+                             ghost.FALLBACK_FEE_XMR)
+finally:
+    ghost.integrity_log, ghost.create_fresh_account = _old_l2, _old_a2
+check("fee/label: the fee ACCOUNT is minted with an empty label — a label is "
+      "written into the wallet file, which paranoia_mode never deletes",
+      _LABELS["acct"] == "")
+check("fee/label: ...and so is the SUBADDRESS inside it", _LABELS["sub"] == "")
+# NON-VACUITY: the recorder really did see both calls, so an empty string is
+# an observed label and not an un-run stub.
+check("fee/label: NON-VACUITY -- both mints were actually reached, so the "
+      "empty labels are observed and not defaults of a call that never "
+      "happened",
+      _LABELS["acct"] is not None and _LABELS["sub"] is not None)
+# ...and at the source level, so the property is also readable: neither call
+# may pass a label expression at all.
+check("fee/label: neither mint passes anything but a literal empty label",
+      all(isinstance(_k.value, _ast.Constant) and _k.value.value == ""
+          for _n in _ast.walk(_pf_fn) if isinstance(_n, _ast.Call)
+          for _k in _n.keywords if _k.arg == "label"))
+check("fee/label: NON-VACUITY -- there ARE label= keywords in plan_usage_fee "
+      "for that check to have read",
+      len([_k for _n in _ast.walk(_pf_fn) if isinstance(_n, _ast.Call)
+           for _k in _n.keywords if _k.arg == "label"]) == 2)
+
+# WHAT REACHES THE PERSISTENT CHAIN. The fee is a fixed fraction of the
+# deposit, so an amount on the chain is the deposit on the chain.
+# ITS OWN TAG. "fee" was already taken -- by the DAEMON's network fee
+# (daemon_fee:*, using_fallback_fee, IMPLAUSIBLE_daemon_fee). Two unrelated
+# meanings under one chain tag is a reader's problem, and this test found it.
+_fee_chain = re.findall(r'integrity_log\w*\("usagefee",\s*(?:f?")([^"]*)"',
+                        Path(REPO, "GhostSpiral").read_text())
+check(f"fee/chain: the usage fee has its own chain tag, not the daemon's "
+      f"({len(_fee_chain)} payloads)", len(_fee_chain) >= 4)
+check("fee/chain: NON-VACUITY -- the daemon's own fee tag still exists and is "
+      "a different one",
+      bool(re.findall(r'integrity_log\w*\("fee",',
+                      Path(REPO, "GhostSpiral").read_text())))
+check(f"fee/chain: no usage-fee payload interpolates anything but a COUNT "
+      f"({_fee_chain})",
+      all("{" not in _p or "len(" in _p for _p in _fee_chain))
+# THE INTERPOLATED EXPRESSIONS, not the payload NAMES. A first version of this
+# looked for the substring "addr" and flagged `address_validated` -- a constant
+# string that carries no address at all. What matters is what gets substituted
+# IN, so that is what is read.
+_fee_interp = [_e for _p in _fee_chain
+               for _e in re.findall(r"\{([^}]*)\}", _p)]
+check(f"fee/chain: every interpolated value is a COUNT, never an address or "
+      f"an amount ({_fee_interp or 'nothing is interpolated'})",
+      all(_e.startswith("len(") for _e in _fee_interp))
+check("fee/chain: NON-VACUITY -- the extractor really does find the one "
+      "interpolation there is, so the check is not scanning an empty list",
+      len(_fee_interp) == 1)
+_gsc_mod = __import__("gs_common")
+for _p in ("on_fanout:4_chunks", "subaddress_minted"):
+    check(f"fee/chain: chain_safe leaves {_p!r} carrying no digit",
+          not any(_c.isdigit() for _c in _gsc_mod.chain_safe(_p)))
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
