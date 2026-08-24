@@ -755,7 +755,71 @@ doorbell, so anything it does you can do from a terminal.
    Leave it there and the vault is simply not wakeable — which is the
    correct trade for the hour you are using it, and the wrong one to
    forget about for a week.
-8. Idle weeks: ThinkPad is off. Only the Pi hums.
+8. **The money is not finished yet, and this step did not exist.** What
+   landed is on a receive subaddress whose full address the swap already
+   published, in the clear, in a Bitcoin `OP_RETURN`. §4 calls that
+   destination "a **throwaway** that GhostSpiral then mixes away from … not
+   where you want the money to end up" — and the cycle used to stop at step 7
+   and never say so, so an operator who followed it to the end had made the
+   throwaway their final address by default.
+
+   Two ways on, and they are not equivalent:
+
+   **At the vault, by hand.** Plug in the spend USB and run the mix against
+   that bundle, naming a destination this run never created:
+
+   ```bash
+   export GS_EXIT_TO="4…"          # env, never argv: /proc/<pid>/cmdline is 0444
+   python3 GhostSpiral --tor-proxy socks5h://127.0.0.1:9050 \
+       --receive-wallet /var/lib/gs/wallet_recv_1.json --dag-mixing
+   ```
+
+   This is the default and the one that keeps custody off every networked
+   machine. It takes two to three hours, almost all of it the per-transaction
+   `--hop-delay`, which is an OPSEC parameter and not overhead: **do not
+   interrupt it.**
+
+   **From the phone, with `/withdraw`.** Only if you have paired with
+   `--allow-withdraw`, and read §4b first, because it is a real trade and not
+   a convenience.
+
+9. Idle weeks: ThinkPad is off. Only the Pi hums.
+
+### 4b. `/withdraw`, and what it costs
+
+Off by default. `gs_wake_agent` refuses the job outright unless **this
+machine's own keyfile** says `allow_withdraw`, which is written by re-pairing
+with `--allow-withdraw` — physical access to both boxes, the same bar the
+amount ladder sits behind. A keyfile written before this existed does not have
+the field, and absent means no: upgrading the code does not give a pager the
+ability to spend.
+
+What you give up by turning it on, stated plainly:
+
+- **The spend wallet has to be reachable by a machine the phone can wake.**
+  That is custody on a networked box. Every other job in this design exists
+  under the opposite rule.
+- **Whoever holds the bot token can trigger a withdrawal, to an address they
+  type.** The confirm sum does not stop them — §5 step 1 says why. The bounds
+  that still hold are the wake budget and the daily cap, both in the keyfile.
+- **The destination is in the chat.** By design: you type it as a reply, so
+  the transcript holds it. `--burn-after` shortens how long, and Telegram only
+  lets a bot delete for 48 h.
+
+What it still refuses:
+
+- The address is checked three times — at the pager, on the wire, and at the
+  vault with a real checksum before a coin moves — and it never reaches an
+  argv. It travels in `GS_EXIT_TO`, so it cannot become a flag however it is
+  shaped.
+- `/withdraw` with the address on the same line is refused. It asks, then
+  confirms. Same rule as `/depo`, and for a stronger reason.
+- The mix runs `--dag-mixing`: a withdrawal you are not watching takes the
+  stronger shape, not the faster one.
+- The agent re-arms a **longer** power-off backstop for the job and **refuses
+  to start it if it cannot**. The shipped one is sized for the largest
+  non-spending job; a mix runs far past it, and powering off mid-round is the
+  one failure GhostSpiral cannot recover from automatically.
 
 Until the bot exists: skip 1–3. You are at the ThinkPad. Same files,
 same “memo never leaves the machine except to the sender.”

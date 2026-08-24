@@ -1526,6 +1526,45 @@ def _handle_field(v):
 
 _handle_field.spec = "handle ^[0-9A-F]{4}$"
 
+#: A Monero address, and THE ONLY FREE TEXT THIS CHANNEL HAS EVER CARRIED.
+#:
+#: Every other field is a bounded int or a 4-hex label, and that was a design
+#: rule, not an accident: OPSEC_SETUP.md's "the Pi is never given the chance to
+#: send a number" is the same argument. It holds here only because of what the
+#: value is used FOR -- gs_wake_agent puts it in GS_EXIT_TO, an environment
+#: variable, and never on an argv -- and because of what this refuses.
+#:
+#: WHY A REGEX AND NOT A CHECKSUM. A full Monero address check needs the
+#: network byte and a Keccak checksum, which this file cannot do without a
+#: crypto dependency it does not have; the VAULT re-validates properly
+#: (validate_xmr_address, an RPC round trip) before a single coin moves. What
+#: this gate is for is narrower and it is the part that must not be skipped:
+#: nothing shaped like a FLAG, a path, a URL or a shell fragment may travel,
+#: because the value crosses a machine boundary and is handed to a subprocess
+#: on the other side.
+#:
+#: So: base58's alphabet only (no 0, O, I, l -- and therefore no '-', '/',
+#: '=', '$', whitespace or a quote), starting with 4 or 8, at exactly the two
+#: lengths Monero uses. A standard address is 95 characters and an integrated
+#: one 106. Nothing else is admitted, and length is checked before content so
+#: an enormous string is rejected without scanning it.
+_B58_XMR = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+
+def _xmr_address_field(v):
+    if not isinstance(v, str):
+        raise WakeError("expected a Monero address as text")
+    if len(v) not in (95, 106):
+        raise WakeError("expected a Monero address of 95 or 106 characters")
+    if v[0] not in ("4", "8"):
+        raise WakeError("a Monero address starts with 4 or 8")
+    if any(c not in _B58_XMR for c in v):
+        raise WakeError("a Monero address is base58 and this is not")
+    return v
+
+
+_xmr_address_field.spec = "xmr address ^[48][base58]{94,105}$"
+
 
 JOBS = {
     # Mint receive subaddresses. Spends nothing.
@@ -1572,7 +1611,49 @@ JOBS = {
         # enough that the vault is off again before it is worth noticing.
         "budget_s": 300,
     },
+    # MIX WHAT LANDED AND SEND IT OUT. The only job that spends, the only one
+    # that carries free text, and the only one the vault refuses by default.
+    #
+    # WHY IT EXISTS AT ALL. Without it the documented cycle ends with the money
+    # sitting on a receive subaddress whose full address the swap already
+    # published in a Bitcoin OP_RETURN, and the operator holding a phone that
+    # cannot do anything about it. "Go to the vault" is not an answer when the
+    # reason the vault is far away is that it is a vault.
+    #
+    # WHAT IT COSTS, stated here rather than in a doc nobody reads at 3am:
+    #
+    #   * The spend wallet has to be reachable by a machine the phone can wake.
+    #     That is custody on a networked box, and it is the trade OPSEC_SETUP
+    #     spends a section refusing for every OTHER job. Whoever holds the bot
+    #     token can trigger a withdrawal; the address is theirs to type.
+    #   * The destination is free text from a chat. It is validated three
+    #     times -- here, at the pager, and at the vault with a real checksum --
+    #     and it is never put on an argv, but it is still the first value this
+    #     channel has carried that an attacker gets to CHOOSE.
+    #
+    # WHICH IS WHY THE VAULT REFUSES IT UNLESS ITS OWN KEYFILE SAYS OTHERWISE.
+    # `allow_withdraw` is set with physical access, like the amount ladder, and
+    # is absent from every keyfile that existed before this job did -- so an
+    # upgraded pair does not silently gain the ability to spend.
+    "withdraw": {
+        "schema": {"handle": _handle_field, "exit_to": _xmr_address_field},
+        "tools": ("GhostSpiral",),
+        # FOUR HOURS, and it is measured rather than generous. GhostSpiral's
+        # own estimate_runtime puts a default fan-out plus DAG round at about
+        # 2.3-3 h, almost all of it the per-transaction --hop-delay, which is
+        # an OPSEC parameter and not overhead to be trimmed. The budget has to
+        # clear the SLOW end of that with room, because the failure it prevents
+        # is not a late report: it is the vault powering off mid-round, which
+        # GhostSpiral says in as many words it cannot recover from
+        # automatically.
+        "budget_s": 14400,
+    },
 }
+
+#: Jobs that need a spend-capable wallet, and therefore an explicit keyfile
+#: opt-in on the vault. A tuple rather than a flag on each job, so the agent's
+#: gate and the doorbell's window sizing read the same list.
+SPENDING_JOBS = ("withdraw",)
 
 #: THE VAULT'S MANDATORY JITTER, DECLARED WHERE BOTH BOXES CAN SEE IT.
 #:
@@ -1614,10 +1695,49 @@ def result_budget_s(job: str) -> int:
 
 
 #: Named so a test can assert they are unreachable rather than merely absent.
-#: The mix needs a physically-present spend USB and must never be driven by a
-#: pager -- OPSEC_SETUP.md §8.
-FORBIDDEN_TOOLS = ("GhostSpiral", "run_pipeline", "airgap_tx_signer",
+#:
+#: THIS LIST USED TO CONTAIN "GhostSpiral", and removing it is the single
+#: largest change this channel has ever taken -- so it is narrowed rather than
+#: shortened, and the narrowing is the whole security argument.
+#:
+#: The old rule was "no job may drive a spending tool", which was enforceable
+#: and absolute and left the operator holding a phone that could not move their
+#: own money. The new rule is: no job may drive a spending tool EXCEPT the one
+#: job that exists to spend, which the vault refuses unless its own keyfile
+#: says otherwise (see SPENDING_JOBS and gs_wake_agent's allow_withdraw gate).
+#:
+#: Everything else on this list stays unreachable from any job at all, and
+#: they are the ones with no gate that could make them safe: the cold signer
+#: and the broadcaster take a plan file and relay it, so a job that could name
+#: them could relay a plan the operator never saw.
+FORBIDDEN_TOOLS = ("run_pipeline", "airgap_tx_signer",
                    "broadcast_signed_xmr", "exit_strategy_simulator")
+
+#: Tools only a SPENDING job may name, and only then. Kept separate from
+#: FORBIDDEN_TOOLS so "unreachable from every job" stays a testable property of
+#: that list, rather than becoming "unreachable except sometimes".
+GATED_TOOLS = ("GhostSpiral",)
+
+
+def job_tools_are_permitted() -> bool:
+    """Every job's tools are allowed to it. Checked, not assumed.
+
+    Three properties in one predicate, because they only mean anything
+    together: no job names a FORBIDDEN tool at all; only a SPENDING job names a
+    GATED one; and a spending job names nothing but gated tools -- so
+    `withdraw` cannot quietly acquire a second tool that runs unattended
+    alongside the mix.
+    """
+    for _name, _spec in JOBS.items():
+        _tools = tuple(_spec["tools"])
+        if any(t in FORBIDDEN_TOOLS for t in _tools):
+            return False
+        _gated = [t for t in _tools if t in GATED_TOOLS]
+        if _gated and _name not in SPENDING_JOBS:
+            return False
+        if _name in SPENDING_JOBS and set(_tools) - set(GATED_TOOLS):
+            return False
+    return True
 
 
 def validate_job(body: dict) -> tuple:

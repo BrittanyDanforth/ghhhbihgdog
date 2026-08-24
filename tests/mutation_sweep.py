@@ -1456,9 +1456,12 @@ MUTATIONS = [
  # One attempt is what makes three choices mean three choices.
  ("the confirm gate can be guessed at until it is right",
   "gs_telegram_pager",
-  "        slot, expect = c.slot, c.expect\n"
+  # Re-anchored: the confirm step reads both wizards' fields now, but the
+  # property is the same one -- the conversation is deleted BEFORE the answer
+  # is checked, so a wrong answer cannot be retried against the same sum.
+  "        handle, exit_to = c.handle, c.exit_to\n"
   "        del self.convos[chat_id]\n",
-  "        slot, expect = c.slot, c.expect\n",
+  "        handle, exit_to = c.handle, c.exit_to\n",
   ["test_depo_wizard"]),
 
  # A real command typed mid-flow must not be swallowed as an answer.
@@ -2239,6 +2242,85 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- the one job that spends -------------------------------------------
+ #
+ # /withdraw is the first job that drives a spending tool, carries free text,
+ # and can move money. Every one of these gates is the only thing between a
+ # stolen bot token and a withdrawal.
+
+ # The keyfile decides, and an old keyfile means no.
+ ("a spending job runs without the keyfile allowing it", "gs_wake_agent",
+  '        if not key.get("allow_withdraw"):',
+  "        if False:",
+  ["test_wake_agent"]),
+
+ # A mix under the shipped 9300s backstop is the vault powering off mid-round,
+ # which GhostSpiral says it cannot recover from automatically.
+ ("a spending job runs under a backstop too short for it", "gs_wake_agent",
+  "        if not _extend_deadman(_need):",
+  "        if False:",
+  ["test_wake_agent"]),
+
+ # Arm, VERIFY, then disarm. systemd-run can exit 0 having queued a job that
+ # never starts, and that check is all that stands between a four-hour spend
+ # and no backstop at all.
+ ("the longer backstop is assumed armed rather than verified",
+  "gs_wake_agent",
+  '        if not (is_active or unit_is_active)(f"{DEADMAN_EXT_UNIT}.timer"):\n'
+  "            return False",
+  "        if False:\n            return False",
+  ["test_wake_agent"]),
+
+ # The destination is the first operator-chosen string to cross the boundary.
+ # In the environment it cannot become a flag; on an argv it is world-readable
+ # for the whole run.
+ ("the withdrawal address goes on the argv again", "gs_wake_agent",
+  '            env_extra["GS_EXIT_TO"] = _dest',
+  "            argv.append(_dest)",
+  ["test_wake_agent"]),
+
+ # The argv template interpolates `bundle`, and the resolver that fills it in
+ # lives in another function. Driven when this was missing: the composed
+ # command was `--receive-wallet None` -- a mix pointed at a bundle that does
+ # not exist, on the one job that spends.
+ ("the spending job runs against an unresolved bundle", "gs_wake_agent",
+  '    if job in ("watch", "swap_status", "withdraw"):',
+  '    if job in ("watch", "swap_status"):',
+  ["test_wake_agent"]),
+
+ # The gate that refuses a flag, a path, a URL or a shell fragment.
+ ("the address gate stops refusing anything", "gs_wake_proto.py",
+  "    if any(c not in _B58_XMR for c in v):",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ ("the address gate stops checking the length", "gs_wake_proto.py",
+  "    if len(v) not in (95, 106):",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ # The split that keeps "unreachable from every job" a testable property of
+ # FORBIDDEN_TOOLS rather than "unreachable except sometimes".
+ ("the mix becomes reachable from an ordinary job", "gs_wake_proto.py",
+  '        if _gated and _name not in SPENDING_JOBS:\n            return False',
+  "        if False:\n            return False",
+  ["test_wake_protocol"]),
+
+ # /withdraw with the address on the same line skips the confirm and puts the
+ # destination in the transcript attached to the command.
+ ("/withdraw takes the address on the command line", "gs_telegram_pager",
+  '        if arg:\n            return "", {}, "just /withdraw — it asks"',
+  '        if False:\n            return "", {}, "just /withdraw — it asks"',
+  ["test_depo_wizard"]),
+
+ # A rejected near-miss of the operator's own destination is the same
+ # disclosure as the address itself.
+ ("a rejected address is echoed back into the transcript",
+  "gs_telegram_pager",
+  '                self.send(chat_id, "no: bad address. Cancelled.")',
+  '                self.send(chat_id, f"no: bad address: {_a}. Cancelled.")',
+  ["test_depo_wizard"]),
+
  # ---- a phase outranks the outcome ---------------------------------------
  #
  # Three gates each dropped it, and fixing any one alone changes nothing --
