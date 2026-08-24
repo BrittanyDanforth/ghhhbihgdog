@@ -1545,9 +1545,11 @@ MUTATIONS = [
  # fee. This restores the floor that hopped and then could not pay to leave.
  ("the fan-out floor goes back to reserving the hop and not the exit sweep",
   "GhostSpiral",
-  "    min_each = min_exit_fundable(fee_xmr, dag_enabled)",
+  "    min_each = min_exit_fundable(fee_xmr, dag_enabled)\n"
+  "    floor_total = min_each * Decimal(fanout_count)",
   "    min_each = (min_hop_fundable(fee_xmr) if dag_enabled\n"
-  "                else (DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP))",
+  "                else (DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP))\n"
+  "    floor_total = min_each * Decimal(fanout_count)",
   ["test_listed_bugs"]),
 
  # The predicate itself, not just the caller: doubling the reserve is what
@@ -2058,6 +2060,88 @@ MUTATIONS = [
   "    It is the one hook that reliably covers them all. Two programs also have\n"
   "    their own, and they",
   ["test_listed_bugs"]),
+
+ # ------------------------------------------------------------------
+ #  Round: the operator's cut, and the minimum a UI may print
+ # ------------------------------------------------------------------
+
+ # The cut is deducted unconditionally but only the FAN-OUT branch pays it, so
+ # --peel took 1.1% and paid nobody: the residue landed on the veil carrier and
+ # the exit swept it to --exit-to.
+ ("--mix-cut --peel goes back to charging a cut it never pays",
+  "GhostSpiral",
+  '    if getattr(args, "peel", False):\n        sys.exit(',
+  '    if False:\n        sys.exit(',
+  ["test_dag_entry"]),
+
+ # A split cut is checked against the TOTAL and paid as N separate outputs,
+ # each of which can be individually below the fee to move it.
+ ("--mix-cut --split N goes back to a cut that may be unspendable per chunk",
+  "GhostSpiral",
+  '    if int(getattr(args, "split", 1) or 1) > 1:\n'
+  "        sys.exit(\n"
+  '            f"[!] --mix-cut with --split "',
+  '    if False:\n'
+  "        sys.exit(\n"
+  '            f"[!] --mix-cut with --split "',
+  ["test_dag_entry"]),
+
+ # This branch used to sys.exit with "Nothing has been spent" -- true of
+ # Monero, false of the deposit, which is already through ThorChain and sitting
+ # on an address the swap memo names in a public OP_RETURN.
+ ("the unspendable-cut branch goes back to aborting after the swap",
+  "GhostSpiral",
+  '        print(f"  [!] NO CUT TAKEN.',
+  '        sys.exit(f"  [!] NO CUT TAKEN.',
+  ["test_dag_entry"]),
+
+ # The cut account was minted, paid, and mentioned nowhere -- and the wallet
+ # balance is the only authoritative record that the operator was paid.
+ ("the cut is taken again without telling the operator where it went",
+  "GhostSpiral",
+  '    print(f"  [*] CUT: {cut} XMR',
+  '    _unused = (f"  [*] CUT: {cut} XMR',
+  ["test_dag_entry"]),
+
+ # A fixed cut address is the reuse this repo refuses by sys.exit in three
+ # other places; minting per run is what removes the cross-run join key.
+ ("the cut goes back to one account instead of a fresh one per run",
+  "GhostSpiral",
+  '    _acct = create_fresh_account(rpc, label="")',
+  "    _acct = 0",
+  ["test_dag_entry"]),
+
+ # The distinctness staircase needs n(n-1)/2 DUST ticks -- 0.177 XMR at 60
+ # wallets, more than the fundability floor asks for. A minimum derived from
+ # the floor alone is short, in the direction that strands a run.
+ ("the displayed minimum forgets the distinctness staircase",
+  "GhostSpiral",
+  "    ticks = Decimal(n * (n - 1) // 2) + Decimal(n)",
+  "    ticks = Decimal(n)",
+  ["test_dag_entry"]),
+
+ # A cut worth exactly the fee to move it is worth nothing once moved.
+ ("the cut spendability floor goes back to being one tick short",
+  "GhostSpiral",
+  "        need = max(need, (hop_fee_reserve(fee_xmr) + DUST_XMR) / cut_pct)",
+  "        need = max(need, hop_fee_reserve(fee_xmr) / cut_pct)",
+  ["test_dag_entry"]),
+
+ # The fan-out funds wallets + randint(DECOY_MIN, DECOY_MAX), drawn at run
+ # time, so a minimum computed from --wallets alone survives a lucky draw only.
+ ("the displayed minimum forgets the decoys the operator does not choose",
+  "GhostSpiral",
+  "    n = w + DECOY_MAX",
+  "    n = w",
+  ["test_dag_entry"]),
+
+ # The four money fields were the only inputs on the console page asking for a
+ # quantity without stating one.
+ ("the console stops telling the operator the minimum",
+  "gs_console",
+  '                "limits": limits_note(c["params"])}))',
+  '                "limits": ""}))',
+  ["test_console"]),
 
 ]
 

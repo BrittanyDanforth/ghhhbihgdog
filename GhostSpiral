@@ -257,6 +257,16 @@ SPLIT_JITTER = Decimal("0.18")
 FANOUT_CONFIRM_POLL_ESTIMATE = 20 * 60
 MIN_WALLETS = 3
 MIN_DEEP = 1
+#: The largest --wallets this toolchain claims to support.
+#:
+#: IT IS NOT ENFORCED HERE, and saying so is the point. main() clamps only the
+#: LOWER end (`args.wallets = max(args.wallets, MIN_WALLETS)`); nothing rejects
+#: --wallets 5000, which would ask the wallet for 5007 accounts and size a
+#: fee reserve against them. gs_console's field has carried max="60" all along
+#: and two comments in this file say "the CLI accepts up to 60" -- a claim the
+#: CLI does not make. This constant is what those three already meant, in one
+#: place, so limits_report can quote a range that matches the page.
+MAX_WALLETS = 60
 # Extra mix outputs beyond `wallets`, chosen RANDOMLY per run within this range.
 # A fixed count (the old NUM_DECOYS = 4) makes the total output count a
 # deterministic function of `wallets` -- so with public code, seeing 44 outputs
@@ -267,6 +277,46 @@ MIN_DEEP = 1
 # volume rather than a filterable class.
 DECOY_MIN = 2
 DECOY_MAX = 7
+
+# ---------------------------------------------------------------------------
+#  THE OPERATOR'S CUT
+# ---------------------------------------------------------------------------
+#: Fraction of the deposit the operator keeps, when --mix-cut is on. OFF by
+#: default: a run that has not been asked to skim must not skim.
+#:
+#: WHERE IT IS TAKEN, AND WHY NOWHERE ELSE WOULD DO. As one more destination on
+#: the FAN-OUT, which is already the single wide transaction of the run. The
+#: three alternatives were measured, not guessed, and each is worse in a way
+#: that cannot be tuned away:
+#:
+#:   * ON THE BITCOIN SIDE. Bitcoin amounts are public and exact. If the
+#:     operator ever takes custody, one transaction gives r = (V-V'-f)/V to six
+#:     significant figures -- solving an equation, not accumulating evidence.
+#:     And the ThorChain memo publishes ENTRY in a plaintext OP_RETURN, so a
+#:     BTC-side marker does not stay on the BTC side: it labels which Monero
+#:     entry addresses are this operator's. Refused outright -- see
+#:     resolve_mix_cut.
+#:   * AS AN EXTRA --exit-to. Costs nothing and does not work: the exit is one
+#:     sweep_all per subaddress and the fan-out amounts are deliberately
+#:     unequal, so an extra destination takes whole OUTPUTS, not a fraction.
+#:     Simulated over 2000 runs at --wallets 10: median 48% of the value,
+#:     range 15%-78%. There is no repetition count that yields 1.1%.
+#:   * INSIDE AN EXIT TRANSACTION. tx_extra is 33 + 2 + 32n bytes for n real
+#:     destinations and 44 for exactly one -- a cleartext readout, verified
+#:     against all five shapes this file already measures. Every exit today is
+#:     extra=44. Paying the cut there makes it 99 forever, on every withdrawal
+#:     of every run, which is precisely the marker --peel's own notice calls
+#:     "the only thing still setting them apart from an ordinary payment".
+#:
+#: The fan-out is already 1-in/N-out with extra=259 at N=7, so one more
+#: destination moves it to 291 and changes no shape CLASS -- and it is not the
+#: entry output's first spend either, because build_entry_veils is. That is the
+#: whole reason this placement is cheap and the others are not.
+MIX_CUT_PCT = Decimal("0.011")
+#: A sanity ceiling on --mix-cut-pct, in the sense ABSURD_RATE is one: it says
+#: "that is not a cut", never "that cut looks greedy". A quarter of the deposit
+#: is far above any real fee and far below anything that breaks the arithmetic.
+MIX_CUT_PCT_MAX = Decimal("0.25")
 
 # FALLBACK FEE, and the old value here was not conservative -- it was 48x LOW.
 #
@@ -1039,6 +1089,112 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
     # is to delete the code rather than write a test that cannot fail.
     integrity_log("stage4", "fanout_refused:indistinct_amounts")
     return []
+
+
+def min_fanout_usable(fanout_count: int, fee_xmr: Decimal,
+                      dag_enabled: bool) -> Decimal:
+    """The smallest `usable` compute_fanout_amounts will reliably fund.
+
+    RELIABLY, not once. compute_fanout_amounts draws random weights, so the
+    exact threshold moves seed to seed; a bound that happens to work for one
+    draw is not a minimum anyone can be told. This returns a figure that funds
+    the plan on EVERY draw, and tests/test_dag_entry.py drives it over many
+    SystemRandom draws at every wallet count the CLI accepts.
+
+    TWO CONSTRAINTS, and only the first is obvious:
+
+      * FUNDABILITY. Every output must clear min_exit_fundable -- its own hop
+        and the exit sweep that spends it -- so the budget needs
+        min_each * n. The budget is usable * FANOUT_SPEND_FRACTION, not usable.
+
+      * DISTINCTNESS. The amounts must be strictly different (identical outputs
+        are one value and one shape for an analyst to cluster on -- see the
+        docstring above and split_btc_amount's). They live on a DUST_XMR grid,
+        so n distinct values need 0+1+...+(n-1) = n(n-1)/2 ticks of remainder
+        ABOVE the floor, and compute_fanout_amounts returns [] when it cannot
+        pay for that staircase. This is the constraint that bites: at
+        --wallets 60 it is 1770 ticks, 0.177 XMR, which is more than the
+        fundability floor asks for. A bound derived from the floor alone is
+        wrong by that much and wrong in the dangerous direction.
+
+    Plus one tick per output for the ROUND_DOWN each share takes onto the grid.
+
+    NOT A SECOND SPELLING OF THE RULE -- a bound ON it. compute_fanout_amounts
+    stays the authority on whether any particular plan is fundable; this only
+    has to be safe, and it is checked against the real function rather than
+    argued. Measured margin over the true 100%-success floor: 0.34%-0.48%
+    across --wallets 3/10/20/60, which is the price of "reliably".
+    """
+    n = max(0, int(fanout_count))
+    if n <= 0:
+        return Decimal(0)
+    min_each = min_exit_fundable(fee_xmr, dag_enabled)
+    ticks = Decimal(n * (n - 1) // 2) + Decimal(n)
+    budget = min_each * Decimal(n) + DUST_XMR * ticks
+    return (budget / FANOUT_SPEND_FRACTION).quantize(DUST_XMR,
+                                                     rounding=ROUND_UP)
+
+
+def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
+                    dag_mixing: bool = True, exit_set: bool = True,
+                    chunks: int = 1, cut_pct: Decimal = None) -> Decimal:
+    """The smallest WALLET BALANCE that completes a mix and delivers it.
+
+    This is the number an operator can be shown when something asks how much
+    they want to mix. min_fanout_usable answers a narrower question -- what the
+    fan-out needs once the fees are already set aside -- and three things sit
+    between that and a figure anyone can type.
+
+    DECOYS, WHICH THE OPERATOR DOES NOT CHOOSE. The fan-out funds
+    `wallets + num_decoys`, and num_decoys is
+    `randint(DECOY_MIN, DECOY_MAX)` drawn at RUN TIME, after the money has
+    arrived (see the draw at stage 3 and select_fanout_targets). A minimum
+    computed from `wallets` alone is short by up to DECOY_MAX outputs and is
+    only survivable on a lucky draw. DECOY_MAX is used here for the same reason
+    compute_fee_budget uses it: it is the only count that holds for every draw.
+
+    THE FEE RESERVE. compute_fee_budget holds back every transaction fee the
+    run will pay, and `usable == bal - total_fees` exactly, with total_fees a
+    function of the SETTINGS and not of the balance -- so the balance floor is
+    the usable floor plus that reserve. Driven and pinned in
+    tests/test_dag_entry.py rather than assumed, because the whole figure rests
+    on it.
+
+    THE OPERATOR'S CUT, when one is taken, and it binds more often than it
+    looks. `cut_pct` of the balance is removed before the fan-out is planned,
+    so the balance has to be larger by that fraction -- but the constraint that
+    actually bites is that the cut must be SPENDABLE. An output worth less than
+    the fee to spend it is unspendable by anyone (see exit_is_fundable), so a
+    cut that merely clears DUST_XMR is a fee the operator can never collect and
+    a permanent on-chain output created to do it. At the shipped 1.1% and a
+    0.0024 fee that floor is hop_fee_reserve/0.011 = 0.3273 XMR, which is
+    ABOVE the mixing minimum at every wallet count up to about 15 -- so with a
+    cut enabled the cut, not the mix, is what sets the minimum for a default
+    run. Returned as one number so a UI cannot show the smaller half of that.
+
+    NOT FOR --peel. A peel chain sizes itself with fit_peel_distribution
+    walking PEEL_BUDGET_FRACTIONS, which is a different rule; this would be a
+    second spelling of it. Callers pass dag_mixing/exit_set and leave peel
+    alone.
+    """
+    w = max(1, int(wallets))
+    n = w + DECOY_MAX
+    # bal is arbitrary: total_fees does not depend on it (asserted in the
+    # tests), so this reads the reserve out of the real budget function rather
+    # than restating its arithmetic here.
+    _usable, total_fees, _txs = compute_fee_budget(
+        Decimal(1), fee_xmr, w, peel=False, dag_mixing=dag_mixing,
+        exit_set=exit_set, chunks=chunks)
+    need = min_fanout_usable(n, fee_xmr, dag_mixing) + total_fees
+    if cut_pct and cut_pct > 0:
+        need = need / (Decimal(1) - cut_pct)
+        # STRICTLY ABOVE the cost of moving it, not equal to it. An output
+        # worth exactly the fee to spend it is worth nothing once spent, so
+        # `hop_fee_reserve / cut_pct` is one tick short of a collectable cut --
+        # driven, and it is the figure a UI would otherwise print as the
+        # minimum.
+        need = max(need, (hop_fee_reserve(fee_xmr) + DUST_XMR) / cut_pct)
+    return need.quantize(DUST_XMR, rounding=ROUND_UP)
 
 
 def select_fanout_targets(mix_targets: list, decoy_addrs: set,
@@ -3840,6 +3996,34 @@ def build_cli() -> argparse.ArgumentParser:
                           "the flag to spread the withdrawal across several "
                           "destinations. Without it nothing is withdrawn and "
                           "the funds stay on this wallet.")
+    cli.add_argument("--mix-cut", action="store_true",
+                     help=f"Keep {(MIX_CUT_PCT * 100).normalize()}%% of the deposit as the "
+                          f"operator's cut, paid as one more destination on "
+                          f"the fan-out. By default it goes to a FRESH "
+                          f"account and subaddress minted for this run, so no "
+                          f"address collects from two runs. XMR side only -- "
+                          f"there is no BTC-side cut and there will not be "
+                          f"one; see --mix-cut-address.")
+    cli.add_argument("--mix-cut-pct", type=decimal_arg, metavar="FRACTION",
+                     help=f"Override the cut (default {MIX_CUT_PCT} = "
+                          f"{(MIX_CUT_PCT * 100).normalize()}%%). Ceiling "
+                          f"{MIX_CUT_PCT_MAX}. Implies --mix-cut.")
+    cli.add_argument("--mix-cut-address", metavar="XMR_ADDRESS",
+                     help="Send the cut to THIS address instead of a freshly "
+                          "minted one. Prefer GS_MIX_CUT_ADDRESS=... : an "
+                          "argv address is world-readable via ps and "
+                          "/proc/<pid>/cmdline (mode 444). Note what it costs: "
+                          "one address collecting a slice of every run is the "
+                          "reuse this toolchain refuses everywhere else, and "
+                          "it survives the mix. The default mints a fresh one "
+                          "per run for that reason.")
+    cli.add_argument("--print-limits", action="store_true",
+                     help="Print the minimum and maximum amounts this "
+                          "configuration accepts, as JSON, and exit. Reads no "
+                          "wallet and opens no socket -- gs_console uses it to "
+                          "put a real minimum beside its amount fields "
+                          "instead of carrying a second copy of the "
+                          "arithmetic.")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--allow-test-chain", action="store_true",
@@ -5512,6 +5696,160 @@ def resolve_btc_amount(args) -> None:
             f"{fmt_btc(amt.quantize(SATOSHI_BTC, rounding=ROUND_DOWN) + SATOSHI_BTC)}.")
 
 
+def resolve_mix_cut(args) -> None:
+    """Validate the operator's cut, before anything is fetched or spent.
+
+    Mirrors resolve_exit_destinations deliberately: same env-first rule, same
+    validator, same refusal-not-warning stance. A cut destination is the
+    operator's OWN address, which makes it exactly as sensitive as --exit-to --
+    the run spends hours unlinking the mix from the swap memo, and an address
+    that collects a slice of every run is the one value that could put it back.
+
+    FOUR REFUSALS, and each is a thing that would otherwise be discovered after
+    the money moved:
+
+      * A CUT WITH NOWHERE TO GO. --mix-cut-pct without a destination is a
+        request to skim into nothing.
+      * AN OUT-OF-BAND PERCENTAGE. Zero or negative is not a cut; above
+        MIX_CUT_PCT_MAX is not one either. Sanity ceiling, not a judgement --
+        see the constant.
+      * THE CUT ADDRESS IS AN EXIT DESTINATION. Then the cut is not a cut: it
+        lands with the mixed funds, in the same wallet, and the operator has
+        paid a transaction to move money to itself. Refused rather than
+        warned, because the fan-out has already been planned around it by the
+        time anything would notice.
+      * THE CUT ADDRESS IS THE BTC ENTRY. A Monero validator would not catch
+        it, and it is the shape a copy-paste slip takes.
+
+    THERE IS NO BTC-SIDE CUT AND THERE WILL NOT BE ONE. Bitcoin amounts are
+    public and exact, and the ThorChain memo publishes ENTRY in a plaintext
+    OP_RETURN -- so a cut taken there is both readable to six significant
+    figures and attached, on the public chain, to the Monero address it was
+    meant to be unlinked from. See MIX_CUT_PCT. The cut is XMR-side only, and
+    the flag names say so.
+    """
+    # THE RATE GOES THROUGH env_or_argv TOO. The address did and the rate did
+    # not, which is the same split exit_strategy_simulator's --fee-pct had. The
+    # DEFAULT is public in the source, so it leaks nothing -- but an OVERRIDE
+    # is a per-operator constant, and putting it on argv publishes it to `ps`
+    # and to every local account for the life of the run, next to amounts it
+    # divides exactly into.
+    _pct_given = env_or_argv("GS_MIX_CUT_PCT",
+                             getattr(args, "mix_cut_pct", None),
+                             "The cut fraction")
+    _addr = env_or_argv("GS_MIX_CUT_ADDRESS",
+                        getattr(args, "mix_cut_address", None),
+                        "The cut destination")
+    args.mix_cut_address = _addr or None
+    if not args.mix_cut_address:
+        # A fresh account+subaddress is minted per run instead (see stage 4),
+        # which is the no-reuse default. Nothing to validate here.
+        args.mix_cut_pct = (Decimal(str(_pct_given)) if _pct_given is not None
+                            else None)
+        if args.mix_cut_pct is None and getattr(args, "mix_cut", False):
+            args.mix_cut_pct = MIX_CUT_PCT
+        _check_cut_pct(args)
+        _refuse_cut_combinations(args)
+        return
+    if not getattr(args, "mix_cut", False) and _pct_given is None:
+        sys.exit(
+            "[!] A cut destination was given but --mix-cut was not.\n"
+            "    Refusing to guess: an address alone does not say whether this "
+            "run should skim.\n"
+            "    Add --mix-cut to take the default "
+            f"{(MIX_CUT_PCT * 100).normalize()}% , or drop the address.")
+    args.mix_cut_pct = (Decimal(str(_pct_given)) if _pct_given is not None
+                        else MIX_CUT_PCT)
+    _check_cut_pct(args)
+    validate_xmr_address(args.mix_cut_address, "--mix-cut-address")
+    _refuse_cut_combinations(args)
+    for _d in (getattr(args, "exit_to", None) or []):
+        if _d == args.mix_cut_address:
+            sys.exit(
+                f"[!] --mix-cut-address is also an --exit-to destination "
+                f"({scrub_address(_d)}).\n"
+                f"    Then it is not a cut: the skim lands in the same place "
+                f"as the mixed funds,\n"
+                f"    having paid a transaction to move your money to itself. "
+                f"Give the cut its own\n"
+                f"    address, or drop --mix-cut.")
+    if args.mix_cut_address == (getattr(args, "btc_entry", None) or object()):
+        sys.exit("[!] --mix-cut-address is the BTC entry address. That is a "
+                 "copy-paste slip, not a destination.")
+    integrity_log("cut", "cut_address_validated")
+
+
+def _refuse_cut_combinations(args) -> None:
+    """The two shapes where the cut is charged and never paid.
+
+    Both were REAL in the first version of this feature, both silent, and both
+    are refused rather than patched -- the same answer resolve_split already
+    gives to `--split N --peel`, and for the identical reason: the code has no
+    representation for a partial one.
+
+      * --peel. plan_operator_cut deducts the cut from the balance
+        unconditionally, but only the FAN-OUT branch of build_distribution_plan
+        builds a cut destination; the peel branch has no reference to it at
+        all. So a peel run charges the cut, pays nobody, and leaves the residue
+        on the veil carrier -- which is in addr_index, so the exit sweeps it
+        straight to --exit-to. The operator is silently paid nothing.
+
+      * --split > 1. The cut is split across N fan-out transactions relayed as
+        one batch. Two things break: a partial relay pays a partial cut, and
+        the spendability floor is checked against the TOTAL while the operator
+        receives N separate outputs -- each of which can be individually below
+        the fee to move it, which is the exact uncollectable output the floor
+        exists to prevent. Loading the whole cut onto chunk 0 instead would
+        make one fan-out one destination wider than its siblings, which the
+        placement doctrine rejects on its own terms.
+
+    With --split 1 the window does not exist: the fan-out is one
+    transfer_split and _run_round aborts on any failure, so either the mix
+    outputs and the cut exist under one txid or nothing was spent. "The mix
+    started" and "the operator was paid" are the same event.
+    """
+    if not getattr(args, "mix_cut_pct", None):
+        return
+    if getattr(args, "peel", False):
+        sys.exit(
+            "[!] --mix-cut with --peel is refused.\n"
+            "    The peel planner has no cut destination, so the cut would be "
+            "deducted from the\n"
+            "    balance and paid to nobody -- the residue lands on the veil "
+            "carrier and the exit\n"
+            "    sweeps it to your --exit-to. Charged and never paid, "
+            "silently.\n"
+            "    Use --peel without --mix-cut, or --mix-cut without --peel.")
+    if int(getattr(args, "split", 1) or 1) > 1:
+        sys.exit(
+            f"[!] --mix-cut with --split "
+            f"{int(getattr(args, 'split', 1) or 1)} is refused.\n"
+            f"    The cut would be split across that many fan-out "
+            f"transactions. A partial relay\n"
+            f"    pays a partial cut, and the spendability floor is checked "
+            f"against the total while\n"
+            f"    you would receive one output per chunk -- each of which can "
+            f"be worth less than the\n"
+            f"    fee to move it. Take the cut on a --split 1 run.")
+
+
+def _check_cut_pct(args) -> None:
+    """The percentage band. Split out so both branches above take one rule."""
+    _p = getattr(args, "mix_cut_pct", None)
+    if _p is None:
+        return
+    if _p <= 0:
+        sys.exit(f"[!] --mix-cut-pct must be positive (got {_p}). A zero cut "
+                 f"is the default already -- leave --mix-cut off.")
+    if _p > MIX_CUT_PCT_MAX:
+        sys.exit(
+            f"[!] --mix-cut-pct {_p} is above the ceiling of "
+            f"{MIX_CUT_PCT_MAX}.\n"
+            f"    That is a sanity bound, not an opinion about your fee: above "
+            f"it the remainder\n"
+            f"    stops being able to fund the mix it is supposed to pay for.")
+
+
 def resolve_split(args) -> None:
     """Bounds-check --split. It is SUPPORTED now; it used to be refused.
 
@@ -6339,11 +6677,223 @@ def resolve_entry_veils(rpc, args, addr_index: dict, entries: list,
     return veil_plan, sources, bal - hop_fee_reserve(fee_xmr) * _n
 
 
+def limits_report(args) -> dict:
+    """The minimum and maximum a UI may state, and what they are worth.
+
+    ONE SOURCE, because the alternative is two. The four amount fields in
+    gs_console are bare inputs today -- no type="number", no min, no max, and a
+    regex that accepts literal zero -- while the same page puts min/max on
+    --split, --wallets and --deep, which are counts. Money is the one thing it
+    asks for without saying what the bounds are.
+
+    THE MINIMUM IS NOT ONE NUMBER, and pretending otherwise is how a UI lies.
+    It moves with --wallets (each mix output reserves its own fees), with
+    --dag-mixing (an output that never hops reserves one transaction fewer),
+    and with the cut (which binds harder than the mix below about 15 wallets).
+    So this returns the whole curve and lets the page look up the row the
+    operator has actually selected.
+
+    AT THE FALLBACK FEE, and said so in the payload. The real per-transaction
+    fee comes from the daemon at run time and this runs before any socket is
+    opened, so every figure here is computed at FALLBACK_FEE_BY_PRIORITY --
+    correct at --fee-priority 1 and an UNDERSTATEMENT at 2, 3 or 4, where the
+    fee is 4x, 20x and 200x. The payload carries the assumption so the page can
+    show it rather than imply a precision it does not have.
+
+    THE MAXIMUM IS HONEST ABOUT BEING USELESS. XMR_ABSURD_TOTAL is a sanity
+    ceiling that exists to stop a Decimal context overflow -- it says "that is
+    not an amount", never "that amount looks wrong". The real ceiling is the
+    wallet balance and the swap's liquidity, and this tool knows neither. Both
+    facts go in the payload; a page that shows the first without the second is
+    quoting a limit nobody will ever hit as though it were the limit.
+    """
+    fee = FALLBACK_FEE_BY_PRIORITY.get(
+        int(getattr(args, "fee_priority", 1) or 1), FALLBACK_FEE_XMR)
+    dag = bool(getattr(args, "dag_mixing", False))
+    exit_set = bool(getattr(args, "exit_to", None))
+    cut = getattr(args, "mix_cut_pct", None) or MIX_CUT_PCT
+    rows = {}
+    for w in range(MIN_WALLETS, MAX_WALLETS + 1):
+        rows[str(w)] = {
+            "min_xmr": str(mix_minimum_xmr(fee, w, dag_mixing=dag,
+                                           exit_set=exit_set)),
+            "min_xmr_with_cut": str(mix_minimum_xmr(
+                fee, w, dag_mixing=dag, exit_set=exit_set, cut_pct=cut)),
+        }
+    return {
+        "schema": "gs_limits_v1",
+        "fee_assumed_xmr": str(fee),
+        "fee_priority": int(getattr(args, "fee_priority", 1) or 1),
+        "fee_note": ("computed at the FALLBACK fee for this priority; the real "
+                     "fee comes from the daemon at run time, so these are a "
+                     "guide and an understatement at higher priorities"),
+        "dag_mixing": dag,
+        "exit_set": exit_set,
+        "cut_pct": str(cut),
+        "cut_spend_floor_xmr": str(hop_fee_reserve(fee)),
+        "cut_note": (f"a cut worth less than {hop_fee_reserve(fee)} XMR cannot "
+                     f"be spent by anyone, so below the with-cut minimum the "
+                     f"run is refused rather than taking a fee that cannot be "
+                     f"collected"),
+        "by_wallets": rows,
+        "max_xmr": str(XMR_ABSURD_TOTAL),
+        "max_btc": str(BTC_ABSURD_TOTAL),
+        "max_note": ("a sanity ceiling that exists to stop a Decimal overflow, "
+                     "not a policy limit. The real ceiling is your wallet "
+                     "balance and the swap's liquidity, and this tool knows "
+                     "neither -- it will not invent them"),
+    }
+
+
+def maybe_print_limits() -> bool:
+    """Handle --print-limits and say whether it did. True means main() is done.
+
+    BEFORE build_cli(), and that is deliberate rather than convenient.
+
+    --print-limits reads no wallet, opens no socket and spends nothing; it is
+    arithmetic over constants, so gs_console can put a real minimum beside the
+    box it asks for an amount in without carrying a second copy of
+    min_exit_fundable, hop_fee_reserve and compute_fee_budget. (The console
+    already mirrors three timeout constants that way and needed a test to stop
+    them drifting -- see JOB_TIMEOUT_FLOOR_S. One process boundary is cheaper.)
+
+    THE TOR GATE IS NOT RELAXED TO MAKE ROOM FOR IT. --tor-proxy is
+    required=True on the real parser, so an info mode either runs before that
+    parser or weakens it. A separate, tiny parser reading only the flags the
+    arithmetic depends on is the option that cannot make the pipeline reachable
+    without Tor by accident: this returns True and main() stops, while every
+    path that spends anything still goes through build_cli().
+
+    A FUNCTION RATHER THAN A BLOCK IN main(), because tests/test_units.py holds
+    main() under 500 lines and it was at 502 with this inline. That check is
+    the reason main() is readable at all; the honest response to tripping it is
+    to extract, not to raise it.
+    """
+    if "--print-limits" not in sys.argv[1:]:
+        return False
+    _lp = argparse.ArgumentParser(add_help=False)
+    _lp.add_argument("--wallets", type=int, default=10)
+    _lp.add_argument("--fee-priority", type=int, default=1)
+    _lp.add_argument("--dag-mixing", action="store_true")
+    _lp.add_argument("--exit-to", action="append")
+    _lp.add_argument("--mix-cut-pct", type=decimal_arg)
+    _la, _ = _lp.parse_known_args()
+    print(json.dumps(limits_report(_la), indent=2))
+    return True
+
+
+def plan_operator_cut(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
+    """Decide the operator's cut and where it lands. Returns (address, amount).
+
+    (None, 0) when no cut was asked for, which is the default.
+
+    A FRESH ACCOUNT AND SUBADDRESS PER RUN, unless the operator named an
+    address. This is the whole reason the cut is affordable in OPSEC terms and
+    it is not a nicety: thor_swap_preparer refuses a reused destination by
+    sys.exit, GhostSpiral refuses a duplicate swap destination, and
+    create_receive_wallet refuses --count > 1 with --account -- three separate
+    refusals of the same thing. A fixed cut address is that thing at its
+    maximum: the SAME address collecting from every deposit of every run,
+    forever. Minting one per run costs one create_account plus one
+    create_address and removes the linkage outright.
+
+    Its own account, not just its own subaddress, for the reason create_subs
+    gives at length: spending several outputs together is permanent public
+    proof they share an owner, and one account per output makes that merge
+    impossible rather than merely discouraged. The cut inherits that.
+
+    THE CUT MUST BE SPENDABLE, and this is the refusal that fires in practice.
+    An output worth less than the fee to move it is unspendable by anyone -- so
+    a cut that clears DUST_XMR but not the sweep fee is a fee the operator can
+    never collect, and a permanent on-chain output created to fail at it.
+    Driven: at 1.1% and a 0.0024 fee that floor is 0.3364 XMR of deposit, which
+    is ABOVE the mixing minimum at every wallet count up to about 15 -- so on a
+    default run it is the CUT, not the mix, that sets how small a deposit may
+    be. Refused here rather than discovered later, and refused BEFORE the
+    fan-out is planned around it.
+
+    ROUND_DOWN, so the cut is never larger than the fraction asked for. The
+    remainder stays with the mix, which is the direction that cannot surprise
+    the depositor.
+    """
+    pct = getattr(args, "mix_cut_pct", None)
+    if not pct or pct <= 0:
+        return None, Decimal(0)
+    cut = (bal * pct).quantize(DUST_XMR, rounding=ROUND_DOWN)
+    _spend_cost = hop_fee_reserve(fee_xmr)
+    if cut <= _spend_cost:
+        # WAIVED, NOT ABORTED, and the first version of this had it backwards.
+        #
+        # It called sys.exit with "Nothing has been spent." That is true of
+        # Monero and FALSE OF THE DEPOSIT: this runs after stage4_await_swap,
+        # so the BTC is already through ThorChain and the XMR is sitting on
+        # ENTRY -- an address the swap memo names in plaintext in a Bitcoin
+        # OP_RETURN. Aborting here to protect a fee strands a swapped,
+        # publicly-named balance on a pipeline with no auto-resume. That is
+        # strictly worse for everyone than skipping one run's cut.
+        #
+        # Waiving is also the only branch that cannot produce the thing the
+        # check exists to prevent: an on-chain output nobody can ever spend.
+        # The gate that CAN refuse safely is the one before the deposit
+        # instructions are printed, where "nothing has been spent" is true of
+        # the deposit too -- and limits_note/--print-limits put the same figure
+        # in front of the operator before they send anything.
+        integrity_log("cut", "cut_waived_below_spend_cost")
+        _need = mix_minimum_xmr(
+            fee_xmr, args.wallets,
+            dag_mixing=bool(getattr(args, "dag_mixing", False)),
+            exit_set=bool(getattr(args, "exit_to", None)),
+            cut_pct=pct)
+        print(f"  [!] NO CUT TAKEN. {(pct * 100).normalize()}% of this deposit "
+              f"is {cut} XMR, which is not more\n"
+              f"      than the {_spend_cost} XMR it costs to move one output — "
+              f"a fee you could never\n"
+              f"      collect, and a permanent on-chain output created to fail "
+              f"at it.\n"
+              f"      This deposit needed to be at least {_need} XMR at these "
+              f"settings. The mix is\n"
+              f"      going ahead in full; the swap has already happened and "
+              f"aborting now would\n"
+              f"      strand it on an address the swap memo names publicly.")
+        return None, Decimal(0)
+    addr = getattr(args, "mix_cut_address", None)
+    if addr:
+        # The operator's own external address, reused every run by
+        # construction. Said once, here, where it is actually about to happen.
+        integrity_log("cut", "cut_to_static_address")
+        print(f"  [!] The cut goes to a FIXED address you supplied. It will "
+              f"collect from every run\n"
+              f"      that uses it, which is the address reuse this toolchain "
+              f"refuses everywhere\n"
+              f"      else -- and mixing does not retract it. Drop "
+              f"--mix-cut-address to have a\n"
+              f"      fresh account and subaddress minted per run instead.")
+        return addr, cut
+    _acct = create_fresh_account(rpc, label="")
+    addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")
+    integrity_log("cut", "cut_subaddress_minted")
+    # SAY IT, AND SAY WHERE. The first version printed nothing at all on this
+    # branch: the cut account was minted, paid, and never mentioned -- not on
+    # the terminal, not in report_holdings, which lists "THIS RUN'S FUNDS ARE
+    # IN N SEPARATE ACCOUNTS" and had no idea this one existed. An operator
+    # cannot check they were paid against a number they were never given, and
+    # the wallet is the only authoritative record; this line is what makes a
+    # discrepancy noticeable at all.
+    print(f"  [*] CUT: {cut} XMR ({(pct * 100).normalize()}% of the deposit) "
+          f"goes to a freshly minted\n"
+          f"      account {_acct}, subaddress {_idx}, as one more destination "
+          f"on the fan-out.\n"
+          f"      It is not mixed and it is not swept by the exit — it is "
+          f"yours where it lands.")
+    return addr, cut
+
+
 def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                             fanout_dests, fanout_by_addr, _dest_slices,
                             fee_xmr, bal_account, fanout_count,
                             _delay_window, _secrets, bal,
-                            usable) -> tuple:
+                            usable, cut_addr=None,
+                            cut_amt=Decimal(0)) -> tuple:
     """Build the plan that spends the carriers. Returns
     (fanout_plan, change_accounts, distribution_mode, fanout_by_addr).
 
@@ -6519,17 +7069,53 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
               f"change sweeps for this run and nothing rests on a subaddress 0.")
     else:
         fanout_plan = []
+        # THE CUT RIDES ON THE FAN-OUT, SPLIT ACROSS THE CHUNKS IT COMES FROM.
+        #
+        # One more destination, on a transaction that is already 1-in/N-out.
+        # tx_extra grows by 32 bytes (33 + 2 + 32n, verified against all five
+        # shapes this file measures) and the output count by one, on the single
+        # transaction of the run that is already unique by arity -- so no shape
+        # CLASS is created. Everything else in the run stays 2-output.
+        #
+        # PROPORTIONAL, NOT ALL ON CHUNK 0. With --split there is one fan-out
+        # per swap chunk and each carrier holds only ITS chunk, so a cut sized
+        # against the whole deposit but charged to one carrier can exceed what
+        # that carrier has. Splitting it by each chunk's share keeps every
+        # fan-out fundable and gives them all the same +1 destination, rather
+        # than making one of them the odd one out.
+        #
+        # The remainder from the division lands on the LAST chunk, and it is at
+        # most a DUST_XMR tick per chunk -- the same treatment split_btc_amount
+        # gives its satoshi remainder, for the same reason: it has to go
+        # somewhere and a fixed choice is the only one that cannot be a draw.
+        _cut_by_chunk = []
+        if cut_addr and cut_amt > 0:
+            _n_src = len(SPEND_SOURCES)
+            _per = (cut_amt / Decimal(_n_src)).quantize(DUST_XMR,
+                                                        rounding=ROUND_DOWN)
+            _cut_by_chunk = [_per] * _n_src
+            _cut_by_chunk[-1] = cut_amt - _per * Decimal(_n_src - 1)
         for _si, (_src_addr, _src_acct, _src_idx) in enumerate(SPEND_SOURCES):
             _slice = _dest_slices[_si]
+            _dests = [{"address": a, "amount": str(fanout_by_addr[a])}
+                      for a in _slice]
+            if _cut_by_chunk and _cut_by_chunk[_si] > 0:
+                _dests.append({"address": cut_addr,
+                               "amount": str(_cut_by_chunk[_si])})
             fanout_plan.append({
                 "src": _src_addr,
                 "src_index": _src_idx,
                 "account_index": _src_acct,
-                "destinations": [{"address": a,
-                                  "amount": str(fanout_by_addr[a])}
-                                 for a in _slice],
+                "destinations": _dests,
                 "delay": hop_delay(_delay_window),
             })
+        if cut_addr:
+            # STRUCTURE, NOT THE AMOUNT. The cut is a fixed fraction of the
+            # deposit, so logging it would put the deposit on a chain that
+            # persists -- the one quantity every other integrity_log call on
+            # this path is careful to leave out. That the run took a cut, and
+            # across how many chunks, is safe; how much is not.
+            integrity_log("cut", f"cut_on_fanout:{len(_cut_by_chunk)}_chunks")
         # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
         # amount. integrity_chain.log persists on disk, and the exact fan-out
         # amount is the single most linkable quantity in the whole pipeline:
@@ -7080,6 +7666,9 @@ def resolve_swap_deposits(args, proxy, jm_utxos, receive_mode, entry_addr,
 def main():
     install_signal_handlers()
 
+    if maybe_print_limits():
+        return
+
     cli = build_cli()
     args = cli.parse_args()
 
@@ -7087,6 +7676,9 @@ def main():
     # semantic (a wallet password prompt, a bech32 checksum) can mask it.
     _delay_window = resolve_hop_delay(args)
     resolve_exit_destinations(args)
+    # AFTER the exit destinations, because one of its refusals compares against
+    # them: a cut address that is also an exit address is not a cut.
+    resolve_mix_cut(args)
     resolve_split(args)
     resolve_swap_arrival(args)
 
@@ -7350,6 +7942,22 @@ def main():
             integrity_log("stage4", "no_mix_targets")
             sys.exit("[!] No mix subaddresses available to fan out into "
                      f"(got {len(mix_targets)}). Cannot build a plan.")
+        # THE CUT COMES OFF BEFORE ANYTHING SIZES AGAINST THE BALANCE.
+        #
+        # It is one more destination on the fan-out, so the fan-out spends the
+        # same total either way -- what changes is how much of it the MIX gets.
+        # Taking it here, from the pre-veil balance, is what makes that true
+        # everywhere downstream: size_and_prune_chunks slices this figure,
+        # resolve_entry_veils reduces it again, and compute_fee_budget is
+        # recomputed from the result. Deducting it later would leave the
+        # fan-out promising more than the carrier holds.
+        #
+        # PRE-VEIL, because that is the deposit. The veil reserve is a cost of
+        # mixing; the cut is a share of what arrived, and an operator quoting
+        # 1.1% means 1.1% of what was sent, not of what survived the plumbing.
+        _cut_addr, _cut_amt = plan_operator_cut(rpc_primary, args, bal, fee_xmr)
+        if _cut_addr:
+            bal = bal - _cut_amt
         # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
         # give a chain analyst one value and one shape to cluster and follow.
         (ENTRY_SET_FUNDED, _entry_unlocked, bal, usable,
@@ -7418,7 +8026,8 @@ def main():
          fanout_by_addr) = build_distribution_plan(
             args, rpc_primary, addr_index, SPEND_SOURCES, fanout_dests,
             fanout_by_addr, _dest_slices, fee_xmr, bal_account,
-            fanout_count, _delay_window, _secrets, bal, usable)
+            fanout_count, _delay_window, _secrets, bal, usable,
+            cut_addr=_cut_addr, cut_amt=_cut_amt)
 
         # Subaddresses that will receive a fan-out output, with the (account, index)
         # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
