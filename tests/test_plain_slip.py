@@ -326,6 +326,36 @@ check("...so 'nothing yet' and 'still confirming' are DIFFERENT answers",
 check("no phase line calls an ordinary wait a failure",
       not any("FAIL" in v.upper() for v in P.PHASE_LINES.values()))
 
+# "LANDED" IS ABOUT THE SWAP, AND IT HAS TO SAY WHICH STEP IT MEANS.
+#
+# This line was shortened from "landed and spendable. The swap is done." to
+# "...Done." while stripping prose out of the chat surface -- and the edit
+# changed which NOUN the sentence was about. The swap has landed; the MIX has
+# not run and cannot be run from the phone (gs_wake_agent refuses every job
+# while a removable device is attached, because the mix needs the spend USB).
+# So "Done" tells the operator the job finished while their money is sitting
+# un-mixed on the receive wallet, on the one surface they check most.
+#
+# A mutation sweep found nothing testing it: the shortened line SURVIVED.
+_landed = P.PHASE_LINES["landed"]
+check("the 'landed' line names WHICH step finished, not just that one did",
+      "swap" in _landed.lower())
+check("...and does not read as the whole job being over",
+      not _landed.rstrip().lower().endswith("done.")
+      or "swap" in _landed.lower())
+# NON-VACUITY: the line is a real sentence that still says the money arrived,
+# so this is not passing on an empty or unrelated string.
+check("NON-VACUITY -- it still tells the operator the money is there",
+      "landed" in _landed.lower() and "spendable" in _landed.lower())
+# AND NO PHASE LINE NAMES THE OPERATOR'S HARDWARE. These are sent verbatim to
+# the chat by gs_telegram_pager, so they are chat text living in a file that
+# does not look like chat text -- which is how two of them kept saying "check
+# it on the vault" after every reply in the pager itself had been stripped.
+for _k, _v in P.PHASE_LINES.items():
+    check(f"phase line {_k!r} names no machine",
+          not any(w in _v.lower()
+                  for w in ("vault", "thinkpad", "keyfile", "pi ")))
+
 (_sd / AG.STATUS_FILE).write_text("{ not json")
 check("an unreadable status file gives no word rather than a made-up one",
       AG._phase_of("swap_status", _sd) == "")

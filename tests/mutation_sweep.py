@@ -2235,6 +2235,30 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- chat text that lives in another file is still chat text ------------
+ #
+ # PHASE_LINES are defined in gs_wake_proto and sent verbatim by the pager
+ # (`f"{h}: {PHASE_LINES.get(phase, phase)}"`). The source-level guard that
+ # strips machine names from the pager's replies read literals in
+ # gs_telegram_pager and could not see them: two said "check it on the vault"
+ # and "the vault's wallet is not scanning" -- the operator's own hardware,
+ # named in the readable surface, on the two answers most asked for when
+ # something has gone wrong.
+ ("a phase line names the operator's machine in the chat again",
+  "gs_wake_proto.py",
+  '    "stuck": "not scanning, so this says NOTHING about your money. Check.",',
+  '    "stuck": "the vault\'s wallet is not scanning, so this says NOTHING "\n'
+  '             "about your money. Check the vault.",',
+  ["test_depo_wizard"]),
+
+ # "Done." is about the SWAP, and shortening it to "Done" changed which noun.
+ # The mix has not run; the money is sitting un-mixed; the operator is reading
+ # the surface they check most.
+ ("the landed line claims the whole job is finished", "gs_wake_proto.py",
+  '    "landed": "landed and spendable. The swap is done.",',
+  '    "landed": "landed and spendable. Done.",',
+  ["test_plain_slip"]),
+
  # ---- the bot says the answer and stops -----------------------------------
  #
  # Two drafts explained instead of answering: where each knob really lives, why
