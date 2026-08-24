@@ -1272,6 +1272,63 @@ check("artifact-dir: the shipped unit also sets UMask=0077, for files a "
 
 
 _finished()
+# ===========================================================================
+#  A WATCH THAT RAN OUT OF TIME IS NOT A FAILURE
+# ===========================================================================
+print("\n-- /watch reports what it saw, like /check does --")
+#
+# receive_watch exits non-zero when its 110 minutes run out, so the pager said
+# "watch: failed." about money that was simply still in flight. That is the
+# exact sentence swap_status was built to stop saying -- and it was being said
+# on the command an operator reaches for when they are least able to go and
+# look for themselves.
+#
+# _phase_of returned "" for anything that was not swap_status, so `watch` could
+# never produce a phase however it ended.
+import importlib.machinery as _im2, importlib.util as _iu2
+_ldw = _im2.SourceFileLoader("gs_wake_agent", os.path.join(REPO, "gs_wake_agent"))
+_AGW = _iu2.module_from_spec(_iu2.spec_from_loader(_ldw.name, _ldw))
+_ldw.exec_module(_AGW)
+
+_wkey = {"tor_proxy": "socks5h://127.0.0.1:9050", "rpc_primary": "http://x",
+         "amount_ladder": ["0.01", "0.02"]}
+_wargv = _AGW.build_argv("watch", {"handle": "A3F1"}, _wkey,
+                         Path("/var/lib/ghostspiral"),
+                         bundle="/b.json", slip="/p.json", handle="A3F1")
+_flat_w = _wargv[0]
+check("watch: the argv asks receive_watch to report what it saw",
+      "--result-json" in _flat_w)
+check("watch: ...to the same fixed path the status probe uses, composed from "
+      "the keyfile and not from anything the operator typed",
+      str(Path("/var/lib/ghostspiral") / _AGW.STATUS_FILE) in _flat_w)
+check("watch: ...and still inside its own 110-minute window",
+      "--timeout-min" in _flat_w
+      and _flat_w[_flat_w.index("--timeout-min") + 1] == "110")
+# NON-VACUITY: the handle and the slot never reach argv as anything but the
+# fixed template plus a validated value.
+check("watch: NON-VACUITY -- the argv is a real one for the real tool",
+      "receive_watch" in " ".join(_flat_w))
+
+# AND _phase_of NOW ANSWERS FOR IT.
+_wd = Path(tempfile.mkdtemp(prefix="watchphase_"))
+for _state, _total, _want in (("timeout", "0", "not_yet"),
+                              ("timeout", "0.4", "arriving"),
+                              ("funded", "1.2", "landed"),
+                              ("stalled", "0.4", "short")):
+    (_wd / _AGW.STATUS_FILE).write_text(json.dumps(
+        {"state": _state, "total": _total, "unlocked": _total, "ticks": 2}))
+    check(f"watch: a {_state!r} watch reports {_want!r}, not a failure",
+          _AGW._phase_of("watch", _wd) == _want)
+# NON-VACUITY: a job that is NOT a watching job still gets no phase, so this
+# did not open the door to every job inventing a status.
+(_wd / _AGW.STATUS_FILE).write_text(json.dumps({"state": "funded",
+                                                "total": "1"}))
+check("watch: NON-VACUITY -- receive_and_quote still earns no phase",
+      _AGW._phase_of("receive_and_quote", _wd) == "")
+check("watch: NON-VACUITY -- and swap_status still does",
+      _AGW._phase_of("swap_status", _wd) == "landed")
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)
