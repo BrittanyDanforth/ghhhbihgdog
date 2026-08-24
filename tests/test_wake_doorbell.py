@@ -88,7 +88,7 @@ class Bell:
 
     def __init__(self, job="receive_and_quote", params=None, t=1000.0):
         self.t = [t]
-        self.pending = DB.Pending(KEY, job, params or {"amount_slot": 1},
+        self.pending = DB.Pending(KEY, job, params or {"amount_sat": 5000000},
                                   clock=lambda: self.t[0])
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
@@ -238,7 +238,7 @@ for flag in ("--job", "--amount", "--count", "--handle", "--param"):
     check(f"there is no {flag} flag — a job on argv lands in "
           f"/proc/<pid>/cmdline, which is mode 0444",
           flag not in help_text)
-for raw, why in (('{"job":"receive_and_quote","amount_slot":2}', None),
+for raw, why in (('{"job":"receive_and_quote","amount_sat":5000000}', None),
                  ('{"job":"run_pipeline"}', "a spending job"),
                  ('{"job":"GhostSpiral"}', "the mix itself"),
                  ('{"job":"receive_new","count":9}', "an out-of-range count"),
@@ -265,7 +265,7 @@ check("an authenticated M1 gets the job", st == 200 and len(m2) == P.RECORD_LEN)
 body = P.open_record(eph, PI.public_key, m2, P.TAG_M2)
 check("...the M2 echoes this boot's challenge", body["challenge"] == chal.hex())
 check("...and names the job the operator asked for",
-      body["job"] == "receive_and_quote" and body["amount_slot"] == 1)
+      body["job"] == "receive_and_quote" and body["amount_sat"] == 5000000)
 
 st2, m2b = b.post("/wake", m1_for(eph, chal, b.pending.window))
 check("REPLAYING the same M1 returns the SAME M2 and consumes nothing — a "
@@ -853,51 +853,52 @@ check("the vault reads its jitter from the protocol module, so the two boxes "
 # ===========================================================================
 #  THE WORDS THE CHAT OFFERS, AND WHY THEY MAY LIVE ON THIS CARD
 # ===========================================================================
-print("\n== labels are words, never amounts ==")
+print("\n== the amount ladder is gone, and so is every trace of it ==")
 #
-# The ladder is on the vault and always will be: this box must not be able to
-# turn "0.05" into anything. The consequence was a chat that asked "Which slot?
-# Reply 0-7" -- a question nobody who had not read the source could answer.
+# THIS SECTION USED TO TEST --amount-labels: the operator's words for the rungs
+# of a ladder of amounts held on the vault, written onto the Pi's card so the
+# chat could ask "small / medium / large" instead of "Which slot? Reply 0-7".
+# The pairing refused any label that looked like a number, because a decimal on
+# this card was the exact value the ladder existed to keep off it.
 #
-# A LABEL is not an amount. "small" says the owner had a category called small;
-# it cannot be turned into a number by anything here. A DECIMAL is exactly the
-# value the ladder exists to keep off this card, so it is refused at pairing.
+# The ladder is gone -- see gs_wake_proto above _int_range -- so the labels
+# name nothing. What is tested now is that the removal was COMPLETE, because a
+# half-removed feature is worse than either state: a flag that still parses and
+# changes nothing, or a field on a sealed card whose meaning the next person
+# has to reconstruct.
 _lbl_src = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
-check("labels: the pairing refuses a label that is a number",
-      r'if re.match(r"^[0-9.,]+\Z", str(_lb).strip()):' in _lbl_src)
-# \Z, NOT $: this repo has a rule and a test for it, because `$` also matches
-# before a trailing newline and the two are not the same anchor.
-check("labels: ...anchored with \\Z, like every other validator here",
-      '"^[0-9.,]+$"' not in _lbl_src)
-check("labels: ...and says why, rather than just refusing",
-      "the vault's ladder exists" in _lbl_src)
-
-
-def _label_ok(v):
-    """Run the real refusal over one label. True if it would be accepted."""
-    import re as _re_l
-    if _re_l.match(r"^[0-9.,]+\Z", str(v).strip()):
-        return False
-    if len(str(v)) > 24 or not str(v).strip():
-        return False
-    return True
-
-
-for _bad in ("0.05", "5", "0,05", "1.0", "  2  ", "", "   ", "x" * 25):
-    check(f"labels: {_bad!r} is refused", not _label_ok(_bad))
-# NON-VACUITY: real words pass, or the check above is a function that refuses
-# everything and the feature does not exist.
-for _good in ("small", "medium", "large", "rent", "big one"):
-    check(f"labels: NON-VACUITY -- {_good!r} is accepted", _label_ok(_good))
-# AND THE PREDICATE THIS TEST USES IS THE ONE THE TOOL USES. Copied here it
-# would drift; asserted against the source it cannot.
-check("labels: the predicate tested here is the one in the tool",
-      r'"^[0-9.,]+\Z"' in _lbl_src and "len(str(_lb)) > 24" in _lbl_src)
-# THE KEYFILE CARRIES THEM, so the pager has something to offer.
-check("labels: the Pi's keyfile carries them",
-      '"amount_labels": _labels,' in _lbl_src)
-check("labels: ...built with getattr, so a pairing that predates the flag "
-      "does not raise", 'getattr(args, "amount_labels", None)' in _lbl_src)
+check("ladder: the pairing no longer writes amount_labels onto the card",
+      '"amount_labels": _labels,' not in _lbl_src
+      and '"amount_labels"' not in _lbl_src)
+check("ladder: ...and the flag is gone rather than accepted and ignored",
+      '"--amount-labels"' not in _lbl_src)
+check("ladder: ...and the label validator went with it",
+      "_label_ok" not in _lbl_src and "len(str(_lb)) > 24" not in _lbl_src)
+# ARGPARSE REFUSES IT, which is the behaviour that matters: a pairing script
+# that still passes --amount-labels stops, rather than sealing a card whose
+# labels nothing will ever read.
+_ap = DB.build_cli()
+_rejected = False
+try:
+    _ap.parse_args(["pair", "192.168.1.20", "--amount-labels", "small"])
+except SystemExit:
+    _rejected = True
+check("ladder: a pairing that still passes --amount-labels is refused, not "
+      "silently ignored", _rejected)
+# NON-VACUITY: the same parser accepts the pairing without that flag, so the
+# check above is about the flag and not about a parser that refuses everything.
+_accepts = True
+try:
+    _ap.parse_args(["pair", "192.168.1.20"])
+except SystemExit:
+    _accepts = False
+check("ladder: NON-VACUITY -- the same pairing without the flag still parses",
+      _accepts)
+# AND THE VAULT SIDE, so the ladder cannot survive on the other card either.
+_keys_src = open(os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read()
+check("ladder: gs_wake_keys no longer writes amount_ladder either",
+      '"amount_ladder": list(args.amount_ladder),' not in _keys_src
+      and "MAX_LADDER" not in _keys_src)
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

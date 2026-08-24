@@ -77,10 +77,10 @@ EPH = NP.PrivateKey.generate()     # vault, per boot
 
 _SAMPLE_XMR = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 SAMPLE = {"receive_new": {"count": 4},
-          "receive_and_quote": {"amount_slot": 7},
+          "receive_and_quote": {"amount_sat": 5_000_000},
           "watch": {"handle": "A3F1"},
           "swap_status": {"handle": "A3F1"},
-          "withdraw": {"exit_to": _SAMPLE_XMR}}
+          "withdraw": {"exit_to": _SAMPLE_XMR, "depth": 1}}
 # KEYED ON JOBS, AND CHECKED TO BE. This table is what every per-job check
 # below iterates, so a job added to the protocol without a sample here would
 # not be silently skipped -- it would KeyError and crash the suite, which
@@ -198,9 +198,9 @@ for n, why in ((295, "one short"), (297, "one long"), (0, "empty")):
 print("\n== the hardened parser ==")
 cases = [
     (b'{"job":"receive_new","job":"run_pipeline"}', "duplicate key"),
-    (b'{"amount_slot": Infinity}', "Infinity"),
-    (b'{"amount_slot": NaN}', "NaN"),
-    (b'{"amount_slot": 1.5}', "a float"),
+    (b'{"amount_sat": Infinity}', "Infinity"),
+    (b'{"amount_sat": NaN}', "NaN"),
+    (b'{"amount_sat": 1.5}', "a float"),
     (b'{"a": {"b": 2.0}}', "a nested float"),
     (b'[]', "a JSON array"),
     (b'not json', "not JSON"),
@@ -314,7 +314,9 @@ bad_bodies = [
     ({"job": "receive_new"}, "a missing key"),
     ({"job": "watch", "handle": "a3f1"}, "a lowercase handle"),
     ({"job": "watch", "handle": "4" + "A" * 94}, "an address as a handle"),
-    ({"job": "receive_and_quote", "amount_slot": 8}, "a slot past the ladder"),
+    ({"job": "receive_and_quote", "amount_sat": 1}, "an amount under the floor"),
+    ({"job": "receive_and_quote", "amount_sat": 10 ** 15},
+     "an amount over the ceiling"),
 ]
 for body, why in bad_bodies:
     b = {"job_id": P.new_job_id(), "challenge": P.new_challenge().hex()}

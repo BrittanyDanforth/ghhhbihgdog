@@ -156,16 +156,28 @@ JOB_TERM_GRACE_S = 30
 #: socks5h://[user:pass@]host:port -- the userinfo is Tor stream isolation
 #: (IsolateSOCKSAuth), not decoration. gs_common.SOCKS_RE accepts it and the
 #: console must not be the component that forbids it.
-SOCKS_RE = re.compile(r"^socks5h://([A-Za-z0-9._-]+:[A-Za-z0-9._-]*@)?[A-Za-z0-9._-]+:\d{1,5}\Z")
-URL_RE = re.compile(r"^https?://[A-Za-z0-9._\-]+(:\d{1,5})?\Z")
+SOCKS_RE = re.compile(r"^socks5h://([A-Za-z0-9._-]+:[A-Za-z0-9._-]*@)?[A-Za-z0-9._-]+:[0-9]{1,5}\Z")
+URL_RE = re.compile(r"^https?://[A-Za-z0-9._\-]+(:[0-9]{1,5})?\Z")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}\Z", re.I)
 PATH_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,200}\Z")
-DEC_RE = re.compile(r"^\d{1,10}(\.\d{1,12})?\Z")
+#: [0-9] AND NOT \d, ON EVERY NUMERIC FIELD ABOVE AND BELOW.
+#:
+#: \d matches all 455 Unicode decimal digits, and every parser downstream
+#: accepts them: Decimal("٥") is 5, Decimal("０.０５") is 0.05, float("１") is
+#: 1.0. So a money field validated with \d accepted a string that RENDERS as
+#: one thing and PARSES as another -- "٥" is not a 5 to anyone reading it, and
+#: it reached an argv as one. Driven against the shipped pattern before this
+#: change; all four of these matched.
+#:
+#: Nothing here needs a non-ASCII digit, so the fix is to say so in the
+#: pattern rather than to trust each downstream parser to agree about what a
+#: digit is. gs_wake_proto._BTC_RE carries the same note and the same defect.
+DEC_RE = re.compile(r"^[0-9]{1,10}(\.[0-9]{1,12})?\Z")
 #: --hop-delay, as GhostSpiral.parse_hop_delay accepts it: "SECONDS" or
 #: "MIN-MAX" seconds. Bounds are re-checked by parse_hop_delay itself (negative,
 #: backwards, and > HOP_DELAY_MAX all raise there); this only has to keep
 #: anything that is not that shape off the argv.
-HOPDELAY_RE = re.compile(r"^\d{1,7}(-\d{1,7})?\Z")
+HOPDELAY_RE = re.compile(r"^[0-9]{1,7}(-[0-9]{1,7})?\Z")
 #: Monero address: 95 chars, base58 (no 0OIl), 4/8 prefix. Standard AND
 #: subaddress forms both start 4/8 and both are legitimate exit destinations --
 #: an exchange deposit address is normally a subaddress. This is a FORMAT check

@@ -1463,9 +1463,9 @@ MUTATIONS = [
   # confirm step reads one field. The property is unchanged -- the
   # conversation is deleted BEFORE the answer is checked, so a wrong answer
   # cannot be retried against the same sum.
-  "        exit_to = c.exit_to\n"
+  "        exit_to, depth = c.exit_to, c.depth\n"
   "        del self.convos[chat_id]\n",
-  "        exit_to = c.exit_to\n",
+  "        exit_to, depth = c.exit_to, c.depth\n",
   ["test_depo_wizard"]),
 
  # A real command typed mid-flow must not be swallowed as an answer.
@@ -1475,24 +1475,54 @@ MUTATIONS = [
   "        if False:",
   ["test_depo_wizard"]),
 
- ("the wizard accepts a slot outside the ladder", "gs_telegram_pager",
-  # Re-anchored: the bound moved into _slot_from when the wizard started
-  # asking in the operator's own words. Same property -- a rung the ladder
-  # does not have is refused HERE, before a wake is spent finding out.
-  "            if 0 <= n <= hi:",
-  "            if True:",
+ # Re-anchored twice: the bound was in _slot_from when the wizard asked in the
+ # operator's own words, and the ladder is gone entirely now. Same property --
+ # an amount the vault will refuse is refused HERE, before a wake is spent
+ # finding out.
+ ("the wizard accepts an amount the vault will refuse", "gs_wake_proto.py",
+  "    if not DEPOSIT_MIN_SAT <= sat <= DEPOSIT_MAX_SAT:",
+  "    if False:",
+  ["test_depo_wizard", "test_telegram_pager"]),
+
+ # THE ONE THAT WAS ACTUALLY SHIPPED BROKEN. \\d matches all 455 Unicode
+ # decimal digits and int() converts every one, so "\uff11" -- FULLWIDTH DIGIT
+ # ONE, which renders as a slightly wide 1 -- parsed as one whole bitcoin.
+ # Driven before the fix.
+ ("the amount parser goes back to accepting any Unicode digit",
+  "gs_wake_proto.py",
+  '_BTC_RE = re.compile(r"[0-9]{1,9}(?:\\.[0-9]{1,8})?\\Z")',
+  '_BTC_RE = re.compile(r"\\d{1,9}(?:\\.\\d{1,8})?\\Z")',
+  ["test_depo_wizard", "test_telegram_pager"]),
+
+ # The same family at the depth gate, where it is harmless -- and anchored
+ # anyway, because "harmless here" is how it survived at the amount gate.
+ ("the depth menu goes back to accepting any Unicode digit",
+  "gs_telegram_pager",
+  '        if not w or not all(c in "0123456789" for c in w):',
+  "        if not w.isdecimal():",
   ["test_depo_wizard"]),
+
+ # Satoshis handed to a tool that reads bitcoin: a swap quoted for a hundred
+ # million times the intended amount, with nothing erroring anywhere.
+ ("the deposit amount reaches the swap tool as satoshis, not bitcoin",
+  "gs_wake_agent",
+  "            env_extra[\"GS_SWAP_AMOUNTS\"] = proto.sat_to_btc(\n"
+  "                params[\"amount_sat\"])",
+  "            env_extra[\"GS_SWAP_AMOUNTS\"] = str(params[\"amount_sat\"])",
+  ["test_wake_agent", "test_wake_endtoend"]),
 
  # REPRODUCED: "²".isdigit() is True and int("²") raises. Guarded by isdigit
  # the ValueError escaped step_convo -- no reply sent AND the conversation
  # left live, so the operator's next unrelated message was eaten as a slot
  # answer. isdecimal is the predicate that matches what int() accepts.
- ("a superscript digit goes back to escaping the slot check and leaving a "
+ ("a bad amount goes back to escaping the parse and leaving a "
   "conversation live and armed", "gs_telegram_pager",
-  # Re-anchored, same move. isdecimal is the predicate that matches what
-  # int() accepts; isdigit is wider and lets "\u00b2" through to raise.
-  "        if w.isdecimal():",
-  "        if w.isdigit():",
+  # Re-anchored: the slot step is gone and the amount step is where a raising
+  # parse would now escape. proto.btc_to_sat raises WakeError by design, so
+  # removing the guard leaves the conversation armed and unanswered -- which
+  # is the original defect, at the new step.
+  "            except Exception as _e:                          # noqa: BLE001",
+  "            except ZeroDivisionError as _e:",
   ["test_depo_wizard"]),
 
  # REPRODUCED: /cancel@mybot -- the group form this file supports -- cancelled
@@ -1507,10 +1537,14 @@ MUTATIONS = [
  # The ladder bound checked only the top end, so a negative slot indexed from
  # the far end -- ladder[-1] is the largest rung. The only thing stopping it
  # was a range check in another file.
- ("a negative amount slot goes back to selecting the ladder's last rung",
+ # The ladder bound checked only the top end, so a negative slot indexed from
+ # the far end -- ladder[-1] was the largest rung. The ladder is gone; the
+ # lesson is that the box holding the money bounds the number ITSELF, at both
+ # ends, rather than trusting a range check in another file.
+ ("the vault stops re-checking the amount it was handed",
   "gs_wake_agent",
-  "        if not 0 <= slot < len(ladder):",
-  "        if slot >= len(ladder):",
+  '            proto.JOBS["receive_and_quote"]["schema"]["amount_sat"](_amt)',
+  "            pass",
   ["test_depo_wizard", "test_wake_agent"]),
 
  # ---- FOUR DEFECTS THAT WERE LISTED AND THEN NOT FIXED -----------------
@@ -2271,20 +2305,28 @@ MUTATIONS = [
 
  # Offering three rungs and accepting eight offers a choice that is not there;
  # slot 7 on a three-rung ladder is refused at the vault, after a wake.
- ("a slot past the labels is accepted and spends a wake to be refused",
-  "gs_telegram_pager",
-  "            hi = (len(labs) - 1) if labs else 7",
-  "            hi = 7",
+ # Re-anchored: the labels are gone with the ladder, and the same property
+ # now lives at the depth menu -- an option the menu does not offer is refused
+ # HERE, before a wake is spent finding out at the vault.
+ ("a depth the menu does not offer is accepted and spends a wake to be "
+  "refused", "gs_telegram_pager",
+  "        return n if n in proto.WITHDRAW_DEPTHS else None",
+  "        return n",
   ["test_depo_wizard"]),
 
- # A label that is a number is the value the vault's ladder exists to keep off
- # this card.
- ("an amount can be written onto the Pi as a label", "gs_doorbell",
-  # Re-anchored: \Z rather than $, per this repo's own rule and the test that
-  # enforces it -- `$` also matches before a trailing newline.
-  '        if re.match(r"^[0-9.,]+\\Z", str(_lb).strip()):',
-  "        if False:",
-  ["test_wake_doorbell"]),
+ # DELETED, NOT RE-ANCHORED. This mutated the doorbell's refusal of a numeric
+ # --amount-labels value -- "a label that is a number is the value the vault's
+ # ladder exists to keep off this card". The ladder is gone (gs_wake_proto,
+ # above _int_range), the flag is gone, and the validator went with them, so
+ # there is no line left to mutate: an absence cannot be broken by an edit.
+ #
+ # Removed rather than pointed at something adjacent, because a mutation
+ # re-aimed at a different guarantee under its old name is worse than no
+ # mutation -- the tally still says the original property is swept. What
+ # replaces it is a plain assertion in tests/test_wake_doorbell.py that the
+ # removal is COMPLETE: no amount_labels on the card, no flag on the parser,
+ # no validator in the source, and argparse refusing a pairing that still
+ # passes it.
 
  # ---- the vault finds its own money, and leaves nothing behind ----------
  #
@@ -2293,8 +2335,11 @@ MUTATIONS = [
  # withdrawn -- and the operator had to remember which label named which pile.
  # The machine holding the wallet is the one that can see where the money is.
  ("the withdraw job goes back to demanding a handle", "gs_wake_proto.py",
-  '        "schema": {"exit_to": _xmr_address_field},',
-  '        "schema": {"handle": _handle_field, "exit_to": _xmr_address_field},',
+  '        "schema": {"exit_to": _xmr_address_field,\n'
+  '                   "depth": _int_range(1, 3)},',
+  '        "schema": {"handle": _handle_field,\n'
+  '                   "exit_to": _xmr_address_field,\n'
+  '                   "depth": _int_range(1, 3)},',
   ["test_wake_agent"]),
 
  # Summing subaddresses would mean a first transaction spending inputs from
@@ -2327,10 +2372,40 @@ MUTATIONS = [
  # that drew high went over, and over budget is not a late report: run_child
  # SIGTERMs the process group and then SIGKILLs it, mid-mix, with the money
  # already moving.
- ("the spending budget goes back to fitting only the median",
+ # The budget was 21600 (6h), computed against a hop-delay window of
+ # (300, 300). DEFAULT_HOP_DELAY is (180, 720), so at the real slow end even
+ # the SHALLOWEST depth needs 6.1h and every withdrawal would have been
+ # SIGKILLed mid-mix. It is derived from the depth table now; this puts the
+ # constant back.
+ ("the spending budget goes back to a hand-typed constant that fits nothing",
   "gs_wake_proto.py",
+  '        "budget_s": int(max(t for _w, t in WITHDRAW_DEPTHS.values()) * 1.25),',
   '        "budget_s": 21600,',
-  '        "budget_s": 14400,',
+  ["test_wake_agent"]),
+
+ # The margin covers FANOUT_CONFIRM_POLL_ESTIMATE, which is an estimate of
+ # chain confirmation time and is not bounded by anything in this repo. The
+ # hop-delay term IS a ceiling; this one is not.
+ ("the spending budget fits its worst case exactly, with no margin",
+  "gs_wake_proto.py",
+  "WITHDRAW_DEPTHS.values()) * 1.25),",
+  "WITHDRAW_DEPTHS.values()) * 1.0),",
+  ["test_wake_agent"]),
+
+ # A depth row whose claimed seconds no longer match GhostSpiral's own
+ # arithmetic. This drifted for real: depth 3 claimed 47040s against 46560s.
+ ("a depth's claimed runtime drifts from the arithmetic it came from",
+  "gs_wake_proto.py",
+  "    3: (20, 46560),    # 12.9h",
+  "    3: (20, 20000),    # wrong",
+  ["test_wake_agent"]),
+
+ # The whole point of the change: a single pinned hop count is a FLOOR on
+ # what can be withdrawn at all, because the mix minimum rises with it.
+ ("the deepest mix is offered without the budget to finish it",
+  "gs_wake_proto.py",
+  "    3: (20, 46560),    # 12.9h",
+  "    4: (60, 46560),    # unfundable",
   ["test_wake_agent"]),
 
  # At 20 wallets the same job takes 4.2h and at 40 it takes 6.2h. Leaving the
@@ -2338,8 +2413,28 @@ MUTATIONS = [
  # property nobody would think to check.
  ("the mix inherits its wallet count from another file's default",
   "gs_wake_agent",
-  '                 "--wallets", str(WITHDRAW_WALLETS),\n',
+  '                 "--wallets", str(withdraw_wallets(params["depth"])),\n',
   "",
+  ["test_wake_agent"]),
+
+ # The operator's chosen depth is ignored and every withdrawal mixes at one
+ # hop count again -- which is the defect the depth exists to fix, and it
+ # would look exactly like working software.
+ ("the chosen depth is ignored and every mix runs at one pinned count",
+  "gs_wake_agent",
+  '"--wallets", str(withdraw_wallets(params["depth"])),',
+  '"--wallets", "10",',
+  ["test_wake_agent"]),
+
+ # Defaulting instead of refusing means a depth nobody chose gets spent at.
+ # test_wake_agent only: withdraw_wallets is reached from build_argv, which the
+ # wizard suite never calls for a withdrawal. Listing a suite that cannot go
+ # red for a mutation makes the tally read as broader coverage than it is.
+ ("a depth off the table silently becomes the shallowest instead of refusing",
+  "gs_wake_agent",
+  "    if isinstance(depth, bool) or not isinstance(depth, int) \\\n"
+  "            or depth not in proto.WITHDRAW_DEPTHS:",
+  "    if False:",
   ["test_wake_agent"]),
 
  # ---- the spending job has to be able to SIGN ---------------------------
@@ -2507,7 +2602,7 @@ MUTATIONS = [
   "        s = int(arg)\n"
   "        if not 0 <= s <= 7:\n"
   '            return "", {}, "slot must be 0-7"\n'
-  '        return "receive_and_quote", {"amount_slot": s}, ""',
+  '        return "receive_and_quote", {"amount_sat": 5000000}, ""',
   ["test_depo_wizard"]),
 
  # The one file the pager persists held a float per poke: the exact second the
@@ -2724,8 +2819,8 @@ MUTATIONS = [
  ("the confirm names the machine it is about to wake", "gs_telegram_pager",
   # Re-anchored: the confirm names the operator's own word now, not a slot
   # number. It still must not name the machine.
-  '                      f"Deposit — {_named}. This wakes the machine.\\n\\n{q}")',
-  '                      f"Deposit — {_named}. This wakes the VAULT.\\n\\n{q}")',
+  '                      f"This wakes the machine.\\n\\n{q}")',
+  '                      f"This wakes the VAULT.\\n\\n{q}")',
   ["test_depo_wizard"]),
 
  # The label is copied rather than imported (the phone-side box has no reason

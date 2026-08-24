@@ -21,6 +21,7 @@ one failure this feature must not introduce.
 Everything is injected. No systemd, no Pi, no network, no real WOL, no sleeping.
 """
 import contextlib
+from decimal import Decimal
 import importlib.machinery
 import importlib.util
 import io
@@ -84,7 +85,7 @@ TP = NP.PrivateKey.generate()
 PI = NP.PrivateKey.generate()
 
 
-def new_env(job="receive_and_quote", params=None, ladder=("0.01", "0.05")):
+def new_env(job="receive_and_quote", params=None):
     """A scratch vault: keyfile, artifact dir, and a doorbell holding one job."""
     d = Path(tempfile.mkdtemp(prefix="wakeagent_"))
     key = {"schema": "gs_wake_v1", "version": 1, "role": "thinkpad",
@@ -93,7 +94,7 @@ def new_env(job="receive_and_quote", params=None, ladder=("0.01", "0.05")):
            "doorbell_url": "http://10.0.0.9:8770",
            "tor_proxy": "socks5h://127.0.0.1:9050",
            "rpc_primary": "http://127.0.0.1:18083",
-           "artifact_dir": str(d), "amount_ladder": list(ladder),
+           "artifact_dir": str(d),
            "account_ceiling": 45}
     kf = d / "tp.key"
     # THE REAL CONTAINER, not a hand-built dict. A fixture that writes a shape
@@ -103,7 +104,7 @@ def new_env(job="receive_and_quote", params=None, ladder=("0.01", "0.05")):
     os.chmod(kf, 0o400)
     bell = DB.Pending({"secret": PI.encode().hex(),
                        "peer_public": TP.public_key.encode().hex()},
-                      job, params if params is not None else {"amount_slot": 1},
+                      job, params if params is not None else {"amount_sat": 5000000},
                       clock=lambda: 0.0)
     return d, kf, key, bell
 
@@ -204,20 +205,35 @@ check("...and no argv element points anywhere near the doorbell — "
       not any("10.0.0.9" in a for a in argv_all))
 check("the AMOUNT rides in the environment, never argv "
       "(/proc/<pid>/cmdline is 0444)",
-      env_all.get("GS_SWAP_AMOUNTS") == "0.05"
-      and not any("0.05" == a for a in argv_all))
-check("the amount is selected by LADDER INDEX, so the note carries no number",
-      "amount_slot" in P.JOBS["receive_and_quote"]["schema"])
+      env_all.get("GS_SWAP_AMOUNTS") == "0.05000000"
+      and not any("0.05" in a for a in argv_all))
+# THE NOTE CARRIES SATOSHIS; THE CHILD IS HANDED BITCOIN. Both halves, because
+# str() on the wire value is also a plausible-looking GS_SWAP_AMOUNTS and
+# would quote a swap for five million bitcoin without erroring anywhere.
+# EXACT VALUES, NOT SUBSTRINGS. The first version of this check asked whether
+# "5000000" appeared anywhere in the environment -- and it does, inside
+# "0.05000000", so the check failed on correct behaviour. A containment test
+# on a number is a test that goes red for the wrong reason and then gets
+# deleted by whoever is in a hurry.
+check("the note's satoshi count never reaches the child as a raw number",
+      "5000000" not in set(env_all.values())
+      and "5000000" not in set(argv_all))
+check("the amount is a bounded satoshi count on the wire",
+      "amount_sat" in P.JOBS["receive_and_quote"]["schema"])
 
-# Plant the address in every field a note can reach, and in the ladder.
-d2, kf2, key2, bell2 = new_env(params={"amount_slot": 0}, ladder=(XMR,))
+# AN ADDRESS PLANTED IN THE NOTE'S AMOUNT FIELD. This block used to plant one
+# in the vault's amount LADDER and prove it reached the environment rather
+# than argv; the ladder is gone, so the question becomes the sharper one --
+# the note is the only thing an attacker writes, so what happens when the
+# thing they write is an address?
+d2, kf2, key2, bell2 = new_env()
+bell2.params = {"amount_sat": XMR}
 dp2 = deps_for(d2, bell2)
 out2, err2, _t = run(kf2, dp2)
-argv2 = [a for argv, _e in dp2["_ran"] for a in argv]
-check("even an address planted in the ladder never reaches argv",
-      not any(XMR in a for a in argv2))
-check("...it reaches the child's ENV instead, which is mode 0400",
-      any(XMR in v for _a, e in dp2["_ran"] for v in e.values()))
+check("a note whose amount is an ADDRESS is refused outright",
+      out2 is None and err2 is not None)
+check("...and no child ran at all, so it reached neither argv nor an env var",
+      dp2["_ran"] == [])
 
 
 # ===========================================================================
@@ -227,7 +243,7 @@ for bad in ("--tor-proxy", "socks5h://10.0.0.9:9050", "--allow-unbound-memo",
             "--rpc", "--dests", XMR):
     d3, kf3, _k, bell3 = new_env()
     # A doorbell that has been told to send a flag-shaped value.
-    bell3.params = {"amount_slot": bad}
+    bell3.params = {"amount_sat": bad}
     out3, err3, _t = run(kf3, deps_for(d3, bell3))
     check(f"a note carrying {bad[:20]!r} is refused",
           out3 is None and err3 is not None)
@@ -410,7 +426,7 @@ first = json.loads((d12 / "gs_wake_state.json").read_text())["jobs"][0]["id"]
 # A doorbell (buggy or compromised) re-issuing the SAME job_id on a later boot.
 bell13 = DB.Pending({"secret": PI.encode().hex(),
                      "peer_public": TP.public_key.encode().hex()},
-                    "receive_and_quote", {"amount_slot": 1}, clock=lambda: 0.0)
+                    "receive_and_quote", {"amount_sat": 5000000}, clock=lambda: 0.0)
 bell13.job_id = first
 out13, err13, _t = run(kf12, deps_for(d12, bell13))
 check("the same job_id on a later boot is REFUSED — a second slip would "
@@ -992,7 +1008,7 @@ check("...and no argv template offers --any, which would report a dust probe "
 # the path. If that step fails the slip was never written, and leaving the
 # path in makes a later watch die inside receive_watch instead of refusing.
 dw4, kfw4, _k, bellw4 = new_env(job="receive_and_quote",
-                                params={"amount_slot": 0})
+                                params={"amount_sat": 5000000})
 
 
 def _quote_fails(argv, env_extra, budget):
@@ -1025,9 +1041,9 @@ _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
       # NO-RESULT outcome mutation_sweep scores as no verdict at all.
       "wallet_file": "/var/lib/gs/spend.wallet"}
 _XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
-_sample = {"receive_new": {"count": 1}, "receive_and_quote": {"amount_slot": 0},
+_sample = {"receive_new": {"count": 1}, "receive_and_quote": {"amount_sat": 5000000},
            "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
-           "withdraw": {"exit_to": _XMR_SAMPLE}}
+           "withdraw": {"exit_to": _XMR_SAMPLE, "depth": 1}}
 # Asserted rather than assumed: this loop runs over P.JOBS, so a job added
 # without a sample here KeyErrors and kills the suite -- which mutation_sweep
 # scores NO-RESULT, not CAUGHT. A missing sample should read as one red line.
@@ -1093,7 +1109,7 @@ _saved_il = A.integrity_log
 try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
-        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE},
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                     _k, _wdir, "A3F1", _capture, "job-1",
                     funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
 finally:
@@ -1155,7 +1171,7 @@ _saved_il2 = A.integrity_log
 try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
-        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE}, _k, _wdir, "B2C4",
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1}, _k, _wdir, "B2C4",
                     _capture, "job-5", funded=lambda: None)
     check("dispatch: an empty wallet is refused", False)
 except A.Refused as _e5:
@@ -1209,7 +1225,7 @@ check("dispatch: NON-VACUITY -- ...and that ordinary job really ran a child, "
 # succeeded, so the money has already moved when it stops.
 print("\n== the spending job can actually sign ==")
 _kw = dict(_k)
-_wargv2 = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE},
+_wargv2 = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                        _kw, _wdir, bundle=str(_wdir / "wallet_recv_1.json"),
                        slip=None, handle="A3F1")[0]
 check("sign: the composed argv names the wallet to sign with",
@@ -1223,7 +1239,7 @@ check("sign: ...from the KEYFILE, never from the job parameters — a note that 
 _kn = dict(_k)
 _kn.pop("wallet_file", None)
 try:
-    A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE},
+    A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                  _kn, _wdir, bundle="b", slip=None, handle="A3F1")
     check("sign: a keyfile with no wallet file is refused", False)
 except A.Refused as _e:
@@ -1255,55 +1271,131 @@ _GS = importlib.util.module_from_spec(
     importlib.util.spec_from_loader(_gld.name, _gld))
 _gld.exec_module(_GS)
 
-def _hours(window, wallets=None):
+def _hours(window, wallets):
     """GhostSpiral's own estimate, as a number rather than its "~3.2h" text.
 
     The output count is derived from `wallets` HERE rather than read from a
     module-level constant: the first version took only the window, so changing
     _wargs.wallets for the 40-wallet partner left the output count at 10 and
     the check compared a number against itself.
+
+    `wallets` IS NOW REQUIRED. It defaulted to A.WITHDRAW_WALLETS -- a single
+    pinned hop count for every withdrawal -- and that constant is exactly what
+    this section stopped being about: the operator picks a depth, so there are
+    three runtimes to fit, not one.
     """
-    _w = A.WITHDRAW_WALLETS if wallets is None else wallets
     _a = types.SimpleNamespace(dag_mixing=True, deep=2, peel=False,
-                               wallets=_w, split=1, hop_delay=None,
+                               wallets=wallets, split=1, hop_delay=None,
                                exit_to=["x"])
-    _t = _GS.estimate_runtime(_a, 1, _w + _GS.DECOY_MAX, window)
+    _t = _GS.estimate_runtime(_a, 1, wallets + _GS.DECOY_MAX, window)
     return float(re.search(r"([\d.]+)\s*h", _t).group(1))
 
 
-_median_h = _hours((60, 300))
-_worst_h = _hours((300, 300))
+# THE WINDOW IS GhostSpiral's OWN DEFAULT, and reading it rather than typing
+# it is the whole point of this block.
+#
+# The shipped budget was computed against a hop-delay window of (300, 300),
+# which is not the default and never was: DEFAULT_HOP_DELAY is (180, 720). At
+# the real slow end even the SHALLOWEST depth needs 6.1h against a budget that
+# was 6.0h, so every withdrawal would have been SIGKILLed mid-mix with the
+# money already moving. A test that hard-codes the window cannot catch that,
+# because it agrees with the mistake.
+_LO, _HI = _GS.DEFAULT_HOP_DELAY
+check(f"budget: the window used here is GhostSpiral's own default "
+      f"({_LO}, {_HI}), not a number typed into this test",
+      (_LO, _HI) == _GS.DEFAULT_HOP_DELAY and _HI > _LO)
+
 _budget_h = P.JOBS["withdraw"]["budget_s"] / 3600.0
-check(f"budget: the worst case ({_worst_h}h) fits inside the budget "
-      f"({_budget_h}h)", _budget_h > _worst_h)
-# THE MARGIN IS THE POINT. Fitting exactly is what the deadman did, and a sum
-# of thirty random draws does not respect an exact fit.
-check(f"budget: ...with real margin, not exactly ({_budget_h}h vs "
-      f"{_worst_h}h)", _budget_h >= _worst_h * 1.25)
-# NON-VACUITY 1: the worst case is genuinely worse than the median, so this is
-# not two names for the same number.
-check(f"budget: NON-VACUITY -- the worst case really is worse than the median "
-      f"({_worst_h}h vs {_median_h}h)", _worst_h > _median_h * 1.2)
-# NON-VACUITY 2: the OLD budget would have failed this check. Stated as a
-# number rather than a memory, so the check is demonstrably able to say no.
-check("budget: NON-VACUITY -- the budget this replaced (4h) would NOT have "
-      "fit, which is the defect this check exists for", 4.0 < _worst_h)
-# THE WALLET COUNT IS PINNED, or the estimate above is about a run nobody
-# composes. At 20 the same job takes 4.2h and at 40 it takes 6.2h.
-_pin_argv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE},
+
+# EVERY DEPTH THE PROTOCOL OFFERS MUST FIT, and each row's claimed seconds
+# must match what GhostSpiral actually says. Two separate failures: a depth
+# whose runtime nobody rechecked, and a table whose numbers drifted from the
+# arithmetic they were copied from. The second one was real -- depth 3 claimed
+# 47040s against a recomputed 46560s.
+for _d, (_w, _claimed) in sorted(P.WITHDRAW_DEPTHS.items()):
+    _h = _hours((_HI, _HI), _w)
+    check(f"budget: depth {_d} ({_w} hops, {_h}h) fits inside the budget "
+          f"({_budget_h}h)", _budget_h > _h)
+    check(f"budget: ...with real margin, not exactly (depth {_d})",
+          _budget_h >= _h * 1.25)
+    # THE TABLE'S OWN NUMBER, recomputed from GhostSpiral rather than trusted.
+    _secs, _ntx = _GS._runtime_terms(
+        types.SimpleNamespace(dag_mixing=True, deep=2, peel=False, wallets=_w,
+                              split=1, hop_delay=None, exit_to=["x"]),
+        1, _w + _GS.DECOY_MAX, Decimal(_HI),
+        Decimal(_GS.FANOUT_CONFIRM_POLL_ESTIMATE))
+    check(f"budget: WITHDRAW_DEPTHS[{_d}] claims {_claimed}s and GhostSpiral "
+          f"computes {int(_secs)}s", int(_secs) == _claimed)
+    # AND THE DEPTH REACHES THE MIX. A table nothing reads is a table that
+    # says whatever you like.
+    _argv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": _d},
                          _k, _wdir, bundle="b", slip=None, handle="A3F1")[0]
-check("budget: the composed argv PINS --wallets rather than inheriting a "
-      "default from another file",
-      "--wallets" in _pin_argv
-      and _pin_argv[_pin_argv.index("--wallets") + 1] == str(A.WITHDRAW_WALLETS))
-# NON-VACUITY 3: raising it really would break the fit, so pinning it matters.
-_big_h = _hours((300, 300), wallets=40)
-check(f"budget: NON-VACUITY -- at 40 wallets the same job would NOT fit "
-      f"({_big_h}h vs {_budget_h}h), which is why the count is pinned",
+    check(f"budget: choosing depth {_d} composes --wallets {_w}",
+          "--wallets" in _argv
+          and _argv[_argv.index("--wallets") + 1] == str(_w))
+
+# THE BUDGET IS SIZED FROM THE DEEPEST ROW, so adding a fourth depth without
+# raising the budget goes red here rather than in production at hour thirteen.
+_deepest = max(_t for _w, _t in P.WITHDRAW_DEPTHS.values())
+check(f"budget: it is sized from the DEEPEST depth ({_deepest}s), not the "
+      f"shallowest", P.JOBS["withdraw"]["budget_s"] > _deepest)
+
+# NON-VACUITY 1: the worst case is genuinely worse than the median, so the
+# figures above are not two names for the same number.
+_shallow = min(_w for _w, _t in P.WITHDRAW_DEPTHS.values())
+_median_h = _hours((_LO, _HI), _shallow)
+_worst_h = _hours((_HI, _HI), _shallow)
+check(f"budget: NON-VACUITY -- the worst case really is worse than the median "
+      f"({_worst_h}h vs {_median_h}h)", _worst_h > _median_h)
+# NON-VACUITY 2: the budget this replaced would have failed. Stated as a
+# number rather than a memory, so the check is demonstrably able to say no.
+check("budget: NON-VACUITY -- the 6h budget this replaced would NOT have fit "
+      "even the SHALLOWEST depth, which is the defect this exists for",
+      6.0 < _worst_h)
+# NON-VACUITY 3: a depth outside the table really would not fit, which is why
+# the note cannot name one.
+_big_h = _hours((_HI, _HI), 40)
+check(f"budget: NON-VACUITY -- at 40 hops the same job would NOT fit "
+      f"({_big_h}h vs {_budget_h}h), which is why depth is a closed table",
       _big_h > _budget_h)
+# AND A DEPTH OFF THE TABLE IS REFUSED BY THE BOX THAT SPENDS, not just by the
+# schema two files away.
+for _bad in (0, 4, 40, -1, None, "2", 2.5, True):
+    try:
+        A.withdraw_wallets(_bad)
+        _ref = False
+    except A.Refused:
+        _ref = True
+    check(f"budget: the vault refuses depth {_bad!r} rather than defaulting",
+          _ref)
 # AND THE BACKSTOP IS LONGER THAN THE BUDGET, or it becomes the killer.
 check("budget: the deadman extension outlasts the budget it protects",
       P.result_budget_s("withdraw") + 600 > P.JOBS["withdraw"]["budget_s"])
+
+# ---- AND THE DEPOSIT AMOUNT IS BOUNDED BY THE BOX THAT ACTS ON IT -------
+#
+# The schema bounds it on the wire; this is the second check, in the file
+# that composes the argv. Its predecessor guarded a ladder index and read
+# `slot >= len(ladder)` -- one end only -- so a NEGATIVE slot indexed from the
+# far end into ladder[-1], the largest rung, and the refusal never fired. The
+# only thing that stopped it was a range check two files away, which is a real
+# check and is also somebody else's.
+#
+# Here rather than only in test_depo_wizard: this is gs_wake_agent's own
+# behaviour, and a mutation to it should go red in gs_wake_agent's own suite.
+for _sat, _want_refusal in ((-1, True), (0, True),
+                            (P.DEPOSIT_MIN_SAT - 1, True),
+                            (P.DEPOSIT_MAX_SAT + 1, True), (10 ** 18, True),
+                            ("0.05", True), (5_000_000.0, True), (True, True),
+                            (P.DEPOSIT_MIN_SAT, False), (5_000_000, False),
+                            (P.DEPOSIT_MAX_SAT, False)):
+    try:
+        A.build_argv("receive_and_quote", {"amount_sat": _sat}, _k, _wdir)
+        _ref = False
+    except A.Refused:
+        _ref = True
+    check(f"amount: the vault {'refuses' if _want_refusal else 'accepts'} "
+          f"{_sat!r} satoshis", _ref == _want_refusal)
 
 # ---- WHAT BOUNDS A WITHDRAWAL, NOW THAT ONE CAN HAPPEN ------------------
 #
@@ -1332,15 +1424,26 @@ check("bound: ...and the fan-out's change rests in that same account",
 _CRW = open(os.path.join(REPO, "create_receive_wallet"), encoding="utf-8").read()
 check("bound: each receive gets its OWN account, so deposits do not pool",
       "create_fresh_account" in _CRW)
-check("bound: the job carries ONLY a destination — no handle to remember, "
-      "and no account for a chat message to name",
-      list(P.JOBS["withdraw"]["schema"]) == ["exit_to"])
-# NON-VACUITY: there is no AMOUNT field anywhere on this path, so nothing lets
-# a caller ask for more than the bundle holds -- and nothing lets them ask for
-# less either, which is worth knowing.
-check("bound: NON-VACUITY -- no job schema takes an amount at all",
-      not any("amount" in k for sp in P.JOBS.values() for k in sp["schema"]
-              if k != "amount_slot"))
+# WHERE IT GOES AND HOW DEEP, and nothing else. No handle to remember and no
+# account index for a chat message to name -- the vault finds its own funded
+# output. `depth` joined this list because a single pinned hop count was a
+# floor on what could be withdrawn at all (the mix minimum rises with the hop
+# count), and it is safe to add precisely because it names a row of a closed
+# table rather than a quantity.
+check("bound: the job carries a destination and a depth — no handle to "
+      "remember, and no account for a chat message to name",
+      sorted(P.JOBS["withdraw"]["schema"]) == ["depth", "exit_to"])
+# NON-VACUITY: there is no AMOUNT field on the WITHDRAW path, so nothing lets
+# a caller ask for more than the wallet holds -- and nothing lets them ask for
+# less either, which is worth knowing. The deposit path does carry one, which
+# is a different job that spends nothing.
+check("bound: NON-VACUITY -- the spending job takes no amount at all",
+      not any("amount" in k for k in P.JOBS["withdraw"]["schema"]))
+check("bound: NON-VACUITY -- and the only job that DOES name an amount is one "
+      "that cannot spend",
+      [j for j, sp in P.JOBS.items()
+       if any("amount" in k for k in sp["schema"])] == ["receive_and_quote"]
+      and "receive_and_quote" not in P.SPENDING_JOBS)
 check("bound: NON-VACUITY -- and the daily cap really exists to bound the "
       "second withdrawal", "daily_wake_budget" in open(
           os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read())
@@ -1431,7 +1534,7 @@ try:
     A.integrity_log = lambda *a, **k: None
     os.environ["GS_WALLET_PASSWORD"] = "spend-secret"
     with contextlib.redirect_stdout(io.StringIO()):
-        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE},
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                     _kw, _wdir, "A3F1", _capture, "job-3",
                     funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
     check("env: the spending step IS handed the password",

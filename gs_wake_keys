@@ -63,7 +63,6 @@ WHAT THIS TOOL REFUSES
   * to write anywhere group- or world-readable
   * to guess this machine's MAC. It detects it from the interface that carries
     the route to the Pi, and refuses with instructions if it cannot
-  * to accept an amount ladder longer than the wire format's slot range
   * to run at all without PyNaCl
 """
 from __future__ import annotations
@@ -75,7 +74,6 @@ import re
 import socket
 import struct
 import sys
-from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -111,9 +109,6 @@ def is_ipv4(v: str) -> bool:
     if not isinstance(v, str) or not IPV4_RE.match(v):
         return False
     return all(str(int(p)) == p and 0 <= int(p) <= 255 for p in v.split("."))
-#: amount_slot is validated as int 0..7 on the wire, so a ladder longer than
-#: that has entries no note can ever select. Refuse rather than carry them.
-MAX_LADDER = 8
 
 THINKPAD_FILE = "gs_wake_thinkpad.key"
 #: The ceremony's own port. Open for one connection, once, ever. It is not the
@@ -262,14 +257,18 @@ def build_cli() -> argparse.ArgumentParser:
                    help="ABSOLUTE path where woken jobs write bundles and "
                         "slips. Must match ReadWritePaths= and "
                         "WorkingDirectory= in systemd/gs-wake-agent.service.")
-    p.add_argument("--amount-ladder", nargs="*", default=[], metavar="BTC",
-                   help=f"up to {MAX_LADDER} BTC amounts a wake may select by "
-                        f"INDEX. The Pi never sends a number - it sends a slot.")
+    # --amount-ladder IS GONE. It held the BTC amounts a wake could select by
+    # index, so the Pi sent a slot and never a number. The chat now asks for
+    # the amount being sent and the wire carries it in satoshis; see
+    # gs_wake_proto above _int_range for why a pre-declared rung was the wrong
+    # answer to "how much are you depositing". Removed rather than accepted
+    # and ignored: a flag that still parses but changes nothing is worse than
+    # one that errors.
     # OFF BY DEFAULT, AND OFF IN EVERY KEYFILE WRITTEN BEFORE IT EXISTED.
     # gs_wake_agent reads it with .get(), so an old keyfile means no -- an
     # upgraded pair does not silently gain the ability to spend. Turning it on
     # requires re-pairing, which requires physical access to both boxes, which
-    # is the same bar the amount ladder sits behind.
+    # is the same bar every other keyfile setting sits behind.
     p.add_argument("--allow-withdraw", action="store_true",
                    help="let a wake run the mix and send funds OUT. Off by "
                         "default. It means the spend wallet is reachable by a "
@@ -309,18 +308,6 @@ def _validate(args) -> None:
         sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "
                  f"agent runs from a unit with its own WorkingDirectory, so a "
                  f"relative path resolves somewhere you did not mean.")
-    for a in args.amount_ladder:
-        # Shape only. thor_swap_preparer does the real Decimal validation; this
-        # refuses the obviously-wrong now rather than at 3am on a woken box.
-        # Decimal, not float: the regex already blocks inf and 1e9, but this
-        # repo has paid for a float on a money path once.
-        if not re.match(r"^\d+(\.\d+)?\Z", a) or Decimal(a) <= 0:
-            sys.exit(f"[!] --amount-ladder entry {a!r} is not a positive "
-                     f"decimal BTC amount.")
-    if len(args.amount_ladder) > MAX_LADDER:
-        sys.exit(f"[!] --amount-ladder has {len(args.amount_ladder)} entries; "
-                 f"the wire format carries a slot index 0..{MAX_LADDER - 1}, so "
-                 f"anything past {MAX_LADDER} could never be selected.")
     if args.account_ceiling < 1:
         sys.exit("[!] --account-ceiling must be at least 1.")
     if not 1 <= args.daily_wake_budget <= 1000:
@@ -508,7 +495,6 @@ def do_pair(args) -> int:
         "tor_proxy": args.tor_proxy,
         "rpc_primary": args.rpc,
         "artifact_dir": args.artifact_dir,
-        "amount_ladder": list(args.amount_ladder),
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),
         "allow_withdraw": bool(args.allow_withdraw),

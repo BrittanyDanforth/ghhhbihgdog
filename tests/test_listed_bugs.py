@@ -326,7 +326,7 @@ def _env():
     os.chmod(kf, 0o400)
     bell = DB.Pending({"secret": PI.encode().hex(),
                        "peer_public": TP.public_key.encode().hex()},
-                      "receive_and_quote", {"amount_slot": 1},
+                      "receive_and_quote", {"amount_sat": 5000000},
                       clock=lambda: 0.0)
     return d, kf, bell
 
@@ -408,7 +408,7 @@ def _dispatch_with(child, d):
     out = None
     with contextlib.redirect_stdout(buf):
         try:
-            out = A._dispatch("receive_and_quote", {"amount_slot": 1}, _k3, d,
+            out = A._dispatch("receive_and_quote", {"amount_sat": 5000000}, _k3, d,
                               "ZZZZ", child, "j" * 24)
         except A.Refused as e:
             caught = e
@@ -469,7 +469,7 @@ _KEY = {"role": "pi", "secret": PI.encode().hex(),
         "listen_host": "127.0.0.1", "listen_port": 0,
         "target_mac": "aa:bb:cc:dd:ee:ff", "wol_broadcast": "255.255.255.255",
         "wol_port": 9}
-_pend = DB.Pending(_KEY, "receive_and_quote", {"amount_slot": 1})
+_pend = DB.Pending(_KEY, "receive_and_quote", {"amount_sat": 5000000})
 _dport = _port()
 _srv = DB.BoundedHTTPServer(("127.0.0.1", _dport), DB.make_handler(_pend))
 threading.Thread(target=_srv.serve_forever, daemon=True).start()
