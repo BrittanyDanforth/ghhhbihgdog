@@ -44,6 +44,7 @@ from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json, check_daemon_relay_egress,
     integrity_log_once,
+    MAX_PLANNED_DELAY, delay_is_sane,
     install_signal_handlers, shutdown_requested, redact_addresses,
 )
 
@@ -80,44 +81,6 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
 PROGRESS_SCHEMA = "broadcast_progress_v2"
-
-# Sanity cap on a manifest-supplied per-TX delay (7 days). The manifest is the
-# sign->relay trust boundary: an absurd delay from a corrupted or tampered
-# manifest would park signed transactions unbroadcast for effectively ever.
-MAX_PLANNED_DELAY = 7 * 24 * 3600
-
-
-def delay_is_sane(value, cap: bool = True) -> bool:
-    """Is this a per-TX delay this relay will honour? ONE rule, TWO readers.
-
-    The manifest path validated strictly -- "a float, a bool or a negative
-    index means it was tampered with or corrupted, and coercing it would
-    silently mis-key a transaction's delay" -- and the fallback that recovers
-    delays from an unsigned plan did `int(tx["delay"])` inside a
-    try/except (TypeError, ValueError). int() COERCES, so that except never
-    fired for the values the manifest rule exists to catch. Driven, same value
-    down both paths:
-
-        True        manifest REFUSED          plan accepted as 1
-        3600.9      manifest REFUSED          plan accepted as 3600
-        -500        manifest REFUSED          plan accepted as -500
-        "604800"    manifest REFUSED          plan accepted as 604800
-        10**12      manifest REFUSED (cap)    plan accepted as 10**12
-
-    The last one is the expensive one: 10**12 seconds is ~31,700 years, and
-    MAX_PLANNED_DELAY's own refusal says why that matters -- "a manifest that
-    stalls the relay indefinitely leaves signed transactions sitting
-    unbroadcast". The unsigned plan is read off local disk and is not signed at
-    all, so it is a WEAKER trust boundary than the manifest, and it was the one
-    validated less.
-
-    cap=False for the manifest reader, which reports the over-cap case with its
-    own sentence naming MAX_PLANNED_DELAY; everything else takes the whole rule.
-    """
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return False
-    return not cap or value <= MAX_PLANNED_DELAY
-
 
 def _blob_sort_key(p: Path) -> int:
     """Extract the TX's real manifest index from tx_N.signed's filename.
@@ -707,6 +670,11 @@ def main():
     # signed_manifest_v1.json, both covered end to end by
     # tests/real_delay_pipeline_testnet.py -- so refusing to guess costs
     # nothing a correctly signed batch needs.
+    # Bound OUTSIDE the branch that fills it. The reader below sits in the
+    # `else` of a condition equivalent to this `if`, so it is reachable only
+    # when this block ran -- true today, and a coupling between two separate
+    # conditions that a later edit would not see.
+    rejected = []
     if not any(i.delay for i in items):
         candidates = []
         for pf_path in sorted(Path(".").glob("unsigned/unsigned_*.json")):
@@ -722,6 +690,7 @@ def main():
             if len(txs) != len(items):
                 continue
             by_idx = {}
+            _bad_delay = None
             for pos, tx in enumerate(txs):
                 if isinstance(tx, dict) and "delay" in tx:
                     # THE SAME RULE THE MANIFEST GETS. This was
@@ -736,11 +705,26 @@ def main():
                     # relay whose own manifest is fine. Same shape the old
                     # except had.
                     if not delay_is_sane(tx["delay"]):
+                        _bad_delay = (pos, tx["delay"])
                         by_idx = {}
                         break
                     by_idx[pos] = tx["delay"]
             if by_idx:
                 candidates.append((pf_path, by_idx))
+            elif _bad_delay is not None:
+                # SAY THAT A MATCHING PLAN WAS THROWN AWAY. Discarding it
+                # silently leaves exactly one line of output -- "WARNING: No TX
+                # delays found - all TXs will broadcast with minimal gap!" --
+                # which reads as "there is no plan for these blobs" and sends
+                # the operator to re-sign. The truth is that a plan matching
+                # this batch IS there and one field in it is not a delay,
+                # which is a five-second fix on a file they already have.
+                #
+                # It matters because of what happens next: relaying with no
+                # schedule is the timing correlation the delays exist to
+                # prevent, and an operator who believes no schedule exists will
+                # proceed.
+                rejected.append((pf_path.name, _bad_delay))
         if len(candidates) == 1:
             for it in items:
                 it.delay = candidates[0][1].get(it.idx, 0)
@@ -764,6 +748,21 @@ def main():
     else:
         integrity_log("broadcast", "WARNING:no_delays_found")
         print("  [!] WARNING: No TX delays found - all TXs will broadcast with minimal gap!")
+        # ...AND IF A MATCHING PLAN WAS THROWN AWAY, SAY SO. Without this the
+        # line above is the operator's whole picture, and it means "no plan
+        # exists" -- so they re-sign, or they shrug and relay with no schedule.
+        # A plan that matched this batch and was discarded for one unusable
+        # delay field is a different situation with a much cheaper fix, and it
+        # was invisible.
+        for _name, (_pos, _val) in rejected:
+            print(f"  [!] {_name} MATCHES this batch but was discarded: its "
+                  f"tx[{_pos}] 'delay' is {_val!r}, which is not a "
+                  f"non-negative int at most {MAX_PLANNED_DELAY}s.")
+            print(f"  [!] That is a corrupt or tampered plan file, not a "
+                  f"missing one — fix that field (or re-sign so the manifest "
+                  f"carries the delays) rather than relaying with no "
+                  f"schedule.")
+            integrity_log("broadcast", "plan_rejected:bad_delay")
         print("  [!] This creates a timing cluster visible to chain analysts.")
 
     # Fail fast on tampering in blobs that are readable NOW. This is only an
@@ -778,9 +777,63 @@ def main():
             for t in tampered:
                 print(f"  [!] TAMPERED: {t}")
             sys.exit(f"[!] {len(tampered)} blob(s) failed hash verification! Aborting.")
-        n_present = sum(1 for i in items if i.path.exists())
-        integrity_log_once("broadcast", f"manifest_verified:{n_present}_blobs_ok")
-        print(f"  [+] Manifest verification: {n_present}/{len(items)} present blobs OK")
+        # COUNT WHAT WAS CHECKED, NOT WHAT WAS THERE.
+        #
+        # `tampered` above only examines entries where i.sha is truthy -- an
+        # entry with no 'hash' key is never hashed, here or at the
+        # authoritative pre-submit re-check (`if item.sha:` further down). This
+        # line counted every PRESENT blob and called them all OK. Driven: a
+        # two-entry manifest, one entry with its hash stripped, that blob then
+        # overwritten with different bytes -- and the operator is told
+        #
+        #     [+] Manifest verification: 2/2 present blobs OK
+        #
+        # about a batch in which one blob was never hashed by anything. The
+        # single line whose job is to report the sign->relay integrity check
+        # said it passed for a blob it had not looked at.
+        _present = [i for i in items if i.path.exists()]
+        _checked = [i for i in _present if i.sha]
+        _unchecked = [i.key for i in _present if not i.sha]
+        # A MIXED MANIFEST IS NOT A LEGACY MANIFEST, and the difference decides
+        # whether this refuses. Both manifest writers in airgap_tx_signer emit
+        # "hash" unconditionally for every entry, so no version of this
+        # toolchain produces a file where some entries have one and others do
+        # not. The all-hashless case IS a real older format and is handled
+        # further up by a warning rather than a refusal, on the stated grounds
+        # that refusing would strand an operator mid-batch -- that reasoning
+        # does not reach a shape the signer cannot write.
+        if _unchecked:
+            integrity_log("broadcast", f"manifest_partial_hashes:{len(_unchecked)}")
+            sys.exit(
+                f"[!] This manifest hashes some blobs and not others: "
+                f"{len(_checked)} of {len(_present)} present blob(s) carry a "
+                f"'hash'.\n"
+                f"    Missing on: {', '.join(sorted(_unchecked)[:5])}\n"
+                f"    Every manifest this toolchain writes hashes EVERY entry, "
+                f"so this file was not\n"
+                f"    written by it. An unhashed entry is never verified here "
+                f"nor at the per-TX check\n"
+                f"    before submit, so relaying it would broadcast a blob "
+                f"nothing has checked, under a\n"
+                f"    verification line that counts it as OK.\n"
+                f"    Regenerate the manifest from airgap_tx_signer. If you "
+                f"genuinely mean to relay an\n"
+                f"    unverifiable batch, remove the 'hash' field from EVERY "
+                f"entry: that is the legacy\n"
+                f"    format, it is accepted, and it says so instead of "
+                f"claiming a check it did not do.")
+        # _checked == _present here, necessarily: the refusal above exits on
+        # any present-but-unhashed entry, so nothing present is unchecked by
+        # the time control reaches this line. The count is written as
+        # len(_checked) because that is what the sentence CLAIMS -- blobs that
+        # were verified -- and a reader should not have to prove the
+        # equivalence to know the number is honest. It also means no mutation
+        # of this expression alone can change the output, which is why the
+        # sweep carries no anchor for it: the guarantee lives in the refusal.
+        integrity_log_once("broadcast",
+                           f"manifest_verified:{len(_checked)}_blobs_ok")
+        print(f"  [+] Manifest verification: {len(_checked)}/{len(_present)} "
+              f"present blobs OK")
 
     absent = [i.key for i in items if not i.path.exists()]
     if absent:

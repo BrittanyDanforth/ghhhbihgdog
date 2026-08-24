@@ -13,6 +13,29 @@ OnFailure=gs-wake-poweroff.service
 
 [Service]
 Type=oneshot
+# NO CORE DUMPS, FROM execve ONWARD.
+#
+# The tools suppress this themselves at module import (gs_common's first
+# executable statement; gs_console and gs_doorbell carry their own, because
+# neither may import gs_common). That covers every third-party and crypto
+# import -- nacl/libsodium, requests, tenacity -- but it CANNOT cover the
+# window before the interpreter runs any of our code: exec, dynamic linking,
+# site.py, and the entry script's own `import hashlib, decimal`. No Python
+# statement is early enough for that; the launcher is.
+#
+# It matters here because the secret arrives in the ENVIRONMENT
+# (GS_WALLET_PASSWORD for the tools it runs), so it is in the process image from execve --
+# a dump taken at ANY point after that contains it. Driven: with
+# `ulimit -c unlimited` and the variable set, a SIGABRT wrote a 5 MB core and
+# the secret was in it.
+LimitCORE=0
+# The agent creates its artifact directory with an explicit 0700 and writes
+# every file inside at 0600, so this changes nothing for the paths this repo
+# controls. It is here for the ones it does not: anything a woken job's CHILD
+# process creates without naming a mode inherits the umask, and systemd's
+# default is 0022 -- world-readable. Cheap, and it fails safe rather than
+# relying on every future call site remembering.
+UMask=0077
 # THE ARTIFACT DIRECTORY, THE WIPE ROOTS AND THIS UNIT MUST AGREE, and for a
 # whole draft they did not. paranoia_mode sweeps four fixed roots -- cwd,
 # $HOME, $HOME/ghostspiral, $HOME/GhostSpiral -- at depth 0 and 1, and

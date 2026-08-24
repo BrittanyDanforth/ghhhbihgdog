@@ -65,6 +65,54 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---------------------------------------------------------------------------
+#  CORE DUMPS, SUPPRESSED AT IMPORT -- BEFORE EVERYTHING BELOW
+# ---------------------------------------------------------------------------
+def no_core_dumps() -> bool:
+    """Forbid this process from writing a core file. True if enforced.
+
+    A core dump is a copy of process memory written to DISK, and this process
+    decrypts the Pi's X25519 SECRET out of its keyfile and holds it for the life
+    of the server. That secret is one half of the wake channel; a file containing
+    it on the SD card of the box whose premise is "holds nothing" is the worst
+    artifact this program could leave behind.
+
+    AT MODULE SCOPE, NOT FROM main(), and that is the whole point of where it
+    sits. The secret is in the ENVIRONMENT, so it is in the process image from
+    execve -- before Python runs a line. Calling this at the top of main() left
+    the entire IMPORT PHASE uncovered, which is exactly where the C extensions
+    are (nacl/libsodium). DRIVEN: with `ulimit -c unlimited` and the secret set, a
+    SIGABRT raised during this module's import wrote a 5 MB core file and the
+    secret was in it twice.
+
+    A LOCAL COPY, and not by preference: the header above forbids importing
+    gs_common at all ("Not one of them is needed here, and each is a reason
+    for the next person to reach for it on a box that is supposed to hold
+    nothing"), and tests/test_opsec_doc.py asserts that import list.
+    tests/test_listed_bugs.py pins this against gs_common.disable_core_dumps so
+    the three cannot drift.
+
+    NOT install_signal_handlers(). That would also suppress dumps and would
+    BREAK this program: it replaces SIGINT's disposition with a flag-setter,
+    so KeyboardInterrupt stops being raised -- and read_passphrase catches
+    KeyboardInterrupt so an operator can abandon a prompt. Driven: with the
+    handlers installed a delivered SIGINT raises nothing.
+
+    WHAT THIS CANNOT REACH is the window before the interpreter runs any of our
+    code -- exec, dynamic linking, site.py. No Python statement is early enough,
+    so it belongs to the launcher; the systemd units set LimitCORE=0 for it.
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    except (ImportError, ValueError, OSError):
+        return False
+
+
+no_core_dumps()
+
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1222,53 +1270,7 @@ def report(pending: Pending) -> int:
     return 1
 
 
-def no_core_dumps() -> bool:
-    """Forbid this process from writing a core file. True if enforced.
-
-    A core dump is a copy of process memory written to DISK, and this process
-    decrypts the Pi's X25519 SECRET out of its keyfile and holds it for the
-    life of the server (main() -> load_key -> run_wake). That secret is one
-    half of the wake channel; a file containing it, sitting on the SD card of
-    the box whose entire premise is "holds nothing", is the worst artifact this
-    program could leave behind. `ulimit -c unlimited` is a common default and
-    systemd units here set no LimitCORE.
-
-    EVERY OTHER TOOL GETS THIS FROM gs_common.install_signal_handlers, whose
-    docstring says core-dump suppression lives there because "every script
-    calls this at startup, so it is the one hook that reliably covers them
-    all". Two do not, and they are the two long-lived servers: this and
-    gs_console. Measured -- with `ulimit -c unlimited`, RLIMIT_CORE was still
-    infinite at the instant load_key had the secret in memory.
-
-    A LOCAL COPY, and not by preference. The header above forbids importing
-    gs_common at all ("Not one of them is needed here, and each is a reason for
-    the next person to reach for it on a box that is supposed to hold
-    nothing"), and tests/test_opsec_doc.py asserts that import list. So the
-    shared helper is unavailable here by design, and this is four lines of
-    resource.setrlimit rather than a dependency. tests/test_listed_bugs.py pins
-    this against gs_common.disable_core_dumps so the two cannot drift.
-
-    NOT install_signal_handlers(). That would ALSO have suppressed core dumps,
-    and it would have broken this program: it replaces SIGINT's default
-    disposition with a flag-setter, so KeyboardInterrupt stops being raised --
-    and read_passphrase below catches KeyboardInterrupt to let an operator
-    abandon a prompt. Driven: with the handlers installed, a delivered SIGINT
-    raises nothing and that except clause never runs again. Suppressing the
-    dump is the part that was missing; the handlers are not wanted here.
-    """
-    try:
-        import resource
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        return resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
-    except (ImportError, ValueError, OSError):
-        return False
-
-
 def main(argv=None):
-    # FIRST, before the keyfile is opened and before `pair` reads a passphrase.
-    # Both put secret material in this process's memory and neither should be
-    # recoverable from a core file afterwards.
-    no_core_dumps()
     args = build_cli().parse_args(argv)
     try:
         proto.require_nacl()

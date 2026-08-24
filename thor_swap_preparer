@@ -43,6 +43,7 @@ from gs_common import (
     btc_per_xmr_oracle, quote_deviation, decimal_arg,
     validate_xmr_address,
     decimal_env,
+    BTC_ABSURD_TOTAL,
     finite_decimal,
     fmt_btc,
     PAIR_SCHEMA,
@@ -329,13 +330,67 @@ def main():
                  "pass --amounts.")
     # decimal_env per amount, matching --amounts' own type=decimal_arg. A bare
     # Decimal() here accepted "Infinity", which then went into a swap quote.
-    args.amounts = [decimal_env("GS_SWAP_AMOUNTS", x, positive=True)
+    #
+    # max_value closes the other half of that: "Infinity" is refused and 1e30
+    # is not, because it is finite and positive. It survives the `amt <= 0`
+    # loop below and the quote request, and raises InvalidOperation at
+    # `fmt_btc(amt)` when the pair is written out -- i.e. AFTER the quote has
+    # been fetched over Tor, which is the cost this parse-time check removes.
+    # See BTC_ABSURD_TOTAL.
+    args.amounts = [decimal_env("GS_SWAP_AMOUNTS", x, positive=True,
+                                max_value=BTC_ABSURD_TOTAL)
                     for x in str(_amts).split()]
     if not args.amounts:
         sys.exit("[!] No amounts given.")
 
     if args.max_slippage <= 0:
         sys.exit("[!] --max-slippage must be positive.")
+
+    # CHECK THE ENCRYPTION BEFORE THERE IS ANYTHING TO ENCRYPT.
+    #
+    # --gpg-recipient was only ever acted on at the END of main(), after the
+    # quotes were fetched over Tor and after the PLAINTEXT bundle had been
+    # written to disk -- deposit addresses, memos, and the memos name the
+    # destination XMR address in full. So an operator whose GPG setup was
+    # broken found out by way of the plaintext already existing.
+    #
+    # The `import gnupg` failure was handled there and said the right thing.
+    # `gnupg.GPG()` was not: an absent gpg BINARY (python-gnupg installed, gpg
+    # not on PATH) raises OSError, not ImportError. Driven through the real
+    # main(): an uncaught OSError traceback, the plaintext bundle on disk
+    # holding the deposit address and the memo, and nothing anywhere telling
+    # the operator it was there.
+    #
+    # Doing it here costs one `gpg --version` and moves the whole class of
+    # failure to before the first network call, which is the same rule the rest
+    # of this file follows -- refuse while refusing is still free. The failure
+    # at the point of use is handled too (see the encrypt block), because this
+    # cannot prove the binary will still be there in thirty seconds.
+    if args.gpg_recipient:
+        try:
+            import gnupg
+        except ImportError:
+            integrity_log("thor", "gpg_missing")
+            sys.exit(
+                "[!] --gpg-recipient given but python-gnupg is not installed.\n"
+                "    Nothing has been fetched or written yet. Install it "
+                "(pip install python-gnupg),\n"
+                "    or drop --gpg-recipient and protect the bundle yourself.")
+        try:
+            gnupg.GPG()
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("thor", f"gpg_unusable:{type(e).__name__}")
+            sys.exit(
+                f"[!] --gpg-recipient given but GPG cannot run "
+                f"({type(e).__name__}: {str(e)[:80]}).\n"
+                f"    python-gnupg is installed; the gpg BINARY is what is "
+                f"missing or unusable.\n"
+                f"    Nothing has been fetched or written yet, so there is no "
+                f"plaintext bundle to\n"
+                f"    clean up -- which is the whole reason this is checked "
+                f"here and not at the end.\n"
+                f"    Install gnupg, or drop --gpg-recipient and protect the "
+                f"bundle yourself.")
 
     # The XMR destination is the single most linkable value this tool handles:
     # the aggregator is told it, and it is the address the swap output lands
@@ -447,7 +502,15 @@ def main():
             # A silent expected_xmr=0 defeats the slippage cross-check below and
             # prints "Expected XMR: ~0" in the sender instructions. Say so loudly
             # -- it usually means the route field name changed.
-            integrity_log("thor", f"expected_output_unreadable_{i}")
+            # ONCE. A per-index kind writes one line PER CHUNK, and chain_safe
+            # redacts the digits so they come out byte-identical -- which means
+            # COUNTING them gives the batch size, the run-structure value
+            # chain_safe promises to withhold ("...AND HOW MANY THERE WERE,
+            # does not [survive]"). Driven: 2 chunks -> 2 lines, 4 -> 4, 5 -> 5,
+            # against the 1 that pair_ready (already once-logged) writes. The
+            # index stays on the terminal line below, where it reaches the
+            # operator and stops. See integrity_log_once.
+            integrity_log_once("thor", "expected_output_unreadable")
             print(f"  [!] Pair {i}: could not read expected XMR from the quote "
                   f"(field name may have changed) — slippage check disabled for it.")
 
@@ -475,7 +538,10 @@ def main():
                 f"    one is not routed to you. Refusing to issue sender instructions."
             )
         if not _memo_binds_destination(memo, dest):
-            integrity_log("thor", f"memo_dest_mismatch_{i}")
+            # ONCE, and note this one is written BEFORE the abort check: with
+            # --allow-unbound-memo the run CONTINUES, so it repeats per pair.
+            # (On the refusing path exactly one is written either way.)
+            integrity_log_once("thor", "memo_dest_mismatch")
             if not args.allow_unbound_memo:
                 sys.exit(
                     f"[!] Pair {i}: the returned memo does NOT contain your XMR\n"
@@ -505,7 +571,12 @@ def main():
                 )
             if deviation > Decimal("0.05"):
                 print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
-                integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
+                # ONCE. The oracle rate is fetched once before the loop, so every
+                # chunk is measured against the same snapshot and this warning is
+                # all-or-nothing across the batch -- making the line count the RUN
+                # SIZE rather than a count of anomalies. dev= goes too: chain_safe
+                # renders it "#.#", so it carried nothing the terminal did not.
+                integrity_log_once("thor", "slippage_warn")
 
         pair = {
             "schema": PAIR_SCHEMA,
@@ -674,7 +745,43 @@ def main():
                 f"    The UNENCRYPTED bundle is at {_out} — encrypt or securely\n"
                 f"    delete it yourself. Aborting rather than pretend it's protected."
             )
-        enc = gnupg.GPG().encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+        # EVERY FAILURE IN THIS BLOCK LEAVES THE PLAINTEXT ON DISK, so every
+        # failure in it has to say so. Two were handled -- ImportError above
+        # and `enc.ok` below -- and the rest were not:
+        #
+        #   * gnupg.GPG()  raises OSError when the gpg BINARY is absent, not
+        #     ImportError. Driven through the real main(): an uncaught
+        #     traceback, the plaintext bundle sitting there with the deposit
+        #     address and the memo, and nothing telling the operator.
+        #   * .encrypt() can raise on a broken keyring or a homedir it cannot
+        #     read.
+        #   * secure_write_text can raise on a full or read-only destination,
+        #     and that one is worse: it can leave a PARTIAL .gpg beside the
+        #     plaintext, which looks like the protected copy.
+        #
+        # The block's own comment states the contract -- "If we cannot produce
+        # the encrypted copy, do NOT continue as if the file were protected --
+        # abort loudly" -- so it is applied to the whole attempt rather than to
+        # the two failures somebody happened to think of.
+        #
+        # The startup preflight has already run `gnupg.GPG()` once, so reaching
+        # these handlers means GPG worked a minute ago and does not now. That
+        # is worth saying differently from "you never had gpg", and it is why
+        # the preflight does not replace this.
+        try:
+            enc = gnupg.GPG().encrypt(json.dumps(pairs, indent=2),
+                                      args.gpg_recipient)
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("thor", f"gpg_broke_late:{type(e).__name__}")
+            sys.exit(
+                f"[!] GPG worked at startup and fails NOW "
+                f"({type(e).__name__}: {str(e)[:80]}).\n"
+                f"    The UNENCRYPTED bundle is at {_out} — it holds every "
+                f"deposit address and\n"
+                f"    every memo, and a memo names the destination XMR address "
+                f"in full.\n"
+                f"    Encrypt or securely delete it YOURSELF. Nothing here "
+                f"pretends it is protected.")
         if not enc.ok:
             integrity_log("thor", f"gpg_fail:{enc.status}")
             sys.exit(
@@ -685,7 +792,19 @@ def main():
         gpg_path = Path(str(_out) + ".gpg")
         # 0600 at creation, not chmod'ed after: write_text + chmod left the
         # bundle 0644 in between, and permanently so if killed in that window.
-        secure_write_text(gpg_path, str(enc))
+        try:
+            secure_write_text(gpg_path, str(enc))
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("thor", f"gpg_write_failed:{type(e).__name__}")
+            sys.exit(
+                f"[!] The encrypted bundle could not be written to {gpg_path} "
+                f"({type(e).__name__}: {str(e)[:60]}).\n"
+                f"    The UNENCRYPTED bundle is still at {_out}, and "
+                f"{gpg_path.name} may exist as a\n"
+                f"    PARTIAL file — check it before trusting it; a truncated "
+                f".gpg looks like the\n"
+                f"    protected copy and does not decrypt. Deal with both "
+                f"yourself.")
         if secure_delete_file(_out):
             integrity_log("thor", f"gpg_ok:{gpg_path.name}:plaintext_wiped")
             print(f"  [+] GPG bundle -> {gpg_path}  (plaintext {_out.name} securely deleted)")

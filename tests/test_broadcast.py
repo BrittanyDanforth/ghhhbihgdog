@@ -34,7 +34,8 @@ def check(name, cond):
 class Harness:
     """A staging dir + a stubbed broadcast module, driven through real main()."""
 
-    def __init__(self, n=1, delay=0, hashes=True, wrap=None):
+    def __init__(self, n=1, delay=0, hashes=True, wrap=None,
+                 no_hash_on=()):
         self.mod = load("broadcast_signed_xmr")
         self.work = tempfile.mkdtemp(prefix="bcast_t_")
         self.dir = os.path.join(self.work, "signed")
@@ -53,7 +54,11 @@ class Harness:
             with open(p, "wb") as f:
                 f.write(bytes([i + 1]) * 8)
             e = {"idx": i, "file": p, "delay": delay}
-            if hashes:
+            # no_hash_on names the entries to leave UNHASHED while the rest are
+            # hashed. `hashes=False` is all-or-nothing (the legacy format); a
+            # MIXED manifest is a different shape entirely and neither manifest
+            # writer in airgap_tx_signer can produce one.
+            if hashes and i not in no_hash_on:
                 e["hash"] = hashlib.sha256(bytes([i + 1]) * 8).hexdigest()
             entries.append(e)
         self.entries = entries
@@ -314,6 +319,109 @@ def test_progress_fence_warns_when_identity_is_unprovable():
           "report success" in h.out and "SKIPPED" in h.out)
     check("fence: ...and it is a warning, not an abort — refusing would strand "
           "an operator mid-batch on a legacy manifest", code == 0)
+
+
+def test_a_rejected_plan_is_named_not_dropped_in_silence():
+    # A plan that MATCHES this batch and is discarded for one unusable delay
+    # produced exactly one line: "WARNING: No TX delays found - all TXs will
+    # broadcast with minimal gap!" -- which means "there is no plan for these
+    # blobs". The operator re-signs, or shrugs and relays with no schedule,
+    # which is the timing correlation the delays exist to prevent.
+    h = Harness(n=2, hashes=True)
+    os.makedirs(os.path.join(h.work, "unsigned"), exist_ok=True)
+    with open(os.path.join(h.work, "unsigned", "unsigned_plan.json"), "w") as f:
+        json.dump({"txs": [{"delay": 300}, {"delay": "604800"}]}, f)
+    h.run(path=h.dir)
+    check("plan/reject: a matching plan discarded for a bad delay is NAMED",
+          "unsigned_plan.json MATCHES this batch but was discarded" in h.out)
+    check("plan/reject: ...and the offending field is quoted, not just counted",
+          "'delay' is '604800'" in h.out and "tx[1]" in h.out)
+    check("plan/reject: ...and the operator is told this is a corrupt plan "
+          "rather than a missing one",
+          "corrupt or tampered plan file, not a missing one" in h.out)
+    check("plan/reject: ...and the honest 'no delays' warning still stands, "
+          "because the relay really is about to run without them",
+          "No TX delays found" in h.out)
+    # NON-VACUITY (a): a SANE plan is still used, and says nothing about
+    # rejection -- or the message above would appear on every run.
+    h2 = Harness(n=2, hashes=True)
+    os.makedirs(os.path.join(h2.work, "unsigned"), exist_ok=True)
+    with open(os.path.join(h2.work, "unsigned", "unsigned_plan.json"), "w") as f:
+        json.dump({"txs": [{"delay": 300}, {"delay": 900}]}, f)
+    h2.run(path=h2.dir)
+    check("plan/reject: NON-VACUITY -- a sane plan is still loaded and no "
+          "rejection is reported",
+          "TX delays loaded from unsigned_plan" in h2.out
+          and "was discarded" not in h2.out)
+    # NON-VACUITY (b): with NO plan at all the warning stands alone, so the
+    # new lines are attached to a real rejection and not to the warning.
+    h3 = Harness(n=2, hashes=True)
+    h3.run(path=h3.dir)
+    check("plan/reject: NON-VACUITY -- with no plan present the warning is "
+          "still alone",
+          "No TX delays found" in h3.out and "was discarded" not in h3.out)
+
+
+def test_manifest_verification_counts_only_what_it_checked():
+    # `tampered` only examines entries where i.sha is truthy, and the summary
+    # line counted every PRESENT blob. So an entry with no 'hash' key was never
+    # hashed -- not here, and not at the authoritative `if item.sha:` re-check
+    # before submit -- and was still reported OK.
+    #
+    # Driven: two entries, the second with its hash stripped, that blob then
+    # overwritten with different bytes. Before this, the operator was told
+    # "Manifest verification: 2/2 present blobs OK" and it was relayed.
+    h = Harness(n=2, no_hash_on=(1,))
+    with open(h.blob(1), "wb") as f:
+        f.write(b"ATTACKER BLOB -- a different signed transaction")
+    code, msg = h.run(path=h.manifest)
+    check("manifest: a partially-hashed manifest is REFUSED, not summarised "
+          "as OK", code != 0 and "hashes some blobs and not others" in msg)
+    check("manifest: ...and it names the entry nothing checked",
+          "tx_1.signed" in msg)
+    check("manifest: ...and no blob from it is relayed", h.posts == [])
+    check("manifest: ...and the operator is never told a count that includes "
+          "the unchecked blob", "2/2 present blobs OK" not in h.out)
+    # NON-VACUITY (a): the same shape WITHOUT tampering is refused too -- the
+    # refusal is about the manifest being unverifiable, not about catching this
+    # particular swap, which nothing here could have caught.
+    h2 = Harness(n=2, no_hash_on=(1,))
+    code2, msg2 = h2.run(path=h2.manifest)
+    check("manifest: NON-VACUITY -- an untampered partially-hashed manifest is "
+          "refused for the same reason, because the check is unverifiability",
+          code2 != 0 and "hashes some blobs and not others" in msg2)
+    # NON-VACUITY (b): a fully hashed manifest still passes and still reports.
+    h3 = Harness(n=2)
+    code3, _ = h3.run(path=h3.manifest)
+    check("manifest: NON-VACUITY -- a fully hashed manifest still verifies and "
+          "reports the count", code3 == 0
+          and "2/2 present blobs OK" in h3.out)
+    # NON-VACUITY (c): the ALL-hashless legacy manifest is still ACCEPTED. The
+    # refusal above must not have swallowed the case the warning path exists
+    # for -- that one is a real older format, this one is not.
+    h4 = Harness(n=2, hashes=False)
+    code4, msg4 = h4.run(path=h4.manifest)
+    check("manifest: NON-VACUITY -- an ALL-hashless legacy manifest is still "
+          "accepted, not caught by the partial-hash refusal",
+          code4 == 0 and "hashes some blobs and not others" not in msg4)
+    # THE COUNT ITSELF, on a manifest where present != checked WITHOUT being
+    # partial. Every entry has a hash; one blob is simply not readable yet
+    # (the case _items_from_manifest deliberately keeps a slot for), so it is
+    # PRESENT-less and unchecked. The summary must count the 1 it hashed, not
+    # the 2 entries it holds -- which is the arithmetic the partial-hash
+    # refusal above cannot exercise, because it exits first.
+    h5 = Harness(n=2, hashes=True)
+    os.unlink(h5.blob(1))
+    code5, _ = h5.run(path=h5.manifest)
+    check("manifest: the summary counts CHECKED blobs, not entries -- an "
+          "absent blob is not verified and is not counted as OK",
+          "Manifest verification: 1/1 present blobs OK" in h5.out)
+    check("manifest: ...and the absent one is reported as absent, not as "
+          "verified",
+          "1 manifested blob(s) not readable yet" in h5.out)
+    check("manifest: NON-VACUITY -- with both blobs present the same manifest "
+          "reports 2/2",
+          "2/2 present blobs OK" in h3.out)
 
 
 # --------------------------------------------------------------------------

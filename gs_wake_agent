@@ -66,7 +66,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
-    install_signal_handlers, resource_check, terminal_safe, wipe_covers,
+    install_signal_handlers, resource_check, secure_mkdir, terminal_safe,
+    wipe_covers,
 )
 import gs_wake_proto as proto                                # noqa: E402
 
@@ -507,6 +508,35 @@ def preflight(key: dict, artifact_dir: Path, dry_run: bool,
                       f"Environment=HOME= to {artifact_dir} in "
                       f"gs-wake-agent.service.")
 
+    # NOW it is ours, so narrow it. run_job creates artifact_dir with
+    # narrow_existing=False, which leaves a PRE-EXISTING directory's mode
+    # alone -- correct there, because at that point this is just a path out of
+    # a keyfile and might be the operator's cwd. wipe_covers passing settles
+    # that: this tool guarantees paranoia_mode will securely ERASE this
+    # directory, and refuses to run at all otherwise. A directory whose
+    # contents this toolchain destroys is its own territory, not one it was
+    # merely asked to write a file into, so 0755 here is a leak to fix rather
+    # than an operator preference to respect.
+    #
+    # WARN RATHER THAN REFUSE. Everything above this line is fail-closed
+    # because it names a condition this process cannot fix; a directory mode
+    # is one it can, and bricking an unattended vault over something already
+    # repaired would be its own defect. The mode is reported because a
+    # too-wide directory means the artifacts of PREVIOUS runs were listable,
+    # and this chmod does not undo that.
+    try:
+        _mode = stat.S_IMODE(artifact_dir.stat().st_mode)
+        if _mode & 0o077:
+            os.chmod(artifact_dir, 0o700)
+            agent_say(f"[!] {artifact_dir} was mode {_mode:04o} — group/other "
+                      f"could list this run's artifacts. Narrowed to 0700. "
+                      f"Anything earlier runs left here was listable too.")
+    except OSError as e:                                     # noqa: BLE001
+        # Not fatal: the files inside are 0600 regardless, and refusing the
+        # job would be a worse outcome than a wide directory.
+        agent_say(f"[!] could not read or narrow the mode of {artifact_dir} "
+                  f"({type(e).__name__}). Continuing; check it by hand.")
+
     if not _tor(key.get("tor_proxy", "")):
         raise Refused("tor_down",
                       f"this machine's own Tor is not answering on "
@@ -745,7 +775,26 @@ def run_once(args, deps: dict = None) -> tuple:
 
     key = load_key(Path(args.key))
     artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    # secure_mkdir, NOT a bare mkdir. This was `mkdir(parents=True,
+    # exist_ok=True)`, which is 0777 & ~umask -- measured 0755 under the
+    # default umask, and the shipped unit sets no UMask=. The FILES written
+    # here are 0600, but the LISTING is the leak this toolchain treats as real
+    # everywhere else (see secure_mkdir): a local account could enumerate
+    # thor_pairs_*.json, wallet_*.json, the job log and the status file, and
+    # so learn how many swaps were arranged, when, and that this machine runs
+    # a Monero cold-signing operation at all. Driven as a real unprivileged
+    # uid: all four artifact names were listable. Every other directory in the
+    # repo already goes through secure_mkdir; this was the one bare call left.
+    #
+    # narrow_existing=False, deliberately. artifact_dir defaults to "." when
+    # the keyfile omits it, so a pre-existing directory here may be the
+    # operator's own cwd -- and silently chmod'ing a directory you were merely
+    # asked to write into is the exact regression secure_mkdir's docstring
+    # records from create_receive_wallet. A directory this CREATES is 0700,
+    # including its parents; one that already existed is narrowed in
+    # preflight, after wipe_covers has established it is this tool's own
+    # territory rather than somewhere borrowed.
+    secure_mkdir(artifact_dir, narrow_existing=False)
     # From here on agent_say() has somewhere durable to write. Anything refused
     # BEFORE this line (a missing or world-readable keyfile) is still terminal
     # only -- there is no trusted directory to write to yet, and inventing one
@@ -1377,6 +1426,31 @@ def seal_slip_for_delivery(key: dict, artifact_dir: Path, status: str,
             v = pair.get(src)
             if v is None:
                 raise ValueError(f"the quoted pair has no {src!r}")
+            # `ts` IS NOT JUST "PRESENT", IT HAS TO BE A TIME. Every other
+            # field here is a string the delivery machine re-checks for itself
+            # (memo_binds_destination, instruction_field_safe); `ts` is the one
+            # the operator cannot sanity-check by eye, and it is the input to
+            # the only control that says "this quote has expired".
+            #
+            # Checked here as well as in gs_unseal because the two machines
+            # know different things. gs_unseal cannot tell a malformed slip
+            # from a vault with a broken clock, so all it can do is report the
+            # age as unknown and refuse to call the quote fresh. THIS side can
+            # see the pairs file that produced it, and the operator is standing
+            # at a terminal that prints why -- so a slip with an unusable
+            # timestamp is worth not sealing at all, rather than sending one
+            # whose age nobody can read.
+            #
+            # isinstance(True, int) is True, which is why the bool is excluded
+            # explicitly -- the same trap unlock_keyfile's ops/mem bounds call
+            # out. Zero and negatives are refused too: a Unix epoch of 0 is not
+            # a quote time, it is a field somebody defaulted.
+            if src == "ts" and (isinstance(v, bool)
+                                or not isinstance(v, int) or v <= 0):
+                raise ValueError(
+                    f"the quoted pair's 'ts' is not a usable timestamp "
+                    f"({v!r}); without it the delivery machine cannot tell "
+                    f"whether the quote has expired")
             body[short] = v
         body["h"] = handle
         import nacl.public

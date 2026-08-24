@@ -800,8 +800,7 @@ MUTATIONS = [
  # An anchor here is the standing guard against it going dead again.
  ("a no-job boot powers off the instant it is told there is no job",
   "gs_wake_agent",
-  "        if not args.dry_run:\n"
-  "            _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))",
+  "        _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))",
   "        pass",
   ["test_wake_agent"]),
 
@@ -969,7 +968,7 @@ MUTATIONS = [
  # An incompatible wire change with no version bump lets two boxes agree to
  # pair and then fail at wake time.
  ("PAIR_PROTO is not bumped for the wire break", "gs_wake_proto.py",
-  "PAIR_PROTO = 3",
+  "PAIR_PROTO = 4",
   "PAIR_PROTO = 2",
   ["test_wake_protocol"]),
 
@@ -1130,10 +1129,18 @@ MUTATIONS = [
  # _memo_fields_bind reads fields 0..2, so a newline in field 3 rides through a
  # PERFECT bind and forges a second "To address:" line in the copy-paste block
  # every caller prints. Driven through the real thor CLI as a subprocess.
+ #
+ # THE ANCHOR IS THE SHARED CALL, not an inline rule, because the inline rule
+ # is what went wrong. Three gates in this repo screen the same class of value
+ # for the same reason; instruction_field_safe was widened to the C1 block
+ # (U+0080-U+009F, where U+009B is the single-character CSI) and this one was
+ # left behind, still C0-only. Reverting the call to a private copy is the
+ # regression that actually happened, so it is the one mutated here.
  ("a memo that binds can still forge the sender instructions", "gs_common.py",
+  "    if not instruction_field_safe(raw):\n"
+  "        return False\n",
   "    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw):\n"
   "        return False\n",
-  "",
   ["test_opsec_guarantees"]),
 
  # The manifest hash is unkeyed and sits beside the blob it covers, so it
@@ -1239,7 +1246,8 @@ MUTATIONS = [
  # One ladder slot goes in, so one quoted pair comes out. Picking one of
  # several deposit addresses to send money to is not a guess worth making.
  ("the vault seals whichever quoted pair happens to be first", "gs_wake_agent",
-  "        if not isinstance(pairs, list) or len(pairs) != 1:",
+  "        if not isinstance(pairs, list) or len(pairs) != 1:\n"
+  "            # ONE amount goes in (a single ladder slot), so one pair comes out.",
   "        if not isinstance(pairs, list) or not pairs:",
   ["test_sealed_slip"]),
 
@@ -1247,8 +1255,10 @@ MUTATIONS = [
  # swap is ready and still handed no way to pay it.
  ("the pager never actually sends the slip it was given",
   "gs_telegram_pager",
-  "            self.send(chat_id, slip)",
-  "            pass",
+  "            ok = self.send(chat_id, slip)\n"
+  "            if not ok:",
+  "            ok = True\n"
+  "            if not ok:",
   ["test_sealed_slip"]),
 
  # gs_unseal is the LAST gate before real Bitcoin moves, on a different
@@ -1284,7 +1294,9 @@ MUTATIONS = [
  # walk to, and the only record is a print() the unit routes to /dev/null.
  ("the pager treats a dropped reply as a delivered one again",
   "gs_telegram_pager",
+  '            print(f"  [!] reply failed: {_redact(e)}")\n'
   "            return False",
+  '            print(f"  [!] reply failed: {_redact(e)}")\n'
   "            return True",
   ["test_sealed_slip"]),
 
@@ -1434,9 +1446,9 @@ MUTATIONS = [
  # One attempt is what makes three choices mean three choices.
  ("the confirm gate can be guessed at until it is right",
   "gs_telegram_pager",
-  "            slot, answer = c.slot, c.answer\n"
-  "            del self.convos[chat_id]\n",
-  "            slot, answer = c.slot, c.answer\n",
+  "        slot, expect = c.slot, c.expect\n"
+  "        del self.convos[chat_id]\n",
+  "        slot, expect = c.slot, c.expect\n",
   ["test_depo_wizard"]),
 
  # A real command typed mid-flow must not be swallowed as an answer.
@@ -1644,14 +1656,14 @@ MUTATIONS = [
  # the wallet spend password and the Pi's X25519 secret for their lifetimes.
  ("gs_doorbell goes back to dumping the Pi's secret into a core file",
   "gs_doorbell",
-  "    no_core_dumps()\n    args = build_cli().parse_args(argv)",
-  "    args = build_cli().parse_args(argv)",
+  "no_core_dumps()\n\nfrom pathlib import Path",
+  "\nfrom pathlib import Path",
   ["test_listed_bugs"]),
 
  ("gs_console goes back to dumping the wallet password into a core file",
   "gs_console",
-  "    no_core_dumps()\n    ap = argparse.ArgumentParser(",
-  "    ap = argparse.ArgumentParser(",
+  "no_core_dumps()\n\n\nREPO = os.path.dirname(os.path.abspath(__file__))",
+  "\n\nREPO = os.path.dirname(os.path.abspath(__file__))",
   ["test_listed_bugs"]),
 
  # secure_delete_file opened O_WRONLY on files this toolchain mints 0400 on
@@ -1745,7 +1757,7 @@ MUTATIONS = [
  # a traceback out of main(), after Tor and the oracle round trip.
  ("the off-ramp amount goes back to a hand-rolled parse with no bound",
   "exit_strategy_simulator",
-  '    args.amount = decimal_env("GS_EXIT_AMOUNT", _amt, positive=True,\n'
+  "    args.amount = decimal_env(_src, _amt, positive=True,\n"
   "                              max_value=XMR_ABSURD_TOTAL)",
   "    args.amount = Decimal(str(_amt))\n"
   "    if not args.amount.is_finite() or args.amount <= 0:\n"
@@ -1757,17 +1769,24 @@ MUTATIONS = [
  # problem -- with _bisq_err never bound.
  ("a Bisq reply with no XMR market goes back to being blamed on Tor",
   "exit_strategy_simulator",
-  "        _bisq_err = ValueError(",
-  "        _unused_bisq_err = ValueError(",
+  "            _bisq_err = ValueError(\n"
+  '                f"Bisq answered and the response parsed, but it carried no "',
+  "            _unused_bisq_err = ValueError(\n"
+  '                f"Bisq answered and the response parsed, but it carried no "',
   ["test_listed_bugs"]),
 
  # ...and the remedy must follow the diagnosis. It said "did not fail on the
  # network" and then "Check Tor connectivity and retry" in the same message.
  ("the oracle remedy goes back to saying 'check Tor' after 'not the network'",
   "exit_strategy_simulator",
-  '        + ("    Check Tor connectivity and retry." if _network else\n'
+  '        + ("    Check Tor connectivity and retry." if _network and _cg_net else\n'
   '           "    Tor is not the problem; retry, or check whether the oracle\'s\\n"\n'
-  '           "    response format has changed.")',
+  '           "    response format has changed." if not _network and not _cg_net\n'
+  "           else\n"
+  '           "    CHECK BOTH: one oracle was unreachable and the other "\n'
+  '           "answered.\\n"\n'
+  '           "    Tor may be down for some destinations, and the oracle that "\n'
+  '           "did answer\\n    sent something this tool cannot use.")',
   '        + "    Check Tor connectivity and retry."',
   ["test_listed_bugs"]),
 
@@ -1784,7 +1803,8 @@ MUTATIONS = [
  # rate straight back.
  ("the fiat value goes back to inverting the coarsened oracle price",
   "exit_strategy_simulator",
-  '        "amount_out_fiat": str(fiat_val.quantize(Decimal("1"))),',
+  '        "amount_out_fiat": str((net * coarsen_rate(fiat_rate))\n'
+  '                               .quantize(Decimal("0.01"))),',
   '        "amount_out_fiat": str(fiat_val),',
   ["test_listed_bugs"]),
 
@@ -1810,6 +1830,7 @@ MUTATIONS = [
  ("the relay goes back to coercing a delay out of an unsigned plan",
   "broadcast_signed_xmr",
   '                    if not delay_is_sane(tx["delay"]):\n'
+  '                        _bad_delay = (pos, tx["delay"])\n'
   "                        by_idx = {}\n"
   "                        break\n"
   '                    by_idx[pos] = tx["delay"]',
@@ -1822,18 +1843,261 @@ MUTATIONS = [
 
  # ...and the rule itself must keep both halves: the type/sign test AND the cap.
  ("the delay rule goes back to accepting a 31,700-year stall",
-  "broadcast_signed_xmr",
+  "gs_common.py",
   "    return not cap or value <= MAX_PLANNED_DELAY",
   "    return True",
   ["test_listed_bugs"]),
+
+ # ...and the THIRD reader must take the shared rule rather than coercing. It
+ # does not mis-time a transaction; it sizes the kill timeout for the broadcast
+ # child, so a coerced 10**12 makes that timeout ~31,700 years and the hang is
+ # never killed.
+ ("GhostSpiral goes back to coercing a plan delay into the kill timeout",
+  "GhostSpiral",
+  "                if not delay_is_sane(_d):\n"
+  "                    raise ValueError(",
+  "                if False:\n"
+  "                    raise ValueError(",
+  ["test_listed_bugs"]),
+ # ------------------------------------------------------------------
+ #  Round: the environment path, the coarsened rate, and the wipe's
+ #  remaining blind spots.
+ # ------------------------------------------------------------------
+
+ # resolve_btc_amount ran with the other syntactic checks, three lines BEFORE
+ # resolve_sensitive_inputs overwrote args.btc_amount from GS_BTC_AMOUNT. So
+ # the sub-satoshi and split-minimum refusals were applied to the argv value
+ # and never to the environment one -- the path this tool tells operators to
+ # PREFER, because argv is world-readable. Driven: GS_BTC_AMOUNT=0.123456789
+ # accepted where --btc-amount 0.123456789 is refused.
+ ("the BTC amount is validated before the environment supplies it",
+  "GhostSpiral",
+  "    resolve_wallet_password(args)\n    resolve_sensitive_inputs(args)",
+  "    resolve_btc_amount(args)\n"
+  "    resolve_wallet_password(args)\n    resolve_sensitive_inputs(args)",
+  ["test_listed_bugs"]),
+
+ # positive=True catches NaN, Infinity and 0; it does not catch 1e30, which is
+ # finite, positive, and 39 digits against a 28-digit context -- so the first
+ # fmt_btc() on it raises InvalidOperation. Same omission, same crash, as the
+ # GS_EXIT_AMOUNT one already anchored above.
+ ("GS_BTC_AMOUNT loses its ceiling again", "GhostSpiral",
+  "        args.btc_amount = decimal_env(\"GS_BTC_AMOUNT\", _amt, positive=True,\n"
+  "                                      max_value=BTC_ABSURD_TOTAL)",
+  "        args.btc_amount = decimal_env(\"GS_BTC_AMOUNT\", _amt, positive=True)",
+  ["test_listed_bugs"]),
+
+ ("GS_SWAP_AMOUNTS loses its ceiling again", "thor_swap_preparer",
+  "    args.amounts = [decimal_env(\"GS_SWAP_AMOUNTS\", x, positive=True,\n"
+  "                                max_value=BTC_ABSURD_TOTAL)\n"
+  "                    for x in str(_amts).split()]",
+  "    args.amounts = [decimal_env(\"GS_SWAP_AMOUNTS\", x, positive=True)\n"
+  "                    for x in str(_amts).split()]",
+  ["test_listed_bugs"]),
+
+ # oracle_prices was rounded to WHOLE UNITS, which is an absolute blur applied
+ # to fields three orders of magnitude apart: xmr_usd (~165) lost 0.30% and
+ # btc_usd (~65000) lost 0.00076%, pinning the instant the 10-minute timestamp
+ # bucket exists to hide to about nine seconds.
+ ("the oracle prices go back to an absolute blur that spares btc_usd",
+  "exit_strategy_simulator",
+  '        "oracle_prices": {k: str(coarsen_rate(Decimal(str(v))))\n'
+  "                          for k, v in prices.items() if k != \"source\"},",
+  '        "oracle_prices": {k: str(Decimal(str(v)).quantize(Decimal("1")))\n'
+  "                          for k, v in prices.items() if k != \"source\"},",
+  ["test_listed_bugs"]),
+
+ # airgap_tx_signer writes accounts_count.txt one line after the
+ # outputs_export.hex that IS swept, into the same directory, and no pattern
+ # matched it -- the toolchain's only .txt artifact, invisible to the scan
+ # whose extension whitelist was json/log/hex/key.
+ ("the only .txt artifact drops off the wipe list again", "gs_common.py",
+  '    "accounts_count.txt",\n', "",
+  ["test_gitignore"]),
+
+ # The scan that is supposed to make a new artifact "land here as a red check"
+ # enumerated extensions, so a new extension was not unaccounted -- it was
+ # never looked at.
+ ("the artifact scan goes back to an extension whitelist",
+  "tests/test_gitignore.py",
+  "_ARTIFACT_LITERAL = _re.compile(r'\"([a-z0-9_]+\\.[a-z][a-z0-9]{0,5})\"')",
+  "_ARTIFACT_LITERAL = _re.compile(r'\"([a-z0-9_]+\\.(?:json|log|hex|key))\"')",
+  ["test_gitignore"]),
+
+ # wipe_will_erase judges a directory by GS_ARTIFACT_DIR_PATTERNS; the function
+ # whose only job is to EXPLAIN its answer used the FILE patterns for
+ # everything, so a covered-but-misplaced staging directory was reported as
+ # "both" -- "no name like yours is ever swept", the opposite of the truth.
+ ("wipe_miss_reason goes back to judging a directory by the file patterns",
+  "gs_common.py",
+  "    pats = (GS_ARTIFACT_DIR_PATTERNS if res.is_dir()\n"
+  "            else GS_ARTIFACT_FILE_PATTERNS)\n"
+  "    return any(fnmatch.fnmatch(res.name, pat) for pat in pats)",
+  "    return any(fnmatch.fnmatch(res.name, pat)\n"
+  "               for pat in GS_ARTIFACT_FILE_PATTERNS)",
+  ["test_opsec_guarantees", "test_gitignore"]),
+
+ # --result-json is free-form like the two --outfiles that DO warn, and it
+ # records the arrival AMOUNT in XMR. Nothing told an operator running the tool
+ # by hand that the sweep would walk past it.
+ ("receive_watch stops warning that its result file survives the wipe",
+  "receive_watch",
+  "    _p = Path(path)\n    if not wipe_will_erase(_p):",
+  "    _p = Path(path)\n    if False:",
+  ["test_receive_watch", "test_listed_bugs"]),
+
+ # A bare mkdir is 0777 & ~umask -- measured 0755, and a real uid-65534 child
+ # listed thor_pairs_*.json, wallet_*.json, the job log and the status file.
+ ("the wake agent's artifact directory goes back to a bare mkdir",
+  "gs_wake_agent",
+  "    secure_mkdir(artifact_dir, narrow_existing=False)",
+  "    artifact_dir.mkdir(parents=True, exist_ok=True)",
+  ["test_wake_agent", "test_listed_bugs"]),
+
+ # `tampered` only examines entries where i.sha is truthy; the summary line
+ # counted every PRESENT blob and called them all OK. Driven: a two-entry
+ # manifest with one hash stripped and that blob overwritten reported
+ # "Manifest verification: 2/2 present blobs OK" and relayed it.
+ ("a partially-hashed manifest is summarised as OK again",
+  "broadcast_signed_xmr",
+  "        if _unchecked:\n"
+  '            integrity_log("broadcast", f"manifest_partial_hashes:{len(_unchecked)}")',
+  "        if False:\n"
+  '            integrity_log("broadcast", f"manifest_partial_hashes:{len(_unchecked)}")',
+  ["test_broadcast"]),
+
+ # _file_delivery_public swallowed six failure shapes into "" and the caller
+ # then stated ONE of them as fact -- "it was minted before that field
+ # existed" -- about files whose head had been edited.
+ ("the delivery key's UNKNOWN branch goes back to guessing the cause",
+  "gs_delivery_key",
+  '    if not isinstance(head, dict) or "delivery_public" not in head:\n'
+  '        return "", "absent"',
+  '    if not isinstance(head, dict) or "delivery_public" not in head:\n'
+  '        return "", "malformed"',
+  ["test_listed_bugs"]),
+
+ # A plan matching this batch, discarded for one unusable delay, left exactly
+ # one line of output -- "No TX delays found" -- which reads as "there is no
+ # plan", so the operator relays with no schedule instead of fixing a field.
+ ("a rejected plan goes back to being discarded in silence",
+  "broadcast_signed_xmr",
+  "        for _name, (_pos, _val) in rejected:",
+  "        for _name, (_pos, _val) in []:",
+  ["test_broadcast"]),
+
+ # `prices` is only populated when the price ALSO passes the (0, ABSURD] guard,
+ # so an XMR entry quoting 0 / a negative / 1e30 was reported as an ABSENT
+ # market -- sending the operator to look for one that was there.
+ ("an unusable Bisq price goes back to being reported as a missing market",
+  "exit_strategy_simulator",
+  "        _want = \"XMR\" if \"xmr_btc\" not in prices else \"USD\"\n"
+  "        if _want in seen_codes:",
+  "        _want = \"XMR\" if \"xmr_btc\" not in prices else \"USD\"\n"
+  "        if False:",
+  ["test_listed_bugs"]),
+
+ # The remedy was computed from the Bisq failure alone, so a run where
+ # CoinGecko never got a packet back printed "Tor is not the problem".
+ ("the oracle remedy goes back to ignoring CoinGecko's failure",
+  "exit_strategy_simulator",
+  '        + ("    Check Tor connectivity and retry." if _network and _cg_net else',
+  '        + ("    Check Tor connectivity and retry." if _network else',
+  ["test_listed_bugs"]),
+
+ # The WRITER accepted what the READER refuses. airgap_tx_signer put `delay`
+ # verbatim into both manifests and never validated it, so a value broadcast
+ # rejects at relay time was carried across the air gap first -- after every
+ # blob had been built and signed.
+ ("the signer goes back to writing a delay the relay will refuse",
+  "airgap_tx_signer",
+  "        _dly = tx.get(\"delay\")\n"
+  "        if _dly is not None and not delay_is_sane(_dly):",
+  "        _dly = tx.get(\"delay\")\n"
+  "        if False:",
+  ["test_listed_bugs"]),
+
+ # ...and the manifest validator is the second place it can arrive: a manifest
+ # hand-edited between create and sign is invisible to the plan check.
+ ("the signer's manifest validator goes back to ignoring the delay",
+  "airgap_tx_signer",
+  "        _d = entry.get(\"delay\")\n"
+  "        if _d is not None and not delay_is_sane(_d):",
+  "        _d = entry.get(\"delay\")\n"
+  "        if False:",
+  ["test_listed_bugs"]),
+
+ # The plan fingerprint covers `delay`, but it is computed over the PLAN and
+ # broadcast reads the MANIFEST -- so a manifest-only edit matched the
+ # fingerprint perfectly and rewrote the relay schedule.
+ ("a manifest-only delay edit goes back to matching the fingerprint",
+  "airgap_tx_signer",
+  "    if _dmis:\n"
+  '        integrity_log("signer", f"manifest_delay_mismatch:{len(_dmis)}")',
+  "    if False:\n"
+  '        integrity_log("signer", f"manifest_delay_mismatch:{len(_dmis)}")',
+  ["test_listed_bugs"]),
+
+ # ANCHORED ON THE SOURCE, NOT ON THE CHECK. The first version of this mutated
+ # the test back to searching the whole file -- and SURVIVED, correctly: while
+ # the docstring DOES name gs_console, a file-wide search finds it too, so the
+ # two spellings agree and the mutant is equivalent. This file's own rule is
+ # that an equivalent mutant means the anchor is wrong, not that the guarantee
+ # is untested.
+ #
+ # The guarantee is "install_signal_handlers' docstring names the two scripts
+ # it does NOT cover". Mutating the docstring is what tests it, and it is also
+ # the regression that would actually happen -- somebody tidying the docstring,
+ # not somebody loosening the check. Under the old file-wide search this
+ # mutation would have SURVIVED, because gs_console appears elsewhere in
+ # gs_common.py; under the scoped one it is caught.
+ ("install_signal_handlers goes back to claiming it covers every script",
+  "gs_common.py",
+  "    THAT IS NOT EVERY SCRIPT, and this docstring used to say it was -- \"the one\n"
+  "    hook that reliably covers them all\". Two programs never call it, and they",
+  "    It is the one hook that reliably covers them all. Two programs also have\n"
+  "    their own, and they",
+  ["test_listed_bugs"]),
+
 ]
 
 
+#: The mutation sweep's copies must be TRAVERSABLE by an unprivileged user.
+#:
+#: tempfile.mkdtemp() is 0700, and several checks in test_listed_bugs fork a
+#: child that drops to uid 65534 and then works under the repo's cwd -- the
+#: whole point of them, because uid 0 ignores the write bit and that is what
+#: hid the defect they cover. In a 0700 parent that child cannot traverse in
+#: and every one of them fails with PermissionError(13). Measured: the suite is
+#: green in place and 284/3 in a copy, for no reason but the mode of a
+#: directory two levels up.
+#:
+#: The sweep's premise is that the copy behaves like the original. 0755 on the
+#: temp root is what makes that true; the repo inside keeps whatever modes
+#: copytree gave it.
+def _traversable_tmp(prefix):
+    tmp = tempfile.mkdtemp(prefix=prefix)
+    os.chmod(tmp, 0o755)
+    return tmp
+
+
 def run(idx, name, fname, find, repl, suites):
-    tmp = tempfile.mkdtemp(prefix=f"mutg5_{idx}_")
+    tmp = _traversable_tmp(f"mutg5_{idx}_")
     dst = os.path.join(tmp, "repo")
+    # .git IS COPIED, and leaving it out silently invalidated five anchors.
+    #
+    # test_gitignore shells out to `git check-ignore` and `git ls-files`. Both
+    # need a repository, so in a copy without .git the suite went red 62 checks
+    # deep BEFORE any mutation was applied -- and run() decides CAUGHT purely
+    # from "did this suite report failures", so every anchor naming it came
+    # back CAUGHT whatever the mutation did. Measured on an unmutated copy:
+    # 30 passed, 62 failed. Two of those anchors predate this and had been
+    # reporting a verdict they had not earned.
+    #
+    # It costs 8.2 MB per mutation and is removed with the rest of the tree.
+    # The pre-flight below is the general answer; this is the specific one.
     shutil.copytree(REPO, dst, ignore=shutil.ignore_patterns(
-        ".git", "__pycache__", "*.pyc", "integrity_chain.log*"))
+        "__pycache__", "*.pyc", "integrity_chain.log*"))
     path = os.path.join(dst, fname)
     src = open(path).read()
     if src.count(find) != 1:
@@ -1890,8 +2154,66 @@ def run(idx, name, fname, find, repl, suites):
     return verdict
 
 
+def control(suites) -> dict:
+    """Run each suite on an UNMUTATED copy. Returns {suite: failures}.
+
+    A SUITE THAT IS ALREADY RED PROVES NOTHING ABOUT A MUTATION. run() decides
+    CAUGHT from `failed = int(m[-1][1])` -- "did this suite report failures" --
+    which is only evidence if the suite reports none without the mutation. It
+    did not: the copy excluded .git, `git check-ignore` cannot run without a
+    repository, and test_gitignore came back 30 passed / 62 failed on a
+    pristine tree. Five anchors named that suite and all five reported CAUGHT
+    for a reason that had nothing to do with what they mutated.
+
+    This is the same distinction the header already draws twice -- SKIP is not
+    a pass, NO-RESULT is not a survivor -- in the one direction nobody had
+    written down: PRE-RED is not a catch. Fixing the .git copy fixes today's
+    instance; this catches the next one, whatever causes it.
+
+    Run ONCE for the whole sweep rather than per mutation: the answer cannot
+    depend on which mutation is pending, and per-mutation controls would double
+    a sweep that already takes an hour.
+    """
+    tmp = _traversable_tmp("mutg5_control_")
+    dst = os.path.join(tmp, "repo")
+    shutil.copytree(REPO, dst, ignore=shutil.ignore_patterns(
+        "__pycache__", "*.pyc", "integrity_chain.log*"))
+    out = {}
+    for suite in sorted(suites):
+        try:
+            p = subprocess.run([sys.executable, f"tests/{suite}.py"], cwd=dst,
+                               capture_output=True, text=True, timeout=900)
+            m = re.findall(r"(\d+) passed, (\d+) failed", p.stdout + p.stderr)
+            out[suite] = int(m[-1][1]) if m else -1
+        except subprocess.TimeoutExpired:
+            out[suite] = -1
+    shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
 if __name__ == "__main__":
     only = set(sys.argv[1:])
+    _sel = [m for i, m in enumerate(MUTATIONS) if not only or str(i) in only]
+    _suites = {s for m in _sel for s in m[4]}
+    print(f"[control] {len(_suites)} suite(s) on an UNMUTATED copy — a suite "
+          f"that is already red cannot catch anything")
+    _ctl = control(_suites)
+    _prered = {k: v for k, v in _ctl.items() if v != 0}
+    for _s in sorted(_ctl):
+        if _ctl[_s] == 0:
+            _v = "green"
+        elif _ctl[_s] < 0:
+            _v = "NO-RESULT -- the suite did not report at all"
+        else:
+            _v = f"RED({_ctl[_s]}) -- PRE-RED"
+        print(f"           {_s}: {_v}")
+    if _prered:
+        print(f"\n[!] {len(_prered)} suite(s) fail before any mutation is "
+              f"applied: {sorted(_prered)}.")
+        print("    Every anchor naming one of them would report CAUGHT "
+              "regardless of what it mutated. Fix the suite (or the sweep's "
+              "copy) before trusting any verdict below.")
+        sys.exit(1)
     tally = {}
     for i, mut in enumerate(MUTATIONS):
         if only and str(i) not in only:

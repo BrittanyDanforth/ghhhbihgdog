@@ -1262,16 +1262,43 @@ check("chain-once: ...and erases it with the spent plans",
       '_CHAIN_ONCE_FILE[0] = ""' in _gs_src)
 _sg_src = (Path(__file__).resolve().parent.parent / "airgap_tx_signer").read_text()
 _bc_src = (Path(__file__).resolve().parent.parent / "broadcast_signed_xmr").read_text()
+
+
+def _flat(text):
+    """Source with runs of whitespace collapsed to one space.
+
+    These needles match a CALL, and a call is not a line. Wrapping
+
+        integrity_log_once("broadcast", f"manifest_verified:...")
+
+    across two lines to stay inside the line limit turned this check red with
+    the guarantee completely intact -- the event was still logged once, by the
+    same function, with the same tag. A check that fails on reformatting
+    teaches you to distrust it, which is worse than not having it.
+    """
+    return _re_ws.sub(" ", text)
+
+
+import re as _re_mod                                         # noqa: E402
+_re_ws = _re_mod.compile(r"\s+")
+_sg_flat, _bc_flat = _flat(_sg_src), _flat(_bc_src)
 for _ev in ("using_account_index", "outputs_exported", "create_done",
             "outputs_imported", "sign_done"):
     check("chain-once: the signer's " + _ev + " is a once-per-run event",
-          'integrity_log_once("signer", f"' + _ev in _sg_src
-          or 'integrity_log_once("signer", "' + _ev in _sg_src)
+          'integrity_log_once("signer", f"' + _ev in _sg_flat
+          or 'integrity_log_once("signer", "' + _ev in _sg_flat)
 for _ev in ("rpc_pool", "blobs_found", "delays_loaded", "manifest_verified",
             "egress_via_walletrpc_daemon_conn"):
     check("chain-once: the broadcaster's " + _ev + " is a once-per-run event",
-          'integrity_log_once("broadcast", f"' + _ev in _bc_src
-          or 'integrity_log_once("broadcast", "' + _ev in _bc_src)
+          'integrity_log_once("broadcast", f"' + _ev in _bc_flat
+          or 'integrity_log_once("broadcast", "' + _ev in _bc_flat)
+# NON-VACUITY: the flattening must not make these needles match anything. A
+# tag that is NOT wrapped in integrity_log_once has to stay unmatched.
+check("chain-once: NON-VACUITY -- flattening does not make an unguarded tag "
+      "look guarded",
+      'integrity_log_once("broadcast", f"WARNING:no_delays_found'
+      not in _bc_flat
+      and 'WARNING:no_delays_found' in _bc_flat)
 check("chain-once: and Tor's verified_ok, which fired twice per withdrawal",
       'integrity_log_once("tor", "verified_ok")' in
       (Path(__file__).resolve().parent.parent / "gs_common.py").read_text())
@@ -1279,8 +1306,8 @@ check("chain-once: and Tor's verified_ok, which fired twice per withdrawal",
 for _bad in ("create_fail", "TAMPER_DETECTED", "DOUBLE_SPEND",
              "plan_fingerprint_mismatch"):
     check("chain-once: " + _bad + " still chains every time",
-          'integrity_log_once("signer", f"' + _bad not in _sg_src
-          and 'integrity_log_once("broadcast", f"' + _bad not in _bc_src)
+          'integrity_log_once("signer", f"' + _bad not in _sg_flat
+          and 'integrity_log_once("broadcast", f"' + _bad not in _bc_flat)
 
 
 # ===========================================================================

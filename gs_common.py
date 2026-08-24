@@ -17,6 +17,82 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+#  CORE DUMPS ARE FORBIDDEN BEFORE ANYTHING ELSE HAPPENS
+# ---------------------------------------------------------------------------
+#
+# THIS RUNS AT IMPORT, NOT FROM main(), and the difference is a real window.
+#
+# The secrets these processes hold arrive in the ENVIRONMENT -- GS_WALLET_PASSWORD,
+# GS_WAKE_PASSPHRASE -- which means they are in the process image from execve,
+# before Python executes its first line. Suppressing dumps at the top of main()
+# therefore leaves the whole IMPORT PHASE uncovered, and that phase is where the
+# C extensions are: requests, tenacity, nacl/libsodium, monero, psutil. A
+# SIGSEGV or SIGABRT out of any of those, or a SIGQUIT from Ctrl-\, dumps the
+# environment to disk.
+#
+# DRIVEN, not reasoned: with `ulimit -c unlimited` and GS_WALLET_PASSWORD set, a
+# SIGABRT raised during the import of gs_console wrote a 5 MB core file, and
+# grepping it found the password twice. The fix that only covered main() did
+# nothing for it.
+#
+# Every tool in this chain imports gs_common immediately after its stdlib
+# imports (GhostSpiral line 41, airgap_tx_signer 37, receive_watch 57), so
+# doing it here covers all of them from the earliest point a shared module can
+# reach. gs_console and gs_doorbell cannot import this file at all -- see
+# install_signal_handlers -- and carry their own module-scope copy for the same
+# reason and with the same placement.
+#
+# WHAT THIS CANNOT REACH is the window before the interpreter runs any of our
+# code: exec, dynamic linking, site.py. No Python statement exists early enough
+# for that, so it belongs to the launcher, and the systemd units set
+# LimitCORE=0 to close it. Stating the boundary rather than implying the
+# guarantee is complete.
+def disable_core_dumps() -> bool:
+    """Forbid this process from writing a core file. Returns True if enforced.
+
+    A core dump is a copy of process memory written to DISK. These processes
+    hold the wallet password (and, in the wallet-rpc client path, key material)
+    in memory, so a crash on a machine with the common `ulimit -c unlimited`
+    default would persist that secret to a file nothing here ever wipes.
+    Setting RLIMIT_CORE to 0 is the standard prevention and costs nothing.
+
+    Note this only binds THIS process and children it spawns -- it cannot
+    constrain a separately-launched monerod/monero-wallet-rpc.
+
+    TWO LIMITS, BOTH MEASURED, NEITHER CLOSEABLE FROM HERE.
+
+    1. THE PRE-INTERPRETER WINDOW. The secret this protects usually arrives in
+       the ENVIRONMENT (GS_WALLET_PASSWORD, GS_WAKE_PASSPHRASE), so it is in
+       the process image from execve -- before CPython has run a single line of
+       ours. Timed from /proc/self/stat, this call lands 120-140 ms after
+       execve on an idle box, and a dump taken in that window contains the
+       variable. Calling it at module scope, above every other import, makes
+       the window as small as Python allows; only the launcher can remove it,
+       which is what LimitCORE=0 in systemd/*.service is for and why those
+       units carry it.
+
+    2. THE HARD LIMIT IS LOWERED, AND THAT IS ONE-WAY. setrlimit here sets both
+       soft and hard to 0. A process cannot RAISE its own hard limit, root
+       included -- driven, root gets ValueError: not allowed to raise maximum
+       limit -- and the limit is inherited, so every descendant of a tool that
+       imports this module is permanently undumpable too. That is the intent
+       (it is what covers the wallet-rpc client and the signer subprocesses),
+       but it means a test cannot re-enable dumps after importing this module
+       and must take its measurements before the import rather than after.
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    except (ImportError, ValueError, OSError):
+        return False
+
+
+# CALLED HERE, immediately, before requests/tenacity are pulled in below.
+disable_core_dumps()
+
 import argparse
 import contextlib, errno, fcntl, fnmatch, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -938,6 +1014,21 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # exactly the holdings picture a forensic reader wants -- so it must not
     # survive the wipe. Written 0600, but 0600 is not gone.
     "outputs_export.hex",
+    # WRITTEN ONE LINE AFTER outputs_export.hex, INTO THE SAME DIRECTORY, AND
+    # MATCHED BY NOTHING. airgap_tx_signer stores the online wallet's account
+    # count here so the offline wallet can be checked against it. Every pattern
+    # above ends in .json, .log, .hex, .key, .blob, .signed or .unsigned, and
+    # this is the toolchain's only .txt artifact -- so the sweep walked past
+    # it, and so did the test that scans for unswept names, whose own regex
+    # enumerated those extensions and not this one.
+    #
+    # It is not a big secret and it is not nothing: GhostSpiral puts every
+    # output in its own account, so this number is a running tally of how many
+    # outputs this wallet has handled. Left on disk after a paranoia sweep it
+    # says a Monero cold-signing operation ran here and roughly how much of it,
+    # which is precisely the metadata the sweep exists to remove -- and it says
+    # so next to an empty space where its own siblings used to be.
+    "accounts_count.txt",
     # The WALLET PASSWORD, in plaintext. airgap_tx_signer cannot hand a
     # password to monero-wallet-cli on argv (/proc/<pid>/cmdline is mode 444 --
     # any local user reads it), so it writes one 0600 file and feeds it via
@@ -1065,10 +1156,36 @@ def wipe_will_erase(target) -> bool:
         return False
     if not wipe_covers(res):
         return False
-    name = res.name
+    return _wipe_name_matches(res)
+
+
+def _wipe_name_matches(res: Path) -> bool:
+    """Does the sweep's NAME half match `res`? One rule, two callers.
+
+    THE PATTERN SET DEPENDS ON WHAT THE TARGET IS, and this was written out
+    twice: wipe_will_erase chose GS_ARTIFACT_DIR_PATTERNS for a directory,
+    wipe_miss_reason hard-coded GS_ARTIFACT_FILE_PATTERNS for everything. So
+    the function whose entire job is to EXPLAIN the other one's answer was
+    answering a different question, and only for directories -- the case
+    neither's tests exercised. Driven, with $HOME/gs/tx_staging (a real
+    directory name from GS_ARTIFACT_DIR_PATTERNS, two levels down so the
+    location is genuinely wrong):
+
+        wipe_will_erase  False          -- correct, and for the LOCATION
+        wipe_miss_reason "both"         -- wrong: the name is fine
+
+    "both" tells an operator that no name like theirs is ever swept, so moving
+    the directory cannot help -- which is the opposite of the truth and sends
+    them to rename a directory whose name was never the problem. The same
+    misreport hits any covered-but-misplaced staging directory.
+
+    A path that does not exist is judged as a FILE, which is what the callers
+    need: --outfile is checked before the file is written. Both callers now
+    inherit that from here rather than each deciding.
+    """
     pats = (GS_ARTIFACT_DIR_PATTERNS if res.is_dir()
             else GS_ARTIFACT_FILE_PATTERNS)
-    return any(fnmatch.fnmatch(name, pat) for pat in pats)
+    return any(fnmatch.fnmatch(res.name, pat) for pat in pats)
 
 
 def wipe_covers(target) -> bool:
@@ -1158,6 +1275,11 @@ def wipe_miss_reason(target) -> str:
     there. Two of the three call sites had this; create_receive_wallet does
     not, because it picks the name itself (wallet_<hex>.json, which matches) so
     only the directory can vary -- and its comment already says exactly that.
+
+    THE NAME HALF IS _wipe_name_matches, shared with wipe_will_erase. It was a
+    second inline copy that always used the FILE patterns, so this function
+    disagreed with the one it exists to explain whenever the target was a
+    directory -- see _wipe_name_matches for the driven case.
     """
     if wipe_will_erase(target):
         return ""
@@ -1166,7 +1288,7 @@ def wipe_miss_reason(target) -> str:
         res = Path(target).resolve()
     except OSError:
         res = Path(target)
-    named = any(fnmatch.fnmatch(res.name, p) for p in GS_ARTIFACT_FILE_PATTERNS)
+    named = _wipe_name_matches(res)
     if loc and not named:
         return "name"
     if named and not loc:
@@ -2629,26 +2751,6 @@ def _shutdown_handler(signum, frame):
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
 
-def disable_core_dumps() -> bool:
-    """Forbid this process from writing a core file. Returns True if enforced.
-
-    A core dump is a copy of process memory written to DISK. These processes
-    hold the wallet password (and, in the wallet-rpc client path, key material)
-    in memory, so a crash on a machine with the common `ulimit -c unlimited`
-    default would persist that secret to a file nothing here ever wipes.
-    Setting RLIMIT_CORE to 0 is the standard prevention and costs nothing.
-
-    Note this only binds THIS process and children it spawns -- it cannot
-    constrain a separately-launched monerod/monero-wallet-rpc.
-    """
-    try:
-        import resource
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        return resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
-    except (ImportError, ValueError, OSError):
-        return False
-
-
 def install_signal_handlers():
     """Install handlers for SIGINT and SIGTERM, and forbid core dumps.
 
@@ -2835,6 +2937,76 @@ def quote_deviation(expected_out, amount_in, rate_in_per_out):
 #: quantize() runs out of the default 28-digit decimal context and accept_floor
 #: raises instead of returning a floor.
 XMR_ABSURD_TOTAL = Decimal("100000000")
+
+
+#: Sanity cap on a per-TX broadcast delay (7 days). The manifest is the
+#: sign->relay trust boundary: an absurd delay from a corrupted or tampered
+#: manifest would park signed transactions unbroadcast for effectively ever.
+MAX_PLANNED_DELAY = 7 * 24 * 3600
+
+
+def delay_is_sane(value, cap: bool = True) -> bool:
+    """Is this a per-TX delay a relay will honour? ONE rule, THREE readers.
+
+    The manifest path validated strictly -- "a float, a bool or a negative
+    index means it was tampered with or corrupted, and coercing it would
+    silently mis-key a transaction's delay" -- and the fallback that recovers
+    delays from an unsigned plan did `int(tx["delay"])` inside a
+    try/except (TypeError, ValueError). int() COERCES, so that except never
+    fired for the values the manifest rule exists to catch. Driven, same value
+    down both paths:
+
+        True        manifest REFUSED          plan accepted as 1
+        3600.9      manifest REFUSED          plan accepted as 3600
+        -500        manifest REFUSED          plan accepted as -500
+        "604800"    manifest REFUSED          plan accepted as 604800
+        10**12      manifest REFUSED (cap)    plan accepted as 10**12
+
+    The last one is the expensive one: 10**12 seconds is ~31,700 years, and
+    MAX_PLANNED_DELAY's own refusal says why that matters -- "a manifest that
+    stalls the relay indefinitely leaves signed transactions sitting
+    unbroadcast". The unsigned plan is read off local disk and is not signed at
+    all, so it is a WEAKER trust boundary than the manifest, and it was the one
+    validated less.
+
+    cap=False for the manifest reader, which reports the over-cap case with its
+    own sentence naming MAX_PLANNED_DELAY; everything else takes the whole rule.
+
+    IT LIVES HERE, NOT IN broadcast_signed_xmr, BECAUSE THERE IS A THIRD
+    READER. GhostSpiral sizes the kill timeout it gives the broadcast child
+    from the same field -- `sum(max(0, int(t.get("delay") or 0)) for t in
+    _ptxs)` -- reading the UNSIGNED plan off local disk, and it coerced exactly
+    as the fallback above used to. It does not mis-time a transaction; it
+    defeats the timeout. Driven on that expression: a plan delay of 10**12
+    yields a child timeout of ~31,700 years, so a hung broadcast is never
+    killed, and "604800" quietly buys a week. The rule was written once,
+    applied to two readers in one file, and the reader in the OTHER file --
+    the weakest boundary of the three -- kept the defect the docstring
+    describes. A shared rule in a private module is half a shared rule.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return False
+    return not cap or value <= MAX_PLANNED_DELAY
+
+
+#: The same ceiling for BITCOIN amounts, and it exists for the same measured
+#: reason the XMR one does -- applied to the two environment variables that
+#: carry a BTC amount and had no bound at all.
+#:
+#: GS_BTC_AMOUNT and GS_SWAP_AMOUNTS were passed to decimal_env with
+#: positive=True and no max_value, so NaN and Infinity were caught and 1e30 was
+#: not: it is finite and positive. Every BTC amount in this toolchain is
+#: eventually rendered with fmt_btc, which is `.quantize(SATOSHI_BTC)` -- eight
+#: decimal places -- and 1e30 needs 39 digits against the default 28-digit
+#: context. Driven: `fmt_btc(Decimal("1e30"))` raises decimal.InvalidOperation,
+#: the identical crash GS_EXIT_AMOUNT=1e400 produced before max_value was added
+#: there, from the identical omission.
+#:
+#: 100,000,000 BTC against a 21,000,000 hard cap: no real holding is refused,
+#: nothing that reaches quantize() can overflow, and this says "that is not an
+#: amount" rather than "that amount looks wrong" -- the sanity-ceiling/
+#: plausibility-band distinction drawn everywhere else.
+BTC_ABSURD_TOTAL = Decimal("100000000")
 
 
 #: The schema tag thor_swap_preparer stamps on every entry of a pairs bundle.
@@ -3221,7 +3393,22 @@ def _memo_fields_bind(memo: str, dest: str) -> bool:
     # attempt at this attack put the newline directly after the destination,
     # which breaks the bind -- that is why an earlier pass concluded, wrongly,
     # that the memo could not be used to inject.
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw):
+    # THE SHARED GATE, not a third spelling of it. This was
+    # `ord(ch) < 0x20 or ord(ch) == 0x7f` inline -- the C0+DEL rule -- and when
+    # instruction_field_safe was widened to include the C1 block (U+0080-U+009F,
+    # where U+009B is the single-character CSI) this one was left behind. Three
+    # gates in one repo screening the same class of value for the same reason,
+    # and the widening reached two of them.
+    #
+    # instruction_field_safe's own docstring claims "The memo hole is closed at
+    # its own gate (see _memo_fields_bind); this is the same rule for the
+    # fields that have no gate of their own" -- which stopped being true the
+    # moment they diverged. Calling it makes the sentence true by construction
+    # instead of by coincidence, and there is now one place to change.
+    #
+    # Nothing legitimate is refused: a ThorChain memo is ASCII by construction
+    # and goes into an OP_RETURN, which cannot carry a control character at all.
+    if not instruction_field_safe(raw):
         return False
     parts = raw.strip().split(":")
     if len(parts) < 3:

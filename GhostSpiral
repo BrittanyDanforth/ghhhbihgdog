@@ -50,7 +50,8 @@ from gs_common import (
     secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
     finite_decimal,
-    decimal_env, XMR_ABSURD_TOTAL,
+    decimal_env, XMR_ABSURD_TOTAL, BTC_ABSURD_TOTAL,
+    delay_is_sane,
     swap_arrival_floor,
     progress_line,
     isolated_proxy,
@@ -2209,7 +2210,11 @@ def validate_swap_route(deposit_addr, memo, xmr_dest: str, idx: int,
             f"    Refusing to issue deposit instructions."
         )
     if not memo_binds_destination(memo, xmr_dest):
-        integrity_log("stage2", f"memo_dest_mismatch_{idx}")
+        # ONCE, and written BEFORE the abort check: with --allow-unbound-memo
+        # the run CONTINUES, so it repeats per chunk. Same defect and same fix
+        # as thor_swap_preparer's copy -- these two swap paths are the pair
+        # this file keeps having to stop from drifting.
+        integrity_log_once("stage2", "memo_dest_mismatch")
         if not allow_unbound_memo:
             sys.exit(
                 f"[!] Chunk {idx}: the returned memo does NOT contain your XMR\n"
@@ -3639,7 +3644,15 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
             # A silent 0 here defeats the slippage cross-check below AND
             # prints "Expected: ~0 XMR" in the deposit instructions. Say so;
             # it usually means the route field name changed.
-            integrity_log("stage2", f"expected_output_unreadable_{i}")
+            # ONCE. A per-index kind writes one line PER CHUNK, and chain_safe
+            # redacts the digits so they come out byte-identical -- which means
+            # COUNTING them gives the batch size, the run-structure value
+            # chain_safe promises to withhold ("...AND HOW MANY THERE WERE,
+            # does not [survive]"). Driven: 2 chunks -> 2 lines, 4 -> 4, 5 -> 5,
+            # against the 1 that pair_ready (already once-logged) writes. The
+            # index stays on the terminal line below, where it reaches the
+            # operator and stops. See integrity_log_once.
+            integrity_log_once("stage2", "expected_output_unreadable")
             print(f"  [!] Chunk {i}: could not read the expected XMR from the "
                   f"quote (the route field name may have changed) — the "
                   f"slippage check is DISABLED for it.")
@@ -3662,7 +3675,10 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
                     f"    checking the rate yourself."
                 )
             if dev > Decimal("0.05"):
-                integrity_log("stage2", f"slippage_warn_{i}:dev={dev:.4f}")
+                # ONCE -- see thor_swap_preparer's copy of this line. The oracle
+                # is sampled once before the loop, so the warning is all-or-nothing
+                # and the line count is the chunk count.
+                integrity_log_once("stage2", "slippage_warn")
                 print(f"  [!] Chunk {i}: quote deviates {dev * 100:.1f}% from the oracle.")
 
         deposit_info = {
@@ -3947,7 +3963,12 @@ def resolve_sensitive_inputs(args) -> None:
     if _amt is not None:
         # decimal_env: --btc-amount is type=decimal_arg, this was a bare
         # Decimal, and this is the path the tool tells operators to prefer.
-        args.btc_amount = decimal_env("GS_BTC_AMOUNT", _amt, positive=True)
+        #
+        # max_value, because positive=True alone leaves 1e30 through -- finite,
+        # positive, and 39 digits against a 28-digit context, so the first
+        # fmt_btc() on it raises InvalidOperation. See BTC_ABSURD_TOTAL.
+        args.btc_amount = decimal_env("GS_BTC_AMOUNT", _amt, positive=True,
+                                      max_value=BTC_ABSURD_TOTAL)
 
     # Exactly one entry mode. argparse enforced this while --btc-entry was a
     # required mutually-exclusive member; it cannot once the value may come
@@ -7066,12 +7087,40 @@ def main():
     # semantic (a wallet password prompt, a bech32 checksum) can mask it.
     _delay_window = resolve_hop_delay(args)
     resolve_exit_destinations(args)
-    resolve_btc_amount(args)
     resolve_split(args)
     resolve_swap_arrival(args)
 
     resolve_wallet_password(args)
     resolve_sensitive_inputs(args)
+
+    # AFTER resolve_sensitive_inputs, BECAUSE THAT IS WHAT DECIDES THE AMOUNT.
+    #
+    # This ran three lines up, with the rest of the syntactic checks, and
+    # resolve_sensitive_inputs then OVERWROTE args.btc_amount from
+    # GS_BTC_AMOUNT -- so every check in here was applied to the argv value and
+    # none of them to the environment value. The environment is the path this
+    # tool tells operators to PREFER (argv publishes the amount to
+    # /proc/<pid>/cmdline, mode 0444), so the preferred path was the
+    # unvalidated one. Exactly the defect decimal_env was written for, one
+    # layer up: decimal_env catches NaN/Infinity/non-positive, and the two
+    # checks it does not know about are the two that live here.
+    #
+    # DRIVEN, both of them, against the shipped call order:
+    #
+    #   GS_BTC_AMOUNT=0.123456789            accepted (argv: refused, sub-satoshi)
+    #   GS_BTC_AMOUNT=0.00000003 --split 3   accepted (argv: refused, needs 6 sat)
+    #
+    # The first then reaches split_btc_amount, which raises ValueError for a
+    # total finer than a satoshi -- uncaught, so a raw traceback, and only
+    # after Tor was verified, the wallet opened, the mix subaddresses and the
+    # entry set created. That is the same "did all of that work before saying
+    # no" this function's own docstring records fixing for `--btc-amount 0`.
+    #
+    # Nothing here reads a value resolve_sensitive_inputs does not already
+    # have, and nothing between the two prompts or touches the network, so the
+    # stated ordering rule still holds: this is still before the bech32
+    # checksum in resolve_entry_mode.
+    resolve_btc_amount(args)
 
     (receive_mode, receive_entry_addr, receive_account_index,
      receive_subaddress_index) = resolve_entry_mode(args)
@@ -8030,7 +8079,35 @@ def _run_round_body(args, plan_file, staging_dir, label):
         _planned_delay = 0
         try:
             _ptxs = json.loads(Path(plan_file).read_text()).get("txs") or []
-            _planned_delay = sum(max(0, int(t.get("delay") or 0)) for t in _ptxs)
+            # delay_is_sane, NOT the coercion this replaces:
+            #
+            #     _planned_delay = sum(max(0, int(t.get("delay") or 0))
+            #                          for t in _ptxs)
+            #
+            # This is the THIRD reader of a per-TX plan delay and it was the
+            # one still coercing -- the precise construct delay_is_sane was
+            # written to remove from broadcast_signed_xmr's fallback, left in
+            # the file that does not import it. int() takes bools, floats and
+            # numeric strings, and `max(0, ...)` hides a negative rather than
+            # refusing it.
+            #
+            # WHAT IT COSTS HERE IS THE TIMEOUT, WHICH IS THE POINT OF THE
+            # LINE. _bcast_timeout is what kills a hung broadcast child, and it
+            # is derived from this sum. Driven on the shipped expression: a
+            # plan delay of 10**12 yields a timeout of ~31,700 years, so the
+            # kill never happens; "604800" quietly buys a week. plan_file is an
+            # UNSIGNED file on local disk -- a weaker boundary than the
+            # manifest, which refuses all five of these outright.
+            #
+            # A bad delay raises, so the except below applies its conservative
+            # fallback rather than this loop inventing a number: the failure
+            # mode stays "wait longer", never "never kill".
+            for _t in _ptxs:
+                _d = _t.get("delay") or 0
+                if not delay_is_sane(_d):
+                    raise ValueError(
+                        f"plan delay {_d!r} is not a sane per-TX delay")
+                _planned_delay += _d
         except Exception:                                    # noqa: BLE001
             # A plan we cannot re-read is not a reason to pick a bound that is
             # too SHORT: fall back to the old constant plus the widest window
