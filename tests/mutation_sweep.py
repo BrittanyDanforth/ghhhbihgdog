@@ -1476,8 +1476,11 @@ MUTATIONS = [
   ["test_depo_wizard"]),
 
  ("the wizard accepts a slot outside the ladder", "gs_telegram_pager",
-  "            if not word.isdecimal() or not 0 <= int(word) <= 7:",
-  "            if not word.isdecimal():",
+  # Re-anchored: the bound moved into _slot_from when the wizard started
+  # asking in the operator's own words. Same property -- a rung the ladder
+  # does not have is refused HERE, before a wake is spent finding out.
+  "            if 0 <= n <= hi:",
+  "            if True:",
   ["test_depo_wizard"]),
 
  # REPRODUCED: "²".isdigit() is True and int("²") raises. Guarded by isdigit
@@ -1486,8 +1489,10 @@ MUTATIONS = [
  # answer. isdecimal is the predicate that matches what int() accepts.
  ("a superscript digit goes back to escaping the slot check and leaving a "
   "conversation live and armed", "gs_telegram_pager",
-  "            if not word.isdecimal() or not 0 <= int(word) <= 7:",
-  "            if not word.isdigit() or not 0 <= int(word) <= 7:",
+  # Re-anchored, same move. isdecimal is the predicate that matches what
+  # int() accepts; isdigit is wider and lets "\u00b2" through to raise.
+  "        if w.isdecimal():",
+  "        if w.isdigit():",
   ["test_depo_wizard"]),
 
  # REPRODUCED: /cancel@mybot -- the group form this file supports -- cancelled
@@ -2246,6 +2251,41 @@ MUTATIONS = [
  # own reads as "not built". It is named there only to say it is not there --
  # this channel is designed on the assumption the transcript gets read, and the
  # rate is what divides a cash-out back into a deposit.
+ # ---- the bot stops looking dead, and stops speaking in slot numbers ----
+ #
+ # Telegram builds the "/" menu from setMyCommands. Without it a correctly
+ # working pager presents as an empty chat with no hint that typing anything
+ # does something -- indistinguishable from a bot that does not work.
+ ("the bot stops publishing its command menu", "gs_telegram_pager",
+  "        self.publish_commands()\n",
+  "",
+  ["test_telegram_pager"]),
+
+ # "Which slot? Reply 0-7" is a question nobody who had not read the source
+ # could answer, about a number that means nothing on its own.
+ ("the deposit wizard goes back to asking for a slot number",
+  "gs_telegram_pager",
+  "        self.send(chat_id, self._amount_question())",
+  '        self.send(chat_id, "Which slot? Reply 0-7. /cancel to stop.")',
+  ["test_depo_wizard"]),
+
+ # Offering three rungs and accepting eight offers a choice that is not there;
+ # slot 7 on a three-rung ladder is refused at the vault, after a wake.
+ ("a slot past the labels is accepted and spends a wake to be refused",
+  "gs_telegram_pager",
+  "            hi = (len(labs) - 1) if labs else 7",
+  "            hi = 7",
+  ["test_depo_wizard"]),
+
+ # A label that is a number is the value the vault's ladder exists to keep off
+ # this card.
+ ("an amount can be written onto the Pi as a label", "gs_doorbell",
+  # Re-anchored: \Z rather than $, per this repo's own rule and the test that
+  # enforces it -- `$` also matches before a trailing newline.
+  '        if re.match(r"^[0-9.,]+\\Z", str(_lb).strip()):',
+  "        if False:",
+  ["test_wake_doorbell"]),
+
  # ---- the vault finds its own money, and leaves nothing behind ----------
  #
  # /withdraw used to take a 4-hex handle naming a bundle a /depo had minted,
@@ -2524,8 +2564,10 @@ MUTATIONS = [
  # round trip understated it by two to seven times.
  ("/check's quoted time forgets the jitter it always waits",
   "gs_telegram_pager",
-  '    "/check <h>  has it arrived? (10-25 min)\\n"',
-  '    "/check <h>  has it arrived? (~5 min)\\n"',
+  # Re-anchored: the help is BUILT from BOT_COMMANDS now, so the figure lives
+  # there. It must still include the jitter the operator actually waits.
+  '    ("check", "has my payment arrived yet (10-25 min)"),',
+  '    ("check", "has my payment arrived yet (~5 min)"),',
   ["test_telegram_pager"]),
 
  # ---- chat text that arrives through a variable --------------------------
@@ -2670,16 +2712,20 @@ MUTATIONS = [
   ["test_depo_wizard"]),
 
  ("the help text goes back to describing the setup", "gs_telegram_pager",
-  '    "Memo goes in an OP_RETURN — desktop wallet, not a phone."',
+  # Re-anchored: HELP is generated, so the prose that could grow back is the
+  # tail line rather than the block.
+  '    + ["", "The memo goes in an OP_RETURN — desktop wallet, not a phone."]',
+
   '    "Memo goes in an OP_RETURN — desktop wallet, not a phone.\\n"\n'
   '    "What comes back depends on the VAULT\'s keyfile: a handle, a sealed "\n'
   '    "slip for gs_unseal, or the address in the clear."',
   ["test_depo_wizard"]),
 
  ("the confirm names the machine it is about to wake", "gs_telegram_pager",
-  '            self.send(chat_id, f"slot {c.slot} — confirm.\\n\\n{q}")',
-  '            self.send(chat_id, f"slot {c.slot} — this will WAKE THE VAULT "\n'
-  '                               f"and quote a swap.\\n\\n{q}")',
+  # Re-anchored: the confirm names the operator's own word now, not a slot
+  # number. It still must not name the machine.
+  '                      f"Deposit — {_named}. This wakes the machine.\\n\\n{q}")',
+  '                      f"Deposit — {_named}. This wakes the VAULT.\\n\\n{q}")',
   ["test_depo_wizard"]),
 
  # The label is copied rather than imported (the phone-side box has no reason

@@ -856,6 +856,18 @@ def build_cli() -> argparse.ArgumentParser:
                    help="the port this doorbell will answer wakes on. Default "
                         "0 = pick a random high port, so no two installs of "
                         "this public repository share one.")
+    # THE WORDS THE CHAT WILL OFFER, in ladder order. Optional: without them
+    # the wizard falls back to asking for a number, which is what it always
+    # did and what nobody could answer.
+    #
+    # NOT amounts, and the pairing refuses one that looks like a number for
+    # exactly that reason -- a label is a category the operator recognises,
+    # and a decimal on this card is the thing the vault's ladder exists to
+    # keep off it.
+    p.add_argument("--amount-labels", nargs="*", default=[], metavar="WORD",
+                   help="words for the ladder rungs, in order (e.g. small "
+                        "medium large). The chat offers these instead of "
+                        "'slot 0-7'. Never amounts.")
     p.add_argument("--kdf", default=proto.DEFAULT_KDF,
                    choices=sorted(proto.KDF_PROFILES),
                    help=f"passphrase hardening for the keyfile (default: "
@@ -1039,6 +1051,25 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
         raise Doorbell("the ThinkPad did not send the MAC to wake. Nothing "
                        "was written.")
 
+    # getattr, not args.amount_labels: this function is called by tests and by
+    # any caller that built its own namespace, and a new optional flag must not
+    # make a pairing that worked yesterday raise AttributeError today.
+    _labels = list(getattr(args, "amount_labels", None) or [])
+    for _lb in _labels:
+        # \Z, NOT $. This repo has a rule and a test for it: `$` also matches
+        # before a trailing newline, so the two are not the same anchor. Here
+        # the value is stripped first, which makes them agree on every input
+        # -- and using the loose one anyway is how a validator that MEANT to
+        # be strict gets copied into a place where the difference bites.
+        if re.match(r"^[0-9.,]+\Z", str(_lb).strip()):
+            raise Doorbell(
+                f"--amount-labels {_lb!r} is a number. Labels are WORDS -- a "
+                f"decimal on this card is the value the vault's ladder exists "
+                f"to keep off it. Use something like 'small'.")
+        if len(str(_lb)) > 24 or not str(_lb).strip():
+            raise Doorbell(
+                f"--amount-labels {_lb!r} is empty or too long to read in a "
+                f"chat. Keep them short words.")
     payload = {
         "role": "pi",
         "secret": sk.encode().hex(),
@@ -1049,6 +1080,21 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
         "target_mac": info["mac"],
         "wol_broadcast": info["broadcast"],
         "wol_port": 9,
+        # WORDS, NEVER AMOUNTS, and that distinction is the whole reason this
+        # can live on the Pi at all.
+        #
+        # The ladder is on the vault and always will be: this box must not be
+        # able to turn "0.05" into anything, and OPSEC_SETUP says so. But the
+        # consequence was a chat that asked "Which slot? Reply 0-7" -- a
+        # question nobody who had not read the source could answer, about a
+        # number that means nothing on its own.
+        #
+        # A LABEL is not an amount. "small" tells a reader of this card that
+        # the owner had a category called small; it does not tell them what it
+        # is worth, and it cannot be turned into a number by anything here.
+        # Positional: the Nth label names slot N, so the mapping lives in the
+        # order and there is no second table to keep in step.
+        "amount_labels": _labels,
     }
     print()
     print(f"  [*] Sealing the keyfile ({args.kdf}). This is deliberately slow.")

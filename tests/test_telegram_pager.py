@@ -29,6 +29,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -794,7 +795,7 @@ _hp2, _hs2 = _plain_pager()
 _hp2.handle({"update_id": 1, "message": {"chat": {"id": 111},
                                          "message_id": 1, "text": "/help"}})
 check("help: NON-VACUITY -- /help still prints the command list on request",
-      any("/watch" in t for t in _hs2))
+      any("/wait" in t for t in _hs2))
 
 # 3. THE MACHINE'S OWN JOB NAME. OPSEC_SETUP section 5 step 5 specifies
 #    "depo ready · slip A3F1"; the code sent "receive_and_quote ready".
@@ -824,9 +825,24 @@ check(f"help: ...and that figure is consistent with the real jitter "
       _jit_lo // 60 + 3 <= 10 and 25 >= _jit_hi // 60 + 3)
 # NON-VACUITY: the help still lists the commands, so this is not passing on an
 # emptied string.
-check("help: NON-VACUITY -- every command is still listed",
-      all(c in pg.HELP for c in ("/depo", "/recv", "/check", "/watch",
-                                 "/cancel", "/status")))
+# THE ADVERTISED NAMES, which are now words rather than abbreviations: "depo"
+# and "slot 0-7" meant nothing to anyone who had not read the source. The old
+# spellings still WORK -- parse_command takes both -- but the menu and the help
+# offer the ones a stranger could guess.
+check("help: NON-VACUITY -- every advertised command is listed",
+      all(c in pg.HELP for c in ("/deposit", "/check", "/wait", "/send",
+                                 "/settings", "/cancel", "/status")))
+# ONE LIST, so the "/" menu Telegram renders and the help cannot disagree.
+check("help: the help is BUILT from the command list, not kept beside it",
+      all(f"/{_c}" in pg.HELP for _c, _d in pg.BOT_COMMANDS)
+      and all(_d in pg.HELP for _c, _d in pg.BOT_COMMANDS))
+# ...and the old spellings still answer, so an operator's muscle memory is not
+# met with "unknown command" by a bot that looks broken.
+for _old, _want in (("/depo", "depo_wizard"), ("/withdraw", "withdraw_wizard"),
+                    ("/recv", "receive_new"), ("/watch A3F1", "watch")):
+    _j, _p2, _e = pg.parse_command(_old)
+    check(f"help: the old spelling {_old!r} still works",
+          _j == _want or _e == _want)
 
 
 # ===========================================================================
@@ -891,6 +907,95 @@ for _plain in ("burned 3/7.", "pokes in last 24h: 3/12", "wait 30s",
 check("varchat: NON-VACUITY -- a bot token is still stripped",
       pg._redact("bot123456789:AAEEabcdefghijklmnopqrstuvwxyz01")
       == "bot<token>")
+
+
+# ===========================================================================
+#  THE COMMAND MENU TELEGRAM RENDERS
+# ===========================================================================
+print("\n== the bot stops looking dead ==")
+#
+# Telegram builds the "/" autocomplete, the blue Menu button and the command
+# descriptions from setMyCommands -- and this never called it. So a correctly
+# working pager, over Tor, with a valid token, presented as an empty chat with
+# no menu and no hint that typing anything would do something. The operator had
+# to already know every command and its exact spelling. That is
+# indistinguishable from a bot that does not work.
+def _flat_src(fn):
+    """A function's source with runs of whitespace collapsed, so a check does
+    not depend on how the line happened to wrap."""
+    import inspect
+    return " ".join(inspect.getsource(fn).split())
+
+
+_pub = []
+
+
+class _PubPager:
+    """The real publish_commands with only the HTTP call replaced."""
+
+    def __init__(self, answer):
+        self.proxies = {}
+        self.token = "123456:TOKEN"
+        self._answer = answer
+
+    _url = pg.Pager._url
+    publish_commands = pg.Pager.publish_commands
+
+
+_saved_post = pg.safe_post
+try:
+    pg.safe_post = lambda url, data, **k: (_pub.append((url, data)),
+                                           {"ok": True})[1]
+    _ok = _PubPager(True).publish_commands()
+    check("menu: the pager publishes its command list on start", _ok)
+    _url, _data = _pub[0]
+    check("menu: ...to setMyCommands", _url.endswith("/setMyCommands"))
+    _cmds = json.loads(_data["commands"])
+    check("menu: ...carrying every command it advertises",
+          {c["command"] for c in _cmds}
+          == {c for c, _d in pg.BOT_COMMANDS})
+    check("menu: ...each with a description a stranger could act on",
+          all(c["description"] and len(c["description"]) > 8 for c in _cmds))
+    # NO LEADING SLASH: Telegram rejects the whole call if one is sent, and
+    # the failure is silent from the operator's side -- the menu just never
+    # appears, which is the symptom this exists to fix.
+    check("menu: ...and none of them carries a leading slash, which Telegram "
+          "rejects", not any(c["command"].startswith("/") for c in _cmds))
+    check("menu: ...and none names a machine or an amount",
+          not any("vault" in c["description"].lower()
+                  or re.search(r"\d+\.\d", c["description"]) for c in _cmds))
+    # NOT FATAL. A pager that could not publish its menu still answers every
+    # command; refusing to start over cosmetics is the wrong trade on the box
+    # whose whole job is to be reachable.
+    _pub.clear()
+    pg.safe_post = lambda url, data, **k: {"ok": False}
+    _out = io.StringIO()
+    with contextlib.redirect_stdout(_out):
+        _bad = _PubPager(False).publish_commands()
+    check("menu: a failed publish is reported and NOT fatal",
+          _bad is False and "still answers" in _out.getvalue())
+    pg.safe_post = lambda url, data, **k: (_ for _ in ()).throw(OSError("tor"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        check("menu: ...and a raising transport is not fatal either",
+              _PubPager(False).publish_commands() is False)
+finally:
+    pg.safe_post = _saved_post
+
+# AND run() MUST ACTUALLY CALL IT. The checks above drive publish_commands
+# directly, so they are structurally unable to see the menu never being
+# published at all -- a mutation removing the call from run() SURVIVED them.
+# The producer being correct is not the pipeline being wired.
+_run_src = _flat_src(pg.Pager.run)
+check("menu: run() publishes the menu on start",
+      "self.publish_commands()" in _run_src)
+# .find, NOT .index. index() RAISES when the call is absent, and a check that
+# raises kills the suite -- which mutation_sweep scores NO-RESULT, i.e. no
+# verdict at all, rather than the red line this is for. Driven: removing the
+# call turned a CAUGHT into a NO-RESULT.
+_i_pub, _i_up = _run_src.find("publish_commands"), _run_src.find("Pager up")
+check("menu: ...before it announces itself, so a failure is on screen above "
+      "the 'Pager up' line rather than below it",
+      _i_pub != -1 and _i_up != -1 and _i_pub < _i_up)
 
 
 # ===========================================================================
