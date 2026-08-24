@@ -1435,6 +1435,35 @@ check("daemon: gs_wake_keys writes rpc_daemon into the keyfile",
       '"rpc_daemon": args.rpc_daemon,' in _kp_src
       and '"--rpc-daemon"' in _kp_src)
 
+# ---- AND THE FEE DESTINATION WAS READ BY CODE NOTHING COULD REACH --------
+#
+# gs_wake_agent reads key["usage_fee_address"], the vault's keyfile is the
+# only place it looks, and NOTHING WROTE THE FIELD -- no flag, no payload
+# entry. The read shipped with the fee and the writer did not, so the whole
+# fixed-address branch was unreachable code: the same "declared in one place,
+# never wired to the thing that runs" shape as the missing fee itself.
+check("fee: the pairing offers a flag for the fee destination",
+      '"--usage-fee-address"' in _kp_src)
+check("fee: ...and actually writes it into the keyfile the agent reads",
+      '"usage_fee_address": str(args.usage_fee_address or ""),' in _kp_src)
+check("fee: ...and validates it at pairing, not after a mix has run",
+      'proto.JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)'
+      in _kp_src)
+# THE FIELD NAMES MUST MATCH ON BOTH SIDES, which is the half that was broken.
+_ag_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("fee: the name the agent reads is the name the pairing writes",
+      'key.get("usage_fee_address")' in _ag_src)
+# NON-VACUITY: omitting it is still the default, so the fresh-account-per-run
+# behaviour is not quietly replaced by a required fixed address.
+_K = importlib.util.module_from_spec(importlib.util.spec_from_loader(
+    "gs_wake_keys_for_flags",
+    importlib.machinery.SourceFileLoader("gs_wake_keys_for_flags",
+                                         os.path.join(REPO, "gs_wake_keys"))))
+_K.__loader__.exec_module(_K)
+_ap_k = _K.build_cli().parse_args(["pair"])
+check("fee: NON-VACUITY -- omitting the flag is still valid and still means "
+      "'mint a fresh one per run'", _ap_k.usage_fee_address == "")
+
 # ---- AND THE DEPOSIT AMOUNT IS BOUNDED BY THE BOX THAT ACTS ON IT -------
 #
 # The schema bounds it on the wire; this is the second check, in the file

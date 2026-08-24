@@ -305,6 +305,26 @@ def build_cli() -> argparse.ArgumentParser:
                         "Required with --allow-withdraw. The password goes in "
                         "GS_WALLET_PASSWORD in the agent unit's "
                         "EnvironmentFile, never here and never on an argv.")
+    # WHERE THE OPERATOR'S CUT GOES, and the default is deliberately nowhere.
+    #
+    # gs_wake_agent reads key["usage_fee_address"] and there was NO WAY TO SET
+    # IT -- no flag here, nothing writing the field, and the vault's keyfile is
+    # the only place the agent looks. The read was added with the fee itself
+    # and the writer was not, so the address branch was unreachable code: the
+    # exact "declared in one place, never wired to the thing that runs" shape
+    # the fee bug itself had.
+    #
+    # OMITTING IT IS THE RECOMMENDED SETTING, not a fallback. With no address
+    # GhostSpiral mints a FRESH account and subaddress for the cut on every
+    # run, so no address collects from two runs. A fixed destination is one
+    # address taking a slice of everything, it survives the mix, and it is the
+    # reuse this toolchain refuses everywhere else -- so it is available, and
+    # it is not the default.
+    p.add_argument("--usage-fee-address", default="", metavar="XMR_ADDRESS",
+                   help="send the usage fee to THIS address instead of a "
+                        "freshly minted one. Omit unless you need it: one "
+                        "address collecting a slice of every run is address "
+                        "reuse that survives the mix.")
     p.add_argument("--account-ceiling", type=int, default=45,
                    help="refuse minting jobs once the wallet holds this many "
                         "accounts (OPSEC_SETUP.md section 4)")
@@ -324,6 +344,19 @@ def _validate(args) -> None:
                  "    Without it a withdrawal would relay its fan-out and "
                  "fail hours later at the\n"
                  "    signing step, with the money already moved on-chain.")
+    # CHECKED AT PAIRING, with the protocol's own gate -- the same function the
+    # withdraw job applies to a destination off the wire. A typo here is a cut
+    # paid to an address nobody can spend, discovered after a mix has run.
+    if args.usage_fee_address:
+        try:
+            proto.JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)
+        except proto.WakeError as e:
+            sys.exit(f"[!] --usage-fee-address is not a usable Monero "
+                     f"address: {e}\n"
+                     f"    Refusing to write it: the cut would be paid to "
+                     f"somewhere unspendable,\n"
+                     f"    and you would find out after a mix had already "
+                     f"run.")
     if args.wallet_file and not os.path.isabs(args.wallet_file):
         sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "
                  f"agent runs from a unit with its own WorkingDirectory, so a "
@@ -519,6 +552,7 @@ def do_pair(args) -> int:
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),
         "allow_withdraw": bool(args.allow_withdraw),
+        "usage_fee_address": str(args.usage_fee_address or ""),
         "wallet_file": str(args.wallet_file or ""),
     }
     # kdf="none", deliberately and visibly. See the module docstring: a machine

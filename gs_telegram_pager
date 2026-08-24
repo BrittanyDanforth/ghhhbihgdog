@@ -176,10 +176,11 @@ CONVO_TTL_S = 180
 #: dict, so it is bounded here rather than left to the allowlist's length.
 MAX_CONVOS = 16
 
-#: The confirm gate's choices. THREE, and the reason it is not more is that
-#: this is not a security control and pretending otherwise by widening it would
-#: be the dishonest part. See CONFIRM_NOTE.
-CONFIRM_CHOICES = 3
+# CONFIRM_CHOICES IS GONE. It said "The confirm gate's choices. THREE", and
+# the gate has no choices: _confirm_question asks a free-form sum precisely
+# because "offering three options made a wrong answer a one-in-three guess".
+# Nothing read the constant, so it was a number describing a design that had
+# already been replaced -- documentation that reads as configuration.
 
 #: The usage-fee rate, as the ONE string this channel may say about it.
 #:
@@ -207,6 +208,7 @@ USAGE_FEE_LABEL = "1.1%"
 #: "depo" and "slot 0-7" meant nothing to anyone who had not read the source.
 BOT_COMMANDS = [
     ("deposit", "get an address to send Bitcoin to — asks the amount"),
+    ("receive", "just a fresh address, no swap quote"),
     ("status", "can I start one right now"),
     # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
     # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
@@ -215,6 +217,17 @@ BOT_COMMANDS = [
     ("wait", "wait for it to arrive (up to 2h)"),
     ("send", "send mixed funds out — asks the address, then how deep"),
     ("settings", "what this will do, and where each part is decided"),
+    # THE THREE ANSWERS THAT WERE UNREACHABLE IN PRACTICE. /fee, /speed and
+    # /exit have always been handled in parse_command and have always had
+    # answers -- and none of them was in this list, so setMyCommands never
+    # published them and HELP (built from this list) never mentioned them. The
+    # operator had to already know they existed and how they were spelled,
+    # which is the exact state publish_commands' own docstring calls
+    # "indistinguishable from a bot that does not work". /receive was in the
+    # same state and is above.
+    ("fee", "what this keeps"),
+    ("speed", "can I make it faster"),
+    ("exit", "where the mixed funds go"),
     ("cancel", "drop whatever I was half-way through"),
     ("help", "this list"),
 ]
@@ -271,7 +284,11 @@ SPEED_ANSWER = "Not settable here."
 # WAS "Not settable here." AND THAT IS NO LONGER TRUE. /withdraw sets it, by
 # reply, per withdrawal. An answer that still said "not settable" would be the
 # tool lying about its own capability on the one surface the operator asks.
-EXIT_ANSWER = "Per withdrawal — see /withdraw."
+# /send, NOT /withdraw. Both spellings work (parse_command accepts either)
+# but only /send is in BOT_COMMANDS, so /withdraw is the one the "/" menu
+# never offers -- pointing the operator at it from inside an answer sent
+# them to a command they cannot see.
+EXIT_ANSWER = "Per withdrawal — see /send."
 
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
@@ -812,16 +829,42 @@ class Pager:
                      + ", asked at /send")
         lines.append("  destination     the address you reply with at /send")
         lines.append("")
-        lines.append("Fixed here:")
+        # THE COURTESY BOUND, SAID TO BE THE COURTESY BOUND. This box's
+        # --daily-cap help calls itself exactly that: "courtesy pokes per 24h.
+        # The vault's own keyfile budget is the real bound." Printing this
+        # number under a bare heading told the operator it was THE limit, and
+        # the vault can refuse sooner with a different one -- so a run that
+        # stops has an explanation this reply had ruled out.
+        # "the machine", NOT "the vault". Every other line in this reply says
+        # "the machine" for exactly one reason -- naming the box is naming the
+        # shape of the operation on the surface this design assumes is read --
+        # and the first draft of this line said "the vault" twice. The repo's
+        # own test caught it, which is what that check is for.
+        lines.append("Counted here (the machine keeps its own, and its is the "
+                     "real one):")
         lines.append(f"  wake budget     {self.limits.daily_cap} a day, "
                      f"{len(self.limits.recent())} used")
         lines.append("")
-        lines.append("Set on the machine, not here:")
-        lines.append("  hop delay, and the depth ceiling")
+        # ONLY WHAT IS ACTUALLY THERE. This block used to read "Set on the
+        # machine, not here: hop delay, and the depth ceiling" and two thirds
+        # of that was false. There is no hop-delay field in the vault's
+        # keyfile and gs_wake_agent never composes --hop-delay, so the delay
+        # is GhostSpiral's DEFAULT_HOP_DELAY and is not settable ANYWHERE;
+        # the depth options are a table in gs_wake_proto, identical on every
+        # install of a public repository. Naming them as machine settings
+        # invited a trip to the vault to change something that is not there.
+        lines.append("Set on the machine, with physical access:")
         lines.append("  whether sending out is allowed at all")
+        lines.append("  the real wake budget, and the account ceiling")
+        lines.append("  where the usage fee goes, if anywhere fixed")
         lines.append("")
-        lines.append("Nothing in the last group changes from this chat. A "
-                     "message that could turn the mixing down is a message "
+        lines.append("Fixed in the software, the same for everyone:")
+        lines.append("  the delay between hops")
+        lines.append("  which depths are on the menu")
+        lines.append("  the usage fee — see /fee")
+        lines.append("")
+        lines.append("Nothing in the last two groups changes from this chat. "
+                     "A message that could turn the mixing down is a message "
                      "worth stealing the phone for.")
         return "\n".join(lines)
 

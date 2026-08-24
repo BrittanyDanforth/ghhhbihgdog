@@ -864,10 +864,24 @@ python3 gs_wake_keys pair \
 has not been asked to skim must not skim, and the wake agent never asked — so
 `gs_console` skimmed and every withdrawal started from the phone kept 100%.
 It is on now. By default the cut goes to a **fresh account and subaddress
-minted for that run**, so no address collects from two runs; pair with a fixed
-destination only if you understand that one address taking a slice of every
-run is the reuse this toolchain refuses everywhere else, and that it survives
-the mix.
+minted for that run**, so no address collects from two runs. That is the
+recommended setting; leave the flag below off unless you need a fixed
+destination, because one address taking a slice of every run is the address
+reuse this toolchain refuses everywhere else and it survives the mix.
+
+```bash
+# OPTIONAL, and usually wrong. Only if the cut has to land somewhere fixed.
+python3 gs_wake_keys pair \
+    --allow-withdraw \
+    --wallet-file /var/lib/gs/spend.wallet \
+    --usage-fee-address 4...          # validated here, not after a mix runs
+```
+
+The agent read `usage_fee_address` from this keyfile before the flag existed,
+and nothing wrote it — so the fixed-destination branch was unreachable code.
+That is the same shape as the missing fee itself, and it is why both are now
+checked by a test that compares the name the pairing writes against the name
+the agent reads.
 
 On a small withdrawal the cut is **waived, not charged**: below roughly 0.33
 XMR at a typical fee, 1.1% is worth less than the fee to move it, so
