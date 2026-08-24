@@ -87,6 +87,19 @@ from gs_common import (                                      # noqa: E402
 )
 import gs_wake_proto as proto                                # noqa: E402
 
+def _bucket(t: float, size: int) -> float:
+    """Round a wall-clock stamp DOWN to a bucket. 0 stays 0.
+
+    Down rather than nearest, so a stamp never moves into the future -- a
+    future last_poke would make the interval gate refuse for longer than it
+    should, and a refusal the operator cannot explain is worse than a
+    permissive rounding on a limit that is explicitly a courtesy.
+    """
+    if not t or size <= 1:
+        return float(t or 0)
+    return float(int(t) // int(size) * int(size))
+
+
 #: The token env var. Never a flag: see the module docstring.
 TOKEN_ENV = "GS_TG_BOT_TOKEN"
 
@@ -249,7 +262,6 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 #: and the operator needs it at the moment they are about to send.
 HELP = (
     "/depo       start — asks which slot, then confirms\n"
-    "/depo <s>   same, in one shot, slot 0-7\n"
     "/recv [n]   1-4 addresses to receive on (default 1)\n"
     # BOTH NUMBERS INCLUDE THE JITTER, because the operator waits it.
     #
@@ -394,10 +406,28 @@ class Limits:
         self.pokes = [float(x) for x in (d.get("pokes") or [])
                       if isinstance(x, (int, float))]
 
+    #: Stamps are rounded to this before they touch the card.
+    #:
+    #: This file is the ONE thing the pager persists, and it sat on the SD card
+    #: holding a float per poke: the exact second the operator asked for a
+    #: quote, for every quote in the last 24 hours. Anyone who images the card
+    #: reads a timetable of when its owner was awake and moving money -- and
+    #: they read it to the microsecond.
+    #:
+    #: Five minutes is coarser than anything the file is FOR: the interval gate
+    #: defaults to 300 s and the cap counts a 24-hour window, so a stamp good
+    #: to five minutes answers both. It cannot be zero-cost -- rounding can let
+    #: a poke through up to one bucket early -- and that is a courtesy limit
+    #: whose own docstring says the real bound is the vault's keyfile.
+    STAMP_BUCKET_S = 300
+
     def save(self) -> None:
         atomic_write_json(
-            {"offset": self.offset, "last_poke": self.last_poke,
-             "pokes": self.pokes[-200:]}, self.path, perms=0o600)
+            {"offset": self.offset,
+             "last_poke": _bucket(self.last_poke, self.STAMP_BUCKET_S),
+             "pokes": [_bucket(t, self.STAMP_BUCKET_S)
+                       for t in self.pokes[-200:]]},
+            self.path, perms=0o600)
 
     def recent(self) -> list:
         now = time.time()
@@ -470,19 +500,26 @@ def parse_command(text: str) -> tuple:
             return "", {}, "count must be 1-4"
         return "receive_new", {"count": n}, ""
     if cmd == "/depo":
-        # NO ARGUMENT STARTS THE WIZARD. `/depo 2` is unchanged and always
-        # will be -- the wizard exists because "2" is a number whose meaning
-        # has to be remembered, not because the one-shot form is wrong.
-        if not arg:
-            return "", {}, "depo_wizard"
-        # isdecimal for the same reason as /recv above: int() accepts exactly
-        # the strings isdecimal() matches, and isdigit() is wider.
-        if not arg.isdecimal():
-            return "", {}, "give a ladder SLOT 0-7, not an amount"
-        s = int(arg)
-        if not 0 <= s <= 7:
-            return "", {}, "slot must be 0-7"
-        return "receive_and_quote", {"amount_slot": s}, ""
+        # THE WIZARD IS THE ONLY FORM NOW.
+        #
+        # `/depo 2` used to work in one shot, on the reasoning that the wizard
+        # exists for the operator's convenience and not because the short form
+        # is wrong. It IS wrong, for two reasons that only show up in a
+        # transcript and under a thumb:
+        #
+        #   * "/depo 2" is one keystroke away from a wake and a real quote. The
+        #     confirm step is the whole reason the wizard was written, and a
+        #     second door beside it that skips the confirm makes the confirm
+        #     optional -- which is the same as not having one.
+        #   * It puts the digit in the transcript ATTACHED to the word, on one
+        #     line, permanently. The wizard's answer is a bare "2" on its own,
+        #     which says nothing by itself.
+        #
+        # Any argument at all is refused rather than ignored: silently
+        # dropping it would run a DIFFERENT slot from the one typed.
+        if arg:
+            return "", {}, "just /depo — it asks"
+        return "", {}, "depo_wizard"
     if cmd in ("/cancel", "/stop"):
         return "", {}, "cancel"
     # THE THREE QUESTIONS THAT ARE NOT KNOBS. Each answers where the thing is
@@ -712,21 +749,34 @@ class Pager:
     def commit_convo(self, chat_id: int, slot: int) -> None:
         """Turn a finished conversation into a job. THE ONLY WAY IT BECOMES ONE.
 
-        "Byte-identical to /depo N" is made a TAUTOLOGY rather than a promise:
-        the wizard composes the same TEXT an operator would have typed and
-        hands it to the same parse_command, so there is no second place where
-        a slot becomes a job and no second place for the two to drift.
+        THIS USED TO ROUND-TRIP THROUGH parse_command, composing the text an
+        operator would have typed -- `/depo 2` -- so that the wizard and the
+        one-shot form could not drift apart. That was the right shape while
+        both existed. The one-shot form is gone (it skipped the confirm the
+        wizard was written for, and it put the digit in the transcript
+        attached to the word), so the round trip now asks the parser for a
+        form the parser deliberately refuses, and the wizard could never
+        commit at all. Caught by this repo's own tests, immediately, which is
+        what they are for.
 
-        The result is then compared against the literal it must be. An
-        explicit comparison and not `assert`, because python -O removes
-        asserts and this one is the last thing standing between a conversation
-        and a wake.
+        The invariant it was protecting still matters and is checked directly:
+        what reaches the wire is ONE key holding an in-range int, and it is
+        validated against the PROTOCOL's schema rather than against a literal
+        typed here -- the vault applies that same schema, so agreeing with it
+        is the property, and agreeing with a copy of it is not.
+
+        An explicit comparison and not `assert`, because python -O removes
+        asserts and this is the last thing standing between a conversation and
+        a wake.
         """
-        job, params, err = parse_command(f"/depo {slot}")
-        if err or (job, params) != ("receive_and_quote", {"amount_slot": slot}):
+        job, params = "receive_and_quote", {"amount_slot": int(slot)}
+        _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
+        if (set(params) != set(_schema)
+                or not isinstance(params["amount_slot"], int)
+                or isinstance(params["amount_slot"], bool)
+                or not 0 <= params["amount_slot"] <= 7):
             integrity_log("pager", "convo_commit_mismatch")
-            self.send(chat_id, "no: internal check failed, nothing was woken. "
-                               "Use /depo <slot>.")
+            self.send(chat_id, "no: internal check failed, nothing was woken.")
             return
         self.start_job(chat_id, job, params)
 
@@ -932,6 +982,25 @@ class Pager:
             return
         out = pending.outcome()
         integrity_log("pager", f"outcome:{job}:{out}")
+        # A PHASE OUTRANKS THE OUTCOME, and it is checked before the branch
+        # that reads `out`.
+        #
+        # The phase branch used to live INSIDE `if out == "done"`, so a watch
+        # that ran its full window and reported what it saw -- money still
+        # confirming -- fell through to the failure branch and said
+        # "watch: failed." The phase is the honest answer and the outcome is
+        # the return code; when they disagree, the honest answer wins.
+        #
+        # It is safe to trust here because it is not this box's word: the
+        # doorbell refuses any phase outside the protocol's closed table
+        # before this line can see it, which is also what stops the vault
+        # gaining a free-text channel into a chat.
+        _early = (pending.result or {}).get("phase") or ""
+        if _early and out != "done":
+            self.send(chat_id,
+                      f"{(pending.result or {}).get('handle') or '----'}: "
+                      f"{proto.PHASE_LINES.get(_early, _early)}")
+            return
         if out == "done":
             res = pending.result or {}
             h = res.get("handle") or "----"

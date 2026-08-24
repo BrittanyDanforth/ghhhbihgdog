@@ -76,6 +76,14 @@ import nacl.public as NP                                     # noqa: E402
 _SRC_PG_EARLY = open(os.path.join(REPO, "gs_telegram_pager"),
                      encoding="utf-8").read()
 
+def _confirm_answer(sent):
+    """Read the wizard's arithmetic back off the chat and solve it."""
+    import re as _re_c
+    m = _re_c.search(r"(\d+) \+ (\d+) = \?",
+                     "\n".join(t for _c, t in sent))
+    return int(m.group(1)) + int(m.group(2)) if m else 0
+
+
 #: The vault's real pre-job jitter, read from the protocol rather than copied,
 #: so the help text's quoted round trip cannot drift away from it.
 _AG_JIT = (P.VAULT_JITTER_LO_S, P.VAULT_JITTER_HI_S)
@@ -91,10 +99,8 @@ print("== nothing typed into a chat can name a destination ==")
 for _text, _job, _params in (
         ("/recv", "receive_new", {"count": 1}),
         ("/recv 4", "receive_new", {"count": 4}),
-        ("/depo 0", "receive_and_quote", {"amount_slot": 0}),
-        ("/depo 7", "receive_and_quote", {"amount_slot": 7}),
-        ("/depo@somebot 2", "receive_and_quote", {"amount_slot": 2}),
-        ("/watch a3f1", "watch", {"handle": "A3F1"})):
+        ("/watch a3f1", "watch", {"handle": "A3F1"}),
+        ("/check A3F1", "swap_status", {"handle": "A3F1"})):
     _j, _p, _e = pg.parse_command(_text)
     check(f"{_text!r} -> {_job}", (_j, _p) == (_job, _params))
 
@@ -143,9 +149,14 @@ for _t in ["/recv", "/recv 2", "/depo 0", "/depo 7", "/watch A3F1",
             _long += 1
 check("every parameter is an int or a 4-char handle, never a longer string",
       _types <= {"int", "str"} and _long == 0)
+# /depo is not in this list any more: it produces NO job directly, only the
+# wizard, which is the point. The wizard's own output is checked below.
 check("the jobs it can ask for are exactly the ones the protocol allows",
-      {pg.parse_command(t)[0] for t in ("/recv", "/depo 1", "/watch A3F1",
+      {pg.parse_command(t)[0] for t in ("/recv", "/watch A3F1",
                                         "/check A3F1")} <= set(P.JOBS))
+check("...and /depo produces no job of its own at all, in either form",
+      pg.parse_command("/depo")[0] == ""
+      and pg.parse_command("/depo 2")[0] == "")
 
 # THE SAME GUARANTEE, THROUGH THE WIZARD, because parse_command is no longer
 # the only producer of params. A structural check that covers one of two
@@ -206,7 +217,7 @@ for _j, _pa in _wiz:
                     "challenge": P.new_challenge().hex(), "job": _j, **_pa})
 check("...and every one passes the REAL job schema", True)
 # ...and the protocol itself agrees, rather than this file asserting it alone.
-for _t in ("/recv 2", "/depo 3", "/watch A3F1"):
+for _t in ("/recv 2", "/watch A3F1", "/check A3F1"):
     _j, _p, _e = pg.parse_command(_t)
     check(f"gs_wake_proto accepts what {_t!r} composes",
           _j in P.JOBS and set(_p) <= set(P.JOBS[_j]["schema"]))
@@ -447,9 +458,17 @@ DB.run_wake = lambda a, k, j, p: _real_rw(
     a, k, j, p, sock_factory=lambda: _FakeSock(),
     sleep=lambda n: time.sleep(min(n, 0.05)))
 threading.Thread(target=_vault, args=("A3F1",), daemon=True).start()
-_pe.handle(_msg(111, "/depo 2"))
+# THROUGH THE WIZARD, because that is the only path to a wake now. The
+# end-to-end drive used the one-shot form, which is refused.
+_pe.handle(_msg(111, "/depo"))
+_pe.handle(_msg(111, "2"))
+_pe.handle(_msg(111, str(_confirm_answer(_sent))))
+# WAIT FOR THE HANDLE, NOT FOR A MESSAGE COUNT. The old loop waited for
+# len(_sent) >= 2 -- which the wizard already satisfies before the wake even
+# starts (the slot prompt and the confirm question), so it fell straight
+# through and read a chat that had no handle in it yet.
 for _ in range(500):
-    if len(_sent) >= 2:
+    if any("A3F1" in t for _c, t in _sent):
         break
     time.sleep(0.05)
 time.sleep(0.3)
@@ -675,7 +694,7 @@ check("updates: run() itself excludes bool from the id check",
 #    typo escaped parse_command as a ValueError: handle() is inside run()'s
 #    per-update try, so the operator got NO reply and it was counted as a
 #    dropped update.
-for _sup in ("/recv ²", "/depo ²", "/recv ³", "/depo ½"):
+for _sup in ("/recv ²", "/recv ³", "/recv ½", "/recv ٩٩٩"):
     _raised = False
     try:
         _j, _p, _e = pg.parse_command(_sup)
@@ -686,11 +705,10 @@ for _sup in ("/recv ²", "/depo ²", "/recv ³", "/depo ½"):
 # NON-VACUITY: ordinary digits still work, and so does the Arabic-Indic form
 # the wizard's own test says legitimately reads as a slot.
 check("digits: NON-VACUITY -- plain digits still parse",
-      pg.parse_command("/recv 4")[1] == {"count": 4}
-      and pg.parse_command("/depo 3")[1] == {"amount_slot": 3})
+      pg.parse_command("/recv 4")[1] == {"count": 4})
 check("digits: NON-VACUITY -- Arabic-Indic digits still parse, as the wizard "
       "already decided they legitimately do",
-      pg.parse_command("/depo ٢")[1] == {"amount_slot": 2})
+      pg.parse_command("/recv ٢")[1] == {"count": 2})
 # CODE, NOT PROSE. A substring ban punishes the comments that explain the
 # fix -- the same trap the addr_index guard fell into. Every remaining mention
 # of isdigit in this file is a note saying why isdecimal is used instead.
@@ -873,6 +891,122 @@ for _plain in ("burned 3/7.", "pokes in last 24h: 3/12", "wait 30s",
 check("varchat: NON-VACUITY -- a bot token is still stripped",
       pg._redact("bot123456789:AAEEabcdefghijklmnopqrstuvwxyz01")
       == "bot<token>")
+
+
+# ===========================================================================
+#  THE ONE FILE THE PAGER PERSISTS
+# ===========================================================================
+print("\n== what the state file says about when you were awake ==")
+#
+# It held a float per poke: the exact second the operator asked for a quote,
+# for every quote in the last 24 hours, on the SD card of the box that is
+# supposed to hold nothing. Anyone who images the card reads a timetable of
+# when its owner was moving money, to the microsecond.
+#
+# Five minutes is coarser than anything the file is FOR -- the interval gate
+# defaults to 300 s and the cap counts a 24-hour window -- so a stamp good to
+# five minutes still answers both questions the file exists to answer.
+_stdir = tempfile.mkdtemp(prefix="stamps_")
+_stp = os.path.join(_stdir, "state.json")
+_sl = pg.Limits(__import__("pathlib").Path(_stp), 300, 12)
+_t_odd = 1755900123.456789
+_sl.last_poke = _t_odd
+_sl.pokes = [_t_odd, _t_odd + 7, _t_odd + 61]
+_sl.save()
+_on_disk = json.loads(open(_stp, encoding="utf-8").read())
+check("stamps: no exact second reaches the card",
+      _t_odd not in _on_disk["pokes"]
+      and _on_disk["last_poke"] != _t_odd)
+check("stamps: every stamp is a whole multiple of the bucket",
+      all(float(x) % pg.Limits.STAMP_BUCKET_S == 0
+          for x in _on_disk["pokes"] + [_on_disk["last_poke"]]))
+check("stamps: ...and no stamp moved into the FUTURE, which would make the "
+      "interval gate refuse for longer than it should",
+      all(float(x) <= _t_odd + 61 for x in _on_disk["pokes"])
+      and float(_on_disk["last_poke"]) <= _t_odd)
+# NON-VACUITY: the file still records the pokes it is for, and the cursor.
+check("stamps: NON-VACUITY -- the pokes are still there to be counted",
+      len(_on_disk["pokes"]) == 3 and "offset" in _on_disk)
+# NON-VACUITY: the limiter still WORKS on the coarsened values -- rounding a
+# rate limit into uselessness would be the wrong fix.
+# A LIVE STAMP for the reload check: recent() prunes anything older than 24h,
+# so the fixed 2025 value above is correctly dropped and would make this pass
+# for the wrong reason.
+_sl_live = pg.Limits(__import__("pathlib").Path(_stp), 300, 2)
+_now_live = time.time()
+_sl_live.last_poke = _now_live
+_sl_live.pokes = [_now_live - 10, _now_live - 400, _now_live]
+_sl_live.save()
+_sl2 = pg.Limits(__import__("pathlib").Path(_stp), 300, 2)
+check("stamps: NON-VACUITY -- a restart still reloads them and still refuses",
+      len(_sl2.recent()) >= 2 and _sl2.why_not() != "")
+check("stamps: ...and those live ones were coarsened on the way to disk too",
+      all(float(x) % pg.Limits.STAMP_BUCKET_S == 0
+          for x in json.loads(open(_stp, encoding="utf-8").read())["pokes"]))
+check("stamps: ...and the file is still 0600, which is what makes the "
+      "coarsening a second line rather than the only one",
+      oct(os.stat(_stp).st_mode)[-3:] == "600")
+# 0 IS NOT A TIME. A never-poked limiter must not have its zero turned into a
+# bucket boundary that reads as a real stamp.
+check("stamps: a zero stays zero rather than becoming a timestamp",
+      pg._bucket(0, 300) == 0 and pg._bucket(0.0, 300) == 0)
+
+
+# ===========================================================================
+#  WHAT THE Pi's OWN CARD SAYS ABOUT WHAT THE Pi IS FOR
+# ===========================================================================
+print("\n== the SD card must not be a map of the operation ==")
+#
+# The Pi is the box that is supposed to hold nothing. Its unit files carried
+# ninety lines each explaining what the pager is, what a stolen token gets,
+# which keyfile decides what comes back, and what the wake budget is -- so
+# anyone who imaged that card read the design out of the comments without
+# running a thing. `systemctl status` printed the toolchain's name too.
+#
+# The reasoning belongs in OPSEC_SETUP.md and in the tools' own docstrings, on
+# the machine that has the source.
+_UNITS = {}
+for _u in ("gs-telegram-pager.service.example", "gs-doorbell.service.example"):
+    _up = os.path.join(REPO, "systemd", _u)
+    _UNITS[_u] = open(_up, encoding="utf-8").read() if os.path.exists(_up) else ""
+check("card: both Pi-side unit examples exist, so the checks below read "
+      "something", all(_UNITS.values()))
+
+for _u, _txt in _UNITS.items():
+    _desc = [l for l in _txt.splitlines() if l.startswith("Description=")]
+    check(f"card: {_u} has exactly one Description", len(_desc) == 1)
+    check(f"card: {_u}'s Description names no tool and no toolchain — "
+          f"systemctl prints it to anyone who can read the unit",
+          not any(w in _desc[0].lower()
+                  for w in ("ghostspiral", "gs_", "pager", "doorbell",
+                            "telegram", "wake", "vault")))
+    # A CEILING, because the drift was length rather than a forbidden word.
+    check(f"card: {_u} is under 110 lines ({len(_txt.splitlines())})",
+          len(_txt.splitlines()) <= 110)
+    check(f"card: {_u} does not restate the wake budget or the threat model",
+          not any(w in _txt.lower()
+                  for w in ("24 h wake", "24h wake", "wake budget",
+                            "account ceiling", "stolen phone",
+                            "throws away the only reason")))
+    check(f"card: {_u} sets a UMask, so nothing it writes is world-readable",
+          "UMask=" in _txt)
+    check(f"card: {_u} still keeps the journal empty",
+          "StandardOutput=null" in _txt and "StandardError=null" in _txt)
+    check(f"card: {_u} still forbids core dumps, which hold the token",
+          "LimitCORE=0" in _txt)
+# NON-VACUITY: the units still say the things an installer cannot do without.
+_pgu = _UNITS["gs-telegram-pager.service.example"]
+check("card: NON-VACUITY -- the pager unit still says the token goes in the "
+      "environment and never on argv",
+      "never on argv" in _pgu.lower() or "NEVER ON ARGV" in _pgu)
+check("card: NON-VACUITY -- and still tells the operator to find their chat "
+      "id first", "--whoami" in _pgu)
+check("card: NON-VACUITY -- and documents the burn switch it now has",
+      "--burn-after" in _pgu and "USR1" in _pgu)
+_dbu = _UNITS["gs-doorbell.service.example"]
+check("card: NON-VACUITY -- the doorbell unit still keeps the job off argv, "
+      "which is the defect its own comment records",
+      "StandardInput=file:" in _dbu and "--job" in _dbu)
 
 
 # ===========================================================================

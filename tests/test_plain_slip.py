@@ -537,6 +537,87 @@ check("...and it does not name the machine to go and read it on",
 check("NON-VACUITY -- the plaintext-off reply is a real message",
       _chat_off.strip() and "ready" in _chat_off)
 
+# ===========================================================================
+#  A PHASE OUTRANKS THE OUTCOME
+# ===========================================================================
+#
+# receive_watch exits non-zero when its window runs out, so a /watch whose
+# money was still confirming after 110 minutes reported "watch: failed." --
+# money in flight, called a failure of the machine, after the vault had already
+# powered off. Every reasonable reaction to that message is wrong.
+#
+# The phase was being computed and carried and then dropped, at three separate
+# gates: _dispatch excused a non-zero rc only for swap_status, report_back sent
+# `phase if done else ""`, and the pager's phase branch was nested inside
+# `if out == "done"`. Fixing any one alone changes nothing, which is why this
+# drives the OUTCOME and the PHASE together rather than either on its own.
+print("\n-- a watch that saw something is not a failed watch --")
+
+
+def _drive_out(result, outcome, job="watch"):
+    """Like _drive, but the OUTCOME is what the caller says.
+
+    _drive stubs outcome() to "done" unconditionally, which is right for the
+    slip cases it was written for and makes it structurally unable to see this
+    defect: the bug only exists when the outcome is NOT done.
+    """
+    _sent.clear()
+    fin = type("F", (), {"result": result,
+                         "outcome": staticmethod(lambda: outcome)})()
+    pg._DOORBELL[0] = type("D", (), {
+        "run_wake": staticmethod(lambda a, k, j, p: fin)})()
+    _p.poke(111, job, {"handle": "A3F1"})
+    return list(_sent)
+
+
+def _res(status, phase):
+    return {"status": status, "handle": "A3F1", "slip": "", "plain": {},
+            "phase": phase}
+
+
+for _ph in ("not_yet", "arriving", "short", "stuck"):
+    _m = _drive_out(_res("failed", _ph), "failed")
+    check(f"watch/{_ph}: a non-done outcome carrying a phase reports the "
+          f"phase, not a failure",
+          len(_m) == 1 and P.PHASE_LINES[_ph] in _m[0]
+          and "failed" not in _m[0].lower())
+    check(f"watch/{_ph}: ...and still names the handle, so /check works later",
+          "A3F1" in _m[0])
+# NON-VACUITY 1: a genuine failure with NOTHING seen still says failed. A fix
+# that reported every outcome as a phase would pass every check above.
+_mf = _drive_out(_res("failed", ""), "failed")
+check("watch: NON-VACUITY -- a failure that saw nothing still says failed",
+      _mf == ["watch: failed."])
+_mr = _drive_out(_res("refused", ""), "refused")
+check("watch: NON-VACUITY -- and a refusal still says refused",
+      _mr == ["watch: refused."])
+# NON-VACUITY 2: a DONE outcome still takes the ordinary path.
+_md = _drive_out(_res("done", "landed"), "done")
+check("watch: NON-VACUITY -- a done outcome still reports its phase the way "
+      "it always did", len(_md) == 1 and P.PHASE_LINES["landed"] in _md[0])
+# NON-VACUITY 3: the same drive on a job with no phase is untouched.
+_mq = _drive_out(_res("done", ""), "done", job="receive_and_quote")
+check("watch: NON-VACUITY -- a quote with no phase still reports its handle",
+      any("A3F1" in t for t in _mq))
+
+# AND THE AGENT MUST NOT THROW THE PHASE AWAY BEFORE IT GETS HERE. Three gates,
+# each of which alone makes the fix inert.
+_AG_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("watch/agent: a non-zero rc is excused for BOTH watching jobs",
+      'if rc != 0 and job in ("swap_status", "watch") and not hard:' in _AG_SRC)
+check("watch/agent: the stale status file is cleared for both, or a watch "
+      "reports the answer a probe left behind hours earlier",
+      'if job in ("swap_status", "watch"):' in _AG_SRC)
+check("watch/agent: and the phase travels with a non-done status",
+      '"phase": phase}' in _AG_SRC and '"phase": phase if done' not in _AG_SRC)
+# NON-VACUITY: the OTHER fields are still gated on done -- a job that did not
+# finish must not hand over a slip.
+check("watch/agent: NON-VACUITY -- slip and plain are still done-only, so "
+      "this loosened one field and not the envelope",
+      '"slip": slip if done else ""' in _AG_SRC
+      and '"plain": plain if done else {}' in _AG_SRC)
+
+
 # THE STATUS REPLY.
 for _w in ("not_yet", "arriving", "landed", "short", "stuck"):
     _m = _drive({"status": "done", "handle": "A3F1", "slip": "", "plain": {},
