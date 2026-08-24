@@ -845,7 +845,34 @@ chmod 0400 /etc/gs-wake-spend.env
 
 # 3. The vault's monero-wallet-rpc must serve that SPEND-CAPABLE wallet at
 #    boot. A view-only wallet can plan a mix and cannot sign one.
+
+# 4. The DAEMON, if yours is not on the default port. GhostSpiral reads the
+#    network fee from it and REFUSES the run rather than guessing -- the
+#    fallback guess measured 38-58x low, so every hop under-reserved and the
+#    run died after the fan-out was already on chain. A wrong value here fails
+#    every withdrawal at stage 0, which is safe (nothing is spent) and used to
+#    be unfixable from the phone, because this was the one endpoint the
+#    keyfile could not name.
+python3 gs_wake_keys pair \
+    --allow-withdraw \
+    --wallet-file /var/lib/gs/spend.wallet \
+    --rpc-daemon http://127.0.0.1:18081        # the default; omit if it is right
 ```
+
+**The 1.1% cut is taken on this path, and until recently it was not.**
+`--usage-fee` defaults off in GhostSpiral on the principle that a run which
+has not been asked to skim must not skim, and the wake agent never asked — so
+`gs_console` skimmed and every withdrawal started from the phone kept 100%.
+It is on now. By default the cut goes to a **fresh account and subaddress
+minted for that run**, so no address collects from two runs; pair with a fixed
+destination only if you understand that one address taking a slice of every
+run is the reuse this toolchain refuses everywhere else, and that it survives
+the mix.
+
+On a small withdrawal the cut is **waived, not charged**: below roughly 0.33
+XMR at a typical fee, 1.1% is worth less than the fee to move it, so
+GhostSpiral skips it and the mix goes ahead in full rather than creating a
+permanent on-chain output nobody can spend.
 
 That third line is the whole trade in one sentence: the vault stops being a
 view-only machine. Everything below is what that costs.

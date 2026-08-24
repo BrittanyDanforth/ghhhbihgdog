@@ -698,6 +698,117 @@ finally:
     pg.integrity_log = _saved_il
 check("updates: an update with a non-int id is skipped, not handled",
       [u["update_id"] for u in _handled] == [5])
+
+# 4. THE POLL-FAILURE EXIT MUST NOT KILL A WAKE THAT IS IN FLIGHT.
+#
+# THE MOST EXPENSIVE BUG THIS FILE HAS HELD, and every suite was green through
+# it. safe_get times out at 20 s and the failure path sleeps 5, so
+# MAX_POLL_FAILURES is reached after roughly five minutes of Tor being
+# unreachable -- routine on Tor over WireGuard. The worker that runs a wake is
+# a DAEMON thread, so SystemExit on the polling thread tears the interpreter
+# down without joining it, and the in-process doorbell server dies with its
+# socket closed.
+#
+# End to end: a withdrawal the vault already collected keeps running ON THE
+# VAULT for up to 16.75 h, spends real money, and POSTs its result to a port
+# nothing is bound to. gs_wake_agent.report_back catches that, writes
+# `result_undeliverable`, and the vault powers off. The mix happened. The
+# operator's last message was "working" and nothing ever follows it.
+_saved_sleep = pg.time.sleep
+pg.time.sleep = lambda _s: None
+
+
+def _drive_polls(busy_held, ticks):
+    """Run updates() through `ticks` dead polls. True if it called sys.exit."""
+    _q = pg.Pager.__new__(pg.Pager)
+    _q.proxies, _q.token, _q.poll_failures = {"http": "x"}, "T", 0
+    _q.busy = threading.Lock()
+    _q.limits = types.SimpleNamespace(offset=0, save=lambda: None)
+    if busy_held:
+        _q.busy.acquire()
+    for _ in range(ticks):
+        try:
+            _q.updates()
+        except SystemExit:
+            return True, _q
+    return False, _q
+
+
+try:
+    pg.safe_get = lambda url, proxies=None: (_ for _ in ()).throw(
+        OSError("SOCKS connect failed"))
+    pg.integrity_log = lambda *a, **k: None
+    _exited_busy, _qb = _drive_polls(True, pg.MAX_POLL_FAILURES + 8)
+    _exited_idle, _qi = _drive_polls(False, pg.MAX_POLL_FAILURES + 8)
+    # AND IT STILL STOPS once the wake is done, or the narrowing became a
+    # permanent licence to run deaf.
+    _qb.busy.release()
+    try:
+        _qb.updates()
+        _stops_after = False
+    except SystemExit:
+        _stops_after = True
+finally:
+    pg.safe_get = _saved_get
+    pg.integrity_log = _saved_il
+    pg.time.sleep = _saved_sleep
+
+check("polls: a wake in flight is NOT killed by Telegram being unreachable",
+      not _exited_busy)
+check("polls: ...and the failure counter still climbed, so it is not merely "
+      "not counting", _qb.poll_failures > pg.MAX_POLL_FAILURES)
+check("polls: NON-VACUITY -- with nothing running it DOES still stop, which "
+      "is the original rule", _exited_idle)
+check("polls: ...and it stops on the next poll once the wake finishes, so "
+      "this is a delay and not a licence to run deaf", _stops_after)
+
+# 5. "WORKING. THIS TAKES A WHILE." IS NOT A NUMBER ANYONE CAN WAIT OUT.
+#
+# That was the message for EVERY job, and the jobs are not alike: a status
+# probe is minutes, a withdrawal holds `busy` -- every command, not just
+# another wake -- for the better part of a day. An operator told "a while" and
+# then answered "a wake is already running" for sixteen hours concludes the
+# bot is broken, which is the report this whole channel exists not to produce.
+_said = []
+_wp = pg.Pager.__new__(pg.Pager)
+_wp.args = types.SimpleNamespace(no_jitter=False)
+_wp.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None)
+_wp.send = lambda cid, t: (_said.append((cid, t)), True)[1]
+_saved_thread = threading.Thread
+try:
+    pg.integrity_log = lambda *a, **k: None
+    threading.Thread = lambda **kw: types.SimpleNamespace(start=lambda: None)
+    _durations = {}
+    for _j in sorted(P.JOBS):
+        _said.clear()
+        _wp.busy = threading.Lock() if False else _th2.Lock()
+        _wp.start_job(1, _j, {})
+        _durations[_j] = _said[0][1] if _said else ""
+finally:
+    threading.Thread = _saved_thread
+    pg.integrity_log = _saved_il
+
+check("working: every job says how long it will hold the pager",
+      all(re.search(r"up to \d+\s*(h|min)", _t)
+          for _t in _durations.values()))
+check("working: ...and says that nothing else can run meanwhile, which is "
+      "what `busy` actually means",
+      all("Nothing else" in _t for _t in _durations.values()))
+# THE FIGURES ARE NOT ALL THE SAME, or one message is being printed for five
+# very different waits and the number is decoration.
+check("working: NON-VACUITY -- the durations actually differ per job",
+      len({re.search(r"up to (\d+\s*(?:h|min))", _t).group(1)
+           for _t in _durations.values()}) > 1)
+# AND THE SPENDING JOB IS THE LONG ONE, stated in hours rather than minutes.
+check("working: the withdrawal is reported in HOURS, not 'a while'",
+      "h." in _durations["withdraw"] or re.search(r"up to \d+h",
+                                                  _durations["withdraw"]))
+# DERIVED, NOT TYPED. The figure must track result_budget_s, or it becomes the
+# next 9900 -- a hand-copied duration that stopped being true when a job was
+# added and that nothing noticed.
+_want_h = (P.result_budget_s("withdraw") + DB.PRE_WOL_MAX_S) // 3600 + 1
+check(f"working: the withdrawal figure is derived from result_budget_s "
+      f"({_want_h}h)", f"up to {_want_h}h" in _durations["withdraw"])
 check("updates: ...and True is not accepted as an id (True == 1 would move "
       "the cursor to 2)", _lp.ignored == 2 and _lp.limits.offset == 6)
 # The source-level half, because the loop above is a paraphrase of run():

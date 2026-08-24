@@ -625,6 +625,92 @@ for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
 _mwr = _drive_out(_res("refused", ""), "refused", job="withdraw")
 check("withdraw: NON-VACUITY -- a refusal gets no depth advice either",
       _mwr == ["withdraw: refused."])
+
+# ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
+#
+# With no slip and no plain, a COMPLETED withdrawal fell through to the
+# generic line and reported "withdraw ready · slip A3F1" -- after up to
+# sixteen hours, about money that has already left the wallet. Both halves
+# were wrong, and every suite was green through it.
+#
+#   * "ready" is deposit vocabulary for something that has not happened, used
+#     on the one job where the irreversible thing HAS. This repo caught the
+#     same error once already, in PHASE_LINES, where "Done." "changed which
+#     noun it was about".
+#   * The handle is a PHANTOM. gs_wake_agent._dispatch writes handles[] only
+#     for receive_and_quote and receive_new, so no withdrawal label is ever
+#     registered and /check or /wait on the one printed here answers
+#     unknown_handle. It named a slip that does not exist and invited an
+#     action that fails.
+_mws = _drive_out(_res("done", ""), "done", job="withdraw")
+check("withdraw: a finished spend says SENT, not 'ready'",
+      len(_mws) == 1 and "sent" in _mws[0].lower()
+      and "ready" not in _mws[0].lower())
+check("withdraw: ...and advertises no slip handle, because none was registered",
+      "slip" not in _mws[0].lower() and "A3F1" not in _mws[0])
+# THE SECOND SENTENCE IS THE ONE THAT SAVES MONEY. _funded_entry deliberately
+# takes the LARGEST SINGLE unlocked output rather than summing -- summing
+# would spend inputs from several subaddresses in one transaction, which is
+# permanent public proof they share an owner. So a withdrawal moves ONE pile,
+# and nothing said so: an operator with money in three places had two thirds
+# of it left behind with no indication.
+# "one address", NOT "one". The first version of this check tested for the
+# bare word and the mutation sweep found it: replacing "This moves ONE address
+# at a time" with "It moves everything at once" left the check green, because
+# "more than one place" further down the same message still contains "one".
+# A substring test on a word that common is a check that cannot fail.
+check("withdraw: ...and says it moved ONE ADDRESS, so the rest is not lost "
+      "track of",
+      "one address" in _mws[0].lower()
+      and "everything" not in _mws[0].lower()
+      and "/send again" in _mws[0])
+check("withdraw: ...and states no balance and no count, because this box has "
+      "neither", not re.search(r"\d+\.\d", _mws[0]))
+# NON-VACUITY: the deposit jobs still take the ordinary path, so this is a
+# withdrawal-shaped answer and not a rewrite of every completion message.
+for _j in ("receive_and_quote", "receive_new"):
+    _md2 = _drive_out(_res("done", ""), "done", job=_j)
+    check(f"{_j}: NON-VACUITY -- still reports ready with its slip handle",
+          len(_md2) == 1 and "ready" in _md2[0] and "A3F1" in _md2[0])
+
+# ONE RETRY ON THE COMPLETION NOTICE, and this is the only notification that a
+# spend finished -- at the end of a job that ran up to sixteen hours and moved
+# real money. send() does not retry on its own; it returns whether it landed.
+# A single Tor circuit failing at the wrong second would leave "working" as the
+# last thing the operator ever heard, which is exactly what the poll-failure
+# fix in updates() exists to prevent. Saving the result from a closed socket
+# and then losing it to a dropped POST would be absurd.
+_saved_sleep2 = pg.time.sleep
+_tries = []
+
+
+def _drive_withdraw_send(ok_on):
+    """Complete a withdrawal whose send succeeds on attempt `ok_on`."""
+    _tries.clear()
+    _saved_send = _p.send
+    try:
+        _p.send = lambda cid, t: (_tries.append(t), len(_tries) >= ok_on)[1]
+        _drive_out(_res("done", ""), "done", job="withdraw")
+    finally:
+        _p.send = _saved_send
+    return len(_tries)
+
+
+try:
+    pg.time.sleep = lambda _s: None
+    _n_ok = _drive_withdraw_send(1)
+    _n_retry = _drive_withdraw_send(2)
+    _n_dead = _drive_withdraw_send(99)
+finally:
+    pg.time.sleep = _saved_sleep2
+
+check("withdraw: a completion notice that lands is sent once", _n_ok == 1)
+check("withdraw: ...one that drops is retried, so a single bad circuit does "
+      "not swallow the only word that a spend finished", _n_retry == 2)
+# BOUNDED. This still holds `busy`; a retry storm against a dead circuit would
+# hold it for the rate limit's whole window.
+check("withdraw: ...and it is ONE retry, not a loop, because this holds the "
+      "one-job lock while it runs", _n_dead == 2)
 # NON-VACUITY 2: a DONE outcome still takes the ordinary path.
 _md = _drive_out(_res("done", "landed"), "done")
 check("watch: NON-VACUITY -- a done outcome still reports its phase the way "

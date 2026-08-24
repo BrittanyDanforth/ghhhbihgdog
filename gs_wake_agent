@@ -173,12 +173,18 @@ def withdraw_wallets(depth) -> int:
     """How many mix outputs a WITHDRAW composes, for one chosen depth.
 
     A LOOKUP IN A CLOSED TABLE, not arithmetic on the note's value. This was
-    `WITHDRAW_WALLETS = 10`, one pinned number for every withdrawal, and that
-    single constant is what made the job refuse most real deposits: the mix
-    floor rises with the hop count, so at 10 the tool would not move anything
-    under 0.2936 XMR while at 3 it goes down to 0.1748. The depth was the one
-    dial that decides whether a given pile can be mixed AT ALL, and it was
-    welded shut.
+    `WITHDRAW_WALLETS = 10`, one pinned number for every withdrawal, deciding
+    for the operator both how long their vault sits powered on with an
+    unlocked spend wallet (6.1 h at three hops against 12.9 h at twenty) and,
+    on a deposit small enough that the cut is waived, how little could be
+    mixed at all.
+
+    THE SECOND EFFECT IS SMALLER THAN THIS DOCSTRING FIRST CLAIMED. It said
+    the tool "would not move anything under 0.2936 XMR" at ten hops against
+    0.1748 at three -- real figures, measured with no operator cut, which was
+    only true of this path because --usage-fee was never being passed. With
+    the cut on, the cut's spendability floor sets the minimum flat up to about
+    fifteen hops. gs_wake_proto.WITHDRAW_DEPTHS carries the full correction.
 
     It is a table and not an int off the wire because the budget in
     gs_wake_proto is sized from the deepest row of that same table: any depth
@@ -793,6 +799,27 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                 "--wallet-file.")
         return [[sys.executable, _tool("GhostSpiral"),
                  "--tor-proxy", proxy, "--rpc-primary", rpc,
+                 # THE DAEMON, FROM THIS MACHINE'S KEYFILE.
+                 #
+                 # GhostSpiral reads the network fee from --rpc-daemon and
+                 # REFUSES the run rather than guessing when it cannot: the
+                 # fallback measured 38-58x below the real fee, so every hop
+                 # under-reserved and the run died on a later hop with "not
+                 # enough money" after the fan-out had already gone on chain.
+                 #
+                 # So a vault whose monerod is not on GhostSpiral's default
+                 # port failed EVERY woken withdrawal at stage 0, and the chat
+                 # said "withdraw: refused." with nothing the operator could
+                 # change -- gs_console has this as a settable field and the
+                 # wake path did not. It fails safe, before anything is spent,
+                 # which is why this is a configuration gap and not the
+                 # money-losing kind.
+                 #
+                 # .get() with GhostSpiral's own default, so a keyfile written
+                 # before gs_wake_keys grew --rpc-daemon behaves exactly as it
+                 # did and no re-pairing is needed.
+                 "--rpc-daemon", str(key.get("rpc_daemon")
+                                     or "http://127.0.0.1:18081"),
                  "--receive-wallet", str(bundle),
                  "--wallet-file", str(_wf),
                  "--dag-mixing",
@@ -807,6 +834,11 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  # tests/test_wake_agent.py recomputes both from GhostSpiral's
                  # arithmetic so they cannot drift apart.
                  "--wallets", str(withdraw_wallets(params["depth"])),
+                 # THE CUT. See the GS_USAGE_FEE_ADDRESS block in _dispatch
+                 # for why this was missing and what it cost. A boolean with
+                 # no value in it: the address, if this machine's keyfile
+                 # names one, rides in the environment instead.
+                 "--usage-fee",
                  "--output", str(artifact_dir)]]
     raise Refused("unknown_job", "no argv template for this job")
 
@@ -1625,6 +1657,37 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # preflight refusal above is where that is caught.
             env_extra["GS_WALLET_PASSWORD"] = os.environ.get(
                 "GS_WALLET_PASSWORD", "")
+            # THE OPERATOR'S CUT, WHICH THIS PATH WAS NOT TAKING AT ALL.
+            #
+            # --usage-fee is action="store_true" and defaults OFF ("a run that
+            # has not been asked to skim must not skim"), and nothing here ever
+            # asked. gs_console sets GS_USAGE_FEE_ADDRESS on its own runs, so
+            # the desktop path skimmed and the PHONE path -- the one this whole
+            # feature exists for -- silently did not. Every withdrawal started
+            # from a chat kept 100% and put 0% aside, for as long as the job
+            # has existed.
+            #
+            # NO ADDRESS BY DEFAULT, and that is the OPSEC-load-bearing half.
+            # With --usage-fee alone GhostSpiral mints a FRESH account and
+            # subaddress per run, so no address collects from two runs. Naming
+            # a fixed one is the address reuse this toolchain refuses
+            # everywhere else, and it survives the mix -- so it is available,
+            # from this machine's own keyfile, and never the default.
+            #
+            # ON THE ARGV, DELIBERATELY, because it is a boolean that carries
+            # no value: `ps` learns that this run skims, which is public in
+            # this repository's source anyway. The ADDRESS is the part that
+            # would identify the operator, and that goes in the environment
+            # like every other secret here -- GhostSpiral's own flag help says
+            # to prefer GS_USAGE_FEE_ADDRESS for exactly this reason.
+            _fee_addr = key.get("usage_fee_address")
+            if _fee_addr:
+                # VALIDATED HERE TOO. It came off this machine's keyfile rather
+                # than off the wire, so it is not attacker-controlled -- but a
+                # typo in a paired address is a cut sent somewhere nobody can
+                # spend it, discovered after the mix has already run.
+                env_extra["GS_USAGE_FEE_ADDRESS"] = \
+                    proto.JOBS["withdraw"]["schema"]["exit_to"](str(_fee_addr))
         # WHO IS WATCHING DECIDES WHERE THE OUTPUT GOES.
         #
         # The diversion exists because systemd journals whatever the children
