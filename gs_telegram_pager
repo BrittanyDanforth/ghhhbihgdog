@@ -194,6 +194,7 @@ CHAT_NAME = {
     "receive_new": "recv",
     "swap_status": "check",
     "watch": "watch",
+    "withdraw": "withdraw",
 }
 
 
@@ -237,7 +238,10 @@ CONFIRM_NOTE = (
 #: on the machine that has the source.
 FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee."
 SPEED_ANSWER = "Not settable here."
-EXIT_ANSWER = "Not settable here."
+# WAS "Not settable here." AND THAT IS NO LONGER TRUE. /withdraw sets it, by
+# reply, per withdrawal. An answer that still said "not settable" would be the
+# tool lying about its own capability on the one surface the operator asks.
+EXIT_ANSWER = "Per withdrawal — see /withdraw."
 
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
@@ -276,6 +280,7 @@ HELP = (
     "/cancel     drop a half-finished /depo\n"
     # NOT "counters". It answers ready / wait, because a poke count and a
     # power state are not things this chat should carry.
+    "/withdraw   send one out — asks, then confirms. SPENDS.\n"
     "/status     can I send one now\n"
     "/fee /speed /exit\n"
     "\n"
@@ -520,6 +525,14 @@ def parse_command(text: str) -> tuple:
         if arg:
             return "", {}, "just /depo — it asks"
         return "", {}, "depo_wizard"
+    if cmd == "/withdraw":
+        # SAME RULE AS /depo, and here it matters more: an argument would be
+        # the destination address typed on the same line as the word, which
+        # puts it in the transcript attached to the command and skips the
+        # confirm before a job that SPENDS.
+        if arg:
+            return "", {}, "just /withdraw — it asks"
+        return "", {}, "withdraw_wizard"
     if cmd in ("/cancel", "/stop"):
         return "", {}, "cancel"
     # THE THREE QUESTIONS THAT ARE NOT KNOBS. Each answers where the thing is
@@ -545,21 +558,36 @@ def parse_command(text: str) -> tuple:
 class Convo:
     """One chat's half-finished /depo. Process memory only, never a file.
 
-    THREE FIELDS AND NOT ONE STRING AMONG THEM, which is the enforceable form
-    of the SD-card rule. A struct with no string field cannot hold an address,
-    a memo, a slip or an amount however the prompts around it are later
-    edited, and that is one assertion to test rather than a comment somebody
-    has to keep honouring.
+    ONE STRING FIELD, AND IT IS NAMED, and that is a weakening of what this
+    used to say. The rule was "not one string among them" -- a struct that
+    cannot hold an address however the prompts around it are later edited.
+    /withdraw needs to hold exactly one, because the operator types their
+    destination into the chat and it has to survive until the confirm.
 
-    `step` is DERIVED, not stored: awaiting the slot iff slot is None. That is
-    not brevity -- it makes "at the confirm step with no slot" unrepresentable
-    rather than merely untested.
+    So the rule becomes the narrower thing it was always FOR: exactly one
+    string, `exit_to`, holding a value already checked against the protocol's
+    address gate, and NOTHING here reaches disk -- Limits.save writes the
+    cursor and the counters and this object is not in it. Both halves are
+    asserted in tests/test_depo_wizard.py; the second was always the real
+    invariant and the first was the cheap way to enforce it.
+
+    What it still cannot hold: a memo, a slip, an amount, or free text of any
+    other shape. `exit_to` is set in exactly one place, from a value
+    proto's address field has already accepted.
+
+    `step` is DERIVED, not stored, per kind: a depo awaits its slot iff slot is
+    None; a withdraw awaits its handle iff handle is None and then its address
+    iff exit_to is None. That is not brevity -- it makes "at the confirm step
+    with nothing to confirm" unrepresentable rather than merely untested.
     """
 
-    __slots__ = ("slot", "expect", "deadline")
+    __slots__ = ("kind", "slot", "handle", "exit_to", "expect", "deadline")
 
-    def __init__(self, clock):
+    def __init__(self, clock, kind="depo"):
+        self.kind = kind
         self.slot = None
+        self.handle = None
+        self.exit_to = None
         self.expect = None
         #: ABSOLUTE, from creation, and never refreshed by an answer. A
         #: per-step refresh puts no upper bound on total lifetime -- a chat
@@ -572,7 +600,14 @@ class Convo:
         return clock() < self.deadline
 
     def awaiting_slot(self) -> bool:
-        return self.slot is None
+        return self.kind == "depo" and self.slot is None
+
+    def awaiting_handle(self) -> bool:
+        return self.kind == "withdraw" and self.handle is None
+
+    def awaiting_address(self) -> bool:
+        return (self.kind == "withdraw" and self.handle is not None
+                and self.exit_to is None)
 
 
 def _confirm_question(rng):
@@ -645,7 +680,7 @@ class Pager:
         for c in dead:
             del self.convos[c]
 
-    def begin_convo(self, chat_id: int) -> None:
+    def begin_convo(self, chat_id: int, kind: str = "depo") -> None:
         self._reap()
         # DO NOT START ONE THAT CANNOT FINISH.
         #
@@ -674,9 +709,14 @@ class Pager:
         if (chat_id not in self.convos) and len(self.convos) >= MAX_CONVOS:
             integrity_log("pager", "convo_cap_hit")
             self.send(chat_id, "no: too many conversations in flight. Try "
-                               "again in a few minutes, or use /depo <slot>.")
+                               "again in a few minutes.")
             return
-        self.convos[chat_id] = Convo(self.clock)
+        self.convos[chat_id] = Convo(self.clock, kind=kind)
+        if kind == "withdraw":
+            self.send(chat_id,
+                      "Which deposit? Reply with its 4-character handle. "
+                      "/cancel to stop.")
+            return
         self.send(chat_id,
                   "Which slot? Reply 0-7. /cancel to stop.")
 
@@ -730,21 +770,100 @@ class Pager:
             q, c.expect = _confirm_question(self.rng)
             self.send(chat_id, f"slot {c.slot} — confirm.\n\n{q}")
             return True
+        if c.awaiting_handle():
+            # THE LABEL THIS BOT GAVE THEM, not a free-text field. Matched
+            # against the protocol's own HANDLE_RE so the wizard and the
+            # one-word commands cannot disagree about what a handle is.
+            _h = text.strip().upper()
+            if not proto.HANDLE_RE.match(_h):
+                del self.convos[chat_id]
+                self.send(chat_id, "no: a handle is 4 characters like A3F1. "
+                                   "Cancelled.")
+                return True
+            c.handle = _h
+            self.send(chat_id, "Reply with the destination address. "
+                               "/cancel to stop.")
+            return True
+        if c.awaiting_address():
+            # CHECKED HERE AND AGAIN AT THE VAULT. This gate is the protocol's
+            # own -- the same function validate_job applies on the other side,
+            # so the pager cannot accept something the wire will reject and
+            # leave the operator with a wake spent on a refusal. It is a SHAPE
+            # check: the vault does the real checksum before a coin moves.
+            #
+            # NOT lower-cased and NOT stripped beyond the ends: base58 is
+            # case-significant, and an address that only differs by case is a
+            # different address.
+            _a = text.strip()
+            try:
+                proto.JOBS["withdraw"]["schema"]["exit_to"](_a)
+            except Exception:                                # noqa: BLE001
+                del self.convos[chat_id]
+                # THE REASON, NOT THE VALUE. Echoing what they typed would put
+                # a near-miss of their own destination in the transcript, on
+                # the one surface with no masker.
+                # THE REASON, NOT THE CURRENCY. "not a Monero address" named
+                # what this chat is about, in the chat, on a reply an operator
+                # triggers by fat-fingering one character.
+                self.send(chat_id, "no: bad address. Cancelled.")
+                return True
+            c.exit_to = _a
+            q, c.expect = _confirm_question(self.rng)
+            # THE HANDLE, NEVER THE ADDRESS. The confirm repeats what is being
+            # withdrawn and not where to, because the address is already in
+            # the transcript once and this would make it twice.
+            self.send(chat_id,
+                      f"withdraw {c.handle} to the address you just sent — "
+                      f"this SPENDS.\n\n{q}")
+            return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
         # that is all it is: a wrong answer cancels, and nothing stops the
         # operator -- or whoever holds the phone -- typing /depo again for a
         # fresh sum. Questions are unlimited and free. The number bounds a
         # pocket-dial, which is what CONFIRM_NOTE claims and all it claims.
         # Logged so a burst of failures is at least visible in the chain.
-        slot, expect = c.slot, c.expect
+        kind, slot, expect = c.kind, c.slot, c.expect
+        handle, exit_to = c.handle, c.exit_to
         del self.convos[chat_id]
         if not word.isdecimal() or int(word) != expect:
             integrity_log("pager", "convo_confirm_failed")
             self.send(chat_id, "no: wrong answer. Cancelled — nothing was "
-                               "woken. Start again with /depo.")
+                               "woken. Start again.")
+            return True
+        if kind == "withdraw":
+            self.commit_withdraw(chat_id, handle, exit_to)
             return True
         self.commit_convo(chat_id, slot)
         return True
+
+    def commit_withdraw(self, chat_id: int, handle, exit_to) -> None:
+        """Turn a finished withdraw conversation into a job.
+
+        Same shape as commit_convo and for the same reason: what reaches the
+        wire is validated against the PROTOCOL's schema, not against a literal
+        typed here, because the vault applies that same schema and agreeing
+        with a local copy of it is not the property.
+
+        BOTH FIELDS RE-CHECKED, including the handle that was checked at its
+        own step. This is the last line before a spend, the object it reads
+        lived in a dict for up to three minutes, and re-running two cheap
+        predicates costs nothing next to what it guards.
+        """
+        job = "withdraw"
+        params = {"handle": handle, "exit_to": exit_to}
+        _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
+        if set(params) != set(_schema):
+            integrity_log("pager", "convo_commit_mismatch")
+            self.send(chat_id, "no: internal check failed, nothing was woken.")
+            return
+        try:
+            for _k, _check in _schema.items():
+                _check(params[_k])
+        except Exception:                                    # noqa: BLE001
+            integrity_log("pager", "convo_commit_mismatch")
+            self.send(chat_id, "no: internal check failed, nothing was woken.")
+            return
+        self.start_job(chat_id, job, params)
 
     def commit_convo(self, chat_id: int, slot: int) -> None:
         """Turn a finished conversation into a job. THE ONLY WAY IT BECOMES ONE.
@@ -1160,6 +1279,9 @@ class Pager:
         job, params, err = parse_command(msg["text"])
         if err == "depo_wizard":
             self.begin_convo(cid)
+            return
+        if err == "withdraw_wizard":
+            self.begin_convo(cid, kind="withdraw")
             return
         if err == "cancel":
             self.convos.pop(cid, None)

@@ -75,10 +75,12 @@ TP = NP.PrivateKey.generate()      # vault, static
 PI = NP.PrivateKey.generate()      # doorbell, static
 EPH = NP.PrivateKey.generate()     # vault, per boot
 
+_SAMPLE_XMR = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 SAMPLE = {"receive_new": {"count": 4},
           "receive_and_quote": {"amount_slot": 7},
           "watch": {"handle": "A3F1"},
-          "swap_status": {"handle": "A3F1"}}
+          "swap_status": {"handle": "A3F1"},
+          "withdraw": {"handle": "A3F1", "exit_to": _SAMPLE_XMR}}
 # KEYED ON JOBS, AND CHECKED TO BE. This table is what every per-job check
 # below iterates, so a job added to the protocol without a sample here would
 # not be silently skipped -- it would KeyError and crash the suite, which
@@ -222,20 +224,78 @@ except P.WakeError:
 
 
 print("\n== the job vocabulary ==")
-check("no job template can name a spending tool",
-      all(t not in P.FORBIDDEN_TOOLS
-          for spec in P.JOBS.values() for t in spec["tools"]))
-check("...and the forbidden list actually names the mix",
-      "GhostSpiral" in P.FORBIDDEN_TOOLS
-      and "airgap_tx_signer" in P.FORBIDDEN_TOOLS)
+# THE RULE NARROWED, IT DID NOT GO AWAY. It used to be "no job may drive a
+# spending tool", which was absolute and left the operator with a phone that
+# could not move their own money. It is now "no job may drive a spending tool
+# EXCEPT the one job that exists to spend, which the vault refuses unless its
+# own keyfile allows it". The predicate checks all three halves together.
+check("no job template names a forbidden tool, only a SPENDING job names a "
+      "gated one, and a spending job names nothing else",
+      P.job_tools_are_permitted())
+check("...and the forbidden list still names the cold signer and the "
+      "broadcaster, which no gate could make safe from a chat",
+      "airgap_tx_signer" in P.FORBIDDEN_TOOLS
+      and "broadcast_signed_xmr" in P.FORBIDDEN_TOOLS
+      and "run_pipeline" in P.FORBIDDEN_TOOLS)
+check("...and the mix is GATED rather than free: it is on no ordinary job",
+      "GhostSpiral" in P.GATED_TOOLS
+      and all("GhostSpiral" not in P.JOBS[j]["tools"]
+              for j in P.JOBS if j not in P.SPENDING_JOBS))
+check("...and exactly one job is allowed to spend at all",
+      P.SPENDING_JOBS == ("withdraw",))
+# NON-VACUITY: the predicate must be able to say no. Planted here rather than
+# trusted, because a checker that returns True for everything reads identical.
+_saved_tools = P.JOBS["watch"]["tools"]
+try:
+    P.JOBS["watch"]["tools"] = ("receive_watch", "airgap_tx_signer")
+    check("NON-VACUITY -- the predicate refuses a forbidden tool on an "
+          "ordinary job", not P.job_tools_are_permitted())
+    P.JOBS["watch"]["tools"] = ("receive_watch", "GhostSpiral")
+    check("NON-VACUITY -- and refuses a GATED tool on a non-spending job, "
+          "which is the exact mistake this split could hide",
+          not P.job_tools_are_permitted())
+finally:
+    P.JOBS["watch"]["tools"] = _saved_tools
+check("control: with the plant removed it passes again",
+      P.job_tools_are_permitted())
 check("there is no swap_quote job — a job that takes a destination is how a "
       "pwned doorbell steals the incoming BTC",
       "swap_quote" not in P.JOBS)
-check("no schema field is a free-form string that could become a flag, a path "
-      "or a URL",
-      all(getattr(c, "spec", "").startswith("int ")
-          or getattr(c, "spec", "").startswith("handle ")
+# ONE FIELD IS TEXT NOW, AND ONLY ONE. Every other schema field is still a
+# bounded int or a 4-hex label. The address is admitted because of what it is
+# used FOR -- gs_wake_agent puts it in GS_EXIT_TO and never on an argv -- and
+# because its own gate refuses anything shaped like a flag, a path or a URL.
+check("no schema field is free-form: every one is a bounded int, a handle, or "
+      "the address gate",
+      all(getattr(c, "spec", "").startswith(("int ", "handle ", "xmr address"))
           for spec in P.JOBS.values() for c in spec["schema"].values()))
+check("...and the text field is on the spending job and nowhere else",
+      [j for j in P.JOBS
+       if any(getattr(c, "spec", "").startswith("xmr address")
+              for c in P.JOBS[j]["schema"].values())] == ["withdraw"])
+# The gate itself, driven against the shapes that would matter if it were lax.
+_ax = P.JOBS["withdraw"]["schema"]["exit_to"]
+for _bad, _why in ((_SAMPLE_XMR[:94], "one character short"),
+                   (_SAMPLE_XMR + "A", "one character long"),
+                   ("-" + _SAMPLE_XMR[1:], "starts like a flag"),
+                   ("/" + _SAMPLE_XMR[1:], "starts like a path"),
+                   ("4" + "0" * 94, "base58 has no zero"),
+                   ("4" + "O" * 94, "base58 has no capital O"),
+                   ("4" + "l" * 94, "base58 has no lowercase L"),
+                   ("4" + " " * 94, "whitespace"),
+                   ("4" + '"' * 94, "a quote"),
+                   ("4" + ";" * 94, "a shell separator"),
+                   ("", "empty"), (5, "not text"), (None, "null")):
+    try:
+        _ax(_bad)
+        check(f"address gate refuses {_why}", False)
+    except Exception:                                        # noqa: BLE001
+        check(f"address gate refuses {_why}", True)
+check("address gate NON-VACUITY -- a real 95-character address passes",
+      _ax(_SAMPLE_XMR) == _SAMPLE_XMR)
+check("address gate NON-VACUITY -- and an integrated 106-character one does "
+      "too, so the length rule is a set and not a single number",
+      _ax("8" + "Ad" * 52 + "A") == "8" + "Ad" * 52 + "A")
 
 for job in P.JOBS:
     body = {"job_id": P.new_job_id(), "challenge": P.new_challenge().hex(),

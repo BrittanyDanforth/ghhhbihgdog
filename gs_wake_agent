@@ -169,6 +169,60 @@ def disarm_deadman() -> None:
         pass
 
 
+#: The transient timer extend_deadman starts. Named so a human can find it.
+DEADMAN_EXT_UNIT = "gs-wake-deadman-ext"
+
+
+def extend_deadman(seconds: int, runner=None, is_active=None) -> bool:
+    """Arm a LONGER backstop for one job. True only if it is really armed.
+
+    WHY NOT JUST MAKE THE SHIPPED TIMER LONGER. It is armed at boot, before any
+    job is known, so lengthening it to cover the slowest job lengthens it for
+    every wake -- including the five-minute status probe. A vault sitting
+    powered on for four and a half hours because its agent died during a
+    two-minute job is the power and network signature this whole design exists
+    to avoid. The backstop should fit the job that was actually collected.
+
+    ARM FIRST, DISARM SECOND, and never the other way round. The new timer is
+    started and then VERIFIED active before the short one is stopped, so there
+    is no instant with no backstop at all. If anything fails, the short timer
+    is left exactly as it was and this returns False -- the caller refuses the
+    job, which is the safe end: a refused job is a wake wasted, and a long job
+    under a short deadman is the vault powering off mid-round, which
+    GhostSpiral says it cannot recover from automatically.
+
+    A TRANSIENT UNIT rather than a second shipped one, because the delay is a
+    property of the job and systemd timer units cannot take one at start time.
+    It starts the SAME gs-wake-poweroff.service the shipped timer does, so the
+    SIGTERM-then-SIGKILL ordering that lets the finally blocks erase the plans
+    is unchanged.
+    """
+    _run = runner or (lambda argv: subprocess.run(
+        argv, timeout=30, capture_output=True))
+    try:
+        r = _run(["systemd-run", f"--on-active={int(seconds)}",
+                  f"--unit={DEADMAN_EXT_UNIT}",
+                  "--timer-property=AccuracySec=30s",
+                  "systemctl", "start", "gs-wake-poweroff.service"])
+        if getattr(r, "returncode", 1) != 0:
+            return False
+        # VERIFIED, not assumed. systemd-run can exit 0 having queued a job
+        # that then fails to start, and this is the one check standing between
+        # a four-hour spend and no backstop at all.
+        # unit_is_active, the MODULE-level helper. The first version of this
+        # called `_unit_active`, which is a local inside preflight() -- so the
+        # one check standing between a four-hour spend and no backstop would
+        # have raised NameError at runtime, been swallowed by the except
+        # below, and returned False on every call. Fail-closed by accident is
+        # still a check that never passes; found by driving it.
+        if not (is_active or unit_is_active)(f"{DEADMAN_EXT_UNIT}.timer"):
+            return False
+    except Exception:                                        # noqa: BLE001
+        return False
+    disarm_deadman()
+    return True
+
+
 def removable_devices() -> list:
     """Block devices the kernel marks removable.
 
@@ -662,6 +716,26 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  # the stall check can never fire inside the window anyway.
                  "--stall-min", "3",
                  "--result-json", str(artifact_dir / STATUS_FILE)]]
+    if job == "withdraw":
+        # THE ADDRESS IS NOT HERE, and that is the whole point of this branch.
+        #
+        # It is the first operator-chosen string this channel carries, it
+        # crosses a machine boundary, and it is handed to a subprocess -- so it
+        # goes in GS_EXIT_TO, set by the runner below, exactly like
+        # GS_SWAP_AMOUNTS. /proc/<pid>/cmdline is 0444 and every local account
+        # on this box could read an argv for the whole run; more importantly,
+        # a value that never reaches an argv cannot become a flag however it
+        # is shaped.
+        #
+        # --receive-wallet, so the mix spends the bundle this handle names and
+        # nothing else on the wallet. --dag-mixing because a withdrawal the
+        # operator cannot supervise should take the stronger of the two shapes
+        # rather than the faster one; the budget is sized for it.
+        return [[sys.executable, _tool("GhostSpiral"),
+                 "--tor-proxy", proxy, "--rpc-primary", rpc,
+                 "--receive-wallet", str(bundle),
+                 "--dag-mixing",
+                 "--output", str(artifact_dir)]]
     raise Refused("unknown_job", "no argv template for this job")
 
 
@@ -1065,6 +1139,37 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # A refusal raised in here is reported by run_once's handler, which now
     # covers this and every other refusal past collection alike -- rather than
     # this one path having its own copy and the rest having none.
+    # A SPENDING JOB IS REFUSED UNLESS THIS MACHINE'S OWN KEYFILE ALLOWS IT,
+    # AND UNLESS THE BACKSTOP CAN BE MADE TO FIT IT. Both gates here, after
+    # collection and before any work, because both answers are the vault's and
+    # neither may be inferred from the note.
+    # Injectable like every other side effect in here, so a test can drive the
+    # refusal without a systemd on the box.
+    _extend_deadman = d.get("extend_deadman", extend_deadman)
+    if job in getattr(proto, "SPENDING_JOBS", ()):
+        # THE KEYFILE, NOT THE NOTE. `allow_withdraw` is written with physical
+        # access, like the amount ladder, and is ABSENT from every keyfile
+        # written before this job existed -- so upgrading the code does not
+        # silently give a pager the ability to spend. getattr-with-default is
+        # deliberate: an old keyfile means "no".
+        if not key.get("allow_withdraw"):
+            raise Refused(
+                "withdraw_not_allowed",
+                "this machine's keyfile does not allow spending jobs. That is "
+                "the default, and turning it on means the spend wallet is "
+                "reachable by a machine a pager can wake -- re-pair with "
+                "--allow-withdraw, with physical access, if you mean it.")
+        # THE BACKSTOP MUST OUTLAST THE JOB, or it becomes the thing that
+        # breaks it. The shipped deadman is sized for the largest NON-spending
+        # job; a mix runs far past it, and a power-off mid-round is the one
+        # failure GhostSpiral cannot recover from automatically.
+        _need = int(proto.result_budget_s(job)) + 600
+        if not _extend_deadman(_need):
+            raise Refused(
+                "deadman_too_short",
+                "could not arm a backstop long enough for this job, so it was "
+                "not started. The short one is still armed and this machine "
+                "will still power itself off.")
     code, status, handle = _dispatch(job, params, key, artifact_dir,
                                      handle, _child, job_id)
     # A STATUS PROBE REPORTS THE HANDLE IT WAS ASKED ABOUT, not the fresh one
@@ -1184,7 +1289,15 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
                       "things it wipes.")
 
     bundle = slip = None
-    if job in ("watch", "swap_status"):
+    # EVERY JOB THAT NAMES A HANDLE RESOLVES IT HERE, and `withdraw` was
+    # missing from this tuple while its argv template already interpolated
+    # `bundle`. Driven: the composed command was
+    # `--receive-wallet None`, i.e. a mix pointed at a bundle that does not
+    # exist, on the one job that spends. It reached that state because the
+    # argv template and the resolver are in different functions and only the
+    # template was written for the new job -- the same producer/consumer seam
+    # this repo has been caught by three times now.
+    if job in ("watch", "swap_status", "withdraw"):
         rec = handles.get(params["handle"])
         if not rec:
             raise Refused("unknown_handle",
@@ -1277,6 +1390,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
             handles[handle] = {"bundle": new[0], "minted": 1,
                                "slip": str(artifact_dir /
                                            f"thor_pairs_{handle}.json")}
+        if job == "withdraw":
+            # THE DESTINATION, IN THE ENVIRONMENT, NEVER ON THE ARGV.
+            # GhostSpiral reads GS_EXIT_TO through env_or_argv and prefers it
+            # for exactly this reason. Re-validated one last time against the
+            # protocol's own gate: this value came off a chat, through a
+            # doorbell, out of a sealed record, and this is the last place that
+            # can refuse it before it reaches a process that spends.
+            _dest = proto.JOBS["withdraw"]["schema"]["exit_to"](
+                params["exit_to"])
+            env_extra["GS_EXIT_TO"] = _dest
         # WHO IS WATCHING DECIDES WHERE THE OUTPUT GOES.
         #
         # The diversion exists because systemd journals whatever the children

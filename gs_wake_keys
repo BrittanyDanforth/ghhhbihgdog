@@ -265,6 +265,17 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--amount-ladder", nargs="*", default=[], metavar="BTC",
                    help=f"up to {MAX_LADDER} BTC amounts a wake may select by "
                         f"INDEX. The Pi never sends a number - it sends a slot.")
+    # OFF BY DEFAULT, AND OFF IN EVERY KEYFILE WRITTEN BEFORE IT EXISTED.
+    # gs_wake_agent reads it with .get(), so an old keyfile means no -- an
+    # upgraded pair does not silently gain the ability to spend. Turning it on
+    # requires re-pairing, which requires physical access to both boxes, which
+    # is the same bar the amount ladder sits behind.
+    p.add_argument("--allow-withdraw", action="store_true",
+                   help="let a wake run the mix and send funds OUT. Off by "
+                        "default. It means the spend wallet is reachable by a "
+                        "machine a pager can wake, so whoever holds the bot "
+                        "token can trigger a withdrawal - to an address they "
+                        "type. Read OPSEC_SETUP.md before using it.")
     p.add_argument("--account-ceiling", type=int, default=45,
                    help="refuse minting jobs once the wallet holds this many "
                         "accounts (OPSEC_SETUP.md section 4)")
@@ -476,6 +487,7 @@ def do_pair(args) -> int:
         "amount_ladder": list(args.amount_ladder),
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),
+        "allow_withdraw": bool(args.allow_withdraw),
     }
     # kdf="none", deliberately and visibly. See the module docstring: a machine
     # that boots unattended cannot keep a passphrase from someone holding it.

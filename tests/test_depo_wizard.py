@@ -176,6 +176,75 @@ check("nothing in the emitted params is a string",
           for v in _params.values()))
 
 # ===========================================================================
+# 1b. /withdraw: THE ONE JOB THAT SPENDS, AND THE ONLY FREE TEXT ON THE WIRE
+# ===========================================================================
+print("\n-- the withdraw wizard, driven end to end --")
+#
+# Every other command is a bounded int or a label this bot issued. This one
+# takes an address the operator types, because the alternative is a phone that
+# cannot move its owner's money and a documented cycle that ends with the
+# funds sitting on an address the Bitcoin chain already published.
+_WA = "4" + "Ad" * 47
+w = Fake()
+w.say("/withdraw")
+check("wd: /withdraw starts a conversation", 111 in w.p.convos)
+check("wd: ...and asks for the handle FIRST, not the address",
+      "handle" in w.sent[-1][1].lower()
+      and "address" not in w.sent[-1][1].lower())
+w.say("A3F1")
+check("wd: ...then for the address", "address" in w.sent[-1][1].lower())
+w.say(_WA)
+check("wd: ...then confirms, saying plainly that this one SPENDS",
+      "SPENDS" in w.sent[-1][1] and "= ?" in w.sent[-1][1])
+# THE HANDLE, NOT THE ADDRESS, IN THE CONFIRM. It is already in the transcript
+# once; repeating it would make it twice, on the surface with no masker.
+check("wd: ...and the confirm repeats the HANDLE and not the address",
+      "A3F1" in w.sent[-1][1] and _WA not in w.sent[-1][1])
+w.answer_confirm()
+check("wd: answering correctly pokes exactly one withdraw job",
+      w.pokes == [(111, "withdraw", {"handle": "A3F1", "exit_to": _WA})])
+check("wd: ...and the conversation is gone", 111 not in w.p.convos)
+# THE REAL SCHEMA, through validate_job -- the same gate the vault applies.
+_wok = True
+try:
+    P.validate_job({"job_id": P.new_job_id(),
+                    "challenge": P.new_challenge().hex(),
+                    "job": "withdraw", **w.pokes[0][2]})
+except P.WakeError:
+    _wok = False
+check("wd: ...and what it emits passes the REAL job schema", _wok)
+
+# EVERY WAY IT REFUSES, driven. Each leaves no conversation and no poke.
+for _msgs, _label, _want in (
+        (["/withdraw", "zzzz"], "a handle that is not 4 hex", "handle is 4"),
+        (["/withdraw", "A3F1", "notanaddress"], "a bad address", "bad address"),
+        (["/withdraw", "A3F1", "-" + _WA[1:]], "an address shaped like a flag",
+         "bad address"),
+        (["/withdraw", "A3F1", _WA[:94]], "an address one character short",
+         "bad address"),
+        (["/withdraw", "A3F1", _WA, "999"], "a wrong confirm", "wrong answer"),
+        (["/withdraw " + _WA], "the address on the command line",
+         "just /withdraw")):
+    _g = Fake()
+    for _m in _msgs:
+        _g.say(_m)
+    check(f"wd: {_label} wakes nothing", _g.pokes == [])
+    check(f"wd: ...and says why ({_want!r})", _want in _g.text())
+    check(f"wd: ...and leaves no conversation armed", 111 not in _g.p.convos)
+# THE VALUE IS NEVER ECHOED BACK. A near-miss of the operator's own
+# destination in the transcript is the same disclosure as the address.
+_ge = Fake()
+_ge.say("/withdraw")
+_ge.say("A3F1")
+_ge.say(_WA[:60])
+check("wd: a rejected address is NOT echoed back into the chat",
+      _WA[:60] not in _ge.text() and _WA[:16] not in _ge.text())
+# NON-VACUITY: the good path really does carry the address, so the check above
+# is about the REJECTED value and not about a bot that never says addresses.
+check("wd: NON-VACUITY -- the accepted address really does reach the job",
+      w.pokes[0][2]["exit_to"] == _WA)
+
+# ===========================================================================
 # 2. IT CANNOT NAME AN AMOUNT. Structural, not behavioural.
 # ===========================================================================
 print("\n-- it cannot show an amount, because it has none to show --")
@@ -205,16 +274,42 @@ check("NON-VACUITY -- it still asks the question and still says how to stop",
 print("\n-- a half-finished /depo never reaches the SD card --")
 check("Convo has __slots__, so a field cannot be added by accident",
       hasattr(pg.Convo, "__slots__"))
-check("...and holds only slot, expect, deadline",
-      set(pg.Convo.__slots__) == {"slot", "expect", "deadline"})
-# NO STRING FIELD AT ALL, which is the enforceable form of the SD-card rule:
-# a struct with no string cannot hold an address, a memo, a slip or an amount
-# however the prompts around it are later edited. `step` used to be a string
-# and is now DERIVED from `slot is None`, which also makes "at the confirm
-# step with no slot" unrepresentable rather than merely untested.
-check("...and not one of them is a string field",
-      all(isinstance(getattr(pg.Convo(lambda: 0.0), f), (int, float, type(None)))
+check("...and holds only the six fields the two wizards need",
+      set(pg.Convo.__slots__) == {"kind", "slot", "handle", "exit_to",
+                                  "expect", "deadline"})
+# THE RULE NARROWED. It used to be "no string field at all" -- a struct that
+# cannot hold an address however the prompts are later edited. /withdraw has to
+# hold one, because the operator types their destination into the chat and it
+# must survive until the confirm.
+#
+# So the rule becomes the narrower thing it was always FOR: exactly ONE free
+# text field, named, and nothing here reaching disk. The second half was always
+# the real invariant; the first was the cheap way to enforce it, and it is
+# still enforced for every other field.
+_c_fresh = pg.Convo(lambda: 0.0)
+check("...and every field starts empty, so a fresh Convo holds nothing",
+      all(getattr(_c_fresh, f) in (None, "depo")
+          or isinstance(getattr(_c_fresh, f), float)
           for f in pg.Convo.__slots__))
+_c_full = pg.Convo(lambda: 0.0, kind="withdraw")
+_c_full.handle, _c_full.exit_to, _c_full.expect = "A3F1", "4" + "Ad" * 47, 9
+_str_fields = [f for f in pg.Convo.__slots__
+               if isinstance(getattr(_c_full, f), str)]
+check("...and a FULL withdraw conversation holds exactly three strings: its "
+      "kind, the handle this bot issued, and the one address",
+      sorted(_str_fields) == ["exit_to", "handle", "kind"])
+check("...and no field can hold a memo, a slip or an amount — nothing else is "
+      "text at all",
+      all(not isinstance(getattr(_c_full, f), str)
+          for f in pg.Convo.__slots__
+          if f not in ("kind", "handle", "exit_to")))
+# AND THE ADDRESS IS SET IN EXACTLY ONE PLACE, from a value the protocol's own
+# gate has already accepted. A second writer is how a checked field becomes an
+# unchecked one.
+check("...and exit_to is assigned in exactly one place in the source",
+      _SRC.count("c.exit_to = ") == 1)
+check("...and that place is guarded by the protocol's address gate",
+      'proto.JOBS["withdraw"]["schema"]["exit_to"](_a)' in _SRC)
 check("...so `step` is derived, not stored", "step" not in pg.Convo.__slots__)
 _save = pg.Limits.save.__doc__ or ""
 _lsrc = _SRC.split("class Limits")[1].split("\nclass ")[0]
@@ -496,9 +591,22 @@ check("/fee's claim holds: --max-slippage exists and is a vault-side flag",
 check("...and is NOT reachable from the pager",
       "max-slippage" not in _SRC.split("SPEED_ANSWER")[0]
       .split("FEE_ANSWER")[0])
-check("/exit's claim holds: no job schema takes a destination",
+# /exit's CLAIM CHANGED WITH THE CODE. It used to say "not settable here" and
+# the check proved no job schema took a destination. /withdraw takes one now,
+# by reply, per withdrawal -- so the old check would have kept a FALSE answer
+# green, which is the drift this file exists to catch.
+check("/exit points at the command that does set it",
+      "/withdraw" in pg.EXIT_ANSWER
+      and "not settable" not in pg.EXIT_ANSWER.lower())
+check("...and exactly one job schema takes a destination, not several",
+      [j for j in P.JOBS
+       if any("exit" in k or "dest" in k or "addr" in k
+              for k in P.JOBS[j]["schema"])] == ["withdraw"])
+check("...and no OTHER job gained one, which is what /exit's answer would "
+      "stop being true about first",
       not any("dest" in k or "exit" in k or "addr" in k
-              for s in P.JOBS.values() for k in s["schema"]))
+              for j, sp in P.JOBS.items() if j != "withdraw"
+              for k in sp["schema"]))
 
 # THE USAGE FEE IS NAMED ONLY TO SAY IT IS NOT HERE.
 #
@@ -524,9 +632,31 @@ check("...and the rate it prints is the rate GhostSpiral actually charges, "
 # argv table decides what can run at all, and GhostSpiral is not in it -- so no
 # usage-fee line can reach this channel however the pager behaves.
 _agent = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
-check("/fee's new claim holds: the wake agent cannot spawn GhostSpiral, so its "
-      "output can never reach this chat",
-      '_tool("GhostSpiral")' not in _agent)
+# /fee's CLAIM ALSO CHANGED. The agent CAN spawn GhostSpiral now, for exactly
+# one keyfile-gated job -- so "its output can never reach this chat" is no
+# longer true by construction and has to be true by what is SENT instead.
+check("/fee's claim holds: the agent spawns the mix only for the spending job",
+      _agent.count('_tool("GhostSpiral")') == 1
+      and 'if job == "withdraw":' in _agent)
+check("...and that job is refused unless this machine's own keyfile allows it",
+      'if not key.get("allow_withdraw"):' in _agent)
+# AND THE OLD CHECK HERE IS GONE, DELIBERATELY. It asserted the fee RATE never
+# reached the chat, on the reasoning that the rate divides an observed cash-out
+# back into a deposit size. That was true and worth guarding while the chat
+# carried no destination. /withdraw carries one now, by reply, by design -- and
+# a transcript holding the destination makes guarding the rate beside it
+# theatre. Keeping a check that guards the smaller of two values while the
+# larger goes past it is worse than having none: it reads as coverage.
+#
+# What still matters is that the fee is not SETTABLE from here, because a
+# stolen phone changing the rate is a different thing from reading it.
+check("/fee is an answer, not a control: no chat message sets a rate",
+      not any("usage_fee" in k or "fee_pct" in k
+              for sp in P.JOBS.values() for k in sp["schema"]))
+check("...and no job drives a tool that could set one",
+      "GhostSpiral" not in [t for j, sp in P.JOBS.items()
+                            if j not in P.SPENDING_JOBS
+                            for t in sp["tools"]])
 check("NON-VACUITY -- the agent DOES spawn other tools by that same helper, so "
       "the absence above is an absence from a real table",
       '_tool("receive_watch")' in _agent

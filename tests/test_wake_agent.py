@@ -699,12 +699,74 @@ _dms = int(_val(_dead_u, "OnActiveSec"))
 # len(tools) * budget_s: the budget is PER STEP, not per job, so a two-tool
 # job can legitimately take twice it. Same answer today (watch's single 7200s
 # step is the worst) and still the right answer if a third tool is added.
+# THE SHIPPED UNITS COVER THE ORDINARY JOBS. A SPENDING job runs far past them
+# and is covered by extend_deadman instead -- because these two numbers are
+# fixed at BOOT, before any job is known, so sizing them for the slowest job
+# sizes them for every wake. A vault sitting powered on for four and a half
+# hours because its agent died during a two-minute status probe is the power
+# and network signature this whole design exists to avoid.
+_ordinary = {j: sp for j, sp in P.JOBS.items() if j not in P.SPENDING_JOBS}
 _worst = A.JITTER_HI_S + max(len(sp["tools"]) * sp["budget_s"]
-                             for sp in P.JOBS.values())
-check("the agent's own timeout leaves room for the worst real job "
+                             for sp in _ordinary.values())
+check("the agent's own timeout leaves room for the worst ORDINARY job "
       f"(jitter {A.JITTER_HI_S}s + the largest budget)", _tmo > _worst)
 check("...and the DEADMAN is longer than it, so the ordinary path is bounded "
       "by the agent and the deadman is only the backstop", _dms > _tmo)
+# NON-VACUITY: there IS a job the shipped numbers do not cover, or the split
+# above is describing a distinction that does not exist.
+_spend_worst = A.JITTER_HI_S + max(
+    len(P.JOBS[j]["tools"]) * P.JOBS[j]["budget_s"] for j in P.SPENDING_JOBS)
+check("NON-VACUITY -- the spending job really does outrun the shipped deadman, "
+      f"which is why it re-arms one ({_spend_worst}s vs {_dms}s)",
+      _spend_worst > _dms)
+# ...AND IT REFUSES RATHER THAN RUNNING UNDER A SHORT ONE. A mix under a
+# 9300-second backstop is the vault powering off mid-round, which GhostSpiral
+# says in as many words it cannot recover from automatically.
+_A_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("the agent extends the backstop for a spending job",
+      "_extend_deadman(_need)" in _A_SRC
+      and "def extend_deadman(" in _A_SRC)
+check("...and REFUSES the job if it cannot, rather than running unprotected",
+      'raise Refused(\n                "deadman_too_short"' in _A_SRC)
+check("...and asks for more than the job's own worst case, not exactly it",
+      "int(proto.result_budget_s(job)) + 600" in _A_SRC)
+# THE ORDERING, driven rather than read: arm the new one, VERIFY it, and only
+# then stop the short one -- so there is no instant with no backstop at all.
+_ord_calls = []
+
+
+def _fake_run(argv):
+    _ord_calls.append("arm")
+    return types.SimpleNamespace(returncode=0)
+
+
+_saved_disarm = A.disarm_deadman
+try:
+    A.disarm_deadman = lambda: _ord_calls.append("disarm")
+    _armed = A.extend_deadman(15600, runner=_fake_run, is_active=lambda u: True)
+    check("deadman: the extension arms, verifies, and only then disarms the "
+          "short one", _armed and _ord_calls == ["arm", "disarm"])
+    _ord_calls.clear()
+    _unverified = A.extend_deadman(15600, runner=_fake_run,
+                                   is_active=lambda u: False)
+    check("deadman: an extension that cannot be VERIFIED active fails, and "
+          "leaves the short one armed",
+          not _unverified and _ord_calls == ["arm"])
+    _ord_calls.clear()
+    _rcbad = A.extend_deadman(
+        15600, runner=lambda a: types.SimpleNamespace(returncode=1),
+        is_active=lambda u: True)
+    check("deadman: a non-zero systemd-run also fails closed",
+          not _rcbad and _ord_calls == [])
+    _ord_calls.clear()
+
+    def _boom(argv):
+        raise OSError("systemd-run is not on this box")
+    check("deadman: no systemd at all fails closed rather than raising",
+          not A.extend_deadman(15600, runner=_boom, is_active=lambda u: True)
+          and _ord_calls == [])
+finally:
+    A.disarm_deadman = _saved_disarm
 
 # THE COUPLING THAT WAS BROKEN. paranoia_mode sweeps cwd/$HOME; systemd starts
 # a unit with cwd=/ and HOME=/root, so without these two lines the agent
@@ -955,8 +1017,10 @@ print("\n== the job whitelist is unreachable from a note ==")
 _argvs = []
 _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
       "rpc_primary": "http://127.0.0.1:18083", "amount_ladder": ["0.01"]}
+_XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 _sample = {"receive_new": {"count": 1}, "receive_and_quote": {"amount_slot": 0},
-           "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"}}
+           "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
+           "withdraw": {"handle": "A3F1", "exit_to": _XMR_SAMPLE}}
 # Asserted rather than assumed: this loop runs over P.JOBS, so a job added
 # without a sample here KeyErrors and kills the suite -- which mutation_sweep
 # scores NO-RESULT, not CAUGHT. A missing sample should read as one red line.
@@ -973,12 +1037,112 @@ check("no COMPOSED argv names a spending tool",
               for t in P.FORBIDDEN_TOOLS))
 check("...and every composed argv names only a whitelisted tool",
       {os.path.basename(a[1]) for a in _argvs}
-      == {"create_receive_wallet", "thor_swap_preparer", "receive_watch"})
+      == {"create_receive_wallet", "thor_swap_preparer", "receive_watch",
+          "GhostSpiral"})
+# THE ADDRESS IS NOWHERE ON ANY ARGV. It is the first operator-chosen string
+# this channel carries and it crosses a machine boundary into a subprocess, so
+# it travels in GS_EXIT_TO like GS_SWAP_AMOUNTS -- /proc/<pid>/cmdline is 0444,
+# and a value that never reaches an argv cannot become a flag however shaped.
+check("no composed argv carries the destination address anywhere in it",
+      not any(_XMR_SAMPLE in a for argv in _argvs for a in argv))
+check("...and no argv carries even a PREFIX of it, which would be enough to "
+      "confirm an address a watcher already suspects",
+      not any(_XMR_SAMPLE[:16] in a for argv in _argvs for a in argv))
+check("...and the mix argv names the bundle and the output dir instead",
+      any("--receive-wallet" in argv and "--output" in argv
+          for argv in _argvs
+          if os.path.basename(argv[1]) == "GhostSpiral"))
+check("...and asks for the stronger distribution, since nobody is watching it",
+      any("--dag-mixing" in argv for argv in _argvs
+          if os.path.basename(argv[1]) == "GhostSpiral"))
+# NON-VACUITY: the mix argv WAS composed, so the absences above are absences
+# from something that exists.
+check("NON-VACUITY -- a mix argv really was composed for the spending job",
+      any(os.path.basename(argv[1]) == "GhostSpiral" for argv in _argvs))
+
+# ---- WHAT ACTUALLY REACHES THE CHILD ------------------------------------
+#
+# build_argv NEVER SEES THE ADDRESS. It is added by the runner loop in
+# _dispatch, alongside GS_SWAP_AMOUNTS -- so a test that only reads
+# build_argv's output is structurally unable to see the one mistake that
+# matters here, and a mutation moving the value onto the argv SURVIVED it.
+#
+# So this drives the real _dispatch and captures the (argv, env) pair the
+# child is actually handed.
+print("\n== the address the child is handed ==")
+_seen = []
+
+
+def _capture(argv, env_extra, budget_s):
+    _seen.append((list(argv), dict(env_extra or {})))
+    return 0, False
+
+
+_wdir = Path(tempfile.mkdtemp(prefix="wdisp_"))
+(_wdir / A.HANDLES_FILE).write_text(json.dumps(
+    {"A3F1": {"bundle": str(_wdir / "wallet_recv_1.json"),
+              "slip": str(_wdir / "thor_pairs_A3F1.json"), "minted": 1}}))
+_saved_il = A.integrity_log
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("withdraw",
+                    {"handle": "A3F1", "exit_to": _XMR_SAMPLE},
+                    _k, _wdir, "A3F1", _capture, "job-1")
+finally:
+    A.integrity_log = _saved_il
+
+check("dispatch: the spending job ran exactly one child", len(_seen) == 1)
+_wargv, _wenv = _seen[0] if _seen else ([], {})
+check("dispatch: the destination is in the ENVIRONMENT",
+      _wenv.get("GS_EXIT_TO") == _XMR_SAMPLE)
+# THE CHECK THE MUTATION ESCAPED. /proc/<pid>/cmdline is 0444 for the life of
+# the run, and a value that never reaches an argv cannot become a flag however
+# it is shaped.
+check("dispatch: and NOWHERE on the argv the child is executed with",
+      not any(_XMR_SAMPLE in str(x) for x in _wargv))
+check("dispatch: not even a 16-character prefix of it, which is enough to "
+      "confirm an address a watcher already suspects",
+      not any(_XMR_SAMPLE[:16] in str(x) for x in _wargv))
+check("dispatch: the argv names the mix and the bundle this handle points at",
+      os.path.basename(_wargv[1]) == "GhostSpiral"
+      and str(_wdir / "wallet_recv_1.json") in _wargv)
+# NON-VACUITY: the capture really ran and really saw an environment, so the
+# absences above are absences from something.
+check("dispatch: NON-VACUITY -- the child was handed a real argv and a real "
+      "environment", len(_wargv) > 3 and _wenv)
+# NON-VACUITY: an ORDINARY job sets no destination at all.
+_seen.clear()
+_saved_il = A.integrity_log
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("swap_status", {"handle": "A3F1"}, _k, _wdir, "A3F1",
+                    _capture, "job-2")
+finally:
+    A.integrity_log = _saved_il
+check("dispatch: NON-VACUITY -- an ordinary job sets no GS_EXIT_TO at all",
+      _seen and "GS_EXIT_TO" not in _seen[0][1])
+check("dispatch: NON-VACUITY -- ...and that ordinary job really ran a child, "
+      "so the absence is from something", _seen and len(_seen[0][0]) > 3)
 check("...with the vault's own proxy and rpc in every one of them",
       all("socks5h://127.0.0.1:9050" in a for a in _argvs))
-check("...and the only tools it can spawn are the three in JOBS",
+check("...and the only tools it can spawn are the four in JOBS, with the mix "
+      "reachable ONLY from the spending job",
       set(t for spec in P.JOBS.values() for t in spec["tools"])
+      == {"create_receive_wallet", "thor_swap_preparer", "receive_watch",
+          "GhostSpiral"}
+      and set(t for j, spec in P.JOBS.items() if j not in P.SPENDING_JOBS
+              for t in spec["tools"])
       == {"create_receive_wallet", "thor_swap_preparer", "receive_watch"})
+# THE GATE, at the source, because the argv table alone would compose a mix for
+# anyone who could name the job. The keyfile decides, and an old keyfile -- one
+# written before this job existed -- means no.
+check("...and a spending job is refused unless the KEYFILE allows it",
+      'if not key.get("allow_withdraw"):' in _A_SRC)
+check("...which an upgraded pair does not gain silently: absent means no",
+      ".get(\"allow_withdraw\")" in _A_SRC
+      and "allow_withdraw\"]" not in _A_SRC)
 
 
 # ===========================================================================
