@@ -1636,7 +1636,20 @@ JOBS = {
     # is absent from every keyfile that existed before this job did -- so an
     # upgraded pair does not silently gain the ability to spend.
     "withdraw": {
-        "schema": {"handle": _handle_field, "exit_to": _xmr_address_field},
+        # ONE FIELD: WHERE IT GOES. Nothing else.
+        #
+        # It used to take a HANDLE as well -- the 4-hex label of a receive
+        # bundle a /depo had minted -- so a withdrawal was only possible for
+        # money that had arrived through this tool's own deposit flow, and the
+        # operator had to know which label named which pile. That is backend
+        # bookkeeping leaking into the one command that should need none: the
+        # money is wherever the operator put it, and the only thing they
+        # actually have to decide is where it goes.
+        #
+        # The vault finds the funded output itself now (see
+        # gs_wake_agent._funded_entry). It is the machine holding the wallet;
+        # asking a phone to name an account index was asking the wrong box.
+        "schema": {"exit_to": _xmr_address_field},
         "tools": ("GhostSpiral",),
         # SIX HOURS, SIZED FROM THE WORST CASE AND NOT THE MEDIAN, and the
         # first version of this got that wrong in the direction that costs

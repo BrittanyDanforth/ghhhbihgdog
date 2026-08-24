@@ -80,7 +80,7 @@ SAMPLE = {"receive_new": {"count": 4},
           "receive_and_quote": {"amount_slot": 7},
           "watch": {"handle": "A3F1"},
           "swap_status": {"handle": "A3F1"},
-          "withdraw": {"handle": "A3F1", "exit_to": _SAMPLE_XMR}}
+          "withdraw": {"exit_to": _SAMPLE_XMR}}
 # KEYED ON JOBS, AND CHECKED TO BE. This table is what every per-job check
 # below iterates, so a job added to the protocol without a sample here would
 # not be silently skipped -- it would KeyError and crash the suite, which

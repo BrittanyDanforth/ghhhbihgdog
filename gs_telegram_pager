@@ -602,12 +602,8 @@ class Convo:
     def awaiting_slot(self) -> bool:
         return self.kind == "depo" and self.slot is None
 
-    def awaiting_handle(self) -> bool:
-        return self.kind == "withdraw" and self.handle is None
-
     def awaiting_address(self) -> bool:
-        return (self.kind == "withdraw" and self.handle is not None
-                and self.exit_to is None)
+        return self.kind == "withdraw" and self.exit_to is None
 
 
 def _confirm_question(rng):
@@ -713,9 +709,15 @@ class Pager:
             return
         self.convos[chat_id] = Convo(self.clock, kind=kind)
         if kind == "withdraw":
+            # STRAIGHT TO THE ADDRESS. This used to ask for a 4-character
+            # handle first -- the label of a bundle a /depo had minted -- so a
+            # withdrawal was only possible for money that arrived through this
+            # tool's own deposit flow, and the operator had to remember which
+            # label named which pile. The vault finds its own funded output
+            # now; the only thing the operator actually has to decide is where
+            # it goes.
             self.send(chat_id,
-                      "Which deposit? Reply with its 4-character handle. "
-                      "/cancel to stop.")
+                      "Send where? Reply with the address. /cancel to stop.")
             return
         self.send(chat_id,
                   "Which slot? Reply 0-7. /cancel to stop.")
@@ -770,20 +772,6 @@ class Pager:
             q, c.expect = _confirm_question(self.rng)
             self.send(chat_id, f"slot {c.slot} — confirm.\n\n{q}")
             return True
-        if c.awaiting_handle():
-            # THE LABEL THIS BOT GAVE THEM, not a free-text field. Matched
-            # against the protocol's own HANDLE_RE so the wizard and the
-            # one-word commands cannot disagree about what a handle is.
-            _h = text.strip().upper()
-            if not proto.HANDLE_RE.match(_h):
-                del self.convos[chat_id]
-                self.send(chat_id, "no: a handle is 4 characters like A3F1. "
-                                   "Cancelled.")
-                return True
-            c.handle = _h
-            self.send(chat_id, "Reply with the destination address. "
-                               "/cancel to stop.")
-            return True
         if c.awaiting_address():
             # CHECKED HERE AND AGAIN AT THE VAULT. This gate is the protocol's
             # own -- the same function validate_job applies on the other side,
@@ -809,12 +797,14 @@ class Pager:
                 return True
             c.exit_to = _a
             q, c.expect = _confirm_question(self.rng)
-            # THE HANDLE, NEVER THE ADDRESS. The confirm repeats what is being
-            # withdrawn and not where to, because the address is already in
-            # the transcript once and this would make it twice.
+            # NEITHER THE ADDRESS NOR AN AMOUNT. The address is already in the
+            # transcript once and repeating it would make it twice, on the one
+            # surface with no masker. There is no amount to state: the vault
+            # decides what it is spending when it looks, and this box has never
+            # been told a balance.
             self.send(chat_id,
-                      f"withdraw {c.handle} to the address you just sent — "
-                      f"this SPENDS.\n\n{q}")
+                      f"Send to the address you just sent — this SPENDS."
+                      f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
         # that is all it is: a wrong answer cancels, and nothing stops the
@@ -823,7 +813,7 @@ class Pager:
         # pocket-dial, which is what CONFIRM_NOTE claims and all it claims.
         # Logged so a burst of failures is at least visible in the chain.
         kind, slot, expect = c.kind, c.slot, c.expect
-        handle, exit_to = c.handle, c.exit_to
+        exit_to = c.exit_to
         del self.convos[chat_id]
         if not word.isdecimal() or int(word) != expect:
             integrity_log("pager", "convo_confirm_failed")
@@ -831,12 +821,12 @@ class Pager:
                                "woken. Start again.")
             return True
         if kind == "withdraw":
-            self.commit_withdraw(chat_id, handle, exit_to)
+            self.commit_withdraw(chat_id, exit_to)
             return True
         self.commit_convo(chat_id, slot)
         return True
 
-    def commit_withdraw(self, chat_id: int, handle, exit_to) -> None:
+    def commit_withdraw(self, chat_id: int, exit_to) -> None:
         """Turn a finished withdraw conversation into a job.
 
         Same shape as commit_convo and for the same reason: what reaches the
@@ -844,13 +834,13 @@ class Pager:
         typed here, because the vault applies that same schema and agreeing
         with a local copy of it is not the property.
 
-        BOTH FIELDS RE-CHECKED, including the handle that was checked at its
-        own step. This is the last line before a spend, the object it reads
-        lived in a dict for up to three minutes, and re-running two cheap
-        predicates costs nothing next to what it guards.
+        RE-CHECKED HERE, though it was checked at its own step. This is the
+        last line before a spend, the object it reads lived in a dict for up
+        to three minutes, and re-running one cheap predicate costs nothing
+        next to what it guards.
         """
         job = "withdraw"
-        params = {"handle": handle, "exit_to": exit_to}
+        params = {"exit_to": exit_to}
         _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
         if set(params) != set(_schema):
             integrity_log("pager", "convo_commit_mismatch")

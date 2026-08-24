@@ -1322,7 +1322,72 @@ def _account_count(key: dict, injected=None):
         return None
 
 
-def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
+def _funded_entry(key: dict, injected=None):
+    """The (account, subaddress, address, atomic) holding this wallet's money.
+
+    THE VAULT ANSWERS THIS, NOT THE PHONE. A withdrawal used to name a 4-hex
+    handle pointing at a receive bundle a /depo had minted -- which meant only
+    money that arrived through this tool's own deposit flow could be withdrawn
+    at all, and the operator had to remember which label named which pile. The
+    machine holding the wallet is the one that can see where the money is;
+    asking a chat message to name an account index was asking the wrong box.
+
+    THE LARGEST SINGLE OUTPUT, and it is a deliberate refusal to be clever.
+    Summing several subaddresses would mean a mix whose first transaction
+    spends inputs from all of them, which is permanent public proof they share
+    an owner -- exactly what the rest of this pipeline spends hours avoiding.
+    One output in, one mix, one destination. If the operator has money in three
+    places, that is three withdrawals, and that is the honest cost rather than
+    a merge dressed up as convenience.
+
+    UNLOCKED ONLY. A balance that has not unlocked cannot be spent, and a mix
+    planned around it fails partway with money already moved.
+
+    RETURNS None WHEN NOTHING QUALIFIES, and the caller refuses. Guessing an
+    account here would point a spend at the wrong pile.
+    """
+    if injected is not None:
+        return injected()
+    try:
+        from gs_common import connect_rpc
+        rpc = connect_rpc(key["rpc_primary"], proxy_url=key.get("tor_proxy", ""))
+        try:
+            rpc.raw_request("refresh", {})
+        except Exception:                                    # noqa: BLE001
+            # A refresh that fails is not fatal -- the balances below are
+            # whatever the wallet has already scanned. It is worth trying
+            # because a wallet that has just booted may not have caught up.
+            pass
+        accts = (rpc.raw_request("get_accounts", {})
+                 or {}).get("subaddress_accounts") or []
+        best = None
+        for _a in accts:
+            _ai = _a.get("account_index")
+            if not isinstance(_ai, int) or isinstance(_ai, bool):
+                continue
+            r = rpc.raw_request("get_balance",
+                                {"account_index": _ai,
+                                 "address_indices": [],
+                                 "all_accounts": False}) or {}
+            for _sub in (r.get("per_subaddress") or []):
+                _amt = _sub.get("unlocked_balance")
+                _si = _sub.get("address_index")
+                _ad = _sub.get("address")
+                if not isinstance(_amt, int) or isinstance(_amt, bool):
+                    continue
+                if not isinstance(_si, int) or isinstance(_si, bool):
+                    continue
+                if not _amt or not isinstance(_ad, str) or not _ad:
+                    continue
+                if best is None or _amt > best[3]:
+                    best = (_ai, _si, _ad, _amt)
+        return best
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
+              funded=None) -> tuple:
     """Run the job's tools in order. Returns (code, status, handle)."""
     budget = proto.JOBS[job]["budget_s"]
     handles = _load_handles(artifact_dir)
@@ -1356,7 +1421,52 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
     # argv template and the resolver are in different functions and only the
     # template was written for the new job -- the same producer/consumer seam
     # this repo has been caught by three times now.
-    if job in ("watch", "swap_status", "withdraw"):
+    if job == "withdraw":
+        # THE VAULT LOOKS. See _funded_entry: the machine holding the wallet is
+        # the one that can see where the money is, and a chat message naming an
+        # account index was the wrong box being asked.
+        # `funded` is injectable like every other side effect here, so a test
+        # can drive both the found and the empty case without a wallet. The
+        # first version reached for `d`, which is _run_validated's parameter
+        # and does not exist in this scope -- a NameError on the one job that
+        # spends, caught immediately by driving it.
+        _found = _funded_entry(key, injected=funded)
+        if not _found:
+            raise Refused(
+                "nothing_to_withdraw",
+                "no unlocked balance is visible on this wallet, so there is "
+                "nothing to mix. If a payment is still confirming it is not "
+                "spendable yet; ask again once it has.")
+        _fa, _fs, _fad, _famt = _found
+        # A BUNDLE IS WRITTEN, and it is the same 0600 file in the same swept
+        # directory every other job's bundle already lives in -- not a new
+        # class of artifact. GhostSpiral's receive mode reads a
+        # gs_receive_wallet_v1 pointer and nothing else, so this is the format
+        # the boundary takes; inventing a second way in would mean two parsers
+        # for the thing that says where money is.
+        #
+        # NOT create_receive_wallet. That mints a NEW subaddress, which is
+        # exactly what a withdrawal must not do: the money is already
+        # somewhere, and minting somewhere else to point at it would be a
+        # second account for the wipe to miss and a second address for nothing.
+        # NAMED wallet_* SO THE WIPE ACTUALLY TAKES IT. The first version
+        # called this gs_withdraw_<handle>.json, which matches NOTHING in
+        # gs_common.GS_ARTIFACT_FILE_PATTERNS -- driven with fnmatch against
+        # the real list. It would have sat in the artifact directory naming an
+        # account and a subaddress of this wallet, through every paranoia_mode
+        # run, on the machine that is supposed to keep nothing.
+        #
+        # wallet_*.json is the pattern receive bundles already match, and this
+        # IS a receive bundle: same schema, same directory, same 0600. A new
+        # name would have meant a new pattern, and a pattern nobody added.
+        bundle = str(artifact_dir / f"wallet_withdraw_{handle}.json")
+        atomic_write_json({"schema": "gs_receive_wallet_v1",
+                           "address": _fad,
+                           "account_index": int(_fa),
+                           "subaddress_index": int(_fs),
+                           "rpc_endpoint": key.get("rpc_primary", "")},
+                          Path(bundle), perms=0o600)
+    elif job in ("watch", "swap_status"):
         rec = handles.get(params["handle"])
         if not rec:
             raise Refused("unknown_handle",

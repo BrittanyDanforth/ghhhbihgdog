@@ -779,7 +779,12 @@ doorbell, so anything it does you can do from a terminal.
    `--hop-delay`, which is an OPSEC parameter and not overhead: **do not
    interrupt it.**
 
-   **From the phone, with `/withdraw`.** Only if you have paired with
+   **From the phone, with `/withdraw`.** Two messages: the command, then the
+   address. Nothing else — no handle, no account, no amount. The vault looks at
+   its own wallet, takes the largest unlocked output, mixes it and sends it
+   there. It needs nothing from you that you would have to look up.
+
+   Only if you have paired with
    `--allow-withdraw`, and read §4b first, because it is a real trade and not
    a convenience.
 
