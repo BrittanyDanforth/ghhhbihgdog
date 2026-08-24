@@ -2623,6 +2623,88 @@ MUTATIONS = [
   '            _tail = (" It was too deep for the balance — the deeper "',
   ["test_plain_slip"]),
 
+ # THE MOST EXPENSIVE BUG THIS REPOSITORY HAS HELD, and every suite was green
+ # through it. Five minutes of Tor being unreachable (safe_get 20 s + 5 s
+ # sleep, twelve times) made the polling thread sys.exit while a WAKE WAS IN
+ # FLIGHT. The worker is a daemon thread, so the interpreter tore down without
+ # joining it and the in-process doorbell socket closed -- and the vault,
+ # hours later, POSTed the result of a real spend to a port nothing was bound
+ # to, logged result_undeliverable, and powered off.
+ ("Telegram going quiet goes back to killing a wake in flight",
+  "gs_telegram_pager",
+  "                if self.busy.locked():\n"
+  "                    # ONCE PER OUTAGE, NOT ONCE PER POLL.",
+  "                if False:\n"
+  "                    # ONCE PER OUTAGE, NOT ONCE PER POLL.",
+  ["test_telegram_pager"]),
+
+ # --usage-fee defaults OFF ("a run that has not been asked to skim must not
+ # skim") and the wake path never asked, so the phone path -- the one the
+ # channel exists for -- took no cut at all while gs_console's did.
+ ("the wake path goes back to taking no usage fee at all",
+  "gs_wake_agent",
+  '                 "--usage-fee",\n',
+  "",
+  ["test_wake_agent"]),
+
+ # A completed spend reported "withdraw ready · slip A3F1": deposit vocabulary
+ # for something already finished, naming a handle _dispatch never registers,
+ # so /check on it answers unknown_handle.
+ ("a finished withdrawal goes back to reporting itself as a ready deposit",
+  "gs_telegram_pager",
+  '            if job == "withdraw":\n'
+  '                _msg = ("withdraw: sent. The mix ran and the funds went to "',
+  '            if False:\n'
+  '                _msg = ("withdraw: sent. The mix ran and the funds went to "',
+  ["test_plain_slip"]),
+
+ # And the sentence that stops two thirds of the money being forgotten:
+ # _funded_entry takes the LARGEST SINGLE output on purpose, so a withdrawal
+ # moves one pile and the operator has to be told there may be more.
+ ("the withdrawal message stops saying it moved only ONE address",
+  "gs_telegram_pager",
+  '                        "This moves ONE address at a time — merging several "',
+  '                        "It moves everything at once — merging several "',
+  ["test_plain_slip"]),
+
+ # "working. This takes a while." for a job that holds every command for the
+ # better part of a day. The figure must stay DERIVED or it becomes the next
+ # 9900 -- a hand-copied duration that stopped being true and nothing noticed.
+ ("the working message goes back to a duration nobody can wait out",
+  "gs_telegram_pager",
+  '            _hold = proto.result_budget_s(job)\n',
+  "            _hold = 9900\n",
+  ["test_telegram_pager"]),
+
+ # The only notification that a spend finished, after up to sixteen hours and
+ # real money moved. send() returns whether it landed and does not retry.
+ ("the withdrawal completion notice goes back to one unchecked send",
+  "gs_telegram_pager",
+  "                if not self.send(chat_id, _msg):\n"
+  "                    time.sleep(SLIP_RETRY_S)\n"
+  "                    if not self.send(chat_id, _msg):\n"
+  '                        integrity_log("pager", "withdraw_result_undelivered")',
+  "                self.send(chat_id, _msg)",
+  ["test_plain_slip"]),
+
+ # GhostSpiral refuses rather than guessing a fee it could not fetch (the
+ # fallback measured 38-58x low), so a wrong or missing --rpc-daemon failed
+ # every woken withdrawal at stage 0 with nothing the operator could change.
+ ("the wake path stops naming this machine's daemon", "gs_wake_agent",
+  '                 "--rpc-daemon", str(key.get("rpc_daemon")\n'
+  '                                     or "http://127.0.0.1:18081"),\n',
+  "",
+  ["test_wake_agent"]),
+
+ # And it must come from the KEYFILE, not be re-hardcoded here -- which is the
+ # state that made this a bug in the first place.
+ ("the daemon url goes back to a constant the keyfile cannot override",
+  "gs_wake_agent",
+  '                 "--rpc-daemon", str(key.get("rpc_daemon")\n'
+  '                                     or "http://127.0.0.1:18081"),',
+  '                 "--rpc-daemon", "http://127.0.0.1:18081",',
+  ["test_wake_agent"]),
+
  # The one file the pager persists held a float per poke: the exact second the
  # operator asked for a quote, for every quote in 24 hours, on the SD card.
  ("the SD card holds exact wake timestamps again", "gs_telegram_pager",

@@ -253,6 +253,26 @@ def build_cli() -> argparse.ArgumentParser:
                         "the path.")
     p.add_argument("--rpc", default="http://127.0.0.1:18083",
                    help="this machine's wallet-rpc")
+    # THE DAEMON, WHICH THIS KEYFILE COULD NOT NAME AND NEEDED TO.
+    #
+    # GhostSpiral reads the network fee from --rpc-daemon and REFUSES the run
+    # when it cannot -- deliberately, because the fallback guess measured
+    # 38-58x below the real fee and every hop then under-reserved. So a vault
+    # whose monerod is not on the default port failed every woken withdrawal
+    # at stage 0, and the operator saw "withdraw: refused." with nothing they
+    # could change: gs_console exposes this field, and the wake path hardcoded
+    # GhostSpiral's default.
+    #
+    # It fails SAFE -- the refusal is before anything is spent -- which is why
+    # this is a configuration gap and not the money-losing kind. Same default
+    # as GhostSpiral's own, so a keyfile written before this flag existed
+    # behaves exactly as it did: gs_wake_agent reads it with .get() and falls
+    # back to the same string.
+    p.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
+                   help="this machine's monerod. GhostSpiral reads the "
+                        "network fee here and refuses the run rather than "
+                        "guessing one, so a wrong value fails every "
+                        "withdrawal before it spends anything.")
     p.add_argument("--artifact-dir", default="/var/lib/ghostspiral",
                    help="ABSOLUTE path where woken jobs write bundles and "
                         "slips. Must match ReadWritePaths= and "
@@ -494,6 +514,7 @@ def do_pair(args) -> int:
         "doorbell_url": f"http://{info['host']}:{info['port']}",
         "tor_proxy": args.tor_proxy,
         "rpc_primary": args.rpc,
+        "rpc_daemon": args.rpc_daemon,
         "artifact_dir": args.artifact_dir,
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),

@@ -723,11 +723,20 @@ class Pager:
         self._reap()
         # DO NOT START ONE THAT CANNOT FINISH.
         #
-        # A wake holds `busy` for up to 9900 s and a conversation lives 180 s,
-        # so a conversation begun while a job runs is GUARANTEED to expire
-        # before the lock frees. Without this the operator walks the whole
-        # wizard over Tor -- two round trips on a phone -- to be told "a wake
-        # is already running" at the end, having achieved nothing.
+        # A wake holds `busy` for up to result_budget_s + the doorbell's
+        # pre-WOL ceiling -- 60300 s for a withdrawal, nearly seventeen hours
+        # -- and a conversation lives CONVO_TTL_S, 180 s. So a conversation
+        # begun while a job runs is GUARANTEED to expire before the lock frees.
+        # Without this the operator walks the whole wizard over Tor -- two
+        # round trips on a phone -- to be told "a wake is already running" at
+        # the end, having achieved nothing.
+        #
+        # THE NUMBER USED TO BE WRITTEN HERE AS 9900 s, which was the longest
+        # NON-spending job and stopped being the ceiling the moment `withdraw`
+        # existed. It is left out of the sentence now rather than restated,
+        # because a hand-copied duration in a comment is a thing that goes
+        # stale silently; start_job computes the real one and tells the
+        # operator, which is where the figure belongs.
         #
         # Advisory only: it creates nothing, charges nothing and reserves
         # nothing, and start_job re-checks both authoritatively at the poke.
@@ -1251,6 +1260,55 @@ class Pager:
             print(f"  [!] poll failed ({self.poll_failures}/"
                   f"{MAX_POLL_FAILURES}): {_redact(e)}")
             if self.poll_failures >= MAX_POLL_FAILURES:
+                # NEVER WHILE A WAKE IS IN FLIGHT, and this exit used to fire
+                # regardless. It is the most expensive bug in this file.
+                #
+                # DRIVEN. safe_get times out at 20 s and this sleeps 5, so
+                # MAX_POLL_FAILURES is reached after about five minutes of Tor
+                # being unreachable -- an ordinary event on a link whose whole
+                # design is Tor over WireGuard. The worker thread that runs a
+                # wake is `daemon=True`, so SystemExit on THIS thread tears the
+                # interpreter down without joining it: the in-process doorbell
+                # server dies mid-window with its socket closed.
+                #
+                # What that costs, end to end: a withdrawal collected by the
+                # vault runs on the VAULT, for up to 16.75 h, spending real
+                # money, and reports back over the LAN when it finishes. It
+                # POSTs to a port nothing is bound to any more. report_back
+                # catches the failure, writes `result_undeliverable`, and the
+                # vault powers off. The mix happened. The money moved. The
+                # operator's last message was "working. This takes a while."
+                # and nothing ever follows it.
+                #
+                # THE ORIGINAL REASONING SURVIVES, NARROWED. "A pager that
+                # cannot reach Telegram but keeps running is one you believe is
+                # listening when it is not" is right -- about TELEGRAM. It says
+                # nothing about the LAN, which is a different network, is not
+                # down, and is where the only irreversible thing in this system
+                # is happening. So the exit waits for the wake instead of
+                # killing it: the counter stays at the ceiling, every later
+                # poll re-checks, and the process stops the moment `busy` is
+                # free.
+                if self.busy.locked():
+                    # ONCE PER OUTAGE, NOT ONCE PER POLL. Each failed poll
+                    # costs about 25 s (a 20 s timeout plus the sleep below),
+                    # so a wake that rides out a long outage passes here
+                    # thousands of times -- and integrity_log APPENDS TO A HASH
+                    # CHAIN ON THE SD CARD. Logging every pass would turn one
+                    # network problem into thousands of writes to the card this
+                    # design is otherwise careful not to touch, and would bury
+                    # the entry that matters in its own repetitions. The
+                    # equality is the crossing; every later poll is the same
+                    # outage still going on.
+                    if self.poll_failures == MAX_POLL_FAILURES:
+                        integrity_log("pager", "poll_failed_wake_in_flight")
+                        print(f"  [!] Telegram unreachable, but a wake is in "
+                              f"flight on the LAN. NOT stopping: the vault "
+                              f"will report back to this process and there is "
+                              f"nowhere else for that result to go. Stopping "
+                              f"when it finishes.")
+                    time.sleep(5)
+                    return []
                 integrity_log("pager", "poll_failed_giving_up")
                 sys.exit(
                     f"[!] {MAX_POLL_FAILURES} consecutive poll failures. "
@@ -1332,6 +1390,58 @@ class Pager:
                 # checked against a closed set by the doorbell before it got
                 # here.
                 self.send(chat_id, f"{h}: {proto.PHASE_LINES.get(phase, phase)}")
+                return
+            # A FINISHED SPEND IS NOT A READY DEPOSIT, and it used to be
+            # reported as one. With no slip and no plain, a completed
+            # withdrawal fell through to the generic line below and said
+            # "withdraw ready · slip A3F1" -- after sixteen hours, about money
+            # that has already left the wallet.
+            #
+            # Both halves of that were wrong. "ready" is deposit vocabulary for
+            # something that has not happened yet, on the one job where the
+            # irreversible thing HAS happened; this repo already caught the
+            # same error once, in PHASE_LINES, where shortening "The swap is
+            # done" to "Done." "changed which noun it was about". And the
+            # handle is a phantom: _dispatch writes handles[] only for
+            # receive_and_quote and receive_new, so no withdrawal label is ever
+            # registered, and /check or /wait on the one printed here answers
+            # unknown_handle. It named a slip that does not exist and invited
+            # an action that fails.
+            #
+            # THE SECOND SENTENCE IS THE ONE THAT SAVES MONEY. _funded_entry
+            # deliberately takes the LARGEST SINGLE unlocked output rather than
+            # summing -- summing would spend inputs from several subaddresses
+            # in one transaction, which is permanent public proof they share an
+            # owner. That is the right call and it means a withdrawal moves ONE
+            # pile. Nothing said so, so an operator with money in three places
+            # had two-thirds of it left behind with no indication.
+            #
+            # No balance and no count: this box has never been told either, and
+            # the sentence is true whichever case they are in.
+            if job == "withdraw":
+                _msg = ("withdraw: sent. The mix ran and the funds went to "
+                        "the address you gave.\n\n"
+                        "This moves ONE address at a time — merging several "
+                        "would prove on-chain that they share an owner. If "
+                        "you had funds in more than one place, /send again "
+                        "for the next.")
+                # ONE RETRY, like the slip path, and for a sharper reason.
+                # This is the ONLY notification that a spend completed, at the
+                # end of a job that ran for up to sixteen hours and moved real
+                # money. send() does not retry on its own -- it returns whether
+                # it landed -- so a single Tor circuit failing at the wrong
+                # second leaves the operator with "working" as the last thing
+                # they ever heard, which is the exact outcome the poll-failure
+                # fix in updates() exists to prevent. Losing it to a dropped
+                # POST after saving it from a closed socket would be absurd.
+                #
+                # One, not a loop: this still holds `busy`, and a retry storm
+                # against a dead circuit would hold it for the rate limit's
+                # whole window. The journal keeps the record either way.
+                if not self.send(chat_id, _msg):
+                    time.sleep(SLIP_RETRY_S)
+                    if not self.send(chat_id, _msg):
+                        integrity_log("pager", "withdraw_result_undelivered")
                 return
             if plain:
                 # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
@@ -1608,7 +1718,29 @@ class Pager:
         try:
             self.limits.record()
             integrity_log("pager", f"poke:{job}")
-            self.send(cid, f"{chat_name(job)}: working. This takes a while.")
+            # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
+            # OUT. This said "working. This takes a while." for every job, and
+            # the jobs are not alike: a status probe is minutes and a
+            # withdrawal holds this pager -- every command, not just another
+            # wake -- for up to 16.75 h. An operator told "a while" and then
+            # answered "no: a wake is already running" for two thirds of a day
+            # concludes the bot is broken, which is the report this whole
+            # channel exists to avoid producing.
+            #
+            # FROM result_budget_s AND THE DOORBELL'S OWN PRE-WOL CEILING, not
+            # a literal, so it cannot drift from the window actually held. The
+            # jitter is included because the operator waits it too, and skipped
+            # when --no-jitter says it will not happen. Rounded up to whole
+            # hours past an hour: they need the order of magnitude, and
+            # "16.75h" reads like a precision this cannot honour.
+            _hold = proto.result_budget_s(job)
+            if not getattr(self.args, "no_jitter", False):
+                _hold += getattr(doorbell(), "PRE_WOL_MAX_S", 0)
+            _how = (f"up to {_hold // 3600 + 1}h" if _hold >= 3600
+                    else f"up to {max(1, _hold // 60)} min")
+            self.send(cid,
+                      f"{chat_name(job)}: working — {_how}. Nothing else can "
+                      f"run until it finishes.")
             threading.Thread(target=self._worker, args=(cid, job, params),
                              daemon=True).start()
         except BaseException as e:                           # noqa: BLE001
@@ -1705,6 +1837,30 @@ class Pager:
             _burned = self.burn_expired(self.burn_after)
             if _burned:
                 integrity_log("pager", "messages_burned")
+        # SAY WHAT IS BEING ABANDONED. The other way this process can end is a
+        # signal -- `systemctl restart`, or an operator with a terminal -- and
+        # it reaches here with the same consequence the poll-failure exit was
+        # just taught to avoid: the worker is a daemon thread, so returning
+        # from run() tears down the in-process doorbell server, and a vault
+        # that is mid-withdrawal reports back to a closed port hours later.
+        #
+        # This one is NOT overridden. A signal is a person saying stop, and a
+        # pager that ignored SIGTERM for sixteen hours would be worse than the
+        # thing it was avoiding -- systemd would SIGKILL it anyway, with no
+        # message at all. What was missing is that the operator was never told:
+        # the process exited "cleanly", said "Shutdown requested.", and the
+        # money it was in the middle of moving went unreported.
+        if self.busy.locked():
+            integrity_log("pager", "shutdown_with_wake_in_flight")
+            print("  [!] Shutdown requested WHILE A WAKE IS IN FLIGHT.")
+            print("      The vault keeps running its job -- it is a different "
+                  "machine and nothing here can stop it -- but its result "
+                  "comes back to THIS process, which is going away. That "
+                  "result is lost.")
+            print("      The job itself is not: it completes on the vault and "
+                  "its artifacts are in the vault's artifact directory. Check "
+                  "there before starting another one.")
+            return 1
         print("  [*] Shutdown requested.")
         return 0
 

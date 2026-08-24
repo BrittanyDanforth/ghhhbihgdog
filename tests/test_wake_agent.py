@@ -1372,6 +1372,69 @@ for _bad in (0, 4, 40, -1, None, "2", 2.5, True):
 check("budget: the deadman extension outlasts the budget it protects",
       P.result_budget_s("withdraw") + 600 > P.JOBS["withdraw"]["budget_s"])
 
+# ---- THE OPERATOR'S CUT, WHICH THIS PATH WAS NOT TAKING AT ALL ----------
+#
+# GhostSpiral's --usage-fee is action="store_true" and defaults OFF, on the
+# stated principle that "a run that has not been asked to skim must not skim".
+# Nothing here ever asked. gs_console sets GS_USAGE_FEE_ADDRESS on its own
+# runs, so the DESKTOP path skimmed and the PHONE path -- the one the whole
+# wake channel exists for -- silently did not, for as long as the job existed.
+# Every suite was green through it, because nothing looked.
+_fee_argv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                         _k, _wdir, bundle="b", slip=None, handle="A3F1")[0]
+check("fee: the composed withdrawal actually asks for the usage fee",
+      "--usage-fee" in _fee_argv)
+# NON-VACUITY: GhostSpiral's own resolver accepts this exact combination, so
+# the flag is not merely present but usable. --peel and --split > 1 are both
+# refused with --usage-fee, and neither is composed here.
+check("fee: NON-VACUITY -- neither refused combination is composed",
+      "--peel" not in _fee_argv and "--split" not in _fee_argv)
+# THE ADDRESS IS NOT ON THE ARGV, EVER. GhostSpiral's own flag help says to
+# prefer GS_USAGE_FEE_ADDRESS because an argv address is world-readable
+# through /proc/<pid>/cmdline. The boolean may be there; the destination is
+# the part that identifies the operator.
+check("fee: ...and no address rides on the argv with it",
+      "--usage-fee-address" not in _fee_argv)
+# THE DEFAULT MINTS A FRESH ACCOUNT PER RUN. One address collecting a slice of
+# every run is the reuse this toolchain refuses everywhere else, and it
+# survives the mix -- so a fixed destination is opt-in, from THIS machine's
+# keyfile, and never the default.
+_no_addr_env = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                            dict(_k), _wdir, bundle="b", slip=None,
+                            handle="A3F1")
+check("fee: with no keyfile address the run is left to mint a fresh one",
+      not any("USAGE_FEE_ADDRESS" in str(x) for x in _no_addr_env))
+
+# ---- THE DAEMON THIS KEYFILE COULD NOT NAME -----------------------------
+#
+# GhostSpiral reads the network fee from --rpc-daemon and REFUSES the run
+# rather than guessing: the fallback measured 38-58x low, so every hop
+# under-reserved and the run died after the fan-out was already on chain. The
+# wake path never passed the flag, so a vault whose monerod is not on
+# GhostSpiral's default port failed every withdrawal at stage 0 -- and the
+# chat said "refused." with nothing the operator could change, because
+# gs_console exposes this field and the keyfile did not.
+check("daemon: the composed withdrawal names a daemon at all",
+      "--rpc-daemon" in _fee_argv)
+_dk = dict(_k, rpc_daemon="http://127.0.0.1:29081")
+_dargv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                      _dk, _wdir, bundle="b", slip=None, handle="A3F1")[0]
+check("daemon: ...and it is THIS machine's, from its own keyfile",
+      _dargv[_dargv.index("--rpc-daemon") + 1] == "http://127.0.0.1:29081")
+# BACKWARD COMPATIBLE. A keyfile written before gs_wake_keys grew the flag has
+# no such field, and must behave exactly as it did rather than composing an
+# empty string that GhostSpiral would then refuse.
+check("daemon: a keyfile predating the flag falls back to the same default "
+      "it used to get",
+      _fee_argv[_fee_argv.index("--rpc-daemon") + 1]
+      == "http://127.0.0.1:18081")
+# AND THE PAIRING WRITES IT, or the field is one the agent reads and nothing
+# ever sets.
+_kp_src = open(os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read()
+check("daemon: gs_wake_keys writes rpc_daemon into the keyfile",
+      '"rpc_daemon": args.rpc_daemon,' in _kp_src
+      and '"--rpc-daemon"' in _kp_src)
+
 # ---- AND THE DEPOSIT AMOUNT IS BOUNDED BY THE BOX THAT ACTS ON IT -------
 #
 # The schema bounds it on the wire; this is the second check, in the file

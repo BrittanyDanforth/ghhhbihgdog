@@ -1681,10 +1681,31 @@ _xmr_address_field.spec = "xmr address ^[48][base58]{94,105}$"
 
 #: THE DEPTHS THE SERVICE OFFERS, and the numbers are the whole point.
 #:
-#: A single fixed depth is not "always this private" -- it is a FLOOR on what
-#: can be mixed at all. mix_minimum_xmr is a curve: 0.1748 XMR at three wallets
-#: and 0.2936 at ten. Hard-coding ten refuses every deposit under 0.2936 XMR,
-#: after the swap has already settled, which is most of what a person sends.
+#: WHAT DEPTH ACTUALLY BUYS, stated more carefully than the first version of
+#: this comment stated it. That version said a fixed depth is "a FLOOR on what
+#: can be mixed at all", quoting mix_minimum_xmr at 0.1748 XMR for three
+#: wallets and 0.2936 for ten. Both figures are real and both were measured
+#: with NO operator cut -- which was true of this path only because the wake
+#: agent was not passing --usage-fee at all, which was itself a bug. With the
+#: cut on, mix_minimum_xmr's own docstring is the authority: the cut's
+#: spendability floor is hop_fee_reserve/usage_pct, and it sits ABOVE the
+#: mixing minimum at every wallet count up to about fifteen. Driven at a
+#: 0.0024 fee: 0.3364 XMR at three hops and 0.3364 at ten -- the same number,
+#: because the cut is what sets it, not the hops.
+#:
+#: So the honest claim is narrower and still worth the change:
+#:
+#:   * RUNTIME is where depth really moves, and it moves a lot: 6.1 h at three
+#:     hops against 12.9 h at twenty. That is the vault powered on with an
+#:     unlocked spend wallet, which is the signature this design spends its
+#:     effort hiding, and it is the operator's call to make.
+#:   * THE MINIMUM moves too, but only in the regime where no cut is taken --
+#:     below the waiver threshold, where plan_usage_fee skips the cut and the
+#:     mix goes ahead in full. That is exactly the small-deposit case, so the
+#:     effect survives where it matters and vanishes where it does not.
+#:   * PRIVACY is the thing being bought, and it is not a number in this file.
+#:
+#: A single fixed depth denies all three to the person whose money it is.
 #:
 #: AND THE TOOL MUST NOT PICK IT FROM THE BALANCE. That was tried here and is
 #: worse than either extreme: the fan-out's output count is PUBLIC, so a depth
@@ -1815,12 +1836,14 @@ JOBS = {
         # gs_wake_agent._funded_entry). It is the machine holding the wallet;
         # asking a phone to name an account index was asking the wrong box.
         #
-        # `depth` is the SECOND thing that is genuinely theirs to decide, and
-        # shipping without it made the job refuse most real deposits: the mix
-        # floor is a function of the hop count (GhostSpiral.mix_minimum_xmr
-        # answers 0.1748 XMR at 3 wallets and 0.2936 at 10), so a hard-coded
-        # 10 was a hard floor on what could be withdrawn at all. See
-        # WITHDRAW_DEPTHS for why it is a small closed set and not a number.
+        # `depth` is the SECOND thing that is genuinely theirs to decide: it
+        # sets how long the vault stays powered on with an unlocked spend
+        # wallet (6.1 h at three hops against 12.9 h at twenty) and, on a
+        # deposit small enough that the operator's cut is waived, how little
+        # can be mixed at all. A hard-coded 10 decided both for them. See
+        # WITHDRAW_DEPTHS, which states exactly how much of that second effect
+        # is real once a cut is being taken -- less than the first draft of
+        # this comment claimed.
         "schema": {"exit_to": _xmr_address_field,
                    "depth": _int_range(1, 3)},
         "tools": ("GhostSpiral",),
