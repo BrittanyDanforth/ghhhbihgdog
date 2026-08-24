@@ -246,6 +246,95 @@ check("wd: NON-VACUITY -- the accepted address really does reach the job",
       w.pokes[0][2]["exit_to"] == _WA)
 
 # ===========================================================================
+# 1c. IT ASKS IN WORDS, NOT IN SLOT NUMBERS
+# ===========================================================================
+print("\n-- nobody knows what slot 0 to 7 is --")
+#
+# "Which slot? Reply 0-7" is a question nobody who had not read the source
+# could answer, about a number that means nothing on its own. The ladder stays
+# on the vault -- this box must not be able to turn "0.05" into anything -- but
+# a LABEL is not an amount. "small" says the owner had a category called small;
+# it cannot be turned into a number by anything here.
+_LABS = ["small", "medium", "large"]
+
+
+def _labelled(allow=(111, 222)):
+    _f = Fake(allow=allow)
+    _f.p.key = {"amount_labels": list(_LABS)}
+    return _f
+
+
+_l = _labelled()
+_l.say("/deposit")
+_q = _l.sent[-1][1]
+check("labels: the question offers the operator's OWN words",
+      all(w in _q for w in _LABS))
+check("labels: ...and no longer asks for a slot number nobody can decode",
+      "slot" not in _q.lower())
+_l.say("medium")
+check("labels: answering by WORD is understood",
+      "Deposit —" in _l.sent[-1][1] and "medium" in _l.sent[-1][1])
+_l.answer_confirm()
+check("labels: ...and maps to the right rung by POSITION",
+      _l.pokes == [(111, "receive_and_quote", {"amount_slot": 1})])
+# CASE-INSENSITIVE, whole word. A phone capitalises the first letter of a
+# sentence on its own, so "Medium" must work or the bot rejects its own prompt.
+_lc = _labelled()
+_lc.say("/deposit"); _lc.say("MEDIUM"); _lc.answer_confirm()
+check("labels: ...whatever the phone did to the capitalisation",
+      _lc.pokes == [(111, "receive_and_quote", {"amount_slot": 1})])
+# THE NUMBER STILL WORKS. An operator who has typed "1" for months should not
+# be told it is now wrong.
+_ln = _labelled()
+_ln.say("/deposit"); _ln.say("1"); _ln.answer_confirm()
+check("labels: NON-VACUITY -- the number still works too",
+      _ln.pokes == [(111, "receive_and_quote", {"amount_slot": 1})])
+# BOUNDED BY THE LABELS. Offering three and accepting eight offers a choice
+# that is not there, and slot 7 on a three-rung ladder is refused at the vault
+# anyway -- after a wake has been spent.
+_lb = _labelled()
+_lb.say("/deposit"); _lb.say("7")
+check("labels: a number past the labels is refused HERE, before a wake",
+      _lb.pokes == [] and "did not recognise" in _lb.text())
+_lw = _labelled()
+_lw.say("/deposit"); _lw.say("enormous")
+check("labels: an unknown word is refused too", _lw.pokes == [])
+# NO LABELS PAIRED is the old behaviour, and the fallback must still say what
+# the number MEANS rather than just naming its range.
+_l0 = Fake(); _l0.p.key = {}
+_l0.say("/deposit")
+check("labels: with none paired it explains what the number is",
+      "position" in _l0.sent[-1][1].lower())
+check("labels: ...and says how to be asked by name instead",
+      "--amount-labels" in _l0.sent[-1][1])
+# AND THE LABELS ARE NOT AMOUNTS. The whole reason this can live on the Pi.
+check("labels: no amount appears in the question",
+      not re.search(r"\d+\.\d", _q))
+
+# ===========================================================================
+# 1d. /settings — WHAT A RUN DOES, AND WHO DECIDES IT
+# ===========================================================================
+print("\n-- the settings the dashboard had and the chat did not --")
+_st = _labelled()
+_st.say("/settings")
+_stx = _st.sent[-1][1]
+check("settings: it names the amounts by the operator's own words",
+      all(w in _stx for w in _LABS))
+check("settings: ...and the wake budget, which is on THIS box",
+      "12" in _stx and "budget" in _stx.lower())
+check("settings: ...and says plainly which parts are decided elsewhere",
+      "mixing depth" in _stx and "not here" in _stx)
+check("settings: ...and why they are not settable from a chat",
+      "turn the mixing down" in _stx)
+check("settings: it wakes nothing to answer", _st.pokes == [])
+# NOTHING OPERATIONAL LEAKS. It is a reply on the surface this design assumes
+# is read: no machine names, no amounts, no addresses.
+check("settings: it names no machine",
+      "vault" not in _stx.lower() and "thinkpad" not in _stx.lower()
+      and "pi" not in _stx.lower().split())
+check("settings: and no amount", not re.search(r"\d+\.\d", _stx))
+
+# ===========================================================================
 # 2. IT CANNOT NAME AN AMOUNT. Structural, not behavioural.
 # ===========================================================================
 print("\n-- it cannot show an amount, because it has none to show --")
@@ -267,7 +356,7 @@ check("...and the prompt does not describe the setup to whoever reads this "
       "ladder" not in f2.text().lower()
       and "vault" not in f2.text().lower())
 check("NON-VACUITY -- it still asks the question and still says how to stop",
-      "0-7" in f2.text() and "/cancel" in f2.text())
+      "How much" in f2.text() and "/cancel" in f2.text())
 
 # ===========================================================================
 # 3. IN MEMORY, NEVER ON THE CARD.
@@ -420,7 +509,11 @@ fa = Fake()
 fa.say("/depo")
 fa.say("4")
 _q = fa.text()
-check("the confirm repeats the slot before waking anything", "slot 4" in _q)
+# THE CONFIRM NAMES WHAT WAS CHOSEN, in the operator's own word when they
+# paired one and "#4" when they did not. "slot 4" was a number nobody could
+# check against anything.
+check("the confirm names what was chosen before waking anything",
+      "Deposit —" in _q and "#4" in _q)
 check("...and names no machine while doing it", "vault" not in _q.lower())
 # FREE-FORM, NOT MULTIPLE CHOICE. Three buttons meant a pocket-dial cleared
 # the gate one time in three; typing a sum is no harder for the operator and
@@ -482,7 +575,7 @@ for _oob in ("8", "9", "70"):
     fd.sent.clear()
     fd.say(_oob)
     check(f"...and {_oob!r} is refused with the REASON, at the step the "
-          f"operator typed it", "a slot is 0-7" in fd.text())
+          f"operator typed it", "did not recognise" in fd.text())
 
 # A SUPERSCRIPT DIGIT IS THE isdigit/isdecimal TRAP, and it is here because it
 # was a real reproduced bug: "²".isdigit() is True and int("²") raises, so a
@@ -497,7 +590,7 @@ for _sup in ("²", "³", "¹"):
     fe2.sent.clear()
     fe2.say(_sup)
     check(f"{_sup!r} is refused as a bad slot, not as an internal error",
-          "a slot is 0-7" in fe2.text()
+          "did not recognise" in fe2.text()
           and "went wrong" not in fe2.text())
 
 # AND THE LADDER'S OWN BOUND, at the vault, checked from both ends. The wizard

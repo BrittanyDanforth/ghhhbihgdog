@@ -189,6 +189,26 @@ USAGE_FEE_LABEL = "1.1%"
 #:
 #: .get(job, job) rather than a lookup that can fail: a job added later without
 #: a chat name should read oddly, not crash the reply that says a wake landed.
+#: What Telegram shows in the "/" menu. ONE PLACE, and the help text is built
+#: from it -- two lists would drift and the operator would be offered a command
+#: the help does not explain, or told about one the menu does not have.
+#:
+#: Descriptions are what a stranger would need, not what the author remembers:
+#: "depo" and "slot 0-7" meant nothing to anyone who had not read the source.
+BOT_COMMANDS = [
+    ("deposit", "get an address to send Bitcoin to"),
+    ("status", "can I start one right now"),
+    # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
+    # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
+    # so "3 min" would be a figure they never once observe.
+    ("check", "has my payment arrived yet (10-25 min)"),
+    ("wait", "wait for it to arrive (up to 2h)"),
+    ("send", "send mixed funds out — asks for the address"),
+    ("settings", "what this will do, and where each part is decided"),
+    ("cancel", "drop whatever I was half-way through"),
+    ("help", "this list"),
+]
+
 CHAT_NAME = {
     "receive_and_quote": "depo",
     "receive_new": "recv",
@@ -264,27 +284,16 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 #: The memo line stays, in its shortest form. It is not an explanation, it is
 #: the difference between a payment arriving and a payment being unrecoverable,
 #: and the operator needs it at the moment they are about to send.
-HELP = (
-    "/depo       start — asks which slot, then confirms\n"
-    "/recv [n]   1-4 addresses to receive on (default 1)\n"
-    # BOTH NUMBERS INCLUDE THE JITTER, because the operator waits it.
-    #
-    # "/check ~5 min" was the probe's own three-minute window and nothing else.
-    # Every wake first serves a random 5-20 minutes (gs_wake_agent's JITTER,
-    # which decorrelates boot from the swap) BEFORE the job starts, so the real
-    # round trip is 8-23 minutes -- understating it by two to seven times, on
-    # the command an operator reaches for when they are already anxious about
-    # money that has not appeared.
-    "/check <h>  has it arrived? (10-25 min)\n"
-    "/watch <h>  wait for it (up to 2h)\n"
-    "/cancel     drop a half-finished /depo\n"
-    # NOT "counters". It answers ready / wait, because a poke count and a
-    # power state are not things this chat should carry.
-    "/withdraw   send one out — asks, then confirms. SPENDS.\n"
-    "/status     can I send one now\n"
-    "/fee /speed /exit\n"
-    "\n"
-    "Memo goes in an OP_RETURN — desktop wallet, not a phone."
+#: BUILT FROM BOT_COMMANDS, so the "/" menu and the help cannot disagree. Two
+#: hand-kept lists drift, and the operator is either offered a command the help
+#: does not explain or told about one the menu does not have.
+#:
+#: The memo line stays. It is not an explanation -- it is the difference
+#: between a payment arriving and a payment being unrecoverable, and it is
+#: needed at the moment the operator is about to send.
+HELP = "\n".join(
+    [f"/{_c:<9s} {_d}" for _c, _d in BOT_COMMANDS]
+    + ["", "The memo goes in an OP_RETURN — desktop wallet, not a phone."]
 )
 
 
@@ -488,7 +497,7 @@ def parse_command(text: str) -> tuple:
         return "", {}, "help"
     if cmd == "/status":
         return "", {}, "status"
-    if cmd == "/recv":
+    if cmd in ("/receive", "/recv"):
         n = 1
         if arg:
             # isdecimal, NOT isdigit, and the wizard already carries the note
@@ -504,7 +513,12 @@ def parse_command(text: str) -> tuple:
         if not 1 <= n <= 4:
             return "", {}, "count must be 1-4"
         return "receive_new", {"count": n}, ""
-    if cmd == "/depo":
+    # ONE COMMAND, SEVERAL SPELLINGS. "depo" was the only name and it is not a
+    # word: nobody who had not read the source knew what it did. The long form
+    # is what the menu advertises; the short ones keep working because they are
+    # already in an operator's muscle memory and a bot that answers "unknown
+    # command" to its own old name is a bot that looks broken.
+    if cmd in ("/deposit", "/depo", "/dep"):
         # THE WIZARD IS THE ONLY FORM NOW.
         #
         # `/depo 2` used to work in one shot, on the reasoning that the wizard
@@ -525,7 +539,7 @@ def parse_command(text: str) -> tuple:
         if arg:
             return "", {}, "just /depo — it asks"
         return "", {}, "depo_wizard"
-    if cmd == "/withdraw":
+    if cmd in ("/send", "/withdraw"):
         # SAME RULE AS /depo, and here it matters more: an argument would be
         # the destination address typed on the same line as the word, which
         # puts it in the transcript attached to the command and skips the
@@ -538,13 +552,15 @@ def parse_command(text: str) -> tuple:
     # THE THREE QUESTIONS THAT ARE NOT KNOBS. Each answers where the thing is
     # really decided, rather than offering a control wired to nothing. See
     # FEE_ANSWER / SPEED_ANSWER / EXIT_ANSWER for why each is not settable.
+    if cmd == "/settings":
+        return "", {}, "settings"
     if cmd == "/fee":
         return "", {}, "fee"
     if cmd == "/speed":
         return "", {}, "speed"
     if cmd == "/exit":
         return "", {}, "exit"
-    if cmd == "/watch":
+    if cmd in ("/wait", "/watch"):
         if not HANDLE_RE.match(arg):
             return "", {}, "handle must be 4 hex characters"
         return "watch", {"handle": arg.upper()}, ""
@@ -719,8 +735,93 @@ class Pager:
             self.send(chat_id,
                       "Send where? Reply with the address. /cancel to stop.")
             return
-        self.send(chat_id,
-                  "Which slot? Reply 0-7. /cancel to stop.")
+        self.send(chat_id, self._amount_question())
+
+    def _settings_text(self) -> str:
+        """What a run does, and who decides each part.
+
+        THE MISSING HALF OF THE CONSOLE. The web console exposes two dozen
+        settings; the chat exposed none of them and said nothing about them
+        either -- so an operator on a phone had no way to know what a run
+        would be, only that one had started.
+
+        IT SHOWS, IT DOES NOT SET, and that is a design rather than an
+        omission. Every value here lives in the vault's keyfile because a chat
+        message that could change the mixing depth is a chat message that
+        could WEAKEN it, and the one thing a stolen phone must not be able to
+        do is turn the mixing down. Naming where each one lives is what makes
+        the difference: the operator sees what will happen and knows which box
+        to go to.
+
+        NOTHING IS FETCHED. The budget and the cap are already on this box;
+        the ladder, the depth and the destination are not, and a /settings
+        that woke the vault would spend a wake to answer a question.
+        """
+        labs = self._labels()
+        lines = ["What a run does, and who decides it.", ""]
+        lines.append("  amounts     " + (", ".join(labs) if labs
+                                         else "not named — pair with "
+                                              "--amount-labels"))
+        lines.append(f"  wake budget {self.limits.daily_cap} a day, "
+                     f"{len(self.limits.recent())} used")
+        lines.append("")
+        lines.append("Set on the machine, not here:")
+        lines.append("  how much each amount is")
+        lines.append("  mixing depth and delay")
+        lines.append("  whether sending out is allowed at all")
+        lines.append("")
+        lines.append("None of it changes from this chat. A message that could "
+                     "turn the mixing down is a message worth stealing the "
+                     "phone for.")
+        return "\n".join(lines)
+
+    def _labels(self) -> list:
+        """The operator's own words for the ladder rungs, in order.
+
+        Empty when the pairing set none, which is the old behaviour and the
+        reason this exists: "Which slot? Reply 0-7" is a question nobody who
+        had not read the source could answer.
+        """
+        v = (self.key or {}).get("amount_labels") or []
+        return [str(x) for x in v if str(x).strip()][:8]
+
+    def _amount_question(self) -> str:
+        """What to ask, in the operator's words if they gave any."""
+        labs = self._labels()
+        if not labs:
+            # NO LABELS PAIRED. Say what the number MEANS rather than just
+            # naming its range: "0-7" alone is the question that started this.
+            return ("How much? Reply with the position of the amount in the "
+                    "list you set up — 0 is the first. /cancel to stop.\n"
+                    "(Pair with --amount-labels to be asked by name instead.)")
+        return ("How much? Reply with one:\n"
+                + "\n".join(f"  {i}  {l}" for i, l in enumerate(labs))
+                + "\nReply with the word or the number. /cancel to stop.")
+
+    def _slot_from(self, word: str):
+        """A slot from either the number or the operator's own word, or None.
+
+        BOTH FORMS, because the labels are a convenience and the numbers are
+        what the wire has always carried -- an operator who has typed "2" for
+        months should not be told it is now wrong.
+
+        Matched case-insensitively and on the whole word: a label is a short
+        word the operator chose, and a prefix match would make "s" ambiguous
+        between "small" and "standard" without saying so.
+        """
+        w = (word or "").strip().lower()
+        labs = self._labels()
+        for i, l in enumerate(labs):
+            if w == str(l).strip().lower():
+                return i
+        if w.isdecimal():
+            n = int(w)
+            # Bounded by the LABELS when there are any -- offering three and
+            # accepting eight is offering a choice that is not there.
+            hi = (len(labs) - 1) if labs else 7
+            if 0 <= n <= hi:
+                return n
+        return None
 
     def step_convo(self, chat_id: int, text: str) -> bool:
         """Advance a live conversation. True if this message was consumed.
@@ -759,18 +860,25 @@ class Pager:
             del self.convos[chat_id]
             return False
         if c.awaiting_slot():
-            # isdecimal, not isdigit: isdecimal is the predicate that matches
-            # what int() accepts. See the docstring above.
-            if not word.isdecimal() or not 0 <= int(word) <= 7:
+            # EITHER THE WORD OR THE NUMBER. _slot_from does the isdecimal
+            # check (not isdigit: isdecimal is what int() accepts) and bounds
+            # the number by the labels when there are any.
+            _s = self._slot_from(word)
+            if _s is None:
                 del self.convos[chat_id]
-                self.send(chat_id, "no: a slot is 0-7. Cancelled — start "
-                                   "again with /depo.")
+                self.send(chat_id, "no: I did not recognise that. Cancelled — "
+                                   "start again with /deposit.")
                 return True
-            c.slot = int(word)
+            c.slot = _s
             # DEADLINE UNTOUCHED. See Convo: it is absolute from creation, so
             # answering slowly does not buy another full window.
             q, c.expect = _confirm_question(self.rng)
-            self.send(chat_id, f"slot {c.slot} — confirm.\n\n{q}")
+            # THE OPERATOR'S OWN WORD BACK, so the confirm is about something
+            # they recognise. Falls back to the number when nothing is paired.
+            _labs = self._labels()
+            _named = (_labs[c.slot] if c.slot < len(_labs) else f"#{c.slot}")
+            self.send(chat_id,
+                      f"Deposit — {_named}. This wakes the machine.\n\n{q}")
             return True
         if c.awaiting_address():
             # CHECKED HERE AND AGAIN AT THE VAULT. This gate is the protocol's
@@ -1278,6 +1386,9 @@ class Pager:
             self.send(cid, "cancelled. Nothing was woken." if had_convo
                       else "nothing to cancel.")
             return
+        if err == "settings":
+            self.send(cid, self._settings_text())
+            return
         if err == "fee":
             self.send(cid, FEE_ANSWER)
             return
@@ -1380,7 +1491,44 @@ class Pager:
             integrity_log("pager", "worker_start_failed")
             self.send(cid, f"{chat_name(job)}: could not start the wake — {_redact(e)[:120]}")
 
+    def publish_commands(self) -> bool:
+        """Register the command list with Telegram. Returns whether it landed.
+
+        WITHOUT THIS THE BOT LOOKS DEAD. Telegram builds the "/" autocomplete
+        menu, the blue Menu button and the command descriptions from
+        setMyCommands -- and this never called it. So a correctly working
+        pager, over Tor, with a valid token, presented as an empty chat with no
+        menu and no hint that typing anything would do something. The operator
+        had to already know every command and its exact spelling.
+        That is indistinguishable from a bot that does not work.
+
+        NOT FATAL. A pager that could not publish its menu still answers every
+        command it always did, and refusing to start over cosmetics would be
+        the wrong trade on the box whose whole job is to be reachable. It says
+        so instead, once, on the terminal.
+
+        SCOPE default (every chat this bot is in), because the allowlist is
+        what decides who is answered -- and it is checked on every message, so
+        a menu visible to a stranger buys them nothing but the word "no".
+        """
+        cmds = [{"command": c, "description": d} for c, d in BOT_COMMANDS]
+        try:
+            r = safe_post(self._url("setMyCommands"),
+                          {"commands": json.dumps(cmds)},
+                          proxies=self.proxies)
+            ok = bool(isinstance(r, dict) and r.get("ok"))
+        except Exception:                                    # noqa: BLE001
+            ok = False
+        if not ok:
+            print("  [!] Could not publish the command menu to Telegram. The "
+                  "bot still answers every\n"
+                  "      command; the phone just will not offer them. Usually "
+                  "Tor being slow on the\n"
+                  "      first poll — it is retried on the next start.")
+        return ok
+
     def run(self) -> int:
+        self.publish_commands()
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s), "
               f"Tor only, one wake at a time.")
         while not shutdown_requested():

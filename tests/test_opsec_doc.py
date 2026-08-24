@@ -200,10 +200,24 @@ check("the pager's replies are built from a fixed vocabulary, not from job "
       _PAGER.count("self.send(") >= 5
       and "slip {h}" in _PAGER
       and "pending.result" in _PAGER)
+# A READ, NOT AN OCCURRENCE, and the paragraph directly above warns against
+# exactly the mistake this line was making. It hunted for the quoted word
+# anywhere in the file, so naming the command "/deposit" -- a word an operator
+# can guess, replacing "depo", which nobody could -- tripped a check about
+# result FIELDS. The property is that the pager never pulls one of these out of
+# a job's answer; how the commands are spelled has nothing to do with it.
 for _forbidden in ("dest_xmr", "deposit", "expected_xmr", "btc_in",
                    "thor_pairs", "unsigned_"):
-    check(f"the pager never reads a field named {_forbidden}",
-          f'"{_forbidden}"' not in _PAGER and f"'{_forbidden}'" not in _PAGER)
+    _reads = (f'["{_forbidden}"]' in _PAGER
+              or f".get(\"{_forbidden}\"" in _PAGER
+              or f"['{_forbidden}']" in _PAGER
+              or f".get('{_forbidden}'" in _PAGER)
+    check(f"the pager never reads a field named {_forbidden}", not _reads)
+# NON-VACUITY: the pager DOES read fields, so the absences above are absences
+# from something -- a checker that finds no reads at all would pass this loop
+# whatever the file said.
+check("...NON-VACUITY -- it reads the fields it is allowed to",
+      '.get("handle")' in _PAGER and '.get("phase")' in _PAGER)
 check("the pager cannot name a destination: no job it sends takes one",
       "--exit-to" not in _PAGER and "--dest" not in _PAGER)
 # THE DEFAULT REPLY, which is what §5 step 5 describes and what an operator who

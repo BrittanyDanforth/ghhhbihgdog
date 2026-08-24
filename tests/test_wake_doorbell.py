@@ -850,6 +850,55 @@ check("the vault reads its jitter from the protocol module, so the two boxes "
       "proto.VAULT_JITTER_LO_S" in open(os.path.join(REPO,
                                                      "gs_wake_agent")).read())
 
+# ===========================================================================
+#  THE WORDS THE CHAT OFFERS, AND WHY THEY MAY LIVE ON THIS CARD
+# ===========================================================================
+print("\n== labels are words, never amounts ==")
+#
+# The ladder is on the vault and always will be: this box must not be able to
+# turn "0.05" into anything. The consequence was a chat that asked "Which slot?
+# Reply 0-7" -- a question nobody who had not read the source could answer.
+#
+# A LABEL is not an amount. "small" says the owner had a category called small;
+# it cannot be turned into a number by anything here. A DECIMAL is exactly the
+# value the ladder exists to keep off this card, so it is refused at pairing.
+_lbl_src = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
+check("labels: the pairing refuses a label that is a number",
+      r'if re.match(r"^[0-9.,]+\Z", str(_lb).strip()):' in _lbl_src)
+# \Z, NOT $: this repo has a rule and a test for it, because `$` also matches
+# before a trailing newline and the two are not the same anchor.
+check("labels: ...anchored with \\Z, like every other validator here",
+      '"^[0-9.,]+$"' not in _lbl_src)
+check("labels: ...and says why, rather than just refusing",
+      "the vault's ladder exists" in _lbl_src)
+
+
+def _label_ok(v):
+    """Run the real refusal over one label. True if it would be accepted."""
+    import re as _re_l
+    if _re_l.match(r"^[0-9.,]+\Z", str(v).strip()):
+        return False
+    if len(str(v)) > 24 or not str(v).strip():
+        return False
+    return True
+
+
+for _bad in ("0.05", "5", "0,05", "1.0", "  2  ", "", "   ", "x" * 25):
+    check(f"labels: {_bad!r} is refused", not _label_ok(_bad))
+# NON-VACUITY: real words pass, or the check above is a function that refuses
+# everything and the feature does not exist.
+for _good in ("small", "medium", "large", "rent", "big one"):
+    check(f"labels: NON-VACUITY -- {_good!r} is accepted", _label_ok(_good))
+# AND THE PREDICATE THIS TEST USES IS THE ONE THE TOOL USES. Copied here it
+# would drift; asserted against the source it cannot.
+check("labels: the predicate tested here is the one in the tool",
+      r'"^[0-9.,]+\Z"' in _lbl_src and "len(str(_lb)) > 24" in _lbl_src)
+# THE KEYFILE CARRIES THEM, so the pager has something to offer.
+check("labels: the Pi's keyfile carries them",
+      '"amount_labels": _labels,' in _lbl_src)
+check("labels: ...built with getattr, so a pairing that predates the flag "
+      "does not raise", 'getattr(args, "amount_labels", None)' in _lbl_src)
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
