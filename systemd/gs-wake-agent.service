@@ -127,6 +127,25 @@ StandardError=null
 # anywhere says why. This writes the reason into the same 0600 job log the
 # agent already uses, which paranoia_mode wipes with the rest of the run.
 ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, socks, psutil, monero" 2>>/var/lib/ghostspiral/gs_wake_job.log || { echo "gs-wake-agent: a Python dependency is missing or not visible under ProtectHome=yes -- see requirements.txt and the install note in this unit" >>/var/lib/ghostspiral/gs_wake_job.log; exit 1; }'
+# THE SPEND PASSWORD, ONLY IF YOU PAIRED WITH --allow-withdraw.
+#
+# Leave this commented out and nothing changes: the withdraw job does not
+# exist for a keyfile that does not allow it, and every other job runs exactly
+# as before. Uncomment it and you have decided that this machine can spend
+# while nobody is sitting at it. OPSEC_SETUP.md section 4b is what that costs.
+#
+# ROOT-OWNED 0400, holding one line:
+#     GS_WALLET_PASSWORD=...
+#
+# /proc/<pid>/cmdline is 0444 and /proc/<pid>/environ is 0400, which is why
+# there is no flag for this and never will be.
+#
+# WHAT STOPS IT REACHING EVERYTHING ELSE: run_child strips every GS_ variable
+# out of the environment it inherits and puts back only what the dispatcher
+# hands that step. So this reaches the mix and reaches nothing else -- not
+# thor_swap_preparer, not create_receive_wallet. Without that scrub, putting a
+# password here would hand it to every child of every job.
+#EnvironmentFile=/etc/gs-wake-spend.env
 ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_wake_agent --key /etc/gs_wake_thinkpad.key
 
 # §4: "the auto-job user must NOT be allowed to mount removable disks." These

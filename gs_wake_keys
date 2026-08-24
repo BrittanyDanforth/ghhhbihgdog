@@ -276,6 +276,16 @@ def build_cli() -> argparse.ArgumentParser:
                         "machine a pager can wake, so whoever holds the bot "
                         "token can trigger a withdrawal - to an address they "
                         "type. Read OPSEC_SETUP.md before using it.")
+    # WHICH WALLET THE MIX SIGNS WITH. Not a job parameter and it must never
+    # become one: a wake note that could name a wallet file could name any file
+    # on this machine. Only meaningful with --allow-withdraw, and the pairing
+    # refuses the pair without it (see below) rather than writing a keyfile
+    # whose withdraw job would fail hours in, after the money had moved.
+    p.add_argument("--wallet-file", default="",
+                   help="ABSOLUTE path to the wallet the mix signs with. "
+                        "Required with --allow-withdraw. The password goes in "
+                        "GS_WALLET_PASSWORD in the agent unit's "
+                        "EnvironmentFile, never here and never on an argv.")
     p.add_argument("--account-ceiling", type=int, default=45,
                    help="refuse minting jobs once the wallet holds this many "
                         "accounts (OPSEC_SETUP.md section 4)")
@@ -285,6 +295,20 @@ def build_cli() -> argparse.ArgumentParser:
 
 
 def _validate(args) -> None:
+    # REFUSED AT PAIRING, not discovered mid-withdrawal. --allow-withdraw
+    # without a wallet file writes a keyfile whose withdraw job relays a
+    # fan-out and THEN fails at the signing step, with the money already moved.
+    # The two flags are one setting and this is the only moment both are here.
+    if args.allow_withdraw and not args.wallet_file:
+        sys.exit("[!] --allow-withdraw needs --wallet-file: the mix has to "
+                 "know which wallet to sign with.\n"
+                 "    Without it a withdrawal would relay its fan-out and "
+                 "fail hours later at the\n"
+                 "    signing step, with the money already moved on-chain.")
+    if args.wallet_file and not os.path.isabs(args.wallet_file):
+        sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "
+                 f"agent runs from a unit with its own WorkingDirectory, so a "
+                 f"relative path resolves somewhere you did not mean.")
     for a in args.amount_ladder:
         # Shape only. thor_swap_preparer does the real Decimal validation; this
         # refuses the obviously-wrong now rather than at 3am on a woken box.
@@ -488,6 +512,7 @@ def do_pair(args) -> int:
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),
         "allow_withdraw": bool(args.allow_withdraw),
+        "wallet_file": str(args.wallet_file or ""),
     }
     # kdf="none", deliberately and visibly. See the module docstring: a machine
     # that boots unattended cannot keep a passphrase from someone holding it.

@@ -1638,15 +1638,32 @@ JOBS = {
     "withdraw": {
         "schema": {"handle": _handle_field, "exit_to": _xmr_address_field},
         "tools": ("GhostSpiral",),
-        # FOUR HOURS, and it is measured rather than generous. GhostSpiral's
-        # own estimate_runtime puts a default fan-out plus DAG round at about
-        # 2.3-3 h, almost all of it the per-transaction --hop-delay, which is
-        # an OPSEC parameter and not overhead to be trimmed. The budget has to
-        # clear the SLOW end of that with room, because the failure it prevents
-        # is not a late report: it is the vault powering off mid-round, which
-        # GhostSpiral says in as many words it cannot recover from
-        # automatically.
-        "budget_s": 14400,
+        # SIX HOURS, SIZED FROM THE WORST CASE AND NOT THE MEDIAN, and the
+        # first version of this got that wrong in the direction that costs
+        # money.
+        #
+        # It was 14400 (4 h), chosen against GhostSpiral's estimate_runtime
+        # reporting "~3.2h" for the settings this job composes. That figure is
+        # a MEDIAN: --hop-delay draws uniformly from 60-300 s per transaction
+        # and a run makes about thirty of those draws. Asking the same
+        # estimator for the slow end -- estimate_runtime(..., (300, 300)) --
+        # answers ~4.5 h. So a run that drew high was over budget, and over
+        # budget here is not a late report: run_child SIGTERMs the process
+        # group and then SIGKILLs it, mid-mix, with the money already moving.
+        #
+        # 21600 clears the 4.5 h worst case with room. It is checked against
+        # the estimator rather than asserted -- tests/test_wake_agent.py
+        # recomputes the worst case from GhostSpiral's own arithmetic and
+        # fails if it no longer fits, so the two numbers cannot drift apart
+        # the way these two did.
+        #
+        # The cost is real and belongs here rather than in a doc: the vault is
+        # powered on, with an unlocked spend wallet, for up to six hours. That
+        # is far and away the longest any job keeps it up, and it is the power
+        # and network signature this design otherwise spends its effort
+        # hiding. It buys the one thing worth more, which is not being killed
+        # half way through spending.
+        "budget_s": 21600,
     },
 }
 
