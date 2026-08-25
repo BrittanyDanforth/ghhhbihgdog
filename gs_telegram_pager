@@ -952,10 +952,15 @@ class Pager:
         #: and why the SD card must not.
         self.handle_owner = {}
         #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
-        #: otherwise -- a private chat id IS a person. Used for the one thing
-        #: this number decides: whether the operator has to be told, at the
-        #: moment money moves, that the pot is not only theirs. main() refuses
-        #: to start above 1 without --shared-funds.
+        #: otherwise -- a private chat id is a Telegram ACCOUNT, and Telegram
+        #: gives one account one chat with a given bot however many devices it
+        #: is signed in on, so a second one is a second person.
+        #:
+        #: main() refuses to start above 1. This exists so start_job can
+        #: refuse too: that is the only path to a wake, it is the code closest
+        #: to the money, and it cannot be reached by constructing a Pager some
+        #: other way. One wallet, one person -- checked where it is spent as
+        #: well as where it is configured.
         self.spenders = len(self.allow_users) or len(self.allow)
         self.busy = threading.Lock()
         self.ignored = 0
@@ -1422,25 +1427,20 @@ class Pager:
             _spread = (f"across {_n} addresses" if _n > 1 else
                        "onto the ONE address you gave — anyone watching it "
                        "sees them all and can group them")
-            # WHOSE MONEY, ON THE ONE INSTALL WHERE THAT IS A QUESTION.
+            # NO "WHOSE MONEY IS THIS" LINE HERE, AND THAT IS THE POINT.
             #
-            # There is one wallet, and a withdrawal spends the largest
-            # unlocked balance on it -- the vault is never told who asked, and
-            # cannot be. On a single-operator install that is invisible and
-            # right. With --shared-funds acknowledged at startup it is a real
-            # possibility at exactly this moment, so it is said at exactly
-            # this moment rather than in a banner on a headless box.
-            _pot = ("" if self.spenders <= 1 else
-                    "\n\nThis takes the LARGEST balance on the wallet, "
-                    "whoever put it there — "
-                    f"{self.spenders} people can drive this bot and the money "
-                    "is one pot.")
+            # An earlier version added one, for the install where more than
+            # one person could spend from one wallet. There is no such install
+            # any more: main() refuses to start, unconditionally, and
+            # start_job refuses the wake. A sentence explaining a risk the
+            # operator is not allowed to be exposed to would be a sentence
+            # about a state that cannot exist -- and worse, it would read as
+            # the warning that MAKES it acceptable.
             self.send(chat_id,
                       f"Send to the {'addresses' if _n > 1 else 'address'} you "
                       f"just sent, {proto.WITHDRAW_DEPTH_NOTE[_d]} — this "
                       f"SPENDS.\n\n"
                       f"At least {_lo} separate transactions, {_spread}."
-                      f"{_pot}"
                       f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
@@ -2478,6 +2478,29 @@ class Pager:
         spend a poke, and starting conversations would be a way to exhaust the
         day's budget without ever waking anything.
         """
+        # ONE WALLET, ONE PERSON, CHECKED WHERE IT IS SPENT.
+        #
+        # main() refuses this configuration at startup, which is where the
+        # operator is standing and where the message can be long. This is the
+        # same rule at the other end: start_job is the ONLY path to a wake,
+        # and a wake is what moves money. A Pager built some other way -- a
+        # future caller, a test harness promoted into production, an edit that
+        # skips main() -- would otherwise reach the wire with an allowlist
+        # main() would have rejected.
+        #
+        # Defence in depth is worth it HERE specifically because the harm is
+        # not the operator's: with two people on one wallet, the withdrawal
+        # that succeeds takes the other one's money, and nothing downstream
+        # can notice. So this is checked at the last line before the wake,
+        # not only at the first line of the process.
+        if self.spenders > 1:
+            integrity_log("pager", "refused_multi_spender")
+            self.send(cid,
+                      "no: this bot is allowlisted for more than one person "
+                      "and there is one wallet behind it. A withdrawal would "
+                      "spend whoever's balance is largest. Refusing every "
+                      "job until that is fixed — one person per bot.")
+            return
         why = self.limits.why_not()
         if why:
             self.send(cid, f"no: {why}")
@@ -2578,36 +2601,15 @@ class Pager:
               + (f", {len(self.allow_users)} allowlisted sender(s)"
                  if self.allow_users else "")
               + ", Tor only, one wake at a time.")
-        # WHAT IS SHARED, WHEN MORE THAN ONE PARTY IS ALLOWLISTED.
+        # NOTHING HERE ABOUT SHARING, BECAUSE NOTHING IS SHARED ANY MORE.
         #
-        # This design is single-tenant and nothing said so. Repeating
-        # --chat-id is supported and is the right thing for ONE operator with
-        # a phone and a desktop -- but everything behind it is one pool:
-        #
-        #   * ONE wake budget and one rate limit (a single Limits object), so
-        #     one chat exhausts the other's;
-        #   * ONE `busy` lock, so one chat's withdrawal refuses every command
-        #     from the other for up to 16.75 h;
-        #   * ONE handle namespace on the vault, which has no notion of a chat
-        #     at all -- handle_owner above narrows that to what this process
-        #     has seen, and cannot narrow it further.
-        #
-        # Fine for one person on two devices. Said out loud because it is not
-        # fine for two people, and nothing else in the toolchain mentions it.
-        # LEADS WITH THE MONEY NOW. This said "one wake budget, one
-        # one-job-at-a-time lock, and one handle namespace" -- all true, all
-        # inconvenience, and it left out the one that is not: the vault takes
-        # the largest balance it can see, whoever put it there. main() refuses
-        # to start in this state without --shared-funds; this is the reminder
-        # for the install that acknowledged it.
-        if self.spenders > 1:
-            print("  [!] {n} people can drive this bot and they SHARE ONE POT."
-                  .format(n=self.spenders))
-            print("      A withdrawal spends the largest balance on the "
-                  "wallet, whoever put it there —")
-            print("      it does not ask who is asking. They also share one "
-                  "wake budget, one rate")
-            print("      limit, and one job at a time.")
+        # This block used to print a warning: one wake budget, one job lock,
+        # one handle namespace, later one pot of money. Every line of it was a
+        # description of a configuration that main() now refuses outright --
+        # one wallet means one person, and there is no flag to say otherwise.
+        # A banner explaining the consequences of a state the program will not
+        # enter is decoration, and this file removes guards that cannot fire
+        # rather than keeping them for reassurance.
         while not shutdown_requested():
             for upd in self.updates():
                 uid = upd.get("update_id")
@@ -2794,17 +2796,17 @@ def build_cli():
     # people, the second one taps Withdraw and the vault hands them the first
     # one's money, correctly, by its own rules.
     #
-    # There is no fix for that inside this file. Dividing the pot would mean a
-    # persistent chat-to-account ledger on the vault -- exactly the record
-    # this design refuses to keep, and a chat identifier on a wire that
-    # deliberately carries none. So the answer is to make the operator say
-    # they know: --shared-funds is an acknowledgement, not a feature.
-    ap.add_argument("--shared-funds", action="store_true",
-                    help="acknowledge that EVERY allowlisted person shares "
-                         "ONE pot of money. Required when more than one "
-                         "person is allowlisted: a withdrawal spends the "
-                         "largest balance on the wallet, whoever put it "
-                         "there.")
+    # THERE IS NO FLAG FOR THIS AND THERE MUST NOT BE. The first version of
+    # this added --shared-funds: an acknowledgement the operator passes to say
+    # they understand. That is the wrong shape for a consent gate, and the
+    # reason is worth writing down. The person who types the flag is the
+    # operator. The person who loses money is the OTHER user, who never saw
+    # it, was never asked, and has no way to find out it was passed. Consent
+    # given by one party to a harm that lands on a second party is not
+    # consent; it is a switch for turning off a safety notice.
+    #
+    # So the allowlist takes ONE person and the refusal is unconditional. See
+    # main().
     ap.add_argument("--user-id", action="append", default=None, type=int,
                     help="allowlisted Telegram USER id, checked against the "
                          "sender of every message. Repeatable. REQUIRED when "
@@ -2936,32 +2938,51 @@ def main(argv=None) -> int:
     # rooms they might be standing in. Without it, every allowlisted chat is a
     # private one -- main() refuses a group above -- and a private chat id IS
     # a person, because Telegram makes it equal to their user id.
+    # ONE PERSON. NOT ONE PERSON UNLESS THEY SAY OTHERWISE.
+    #
+    # There is one wallet behind this bot and a withdrawal spends the largest
+    # unlocked balance on it, whoever put it there -- driven, and there is no
+    # gate downstream that could think otherwise, because the vault is never
+    # told who asked.
+    #
+    # HOW MANY PEOPLE IS NOT HOW MANY CHAT IDS, and it is also not larger than
+    # it looks. With --user-id the senders ARE the people. Without it every
+    # allowlisted chat is private (a group is refused above), and a PRIVATE
+    # CHAT ID IS A TELEGRAM ACCOUNT: Telegram gives one account exactly one
+    # chat with a given bot, on every device it is signed in to. So the "one
+    # operator with a phone and a desktop" this used to be justified by does
+    # not exist -- that operator has one account, one chat id, one entry. A
+    # second --chat-id is a second ACCOUNT, which is a second person.
     _spenders = len(set(args.user_id or ())) or len(set(args.chat_id))
-    if _spenders > 1 and not args.shared_funds:
+    if _spenders > 1:
         sys.exit(
-            f"[!] {_spenders} different people can drive this bot, and they "
-            f"would SHARE ONE POT.\n"
-            f"    There is one wallet behind this. A withdrawal does not ask "
-            f"who is asking: the\n"
-            f"    vault takes the LARGEST unlocked balance it can see and "
-            f"sends it to whatever\n"
-            f"    addresses that person gave. Driven against the shipped "
-            f"code -- with 1000 XMR\n"
-            f"    from one person and 300 from another on one wallet, the "
-            f"second person's\n"
-            f"    withdrawal picks up the first person's 1000.\n"
+            f"[!] {_spenders} different people would be able to spend from "
+            f"ONE wallet. Refusing.\n"
+            f"    There is a single wallet behind this bot. A withdrawal does "
+            f"not ask who is\n"
+            f"    asking: the vault takes the LARGEST unlocked balance it can "
+            f"see and sends it to\n"
+            f"    whatever addresses that person gave. Driven against the "
+            f"shipped code -- with\n"
+            f"    1000 XMR from one person and 300 from another on one "
+            f"wallet, the second\n"
+            f"    person's withdrawal picks up the first person's 1000.\n"
             f"\n"
-            f"    They also share one daily wake budget, one rate limit, and "
-            f"one job at a time --\n"
-            f"    a withdrawal refuses everyone else's commands for the "
-            f"better part of a day.\n"
+            f"    THERE IS NO FLAG TO OVERRIDE THIS. An override would be the "
+            f"operator agreeing,\n"
+            f"    on somebody else's behalf, to a loss that falls on somebody "
+            f"else. The person\n"
+            f"    who would be robbed is not the person who would be asked.\n"
             f"\n"
-            f"    If that is one person on several devices, or people whose "
-            f"money genuinely is\n"
-            f"    one pot, pass --shared-funds and it will start.\n"
-            f"    If they are separate customers, this tool cannot keep them "
-            f"apart and you need\n"
-            f"    one vault and one bot each.")
+            f"    ONE PERSON PER BOT, because it is one wallet per bot. To "
+            f"serve several people,\n"
+            f"    give each of them their own vault, their own wallet and "
+            f"their own bot; they\n"
+            f"    share nothing and cannot reach each other's funds.\n"
+            f"    (If you meant one person on several devices: Telegram gives "
+            f"one account one\n"
+            f"     chat with this bot, whatever it is signed in on. That is "
+            f"one --chat-id.)")
     key = doorbell().load_key(Path(args.key))
 
     st = Path(args.state)

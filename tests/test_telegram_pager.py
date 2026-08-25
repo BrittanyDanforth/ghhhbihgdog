@@ -827,6 +827,7 @@ for _name, _txt in (("EXIT_ANSWER", pg.EXIT_ANSWER),
 _said = []
 _wp = pg.Pager.__new__(pg.Pager)
 _wp.args = types.SimpleNamespace(no_jitter=False)
+_wp.spenders = 1
 _wp.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None)
 _wp.send = lambda cid, t, buttons=None: (_said.append((cid, t)), True)[1]
 _saved_thread = threading.Thread
@@ -1526,6 +1527,7 @@ def _room_pager(allow, users):
     p.allow, p.ignored, p.convos = set(allow), 0, {}
     p.allow_users, p.handle_owner = set(users), {}
     p.spenders = len(p.allow_users) or len(p.allow)
+    p.burn_after = 0
     p.busy = _th4.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
     p.burn, p.burn_after, p.burn_now = [], 0, False
@@ -1936,62 +1938,91 @@ try:
     _K = ["--key", "/nonexistent.key"]
     _two = _boot(_K + ["--chat-id", "111", "--chat-id", "222"])
     check("pot: two allowlisted people is REFUSED at startup",
-          "SHARE ONE POT" in _two)
+          "spend from ONE wallet" in _two)
     check("pot: ...and the refusal names what actually happens — the largest "
           "balance, whoever put it there",
           "LARGEST unlocked balance" in _two)
     check("pot: ...with the driven figures, not an abstraction",
           "1000 XMR" in _two and "300" in _two)
-    check("pot: ...and says the shared budget and the shared lock too",
-          "wake budget" in _two and "one job at a time" in _two)
-    check("pot: ...and offers the acknowledgement rather than only refusing",
-          "--shared-funds" in _two)
-    check("pot: ...and says what to do if they really are separate customers",
-          "one vault and one bot each" in _two)
-    # SENDERS, NOT CHATS. With --user-id the people are the senders and the
-    # chat ids are rooms they stand in.
+    # THE REFUSAL IS UNCONDITIONAL, AND THAT IS THE FINDING.
+    #
+    # The first version of this offered --shared-funds: an acknowledgement the
+    # operator passes to say they understand. Wrong shape for a consent gate.
+    # The person who types the flag is the OPERATOR; the person who loses
+    # money is the other user, who never saw it, was never asked, and cannot
+    # find out it was passed. Consent by one party to a harm landing on a
+    # second party is not consent, it is a switch for silencing a warning.
+    check("pot: there is NO override flag — an operator cannot consent on "
+          "another person's behalf",
+          "--shared-funds" not in _two and "shared_funds" not in _two)
+    check("pot: ...and the refusal says so, rather than leaving the operator "
+          "hunting for the flag that turns it off",
+          "NO FLAG TO OVERRIDE" in _two)
+    check("pot: ...and says what to do instead",
+          "own vault" in _two and "own bot" in _two)
+    # AND THE "SEVERAL DEVICES" JUSTIFICATION IS CORRECTED, because it was
+    # never true: Telegram gives one ACCOUNT one chat with a given bot,
+    # whatever it is signed in on. A second --chat-id is a second account.
+    check("pot: ...and corrects the several-devices reasoning that used to "
+          "justify a second chat id",
+          "one account one" in _two.replace("\n", " ").replace("  ", " "))
+    # SENDERS, NOT CHATS. With --user-id the people are the senders.
     _grp = _boot(_K + ["--chat-id", "-100123", "--user-id", "4242",
                        "--user-id", "777001"])
     check("pot: two allowlisted SENDERS in one group is refused too",
-          "SHARE ONE POT" in _grp)
-    # NON-VACUITY, four ways: every legitimate shape still starts. They fail
-    # later on the missing keyfile, which is the proof they got past this gate.
+          "spend from ONE wallet" in _grp)
+    # THE FLAG IS GONE FROM THE PARSER, not merely ignored -- an operator who
+    # learned it must be told, not silently allowed.
+    _opts = {a for _act in pg.build_cli()._actions
+             for a in _act.option_strings}
+    check("pot: the old override is not even a recognised argument",
+          "--shared-funds" not in _opts)
+    _flagged = []
+    try:
+        pg.build_cli().parse_args(["--chat-id", "111", "--shared-funds"])
+    except SystemExit:
+        _flagged.append("refused")
+    check("pot: ...so an operator who learned it is TOLD, not silently "
+          "allowed", _flagged == ["refused"])
+    # NON-VACUITY: every legitimate shape still starts. They fail later on the
+    # missing keyfile, which is the proof they got past this gate.
     for _argv, _label in (
             (_K + ["--chat-id", "111"], "one private chat"),
             (_K + ["--chat-id", "111", "--chat-id", "111"],
              "the same chat id twice — one person, deduplicated"),
             (_K + ["--chat-id", "-100123", "--user-id", "4242"],
-             "a group with one allowlisted sender"),
-            (_K + ["--chat-id", "111", "--chat-id", "222", "--shared-funds"],
-             "two people WITH --shared-funds")):
+             "a group with one allowlisted sender")):
         check(f"pot: NON-VACUITY -- {_label} still starts",
-              "SHARE ONE POT" not in _boot(_argv))
+              "spend from ONE wallet" not in _boot(_argv))
 finally:
     (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
      pg.load_token) = _saved_m
 
-# AND IT IS SAID AGAIN AT THE MOMENT MONEY MOVES, because a startup banner is
-# printed to a headless box and the confirm is read by a person.
-_pp1, _ps1 = _room_pager([111], [])
-_pp1.spenders = 1
-_pp1.handle(_msg(111, 111, "/withdraw"))
-_pp1.handle(_msg(111, 111, "4" + "1" * 94))
-_pp1.handle(_msg(111, 111, "2"))
-check("pot: a single-operator install says nothing about a shared pot",
-      "one pot" not in _ps1[-1].lower())
-_pp2, _ps2 = _room_pager([111], [])
-_pp2.spenders = 3
-_pp2.handle(_msg(111, 111, "/withdraw"))
-_pp2.handle(_msg(111, 111, "4" + "1" * 94))
-_pp2.handle(_msg(111, 111, "2"))
-check("pot: a shared install says so on the CONFIRM, which is the moment the "
-      "money moves",
-      "LARGEST balance" in _ps2[-1] and "one pot" in _ps2[-1])
-check("pot: ...and says how many people can drive it",
-      "3 people" in _ps2[-1])
-check("pot: NON-VACUITY -- both are still the confirm question",
-      "SPENDS" in _ps1[-1] and "SPENDS" in _ps2[-1]
-      and "= ?" in _ps1[-1] and "= ?" in _ps2[-1])
+# AND THE SAME RULE AT THE OTHER END. start_job is the ONLY path to a wake and
+# a wake is what moves money, so a Pager built some other way -- a future
+# caller, an edit that skips main() -- must not reach the wire with an
+# allowlist main() would have rejected. Defence in depth is worth it here
+# specifically because the harm is not the operator's.
+_mp1, _ms1 = _room_pager([111], [])
+_mp1.spenders = 2
+_mj1 = []
+_mp1.start_job(111, "withdraw", {"exit_to": ["4" + "1" * 94], "depth": 1})
+check("pot: start_job REFUSES a multi-person allowlist, at the last line "
+      "before the wake",
+      _ms1 and "more than one person" in _ms1[-1])
+check("pot: ...and says every job is refused until it is fixed, not just "
+      "this one", "every job" in _ms1[-1])
+check("pot: ...and nothing was woken", not _mp1.busy.locked())
+# NON-VACUITY: one person gets past it and reaches the real machinery.
+_mp2, _ms2 = _room_pager([111], [])
+_mp2.spenders = 1
+_mp2.limits = types.SimpleNamespace(
+    why_not=lambda: "rate limited", record=lambda: None,
+    recent=lambda: [], daily_cap=12, offset=0, save=lambda: None)
+_mp2.start_job(111, "withdraw", {"exit_to": ["4" + "1" * 94], "depth": 1})
+check("pot: NON-VACUITY -- one person gets past that gate and is refused by "
+      "the NEXT one, so the check is not simply 'refuse everything'",
+      _ms2 and "rate limited" in _ms2[-1])
 
 
 # ===========================================================================
