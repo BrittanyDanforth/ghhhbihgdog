@@ -240,13 +240,32 @@ def _refuse_existing(path: Path, vault_names_one: bool,
             f"    To re-key deliberately: move this aside and run `new "
             f"--replace`.\n"
             f"    Slips already sent become unreadable either way.")
+    # THREE CAUSES, AND THE THIRD IS THE LIKELY ONE. This listed two -- a
+    # half-finished `new`, or a file from another vault -- and omitted the one
+    # that produces this state in normal operation: THE VAULT WAS RE-PAIRED.
+    # gs_wake_keys rebuilds the keyfile from scratch and its payload has no
+    # delivery_public field, correctly, because a fresh pairing mints a fresh
+    # vault keypair. So an operator who re-keyed after a suspected compromise,
+    # a new SD card or a moved Pi lands here, and the two causes offered both
+    # suggest the file at --out is suspect when it is simply out of date.
     sys.exit(
         f"[!] {path} already exists, but this vault does NOT name a delivery\n"
-        f"    key -- so an earlier `new` wrote the file and stopped before it\n"
-        f"    told the vault, or this file belongs to a different vault.\n"
+        f"    key. Three ways to be here:\n"
+        f"      * THIS BOX WAS RE-PAIRED. Pairing rewrites the vault keyfile "
+        f"and mints a fresh\n"
+        f"        vault keypair, so it names no delivery key and the file at "
+        f"{path.name}\n"
+        f"        can no longer open anything this box seals. This is the "
+        f"usual cause.\n"
+        f"      * an earlier `new` wrote the file and stopped before it told "
+        f"the vault.\n"
+        f"      * the file belongs to a different vault.\n"
         f"    Nothing here can open a slip as things stand. Move it aside and\n"
-        f"    run `new` again; if it IS this vault's, you lose nothing by\n"
-        f"    re-keying, because no slip has been sealed to it.")
+        f"    run `new` again. Slips sealed by a PREVIOUS pairing of this box "
+        f"stay unreadable\n"
+        f"    either way -- they were sealed by a vault key that no longer "
+        f"exists -- so\n"
+        f"    re-keying costs you nothing you still had.")
 
 
 def read_passphrase(prompt: str, getter=None) -> bytes:

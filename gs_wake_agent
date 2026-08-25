@@ -1072,6 +1072,35 @@ def run_once(args, deps: dict = None) -> tuple:
                   "all check out.")
         agent_say(f"      The doorbell answered at {key['doorbell_url']} with "
                   f"a {len(window)}-byte wake window.")
+        # WHERE A SLIP WILL GO, said here because this is the command the
+        # pairing tells the operator to run, and because the answer changes
+        # SILENTLY under them.
+        #
+        # A re-pair rebuilds this keyfile from scratch, and do_pair's payload
+        # has thirteen fields of which delivery_public is not one -- correctly,
+        # since a fresh pairing mints a fresh vault keypair and a delivery key
+        # minted against the old one can no longer open anything. But
+        # seal_slip_for_delivery answers a missing key with "" and never
+        # raises, and the chat reply on that path is "depo ready · slip A3F1"
+        # -- byte-identical to what an operator who never configured a delivery
+        # key has always seen. There was no signal at all beyond the blob
+        # quietly ceasing to arrive, at the moment money is waiting on it.
+        _dp = (key.get("delivery_public") or "").strip()
+        if _dp:
+            agent_say(f"      Slips will be SEALED to delivery key "
+                      f"{_dp[:16]}... — only gs_delivery.key opens them.")
+        elif key.get("plain_slip"):
+            agent_say("      Slips will be sent as PLAIN TEXT into the chat "
+                      "(plain_slip is set in this keyfile).")
+        else:
+            agent_say("      Slips will STAY ON THIS MACHINE: this keyfile "
+                      "names no delivery key. If you")
+            agent_say("      set one up before a re-pair, it is now orphaned "
+                      "— pairing mints a new vault")
+            agent_say("      keypair, so mint a new one with "
+                      "`gs_delivery_key new` or you will find out at")
+            agent_say("      the moment a swap is quoted and you cannot reach "
+                      "this box.")
         agent_say("      NOT proven: that the two keyfiles are a matched "
                   "pair. Testing that needs a real")
         agent_say("      note, and a real note TAKES THE JOB — the handover "

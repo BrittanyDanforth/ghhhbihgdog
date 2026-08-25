@@ -4858,20 +4858,119 @@ def _dz_pattern(node):
     return None
 
 
+#: Every re.* entry point that takes a pattern. finditer was MISSING, and the
+#: codebase's only legitimate `$` is a re.finditer -- so the one call shape the
+#: guard had to reason about was the one it could not see. findall/subn are
+#: here for the same reason: enumerating six of nine is how the seventh gets in.
+_DZ_CALLS = ("compile", "match", "fullmatch", "search", "sub", "subn",
+             "split", "finditer", "findall")
+
+
+def _dz_bare_dollar(pat):
+    """Positions of every `$` that MEANS "end of string", or [].
+
+    NOT a substring search. `\$` is a literal dollar and `[$]` is a character
+    class containing one; flagging either would be a false positive, and a
+    guard that cries wolf is one an operator turns off.
+    """
+    out, i, esc, in_class = [], 0, False, False
+    while i < len(pat):
+        c = pat[i]
+        if esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif in_class:
+            if c == "]":
+                in_class = False
+        elif c == "[":
+            in_class = True
+        elif c == "$":
+            out.append(i)
+        i += 1
+    return out
+
+
+def _dz_multiline(node):
+    """Does this call pass re.M / re.MULTILINE?
+
+    With re.M a `$` means end-of-LINE and is the correct anchor -- which is
+    what paranoia_mode's HISTFILE= scan wants. Without it, `$` also matches
+    before a trailing newline, which is the whole defect this guard is about.
+    """
+    _flags = [a for a in node.args[2:]] + [k.value for k in node.keywords
+                                           if k.arg == "flags"]
+    return any("MULTILINE" in _ast_dz.dump(f) or "'M'" in _ast_dz.dump(f)
+               or (isinstance(f, _ast_dz.Attribute) and f.attr in ("M",
+                                                                   "MULTILINE"))
+               for f in _flags)
+
+
+def _dz_re_names(tree):
+    """What `re` is called in this module, and which of its functions were
+    imported bare.
+
+    `import re as _re` and `from re import compile` both produce calls this
+    walker would not recognise as re.* at all -- so the guard could be evaded
+    by an import style, silently, which is the one thing a STRUCTURAL check is
+    supposed to rule out.
+    """
+    mods, bare = {"re"}, {}
+    for n in _ast_dz.walk(tree):
+        if isinstance(n, _ast_dz.Import):
+            for a in n.names:
+                if a.name == "re":
+                    mods.add(a.asname or "re")
+        elif isinstance(n, _ast_dz.ImportFrom) and n.module == "re":
+            for a in n.names:
+                if a.name in _DZ_CALLS:
+                    bare[a.asname or a.name] = a.name
+    return mods, bare
+
+
 def _dz_offenders(src):
-    """(lineno, pattern) for every `^...$`-anchored re.* call in `src`."""
+    """(lineno, pattern) for every re.* call whose `$` means end-of-STRING.
+
+    THE PREDICATE WAS `p.startswith("^") and p.rstrip().endswith("$")`, and
+    that left four shapes invisible:
+
+      * re.match(r"[a-z]+$", v) -- re.match anchors at the start implicitly,
+        so this is the identical bug with no literal ^ to find.
+      * f"^a$|^b\\Z" -- an alternation whose LAST branch is safe. The first
+        branch still accepts a trailing newline, and .endswith looked only at
+        the end of the whole string.
+      * re.finditer, absent from the call-name tuple.
+      * a pattern held in a variable, or reached through `import re as _re` /
+        `from re import compile`, which returned None and was skipped IN
+        SILENCE -- the failure mode a structural check exists to remove.
+
+    So the rule is now the actual rule: a bare `$` (not \$, not [$]) means
+    end-of-string unless re.M is passed, and this codebase's validators want
+    \Z. Applied that way there is exactly one `$` in the shipped tools --
+    paranoia_mode's HISTFILE= scan, a re.finditer with re.M -- and it passes.
+
+    A non-literal pattern is reported as ("?", "<non-literal>") rather than
+    skipped, so it fails the check loudly and a human decides.
+    """
     out = []
-    for _n in _ast_dz.walk(_ast_dz.parse(src)):
-        if not (isinstance(_n, _ast_dz.Call)
-                and isinstance(_n.func, _ast_dz.Attribute)
-                and isinstance(_n.func.value, _ast_dz.Name)
-                and _n.func.value.id == "re"
-                and _n.func.attr in ("compile", "match", "fullmatch",
-                                     "search", "sub", "split")
-                and _n.args):
+    _tree = _ast_dz.parse(src)
+    _mods, _bare = _dz_re_names(_tree)
+    for _n in _ast_dz.walk(_tree):
+        if not isinstance(_n, _ast_dz.Call) or not _n.args:
+            continue
+        _f = _n.func
+        _is_re = (isinstance(_f, _ast_dz.Attribute)
+                  and isinstance(_f.value, _ast_dz.Name)
+                  and _f.value.id in _mods
+                  and _f.attr in _DZ_CALLS)
+        _is_bare = isinstance(_f, _ast_dz.Name) and _f.id in _bare
+        if not (_is_re or _is_bare):
             continue
         _p = _dz_pattern(_n.args[0])
-        if _p and _p.startswith("^") and _p.rstrip().endswith("$"):
+        if _p is None:
+            out.append((_n.lineno, "<non-literal pattern: cannot be checked>"))
+            continue
+        if _dz_bare_dollar(_p) and not _dz_multiline(_n):
             out.append((_n.lineno, _p[:60]))
     return out
 
@@ -4901,6 +5000,35 @@ check("...while leaving a correctly anchored one alone",
 check("...and leaving an f-string \\Z alone too, so the fix is not just "
       "'flag every f-string'",
       _dz_offenders('X = re.compile(f"^[48][{_B}]{{94}}\\Z")') == [])
+# THE FOUR SHAPES THE OLD PREDICATE COULD NOT SEE. It was
+# `p.startswith("^") and p.rstrip().endswith("$")`, and each of these is the
+# same defect wearing a different hat.
+check("...an implicit-^ match(): re.match anchors at the start on its own, so "
+      "this is the identical bug with no literal ^ to find",
+      len(_dz_offenders('re.match(r"[a-z]+$", v)')) == 1)
+check("...an alternation whose LAST branch is the SAFE one, so looking at the "
+      "end of the whole pattern saw nothing",
+      len(_dz_offenders('X = re.compile(r"^a+$|^b+\\Z")')) == 1)
+check("...a re.finditer, which was missing from the call list — and is the "
+      "call shape of the codebase's only legitimate $",
+      len(_dz_offenders('re.finditer(r"^x+$", t)')) == 1)
+check("...and a pattern held in a VARIABLE, which returned None and was "
+      "skipped in silence",
+      len(_dz_offenders('PAT = "^a$"\nX = re.compile(PAT)')) == 1)
+check("...reached through an import alias, which was not recognised as re at "
+      "all", len(_dz_offenders('import re as _re\nX = _re.compile(r"^a+$")')) == 1)
+check("...and through a bare import of the function itself",
+      len(_dz_offenders('from re import compile\nX = compile(r"^a+$")')) == 1)
+# ...AND THE FALSE POSITIVES IT MUST NOT RAISE, which is why the rule is "a
+# bare $" rather than "the character $".
+check("...a LITERAL dollar (\\$) is not an anchor and is not flagged",
+      _dz_offenders(r'X = re.compile(r"^\$[0-9]+\Z")') == [])
+check("...nor one inside a character class",
+      _dz_offenders(r'X = re.compile(r"^[$a-z]+\Z")') == [])
+check("...and re.M makes $ mean end-of-LINE, which is correct — this is "
+      "paranoia_mode's HISTFILE= scan, the one $ in the shipped tools",
+      _dz_offenders('re.finditer(r"^HISTFILE=(\\S+)$", t, re.M)') == []
+      and _dz_offenders('re.finditer(r"^H=(x)$", t, flags=re.MULTILINE)') == [])
 
 
 _finished()

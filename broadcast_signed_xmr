@@ -46,9 +46,24 @@ from gs_common import (
     integrity_log_once,
     MAX_PLANNED_DELAY, delay_is_sane,
     install_signal_handlers, shutdown_requested, redact_addresses,
+    _LOCALHOST_NAMES,
 )
 
-_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
+#: DERIVED FROM THE SHARED SET, plus ONE deliberate addition -- it used to be a
+#: private literal under a docstring saying it "mirrors gs_common.MoneroRPC".
+#: It did not mirror it: it held 0.0.0.0 and the shared set does not, so the
+#: two tools answered the same question two ways. Given
+#: --rpc http://0.0.0.0:18083 this relayer contacts it directly while MoneroRPC
+#: declares the same URL non-local, demands a proxy, and then cannot route
+#: loopback through SOCKS.
+#:
+#: The addition STAYS, because on Linux 0.0.0.0 as a DESTINATION resolves to
+#: loopback -- an operator who wrote the wildcard bind address meant the local
+#: daemon, and refusing it here would fail every relay attempt with a proxy
+#: error about a host that is loopback. What is fixed is that it is now one
+#: line of difference from a shared definition instead of a whole private copy
+#: that could drift again, and the difference says why it exists.
+_LOCALHOST_HOSTS = set(_LOCALHOST_NAMES) | {"0.0.0.0"}
 
 
 def _is_localhost(url: str) -> bool:
@@ -63,8 +78,9 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
     Tor's SOCKS port refuses to route to loopback, so proxying a localhost POST
     would fail on every attempt. Only a NON-localhost target needs the Tor proxy
     -- and a non-localhost POST with no proxies is a clearnet leak, so it aborts.
-    This mirrors gs_common.MoneroRPC, which likewise skips the proxy for
-    localhost hosts.
+    Uses gs_common's own localhost set plus 0.0.0.0 -- see _LOCALHOST_HOSTS
+    for why the relayer treats the wildcard bind address as local and
+    MoneroRPC does not.
     """
     if _is_localhost(url):
         proxies = None  # never route loopback through Tor

@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1796,6 +1797,90 @@ _K.__loader__.exec_module(_K)
 _ap_k = _K.build_cli().parse_args(["pair"])
 check("fee: NON-VACUITY -- omitting the flag is still valid and still means "
       "'mint a fresh one per run'", _ap_k.usage_fee_address == "")
+
+# ---- THE THIRD ADDRESS VALIDATOR AGREED WITH THE OTHER TWO ON ALL BUT ONE
+#
+# gs_common.XMR_ADDR_RE and gs_console.XMR_RE are the same expression and a
+# test pins them together. proto._xmr_address_field is hand-rolled -- rightly,
+# because this file imports nothing but the stdlib and PyNaCl -- and it took
+# any length in (95, 106) with a leading 4 or 8, so it admitted an 8-prefixed
+# 106-character string that both regexes reject. No such Monero address exists
+# (integrated addresses carry netbyte 19 and always start 4), so this is a typo
+# shape rather than an attack.
+#
+# It matters because of WHICH BOX HOLDS WHICH CHECK. _xmr_address_list is what
+# the pager applies to an address typed into the chat, and its docstring is
+# explicit: duplicates are refused there so "the operator is told by the box
+# they are typing at, rather than by a vault that has already been woken".
+# This shape got the other outcome -- accepted on the phone, refused on the
+# vault, a wake spent.
+import gs_common as _gsc_addr
+_B58ONE = "1"
+for _a, _label, _want in (
+        ("4" + _B58ONE * 94, "a standard address (4)", True),
+        ("8" + _B58ONE * 94, "a standard address (8)", True),
+        ("4" + _B58ONE * 105, "an integrated address (4)", True),
+        ("8" + _B58ONE * 105, "an 8-prefixed 106-char string", False),
+        ("4" + _B58ONE * 93, "one character short", False)):
+    try:
+        P.xmr_address(_a)
+        _proto_ok = True
+    except P.WakeError:
+        _proto_ok = False
+    _common_ok = bool(_gsc_addr.XMR_ADDR_RE.match(_a))
+    check(f"address: the phone and the vault agree about {_label} "
+          f"(phone {'accepts' if _proto_ok else 'refuses'}, vault "
+          f"{'accepts' if _common_ok else 'refuses'})",
+          _proto_ok == _common_ok == _want)
+
+# ---- AND PAIRING NOW ASKS WHETHER THE WALLET IS THERE -------------------
+#
+# _validate's own comment: "REFUSED AT PAIRING, not discovered mid-withdrawal.
+# --allow-withdraw without a wallet file writes a keyfile whose withdraw job
+# relays a fan-out and THEN fails at the signing step." The check that follows
+# asked two things -- that the flag was given, and that the path was ABSOLUTE
+# -- and never whether the path resolves to anything. An absolute path with a
+# typo produces the same shape the refusal exists to prevent.
+#
+# Fatal, like the isabs check beside it, because there is no `gs_wake_keys
+# edit`: correcting a keyfile means pairing both boxes again.
+_wf_dir = tempfile.mkdtemp(prefix="gs_wf_")
+_wf_real = os.path.join(_wf_dir, "vault")
+open(_wf_real, "w").write("x")
+_wf_keys = os.path.join(_wf_dir, "other")
+open(_wf_keys + ".keys", "w").write("x")
+
+
+def _pairs_with(wallet_file):
+    _argv = ["pair", "--out", os.path.join(_wf_dir, "k.key"),
+             "--artifact-dir", _wf_dir]
+    if wallet_file is not None:
+        _argv += ["--wallet-file", wallet_file, "--allow-withdraw"]
+    try:
+        _K._validate(_K.build_cli().parse_args(_argv))
+        return None
+    except SystemExit as _e:
+        return str(_e)
+
+
+_wf_typo = _pairs_with(os.path.join(_wf_dir, "vualt"))
+check("pairing: an absolute --wallet-file that does not exist is REFUSED, "
+      "not written into the keyfile", _wf_typo is not None)
+check("pairing: ...and the refusal says where the cost lands (the signing "
+      "step, after the wake and the fan-out plan)",
+      _wf_typo and "SIGNING" in _wf_typo and "wake is spent" in _wf_typo)
+check("pairing: ...and that there is no way to edit a keyfile afterwards",
+      _wf_typo and "pairing both boxes again" in _wf_typo)
+# NON-VACUITY, three ways: the real file passes, monero's OTHER name for the
+# same wallet passes, and omitting the flag is still the no-withdraw default.
+check("pairing: NON-VACUITY -- a wallet that IS there still pairs",
+      _pairs_with(_wf_real) is None)
+check("pairing: ...and so does one where only <name>.keys is present, which "
+      "is monero's other name for the same wallet",
+      _pairs_with(_wf_keys) is None)
+check("pairing: ...and omitting --wallet-file entirely is still valid",
+      _pairs_with(None) is None)
+shutil.rmtree(_wf_dir, ignore_errors=True)
 
 # ---- AND THE DEPOSIT AMOUNT IS BOUNDED BY THE BOX THAT ACTS ON IT -------
 #

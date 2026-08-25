@@ -368,6 +368,42 @@ def _validate(args) -> None:
         sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "
                  f"agent runs from a unit with its own WorkingDirectory, so a "
                  f"relative path resolves somewhere you did not mean.")
+    # ...AND THAT IT IS THERE. The check above asks whether the path is
+    # ABSOLUTE and stops. An absolute path with a typo in it, or one written
+    # before the wallet was moved, produces the exact shape the refusal three
+    # blocks up exists to prevent: the vault wakes, mints its accounts, plans
+    # the round, and dies at the first signing step. airgap_tx_signer.phase_sign
+    # is the first thing in the chain that looks ("[!] Wallet file required for
+    # signing"), and by then the wake, the boot and the account-ceiling
+    # headroom are spent. Nothing is lost on-chain -- the veil round's create
+    # uses do_not_relay, so it lands before any broadcast -- but a wake and a
+    # powered-on vault with an unlocked spend wallet is the signature this
+    # whole design spends its effort not producing.
+    #
+    # FATAL, LIKE THE LINE ABOVE, because there is no `gs_wake_keys edit`: the
+    # only way to correct a keyfile is to pair again, which is a two-box
+    # ceremony needing physical access at both. That makes pairing the one
+    # moment this is cheap to catch, and it runs on the vault, where the file
+    # is there to be looked at.
+    #
+    # Either name counts: monero-wallet-cli takes `<name>` and keeps the keys
+    # in `<name>.keys`, and an operator who points at the wrong one of the two
+    # has not made the mistake this is about.
+    if args.wallet_file and not (os.path.exists(args.wallet_file)
+                                 or os.path.exists(args.wallet_file + ".keys")):
+        sys.exit(
+            f"[!] --wallet-file {args.wallet_file!r} does not exist on this "
+            f"box.\n"
+            f"    Pairing runs on the vault, so this is the machine the "
+            f"wallet has to be on -- and\n"
+            f"    a keyfile naming a wallet that is not there fails at the "
+            f"SIGNING step of a\n"
+            f"    withdrawal, after the wake, the boot and the fan-out plan. "
+            f"Nothing is lost on\n"
+            f"    chain, but the wake is spent and there is no way to edit a "
+            f"keyfile: correcting\n"
+            f"    it means pairing both boxes again.\n"
+            f"    Create or move the wallet first, then pair.")
     if args.account_ceiling < 1:
         sys.exit("[!] --account-ceiling must be at least 1.")
     if not 1 <= args.daily_wake_budget <= 1000:
@@ -636,17 +672,40 @@ def do_pair(args) -> int:
     # kept somewhere far away, which is the whole reason to have one. The
     # operator finds out at the moment they need the address and cannot get
     # it, unless something says so while they are still standing here.
+    #
+    # AND A RE-PAIR IS THE CASE THIS BLOCK USED TO GET WRONG. It read as
+    # first-time advice -- "set up a DELIVERY KEY now ... Skip it and nothing
+    # changes" -- and on a re-pair nothing is exactly what changes: the payload
+    # above has thirteen fields and delivery_public is not one of them, which
+    # is right (this pairing minted a fresh vault keypair, so a delivery key
+    # cut against the old one can no longer open anything), but it means an
+    # operator who HAD the channel has just lost it. The vault then answers a
+    # quoted swap with "depo ready · slip A3F1", byte-identical to what
+    # somebody who never configured one has always seen, and the only signal is
+    # a blob quietly ceasing to arrive at the moment money is waiting on it.
+    print()
+    print("  SLIPS: this keyfile names NO delivery key, so a quoted deposit")
+    print("  address will stay on this machine and be readable only here.")
+    print()
+    print("  IF YOU HAVE PAIRED THIS BOX BEFORE and set up a delivery key,")
+    print("  that key is now ORPHANED. This pairing minted a fresh vault")
+    print("  keypair, so nothing sealed by this box can be opened by a key")
+    print("  cut against the old one. Mint a new one, or slips stop arriving")
+    print("  with no error anywhere.")
     print()
     print("  Will you be able to walk to this machine when a swap is quoted?")
-    print("  If not, set up a DELIVERY KEY now, while you are sitting at it:")
+    print("  If not, set up a delivery key now, while you are sitting at it:")
     print()
     print(f"      python3 gs_delivery_key new --vault-key {tp_path} \\")
     print(f"          --out /media/usb/gs_delivery.key")
     print()
     print("  The slip then travels sealed to a key that lives only on the")
     print("  machine you send BTC from -- not on this one, and never on the")
-    print("  Pi. Skip it and nothing changes: the slip stays here, and you")
-    print("  read it here. OPSEC_SETUP.md section 8 has the trade in full.")
+    print("  Pi. Skip it and the slip stays here, and you read it here.")
+    print("  OPSEC_SETUP.md section 8 has the trade in full.")
+    print()
+    print("  Either way, the dry run above prints which of the two is in")
+    print("  force, so you can check rather than remember.")
     return 0
 
 

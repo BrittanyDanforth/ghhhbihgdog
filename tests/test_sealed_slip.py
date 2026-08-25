@@ -800,6 +800,70 @@ check("gs_delivery_key confirms the file opens BEFORE it shreds the copy",
       _dk_src.index("_open_delivery(path, args)") <
       _dk_src.index("secure_delete_file(path)"))
 
+# ===========================================================================
+#  A RE-PAIR ORPHANS THE DELIVERY KEY, AND NOTHING SAID SO
+#
+#  The vault seals a slip only when its keyfile names a delivery_public, and
+#  gs_delivery_key writes that field as its last step. A re-pair rebuilds that
+#  keyfile from scratch: do_pair's payload has thirteen fields and
+#  delivery_public is not one of them -- correctly, because a fresh pairing
+#  mints a fresh vault keypair and a delivery key cut against the old one can
+#  no longer open anything.
+#
+#  But seal_slip_for_delivery answers a missing key with "" and never raises,
+#  and the chat reply on that path is "depo ready · slip A3F1" -- byte-
+#  identical to what an operator who never configured a delivery key has
+#  always seen. The only signal was the blob quietly ceasing to arrive, at the
+#  moment a swap is quoted and money is waiting on it.
+# ===========================================================================
+print("\n== a re-pair must not orphan the delivery key in silence ==")
+_ag_src_rp = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+_dry = _ag_src_rp.split("if args.dry_run:")[1].split("raise Refused")[0]
+check("re-pair: --dry-run reports WHICH delivery mode is in force — it is the "
+      "command the pairing tells the operator to run",
+      "delivery_public" in _dry and "plain_slip" in _dry)
+check("re-pair: ...and names the sealed case with the key it will seal to",
+      "SEALED" in _dry)
+check("re-pair: ...and the plaintext case",
+      "PLAIN TEXT" in _dry)
+check("re-pair: ...and says an existing delivery key is ORPHANED by a "
+      "pairing, which is the case that had no signal at all",
+      "orphaned" in _dry and "re-pair" in _dry)
+# NON-VACUITY: the three branches are distinguishable, so this is not one
+# constant line.
+check("re-pair: NON-VACUITY -- the three answers are three different "
+      "sentences",
+      _dry.count("agent_say") >= 4
+      and "STAY ON THIS MACHINE" in _dry)
+
+# THE PAIRING ITSELF has to say it too, because that is where the loss
+# happens and where the operator is standing. It used to read as first-time
+# advice -- "Skip it and nothing changes" -- which is false on a re-pair.
+_kp_src_rp = open(os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read()
+_tail = _kp_src_rp.split("def do_pair")[1]
+check("re-pair: the pairing says this keyfile names no delivery key",
+      "names NO delivery key" in _tail)
+check("re-pair: ...and that a key from a PREVIOUS pairing is now orphaned",
+      "ORPHANED" in _tail and "fresh vault" in _tail)
+check("re-pair: ...and no longer claims that skipping it changes nothing",
+      "Skip it and nothing changes" not in _tail)
+# ...and the payload still must NOT carry delivery_public, which is the
+# correct behaviour this is warning about rather than a thing to fix.
+check("re-pair: NON-VACUITY -- the pairing payload still carries no "
+      "delivery_public, because the vault keypair really is new",
+      '"delivery_public"' not in _tail.split("payload = {")[1].split("}")[0])
+
+# AND THE RECOVERY MESSAGE MUST NAME THE CAUSE. gs_delivery_key's refusal
+# listed a half-finished `new` and a file from another vault, and omitted the
+# one that produces this state in normal operation.
+_dk_src_rp = open(os.path.join(REPO, "gs_delivery_key"), encoding="utf-8").read()
+_refuse = _dk_src_rp.split("def _refuse_existing")[1].split("\ndef ")[0]
+check("re-pair: the delivery-key refusal names a RE-PAIR as a cause, and as "
+      "the usual one", "RE-PAIRED" in _refuse and "usual cause" in _refuse)
+check("re-pair: ...and still names the other two",
+      "stopped before it told" in _refuse
+      and "belongs to a different vault" in _refuse)
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
