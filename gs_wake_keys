@@ -314,17 +314,39 @@ def build_cli() -> argparse.ArgumentParser:
     # exact "declared in one place, never wired to the thing that runs" shape
     # the fee bug itself had.
     #
-    # OMITTING IT IS THE RECOMMENDED SETTING, not a fallback. With no address
-    # GhostSpiral mints a FRESH account and subaddress for the cut on every
-    # run, so no address collects from two runs. A fixed destination is one
-    # address taking a slice of everything, it survives the mix, and it is the
-    # reuse this toolchain refuses everywhere else -- so it is available, and
-    # it is not the default.
-    p.add_argument("--usage-fee-address", default="", metavar="XMR_ADDRESS",
-                   help="send the usage fee to THIS address instead of a "
-                        "freshly minted one. Omit unless you need it: one "
-                        "address collecting a slice of every run is address "
-                        "reuse that survives the mix.")
+    # THIS HELP USED TO SAY OMITTING IT WAS THE RECOMMENDED SETTING, on the
+    # reasoning that GhostSpiral then mints a fresh account per run "so no
+    # address collects from two runs". That is true of a DESKTOP run and has
+    # never been true of a woken one, which is the only kind this file pairs.
+    #
+    # gs_wake_agent's _withdraw_fee_argv passes --usage-fee only when this
+    # field is set, because a freshly minted account lands ON THE MIXING
+    # WALLET and _funded_entry -- which picks the largest unlocked output and
+    # has no notion of whose it is -- hands it to the NEXT withdrawal. So an
+    # operator who followed this help paired the "recommended" way and took no
+    # fee at all, on every withdrawal, for as long as the job existed, while
+    # being told the opposite.
+    #
+    # REPEATABLE, AND THAT IS THE ANSWER TO THE OTHER HALF. One address
+    # collecting a slice of every run is address reuse that survives the mix:
+    # the rate is published in this repository, so dividing an observed
+    # arrival by it reads back the deposit behind it, and a single address
+    # hands over every deposit the operator ever took. Give the flag several
+    # times -- subaddresses of one cold wallet are not linkable to each other
+    # on-chain -- and each run picks one at random.
+    #
+    # SAY WHAT THAT BUYS, HONESTLY: with N addresses each one collects roughly
+    # 1/N of the income instead of all of it. That is a reduction, not
+    # unlinkability, and no number of addresses makes it unlinkability.
+    p.add_argument("--usage-fee-address", default=[], action="append",
+                   metavar="XMR_ADDRESS",
+                   help="where the usage fee is paid. REQUIRED to take a fee "
+                        "on a woken withdrawal at all -- without it the cut "
+                        "would land on the mixing wallet and be paid out to "
+                        "whoever withdraws next. Repeat the flag for several "
+                        "addresses and each run picks one at random; one "
+                        "address collects every run and divides back to every "
+                        "deposit.")
     p.add_argument("--account-ceiling", type=int, default=45,
                    help="refuse minting jobs once the wallet holds this many "
                         "accounts (OPSEC_SETUP.md section 4)")
@@ -354,9 +376,9 @@ def _validate(args) -> None:
     # were the same check. exit_to takes a LIST now -- so the borrowed gate
     # would have accepted a list of fee addresses at pairing and written
     # whichever one str() produced.
-    if args.usage_fee_address:
+    for _fa in (args.usage_fee_address or []):
         try:
-            proto.xmr_address(args.usage_fee_address)
+            proto.xmr_address(_fa)
         except proto.WakeError as e:
             sys.exit(f"[!] --usage-fee-address is not a usable Monero "
                      f"address: {e}\n"
@@ -364,6 +386,62 @@ def _validate(args) -> None:
                      f"somewhere unspendable,\n"
                      f"    and you would find out after a mix had already "
                      f"run.")
+    # A REPEATED ADDRESS IS NOT A SECOND ADDRESS. The whole point of the list
+    # is that each run picks a different destination; the same string given
+    # twice doubles that one's share and reads, in the keyfile, as spreading
+    # wider than it does. Refused at pairing, where it is a typo, rather than
+    # silently weighting the draw.
+    _seen = [a for a in (args.usage_fee_address or [])]
+    if len(set(_seen)) != len(_seen):
+        sys.exit("[!] --usage-fee-address was given the same address twice.\n"
+                 "    Each run picks one at random, so a repeat only makes "
+                 "that one collect more\n"
+                 "    of your income -- it does not spread it. Give distinct "
+                 "addresses, or one.")
+    # ---- THE DESKTOP PATH RE-OPENS WHAT THE PHONE PATH JUST CLOSED --------
+    #
+    # gs_wake_agent will not take a fee onto the mixing wallet, because
+    # _funded_entry picks the largest unlocked output on that wallet and has no
+    # notion of whose it is -- so a cut minted there is paid out to whoever
+    # withdraws next. That gate is on the WOKEN path only.
+    #
+    # gs_console's fee panel recommends the opposite for a run started at the
+    # desk: "leave the box empty and a new account and subaddress are minted
+    # per run, so no two runs share a collection point". That is sound advice
+    # about address reuse and it mints onto THIS wallet -- and once a phone can
+    # spend from this wallet, _funded_entry will select that account exactly as
+    # readily. Driven: a wallet whose user deposit has been swept out reports
+    # the desktop-minted fee account as the entry for the next /withdraw.
+    #
+    # NEITHER TOOL CAN DETECT THE OTHER. The console has no keyfile and the
+    # agent does not know what was run at the desk. This is the one moment both
+    # facts are present -- a wallet is being named, and a phone is being given
+    # permission to spend from it -- so it is said here, once, to the person
+    # who is choosing.
+    #
+    # A WARNING AND NOT A REFUSAL. An operator who wants no fee at all is
+    # making a legitimate choice, and forcing an address on them to silence a
+    # warning would be worse than the warning.
+    if args.allow_withdraw and not (args.usage_fee_address or []):
+        print()
+        print("  [!] No --usage-fee-address, and this pair lets a phone spend")
+        print("      from the wallet. Two consequences, both worth knowing")
+        print("      before you type the confirmation code:")
+        print()
+        print("      1. A withdrawal started from the chat takes NO usage fee.")
+        print("         The cut can only be taken to somewhere off this")
+        print("         wallet, and nowhere off it has been named.")
+        print("      2. If you run the mix from the desk with 'Keep a usage")
+        print("         fee' ticked and the address box EMPTY, that cut is")
+        print("         minted onto this wallet -- and the next withdrawal")
+        print("         started from the chat will pick it up and send it to")
+        print("         whatever address the chat names. The console page")
+        print("         recommends leaving that box empty; on a wallet a phone")
+        print("         can spend from, do not.")
+        print()
+        print("      Give --usage-fee-address (repeat it for several) to fix")
+        print("      both, or continue if you meant to take no fee.")
+        print()
     if args.wallet_file and not os.path.isabs(args.wallet_file):
         sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "
                  f"agent runs from a unit with its own WorkingDirectory, so a "
@@ -595,7 +673,11 @@ def do_pair(args) -> int:
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),
         "allow_withdraw": bool(args.allow_withdraw),
-        "usage_fee_address": str(args.usage_fee_address or ""),
+        # BOTH FIELDS, and the singular is not vestigial: it is what an agent
+        # from before the list existed reads, and it must name a real
+        # destination on that agent rather than the text of a Python list.
+        "usage_fee_address": str((list(args.usage_fee_address or []) or [""])[0]),
+        "usage_fee_addresses": [str(a) for a in (args.usage_fee_address or [])],
         "wallet_file": str(args.wallet_file or ""),
     }
     # kdf="none", deliberately and visibly. See the module docstring: a machine

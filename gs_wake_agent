@@ -839,49 +839,87 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
     raise Refused("unknown_job", "no argv template for this job")
 
 
-def _withdraw_fee_argv(key: dict) -> list:
-    """["--usage-fee"] only when the cut has somewhere to go that is NOT here.
+def fee_addresses(key: dict) -> list:
+    """Every destination this machine's keyfile allows the cut to be paid to.
 
-    A CUT MINTED ON THIS WALLET IS A CUT THIS WALLET WILL HAND BACK.
-    GhostSpiral's plan_usage_fee, with no fixed destination, mints a FRESH
-    account and subaddress on the wallet being mixed and deliberately keeps it
-    out of addr_index so the exit will not sweep it -- "it is not mixed and it
-    is not swept by the exit, it is yours where it lands". That hold works
-    inside one run, because it is one process's own in-memory index.
+    THE LIST IS THE POINT, and the singular field is the compatibility half.
+    One address collecting a slice of every run is address reuse that survives
+    the mix: the rate is published in this repository's source, so an analyst
+    who finds that address divides an arrival by 0.011 and reads back the
+    deposit behind it -- and with one address, reads back every deposit the
+    operator ever took.
 
-    _funded_entry is a DIFFERENT PROCESS re-enumerating the same wallet, and it
-    has never heard of addr_index. It takes the largest unlocked output there
-    is. Driven against both shipped functions:
+    With several, each run picks one at random and each address collects
+    roughly 1/N of the income. That is a REDUCTION and is not unlinkability;
+    gs_wake_keys' help says so in those words rather than implying more.
 
-        after a withdrawal completes, the exit having swept every run account
-        wallet holds: 0.0220 XMR, the operator's fee, on account 7 sub 3
-        _funded_entry -> account 7 sub 3, 0.0220 XMR
-
-    -- and the pager's own completion message says "/withdraw again for the
-    next", so the next tap mixes the operator's revenue and pays it to the
-    address the chat named. It compounds: that run takes a fee of the fee.
-
-    THE MIRROR CASE NEEDS NO COMPLETED RUN. Any stale fee output larger than
-    the user's live balance becomes the target of EVERY withdrawal, and if it
-    is under the mixing minimum the run dies at stage 0 -- so the user's own
-    money cannot be withdrawn from the phone at all.
-
-    WHY THIS AND NOT A SKIP-LIST. Recording the minted pairs and having
-    _funded_entry skip them was the other candidate. It needs a new file in
-    artifact_dir, and paranoia_mode wipes artifact_dir -- so the protection
-    disappears exactly when the operator has been most careful, and the bug
-    comes back silently. This needs no state at all.
-
-    A FEE IS STILL AVAILABLE, and the honest way to take one from a wallet you
-    are emptying is to send it somewhere else: pair with --usage-fee-address
-    and the cut goes there, never onto the wallet, and plan_usage_fee already
-    waives if that address turns out to be inside this wallet after all. With
-    no address, a phone withdrawal takes no fee -- which costs the operator a
-    percentage and is strictly better than paying the whole fee account out to
-    somebody else.
+    Nothing is remembered between runs, deliberately. An index would be
+    durable state on the one machine paranoia_mode wipes -- it would reset to
+    the first address after every sweep, which is the worst possible reuse
+    pattern -- and two withdrawals racing it would both read the same number.
+    A uniform draw has no state to corrupt, survives the wipe, and cannot be
+    raced.
     """
-    return ["--usage-fee"] if str(key.get("usage_fee_address") or "").strip() \
-        else []
+    out = []
+    v = key.get("usage_fee_addresses")
+    if isinstance(v, list):
+        # EVERY ELEMENT CHECKED. This comes off a file on disk; a list holding
+        # a dict or a None would reach str() and become a destination made of
+        # the word "None".
+        out += [a.strip() for a in v if isinstance(a, str) and a.strip()]
+    one = key.get("usage_fee_address")
+    if isinstance(one, str) and one.strip() and one.strip() not in out:
+        out.append(one.strip())
+    return out
+
+
+def pick_fee_address(key: dict, rng=None) -> str:
+    """One of them, uniformly, or "" when the keyfile names none."""
+    addrs = fee_addresses(key)
+    if not addrs:
+        return ""
+    return (rng or random.SystemRandom()).choice(addrs)
+
+
+def _withdraw_fee_argv(key: dict) -> list:
+    """["--usage-fee"], but only where the keyfile says where it goes.
+
+    THE FIRST FIX FOR THE RECAPTURE BUG WAS WORSE THAN THE BUG. A phone
+    withdrawal was taking the operator's cut onto a fresh account of the very
+    wallet it was emptying, and _funded_entry then handed that account to the
+    NEXT withdrawal. The first fix here was to take no fee at all unless the
+    keyfile named a fixed --usage-fee-address, i.e. somewhere off this wallet.
+
+    That closed the recapture and opened something else. gs_wake_keys says
+    plainly why omitting the address is the RECOMMENDED setting: with no
+    address a fresh account is minted per run, "so no address collects from
+    two runs". A fixed destination is one address taking a slice of
+    everything, it survives the mix, and the fee is a published fraction --
+    so an analyst who finds that address divides by 0.011 and reads every
+    deposit this operator ever took. Making the fee CONDITIONAL on a fixed
+    address made the linkable configuration the only one that pays.
+
+    So the marker moved to where it belongs: gs_common.USAGE_FEE_ACCOUNT_LABEL
+    is written into the wallet by plan_usage_fee, and _funded_entry skips it.
+    The wallet is the one durable store both processes share, a label never
+    reaches the chain, and fresh-mint-per-run keeps working.
+
+    THE MARKER CANNOT LIVE IN THE WALLET EITHER, and that was tried second.
+    (Kept below because it is the reasoning for the shape this settled into.)
+    Labelling the fee account would let _funded_entry tell it apart -- and
+    paranoia_mode deliberately never deletes the wallet file, so a label
+    outlives every artifact wipe. It would survive a seizure that erased the
+    plans, the logs and the staging directory, name which account is the
+    operator's revenue, and hand over the deposit size to anyone who divides
+    by the published rate. GhostSpiral carries that reasoning at the mint.
+
+    SO THE FEE GOES OFF THIS WALLET OR IT IS NOT TAKEN, and the cost of that
+    used to be a single reused address. It is not any more: --usage-fee-address
+    is repeatable, fee_addresses reads the list, and each run draws one. The
+    reuse is divided by however many the operator paired, which is a reduction
+    and is not unlinkability -- see fee_addresses.
+    """
+    return ["--usage-fee"] if fee_addresses(key) else []
 
 
 #: Where a woken job's children write. NOT the journal. 0600, in the artifact
@@ -1788,7 +1826,9 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # would identify the operator, and that goes in the environment
             # like every other secret here -- GhostSpiral's own flag help says
             # to prefer GS_USAGE_FEE_ADDRESS for exactly this reason.
-            _fee_addr = key.get("usage_fee_address")
+            # DRAWN, NOT READ. The keyfile may name several; picking one per
+            # run is the whole reason it may. See fee_addresses.
+            _fee_addr = pick_fee_address(key)
             if _fee_addr:
                 # VALIDATED HERE TOO. It came off this machine's keyfile rather
                 # than off the wire, so it is not attacker-controlled -- but a

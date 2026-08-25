@@ -245,7 +245,7 @@ BOT_COMMANDS = [
     # which is the exact state publish_commands' own docstring calls
     # "indistinguishable from a bot that does not work". The address command
     # was in the same state and is above.
-    ("fee", "what this keeps"),
+    ("fee", "the usage fee this service keeps — not the network fee"),
     ("speed", "can I make it faster"),
     ("exit", "where the mixed funds go"),
     ("cancel", "drop whatever I was half-way through"),
@@ -301,9 +301,24 @@ MENU_BUTTONS = [
     # LABELLED BY DIRECTION, not by command name. "Fresh address" sat next to
     # "Withdraw" and gave no clue which one pays the operator; the arrows do
     # in one glance what the paragraph in WELCOME does in three lines.
-    [("⬇ Deposit Bitcoin", "m:depo"), ("⬆ Withdraw", "m:send")],
-    [("⬇ Monero address", "m:recv"), ("Status", "m:status")],
-    [("What this does", "m:settings"), ("All commands", "m:help")],
+    #
+    # AND THE NOUN IS THE COIN, not the mechanism. "⬇ Monero address" was the
+    # button a newcomer could not place: an address is a thing you are GIVEN
+    # and a thing you SEND TO, so beside "⬇ Deposit Bitcoin" it read as
+    # "somewhere to send Monero", which is a third direction the tool does not
+    # have. "in"/"Withdraw" is the whole vocabulary, and each row says which.
+    #
+    # "⬆ Withdraw" ALSO SAID TOO LITTLE. Withdraw from what, to where -- the
+    # operator arriving for the first time has deposited nothing, so the word
+    # has no object yet. "pays you" gives it one, and it is the sentence the
+    # welcome spends a line on.
+    [("⬇ Bitcoin in", "m:depo"), ("⬆ Withdraw — pays you", "m:send")],
+    [("⬇ Monero in", "m:recv"), ("Status", "m:status")],
+    # "What this does" PROMISED AN OVERVIEW AND OPENED A SETTINGS TABLE. The
+    # overview is the welcome, which is what the newcomer has just read; this
+    # button is the one that answers "what will a run actually do to my
+    # money", and now says so.
+    [("What a run does", "m:settings"), ("All commands", "m:help")],
 ]
 
 
@@ -408,7 +423,33 @@ CONFIRM_NOTE = (
 #:
 #: So: the answer, and nothing around it. The reasoning stayed here, in source,
 #: on the machine that has the source.
-FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee."
+#: TWO DIFFERENT THINGS ARE CALLED "THE FEE", and this answered as if there
+#: were one. "1.1% usage fee." is true and tells a newcomer nothing about
+#: which fee it is -- so an operator reads it as the cost of mixing, sees a
+#: much larger amount leave, and concludes they were overcharged; or reads it
+#: as the network fee and thinks the service is free.
+#:
+#: The usage fee is what this service keeps. The network fee is what Monero
+#: charges per transaction, a mix is many transactions, and none of it comes
+#: here. Naming both is the only way either number means anything.
+FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Not the network fee."
+#: "no: a wake is already running" NAMED THE ARRANGEMENT AND ANSWERED NOTHING.
+#:
+#: "wake" is on the list of words the welcome is tested for NOT containing --
+#: it says there is a machine that is normally off and that this chat is what
+#: switches it on, which is the shape of the operation written into the surface
+#: this file assumes is read. That test was written for the welcome and the
+#: word was left in thirteen replies that predate it, this one among them.
+#:
+#: It also told the operator nothing they could act on. What they need is that
+#: something else is in progress and that waiting is the move.
+#:
+#: ONE STRING, because there are two call sites -- the wizard's pre-check and
+#: start_job's own -- and the comment at the first says they "cannot drift into
+#: describing the same refusal differently". Two copies of a literal is exactly
+#: how that drift happens.
+BUSY_ANSWER = ("no: something is already running. One at a time — wait for it "
+               "to report, then try again.")
 SPEED_ANSWER = "Not settable here."
 # WAS "Not settable here." AND THAT IS NO LONGER TRUE. /withdraw sets it, by
 # reply, per withdrawal. An answer that still said "not settable" would be the
@@ -491,22 +532,45 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 WELCOME_LINES = [
     "Monero mixing, from your phone.",
     "",
-    "MONEY IN",
-    "  /deposit   send Bitcoin — you get an address and a memo to pay",
-    "  /address   a Monero address, if you are being paid in Monero already",
+    "MONEY IN — pick whichever describes you",
+    "  /deposit   you are paying IN Bitcoin. You get an address to pay, and "
+    "a memo that must go with it.",
+    # THE WELCOME MUST NOT PROMISE WHAT THIS JOB CANNOT DELIVER, and the
+    # first draft of this line did. "You get a fresh address to hand out"
+    # describes a command that sends you an address; /address sends a LABEL.
+    #
+    # receive_new mints a subaddress and quotes nothing, so there is no
+    # thor_pairs file -- and both slip builders return "" on it BY DESIGN
+    # (seal_slip_for_delivery: "receive_new mints addresses and quotes
+    # nothing. There is no deposit address to deliver and this is not a
+    # fault."). That is true on every configuration: with a delivery key, with
+    # plain slips, with neither. The job's own reply already says so; the
+    # welcome was the one surface still claiming otherwise, and it is the
+    # surface read first.
+    "  /address   mints a fresh address to be paid into. You read the "
+    "address itself at the machine — this chat only gets a label to track "
+    "it with.",
     "",
     "MONEY OUT",
-    "  /withdraw  mixes what is here and sends it to addresses you name",
+    "  /withdraw  this is the one that pays YOU. It mixes what is here and "
+    "sends it to the addresses you give it.",
     "",
-    "The one that pays YOU is /withdraw. (It used to be called \"receive\", "
-    "which read backwards and caught people out — that one is /address now, "
-    "and it only makes you an empty address to be paid into.)",
+    "WHAT IT COSTS",
+    f"  USAGE FEE {USAGE_FEE_LABEL} — that is what this service keeps, and "
+    f"the only thing it keeps.",
+    "  Taken once, out of what you withdraw. Nothing is charged for "
+    "depositing, for waiting, or for asking.",
+    "",
+    "  That is NOT the same as the network fee. The network charges its own "
+    "fee on every transaction it carries, a mix is many transactions, and "
+    "none of that comes here. So the total that leaves is always a little "
+    "more than the usage fee alone.",
     "",
     "HOW THIS CHAT BEHAVES",
     "  Nothing you type is written down on this end.",
     "  Nothing is ever sent until you confirm it — every time.",
-    "  Replies are kept short and dull on purpose. Assume this transcript "
-    "can be read by somebody who is not you.",
+    "  Replies are kept short and dull on purpose. Assume this chat can be "
+    "read by somebody who is not you.",
 ]
 
 #: The deletion line is CONDITIONAL, because --burn-after 0 disables it and a
@@ -542,7 +606,11 @@ HELP = "\n".join(
        # command from the list above, so this list stays the whole vocabulary
        # and the keyboard is only the short way to reach four of it.
        "Or use the buttons — they send these same commands.",
-       "The memo goes in an OP_RETURN — desktop wallet, not a phone."]
+       "The memo goes in an OP_RETURN — desktop wallet, not a phone.",
+       "",
+       "Old spellings still work: /receive and /recv reach /address, /send "
+       "reaches /withdraw, /depo reaches /deposit. /withdraw is the one that "
+       "pays YOU."]
 )
 
 
@@ -836,6 +904,22 @@ def parse_command(text: str) -> tuple:
         if not HANDLE_RE.match(arg):
             return "", {}, "handle must be 4 hex characters"
         return "swap_status", {"handle": arg.upper()}, ""
+    # A BARE MESSAGE IS NOT A COMMAND THIS BOT DOES NOT KNOW -- it is an
+    # ANSWER WITH NO QUESTION, and telling somebody their answer is an unknown
+    # command is how this reads as broken.
+    #
+    # handle() routes text to the live conversation FIRST, so anything
+    # reaching here has no conversation waiting for it. The commonest way to
+    # get here is the sequence driven in _convo_step: a command dropped the
+    # wizard, and the operator then typed the amount or pasted the address the
+    # wizard had asked for. "unknown command" describes neither.
+    #
+    # NO ECHO. Whatever they typed may be an amount or an address; naming it
+    # back would put it in the transcript for something that is not going to
+    # happen, which is the same rule the amount parser's own refusal follows.
+    if not cmd.startswith("/"):
+        return "", {}, ("nothing here is waiting for an answer. /deposit to "
+                        "pay in, /withdraw to be paid out.")
     return "", {}, "unknown command"
 
 
@@ -1030,7 +1114,7 @@ class Pager:
         # The strings are the same ones `/depo 2` already answers with, so the
         # two paths cannot drift into describing the same refusal differently.
         if self.busy.locked():
-            self.send(chat_id, "no: a wake is already running")
+            self.send(chat_id, BUSY_ANSWER)
             return
         why = self.limits.why_not()
         if why:
@@ -1158,9 +1242,19 @@ class Pager:
         # shape of the operation on the surface this design assumes is read --
         # and the first draft of this line said "the vault" twice. The repo's
         # own test caught it, which is what that check is for.
+        # THE CUT BELONGS IN "WHAT A RUN DOES". This listed what the operator
+        # chooses and what is counted, and said nothing about the one thing a
+        # run takes from them -- on the command whose whole purpose is to
+        # answer "what will this do".
+        lines.append("Taken by the service:")
+        lines.append("  usage fee       taken once from each withdrawal "
+                     "— the rate is on /fee")
+        lines.append("  network fee     the network's own, per transaction "
+                     "— not ours, and larger")
+        lines.append("")
         lines.append("Counted here (the machine keeps its own, and its is the "
                      "real one):")
-        lines.append(f"  wake budget     {self.limits.daily_cap} a day, "
+        lines.append(f"  daily allowance {self.limits.daily_cap} a day, "
                      f"{len(self.limits.recent())} used")
         lines.append("")
         # ONLY WHAT IS ACTUALLY THERE. This block used to read "Set on the
@@ -1173,7 +1267,7 @@ class Pager:
         # invited a trip to the vault to change something that is not there.
         lines.append("Set on the machine, with physical access:")
         lines.append("  whether sending out is allowed at all")
-        lines.append("  the real wake budget, and the account ceiling")
+        lines.append("  the real allowance, and the ceiling on new addresses")
         lines.append("  where the usage fee goes, if anywhere fixed")
         lines.append("")
         lines.append("Fixed in the software, the same for everyone:")
@@ -1302,7 +1396,7 @@ class Pager:
             self.convos.pop(chat_id, None)
             integrity_log("pager", "convo_error")
             self.send(chat_id, f"no: that went wrong — cancelled, nothing was "
-                               f"woken ({_redact(e)[:60]}).")
+                               f"started ({_redact(e)[:60]}).")
             return True
 
     def _step_convo(self, chat_id: int, text: str) -> bool:
@@ -1320,7 +1414,30 @@ class Pager:
         # armed replied "nothing to cancel" having just cancelled something.
         # One vocabulary, in parse_command, where every other command's lives.
         if word.startswith("/"):
+            # ...AND IT SAYS SO, WHICH IT DID NOT. The rule is right and the
+            # silence around it was the whole problem. Driven, end to end:
+            #
+            #     /deposit  -> "How much? Reply with the BTC amount..."
+            #     /status   -> "ready"          (the wizard is now gone)
+            #     0.05      -> "no: unknown command"
+            #
+            # The operator answered the question they were asked and was told
+            # their answer is not a command. Nothing in that sequence tells
+            # them a command cancelled the thing asking -- so the tool reads as
+            # broken at the exact moment it was working as designed.
+            #
+            # NOT FOR /cancel, which has its own reply and would otherwise say
+            # it twice. Asked of parse_command rather than matched here: this
+            # branch has already been the place a second cancel vocabulary got
+            # written and then disagreed with the first one.
+            _kind = c.kind
             del self.convos[chat_id]
+            if parse_command(text)[2] != "cancel":
+                self.send(chat_id,
+                          f"(that dropped the "
+                          f"{'/deposit' if _kind == 'depo' else '/withdraw'} "
+                          f"you were part-way through — any command does. "
+                          f"Nothing was sent.)")
             return False
         if c.awaiting_amount():
             # THE AMOUNT THEY ARE ACTUALLY SENDING, parsed by the PROTOCOL's
@@ -1352,7 +1469,7 @@ class Pager:
             # ever disagreed, this is the line that would show it.
             self.send(chat_id,
                       f"Deposit {proto.btc_display(c.amount)} BTC. "
-                      f"This wakes the machine.\n\n{q}")
+                      f"Confirm and it starts.\n\n{q}")
             return True
         if c.awaiting_address():
             # CHECKED HERE AND AGAIN AT THE VAULT. This gate is the protocol's
@@ -1436,11 +1553,23 @@ class Pager:
             # operator is not allowed to be exposed to would be a sentence
             # about a state that cannot exist -- and worse, it would read as
             # the warning that MAKES it acceptable.
+            # THE FEE IS NAMED WHERE IT IS CHARGED. /fee and the welcome both
+            # say it, and neither is on the screen at the moment the operator
+            # is about to agree to a spend. A cost disclosed only somewhere
+            # else is a cost the person paying it can miss.
+            #
+            # NO AMOUNT AND NO ARITHMETIC. This box has never been told a
+            # balance -- see /settings, which refuses to fetch one -- so it can
+            # state the RATE and must not state a figure. A number invented
+            # here would be a quote the vault never made.
             self.send(chat_id,
                       f"Send to the {'addresses' if _n > 1 else 'address'} you "
                       f"just sent, {proto.WITHDRAW_DEPTH_NOTE[_d]} — this "
                       f"SPENDS.\n\n"
-                      f"At least {_lo} separate transactions, {_spread}."
+                      f"At least {_lo} separate transactions, {_spread}.\n"
+                      f"{USAGE_FEE_LABEL} usage fee comes out of it — this "
+                      f"service's cut. The network fee is separate, charged "
+                      f"on every transaction, and is not ours."
                       f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
@@ -1455,7 +1584,7 @@ class Pager:
         if not word.isdecimal() or int(word) != expect:
             integrity_log("pager", "convo_confirm_failed")
             self.send(chat_id, "no: wrong answer. Cancelled — nothing was "
-                               "woken. Start again.")
+                               "started. Start again.")
             return True
         if kind == "withdraw":
             self.commit_withdraw(chat_id, exit_to, depth)
@@ -1481,14 +1610,14 @@ class Pager:
         _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
         if set(params) != set(_schema):
             integrity_log("pager", "convo_commit_mismatch")
-            self.send(chat_id, "no: internal check failed, nothing was woken.")
+            self.send(chat_id, "no: internal check failed, nothing was started.")
             return
         try:
             for _k, _check in _schema.items():
                 _check(params[_k])
         except Exception:                                    # noqa: BLE001
             integrity_log("pager", "convo_commit_mismatch")
-            self.send(chat_id, "no: internal check failed, nothing was woken.")
+            self.send(chat_id, "no: internal check failed, nothing was started.")
             return
         self.start_job(chat_id, job, params)
 
@@ -1532,7 +1661,7 @@ class Pager:
                 _check(params[_k])
         except Exception:                                    # noqa: BLE001
             integrity_log("pager", "convo_commit_mismatch")
-            self.send(chat_id, "no: internal check failed, nothing was woken.")
+            self.send(chat_id, "no: internal check failed, nothing was started.")
             return
         self.start_job(chat_id, job, params)
 
@@ -1940,13 +2069,29 @@ class Pager:
             # No balance and no count: this box has never been told either, and
             # the sentence is true whichever case they are in.
             if job == "withdraw":
+                # "ONE ADDRESS AT A TIME" NAMED THE WRONG END OF THE JOB.
+                #
+                # /withdraw takes up to MAX_WAKE_EXIT_DESTS DESTINATIONS by
+                # reply, and the confirm before it says "Send to the addresses
+                # you just sent". Then the completion said "This moves ONE
+                # address at a time", which reads as one of those destinations
+                # -- so an operator who gave five is told four were skipped.
+                # The next thing they do is run it again, and the second run
+                # is a real spend of whatever else is on the wallet.
+                #
+                # The "one" is at the SOURCE end: _funded_entry takes the
+                # largest single unlocked output rather than summing, because
+                # summing spends inputs from several subaddresses in one
+                # transaction and that is permanent public proof they share an
+                # owner. Both ends are named now, in the words the operator
+                # used for each: what they GAVE, and what money ARRIVED on.
                 _msg = ("withdraw: sent. The mix ran and the funds went to "
-                        "the address you gave.\n\n"
-                        "This moves ONE address at a time — merging several "
-                        "would prove on-chain that they share an owner. If "
-                        "you had funds in more than one place, /withdraw "
-                        "again "
-                        "for the next.")
+                        "the addresses you gave — all of them.\n\n"
+                        "It emptied ONE of the addresses money had ARRIVED "
+                        "on, not all of those: spending two of them together "
+                        "would prove on-chain that they belong to the same "
+                        "person. If money arrived in more than one place, "
+                        "/withdraw again for the next.")
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
                 # end of a job that ran for up to sixteen hours and moved real
@@ -2130,11 +2275,38 @@ class Pager:
             # BEFORE the first child process starts -- a failure inside a
             # child reports "failed", not "refused" -- so this can say it
             # without guessing.
+            # "TRY /status, THEN AGAIN" WAS ADVICE THAT IS WRONG HALF THE
+            # TIME, and wrong in the direction that costs the operator the
+            # thing it is telling them to spend.
+            #
+            # Refusals come from two kinds of cause and this end cannot tell
+            # them apart, because the reason is deliberately not on the wire:
+            #
+            #   * TRANSIENT -- the daily wake budget is used up, the network
+            #     was not reachable. Waiting fixes it.
+            #   * PERMANENT UNTIL SOMEBODY IS AT THE MACHINE -- the wallet has
+            #     hit its account ceiling so no address can be minted at all,
+            #     the keyfile does not allow spending, the wallet cannot be
+            #     counted. Retrying refuses identically, forever, and every
+            #     attempt spends part of the same daily budget.
+            #
+            # The account ceiling is the one that turns this into a trap: it
+            # makes /deposit and /address refuse every single time, and the
+            # old message told the operator to keep going.
+            #
+            # SO IT SAYS THE SHAPE OF BOTH AND PICKS NEITHER. "Refused twice
+            # the same way, stop" is the rule that is right for both kinds,
+            # and it needs no reason from the wire to be true.
             self.send(chat_id,
                       f"{chat_name(job)}: refused before it started"
                       + (" — nothing was spent and nothing moved."
                          if job == "withdraw" else ".")
-                      + " Try /status, then again.",
+                      + " It does not say why, and this end is not told.\n\n"
+                        "Some refusals clear on their own; others need "
+                        "somebody physically at the machine and will refuse "
+                        "the same way every time. If a second try is refused "
+                        "too, stop — each one spends part of the daily "
+                        "allowance for nothing.",
                       buttons=MENU_BUTTONS)
         elif out == "failed":
             # A FAILED WITHDRAWAL GETS THE ONE THING THE OPERATOR CAN ACT ON.
@@ -2247,7 +2419,7 @@ class Pager:
             # must not become the thing that eats the exception silently.
             try:
                 self.send(chat_id,
-                          f"{chat_name(job)}: the wake ran and this box then "
+                          f"{chat_name(job)}: it ran and this end then "
                           f"failed to report it cleanly "
                           f"({_redact(e)[:80]}).\n"
                           f"I cannot tell you whether it finished. Check "
@@ -2385,10 +2557,10 @@ class Pager:
             # because cancelling a half-typed wizard is still possible and
             # still worth confirming while a job runs.
             if had_convo:
-                self.send(cid, "cancelled. Nothing was woken.")
+                self.send(cid, "cancelled. Nothing was started.")
             elif self.busy.locked():
                 self.send(cid,
-                          "nothing half-typed to cancel — but a wake IS "
+                          "nothing half-typed to cancel — but something IS "
                           "running, and it cannot be stopped from here. The "
                           "machine has the job and is working through it; "
                           "that is also why other commands are being "
@@ -2539,6 +2711,41 @@ class Pager:
             if _id is not None:
                 self.answer_callback(_id, f"no: {_err}")
             return
+        # A DEPTH BUTTON IS ONLY A DEPTH WHILE SOMETHING IS ASKING FOR ONE.
+        #
+        # parse_callback turns a tap into "the text the typed path would have
+        # received", which is what makes a tap and a typed command identical
+        # everywhere else. For the depth menu that text is a BARE DIGIT, and a
+        # bare digit means whatever the live conversation is currently reading
+        # digits as.
+        #
+        # Telegram keyboards do not expire. The depth menu stays under its
+        # message for as long as the message exists, so:
+        #
+        #     /withdraw -> address -> (depth menu drawn)
+        #     ...abandoned, /deposit typed instead
+        #     the operator scrolls up and taps "20 hops"
+        #     -> the wizard reads "3" as THREE BITCOIN and asks them to
+        #        confirm a deposit two orders of magnitude out
+        #
+        # Driven before this existed: the tap produced "Deposit 3 BTC" and a
+        # confirm sum, which the operator is primed to answer because they had
+        # just tapped a button and a question appeared.
+        #
+        # THE MEANING IS CHECKED, NOT THE VALUE. parse_callback already refuses
+        # a depth the protocol does not offer; that is a check on the number
+        # and this is a check on whether a number was asked for at all. A tap
+        # that no live question is waiting for changes nothing and says so on
+        # the tapper's own screen.
+        if str(cb.get("data") or "").startswith("d:"):
+            _c = self.convos.get(cid)
+            if not (_c and _c.alive(self.clock) and _c.awaiting_depth()):
+                integrity_log("pager", "callback_depth_stale")
+                if _id is not None:
+                    self.answer_callback(
+                        _id, "no: that button is from an earlier question. "
+                             "Nothing changed.")
+                return
         # ACKNOWLEDGED FIRST, then the work. start_job can hold this thread
         # long enough for the spinner to time out on its own -- it takes the
         # busy lock and posts to the doorbell over Tor -- and a spinner that
@@ -2603,7 +2810,7 @@ class Pager:
         # a second concurrent wake cannot bind and would fail confusingly --
         # and two vaults woken at once is not a thing this design has.
         if not self.busy.acquire(blocking=False):
-            self.send(cid, "no: a wake is already running")
+            self.send(cid, BUSY_ANSWER)
             return
         # RELEASE IT IF ANYTHING BETWEEN HERE AND THE THREAD RAISES.
         #
@@ -2651,7 +2858,7 @@ class Pager:
         except BaseException as e:                           # noqa: BLE001
             self.busy.release()
             integrity_log("pager", "worker_start_failed")
-            self.send(cid, f"{chat_name(job)}: could not start the wake — {_redact(e)[:120]}")
+            self.send(cid, f"{chat_name(job)}: could not start — {_redact(e)[:120]}")
 
     def publish_commands(self) -> bool:
         """Register the command list with Telegram. Returns whether it landed.

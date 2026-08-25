@@ -1778,7 +1778,17 @@ check("deadman: the extension disarms the short timer only AFTER verifying "
 check("fee: the pairing offers a flag for the fee destination",
       '"--usage-fee-address"' in _kp_src)
 check("fee: ...and actually writes it into the keyfile the agent reads",
-      '"usage_fee_address": str(args.usage_fee_address or ""),' in _kp_src)
+      '"usage_fee_addresses": [str(a) for a in (args.usage_fee_address or [])],'
+      in _kp_src)
+# THE SINGULAR FIELD IS STILL WRITTEN, and it is not vestigial: an agent from
+# before the list existed reads only that name. Writing the list and dropping
+# the singular would leave such an agent taking no fee at all -- the exact
+# silent-zero this section exists about -- and writing str(list) there would
+# hand it a destination made of the text of a Python list.
+check("fee: ...and still writes the singular one an older agent reads, as an "
+      "address rather than the text of a list",
+      '"usage_fee_address": str((list(args.usage_fee_address or []) or [""])[0]),'
+      in _kp_src)
 # proto.xmr_address, NOT the withdraw schema's exit_to field. This used to
 # borrow that one, which was fine only while the two happened to be the same
 # check -- exit_to takes a LIST of destinations now, so the borrowed gate would
@@ -1786,25 +1796,178 @@ check("fee: ...and actually writes it into the keyfile the agent reads",
 # str() produced. A job schema is about that job's fields; "is this an address"
 # has its own name.
 check("fee: ...and validates it at pairing, not after a mix has run",
-      'proto.xmr_address(args.usage_fee_address)' in _kp_src)
+      'proto.xmr_address(_fa)' in _kp_src)
 check("fee: ...with the ONE-address gate, not the withdraw job's destination "
       "list, which is a different question that now returns a different type",
-      'JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)'
-      not in _kp_src)
+      'JOBS["withdraw"]["schema"]["exit_to"](_fa)' not in _kp_src)
 # THE FIELD NAMES MUST MATCH ON BOTH SIDES, which is the half that was broken.
 _ag_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 check("fee: the name the agent reads is the name the pairing writes",
-      'key.get("usage_fee_address")' in _ag_src)
-# NON-VACUITY: omitting it is still the default, so the fresh-account-per-run
-# behaviour is not quietly replaced by a required fixed address.
+      'key.get("usage_fee_address")' in _ag_src
+      and 'key.get("usage_fee_addresses")' in _ag_src)
 _K = importlib.util.module_from_spec(importlib.util.spec_from_loader(
     "gs_wake_keys_for_flags",
     importlib.machinery.SourceFileLoader("gs_wake_keys_for_flags",
                                          os.path.join(REPO, "gs_wake_keys"))))
 _K.__loader__.exec_module(_K)
 _ap_k = _K.build_cli().parse_args(["pair"])
-check("fee: NON-VACUITY -- omitting the flag is still valid and still means "
-      "'mint a fresh one per run'", _ap_k.usage_fee_address == "")
+check("fee: NON-VACUITY -- omitting the flag is still valid", 
+      _ap_k.usage_fee_address == [])
+
+# ---- ONE ADDRESS COLLECTED EVERY RUN, AND THE HELP CALLED IT RECOMMENDED --
+#
+# THE HELP WAS FALSE ON THE ONLY PATH THIS FILE PAIRS. It said omitting the
+# flag was the RECOMMENDED setting because GhostSpiral then "mints a fresh
+# account per run, so no address collects from two runs". True of a desktop
+# run. On a woken one _withdraw_fee_argv passes --usage-fee only when the
+# field is set -- because a minted account lands on the mixing wallet and
+# _funded_entry hands it to the next withdrawal -- so an operator who followed
+# the help took NO FEE AT ALL on every phone withdrawal while being told the
+# opposite. Driven below, both directions.
+print("\n-- the usage fee, and who can read it off the chain --")
+_FA = ["4" + str(_i) + "1" * 93 for _i in range(4)]
+check("fee: a keyfile naming no destination takes no fee at all -- the state "
+      "the old help called 'recommended'",
+      A.fee_addresses({}) == [] and A._withdraw_fee_argv({}) == [])
+# THE CLAIM, NOT A WORD. The history is written above the flag on purpose --
+# "THIS HELP USED TO SAY..." -- so a bare word search finds the retelling and
+# passes on a file that still lies. What must be gone is the assertion itself.
+check("fee: ...and the pairing no longer asserts that omitting it is the "
+      "recommended setting",
+      "OMITTING IT IS THE RECOMMENDED" not in _kp_src)
+check("fee: ...nor that omitting it mints a fresh account per run, which is "
+      "true of a desktop run and never was of a woken one",
+      "GhostSpiral mints a FRESH account and subaddress for the cut on every"
+      not in _kp_src)
+check("fee: ...and says outright that the flag is what makes a woken "
+      "withdrawal take a fee at all",
+      "REQUIRED to take a fee" in _kp_src)
+# THE LEAK THE LIST EXISTS FOR. The rate is published in this repository, so an
+# arrival divided by 0.011 is the deposit behind it. With ONE destination that
+# is every deposit the operator ever took, and it survives the mix because the
+# fee output is the one thing in the run that is not mixed.
+check("fee: the flag is repeatable, so the cut is not one address collecting "
+      "every run", "action=\"append\"" in _kp_src)
+check("fee: ...and the agent reads all of them", 
+      A.fee_addresses({"usage_fee_addresses": _FA}) == _FA)
+check("fee: ...and an older keyfile with only the singular field still works",
+      A.fee_addresses({"usage_fee_address": _FA[0]}) == [_FA[0]])
+check("fee: ...and the two are not double-counted when both name the same one",
+      A.fee_addresses({"usage_fee_addresses": _FA[:2],
+                       "usage_fee_address": _FA[0]}) == _FA[:2])
+# EVERY ELEMENT CHECKED. This list comes off a file on disk. A None or a dict
+# in it would reach str() and become a destination made of the word "None" --
+# the cut paid somewhere unspendable, discovered after the mix.
+check("fee: a list holding junk contributes only the usable addresses",
+      A.fee_addresses({"usage_fee_addresses":
+                       [_FA[0], None, {}, 7, "   ", _FA[1]]}) == _FA[:2])
+check("fee: ...and a field that is not a list at all is not iterated as one",
+      A.fee_addresses({"usage_fee_addresses": "4" + "1" * 94}) == [])
+# THE DRAW IS PER RUN AND KEEPS NOTHING. An index would be durable state on
+# the machine paranoia_mode wipes -- it would reset to the first address after
+# every sweep, which is the worst reuse pattern there is -- and two
+# withdrawals racing it would read the same number.
+_draws = {A.pick_fee_address({"usage_fee_addresses": _FA}) for _ in range(400)}
+check(f"fee: the destination is drawn per run, not fixed ({len(_draws)} of "
+      f"{len(_FA)} seen in 400 draws)", _draws == set(_FA))
+check("fee: ...and with one address paired it is still that one",
+      A.pick_fee_address({"usage_fee_addresses": _FA[:1]}) == _FA[0])
+check("fee: ...and with none it is empty rather than an exception",
+      A.pick_fee_address({}) == "")
+check("fee: ...and nothing is written down to remember the draw",
+      "usage_fee_index" not in _ag_src and "fee_rotation" not in _ag_src)
+# AND THE CLAIM IS BOUNDED HONESTLY. N addresses divide the reuse by N; they
+# do not remove it. A help string promising unlinkability would be the
+# confident false statement this repo keeps deleting.
+check("fee: the pairing help calls it a reduction and not unlinkability",
+      "is a reduction, not" in _kp_src)
+# A REPEAT IS NOT A SECOND ADDRESS: it weights the draw toward one destination
+# while the keyfile reads as spreading wider than it does.
+check("fee: pairing refuses the same address given twice",
+      "if len(set(_seen)) != len(_seen):" in _kp_src)
+
+# ---- ...AND THE DESK RE-OPENS WHAT THE PHONE PATH CLOSED -----------------
+#
+# _withdraw_fee_argv stops the WOKEN path minting a cut onto the mixing
+# wallet. gs_console's fee panel recommends exactly that for a run started at
+# the desk -- "leave the box empty and a new account and subaddress are minted
+# per run" -- and _funded_entry cannot tell the two apart, because it takes the
+# largest unlocked output on the wallet and asks nothing else. So the gate
+# holds on one path and the other walks around it.
+#
+# DRIVEN, not reasoned about: a wallet whose deposit the last exit already
+# swept out reports the desktop-minted fee account as the entry for the next
+# withdrawal.
+print("\n-- the fee the desk leaves behind for the phone to spend --")
+
+
+class _FeeWallet:
+    def __init__(self, accts): self.accts = accts
+
+    def raw_request(self, m, p=None):
+        if m == "get_accounts":
+            return {"subaddress_accounts":
+                    [{"account_index": i} for i in range(len(self.accts))]}
+        if m == "get_balance":
+            return {"per_subaddress": self.accts[p["account_index"]]}
+        return {}
+
+
+def _sub(i, xmr, tag):
+    return {"address_index": i, "unlocked_balance": int(xmr * 10 ** 12),
+            "address": tag}
+
+
+import gs_common as _gc                                       # noqa: E402
+_gc_orig = _gc.connect_rpc
+# acct 0 is the user's entry, swept empty by the run's own exit. acct 9 is what
+# a desktop run with an empty address box minted for the operator.
+_wallet = ([[_sub(0, 0.0, "user-entry")]] + [[] for _ in range(8)]
+           + [[_sub(2, 0.44, "operator-cut-from-the-desk")]])
+try:
+    _gc.connect_rpc = lambda *a, **k: _FeeWallet(_wallet)
+    _fk = {"rpc_primary": "http://127.0.0.1:18083", "tor_proxy": ""}
+    _picked = A._funded_entry(_fk)
+    check("fee: a cut minted at the DESK is what the next woken withdrawal "
+          "picks up, because _funded_entry knows only 'largest unlocked'",
+          _picked is not None and _picked[2] == "operator-cut-from-the-desk")
+    # NON-VACUITY: it is not simply always returning that account -- a real
+    # deposit still outranks it, which is why the leak needs the exit to have
+    # run first and is easy to miss in testing.
+    _wallet[0] = [_sub(0, 12.0, "another-deposit")]
+    check("fee: NON-VACUITY -- with a real deposit present that one wins, so "
+          "the leak only shows after an exit has swept",
+          A._funded_entry(_fk)[2] == "another-deposit")
+finally:
+    _gc.connect_rpc = _gc_orig
+# NEITHER TOOL CAN SEE THE OTHER: the console holds no keyfile and the agent
+# does not know what was run at the desk. Pairing is the one moment both facts
+# are present -- a wallet is named, and a phone is given permission to spend
+# from it -- so that is where the operator is told.
+check("fee: pairing warns when a phone may spend from a wallet and no "
+      "off-wallet destination is named",
+      "if args.allow_withdraw and not (args.usage_fee_address or []):"
+      in _kp_src)
+check("fee: ...and says both consequences, not just the missing fee",
+      "takes NO usage fee" in _kp_src
+      and "will pick it up and send it to" in _kp_src)
+check("fee: ...and it is a warning, not a refusal -- taking no fee is a "
+      "legitimate choice and forcing an address to silence a warning is worse",
+      "or continue if you meant to take no fee" in _kp_src
+      and "sys.exit" not in _kp_src.split(
+          "if args.allow_withdraw and not (args.usage_fee_address or []):")[1]
+          .split("if args.wallet_file")[0])
+# AND THE PAGE THAT RECOMMENDS THE EMPTY BOX SAYS WHEN NOT TO.
+_cons_src = open(os.path.join(REPO, "gs_console"), encoding="utf-8").read()
+check("fee: the console's fee panel names the case where its own advice is "
+      "wrong", "Unless a phone can spend from this wallet" in _cons_src)
+# WHITESPACE-NORMALISED, because this is HTML source: the sentence wraps at
+# whatever column the file wraps at, so a raw substring check passes or fails
+# on where a line break happens to fall rather than on what the page says.
+_cons_flat = " ".join(_cons_src.split())
+check("fee: ...and points at the fix rather than only at the hazard",
+      "put an address in the box" in _cons_flat
+      and "one is drawn per run" in _cons_flat)
 
 # ---- A KILLED PROBE WAS A COMPLETED DEPOSIT --------------------------
 #
@@ -1877,17 +2040,48 @@ _with_addr = A.build_argv("withdraw", _fee_params,
                            dict(_fee_key, usage_fee_address="4" + "7" * 94),
                            Path("/tmp"), bundle="/tmp/b.json", slip=None,
                            handle="A3F1")[0]
-check("fee: with no --usage-fee-address, a phone withdrawal takes NO fee — "
-      "a cut minted on this wallet is a cut this wallet hands back",
+# THE FEE GOES OFF THIS WALLET, OR IT IS NOT TAKEN.
+#
+# Two other fixes were tried and both were wrong, which is why this one is
+# pinned with its reasoning:
+#
+#   * Take the fee as usual and have _funded_entry skip the fee ACCOUNT by a
+#     recorded pair. The record has to live somewhere, and artifact_dir is
+#     wiped by paranoia_mode -- so the protection disappears exactly when the
+#     operator has been most careful.
+#   * Mark the fee account with a wallet LABEL. paranoia_mode deliberately
+#     never deletes the wallet file, so a label outlives every artifact wipe:
+#     it survives a seizure that erased the plans and the logs, names which
+#     account is the operator's revenue, and hands the deposit size to anyone
+#     who divides by the published rate. test_dag_entry already pins both
+#     mints to an empty label for exactly this reason.
+#
+# So nothing marks it, and nothing needs to: with no --usage-fee-address the
+# withdrawal takes no cut, and nothing of the operator's is left on a wallet
+# the phone can drain. The cost is real and is stated rather than hidden -- a
+# fixed address is address reuse, which gs_wake_keys is right to call the
+# worse default in general. On an install where a phone can empty the wallet
+# it is the better of the two, because the alternative is not "a fresh
+# account per run", it is "the operator's revenue is paid to whoever asks
+# next".
+check("fee: with no --usage-fee-address, a phone withdrawal takes NO fee, so "
+      "nothing of the operator's is left where _funded_entry will find it",
       "--usage-fee" not in _no_addr)
-check("fee: ...and with one, the fee is taken, because it goes off-wallet",
+check("fee: ...and with one, the fee IS taken, because it goes off-wallet",
       "--usage-fee" in _with_addr)
-check("fee: NON-VACUITY -- both are otherwise the same command",
+check("fee: NON-VACUITY -- the two commands are otherwise identical",
       [a for a in _no_addr if a != "--usage-fee"]
       == [a for a in _with_addr if a != "--usage-fee"])
-# ...and the address itself never rides on argv, which was already true.
-check("fee: NON-VACUITY -- the address is not on the command line either way",
+check("fee: NON-VACUITY -- the address never rides on the argv either way",
       "4" + "7" * 94 not in _with_addr)
+# AND NOTHING IS LABELLED, checked from this side too so the two files cannot
+# drift into disagreeing about it.
+_gs_src = open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read()
+check("fee: the fee account is still minted with an EMPTY label, because a "
+      "label outlives every artifact wipe",
+      'create_fresh_account(rpc, label="")' in _gs_src)
+check("fee: ...and so is its subaddress",
+      'new_subaddress_indexed(account_index=_acct, label="")' in _gs_src)
 
 # ---- THE THIRD ADDRESS VALIDATOR AGREED WITH THE OTHER TWO ON ALL BUT ONE
 #
