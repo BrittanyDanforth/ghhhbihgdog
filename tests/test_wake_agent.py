@@ -728,8 +728,27 @@ _worst = A.JITTER_HI_S + max(len(sp["tools"]) * sp["budget_s"]
                              for sp in _ordinary.values())
 check("the agent's own timeout leaves room for the worst ORDINARY job "
       f"(jitter {A.JITTER_HI_S}s + the largest budget)", _tmo > _worst)
-check("...and the DEADMAN is longer than it, so the ordinary path is bounded "
-      "by the agent and the deadman is only the backstop", _dms > _tmo)
+# THE ORDER IS NOW DEADMAN FIRST, AND THIS CHECK USED TO PIN THE OPPOSITE.
+#
+# It asserted _dms > _tmo -- "the ordinary path is bounded by the agent and
+# the deadman is only the backstop" -- which was coherent while every job was
+# ordinary. It quietly assumed TimeoutStartSec could be sized per job. It
+# cannot: it is static, applies to the WHOLE ExecStart under Type=oneshot, and
+# extend_deadman can lengthen the deadman for a spend but nothing can lengthen
+# this. Keeping _tmo under the deadman is exactly what killed every
+# withdrawal at 2.5h.
+#
+# So this number now covers the LONGEST job (asserted further down) and the
+# deadman is the tight bound that fires first. That is also the better of the
+# two orderings on its own merits: gs-wake-poweroff.service SIGTERMs the job's
+# process group, waits, and only then SIGKILLs, which is what lets the tools'
+# `finally` blocks erase their plan files. systemd's own timeout kill does not
+# run that sequence.
+check("the boot deadman fires BEFORE systemd's timeout, so an ordinary job is "
+      "stopped by the path that SIGTERMs the group first", _dms < _tmo)
+check("...and systemd's timeout is therefore the outer backstop, for a "
+      "deadman that failed to arm at all",
+      _tmo > _dms and _tmo > max(P.result_budget_s(_j) for _j in P.JOBS))
 # NON-VACUITY: there IS a job the shipped numbers do not cover, or the split
 # above is describing a distinction that does not exist.
 _spend_worst = A.JITTER_HI_S + max(
@@ -1484,6 +1503,50 @@ check("wallet: NON-VACUITY -- a withdrawal composes BOTH --rpc-primary and "
       "--rpc-primary" in _wargv and "--wallet-file" in _wargv
       and _wargv[_wargv.index("--rpc-primary") + 1]
           != _wargv[_wargv.index("--wallet-file") + 1])
+
+# ---- SYSTEMD MUST NOT KILL THE JOB BEFORE THE DEADMAN DOES --------------
+#
+# THE WORST ONE IN THIS FILE'S HISTORY, and it defeated every other bound.
+#
+# gs-wake-agent.service is Type=oneshot, so TimeoutStartSec applies to the
+# WHOLE ExecStart -- the entire job. It was 9000s, sized when `watch` (7200s)
+# was the largest job. A withdrawal runs up to result_budget_s = 59400s and
+# the agent extends the deadman to 60000s to cover it, so systemd was killing
+# the unit 6.7x earlier than the backstop it was supposed to precede -- and
+# OnFailure=gs-wake-poweroff.service then powers the machine off. Mid-mix,
+# money already moving, on EVERY withdrawal at EVERY depth, since the
+# shallowest needs 6.1h.
+#
+# The job budget, the deadman extension and the pager's poll-failure fix all
+# bound something else. None of them can survive systemd killing the unit.
+_unit = open(os.path.join(REPO, "systemd", "gs-wake-agent.service"),
+             encoding="utf-8").read()
+_tss = int(re.search(r"^TimeoutStartSec=(\d+)", _unit, re.M).group(1))
+check("systemd: the unit really is Type=oneshot, so this timeout bounds the "
+      "whole job and not just the launch",
+      re.search(r"^Type=oneshot", _unit, re.M) is not None)
+_longest = max(P.result_budget_s(_j) for _j in P.JOBS)
+check(f"systemd: TimeoutStartSec ({_tss}s) outlasts the longest job the agent "
+      f"can run ({_longest}s)", _tss > _longest)
+# AND IT OUTLASTS THE DEADMAN THE AGENT ARMS FOR THAT JOB, or systemd still
+# wins the race and the deadman never gets to be the bound.
+_armed = _longest + 600            # gs_wake_agent: result_budget_s(job) + 600
+check(f"systemd: ...and outlasts the deadman the agent arms for it "
+      f"({_armed}s), so the deadman is what bounds a spend",
+      _tss > _armed)
+# NON-VACUITY 1: the value this replaced would FAIL both checks. Stated as a
+# number rather than a memory, so the check is demonstrably able to say no.
+check("systemd: NON-VACUITY -- the 9000s this replaced would NOT have covered "
+      "the longest job, which is the defect", 9000 < _longest)
+# NON-VACUITY 2: a withdrawal really is the long one, so this is not two names
+# for the same job.
+check("systemd: NON-VACUITY -- the spending job really is the longest",
+      P.result_budget_s("withdraw") == _longest
+      and _longest > P.result_budget_s("watch"))
+# AND FAILURE STILL POWERS OFF, or raising the timeout would have quietly
+# removed the thing that stops a crashed agent sitting powered on.
+check("systemd: a failed agent still powers the machine off",
+      "OnFailure=gs-wake-poweroff.service" in _unit)
 
 # ---- THE BOOT DEADMAN MUST STILL COVER THE JOBS IT IS THE BACKSTOP FOR ---
 #
