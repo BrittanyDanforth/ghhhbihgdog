@@ -1513,9 +1513,17 @@ check("budget: the deadman extension outlasts the budget it protects",
 # runs, so the DESKTOP path skimmed and the PHONE path -- the one the whole
 # wake channel exists for -- silently did not, for as long as the job existed.
 # Every suite was green through it, because nothing looked.
+# ...AND IT ASKS ONLY WHEN THE CUT HAS SOMEWHERE TO GO THAT IS NOT HERE.
+# With no --usage-fee-address, plan_usage_fee mints a fresh account on the
+# wallet being emptied and keeps it out of addr_index so the exit will not
+# sweep it. _funded_entry is a different process re-enumerating the same
+# wallet and takes the largest unlocked output -- which, after the exit has
+# swept everything else, is that fee. See _withdraw_fee_argv.
 _fee_argv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
-                         _k, _wdir, bundle="b", slip=None, handle="A3F1")[0]
-check("fee: the composed withdrawal actually asks for the usage fee",
+                         dict(_k, usage_fee_address="4" + "7" * 94),
+                         _wdir, bundle="b", slip=None, handle="A3F1")[0]
+check("fee: the composed withdrawal asks for the usage fee when the keyfile "
+      "names somewhere OFF this wallet to put it",
       "--usage-fee" in _fee_argv)
 # NON-VACUITY: GhostSpiral's own resolver accepts this exact combination, so
 # the flag is not merely present but usable. --peel and --split > 1 are both
@@ -1797,6 +1805,89 @@ _K.__loader__.exec_module(_K)
 _ap_k = _K.build_cli().parse_args(["pair"])
 check("fee: NON-VACUITY -- omitting the flag is still valid and still means "
       "'mint a fresh one per run'", _ap_k.usage_fee_address == "")
+
+# ---- A KILLED PROBE WAS A COMPLETED DEPOSIT --------------------------
+#
+# The success gate for a status probe read: rc != 0, job is a watching one,
+# not a hard kill, and STATUS_FILE EXISTS -> continue. It checked that the
+# file exists and nothing about what is in it. receive_watch writes
+# {"state": "interrupted"} on its way out when it is killed at its budget,
+# and _PHASE_OF_STATE maps "interrupted" to "" -- no phase earned.
+#
+# So the vault reported "done" with no phase, and the pager's done-branch
+# falls past the phase reply into the SLIP branches. Driven on a deposit
+# handle: seal_slip_for_delivery(status="done") returned 568 characters and
+# plain_slip_for_chat returned the full field set, memo included. "Has my
+# payment arrived?" re-published the entire deposit slip, captioned as ready,
+# for a probe that answered nothing.
+#
+# _phase_of IS the test for "did this probe earn an answer": same file, the
+# protocol's closed table, "" for every state that did not.
+_pk_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+# TO THE END OF THE BRANCH, not a fixed slice: the comment above the code is
+# longer than any window guessed by eye, and a slice that misses the line is a
+# check that reads as a failure while the code is right.
+_pk_gate = _pk_src.split(
+    'if rc != 0 and job in ("swap_status", "watch") and not hard:'
+)[1].split("\n        if rc != 0:")[0]
+check("probe: the success gate asks for a PHASE, not for a file that exists",
+      "_phase_of(job, artifact_dir)" in _pk_gate)
+check("probe: ...and no longer settles for STATUS_FILE.exists()",
+      "STATUS_FILE).exists()" not in _pk_gate)
+
+_pk_dir = Path(tempfile.mkdtemp(prefix="gs_probe_"))
+for _state, _want, _label in (
+        ("funded", True, "money landed"),
+        ("stalled", True, "arrived short"),
+        ("not_syncing", True, "wallet not scanning"),
+        ("timeout", True, "nothing yet"),
+        ("interrupted", False, "KILLED AT ITS BUDGET"),
+        ("some_new_word", False, "a state this build has never heard of")):
+    (_pk_dir / A.STATUS_FILE).write_text(json.dumps(
+        {"state": _state, "unlocked": "0", "total": "0"}))
+    _got = bool(A._phase_of("swap_status", _pk_dir))
+    check(f"probe: state={_state!r} ({_label}) counts as answered: {_got}",
+          _got == _want)
+(_pk_dir / A.STATUS_FILE).write_text("{}")
+check("probe: a status file with no state at all is not an answer either",
+      not A._phase_of("swap_status", _pk_dir))
+shutil.rmtree(_pk_dir, ignore_errors=True)
+
+# ---- A PHONE WITHDRAWAL TAKES NO FEE ONTO THE WALLET IT IS EMPTYING ---
+#
+# plan_usage_fee, with no fixed destination, mints a FRESH account on the
+# wallet being mixed and keeps it out of addr_index so the exit will not
+# sweep it -- "it is yours where it lands". That hold is one process's
+# in-memory index. _funded_entry is a different process re-enumerating the
+# same wallet and takes the largest unlocked output there is. Driven: after a
+# withdrawal completes, the fee account IS the largest output, so the next
+# /withdraw -- which the pager itself suggests -- mixes the operator's
+# revenue and pays it to the address the chat named.
+_fee_key = {"rpc_primary": "http://127.0.0.1:18083",
+            "rpc_daemon": "http://127.0.0.1:18081",
+            "tor_proxy": "socks5h://127.0.0.1:9050",
+            "wallet_file": "/w", "artifact_dir": "/tmp",
+            "allow_withdraw": True}
+_fee_params = {"exit_to": ["4" + "1" * 94], "depth": 2}
+_no_addr = A.build_argv("withdraw", _fee_params,
+                         dict(_fee_key, usage_fee_address=""),
+                         Path("/tmp"), bundle="/tmp/b.json", slip=None,
+                         handle="A3F1")[0]
+_with_addr = A.build_argv("withdraw", _fee_params,
+                           dict(_fee_key, usage_fee_address="4" + "7" * 94),
+                           Path("/tmp"), bundle="/tmp/b.json", slip=None,
+                           handle="A3F1")[0]
+check("fee: with no --usage-fee-address, a phone withdrawal takes NO fee — "
+      "a cut minted on this wallet is a cut this wallet hands back",
+      "--usage-fee" not in _no_addr)
+check("fee: ...and with one, the fee is taken, because it goes off-wallet",
+      "--usage-fee" in _with_addr)
+check("fee: NON-VACUITY -- both are otherwise the same command",
+      [a for a in _no_addr if a != "--usage-fee"]
+      == [a for a in _with_addr if a != "--usage-fee"])
+# ...and the address itself never rides on argv, which was already true.
+check("fee: NON-VACUITY -- the address is not on the command line either way",
+      "4" + "7" * 94 not in _with_addr)
 
 # ---- THE THIRD ADDRESS VALIDATOR AGREED WITH THE OTHER TWO ON ALL BUT ONE
 #

@@ -1919,6 +1919,113 @@ check("tap: ...and no callback maps to anything the typed vocabulary does "
 #  refuses to keep -- and a chat identifier on a wire that deliberately
 #  carries none. So the operator is made to say they know.
 # ===========================================================================
+# ===========================================================================
+#  BOOKKEEPING MUST NOT PRE-EMPT THE REPORT
+#
+#  poke() writes the integrity chain ABOVE every reply branch, and
+#  integrity_log re-raises an OSError. _worker was try/finally with no except,
+#  so a full or read-only SD card at the moment a 16.5-hour withdrawal
+#  reported back killed the thread silently: busy released by the finally, the
+#  pager still answering "ready", and under the shipped unit's
+#  StandardOutput=null the traceback going nowhere.
+#
+#  Driven: messages received [], busy released True, thread alive False --
+#  after the job that spends everything.
+# ===========================================================================
+print("\n== the report survives the bookkeeping ==")
+
+
+class _DoneFin:
+    result = {"status": "done", "handle": "----", "slip": "", "plain": {},
+              "phase": ""}
+
+    def outcome(self):
+        return "done"
+
+
+def _chain_dead(job="withdraw"):
+    _p, _s = _room_pager([111], [])
+    _saved_il, _saved_db = pg.integrity_log, pg._DOORBELL[0]
+    pg._DOORBELL[0] = types.SimpleNamespace(
+        run_wake=lambda a, k, j, pa, on_event=None: _DoneFin())
+    pg.integrity_log = lambda *a, **k: (_ for _ in ()).throw(
+        OSError(28, "No space left on device"))
+    _p.busy.acquire()
+    _th = threading.Thread(target=_p._worker, args=(111, job, {}), daemon=True)
+    _err = []
+    _saved_hook = threading.excepthook
+    threading.excepthook = lambda a: _err.append(a.exc_type.__name__)
+    try:
+        _th.start()
+        _th.join(5)
+    finally:
+        threading.excepthook = _saved_hook
+        pg.integrity_log, pg._DOORBELL[0] = _saved_il, _saved_db
+    return _p, _s
+
+
+_cp, _cs = _chain_dead()
+check("chain: a chain write that fails does NOT cost the completion message "
+      "— the message IS what happened, as far as the operator is concerned",
+      _cs != [])
+check("chain: ...and the message that lands is the real completion one",
+      any("withdraw: sent" in t for t in _cs))
+check("chain: ...and busy is still released, so the pager is not wedged",
+      not _cp.busy.locked())
+
+# AND IF poke() ITSELF DIES, the operator is still told something -- and told
+# honestly, because this box cannot know whether the wake ran.
+_wp3, _ws3 = _room_pager([111], [])
+_wp3.busy.acquire()
+_saved_db3 = pg._DOORBELL[0]
+pg._DOORBELL[0] = types.SimpleNamespace(
+    run_wake=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+_saved_poke = pg.Pager.poke
+pg.Pager.poke = lambda self, c, j, p_: (_ for _ in ()).throw(
+    OSError(28, "No space left on device"))
+_th3 = threading.Thread(target=_wp3._worker, args=(111, "withdraw", {}),
+                        daemon=True)
+_saved_hook3 = threading.excepthook
+threading.excepthook = lambda a: None
+try:
+    _th3.start()
+    _th3.join(5)
+finally:
+    threading.excepthook = _saved_hook3
+    pg.Pager.poke = _saved_poke
+    pg._DOORBELL[0] = _saved_db3
+check("chain: a worker that dies for ANY reason still tells the operator "
+      "something", _ws3 != [])
+check("chain: ...and does not claim it finished, because this box cannot know",
+      _ws3 and "cannot tell you whether" in _ws3[-1])
+check("chain: ...and does not imply the money is safe either",
+      _ws3 and "nothing was spent" not in _ws3[-1].lower())
+check("chain: ...and busy is released, so the pager keeps working",
+      not _wp3.busy.locked())
+
+# ...AND THE UPDATE CURSOR CANNOT KILL THE PROCESS. limits.save() sat outside
+# the per-update try, and the doorbell's HTTP server runs IN THIS PROCESS: a
+# card fault plus any incoming update -- including one from a stranger the
+# allowlist would ignore a line later -- tore the interpreter down mid-wake
+# and took the socket with it. updates() carries a long note about exactly
+# that outcome; this line walked around it.
+_src_run = _SRC_PG.split("def run(")[1].split("\n    def ")[0]
+# TO THE END OF THE BRANCH, not a fixed window. The comment above the code is
+# longer than any slice guessed by eye, and a window that misses the line
+# reads as a failure while the code is right -- which is exactly the mistake
+# this check would otherwise be reporting.
+_save_line = _src_run.split("self.limits.offset = max(")[1].split(
+    "                else:")[0]
+check("cursor: limits.save() in the poll loop is guarded",
+      "try:" in _save_line and "self.limits.save()" in _save_line)
+check("cursor: ...and the failure is reported rather than swallowed",
+      "could not persist the update cursor" in _save_line)
+check("cursor: ...and the in-memory offset is advanced BEFORE the write, so a "
+      "failed save does not replay the batch inside this process",
+      _src_run.index("self.limits.offset = max(")
+      < _src_run.index("self.limits.save()"))
+
+
 print("\n== one wallet, several people ==")
 _saved_m = (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy, pg.load_token)
 pg.validate_proxy = lambda u: "socks5h://x"

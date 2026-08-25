@@ -767,6 +767,91 @@ def test_signer_records_the_total_it_signed_against():
           "signed_count < len(entries)" in body)
 
 
+# --------------------------------------------------------------------------
+# A PROGRESS FILE THAT NAMES NO BLOB SET WAS APPLIED TO ANY BLOB SET.
+#
+# Both staleness fences read `if saved_fp and saved_fp != ...`, so an absent,
+# empty or null blob_fingerprint disabled BOTH, and the `relayed` list was
+# applied to whatever batch was in hand. Driven against the shipped main()
+# with three unsent transactions and a progress file listing all three:
+#
+#     missing   -> relayed 0/3, exit 0, silent
+#     ""        -> relayed 0/3, exit 0, silent
+#     v1 shape  -> relayed 0/3, exit 0, prints "Migrated v1 progress file:
+#                  3 relayed, 0 permanently failed."
+#
+# Money that never leaves, reported as delivered. airgap_tx_signer made the
+# identical change for plan_fingerprint one stage earlier.
+# --------------------------------------------------------------------------
+def _with_progress(h, body):
+    with open(os.path.join(h.work, "broadcast_progress.json"), "w") as f:
+        json.dump(body, f)
+    return ["--resume", os.path.join(h.work, "broadcast_progress.json")]
+
+
+def test_progress_without_a_blob_fingerprint_is_refused():
+    _REL = ["tx_0.signed", "tx_1.signed", "tx_2.signed"]
+    for _body, _label in (
+            ({"schema": load("broadcast_signed_xmr").PROGRESS_SCHEMA,
+              "relayed": _REL, "failed_perm": [], "log": []},
+             "the field is missing"),
+            ({"schema": load("broadcast_signed_xmr").PROGRESS_SCHEMA,
+              "blob_fingerprint": "", "relayed": _REL, "failed_perm": [],
+              "log": []}, "the field is an empty string"),
+            ({"schema": load("broadcast_signed_xmr").PROGRESS_SCHEMA,
+              "blob_fingerprint": None, "relayed": _REL, "failed_perm": [],
+              "log": []}, "the field is null"),
+            ({"relayed": [0, 1, 2], "failed_perm": [], "log": []},
+             "a v1 position-keyed file with no blob set")):
+        h = Harness(n=3)
+        code, msg = h.run(extra=_with_progress(h, _body))
+        check(f"progress: {_label} — the batch is REFUSED, not silently "
+              f"skipped", code != 0)
+        check(f"progress: {_label} — and nothing was relayed under it",
+              h.posts == [])
+    # THE MESSAGE HAS TO SAY WHAT WOULD HAVE HAPPENED, because the operator's
+    # instinct on a refusal about a progress file is to delete or edit it --
+    # which is what produces this state in the first place.
+    h = Harness(n=3)
+    code, msg = h.run(extra=_with_progress(
+        h, {"schema": load("broadcast_signed_xmr").PROGRESS_SCHEMA,
+            "relayed": _REL, "failed_perm": [], "log": []}))
+    check("progress: the refusal says it would have skipped transactions that "
+          "were never sent", "never sent" in msg)
+    check("progress: ...and that it would have exited reporting success",
+          "reporting success" in msg)
+    check("progress: ...and tells them not to add the field by hand",
+          "by hand" in msg)
+
+
+def test_a_real_resume_still_resumes():
+    """NON-VACUITY, and the one that matters: this must not brick --resume."""
+    h = Harness(n=3)
+    code, _ = h.run()
+    check("progress: NON-VACUITY -- a fresh run still relays everything",
+          len(h.posts) == 3 and code == 0)
+    with open(os.path.join(h.work, "broadcast_progress.json")) as f:
+        _prog = json.load(f)
+    check("progress: ...and records a blob_fingerprint, so the field the "
+          "refusal demands is one the tool actually writes",
+          isinstance(_prog.get("blob_fingerprint"), str)
+          and _prog["blob_fingerprint"])
+    # Same blobs, so the same fingerprint; two of three already done.
+    h2 = Harness(n=3)
+    _p2 = dict(_prog, relayed=_prog["relayed"][:2])
+    code2, _ = h2.run(extra=_with_progress(h2, _p2))
+    check(f"progress: NON-VACUITY -- a matching resume relays only what is "
+          f"left ({len(h2.posts)} of 3) and succeeds",
+          len(h2.posts) == 1 and code2 == 0)
+    # ...and a WRONG fingerprint is still caught, which was already true.
+    h3 = Harness(n=3)
+    code3, msg3 = h3.run(extra=_with_progress(
+        h3, dict(_prog, blob_fingerprint="deadbeef" * 4)))
+    check("progress: NON-VACUITY -- a fingerprint naming another batch is "
+          "still refused for its own reason",
+          code3 != 0 and h3.posts == [] and "DIFFERENT set of blobs" in msg3)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

@@ -834,13 +834,54 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  # tests/test_wake_agent.py recomputes both from GhostSpiral's
                  # arithmetic so they cannot drift apart.
                  "--wallets", str(withdraw_wallets(params["depth"])),
-                 # THE CUT. See the GS_USAGE_FEE_ADDRESS block in _dispatch
-                 # for why this was missing and what it cost. A boolean with
-                 # no value in it: the address, if this machine's keyfile
-                 # names one, rides in the environment instead.
-                 "--usage-fee",
-                 "--output", str(artifact_dir)]]
+                 "--output", str(artifact_dir)]
+                + _withdraw_fee_argv(key)]
     raise Refused("unknown_job", "no argv template for this job")
+
+
+def _withdraw_fee_argv(key: dict) -> list:
+    """["--usage-fee"] only when the cut has somewhere to go that is NOT here.
+
+    A CUT MINTED ON THIS WALLET IS A CUT THIS WALLET WILL HAND BACK.
+    GhostSpiral's plan_usage_fee, with no fixed destination, mints a FRESH
+    account and subaddress on the wallet being mixed and deliberately keeps it
+    out of addr_index so the exit will not sweep it -- "it is not mixed and it
+    is not swept by the exit, it is yours where it lands". That hold works
+    inside one run, because it is one process's own in-memory index.
+
+    _funded_entry is a DIFFERENT PROCESS re-enumerating the same wallet, and it
+    has never heard of addr_index. It takes the largest unlocked output there
+    is. Driven against both shipped functions:
+
+        after a withdrawal completes, the exit having swept every run account
+        wallet holds: 0.0220 XMR, the operator's fee, on account 7 sub 3
+        _funded_entry -> account 7 sub 3, 0.0220 XMR
+
+    -- and the pager's own completion message says "/withdraw again for the
+    next", so the next tap mixes the operator's revenue and pays it to the
+    address the chat named. It compounds: that run takes a fee of the fee.
+
+    THE MIRROR CASE NEEDS NO COMPLETED RUN. Any stale fee output larger than
+    the user's live balance becomes the target of EVERY withdrawal, and if it
+    is under the mixing minimum the run dies at stage 0 -- so the user's own
+    money cannot be withdrawn from the phone at all.
+
+    WHY THIS AND NOT A SKIP-LIST. Recording the minted pairs and having
+    _funded_entry skip them was the other candidate. It needs a new file in
+    artifact_dir, and paranoia_mode wipes artifact_dir -- so the protection
+    disappears exactly when the operator has been most careful, and the bug
+    comes back silently. This needs no state at all.
+
+    A FEE IS STILL AVAILABLE, and the honest way to take one from a wallet you
+    are emptying is to send it somewhere else: pair with --usage-fee-address
+    and the cut goes there, never onto the wallet, and plan_usage_fee already
+    waives if that address turns out to be inside this wallet after all. With
+    no address, a phone withdrawal takes no fee -- which costs the operator a
+    percentage and is strictly better than paying the whole fee account out to
+    somebody else.
+    """
+    return ["--usage-fee"] if str(key.get("usage_fee_address") or "").strip() \
+        else []
 
 
 #: Where a woken job's children write. NOT the journal. 0600, in the artifact
@@ -1836,7 +1877,29 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # The job SUCCEEDED as long as it ran and wrote an answer. Only a hard
         # kill or a missing answer is a real failure.
         if rc != 0 and job in ("swap_status", "watch") and not hard:
-            if (artifact_dir / STATUS_FILE).exists():
+            # AN ANSWER, NOT A FILE. This checked that STATUS_FILE EXISTS and
+            # nothing else -- so a probe killed at its budget, which writes
+            # {"state": "interrupted"} on its way out, counted as a success.
+            #
+            # _PHASE_OF_STATE maps "interrupted" to "", meaning no phase was
+            # earned. The vault then reported "done" with no phase, and the
+            # pager's done-branch falls past the phase reply into the SLIP
+            # branches. Driven on a deposit handle:
+            #
+            #   /check A3F1, probe killed at its budget
+            #     seal_slip_for_delivery(status="done") -> 568 chars
+            #     plain_slip_for_chat(status="done")    -> b d h m x
+            #     and the memo field carries the destination XMR address whole
+            #
+            # So "has my payment arrived?" re-published the entire deposit
+            # slip into the transcript, captioned as ready, for a probe that
+            # answered nothing. Twice the exposure of the original delivery,
+            # bought with a question about it.
+            #
+            # _phase_of is the exact test for "did this probe earn an answer":
+            # it reads the same file, maps the state through the protocol's
+            # closed table, and returns "" for every state that did not.
+            if _phase_of(job, artifact_dir):
                 continue
         if rc != 0:
             if hard:
