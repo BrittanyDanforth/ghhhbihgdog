@@ -1661,8 +1661,34 @@ class Pager:
             return
         if err == "cancel":
             self.convos.pop(cid, None)
-            self.send(cid, "cancelled. Nothing was woken." if had_convo
-                      else "nothing to cancel.")
+            # THREE ANSWERS, BECAUSE THERE ARE THREE STATES. This had two, and
+            # the missing one is the state an operator is most likely to be in
+            # when they type /cancel: a wake already running.
+            #
+            # A conversation is cancellable and a WAKE IS NOT -- the vault has
+            # collected the job and is executing it on a machine nothing here
+            # can reach. But answering "nothing to cancel" while a withdrawal
+            # holds `busy` for the better part of a day is the bot flatly
+            # contradicting itself: the very next command answers "a wake is
+            # already running". The operator is told nothing is happening and
+            # then refused because something is.
+            #
+            # So the third answer says what is true -- something IS running,
+            # it cannot be stopped from here, and this is why everything else
+            # is being refused. `busy` is checked AFTER the conversation pop,
+            # because cancelling a half-typed wizard is still possible and
+            # still worth confirming while a job runs.
+            if had_convo:
+                self.send(cid, "cancelled. Nothing was woken.")
+            elif self.busy.locked():
+                self.send(cid,
+                          "nothing half-typed to cancel — but a wake IS "
+                          "running, and it cannot be stopped from here. The "
+                          "machine has the job and is working through it; "
+                          "that is also why other commands are being "
+                          "refused. It will report back when it finishes.")
+            else:
+                self.send(cid, "nothing to cancel.")
             return
         if err == "settings":
             self.send(cid, self._settings_text())

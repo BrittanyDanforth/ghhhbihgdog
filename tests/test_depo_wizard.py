@@ -782,6 +782,63 @@ fe.say("/cancel")
 check("/cancel with nothing running says so rather than lying",
       "nothing to cancel" in fe.text())
 
+# AND THE THIRD STATE, WHICH IS THE ONE AN OPERATOR IS MOST LIKELY IN.
+#
+# /cancel had two answers for three states. With no half-typed conversation
+# but a WAKE IN FLIGHT it said "nothing to cancel." -- while a withdrawal held
+# `busy` for up to sixteen hours and every other command was being refused
+# with "a wake is already running". The bot told the operator nothing was
+# happening and then refused them because something was. That flat
+# self-contradiction is the thing that reads as broken software.
+#
+# A wake genuinely cannot be cancelled: the vault has collected the job and is
+# running it on a machine nothing here can reach. So the fix is not a cancel,
+# it is an honest answer.
+_cb = Fake()
+_cb.p.busy.acquire()                       # a wake is running, no conversation
+_cb.say("/cancel")
+_cbt = _cb.text()
+check("/cancel with a WAKE running does not claim there is nothing to cancel",
+      "nothing to cancel." not in _cbt)
+check("...and says a wake is running instead",
+      "wake is running" in _cbt.lower() or "wake IS running" in _cbt)
+check("...and says plainly that it cannot be stopped from here, rather than "
+      "implying it was", "cannot be stopped" in _cbt.lower())
+check("...and explains why everything else is being refused",
+      "refused" in _cbt.lower())
+check("...and wakes nothing itself", _cb.pokes == [])
+# A HALF-TYPED CONVERSATION IS STILL CANCELLABLE WHILE A WAKE RUNS -- and
+# building that state took a correction. The obvious construction (hold
+# `busy`, then /depo) does not produce it: begin_convo REFUSES to start a
+# conversation while a wake runs, deliberately, because a wake outlives
+# CONVO_TTL_S and the operator would walk the whole wizard to be refused at
+# the end. So a live conversation can only coexist with a wake if it was
+# started FIRST -- which happens for real whenever two chats are allowlisted
+# and the other one pokes.
+_cc = Fake()
+_cc.say("/depo")
+check("/cancel: the state exists -- a conversation started before the wake",
+      111 in _cc.p.convos)
+_cc.p.busy.acquire()                       # now the other chat's wake begins
+_cc.sent.clear()
+_cc.say("/cancel")
+check("/cancel still cancels a half-typed wizard while a wake runs",
+      "Nothing was woken" in _cc.text() and 111 not in _cc.p.convos)
+# AND THE GUARD THAT MADE THE FIRST VERSION OF THIS CHECK WRONG IS ITSELF
+# WORTH PINNING: a wizard cannot be STARTED during a wake.
+_ce = Fake()
+_ce.p.busy.acquire()
+_ce.say("/depo")
+check("/cancel: ...and a wizard cannot be started during a wake at all",
+      111 not in _ce.p.convos
+      and "already running" in _ce.text())
+# NON-VACUITY: with nothing running at all the plain answer is unchanged, so
+# the new branch is about `busy` and not a rewrite of every cancel.
+_cd = Fake()
+_cd.say("/cancel")
+check("/cancel: NON-VACUITY -- idle still answers 'nothing to cancel.'",
+      "nothing to cancel." in _cd.text())
+
 # THEY ANSWER "WHERE", AND DELIBERATELY NAME NO IDENTIFIER.
 #
 # THE ANSWER, AND NOTHING AROUND IT.
