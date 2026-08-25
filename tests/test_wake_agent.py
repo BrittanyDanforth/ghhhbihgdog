@@ -1504,6 +1504,56 @@ check("wallet: NON-VACUITY -- a withdrawal composes BOTH --rpc-primary and "
       and _wargv[_wargv.index("--rpc-primary") + 1]
           != _wargv[_wargv.index("--wallet-file") + 1])
 
+# ---- ONCE THE JOB IS OFF THE DOORBELL, EVERY ENDING OWES IT AN ANSWER ---
+#
+# run_once wraps _run_validated in `except (Refused, SystemExit)` and reports
+# "refused" before re-raising, under a comment that describes fixing exactly
+# this. It fixed it for the two exception types it was thinking about. An
+# ordinary Python failure -- AttributeError, KeyError, an OSError off a full
+# disk -- sailed straight past: main() logs the traceback, the finally powers
+# the machine off, and the doorbell is told NOTHING.
+#
+# The Pi then waits out the ENTIRE result budget and reports "collected but
+# never reported back ... CHECK THE VAULT" for a job that died in its first
+# second. For a withdrawal that is 59400s, so a one-line bug on the vault
+# holds the pager's one-job lock -- and every other command with it -- for
+# sixteen and a half hours.
+#
+# DRIVEN by breaking a function on the reporting path, which nothing wraps.
+_crash_d, _crash_kf, _crash_key, _crash_bell = new_env()
+_crash_dp = deps_for(_crash_d, _crash_bell)
+_real_seal = A.seal_slip_for_delivery
+
+
+def _seal_boom(*_a, **_k):
+    raise AttributeError("simulated bug on the reporting path")
+
+
+try:
+    A.seal_slip_for_delivery = _seal_boom
+    try:
+        run(_crash_kf, _crash_dp)
+    except BaseException:                                    # noqa: BLE001
+        pass
+finally:
+    A.seal_slip_for_delivery = _real_seal
+_crash_posted = [_pth for _pth, _r in _crash_dp["_posted"]]
+check("crash: an ordinary Python failure after collection still reports back "
+      "to the doorbell", "/result" in _crash_posted)
+# NON-VACUITY 1: the job really was collected, or "never reported" would be
+# the correct answer rather than the defect.
+check("crash: NON-VACUITY -- the job really had been handed over first",
+      "/wake" in _crash_posted)
+# NON-VACUITY 2: the exception really did escape, so this is about an
+# unhandled crash and not a refusal that was already covered.
+check("crash: NON-VACUITY -- the injected failure is not a Refused, so the "
+      "old two-type handler could not have caught it",
+      not issubclass(AttributeError, (A.Refused, SystemExit)))
+# AND THE WAIT IT AVOIDS IS THE REASON IT MATTERS.
+check(f"crash: ...which is what stops the Pi waiting "
+      f"{P.result_budget_s('withdraw')}s for an answer that was never coming",
+      P.result_budget_s("withdraw") > 3600)
+
 # ---- SYSTEMD MUST NOT KILL THE JOB BEFORE THE DEADMAN DOES --------------
 #
 # THE WORST ONE IN THIS FILE'S HISTORY, and it defeated every other bound.

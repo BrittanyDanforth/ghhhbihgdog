@@ -1172,11 +1172,35 @@ def run_once(args, deps: dict = None) -> tuple:
     # SystemExit is in the handler because gs_common's verify_tor aborts that
     # way; an abort is still a refusal the doorbell can be told about, and
     # main()'s finally still powers the machine off after it.
+    #
+    # BaseException, NOT (Refused, SystemExit), AND THAT NARROW TUPLE WAS THE
+    # SAME DEFECT WEARING A DIFFERENT EXCEPTION CLASS.
+    #
+    # The paragraph above describes fixing exactly this and then fixed it only
+    # for the two exception types it happened to be thinking about. Any
+    # ordinary Python failure inside _run_validated -- an AttributeError, a
+    # KeyError, an OSError off a full disk -- sailed past this handler.
+    # main() logs it, the finally powers the machine off, and the doorbell is
+    # never told anything at all.
+    #
+    # What that costs the operator is the sentence this comment already calls
+    # "the defect this repo names most often, wearing a network timeout as a
+    # disguise": the Pi waits out the ENTIRE result budget and then reports
+    # "collected but never reported back ... CHECK THE VAULT" for a job that
+    # crashed in its first second. For a withdrawal that budget is 59400s, so
+    # a one-line bug on the vault holds the pager's one-job lock -- and every
+    # other command with it -- for sixteen and a half hours.
+    #
+    # It re-raises unchanged, so main()'s handler still writes the traceback
+    # and the finally still powers off. report_back is internally
+    # exception-safe and the doorbell refuses a second answer for a job
+    # already reported, so this cannot overwrite a real result posted just
+    # before a crash.
     try:
         return _run_validated(d, key, artifact_dir, state_deps=(
             job_id, job, params, challenge, _sleep, _rng, _verify_tor,
             _accounts, _child))
-    except (Refused, SystemExit) as e:
+    except BaseException as e:
         report_back(key, job_id, challenge.hex(), "refused", "",
                     poster=d.get("post_record"))
         raise e

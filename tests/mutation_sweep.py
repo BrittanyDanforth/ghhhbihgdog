@@ -554,11 +554,11 @@ MUTATIONS = [
  # Pi times out and tells the operator "this job may already be done. CHECK THE
  # VAULT" when nothing ran.
  ("a post-collection refusal never reaches the doorbell", "gs_wake_agent",
-  "    except (Refused, SystemExit) as e:\n"
+  "    except BaseException as e:\n"
   '        report_back(key, job_id, challenge.hex(), "refused", "",\n'
   '                    poster=d.get("post_record"))\n'
   "        raise e",
-  "    except (Refused, SystemExit) as e:\n        raise e",
+  "    except BaseException as e:\n        raise e",
   ["test_wake_agent"]),
 
  # A slow answer was structurally unreportable while the window was checked
@@ -2686,6 +2686,22 @@ MUTATIONS = [
   '                        integrity_log("pager", "withdraw_result_undelivered")',
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
+
+ # run_once reported back for (Refused, SystemExit) only. An ordinary Python
+ # failure after the job was collected told the doorbell nothing, so the Pi
+ # waited out the whole result budget -- 59400s for a withdrawal -- and then
+ # said "CHECK THE VAULT" for a job that died in its first second.
+ ("a crash after collection goes back to telling the doorbell nothing",
+  "gs_wake_agent",
+  "    except BaseException as e:\n"
+  "        report_back(key, job_id, challenge.hex(), \"refused\", \"\",\n"
+  "                    poster=d.get(\"post_record\"))\n"
+  "        raise e",
+  "    except (Refused, SystemExit) as e:\n"
+  "        report_back(key, job_id, challenge.hex(), \"refused\", \"\",\n"
+  "                    poster=d.get(\"post_record\"))\n"
+  "        raise e",
+  ["test_wake_agent"]),
 
  # THE WORST ONE: Type=oneshot applies TimeoutStartSec to the whole ExecStart,
  # so systemd killed the unit 2.5h into every withdrawal and OnFailure powered
