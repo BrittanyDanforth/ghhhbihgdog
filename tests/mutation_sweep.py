@@ -867,19 +867,19 @@ MUTATIONS = [
  # One job, once: the doorbell caches its answer against (eph_pk, challenge) so
  # a retry and a LAN replay are the same request.
  ("the doorbell hands the job over on every fetch", "gs_doorbell",
-  "        cached = self._issued.get((eph, chal))\n"
-  "        if cached is not None:\n"
-  '            self.events.append("m1_retry")\n'
-  "            return cached",
-  "        pass",
+  "            cached = self._issued.get((eph, chal))\n"
+  "            if cached is not None:\n"
+  '                self.events.append("m1_retry")\n'
+  "                return cached",
+  "            pass",
   ["test_wake_doorbell"]),
 
  # The doorbell may learn a 4-hex label and nothing else.
  ("the doorbell accepts any handle length", "gs_doorbell",
-  '        if status == "done":\n'
-  "            if not proto.HANDLE_RE.match(handle):",
-  "        if False:\n"
-  "            if not proto.HANDLE_RE.match(handle):",
+  '            if status == "done":\n'
+  "                if not proto.HANDLE_RE.match(handle):",
+  "            if False:\n"
+  "                if not proto.HANDLE_RE.match(handle):",
   ["test_wake_doorbell"]),
 
  # time.monotonic() is seconds since BOOT on Linux, so a rate-limiter starting
@@ -2642,7 +2642,8 @@ MUTATIONS = [
  # channel exists for -- took no cut at all while gs_console's did.
  ("the wake path goes back to taking no usage fee at all",
   "gs_wake_agent",
-  '    return ["--usage-fee"] if fee_addresses(key, exclude=dests) else []',
+  '    return ["--usage-fee"] if fee_addresses(\n'
+  "        key, exclude=list(dests) + list(owned)) else []",
   "    return []",
   ["test_wake_agent"]),
 
@@ -2674,8 +2675,9 @@ MUTATIONS = [
  # 9900 -- a hand-copied duration that stopped being true and nothing noticed.
  ("the working message goes back to a duration nobody can wait out",
   "gs_telegram_pager",
-  '            _hold = proto.result_budget_s(job)\n',
-  "            _hold = 9900\n",
+  "            _hold = (proto.result_budget_s(job)\n"
+  '                     + getattr(doorbell(), "FETCH_WINDOW_S", 0))',
+  "            _hold = 9900",
   ["test_telegram_pager"]),
 
  # The only notification that a spend finished, after up to sixteen hours and
@@ -2875,8 +2877,8 @@ MUTATIONS = [
   "gs_telegram_pager",
   # Re-anchored: the help is BUILT from BOT_COMMANDS now, so the figure lives
   # there. It must still include the jitter the operator actually waits.
-  '    ("check", "has my payment arrived yet (10-25 min)"),',
-  '    ("check", "has my payment arrived yet (~5 min)"),',
+  '    ("check", "has my payment arrived yet — /check A3F1"),',
+  '    ("check", "has my payment arrived yet"),',
   ["test_telegram_pager"]),
 
  # ---- chat text that arrives through a variable --------------------------

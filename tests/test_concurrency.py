@@ -540,6 +540,84 @@ check("the restore is in the source, guarded so a failure on the caller's "
       and "if _written < len(pending)" in _gs)
 
 
+# ---- THE AT-MOST-ONCE HANDOVER WAS A CHECK-THEN-ACT ---------------------
+#
+# Pending.on_m1 tested `if self._issued:`, then sealed an M2, then inserted.
+# gs_doorbell serves on a ThreadingHTTPServer and PyNaCl's cffi releases the
+# GIL across the seal -- so two authenticated M1s from two different boots,
+# posted together, both passed the emptiness test and both got a valid note
+# for the same job. Driven before the lock: 26 of 30 trials handed the job to
+# both, and `m1_second_ephemeral` was not even recorded in that interleaving,
+# so the CLI's own warning did not print either.
+#
+# The honest bound is that this is rare: a replayed M1's M2 is sealed to a
+# dead ephemeral, so real harm needs two GENUINE boots. But the code states an
+# invariant in its own comment -- "Queue depth is one: the second boot gets
+# nothing rather than a second copy of the job" -- and an invariant that holds
+# only when the scheduler cooperates is not one.
+print("\n-- one job, two boots, posted together --")
+import threading as _thr2
+import nacl.public as _NP2
+
+_dbm = load("gs_doorbell")
+_P2 = __import__("gs_wake_proto")
+_pi2, _tp2 = _NP2.PrivateKey.generate(), _NP2.PrivateKey.generate()
+_k2 = {"secret": _pi2.encode().hex(),
+       "peer_public": _tp2.public_key.encode().hex()}
+
+
+def _m1_for(_pend, _eph):
+    return _P2.seal(_tp2, _pi2.public_key, _P2.TAG_M1,
+                    {"eph_pk": _eph.public_key.encode().hex(),
+                     "challenge": "11" * 32, "window": _pend.window.hex()})
+
+
+_both, _trials = 0, 25
+for _i in range(_trials):
+    _pend = _dbm.Pending(_k2, "receive_new", {"count": 1}, clock=lambda: 0.0)
+    _ra = _m1_for(_pend, _NP2.PrivateKey.generate())
+    _rb = _m1_for(_pend, _NP2.PrivateKey.generate())
+    _got = []
+    _bar = _thr2.Barrier(2)
+
+    def _go(_rec):
+        _bar.wait()
+        try:
+            _pend.on_m1(_rec)
+            _got.append(1)
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    _t1 = _thr2.Thread(target=_go, args=(_ra,))
+    _t2 = _thr2.Thread(target=_go, args=(_rb,))
+    _t1.start(); _t2.start(); _t1.join(); _t2.join()
+    if len(_got) == 2:
+        _both += 1
+check(f"handover: two boots racing for one job -- exactly one wins, every "
+      f"time ({_both} double-handovers in {_trials} trials)", _both == 0)
+check("handover: ...and the loser is RECORDED, so the CLI's own warning can "
+      "still print", "m1_second_ephemeral" in _pend.events)
+# NON-VACUITY: the lock must not break the retry it exists alongside. A
+# genuine retry from the SAME boot reuses its ephemeral and gets the same note
+# back, consuming nothing -- which is what makes this at-most-once without a
+# counter.
+_pend3 = _dbm.Pending(_k2, "receive_new", {"count": 1}, clock=lambda: 0.0)
+_r3 = _m1_for(_pend3, _NP2.PrivateKey.generate())
+check("handover: NON-VACUITY -- a retry from the SAME boot still gets its own "
+      "note back", _pend3.on_m1(_r3) == _pend3.on_m1(_r3))
+check("handover: ...and is recorded as a retry, not as a second boot",
+      _pend3.events == ["job_collected", "m1_retry"])
+# ...AND THE RESULT PATH HAS THE IDENTICAL SHAPE. on_m3 tests "already
+# reported a result" at the top and assigns self.result at the bottom, with a
+# full record validation in between.
+_dbsrc = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
+_m3 = _dbsrc.split("def on_m3(")[1].split("\ndef ")[0]
+check("handover: the result path is under the same lock, since it is the same "
+      "read-modify-write", "with self._lock:" in _m3)
+check("handover: ...and the lock covers the assignment, not just the test",
+      _m3.index("with self._lock:") < _m3.index("self.result = {"))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

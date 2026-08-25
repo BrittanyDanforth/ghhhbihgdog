@@ -131,7 +131,8 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int,
           f"(index read-back + validate_address, nettype {v.get('nettype', '?')})")
 
 
-def mint_one_receive(wallet_rpc, args) -> tuple:
+def mint_one_receive(wallet_rpc, args, seen_addrs=None, seen_accts=None,
+                     n: int = 0, count: int = 1) -> tuple:
     """Create ONE receive address in its own account and write its bundle.
 
     Returns (address, bundle_path). Extracted from main() so --count can mint
@@ -272,6 +273,22 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
                   f"operation on this host. chmod 700 it yourself if that "
                   f"matters; this tool no longer changes a directory you "
                   f"chose.")
+    # REFUSED BEFORE THE FILE EXISTS, NOT AFTER.
+    #
+    # refuse_duplicate_receive was called from main()'s loop AFTER this
+    # function returned -- so by the time it printed "Refusing rather than
+    # writing bundles that all name it", two 0600 JSON files naming the same
+    # address were already on disk, and main() sys.exits inside the loop so
+    # nothing cleans them up. The sentence was false at the instant it was
+    # printed, and the operator had no reason to go and delete anything.
+    #
+    # Here, between verify and write, is the only place the claim is true.
+    # main() still calls it as well: that is the caller's own bookkeeping over
+    # the WHOLE run, and a guard asserted in one place and enforced in another
+    # is how this repo's own comments describe half its defects.
+    if seen_addrs is not None and seen_accts is not None:
+        refuse_duplicate_receive(addr_str, acct_idx, seen_addrs, seen_accts,
+                                 n, count)
     fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
     # WIPE COVERAGE, same helper, same reason. The bundle names the receive
@@ -538,9 +555,8 @@ def main():
     for n in range(args.count):
         if args.count > 1:
             print(f"\n  === receive {n + 1} of {args.count} ===")
-        _addr, _path, (_acct, _sub) = mint_one_receive(wallet_rpc, args)
-        refuse_duplicate_receive(_addr, _acct, _seen_addrs,
-                                 _seen_accts, n, args.count)
+        _addr, _path, (_acct, _sub) = mint_one_receive(
+            wallet_rpc, args, _seen_addrs, _seen_accts, n, args.count)
         _seen_addrs.add(_addr)
         _seen_accts.add(_acct)
         bundles.append((_addr, _path))
