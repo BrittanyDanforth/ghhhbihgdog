@@ -7456,6 +7456,27 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
     # fan-out plan, and that is built later, from the values returned here.
     # Waiving costs one run's fee; raising costs a settled swap.
     try:
+        # NOTHING IS LABELLED, and a label was tried here and backed out.
+        #
+        # The problem it was solving is real: gs_wake_agent._funded_entry is a
+        # different process re-enumerating this wallet, and the hold below is
+        # an omission in THIS process's addr_index, so a phone withdrawal took
+        # the fee account as if it were the user's money. Marking the account
+        # would have told it apart.
+        #
+        # It cannot be marked HERE. paranoia_mode deliberately never deletes
+        # the wallet file -- it is the only thing that can still spend the
+        # money -- so anything written INTO it outlives every artifact wipe
+        # this toolchain performs. An account labelled for the fee survives a
+        # seizure that erased the plans, the logs and the staging directory,
+        # and it does the analyst's arithmetic for them: it names which
+        # account is the operator's revenue, and the rate is public, so
+        # dividing by it gives the deposit. That is the exact linkability the
+        # cut is otherwise careful about.
+        #
+        # The fix went to the other end instead: gs_wake_agent takes no fee on
+        # a phone withdrawal unless the keyfile names somewhere OFF this
+        # wallet to put it. See _withdraw_fee_argv.
         _acct = create_fresh_account(rpc, label="")
         addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")
     except Exception as _e:

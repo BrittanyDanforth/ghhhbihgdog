@@ -310,6 +310,35 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
         check("a finished job reports the 4-hex handle", "A3F1" in _text)
         check("...and names no machine while doing it",
               "vault" not in _text.lower())
+    if _out == "refused":
+        # "TRY /status, THEN AGAIN" WAS WRONG HALF THE TIME, and wrong in the
+        # direction that costs the operator the thing it told them to spend.
+        #
+        # Refusals have two shapes and the reason is deliberately not on the
+        # wire, so this end cannot tell them apart. The wake budget clears by
+        # itself. The ACCOUNT CEILING does not: once the wallet holds its
+        # limit, minting is refused every single time, so /deposit and
+        # /address are dead until somebody is physically at the machine -- and
+        # the old message told the operator to keep trying, spending a wake on
+        # each identical refusal.
+        check("refused: it no longer tells the operator to just try again",
+              "then again" not in _text)
+        check("refused: ...it says a repeat may be the same refusal forever, "
+              "which is true of both kinds and needs no reason from the wire",
+              "refuse the same way every time" in _text)
+        check("refused: ...and gives the rule that is right either way",
+              "a second try is refused" in _text and "stop" in _text)
+        check("refused: ...and says retrying is not free",
+              "spends part of the daily allowance" in _text)
+        check("refused: ...while still naming no machine and no reason",
+              "vault" not in _text.lower() and "ceiling" not in _text.lower()
+              and "budget" not in _text.lower())
+        # THE RENDERED MESSAGE, not the literals it is built from. The ceiling
+        # in test_depo_wizard measures string constants, and this reply is
+        # several joined with `+` -- so a paragraph can be added there in
+        # pieces that each pass. Measured here as the operator receives it.
+        check(f"refused: ...and the whole rendered reply stays short "
+              f"({len(_text)} chars)", len(_text) <= 420)
 pg.doorbell = _real_doorbell
 
 
@@ -1156,9 +1185,22 @@ try:
     # appears, which is the symptom this exists to fix.
     check("menu: ...and none of them carries a leading slash, which Telegram "
           "rejects", not any(c["command"].startswith("/") for c in _cmds))
-    check("menu: ...and none names a machine or an amount",
+    # AN AMOUNT, NOT A RATE. This refused any decimal at all, which caught
+    # "the 1.1% usage fee this service keeps" -- a RATE, published in the
+    # source as USAGE_FEE_PCT and the one number a newcomer most needs before
+    # they use the thing. The rule is about MAGNITUDES: what the menu must
+    # never carry is how much money anybody has. A percentage says nothing
+    # about that, so the check now excludes a decimal that is a percentage and
+    # keeps refusing every other one.
+    check("menu: ...and none names a machine or an amount (a RATE is not an "
+          "amount)",
           not any("vault" in c["description"].lower()
-                  or re.search(r"\d+\.\d", c["description"]) for c in _cmds))
+                  or re.search(r"\d+\.\d(?!\s*%)", c["description"])
+                  for c in _cmds))
+    check("menu: NON-VACUITY -- a real amount in a description WOULD be "
+          "caught",
+          re.search(r"\d+\.\d(?!\s*%)", "sends 0.05 BTC") is not None
+          and re.search(r"\d+\.\d(?!\s*%)", "the 1.1% usage fee") is None)
     # NOT FATAL. A pager that could not publish its menu still answers every
     # command; refusing to start over cosmetics is the wrong trade on the box
     # whose whole job is to be reachable.
@@ -1777,19 +1819,159 @@ _mp, _ms, _, _ = _tapper()
 _mp.handle(_msg(111, 111, "/help"))
 _labels = [l for _row in (_ms[0][1] or []) for l, _d in _row]
 check("tap: /help carries the menu",
-      any("Deposit" in l for l in _labels)
+      any("Bitcoin in" in l for l in _labels)
       and any("Withdraw" in l for l in _labels))
 # THE LABELS SAY WHICH WAY THE MONEY GOES. "Fresh address" sat next to
 # "Withdraw" and gave no clue which of them pays the operator -- the same
 # confusion as the command name it was drawn from.
 check("tap: the money-in buttons and the money-out button are marked with "
       "different arrows, so the direction is readable without the words",
-      any("\u2b07" in l and "Deposit" in l for l in _labels)
-      and any("\u2b07" in l and "Monero address" in l for l in _labels)
+      any("\u2b07" in l and "Bitcoin in" in l for l in _labels)
+      and any("\u2b07" in l and "Monero in" in l for l in _labels)
       and any("\u2b06" in l and "Withdraw" in l for l in _labels))
+# AND THE DIRECTION IS IN THE WORDS TOO, not only in the arrow. An arrow is a
+# glyph a client may render as a box, and a label that then reads "Monero
+# address" beside "Deposit Bitcoin" is the confusion the arrow was covering
+# for: an address is both a thing you are given and a thing you send to, so it
+# named a third direction this tool does not have.
+_lbl = [l for _row in pg.MENU_BUTTONS for l, _d in _row]
+check("tap: ...and each money button says its direction in words, so it "
+      "survives a client that does not render the arrow",
+      sum(l.endswith(" in") for l in _lbl) == 2
+      and any(l.startswith("\u2b06") and "pays you" in l for l in _lbl))
+# "WITHDRAW" ALONE HAS NO OBJECT for somebody who has deposited nothing yet,
+# which is precisely who is looking at this menu under the welcome.
+check("tap: ...and the money-out button says who it pays, which is the "
+      "question the old command name got wrong",
+      any("pays you" in l for l in _lbl))
+# THE BUTTON THAT PROMISED AN OVERVIEW OPENED A SETTINGS TABLE.
+check("tap: ...and no button promises an overview it does not open",
+      not any("What this does" in l for l in _lbl)
+      and any("What a run does" in l for l in _lbl))
 check("tap: ...and every button on it maps to a real command",
       all(pg.parse_callback(_d)[1] == ""
           for _row in (_ms[0][1] or []) for _l, _d in _row))
+
+# ---- A DEPTH BUTTON IS ONLY A DEPTH WHILE SOMETHING IS ASKING FOR ONE ----
+#
+# parse_callback turns a tap into "the text the typed path would have
+# received", which is what makes taps and typing identical everywhere else.
+# For the depth menu that text is a BARE DIGIT -- and a bare digit means
+# whatever the live conversation is currently reading digits as.
+#
+# Telegram keyboards do not expire; the menu stays under its message forever.
+# So: /withdraw, address given, depth menu drawn, abandoned; /deposit typed;
+# the operator scrolls up and taps "20 hops". Driven before the gate existed,
+# the reply was "Deposit 3 BTC" and a confirm sum -- a deposit two orders of
+# magnitude out, with the operator primed to answer because they had just
+# tapped a button and a question appeared.
+print("\n== a button from an earlier question ==")
+_dp, _ds, _dt, _dj = _tapper()
+_dp.handle(_msg(111, 111, "/withdraw"))
+_dp.handle(_msg(111, 111, "4" + "1" * 94))
+_dp.handle(_msg(111, 111, "/deposit"))
+_ds.clear()
+_dt.clear()
+_dj.clear()
+_tap(_dp, "d:3")
+check("stale tap: it starts nothing", _dj == [])
+check("stale tap: ...and writes nothing to the transcript", _ds == [])
+check("stale tap: ...and says so on the tapper's own screen instead",
+      len(_dt) == 1 and "earlier question" in _dt[0])
+check("stale tap: ...and the live conversation is untouched — still the "
+      "deposit wizard, still waiting for its amount",
+      _dp.convos.get(111) is not None
+      and _dp.convos[111].kind == "depo"
+      and _dp.convos[111].amount is None)
+# NON-VACUITY, and it is the half that matters: the gate must not break the
+# button it is guarding.
+_dp2, _ds2, _dt2, _dj2 = _tapper()
+_dp2.handle(_msg(111, 111, "/withdraw"))
+_dp2.handle(_msg(111, 111, "4" + "1" * 94))
+_ds2.clear()
+_tap(_dp2, "d:3")
+check("stale tap: NON-VACUITY -- the same tap while a depth IS being asked "
+      "for still answers it",
+      _dp2.convos.get(111) is not None and _dp2.convos[111].depth == 3)
+# ...AND WITH NO CONVERSATION AT ALL, which is the other way to arrive here:
+# the wizard timed out, or was answered hours ago, and the keyboard is still
+# on screen.
+_dp3, _ds3, _dt3, _dj3 = _tapper()
+_tap(_dp3, "d:3")
+check("stale tap: ...and a depth tapped with nothing running at all is "
+      "refused the same way", _dj3 == [] and _ds3 == [] and len(_dt3) == 1)
+
+# ---- A COMMAND ABANDONS THE CONVERSATION, AND NOW SAYS SO ---------------
+#
+# The rule is right and the silence around it was the whole problem. Driven
+# end to end before the notice existed:
+#
+#     /deposit  -> "How much? Reply with the BTC amount..."
+#     /status   -> "ready"                (the wizard is now gone)
+#     0.05      -> "no: unknown command"
+#
+# The operator answered the question they were asked and was told their answer
+# is not a command. Nothing in that sequence says a command cancelled the thing
+# that was asking.
+print("\n== a command cancels the wizard, out loud ==")
+_ap, _as, _, _ = _tapper()
+_ap.handle(_msg(111, 111, "/deposit"))
+_as.clear()
+_ap.handle(_msg(111, 111, "/status"))
+_atext = "\n".join(t for t, _b in _as)
+check("abandon: a command mid-wizard says what it dropped",
+      "dropped the /deposit" in _atext)
+check("abandon: ...and that any command does it, so it is a rule and not a "
+      "glitch", "any command does" in _atext)
+check("abandon: ...and that nothing was sent",
+      "Nothing was sent" in _atext)
+check("abandon: ...and the command still answers, after the notice",
+      _as[-1][0] in ("ready", "wait"))
+check("abandon: ...and the conversation really is gone",
+      _ap.convos.get(111) is None)
+# /withdraw NAMES ITSELF, not "/deposit": the notice is built from the kind.
+_wp, _ws, _, _ = _tapper()
+_wp.handle(_msg(111, 111, "/withdraw"))
+_ws.clear()
+_wp.handle(_msg(111, 111, "/help"))
+check("abandon: ...and it names the wizard that was actually running",
+      "dropped the /withdraw" in "\n".join(t for t, _b in _ws))
+# /cancel MUST NOT SAY IT TWICE. Asked of parse_command rather than matched in
+# the branch: that branch has already been the place a second cancel
+# vocabulary got written and then disagreed with the first one.
+_cp, _cs, _, _ = _tapper()
+_cp.handle(_msg(111, 111, "/deposit"))
+_cs.clear()
+_cp.handle(_msg(111, 111, "/cancel"))
+_ctext = "\n".join(t for t, _b in _cs)
+check("abandon: /cancel says it once, in its own words, not twice",
+      "dropped the" not in _ctext and "cancelled" in _ctext.lower())
+# AND NO SPURIOUS NOTICE when there was nothing to drop.
+_np, _ns, _, _ = _tapper()
+_np.handle(_msg(111, 111, "/status"))
+check("abandon: ...and a command with no wizard running says nothing about "
+      "dropping one",
+      "dropped the" not in "\n".join(t for t, _b in _ns))
+
+# ---- AND THE ANSWER THAT ARRIVES AFTER IT --------------------------------
+#
+# handle() routes text to a live conversation first, so a bare message
+# reaching parse_command has no question waiting for it. "unknown command"
+# describes a mistyped command; it does not describe an amount or a pasted
+# address, which is what actually arrives here.
+_up, _us, _, _ = _tapper()
+_up.handle(_msg(111, 111, "0.05"))
+_utext = "\n".join(t for t, _b in _us)
+check("orphan answer: a bare amount is not called an unknown command",
+      "unknown command" not in _utext)
+check("orphan answer: ...it says nothing is waiting, and what to type",
+      "waiting for an answer" in _utext
+      and "/deposit" in _utext and "/withdraw" in _utext)
+check("orphan answer: ...and does not echo what they typed back into the "
+      "transcript, which may be an amount or an address",
+      "0.05" not in _utext)
+check("orphan answer: NON-VACUITY -- a mistyped COMMAND still gets the "
+      "command answer", pg.parse_command("/nope")[2] == "unknown command")
 _sp, _ss, _, _ = _tapper()
 _sp.handle(_msg(111, 111, "/status"))
 check("tap: /status carries it too — it is the command an operator sends in "
@@ -1919,6 +2101,119 @@ check("tap: ...and no callback maps to anything the typed vocabulary does "
 #  refuses to keep -- and a chat identifier on a wire that deliberately
 #  carries none. So the operator is made to say they know.
 # ===========================================================================
+# ===========================================================================
+#  "THE FEE" IS TWO DIFFERENT THINGS AND THE BOT NAMED NEITHER
+#
+#  The operator's USAGE FEE is 1.1% of a withdrawal and is what this service
+#  keeps. The Monero NETWORK fee is charged per transaction by the network, a
+#  mix is many transactions, and none of it comes here -- so it is the larger
+#  of the two. Conflating them costs in both directions: read as the mixing
+#  cost, the operator thinks they were overcharged; read as the network fee,
+#  they think the service is free.
+#
+#  Before this, /fee said "1.1% usage fee." and nothing else in the bot
+#  mentioned a fee at all -- not the welcome, not /settings, not the confirm
+#  where it is actually charged. A newcomer met the rate only by guessing that
+#  a command called /fee existed.
+# ===========================================================================
+print("\n== the usage fee, and the fee it is not ==")
+check("fee: the RATE is the one pinned to GhostSpiral's own constant, not a "
+      "literal retyped per surface",
+      pg.USAGE_FEE_LABEL in pg.WELCOME and pg.USAGE_FEE_LABEL in pg.FEE_ANSWER)
+# THE FIRST SCREEN. This is the whole of the user's request: somebody seeing
+# the bot for the first time must be told the rate without hunting for it.
+check("fee: the WELCOME states the usage fee on first sight",
+      "USAGE FEE" in pg.WELCOME and pg.USAGE_FEE_LABEL in pg.WELCOME)
+check("fee: ...and says it is what the SERVICE keeps",
+      "this service keeps" in pg.WELCOME)
+check("fee: ...and says which amount it comes out of",
+      "what you withdraw" in pg.WELCOME)
+# WHERE THE EXPLANATION LIVES, AND WHERE ONLY THE DISTINCTION DOES.
+#
+# A first draft put the full two-paragraph explanation on /fee as well, and it
+# failed test_depo_wizard's ceiling on that answer -- 40 characters, naming no
+# machine, tool or file. That ceiling is not decoration: the reasoning it
+# guards is in that file, and it is that /fee is asked REPEATEDLY, so anything
+# it says sits in the readable surface once per asking.
+#
+# The two requirements are not in conflict once the surfaces are separated:
+#
+#   * The WELCOME is sent ONCE, on /start, to somebody who has never seen the
+#     bot. That is the "first time seeing it" the explanation is for, and it
+#     is where the whole of it goes.
+#   * /fee is the lookup. One line, the rate, and the single clause that stops
+#     it being read as the mixing cost.
+#
+# So the deep checks below run on the welcome, and /fee gets the narrow one.
+check("fee: the welcome distinguishes it from the NETWORK fee",
+      "network fee" in pg.WELCOME.lower())
+check("fee: ...and says the network fee is not received here",
+      "none of that comes here" in pg.WELCOME.lower())
+check("fee: ...and that a mix is many transactions, which is why the network "
+      "fee is the larger one",
+      "many transactions" in pg.WELCOME.lower())
+check("fee: ...and says outright that the total leaving is more than the "
+      "usage fee alone, which is the number an operator will actually check",
+      "more than the usage fee" in pg.WELCOME.lower())
+# /fee CARRIES THE DISTINCTION IN ITS ONE LINE, or the answer is worse than
+# nothing: "1.1% usage fee." alone is what an operator reads as the cost of
+# mixing, and then a much larger amount leaves.
+check(f"fee: /fee says which fee it is NOT, in its one line ({pg.FEE_ANSWER!r})",
+      "not the network fee" in pg.FEE_ANSWER.lower())
+# AND IT STAYS UNDER THE OTHER SUITE'S CEILING, checked here too so a change
+# made in this file fails in this file rather than three suites away.
+check(f"fee: ...and stays one short line ({len(pg.FEE_ANSWER)} chars)",
+      len(pg.FEE_ANSWER) <= 40)
+# THE COMMAND LIST has to say which fee /fee is about, or the newcomer has no
+# reason to tap it -- and must NOT carry the rate, because HELP is built from
+# this list and test_depo_wizard pins the rate to /fee and nowhere else.
+# .get, NOT [], AND THAT IS NOT DEFENSIVENESS FOR ITS OWN SAKE. The mutation
+# sweep's entry for this guarantee DELETES the ("fee", ...) row from
+# BOT_COMMANDS -- and a bare subscript then raises KeyError, which kills the
+# whole suite before it reports. The sweep scores that NO-RESULT, i.e. "the
+# suite crashed, which proves nothing about its checks", and it is right to:
+# a crash is indistinguishable from the suite having no opinion. A missing row
+# has to FAIL here, loudly and specifically, not take the process with it.
+_feedesc = dict(pg.BOT_COMMANDS).get("fee", "")
+check("fee: /fee is published in the command list at all — an answer nobody "
+      "can find is an answer that is not built",
+      "fee" in dict(pg.BOT_COMMANDS))
+check(f"fee: the menu entry says whose fee it is ({_feedesc!r})",
+      "usage fee" in _feedesc and "not the network fee" in _feedesc)
+check("fee: ...and does not put the rate in the published command list, "
+      "which HELP is built from",
+      pg.USAGE_FEE_LABEL not in _feedesc)
+
+# AND AT THE MOMENT IT IS CHARGED. A cost disclosed only somewhere else is a
+# cost the person paying it can miss.
+_fp, _fs = _room_pager([111], [])
+_fp.start_job = lambda *a: None
+_fp.handle(_msg(111, 111, "/withdraw"))
+_fp.handle(_msg(111, 111, "4" + "1" * 94))
+_fp.handle(_msg(111, 111, "2"))
+check("fee: the withdraw CONFIRM names the usage fee, where the money moves",
+      pg.USAGE_FEE_LABEL in _fs[-1] and "usage fee" in _fs[-1])
+check("fee: ...and names the network fee beside it, so the operator is not "
+      "surprised by the larger one",
+      "network fee" in _fs[-1].lower())
+# NO ARITHMETIC. This box has never been told a balance -- /settings refuses
+# to fetch one -- so it may state the RATE and must not state a figure.
+check("fee: ...and quotes NO amount, because this box has no balance to "
+      "compute one from",
+      not re.search(r"\d+\.\d{3,}", _fs[-1]))
+check("fee: NON-VACUITY -- it is still the confirm question",
+      "SPENDS" in _fs[-1] and "= ?" in _fs[-1])
+
+# ...AND THE PHONE PATH REALLY IS CHARGED THAT RATE. GS_USAGE_FEE_PCT would
+# override it, and run_child strips every GS_ variable and re-adds only what
+# the dispatcher puts in env_extra -- which never includes the rate. So the
+# number this bot quotes is the number GhostSpiral's own constant charges.
+_ag_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("fee: the vault never passes a rate override, so the quoted rate is "
+      "the one actually charged",
+      "GS_USAGE_FEE_PCT" not in _ag_src)
+
+
 # ===========================================================================
 #  BOOKKEEPING MUST NOT PRE-EMPT THE REPORT
 #
@@ -2170,6 +2465,34 @@ try:
           "a phantom", "/check B7C2" in _atext)
     check("address: ...and the label is still bound to this chat",
           _ap.handle_owner.get("B7C2") == 111)
+    # ...AND THE WELCOME MUST AGREE WITH IT, which is the half that was wrong.
+    #
+    # The reply above has been honest since it was written. The WELCOME said
+    # "/address ... You get a fresh address to hand out" -- a promise that the
+    # chat hands over an address, on the surface a first-time reader meets
+    # before they ever run the command. Two surfaces describing one command in
+    # opposite terms is worse than either alone: the operator reads the
+    # welcome, runs /address, gets a label, and concludes the tool broke.
+    #
+    # AND IT IS TRUE ON EVERY CONFIGURATION, not just this fixture's. Both
+    # slip builders return "" for receive_new by construction -- there is no
+    # quote, so there is no thor_pairs file to build one from -- so no
+    # delivery key and no plain_slip setting can make the chat carry it.
+    _wel_addr = [l for l in pg.WELCOME.splitlines() if "/address" in l]
+    check("address: the welcome describes this command at all",
+          len(_wel_addr) == 1)
+    check("address: ...and does not promise the chat will hand over an "
+          "address, which no configuration can make true",
+          "you get a fresh address" not in _wel_addr[0].lower())
+    check("address: ...and says where the address really is read",
+          "at the machine" in pg.WELCOME)
+    # THE STRUCTURAL REASON, read from the source rather than from this
+    # fixture's empty slip: seal_slip_for_delivery returns "" when the handle
+    # record carries no slip path, and receive_new never writes one.
+    _ag = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+    check("address: ...and the reason is structural — the sealer returns "
+          "nothing when there is no quote to seal",
+          "receive_new mints addresses and quotes nothing" in _ag)
     # NON-VACUITY: a DEPOSIT with no slip still uses the original vocabulary,
     # so this is a branch and not a rewrite of every finished job.
     _dp2, _ds2, _, _ = _tapper()
@@ -2224,18 +2547,43 @@ check("welcome: a chat that is not allowlisted gets NO welcome — a reply is "
 # WHAT IT SAYS. Three things, in the order somebody needs them.
 check("welcome: it says which way each command moves money",
       "MONEY IN" in pg.WELCOME and "MONEY OUT" in pg.WELCOME)
-check("welcome: ...and names the rename directly, because an operator who "
-      "learned the old word has to be told it moved",
+check("welcome: ...and names both money-in commands and the money-out one",
       "/address" in pg.WELCOME and "/withdraw" in pg.WELCOME
-      and "receive" in pg.WELCOME.lower())
+      and "/deposit" in pg.WELCOME)
 check("welcome: ...and says outright which one pays them, since that is the "
       "question the old names got wrong",
-      "pays YOU is /withdraw" in pg.WELCOME)
+      "the one that pays YOU" in pg.WELCOME)
+# THE RENAME NOTE IS IN /help, NOT HERE, and that is the point of this pair.
+#
+# The welcome is read by somebody who has never used this bot. A sentence
+# about a command spelling that no longer exists is, to that reader, a fact
+# about a thing they have never seen -- it makes the shortest surface longer
+# and answers a question they cannot have. The reader it IS for is the one
+# with the old word already in their fingers, and that reader types /help.
+check("welcome: the rename is NOT explained to a first-time reader",
+      "receive" not in pg.WELCOME.lower())
+check("welcome: ...but the old spellings are still answered somewhere, so an "
+      "operator who learned them is not left guessing",
+      "/receive" in pg.HELP and "/send" in pg.HELP
+      and "still work" in pg.HELP)
+check("welcome: ...and every alias named there really is accepted",
+      all(pg.parse_command(_c)[0] == _j or pg.parse_command(_c)[2] == _j
+          for _c, _j in (("/receive", "receive_new"),
+                         ("/recv", "receive_new"),
+                         ("/send", "withdraw_wizard"),
+                         ("/depo", "depo_wizard"))))
 check("welcome: ...and the two things that change how the operator should "
       "behave in this chat",
       "written down" in pg.WELCOME and "until you confirm" in pg.WELCOME)
-check("welcome: ...and that the transcript should be assumed readable",
+check("welcome: ...and that this chat should be assumed readable",
       "read by somebody who is not you" in pg.WELCOME)
+# AND IT SAYS SO WITHOUT THE WORD "TRANSCRIPT", which is on the banned list in
+# test_depo_wizard for a reason this welcome originally walked straight into:
+# the sentence explaining that the omissions are deliberate because the
+# transcript is assumed read is itself a description of the arrangement. The
+# advice survives; the word that turns it into a disclosure does not.
+check("welcome: ...without naming the thing being read",
+      "transcript" not in pg.WELCOME.lower())
 
 # WHAT IT MUST NOT SAY, AND THE FIRST DRAFT SAID ALL OF IT.
 #

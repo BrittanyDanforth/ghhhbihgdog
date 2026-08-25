@@ -781,11 +781,31 @@ check("withdraw: ...and advertises no slip handle, because none was registered",
 # at a time" with "It moves everything at once" left the check green, because
 # "more than one place" further down the same message still contains "one".
 # A substring test on a word that common is a check that cannot fail.
-check("withdraw: ...and says it moved ONE ADDRESS, so the rest is not lost "
-      "track of",
-      "one address" in _mws[0].lower()
-      and "everything" not in _mws[0].lower()
+#
+# AND "ONE ADDRESS" WAS ITSELF THE AMBIGUITY. /withdraw takes up to
+# MAX_WAKE_EXIT_DESTS destinations by reply and the confirm calls them "the
+# addresses you just sent" -- so "this moves ONE address at a time" reads as
+# one of THOSE, telling an operator who gave five that four were skipped. The
+# next thing they do is run it again, which is a second real spend. The "one"
+# is at the source end, and the message has to say which end each is.
+check("withdraw: ...and says every destination they gave was paid, since the "
+      "job takes several and a doubt here costs a second spend",
+      "all of them" in _mws[0].lower())
+# THE NEEDLE IS THE WORD THAT CARRIES THE COUNT, and the first version of
+# this check missed that a second time. It tested for "arrived", "not all of
+# those" and "/withdraw" -- all three of which survive the mutation that
+# rewrites "It emptied ONE of the addresses" as "It emptied EVERY address".
+# The sweep found it and scored SURVIVED. Same lesson as the comment above,
+# one paragraph later: test the claim, not the vocabulary around it.
+check("withdraw: ...and separately that it emptied ONE of the addresses money "
+      "ARRIVED on, so the rest is not lost track of",
+      "emptied one of the addresses" in _mws[0].lower()
+      and "every address" not in _mws[0].lower()
+      and "not all of those" in _mws[0].lower()
       and "/withdraw" in _mws[0])
+check("withdraw: ...and gives the reason, which is why it is not a limitation "
+      "to be fixed later",
+      "same person" in _mws[0].lower())
 check("withdraw: ...and states no balance and no count, because this box has "
       "neither", not re.search(r"\d+\.\d", _mws[0]))
 # NON-VACUITY: a DEPOSIT still takes the ordinary path, so the withdrawal

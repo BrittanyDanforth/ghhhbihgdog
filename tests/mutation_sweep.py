@@ -2299,8 +2299,8 @@ MUTATIONS = [
  # could answer, about a number that means nothing on its own.
  ("the deposit wizard goes back to asking for a slot number",
   "gs_telegram_pager",
-  "        self.send(chat_id, self._amount_question())",
-  '        self.send(chat_id, "Which slot? Reply 0-7. /cancel to stop.")',
+  "        self.send(chat_id, self._amount_question(),",
+  '        self.send(chat_id, "Which slot? Reply 0-7. /cancel to stop.",',
   ["test_depo_wizard"]),
 
  # Offering three rungs and accepting eight offers a choice that is not there;
@@ -2611,8 +2611,8 @@ MUTATIONS = [
  # at.
  ("a failed withdrawal goes back to saying nothing the operator can act on",
   "gs_telegram_pager",
-  '                     "shallower one." if job == "withdraw" else "")',
-  '                     "shallower one." if False else "")',
+  '                     if job == "withdraw" else "")',
+  '                     if False else "")',
   ["test_plain_slip"]),
 
  # The hedge is load-bearing: this box has never been told a balance and must
@@ -2643,8 +2643,8 @@ MUTATIONS = [
  # channel exists for -- took no cut at all while gs_console's did.
  ("the wake path goes back to taking no usage fee at all",
   "gs_wake_agent",
-  '                 "--usage-fee",\n',
-  "",
+  '    return ["--usage-fee"] if fee_addresses(key) else []',
+  "    return []",
   ["test_wake_agent"]),
 
  # A completed spend reported "withdraw ready · slip A3F1": deposit vocabulary
@@ -2652,10 +2652,13 @@ MUTATIONS = [
  # so /check on it answers unknown_handle.
  ("a finished withdrawal goes back to reporting itself as a ready deposit",
   "gs_telegram_pager",
+  # Anchored on the branch line PLUS the first line of its comment: the bare
+  # `if job == "withdraw":` occurs twice at this indentation (here and in the
+  # failed-ending tail), and an anchor matching twice is scored SKIP.
   '            if job == "withdraw":\n'
-  '                _msg = ("withdraw: sent. The mix ran and the funds went to "',
+  '                # "ONE ADDRESS AT A TIME" NAMED THE WRONG END OF THE JOB.',
   '            if False:\n'
-  '                _msg = ("withdraw: sent. The mix ran and the funds went to "',
+  '                # "ONE ADDRESS AT A TIME" NAMED THE WRONG END OF THE JOB.',
   ["test_plain_slip"]),
 
  # And the sentence that stops two thirds of the money being forgotten:
@@ -2663,8 +2666,8 @@ MUTATIONS = [
  # moves one pile and the operator has to be told there may be more.
  ("the withdrawal message stops saying it moved only ONE address",
   "gs_telegram_pager",
-  '                        "This moves ONE address at a time — merging several "',
-  '                        "It moves everything at once — merging several "',
+  '                        "It emptied ONE of the addresses money had ARRIVED "',
+  '                        "It emptied EVERY address money had ARRIVED "',
   ["test_plain_slip"]),
 
  # "working. This takes a while." for a job that holds every command for the
@@ -2768,7 +2771,7 @@ MUTATIONS = [
  # mentioned them. A four-command blind spot that a green suite never saw.
  ("a working command goes back to being invisible in the menu and the help",
   "gs_telegram_pager",
-  '    ("fee", "what this keeps"),\n',
+  '    ("fee", "the usage fee this service keeps — not the network fee"),\n',
   "",
   ["test_telegram_pager"]),
 
@@ -2776,8 +2779,8 @@ MUTATIONS = [
  # accepts but the "/" menu never offers.
  ("an answer goes back to pointing at a command the menu does not offer",
   "gs_telegram_pager",
-  'EXIT_ANSWER = "Per withdrawal — see /send."',
   'EXIT_ANSWER = "Per withdrawal — see /withdraw."',
+  'EXIT_ANSWER = "Per withdrawal — see /cashout."',
   ["test_telegram_pager"]),
 
  # The vault's keyfile is the only place gs_wake_agent looks for the usage-fee
@@ -2785,8 +2788,24 @@ MUTATIONS = [
  # unreachable code.
  ("the usage-fee destination goes back to being unsettable",
   "gs_wake_keys",
-  '        "usage_fee_address": str(args.usage_fee_address or ""),\n',
+  '        "usage_fee_addresses": [str(a) for a in (args.usage_fee_address or [])],\n',
   "",
+  ["test_wake_agent"]),
+
+ # ONE ADDRESS COLLECTING EVERY RUN. The rate is published in this repo, so an
+ # arrival divided by it is the deposit behind it -- with a single destination
+ # that is every deposit the operator ever took. The flag is repeatable and the
+ # draw is per run; collapsing it back to the first entry is the reuse.
+ ("the fee always goes to the same address", "gs_wake_agent",
+  "    return (rng or random.SystemRandom()).choice(addrs)",
+  "    return addrs[0]",
+  ["test_wake_agent"]),
+
+ # ...AND THE OTHER DIRECTION: a keyfile field holding a dict or a None would
+ # reach str() and become a destination made of the word "None".
+ ("the fee address list stops checking what is in it", "gs_wake_agent",
+  "        out += [a.strip() for a in v if isinstance(a, str) and a.strip()]",
+  "        out += [str(a) for a in v]",
   ["test_wake_agent"]),
 
  # GhostSpiral refuses rather than guessing a fee it could not fetch (the
@@ -2837,9 +2856,9 @@ MUTATIONS = [
  # job is to answer "can I send one".
  ("/status discloses the wake count and the power state again",
   "gs_telegram_pager",
-  "            _why = self.limits.why_not()\n"
   "            self.send(cid, _why if _why\n"
-  '                      else ("wait" if self.busy.locked() else "ready"))',
+  '                      else ("wait" if self.busy.locked() else "ready"),\n'
+  "                      buttons=MENU_BUTTONS)",
   '            self.send(cid, f"pokes in last 24h: {len(self.limits.recent())}/"\n'
   '                           f"{self.limits.daily_cap}\\n"\n'
   '                           f"busy: {self.busy.locked()}")',
@@ -3003,7 +3022,7 @@ MUTATIONS = [
  # Every one of those is a description of the arrangement, written permanently
  # into the readable surface, bought by telling the operator what they know.
  ("/fee goes back to explaining instead of answering", "gs_telegram_pager",
-  'FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee."',
+  'FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Not the network fee."',
   'FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Set at the vault when you run '
   'the mix; this channel deliberately cannot read or change it."',
   ["test_depo_wizard"]),
@@ -3011,7 +3030,7 @@ MUTATIONS = [
  ("the help text goes back to describing the setup", "gs_telegram_pager",
   # Re-anchored: HELP is generated, so the prose that could grow back is the
   # tail line rather than the block.
-  '    + ["", "The memo goes in an OP_RETURN — desktop wallet, not a phone."]',
+  '       "The memo goes in an OP_RETURN — desktop wallet, not a phone.",',
 
   '    "Memo goes in an OP_RETURN — desktop wallet, not a phone.\\n"\n'
   '    "What comes back depends on the VAULT\'s keyfile: a handle, a sealed "\n'
@@ -3021,7 +3040,7 @@ MUTATIONS = [
  ("the confirm names the machine it is about to wake", "gs_telegram_pager",
   # Re-anchored: the confirm names the operator's own word now, not a slot
   # number. It still must not name the machine.
-  '                      f"This wakes the machine.\\n\\n{q}")',
+  '                      f"Confirm and it starts.\\n\\n{q}")',
   '                      f"This wakes the VAULT.\\n\\n{q}")',
   ["test_depo_wizard"]),
 
@@ -3346,8 +3365,15 @@ MUTATIONS = [
   ["test_wake_agent"]),
 
  ("the pairing validates the fee address with the LIST gate", "gs_wake_keys",
-  "            proto.xmr_address(args.usage_fee_address)",
-  '            proto.JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)',
+  "            proto.xmr_address(_fa)",
+  '            proto.JOBS["withdraw"]["schema"]["exit_to"](_fa)',
+  ["test_wake_agent"]),
+
+ # A REPEATED ADDRESS IS NOT A SECOND ADDRESS: it weights the draw toward one
+ # destination while the keyfile reads as spreading wider than it does.
+ ("pairing accepts the same fee address twice", "gs_wake_keys",
+  "    if len(set(_seen)) != len(_seen):",
+  "    if False:",
   ["test_wake_agent"]),
 
  # The wizard is the only place an operator can choose to spread it.
@@ -3359,7 +3385,7 @@ MUTATIONS = [
 
  ("the confirm no longer says how many arrivals land where",
   "gs_telegram_pager",
-  '                      f"At least {_lo} separate transactions, {_spread}."',
+  '                      f"At least {_lo} separate transactions, {_spread}.\\n"',
   '                      f""',
   ["test_depo_wizard"]),
 

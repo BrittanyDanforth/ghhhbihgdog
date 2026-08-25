@@ -2564,6 +2564,16 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       everywhere else, and mixing does not retract it. Leave the box empty and
       a new account and subaddress are minted per run, so no two runs share a
       collection point.</p>
+      <p class="lead mut-s"><b>Unless a phone can spend from this wallet.</b>
+      A minted fee account lands on the wallet being mixed. The woken path
+      chooses its entry by taking the largest unlocked output on that wallet
+      and has no way to tell your cut from a deposit — so once the run’s
+      exit has swept everything else out, that fee account is what the next
+      withdrawal started from the chat will pick up, and it goes to whatever
+      address the chat named. If this wallet is paired for withdrawals, put an
+      address in the box. Several addresses can be paired on that side and one
+      is drawn per run, which spreads the collection point the way an empty
+      box would.</p>
       <p class="lead mut-s"><b>What no setting here can fix.</b> The usage fee is a
       published fraction of the deposit. Wherever you eventually spend it,
       whoever you spend it with sees an amount — and dividing it by the

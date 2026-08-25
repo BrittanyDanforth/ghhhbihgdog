@@ -913,11 +913,14 @@ destination, because one address taking a slice of every run is the address
 reuse this toolchain refuses everywhere else and it survives the mix.
 
 ```bash
-# OPTIONAL, and usually wrong. Only if the cut has to land somewhere fixed.
+# REQUIRED to take a usage fee on a withdrawal started from the chat, and
+# repeatable: one address per run is drawn from whatever you pair here.
 python3 gs_wake_keys pair \
     --allow-withdraw \
     --wallet-file /var/lib/gs/spend.wallet \
-    --usage-fee-address 4...          # validated here, not after a mix runs
+    --usage-fee-address 4aaa... \
+    --usage-fee-address 4bbb... \
+    --usage-fee-address 4ccc...       # validated here, not after a mix runs
 ```
 
 The agent read `usage_fee_address` from this keyfile before the flag existed,
@@ -925,6 +928,41 @@ and nothing wrote it — so the fixed-destination branch was unreachable code.
 That is the same shape as the missing fee itself, and it is why both are now
 checked by a test that compares the name the pairing writes against the name
 the agent reads.
+
+**Omitting it means no fee at all on this path, and the help used to say the
+opposite.** With no address the cut would have to be minted onto the wallet
+being mixed, and `_funded_entry` — which chooses a withdrawal's entry by
+taking the largest unlocked output and has no notion of whose it is — hands
+that account to the *next* withdrawal. So `_withdraw_fee_argv` passes
+`--usage-fee` only when this field is set. The flag's help called omitting it
+the recommended setting, on reasoning that is true of a run started at the
+desk and has never been true of a woken one; an operator who followed it took
+nothing, on every chat withdrawal, and was told the reverse.
+
+**Why more than one.** The rate is a published constant in this repository, so
+an arrival divided by 0.011 is the deposit behind it. One destination
+collecting every run therefore hands over every deposit you ever took, and the
+mix does not retract it because the fee output is the one part of the run that
+is not mixed. Pair several — subaddresses of one cold wallet are not linkable
+to each other on-chain — and each run draws one, so an address collects
+roughly 1/N of your income instead of all of it. **That is a reduction and it
+is not unlinkability**, and no number of addresses makes it unlinkability.
+
+Nothing is remembered between runs. An index would be durable state on the one
+machine `paranoia_mode` wipes — it would reset to the first address after
+every sweep, which is the worst reuse pattern available — and two withdrawals
+racing it would read the same number. A uniform draw has no state to corrupt,
+survives the wipe, and cannot be raced.
+
+**The desk can still leave a cut behind for the phone to spend.** The gate
+above is on the woken path only. `gs_console`'s fee panel recommends leaving
+its address box empty so a fresh account is minted per run — sound advice
+about address reuse, and it mints onto *this* wallet, where `_funded_entry`
+will select it exactly as readily once the run's exit has swept everything
+else out. Neither tool can see the other: the console holds no keyfile and the
+agent does not know what was run at the desk. So pairing warns about it, and
+the console page names the case where its own advice is wrong. On a wallet a
+phone can spend from, fill that box in.
 
 On a small withdrawal the cut is **waived, not charged**: below roughly 0.33
 XMR at a typical fee, 1.1% is worth less than the fee to move it, so
@@ -1291,6 +1329,29 @@ an unallowlisted chat is ignored in silence, on purpose, because a reply
 confirms the bot is alive to whoever found it. Run `gs_telegram_pager --whoami`
 once: it needs no `--key` and no `--chat-id`, arms nothing, wakes nothing,
 prints the chat id of the next message it sees and exits.
+
+**The usage fee lands on the wallet the phone can empty, and the vault knows
+not to spend it.** With no `--usage-fee-address`, `plan_usage_fee` mints a
+fresh account per run for the operator's 1.1% and keeps it out of `addr_index`
+so the exit will not sweep it — "it is yours where it lands". That hold is one
+process's in-memory index, and `_funded_entry` on the vault is a *different*
+process re-enumerating the same wallet: it takes the largest unlocked output.
+Driven, after a withdrawal completes the fee **is** the largest output, so the
+next `/withdraw` mixed the operator's own revenue and paid it to the address
+the chat named — compounding, taking a fee of the fee. Any stale fee bigger
+than the user's balance also becomes the target of *every* withdrawal, and if
+it is under the mixing minimum the user's money cannot be withdrawn from the
+phone at all.
+
+The fee account now carries a wallet label (`gs_common.USAGE_FEE_ACCOUNT_LABEL`)
+and `_funded_entry` skips it. The marker lives in the **wallet** rather than in
+a file, because `paranoia_mode` wipes the artifact directory and a skip-list
+there would vanish exactly when the operator had been most careful. A label is
+local metadata and never reaches the chain.
+
+One thing it does not cover: a fee account minted by a build from before the
+label existed carries none, and is indistinguishable from the user's money.
+Sweep those out by hand once.
 
 **One person per bot, and the pager refuses anything else.** There is a single
 wallet behind this. A withdrawal does not ask who is asking — the vault takes

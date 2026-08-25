@@ -480,8 +480,16 @@ check("settings: it says the operator picks the deposit amount",
       "deposit amount" in _stx.lower())
 check("settings: ...and offers every mixing depth the protocol has",
       all(str(_d) in _stx for _d in P.WITHDRAW_DEPTHS))
-check("settings: ...and the wake budget, which is on THIS box",
-      "12" in _stx and "budget" in _stx.lower())
+# "WAKE BUDGET" WAS THE WORD, AND THE WELCOME IS TESTED FOR NOT CONTAINING
+# IT. "wake" says there is a machine that is normally off and that this chat
+# switches it on -- the shape of the operation, on the longest reply this bot
+# sends. The test was written for the welcome and the word was left standing
+# in thirteen replies that predate it, /settings among them. What the
+# operator needs from this line is the number and that it is a daily one.
+check("settings: ...and the daily allowance, which is counted on THIS end",
+      "12" in _stx and "allowance" in _stx.lower())
+check("settings: ...and does not name what is being woken to do it",
+      not re.search(r"\\bwoken?\\b|\\bwakes?\\b", _stx, re.I))
 # THE MEANING, NOT ONE PHRASE. This tested for the literal "not here", which
 # the reply happened to contain; the reply now separates "set on the machine"
 # from "fixed in the software" because the old version claimed the hop delay
@@ -609,7 +617,22 @@ check("...and that place is guarded by the protocol's address gate",
       'proto.JOBS["withdraw"]["schema"]["exit_to"](_a)' in _SRC)
 check("...so `step` is derived, not stored", "step" not in pg.Convo.__slots__)
 _save = pg.Limits.save.__doc__ or ""
-_lsrc = _SRC.split("class Limits")[1].split("\nclass ")[0]
+# THE WINDOW IS THE CLASS, taken from the parse tree rather than from the next
+# occurrence of the word "class".
+#
+# This read _SRC.split("class Limits")[1].split("\nclass ")[0], and there is no
+# class between Limits and Convo -- so the "window" was Limits PLUS every
+# module-level function defined after it, parse_command included. The check
+# below then fails or passes on words written in functions it is not about: it
+# fired on the word "conversation" in parse_command's refusal, which has
+# nothing to do with what Limits.save writes. A window that drifts is a check
+# whose subject drifts with it.
+import ast as _ast_l                                          # noqa: E402
+_lsrc = next(_ast_l.get_source_segment(_SRC, _n)
+             for _n in _ast_l.parse(_SRC).body
+             if isinstance(_n, _ast_l.ClassDef) and _n.name == "Limits")
+check("the window really is just that class and not everything after it",
+      _lsrc.startswith("class Limits") and "def parse_command" not in _lsrc)
 check("Limits.save writes only the cursor and the counters",
       '"offset"' in _lsrc and '"pokes"' in _lsrc and "convo" not in _lsrc)
 check("nothing writes convos to disk",
@@ -893,7 +916,7 @@ fe = Fake()
 fe.say("/depo")
 fe.say("/cancel")
 check("/cancel drops a live conversation", 111 not in fe.p.convos)
-check("...and says nothing was woken", "Nothing was woken" in fe.text())
+check("...and says nothing was started", "Nothing was started" in fe.text())
 fe.sent.clear()
 fe.say("/cancel")
 check("/cancel with nothing running says so rather than lying",
@@ -917,8 +940,9 @@ _cb.say("/cancel")
 _cbt = _cb.text()
 check("/cancel with a WAKE running does not claim there is nothing to cancel",
       "nothing to cancel." not in _cbt)
-check("...and says a wake is running instead",
-      "wake is running" in _cbt.lower() or "wake IS running" in _cbt)
+check("...and says something is running instead",
+      "something is running" in _cbt.lower()
+      or "something IS running" in _cbt)
 check("...and says plainly that it cannot be stopped from here, rather than "
       "implying it was", "cannot be stopped" in _cbt.lower())
 check("...and explains why everything else is being refused",
@@ -939,8 +963,8 @@ check("/cancel: the state exists -- a conversation started before the wake",
 _cc.p.busy.acquire()                       # now the other chat's wake begins
 _cc.sent.clear()
 _cc.say("/cancel")
-check("/cancel still cancels a half-typed wizard while a wake runs",
-      "Nothing was woken" in _cc.text() and 111 not in _cc.p.convos)
+check("/cancel still cancels a half-typed wizard while a job runs",
+      "Nothing was started" in _cc.text() and 111 not in _cc.p.convos)
 # AND THE GUARD THAT MADE THE FIRST VERSION OF THIS CHECK WRONG IS ITSELF
 # WORTH PINNING: a wizard cannot be STARTED during a wake.
 _ce = Fake()
@@ -1040,8 +1064,19 @@ check("...and no OTHER job gained one, which is what /exit's answer would "
 _fh = Fake()
 _fh.say("/fee")
 _fee_reply = _fh.text().strip()
-check("/fee names the usage fee and its rate, and says nothing else",
-      _fee_reply == f"{pg.USAGE_FEE_LABEL} usage fee.")
+# "1.1% usage fee." WAS THE WHOLE ANSWER, and it was ambiguous in the one way
+# that costs money to be wrong about. Two different things are called "the
+# fee": this service's cut, and what the network charges to carry each
+# transaction. A mix is many transactions, so the network's is the LARGER of
+# the two -- and the operator reading "1.1% usage fee." concludes that 1.1% is
+# what mixing costs, watches a bigger number leave, and reads it as theft.
+#
+# The four extra words say which fee it is not. They are still inside the
+# 40-character ceiling above, still name no machine, tool or file, and the
+# equality is kept exact so the paragraph cannot creep back in behind them.
+# The full explanation lives on the welcome, which is sent once.
+check("/fee names the usage fee, its rate, and which fee it is NOT",
+      _fee_reply == f"{pg.USAGE_FEE_LABEL} usage fee. Not the network fee.")
 # THE RATE IS THE ONE NUMBER THIS CHANNEL MAY CARRY, and it is a decision
 # rather than an oversight: the operator asked for it, having been told what it
 # costs (an observed cash-out divided by the rate is the deposit behind it).
@@ -1136,7 +1171,8 @@ def _sent_strings(tree):
                 for x in _ast.walk(arg):
                     if isinstance(x, _ast.Constant) and isinstance(x.value, str):
                         out.append((n.lineno, x.value))
-    for name in ("HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER"):
+    for name in ("HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
+                 "BUSY_ANSWER"):
         for n in tree.body:
             if isinstance(n, _ast.Assign) and getattr(
                     n.targets[0], "id", "") == name:
@@ -1155,6 +1191,113 @@ def _sent_strings(tree):
 # reply vocabulary and covers the part of it that happens to be local.
 _all_sent = _sent_strings(_pg_tree)
 _all_sent += [(0, v) for v in P.PHASE_LINES.values()]
+
+# AND THE REPLIES THAT ARE BUILT, NOT WRITTEN -- the same lesson as PHASE_LINES
+# above, learned a second time and this time closed properly.
+#
+# _sent_strings walks `self.send(cid, <expr>)` and collects the string
+# CONSTANTS inside <expr>. Five of this bot's replies have no constant there at
+# all: they are `self._settings_text()`, `welcome_text(self.burn_after)`, and
+# the three wizard questions. Every one of them was invisible to this scan, and
+# they are between them the LONGEST things the bot says -- /settings and the
+# welcome are the top two.
+#
+# That was not theoretical. The welcome shipped the sentence "Assume this
+# transcript can be read by somebody who is not you", and /settings shipped
+# "Monero's own, per transaction" -- a banned word each, in the two longest
+# replies, past a check whose printed name claims to cover "every string this
+# bot can send". A scan that reads as complete and covers the literals is worse
+# than one that admits its scope.
+_cs = Fake()
+_cs.p.burn_after = 0
+_COMPOSED = [
+    ("welcome_text", pg.welcome_text(0)),
+    ("_settings_text", pg.Pager._settings_text(_cs.p)),
+    ("_amount_question", pg.Pager._amount_question(_cs.p)),
+    ("_exit_question", pg.Pager._exit_question(_cs.p)),
+    ("_depth_question", pg.Pager._depth_question(_cs.p)),
+]
+check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
+      f"BUILT rather than written, which it used to miss entirely",
+      all(len(t) > 40 for _n, t in _COMPOSED))
+
+# AND IT STAYS CLOSED. A sixth composed reply added later would slip past the
+# list above exactly the way these five slipped past the walk -- so the table
+# is checked against the source instead of trusted. Every `send()` whose text
+# argument carries no literal at all must be one this file knows about: either
+# a composed reply driven above, one of the module constants already walked, or
+# a RUNTIME value (a slip from the vault, a minted address, a memo) which is
+# not authored text and cannot be read from source by anyone.
+_RUNTIME_SENDS = {"slip", "_msg", "memo"}
+_COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
+                  | {"welcome_text(self.burn_after)"}
+                  | {"HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
+                     "BUSY_ANSWER"}
+                  | _RUNTIME_SENDS)
+_uncovered = sorted(
+    {_ast.unparse(a) for n in _ast.walk(_pg_tree)
+     if isinstance(n, _ast.Call) and getattr(n.func, "attr", "") == "send"
+     for a in n.args[1:2]
+     if not any(isinstance(x, _ast.Constant) and isinstance(x.value, str)
+                for x in _ast.walk(a))} - _COVERED_SENDS)
+check(f"...and no OTHER reply is composed out of the scan's reach "
+      f"({_uncovered})", _uncovered == [])
+
+# THE CURRENCY IS THE WELCOME'S ONE EXEMPTION, and it is bounded rather than
+# waved through. A welcome that will not say what the service deals in is not a
+# welcome; every other reply still may not say it, and the welcome may not turn
+# it into a running commentary. Two mentions: what this is, and which of the
+# two ways in applies to the reader.
+_CURRENCY_RE = re.compile(r"\b(monero|xmr)\b", re.I)
+_wc = len(_CURRENCY_RE.findall(pg.WELCOME))
+check(f"the welcome names the currency, because a service that will not say "
+      f"what it deals in cannot onboard anybody ({_wc} mentions)", _wc >= 1)
+check("...and no more than twice, so it stays a naming and not a description",
+      _wc <= 2)
+# THE EXEMPTION IS COUNTED ACROSS EVERY SURFACE IT COVERS, not per surface.
+# Scrubbing the currency out before the banned-word scan is what lets the
+# welcome and the button labels name it at all; without a total, that scrub
+# is an open door and each new exempt surface widens it by however much it
+# likes. The cap is checked after the labels are collected, below.
+# Line -1 marks "composed, not a literal": the ceiling below is per
+# surface and reads that marker to tell the two groups apart.
+_all_sent += [(-1, t) for n, t in _COMPOSED if n != "welcome_text"]
+_all_sent += [(-1, _CURRENCY_RE.sub("", pg.WELCOME))]
+
+# AND THE BUTTON LABELS, which were the third surface out of reach.
+#
+# _sent_strings reads `send(cid, <text>)` and stops at the text. Every label on
+# every inline keyboard is a string that lands in the chat, sits under the
+# message permanently, and was never looked at -- so "⬇ Monero address", the
+# label a newcomer could least place, was also a currency name nothing checked.
+_LABELS = [l for _t in (pg.MENU_BUTTONS,) for _row in _t for l, _d in _row]
+_LABELS += [l for _row in pg.Pager._depth_buttons(
+    types.SimpleNamespace()) for l, _d in _row]
+_LABELS += [l for _row in pg.Pager._handle_buttons(
+    types.SimpleNamespace(), "A3F1") for l, _d in _row]
+check(f"the scan reaches the button labels too ({len(_LABELS)} of them), "
+      f"which land in the chat and stay under the message",
+      len(_LABELS) >= 8)
+_all_sent += [(-1, _CURRENCY_RE.sub("", l)) for l in _LABELS]
+_exempt_total = _wc + sum(len(_CURRENCY_RE.findall(l)) for l in _LABELS)
+check(f"the currency exemption stays bounded across every surface it covers "
+      f"({_exempt_total} mentions in the welcome and the labels together)",
+      _exempt_total <= 3)
+# NON-VACUITY on the scrub: it is what lets those surfaces through, so it has
+# to actually be doing something, or the cap above is guarding nothing.
+check("NON-VACUITY -- the surfaces the scrub covers really do name it",
+      _exempt_total >= 2)
+# EVERY BUTTON TABLE, not the one the menu happens to use. A `buttons=` that
+# named a fourth table would be a keyboard nothing above reads.
+_BTN_TABLES = {"MENU_BUTTONS", "self._depth_buttons()",
+               "self._handle_buttons(h)", "[[('Cancel', 'm:cancel')]]"}
+_btn_seen = {_ast.unparse(_kw.value) for _n in _ast.walk(_pg_tree)
+             if isinstance(_n, _ast.Call)
+             and getattr(_n.func, "attr", "") == "send"
+             for _kw in _n.keywords if _kw.arg == "buttons"}
+check(f"...and every keyboard this bot attaches comes from one of them "
+      f"({sorted(_btn_seen - _BTN_TABLES)})",
+      _btn_seen <= _BTN_TABLES)
 check("control: the scan reaches the phase lines too, which live in another "
       "file and are sent verbatim",
       any(t in P.PHASE_LINES.values() for _l, t in _all_sent))
@@ -1165,6 +1308,43 @@ _hits = [(ln, _BANNED_RE.search(t).group(0), t[:60])
          for ln, t in _all_sent if _BANNED_RE.search(t)]
 check(f"no reply this bot can send names a machine, a tool or the operation "
       f"({_hits})", _hits == [])
+# ---- AND THE WORDS THE WELCOME IS TESTED FOR NOT CONTAINING -------------
+#
+# test_telegram_pager sweeps the welcome for ~25 words that describe the SETUP
+# rather than the service -- "doorbell", "switched off", "wakes", "another
+# machine" -- on the reasoning that together they say: there is a second
+# machine, it is normally powered down, and this chat is what switches it on.
+#
+# That sweep was written for the welcome, because the welcome is where the
+# words were newly typed. It was never pointed at the replies that predate it,
+# and thirteen of them carried "wake" or "woken": "no: a wake is already
+# running", "cancelled. Nothing was woken.", "This wakes the machine.", and
+# /settings' own "wake budget" line. An operator's transcript said the thing
+# the welcome is forbidden from saying, on the messages they see most.
+#
+# The information survives the edit in every case, because none of those
+# replies was ABOUT waking: "nothing was started" is what the operator needed
+# to know, and "something is already running" is the one that is actually
+# actionable.
+_ARCH_REPLY = ("wake", "wakes", "woken", "waking", "doorbell", "switched off",
+               "powered down", "air gap", "air-gapped", "second machine",
+               "another machine")
+_ARCH_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _ARCH_REPLY) + r")\b", re.I)
+_arch_hits = [(ln, _ARCH_RE.search(t).group(0), t[:60])
+              for ln, t in _all_sent if _ARCH_RE.search(t)]
+check(f"no reply describes the arrangement it runs on, which is the rule the "
+      f"welcome is already held to ({_arch_hits})", _arch_hits == [])
+# NON-VACUITY, both ways. The list catches what it is for...
+check("NON-VACUITY -- the arrangement sweep fires on the reply it was written "
+      "for", bool(_ARCH_RE.search("no: a wake is already running")))
+# ...and does not fire on the vocabulary these replies legitimately use. "the
+# machine" stays: /settings has to say which settings need physical access, and
+# the operator knows which machine is theirs. It is the OFF-ness and the
+# switching-on that are the disclosure, not the noun.
+check("NON-VACUITY -- ...and not on 'the machine', which the replies may say",
+      not _ARCH_RE.search("Set on the machine, with physical access"))
+
 # NON-VACUITY: the scanner really does catch these words -- proven on a string
 # built here, not hoped for.
 _synth = _ast.parse('def f():\n    self.send(1, "read it on the vault")\n')
@@ -1177,10 +1357,31 @@ check("NON-VACUITY -- ...and does not fire on 'history' or 'storage', which "
       not _BANNED_RE.search("check your history and storage"))
 # A CEILING, because the drafts did not add banned words, they added
 # paragraphs. The longest legitimate reply is /help.
-_longest = max((len(t), ln, t[:50]) for ln, t in _all_sent)
+#
+# THE CEILING IS PER SURFACE, not one number over everything, and that split is
+# the honest version rather than a loosening. Two of these replies are whole
+# screens by design and always were -- /settings is a table of what a run does,
+# the welcome is the one-time introduction -- so a single 400-char rule over
+# the lot either fails on them forever or gets raised to their size and stops
+# constraining the 90 literals it was written for. Each surface is pinned near
+# what it is now, so a paragraph added to ANY of them fails here.
+_longest = max((len(t), ln, t[:50]) for ln, t in _all_sent if ln != -1)
 check(f"no single reply literal runs past 400 characters "
       f"(longest {_longest[0]} at line {_longest[1]})",
       _longest[0] <= 400)
+for _cname, _climit in (("welcome_text", 1400), ("_settings_text", 1200),
+                        ("_amount_question", 400), ("_exit_question", 600),
+                        ("_depth_question", 400)):
+    _ctext = dict(_COMPOSED)[_cname]
+    check(f"...and the composed {_cname} stays under {_climit} "
+          f"({len(_ctext)} chars)", len(_ctext) <= _climit)
+# AND THE TWO LONG ONES STILL FIT A PHONE SCREEN, which is the constraint the
+# character count is standing in for. A 1400-character wall of text is read by
+# nobody, and a welcome nobody reads is a welcome that has not told them the
+# usage fee.
+for _cname, _lines in (("welcome_text", 26), ("_settings_text", 30)):
+    _n = dict(_COMPOSED)[_cname].count("\n") + 1
+    check(f"...and {_cname} stays under {_lines} lines ({_n})", _n <= _lines)
 
 # ===========================================================================
 # 9. AN UNALLOWLISTED CHAT CANNOT START ONE.
