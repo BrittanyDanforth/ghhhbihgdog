@@ -1467,6 +1467,27 @@ check("split: ...and the stage-1 gate asks planned_chunk_count rather than "
 check("split: NON-VACUITY -- it does NOT read --split there, which is the "
       "flag that cannot see a JoinMarket tumble",
       '"split"' not in _rsc_body)
+# AND main() HAS TO CALL IT. A gate nothing invokes is the same as no gate,
+# and the checks above all call refuse_starved_chunks directly -- so deleting
+# the one line in main() left every one of them green. Read out of the parsed
+# tree rather than grepped, so a mention in a comment cannot stand in for a
+# call, and asserted alongside its sibling: these two answer the same question
+# at the same moment and neither is complete on its own.
+_main_calls = set()
+for _fn in _ast.walk(_ast.parse(_rsc_src)):
+    if isinstance(_fn, _ast.FunctionDef) and _fn.name == "main":
+        for _nd in _ast.walk(_fn):
+            if isinstance(_nd, _ast.Call) and isinstance(_nd.func, _ast.Name):
+                _main_calls.add(_nd.func.id)
+check("split: main() actually calls the stage-1 gate — a refusal nothing "
+      "invokes is not a refusal",
+      "refuse_starved_chunks" in _main_calls)
+check("split: ...beside refuse_peel_multichunk, which asks the same question "
+      "at the same moment",
+      "refuse_peel_multichunk" in _main_calls)
+check("split: NON-VACUITY -- the walk really read main()'s calls, so the two "
+      "checks above are not both reading an empty set",
+      "stage1_joinmarket" in _main_calls and len(_main_calls) > 20)
 _too_many = None
 try:
     ghost.resolve_split(types.SimpleNamespace(split=99))
@@ -3014,12 +3035,30 @@ _MMArgs.dag_mixing = True
 # figure that clears min_fanout_usable can still leave the poorest chunk unable
 # to pay for its outputs -- which drops that chunk, strands its value on an
 # address the exit holds back, and can then shortfall the rest of the run.
-for _c in (2, 4, 8):
-    for _w in (10, 20, 60):
-        _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, chunks=_c)
-        check(f"min: --split {_c} --wallets {_w} at {_b} XMR plans on every "
-              f"draw, every carrier funding its own slice",
-              _mm_survives(_b, _w, chunks=_c) == 120)
+#
+# BOTH VALUES OF --dag-mixing, and the second one is not padding. The first
+# version of this ran dag=True only, and the shapes where the per-chunk veil
+# reserve is load-bearing are mostly dag=False: an output that never hops
+# reserves one transaction fewer, so the whole budget is tighter and a missing
+# veil fee has less margin to hide in. A mutation that counted the reserve once
+# however many chunks survived the dag=True grid untouched.
+#
+# AND THE SMALL WALLET COUNTS, which is where a split bites hardest: the same
+# chunk count over fewer mix targets means each carrier's slice is a larger
+# share of a smaller budget. Shapes resolve_split refuses outright are skipped
+# rather than driven -- they cannot reach this code at all.
+for _c in (2, 4, 6, 8):
+    for _dag in (True, False):
+        _MMArgs.dag_mixing = _dag
+        for _w in (4, 6, 10, 20, 60):
+            if _c > _w + ghost.DECOY_MIN:
+                continue
+            _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, dag_mixing=_dag,
+                                       chunks=_c)
+            check(f"min: --split {_c} --wallets {_w} dag={_dag} at {_b} XMR "
+                  f"plans on every draw, every carrier funding its own slice",
+                  _mm_survives(_b, _w, chunks=_c) == 120)
+    _MMArgs.dag_mixing = True
     check(f"min: NON-VACUITY -- the single-chunk figure does NOT survive "
           f"--split {_c}, so wiring the chunk count is doing real work",
           _mm_survives(ghost.mix_minimum_xmr(_MFU_FEE, 10), 10,
@@ -3028,27 +3067,32 @@ for _c in (2, 4, 8):
           f"one chunk does",
           ghost.mix_minimum_xmr(_MFU_FEE, 10, chunks=_c)
           > ghost.mix_minimum_xmr(_MFU_FEE, 10))
-    # ONE VEIL FEE PER CHUNK, ASSERTED AS ARITHMETIC. The behavioural checks
-    # above cannot see this term: min_carrier_usable's margin over the true
-    # floor is larger than (chunks-1) veil fees, so counting the reserve once
-    # still plans on every draw -- it just publishes a number that is wrong.
-    # A mutation sweep found exactly that, so the term is pinned directly.
-    # Each side is built from the shipped functions but composed differently
-    # from mix_minimum_xmr, so this is a bound and not an identity.
-    _d1 = ghost.compute_fee_budget(Decimal(1), _MFU_FEE, 10, peel=False,
-                                   dag_mixing=True, exit_set=True, chunks=1)[1]
-    _dc = ghost.compute_fee_budget(Decimal(1), _MFU_FEE, 10, peel=False,
-                                   dag_mixing=True, exit_set=True,
-                                   chunks=_c)[1]
-    check(f"min: --split {_c} carries {_c} entry-veil fees, not one -- the "
-          f"gap over a single chunk covers every extra veil AND the extra "
-          f"transaction reserve",
-          ghost.mix_minimum_xmr(_MFU_FEE, 10, chunks=_c)
-          - ghost.mix_minimum_xmr(_MFU_FEE, 10)
-          >= (_c - 1) * ghost.hop_fee_reserve(_MFU_FEE) + (_dc - _d1))
-    check(f"min: NON-VACUITY -- {_c} veils really cost more than one, so the "
-          f"bound above is not trivially satisfied",
-          (_c - 1) * ghost.hop_fee_reserve(_MFU_FEE) > 0)
+
+# ONE VEIL FEE PER CHUNK, DRIVEN AT A SHAPE WHERE IT ACTUALLY BINDS.
+#
+# Every entry address gets its own veil transaction and its own fee, so the
+# reserve is hop_fee_reserve * chunks. Counting it ONCE looks harmless -- the
+# figure only drops by (chunks-1) fees, and min_carrier_usable's margin
+# absorbs that at most shapes. It does not absorb it everywhere: driven over
+# every fee priority, chunk count, wallet count and dag/exit setting, the
+# once-counted figure failed at 235 of them, concentrated at six chunks and up
+# and at dag=False.
+#
+# The shape pinned here is the one that fails HARDEST, not a convenient one:
+# --split 7 --wallets 6 with DAG mixing off, at the fallback fee, failed 218
+# of 300 draws when the veil reserve was counted once. Picking a shape that
+# only fails a few draws in a hundred would make this check flaky, which is
+# its own kind of untrue.
+_MMArgs.dag_mixing = False
+_v_full = ghost.mix_minimum_xmr(_MFU_FEE, 6, dag_mixing=False, chunks=7)
+_v_once = _v_full - 6 * ghost.hop_fee_reserve(_MFU_FEE)
+check("min: --split 7 --wallets 6 without DAG mixing plans on every draw at "
+      "the published figure",
+      _mm_survives(_v_full, 6, chunks=7) == 120)
+check("min: NON-VACUITY -- the same figure with ONE veil fee instead of seven "
+      "does NOT, so the per-chunk reserve is load-bearing and not margin",
+      _mm_survives(_v_once, 6, chunks=7) < 120)
+_MMArgs.dag_mixing = True
 
 # --print-limits IS THE ONLY WAY A CALLER THAT CANNOT IMPORT THIS FILE GETS A
 # MINIMUM, and its own tiny parser has to carry every flag the figure depends
