@@ -910,6 +910,81 @@ check("split: ...and before stage 2 runs at all",
       _pm_lines.get("refuse_peel_multichunk", 10 ** 9)
       < _pm_lines.get("resolve_swap_deposits", 0))
 
+# -- AND THE FEE'S HALF OF EXACTLY THE SAME GATE --------------------------
+#
+# _refuse_fee_combinations refuses `--usage-fee --split N` at parse time, and
+# its reason is entirely about the CHUNK COUNT: "the spendability floor is
+# checked against the TOTAL while the operator receives N separate outputs --
+# each of which can be individually below the fee to move it, which is the
+# exact uncollectable output the floor exists to prevent." It reads args.split.
+# The chunk count is not args.split, for the same reason the peel gate above
+# had to be added -- and the fee's half was never added. Driven through the
+# shipped functions with a tumble of three UTXOs and --split at its default:
+# planned_chunk_count -> 3, and the fee gate passed.
+_fee_args = types.SimpleNamespace(split=1, peel=False, joinmarket=True,
+                                  usage_fee=True,
+                                  usage_fee_pct=Decimal("0.011"))
+_fee_msg = None
+with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        ghost.refuse_fee_multichunk(_fee_args, [Decimal("0.1")] * 3)
+    except SystemExit as _e:
+        _fee_msg = str(_e.code)
+check("fee: --usage-fee with a MULTI-UTXO JoinMarket tumble is refused, even "
+      "though --split is 1", _fee_msg is not None)
+check("fee: ...naming JoinMarket's UTXOs rather than a --split the operator "
+      "never passed",
+      _fee_msg and "JoinMarket" in _fee_msg.splitlines()[0]
+      and "--split" not in _fee_msg.splitlines()[0])
+check("fee: ...and saying the swap has NOT happened",
+      _fee_msg and "NOTHING HAS BEEN SWAPPED" in _fee_msg)
+check("fee: ...still naming the reason the parse-time gate gives — an output "
+      "per chunk, each possibly worth less than the fee to move it",
+      _fee_msg and "one output per chunk" in _fee_msg)
+
+# The controls, matching the peel gate's: one chunk is the supported shape,
+# and no --usage-fee makes the chunk count none of this gate's business.
+_fee_ctrl = []
+for _lbl, _a, _u in (
+        ("one JoinMarket UTXO",
+         types.SimpleNamespace(split=1, peel=False, usage_fee=True,
+                               usage_fee_pct=Decimal("0.011")),
+         [Decimal("0.1")]),
+        ("no JoinMarket at all",
+         types.SimpleNamespace(split=1, peel=False, usage_fee=True,
+                               usage_fee_pct=Decimal("0.011")), []),
+        ("three chunks with no usage fee",
+         types.SimpleNamespace(split=1, peel=False, usage_fee=False,
+                               usage_fee_pct=None),
+         [Decimal("0.1")] * 3)):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.refuse_fee_multichunk(_a, _u)
+        _fee_ctrl.append(None)
+    except SystemExit as _e:
+        _fee_ctrl.append(f"{_lbl}: {_e.code}")
+check("control: the fee gate refuses none of the supported shapes",
+      _fee_ctrl == [None, None, None])
+
+check("fee: main() calls refuse_fee_multichunk at all",
+      "refuse_fee_multichunk" in _pm_lines)
+check("fee: ...after stage1_joinmarket, which is where the UTXO count "
+      "becomes known",
+      _pm_lines.get("refuse_fee_multichunk", 0)
+      > _pm_lines.get("stage1_joinmarket", 10 ** 9))
+check("fee: ...and BEFORE the entry set is minted",
+      _pm_lines.get("refuse_fee_multichunk", 10 ** 9)
+      < _pm_lines.get("establish_entry_set", 0))
+check("fee: ...and before stage 2 runs at all",
+      _pm_lines.get("refuse_fee_multichunk", 10 ** 9)
+      < _pm_lines.get("resolve_swap_deposits", 0))
+# ...and it asks planned_chunk_count rather than re-deriving the count, so
+# this gate and the entry set cannot answer differently.
+_fee_src = Path(REPO, "GhostSpiral").read_text().split(
+    "def refuse_fee_multichunk")[1].split("\ndef ")[0]
+check("fee: the gate asks planned_chunk_count rather than re-deriving it",
+      "planned_chunk_count(args, jm_utxos)" in _fee_src)
+
 # -- FEWER MIX OUTPUTS THAN CHUNKS, refused before the swap too -----------
 #
 # split_by_weight returns an EMPTY slice for every chunk it has no destination

@@ -67,10 +67,27 @@ signed_blobs/
 tx_staging/
 .venv/
 
-# WAKE AND DELIVERY KEYFILES. Not artifacts -- paranoia_mode deliberately does
-# NOT sweep these, because wiping the operator's only delivery key destroys
-# every future slip and a wake pairing is a two-box ceremony to rebuild. So
-# they are here on their own footing rather than by the lockstep rule above.
+# WAKE AND DELIVERY KEYFILES. Here on their own footing rather than by the
+# lockstep rule above -- and the two are NOT treated alike by paranoia_mode,
+# which this comment used to say they were ("paranoia_mode deliberately does
+# NOT sweep these"). Driven against the real sweep with all three in a
+# searched root:
+#
+#     gs_wake_pi.key         would be securely deleted: True
+#     gs_wake_thinkpad.key   would be securely deleted: True
+#     gs_delivery.key        would be securely deleted: False
+#
+# THE DELIVERY KEY IS EXEMPT, exactly as written: wiping the operator's only
+# delivery key destroys every future slip, and it is not in
+# GS_ARTIFACT_FILE_PATTERNS.
+#
+# THE WAKE PAIR IS SWEPT, ON PURPOSE. "gs_wake_*.key" is in that list, and the
+# sweep carries a bespoke warning for having done it -- because losing the
+# pairing presents as a hardware fault: the next magic packet is refused, and
+# that refusal is byte-identical to a dead switch, a reset BIOS and a hostile
+# WOL. Rebuilding it is a two-box ceremony needing physical access at both.
+# The one document that would have told an operator otherwise told them the
+# opposite.
 #
 # The reason they need an entry at all: gs_delivery_key's --out defaults to a
 # BARE RELATIVE NAME, so an operator who runs it from a checkout writes a

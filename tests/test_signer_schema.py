@@ -414,4 +414,65 @@ ck("the cross-check is actually wired into the signing loop",
 ck("...and it reads BOTH streams, since wallet-cli's prompt may be on either",
    "(result.stdout or \"\") + (result.stderr or \"\")" in _sg)
 
+# ---------------------------------------------------------------------------
+# THE SHAPE, BEFORE THE FIELDS.
+#
+# Every check above reads tx.get(...), and .get exists on a dict and on
+# nothing else a JSON file can hold. Nine malformed plans -- a bare string, a
+# list of strings, a null entry, [address, amount] pairs, a destinations list
+# of plain address strings -- all produced
+#
+#     AttributeError: 'str' object has no attribute 'get'
+#
+# rather than any of this validator's refusals. `rejects()` above reports
+# those as RAW, not as a rejection, which is the distinction that matters
+# here: the plan crosses an air gap on a removable stick and the operator is
+# standing at an offline machine with nothing to look anything up in. A
+# traceback there reads as "the signer is broken", not "this file is not a
+# plan". _validate_manifest_entries, the sibling validator on the same trust
+# boundary, has checked isinstance(entry, dict) all along.
+# ---------------------------------------------------------------------------
+print("\n-- the plan's SHAPE, checked before any field is read --")
+for _bad, _label in [
+        ({"src": "84AAA"}, "a plan that is a dict, not a list"),
+        ("unsigned", "a plan that is a bare string"),
+        (7, "a plan that is a number"),
+]:
+    _r, _m = rejects(_bad)
+    ck(f"refuses {_label} without a traceback ({_m[:44]})", _r)
+
+for _bad, _label in [
+        (["tx_0"], "an entry that is a string"),
+        ([["84BBB", "1.0"]], "an entry that is an [address, amount] pair"),
+        ([None], "an entry that is null"),
+        ([7], "an entry that is a number"),
+]:
+    _r, _m = rejects(_bad)
+    ck(f"refuses {_label} without a traceback ({_m[:44]})", _r)
+
+_DSTS = {"src": "84AAA", "src_index": 1}
+for _bad, _label in [
+        ({**_DSTS, "destinations": ["84BBB"]},
+         "a destinations list of bare address strings"),
+        ({**_DSTS, "destinations": [None]}, "a null destination"),
+        ({**_DSTS, "destinations": [["84BBB", "1.0"]]},
+         "a destination that is a pair"),
+        ({**_DSTS, "destinations": ["84BBB"], "consume_to": "84CCC"},
+         "consume_to beside a string destination"),
+]:
+    _r, _m = rejects([_bad])
+    ck(f"refuses {_label} without a traceback ({_m[:44]})", _r)
+
+# NON-VACUITY, both directions: the well-formed shapes must still pass, or
+# this is a validator that refuses everything.
+ck("NON-VACUITY: a well-formed single-destination plan is still accepted",
+   rejects([GOOD])[0] is False)
+ck("NON-VACUITY: a well-formed multi-destination plan is still accepted",
+   rejects([{**_DSTS, "destinations": [{"address": "84BBB", "amount": "1.0"},
+                                       {"address": "84CCC", "amount": "2.0"}]}])[0]
+   is False)
+ck("NON-VACUITY: a well-formed consume_to peel is still accepted",
+   rejects([{**_DSTS, "destinations": [{"address": "84BBB", "amount": "1.0"}],
+             "consume_to": "84CCC"}])[0] is False)
+
 print(f"\n{P} passed, {F} failed"); sys.exit(1 if F else 0)
