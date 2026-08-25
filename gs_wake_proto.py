@@ -1678,6 +1678,126 @@ def _xmr_address_field(v):
 
 _xmr_address_field.spec = "xmr address ^[48][base58]{94,105}$"
 
+#: ONE Monero address, under a name a caller may use.
+#:
+#: Callers outside this file used to reach for
+#: JOBS["withdraw"]["schema"]["exit_to"] when they wanted "check that this is
+#: an address" -- gs_wake_agent did it for the operator's USAGE FEE address,
+#: which is not an exit destination and has nothing to do with the withdraw
+#: job. That borrowing broke the moment exit_to became a list: the fee address
+#: came back as ["<addr>"] and went into GS_USAGE_FEE_ADDRESS as the text of a
+#: Python list. Nothing about the fee had changed.
+#:
+#: So the check every caller actually wanted has its own name, and a job
+#: schema is once again only about that job's fields.
+xmr_address = _xmr_address_field
+
+
+#: HOW MANY EXIT ADDRESSES ONE WITHDRAWAL MAY NAME.
+#:
+#: SEVEN BECAUSE THE WIRE CARRIES SEVEN, and the number is derived rather than
+#: chosen. A withdraw note is {job_id, challenge, job, exit_to[], depth} and
+#: MAX_INNER is 1023 bytes.
+#:
+#: THE FIRST VERSION OF THIS SAID EIGHT, measured against the shipped seal()
+#: with 95-character standard addresses: 963 bytes, comfortably inside, and
+#: nine refused. That measurement used the WRONG ADDRESS FORM.
+#: _xmr_address_field also accepts the 106-character INTEGRATED form -- which
+#: is not an edge case here, because an exchange deposit address is commonly
+#: integrated, and an exchange is the likeliest single destination anyone
+#: types. Eight of those is 1051 bytes, and the assertion below caught it at
+#: import the first time this file was loaded.
+#:
+#: So the cap is the worst case, not the typical one: 7 x 106 characters plus
+#: the envelope is 942 bytes, leaving 81 to spare. A field added to this schema
+#: later will trip the assertion -- loudly, on every box, at start-up -- rather
+#: than turning the top of the range into a withdrawal that fails on the wire
+#: at 3am. That is the SLIP_B64_LEN pattern and it has now earned its place
+#: twice.
+#:
+#: THE CONSOLE ALLOWS SIXTEEN and this allows seven, and that is not a
+#: disagreement to be tidied away: gs_console composes an argv on the same
+#: machine and has no wire, while this has a fixed-size padded record whose
+#: constant length is the whole reason a record reveals nothing about the job
+#: it carries. Seven is what that format has room for.
+MAX_WAKE_EXIT_DESTS = 7
+
+#: The worst case this cap has to fit: eight integrated addresses (106
+#: characters, the longer of the two forms) plus the envelope. Computed rather
+#: than asserted from a literal so the two cannot drift.
+_MAX_WITHDRAW_NOTE = (
+    TAG_LEN
+    + len(json.dumps({"job_id": "0" * 32, "challenge": "0" * 64,
+                      "job": "withdraw", "depth": 3,
+                      "exit_to": ["4" + "1" * 105] * MAX_WAKE_EXIT_DESTS},
+                     sort_keys=True, separators=(",", ":")).encode()))
+if _MAX_WITHDRAW_NOTE > MAX_INNER:                           # pragma: no cover
+    raise WakeError(
+        f"MAX_WAKE_EXIT_DESTS is {MAX_WAKE_EXIT_DESTS}, which makes the "
+        f"largest withdraw note {_MAX_WITHDRAW_NOTE} bytes against a wire "
+        f"format that carries {MAX_INNER}. Lower the cap or widen PAD_BLOCK; "
+        f"do not ship a maximum the wire cannot send.")
+
+
+def _xmr_address_list(v):
+    """One or more exit addresses. Returns a list, always.
+
+    WHY THIS IS A LIST AT ALL, and it is the whole point of the field.
+    GhostSpiral's exit sends ONE TRANSACTION PER OUTPUT. A withdrawal funds
+    `wallets + randint(DECOY_MIN, DECOY_MAX)` outputs, so at the depths this
+    service offers that is at fewest 5, 12 and 22 separate arrivals -- and with
+    a single destination every one of them lands on the same address.
+    resolve_exit_destinations says what that costs, in the file that does it:
+    the run "spends hours giving these outputs separate accounts precisely so
+    they cannot be grouped; one destination groups them again off-chain, and no
+    amount of mixing undoes that."
+
+    That warning was unreachable from a phone. It prints on the vault's stdout,
+    which the unit diverts to a 0600 log on a machine that powers off minutes
+    later, and this schema took a single address -- so the wizard could not
+    have offered a second one even if the operator had been told. Every
+    phone-initiated withdrawal was the single-destination case, silently. The
+    console has spread a withdrawal across up to sixteen addresses since it was
+    written; the wake path, added later, never learned how.
+
+    A BARE STRING IS STILL ACCEPTED, and that is not laxity. Both boxes are the
+    operator's and they are usually upgraded together, but not always in the
+    same sitting -- and the failure mode of getting it wrong is a vault that
+    refuses its owner's withdrawal with a schema error they cannot act on from
+    a phone. An older pager sends `"exit_to": "<addr>"`; it means one
+    destination; it is normalised to a list of one and runs exactly as it did.
+
+    DUPLICATES ARE REFUSED, mirroring resolve_exit_destinations' own refusal
+    word for word in intent: repeating an address "looks like a request to
+    spread the withdrawal while actually sending more of it to one place".
+    Caught here so the operator is told by the box they are typing at, rather
+    than by a vault that has already been woken.
+    """
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list):
+        raise WakeError("expected one Monero address, or a list of them")
+    if not v:
+        raise WakeError("a withdrawal needs at least one exit address")
+    if len(v) > MAX_WAKE_EXIT_DESTS:
+        raise WakeError(
+            f"at most {MAX_WAKE_EXIT_DESTS} exit addresses; the wake record "
+            f"is a fixed-size block and more than that does not fit in it")
+    out = []
+    for a in v:
+        a = _xmr_address_field(a)
+        if a in out:
+            # NEVER THE VALUE. It reaches a terminal and a log on the far side.
+            raise WakeError(
+                "the same exit address was given twice; repeating one spreads "
+                "nothing, it just sends more of the withdrawal to one place")
+        out.append(a)
+    return out
+
+
+_xmr_address_list.spec = (f"1-{MAX_WAKE_EXIT_DESTS} xmr addresses "
+                          f"^[48][base58]{{94,105}}$")
+
 
 #: THE DEPTHS THE SERVICE OFFERS, and the numbers are the whole point.
 #:
@@ -1727,6 +1847,41 @@ WITHDRAW_DEPTHS = {
     2: (10, 32160),    # 8.9h
     3: (20, 46560),    # 12.9h
 }
+
+#: GhostSpiral.DECOY_MIN, mirrored, because the box that has to state the
+#: consequence cannot import the file that owns it.
+#:
+#: The fan-out funds `wallets + randint(DECOY_MIN, DECOY_MAX)` outputs and the
+#: exit relays one transaction per output, so the number of separate arrivals a
+#: withdrawal produces is not `wallets` -- it is at fewest `wallets +
+#: DECOY_MIN`. The pager has to say that number out loud when it asks where the
+#: money goes, and the pager may not have GhostSpiral on disk at all (see
+#: WITHDRAW_DEPTH_NOTE for the same argument about the XMR minimum).
+#:
+#: MIRRORED, NOT GUESSED, and pinned: tests/test_wake_protocol.py asserts this
+#: equals GhostSpiral.DECOY_MIN, the way tests/test_wake_agent.py already
+#: recomputes WITHDRAW_DEPTHS' budgets from GhostSpiral's own arithmetic. A
+#: mirror with a test is the shape this repo uses when a constant has to cross
+#: a box that cannot import its owner; a mirror without one is how JOB_TIMEOUT
+#: drifted 6x.
+DECOY_MIN_MIRROR = 2
+
+
+def exit_arrivals_floor(depth: int) -> int:
+    """The fewest separate transactions a withdrawal at `depth` sends out.
+
+    A FLOOR, not an estimate, and it is the number the operator needs before
+    choosing how many destinations to give. resolve_exit_destinations computes
+    the same figure on the vault (`_lo = _w + DECOY_MIN`) to warn about a
+    single destination -- onto a stdout nobody reads. This is that figure,
+    available to the box the operator is actually typing at.
+
+    A FAN-OUT ADDS ONE MORE PER SWAP CHUNK for its change, which this does not
+    include; a withdrawal is one chunk, and a floor that could be too HIGH
+    would be the wrong error for a number whose whole job is "at least this
+    many arrivals will land wherever you point them".
+    """
+    return WITHDRAW_DEPTHS[depth][0] + DECOY_MIN_MIRROR
 
 #: What each depth needs, in words the operator reads before choosing.
 #:
@@ -1847,7 +2002,13 @@ JOBS = {
         # WITHDRAW_DEPTHS, which states exactly how much of that second effect
         # is real once a cut is being taken -- less than the first draft of
         # this comment claimed.
-        "schema": {"exit_to": _xmr_address_field,
+        # `exit_to` IS A LIST NOW. See _xmr_address_list: the exit sends one
+        # transaction per output, so a single destination collects every
+        # arrival this run spent hours separating -- and the pipeline's own
+        # warning about that prints on a vault nobody is watching. A bare
+        # string is still accepted and means a list of one, so an older pager
+        # keeps working against a newer vault.
+        "schema": {"exit_to": _xmr_address_list,
                    "depth": _int_range(1, 3)},
         "tools": ("GhostSpiral",),
         # SIZED FOR THE DEEPEST DEPTH OFFERED, and this number was wrong.

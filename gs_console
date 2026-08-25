@@ -195,7 +195,9 @@ HOPDELAY_RE = re.compile(r"^[0-9]{1,7}(-[0-9]{1,7})?\Z")
 #: character class and by the 95-only length. tests/test_console.py enforces
 #: that this and gs_common.XMR_ADDR_RE accept exactly the same strings.
 _B58_C = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-XMR_RE = re.compile(f"^[48][{_B58_C}]{{94}}$|^4[{_B58_C}]{{105}}$")
+#: \Z, not $ -- see gs_common.XMR_ADDR_RE, whose comment records why the
+#: structural check in tests/test_units.py could not see either of them.
+XMR_RE = re.compile(f"^[48][{_B58_C}]{{94}}\\Z|^4[{_B58_C}]{{105}}\\Z")
 
 
 def _js_xmr_re() -> str:

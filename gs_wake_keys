@@ -344,12 +344,19 @@ def _validate(args) -> None:
                  "    Without it a withdrawal would relay its fan-out and "
                  "fail hours later at the\n"
                  "    signing step, with the money already moved on-chain.")
-    # CHECKED AT PAIRING, with the protocol's own gate -- the same function the
-    # withdraw job applies to a destination off the wire. A typo here is a cut
-    # paid to an address nobody can spend, discovered after a mix has run.
+    # CHECKED AT PAIRING, with the protocol's own one-address gate. A typo here
+    # is a cut paid to an address nobody can spend, discovered after a mix has
+    # run.
+    #
+    # proto.xmr_address, NOT JOBS["withdraw"]["schema"]["exit_to"]. This asked
+    # the withdraw job's exit field to vouch for a value that is not an exit
+    # destination and never travels the wire, which held only while the two
+    # were the same check. exit_to takes a LIST now -- so the borrowed gate
+    # would have accepted a list of fee addresses at pairing and written
+    # whichever one str() produced.
     if args.usage_fee_address:
         try:
-            proto.JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)
+            proto.xmr_address(args.usage_fee_address)
         except proto.WakeError as e:
             sys.exit(f"[!] --usage-fee-address is not a usable Monero "
                      f"address: {e}\n"

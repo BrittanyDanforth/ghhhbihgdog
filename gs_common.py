@@ -793,8 +793,26 @@ _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 #: validate_xmr_address runs monero.address.address() immediately below to
 #: verify it. This is the cheap pre-filter it always was; it no longer refuses
 #: real addresses in the name of being one.
+#: \Z, NOT $, AND THE CHECK THAT WAS SUPPOSED TO CATCH THIS COULD NOT SEE IT.
+#:
+#: In Python `$` also matches just before a trailing newline, so this accepted
+#: "<address>\n" -- driven: XMR_ADDR_RE.match(addr + "\n") was True.
+#: tests/test_units.py has a check whose own comment says it is "STRUCTURAL,
+#: not a list: this walks the shipped source and fails on ANY new `^...$`
+#: validator, because enumerating the thirteen would not stop a fourteenth."
+#: Its detector was a regex over single lines looking for `re.compile(r"^...$"`
+#: -- which cannot match an f-string, and cannot match a call split across two
+#: lines. This validator is both, and so is gs_console's copy of it. They were
+#: the only two `^...$` validators left in the toolchain and the check that
+#: exists to find them was blind to exactly their shape.
+#:
+#: Nothing was exploitable through it: validate_xmr_address below follows the
+#: regex with a real Keccak checksum, which a trailing newline fails, and
+#: gs_console strips before matching. That is defence in depth doing its job,
+#: not a reason to leave the hole -- this is the cheap pre-filter for the value
+#: the ENTIRE mixed balance is sent to.
 XMR_ADDR_RE = re.compile(
-    f"^[48][{_B58}]{{94}}$|^4[{_B58}]{{105}}$")
+    f"^[48][{_B58}]{{94}}\\Z|^4[{_B58}]{{105}}\\Z")
 
 
 def validate_xmr_address(addr: str, what: str = "XMR address") -> None:
