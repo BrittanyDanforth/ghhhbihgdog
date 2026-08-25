@@ -1611,6 +1611,14 @@ def phase_sign(args, plan: List[dict]):
                     "dst": entry.get("dst", ""),
                     "amt": entry.get("amt", ""),
                     "delay": entry.get("delay", 0),
+                    # HOW MANY THERE WERE SUPPOSED TO BE. Without this the
+                    # manifest cannot describe its own completeness: a batch
+                    # whose LAST transaction failed to sign produces four
+                    # entries numbered 0-3, which is indistinguishable from a
+                    # four-transaction plan that signed perfectly. See the
+                    # refusal at the end of this function for why that matters
+                    # and why the check could not live only here.
+                    "of": len(entries),
                 })
                 signed_count += 1
                 print(f"  [+] TX {idx} signed -> {signed_file.name}")
@@ -1652,7 +1660,26 @@ def phase_sign(args, plan: List[dict]):
                 pass
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    # Write signed manifest
+    # Write signed manifest.
+    #
+    # THIS RUNS BEFORE THE REFUSAL BELOW, ON PURPOSE, AND THAT USED TO BE THE
+    # BUG. A partial batch exits non-zero here -- and left a complete-looking
+    # signed_manifest_v1.json sitting in signed/ next to the blobs that did
+    # sign. broadcast_signed_xmr had no completeness check of any kind: it
+    # reads whatever entries the manifest holds and relays them. So the
+    # refusal below protected only the operator who was watching this
+    # terminal. Carry the directory to the online box on a USB stick -- which
+    # is the whole point of an air-gapped signer -- and the partial chain
+    # relays, reported as a clean run.
+    #
+    # Deleting the manifest instead would be worse, not better: with no
+    # manifest the broadcaster falls back to globbing *.signed and relays the
+    # same partial set with hashes unverified and delays unknown.
+    #
+    # So the manifest STAYS, and it carries "of" -- and the broadcaster
+    # refuses any manifest holding fewer entries than its own entries say
+    # there should be. The invariant is now enforced on both sides of the
+    # boundary instead of only on the side that exits.
     final_manifest = signed_dir / "signed_manifest_v1.json"
     atomic_write_json(signed_manifest, final_manifest)
 
@@ -1681,7 +1708,14 @@ def phase_sign(args, plan: List[dict]):
         sys.exit(
             f"[!] Only {signed_count}/{len(entries)} TXs signed. Aborting rather than "
             f"broadcast a partial chain: the transactions that did sign would relay "
-            f"the early hops and strand the funds on an intermediate subaddress."
+            f"the early hops and strand the funds on an intermediate subaddress.\n"
+            f"    {final_manifest} records {signed_count} of {len(entries)}, and "
+            f"broadcast_signed_xmr\n"
+            f"    refuses a short manifest -- so carrying this directory to the "
+            f"online box relays\n"
+            f"    nothing. Fix the signing failure above and re-run this phase; "
+            f"it overwrites\n"
+            f"    the manifest."
         )
     print(f"  [+] Signed TXs ready in {signed_dir}/ for broadcast.")
 

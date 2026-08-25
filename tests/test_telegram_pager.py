@@ -172,6 +172,8 @@ def _wizard_params(answers):
     p = pg.Pager.__new__(pg.Pager)
     p.proxies, p.token, p.key, p.args = {}, "x", {}, _ty.SimpleNamespace()
     p.allow = {1}
+    p.allow_users = set()
+    p.handle_owner = {}
     p.busy = _th.Lock()
     p.ignored = 0
     p.convos = {}
@@ -581,6 +583,7 @@ def _wedge_pager(fail_on):
     p.proxies, p.token, p.key = {"http": "x"}, "T", {}
     p.args = types.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 0, {}
+    p.allow_users, p.handle_owner = set(), {}
     p.busy = _th2.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
     p.burn, p.burn_after, p.burn_now = [], 0, False
@@ -909,6 +912,7 @@ def _plain_pager(busy=False, why=""):
     p.proxies, p.token, p.key = {"http": "x"}, "T", {}
     p.args = _ty3.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 4, {}
+    p.allow_users, p.handle_owner = set(), {}
     p.busy = _th3.Lock()
     if busy:
         p.busy.acquire()
@@ -1309,6 +1313,7 @@ class _BurnPager:
         p.proxies, p.token, p.key = {"http": "x"}, "T", {}
         p.args = _ty2.SimpleNamespace()
         p.allow = {111}
+        p.allow_users, p.handle_owner = set(), {}
         p.busy = __import__("threading").Lock()
         p.ignored = 0
         p.convos = {}
@@ -1477,6 +1482,208 @@ check("burn: NON-VACUITY -- a value inside the window passes this gate and "
       _rc3 is not None and "deletion window" not in str(_rc3)
       and "negative" not in str(_rc3))
 
+
+# ===========================================================================
+#  THE ALLOWLIST GATED THE ROOM, NOT THE PERSON
+#
+#  handle() read msg["chat"]["id"] and checked it against --chat-id. It never
+#  read msg["from"] at all. In a PRIVATE chat those are the same number, so it
+#  worked and every test here passed. In a GROUP they are not: every member's
+#  message carries the group's chat id, so `--chat-id <negative>` allowlisted
+#  the whole room -- for /send, which spends.
+# ===========================================================================
+print("\n== the allowlist: which id is actually checked ==")
+import types as _ty4
+import threading as _th4
+
+
+def _room_pager(allow, users):
+    p = pg.Pager.__new__(pg.Pager)
+    p.proxies, p.token, p.key = {"http": "x"}, "T", {}
+    p.args = _ty4.SimpleNamespace()
+    p.allow, p.ignored, p.convos = set(allow), 0, {}
+    p.allow_users, p.handle_owner = set(users), {}
+    p.busy = _th4.Lock()
+    p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
+    p.burn, p.burn_after, p.burn_now = [], 0, False
+    p.limits = _ty4.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                    recent=lambda: [], daily_cap=12,
+                                    offset=0, save=lambda: None)
+    seen = []
+    p.send = lambda c, t: (seen.append(t), True)[1]
+    return p, seen
+
+
+def _msg(chat, frm, text="/status"):
+    m = {"chat": {"id": chat}, "message_id": 1, "text": text}
+    if frm is not None:
+        m["from"] = {"id": frm}
+    return {"update_id": 1, "message": m}
+
+
+_ROOM = -1001234567890
+_ME, _THEM = 4242, 777001
+
+_gp, _gs_ = _room_pager([_ROOM], [_ME])
+_gp.handle(_msg(_ROOM, _ME))
+check("allowlist: in a group, the allowlisted SENDER is answered",
+      _gs_ == ["ready"])
+_gp2, _gs2 = _room_pager([_ROOM], [_ME])
+_gp2.handle(_msg(_ROOM, _THEM))
+check("allowlist: ...and another member of that same room is NOT — before "
+      "this, the room id was the whole check and they were",
+      _gs2 == [] and _gp2.ignored == 1)
+
+# SILENTLY. A reply confirms the bot is alive to whoever found it, which is
+# the same reason an unlisted chat gets nothing.
+check("allowlist: a rejected sender gets no reply at all, not a refusal",
+      _gs2 == [])
+
+# The shapes Telegram can put in `from`, and the one Python lies about:
+# True is an int, and `True in {1}` is True.
+for _bad, _what in ((None, "no from field at all (a channel post)"),
+                    ("4242", "a string id"),
+                    (True, "a bool, which Python counts as int 1")):
+    _bp, _bs = _room_pager([_ROOM], [1])
+    _bp.handle(_msg(_ROOM, _bad))
+    check(f"allowlist: {_what} is refused, not coerced", _bs == [])
+
+# NON-VACUITY: with no --user-id the gate is off, which is what keeps every
+# private-chat operator working exactly as before.
+_pp, _ps = _room_pager([111], [])
+_pp.handle(_msg(111, 999))
+check("allowlist: NON-VACUITY -- with no --user-id a private chat still "
+      "answers, whoever the from field claims to be (chat.id IS the user "
+      "there, so the room is the person)", _ps == ["ready"])
+
+# ...and the startup refusal, so nobody can be in that state by accident.
+_saved_main = (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
+               pg.load_token)
+pg.validate_proxy = lambda u: "socks5h://x"
+pg.verify_tor = lambda p: None
+pg.isolated_proxy = lambda u, tag: {"https": "socks5h://x"}
+pg.load_token = lambda f: "123456:TOKEN"
+try:
+    _grc = None
+    try:
+        pg.main(["--key", "/nonexistent.key", "--chat-id", str(_ROOM)])
+    except SystemExit as _e:
+        _grc = str(_e)
+    except Exception as _e:                                  # noqa: BLE001
+        _grc = f"{type(_e).__name__}: {_e}"
+    check("allowlist: a GROUP --chat-id with no --user-id is REFUSED at "
+          "startup, not warned about",
+          _grc and "GROUP" in _grc and "--user-id" in _grc)
+    check("allowlist: ...and the refusal says WHY it matters (a group message "
+          "carries the room's id, and /send spends)",
+          _grc and "SPENDS" in _grc)
+    # NON-VACUITY: the same group id WITH --user-id gets past this gate and
+    # fails later for its own reason (there is no keyfile here).
+    _grc2 = None
+    try:
+        pg.main(["--key", "/nonexistent.key", "--chat-id", str(_ROOM),
+                 "--user-id", str(_ME)])
+    except SystemExit as _e:
+        _grc2 = str(_e)
+    except Exception as _e:                                  # noqa: BLE001
+        _grc2 = f"{type(_e).__name__}: {_e}"
+    check(f"allowlist: NON-VACUITY -- the same group WITH --user-id passes "
+          f"this gate ({str(_grc2)[:44]!r})",
+          _grc2 is not None and "GROUP" not in str(_grc2))
+    # ...and a PRIVATE chat id never has to supply one.
+    _grc3 = None
+    try:
+        pg.main(["--key", "/nonexistent.key", "--chat-id", "111"])
+    except SystemExit as _e:
+        _grc3 = str(_e)
+    except Exception as _e:                                  # noqa: BLE001
+        _grc3 = f"{type(_e).__name__}: {_e}"
+    check("allowlist: a PRIVATE chat id still needs no --user-id",
+          _grc3 is not None and "GROUP" not in str(_grc3))
+finally:
+    (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
+     pg.load_token) = _saved_main
+
+# --whoami has to be the thing that TELLS them, because it is the only place
+# an operator ever learns an id. It printed the chat id and "Start the pager
+# with --chat-id {cid}", which in a group is an instruction to allowlist the
+# whole room.
+_wupd = [{"update_id": 9, "message": {"chat": {"id": _ROOM, "title": "grp"},
+                                      "from": {"id": _ME, "username": "op"},
+                                      "text": "hi"}}]
+pg.safe_get = lambda url, proxies=None: {"ok": True, "result": _wupd}
+_gout = io.StringIO()
+with contextlib.redirect_stdout(_gout):
+    pg.whoami("123456:TOKEN", {"https": "socks5h://x"})
+_gtext = _gout.getvalue()
+check("whoami: a GROUP is named as a group, not reported as a chat id",
+      "GROUP" in _gtext)
+check("whoami: ...and it prints the SENDER's id too, which is the one the "
+      "group needs", str(_ME) in _gtext)
+check("whoami: ...and the command it hands over carries both",
+      f"--chat-id {_ROOM} --user-id {_ME}" in _gtext)
+_wupd[:] = [{"update_id": 10, "message": {"chat": {"id": 111},
+                                          "from": {"id": 111, "username": "op"},
+                                          "text": "hi"}}]
+_pout = io.StringIO()
+with contextlib.redirect_stdout(_pout):
+    pg.whoami("123456:TOKEN", {"https": "socks5h://x"})
+_ptext = _pout.getvalue()
+check("whoami: NON-VACUITY -- a PRIVATE chat is told it needs no --user-id, "
+      "so the group advice is not printed at everyone",
+      "PRIVATE" in _ptext and "GROUP" not in _ptext
+      and "--chat-id 111 --user-id" not in _ptext)
+
+
+# ===========================================================================
+#  A HANDLE WAS A BEARER TOKEN WITH NO OWNER
+#
+#  The vault has no notion of a chat -- deliberately -- so it answers /check
+#  and /wait for ANY handle in its file. Driven against the real functions:
+#  a second chat asking /check <somebody else's handle> got their deposit
+#  address, amount and memo in the clear, and the memo names the destination
+#  XMR address in full.
+# ===========================================================================
+print("\n== a handle belongs to the chat that made it ==")
+_hp3, _hs3 = _room_pager([111, 222], [])
+_hp3.start_job = lambda cid, job, params: _hs3.append(("JOB", cid, params))
+
+# chat 111 makes one
+_hp3.handle_owner["A3F1"] = 111
+_hp3.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                         "message_id": 1,
+                                         "text": "/check A3F1"}})
+check("handles: the chat that made a handle can still check it",
+      any(x[0] == "JOB" for x in _hs3 if isinstance(x, tuple)))
+
+_hs3.clear()
+_hp3.handle({"update_id": 2, "message": {"chat": {"id": 222},
+                                         "message_id": 1,
+                                         "text": "/check A3F1"}})
+check("handles: another allowlisted chat asking for it is REFUSED — no wake, "
+      "so no slip and no deposit address",
+      not any(isinstance(x, tuple) and x[0] == "JOB" for x in _hs3))
+check("handles: ...and the refusal does not confirm the handle exists",
+      _hs3 and all("somebody" not in str(t).lower()
+                   and "else" not in str(t).lower() for t in _hs3))
+
+# The honest bound: the map is process memory, so a restart empties it, and
+# refusing an UNKNOWN handle would lock an operator out of their own swap on
+# the one box whose job is to be reachable.
+_hs3.clear()
+_hp3.handle({"update_id": 3, "message": {"chat": {"id": 222},
+                                         "message_id": 1,
+                                         "text": "/check B7C2"}})
+check("handles: a handle this process has never seen is still allowed — the "
+      "map is process memory and a restart must not lock anyone out",
+      any(isinstance(x, tuple) and x[0] == "JOB" for x in _hs3))
+
+# ...and the map really is filled in by the code path that mints one, not
+# only by tests writing to it by hand.
+check("handles: poke() records the owner when a wake comes back with one",
+      "self.handle_owner[h] = chat_id" in _SRC_PG)
+check("handles: ...and the map never reaches the SD card",
+      "handle_owner" not in _SRC_PG.split("def save")[1].split("\n    def ")[0])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

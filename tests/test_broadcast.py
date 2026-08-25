@@ -656,6 +656,117 @@ def test_egress_degrading_between_retries_stops_the_batch():
     check("...and exits non-zero", code != 0)
 
 
+# --------------------------------------------------------------------------
+# A PARTIAL SIGNING RUN MUST NOT RELAY. airgap_tx_signer already refuses one
+# ("Only 2/3 TXs signed. Aborting rather than broadcast a partial chain") --
+# but it writes signed_manifest_v1.json BEFORE that exit, and nothing here
+# looked at completeness at all. So the refusal protected only the operator
+# watching the signing terminal: carry signed/ to the online box on a USB
+# stick, which is the entire point of an air-gapped signer, and the partial
+# chain relayed and was reported as a clean run.
+#
+# Driven against the REAL phase_sign with a wallet-cli stub that fails on the
+# last transaction: manifest on disk = 2 entries for a 3-tx plan, and this
+# file then relayed both.
+# --------------------------------------------------------------------------
+def _rewrite(h, entries):
+    with open(h.manifest, "w") as f:
+        json.dump(entries, f)
+
+
+def _with_of(entries, of):
+    out = []
+    for e in entries:
+        e = dict(e)
+        e["of"] = of
+        out.append(e)
+    return out
+
+
+def test_truncated_manifest_is_refused():
+    # A plan of 5 whose LAST transaction failed to sign: idx 0-3, contiguous,
+    # byte-identical to a 4-transaction plan that signed perfectly. Only the
+    # recorded total can tell them apart.
+    h = Harness(n=5)
+    _rewrite(h, _with_of(h.entries[:4], 5))
+    code, msg = h.run()
+    check("partial: a manifest short of its own plan relays NOTHING",
+          h.posts == [])
+    check("partial: ...and exits non-zero", code != 0)
+    check("partial: ...and says how short it is",
+          "4 transaction(s)" in msg and "5" in msg)
+    check("partial: ...and names the consequence the signer refuses for",
+          "strand" in msg.lower())
+
+
+def test_gapped_manifest_is_refused():
+    # TX 2 of 5 failed: idx 0,1,3,4.
+    h = Harness(n=5)
+    _rewrite(h, _with_of([e for e in h.entries if e["idx"] != 2], 5))
+    code, msg = h.run()
+    check("partial: a manifest with a HOLE in it relays nothing",
+          h.posts == [] and code != 0)
+
+
+def test_gapped_legacy_manifest_is_refused_without_a_total():
+    # A manifest written before "of" existed still cannot hide a hole: the
+    # signer numbers a plan 0..n-1, so a missing index is a missing signature.
+    h = Harness(n=5)
+    _rewrite(h, [e for e in h.entries if e["idx"] != 2])
+    code, msg = h.run()
+    check("partial: a legacy manifest (no total) with a hole is still refused",
+          h.posts == [] and code != 0)
+    check("partial: ...and the refusal names the missing transaction",
+          "missing transaction" in msg.lower() and "2" in msg)
+
+
+def test_manifest_from_two_signing_runs_is_refused():
+    h = Harness(n=2)
+    mixed = [dict(h.entries[0], of=5), dict(h.entries[1], of=3)]
+    _rewrite(h, mixed)
+    code, msg = h.run()
+    check("partial: a manifest that disagrees with itself about the plan size "
+          "is refused rather than reconciled",
+          h.posts == [] and code != 0
+          and "disagrees with itself" in msg)
+
+
+def test_complete_manifest_still_relays():
+    # NON-VACUITY, and the one that matters most: the gate must not refuse a
+    # correctly signed batch. A relay guard that fires on good input strands
+    # money on the wrong side of an air gap.
+    h = Harness(n=5)
+    _rewrite(h, _with_of(h.entries, 5))
+    code, msg = h.run()
+    check("partial: NON-VACUITY -- a COMPLETE manifest relays every "
+          f"transaction (relayed {len(h.posts)}/5, code {code})",
+          len(h.posts) == 5 and code == 0)
+
+
+def test_complete_legacy_manifest_still_relays():
+    # NON-VACUITY for the legacy shape: an old manifest carries no total, and
+    # absence of a total is not evidence of a partial batch.
+    h = Harness(n=5)
+    _rewrite(h, h.entries)
+    code, msg = h.run()
+    check("partial: NON-VACUITY -- a COMPLETE legacy manifest (no total) "
+          f"still relays every transaction (relayed {len(h.posts)}/5)",
+          len(h.posts) == 5 and code == 0)
+
+
+def test_signer_records_the_total_it_signed_against():
+    # The other half of the invariant. A broadcaster that checks a field no
+    # signer writes is a check that never fires.
+    src = open(os.path.join(REPO, "airgap_tx_signer"), encoding="utf-8").read()
+    body = src.split("def phase_sign")[1].split("\ndef ")[0]
+    check("partial: phase_sign records the plan's transaction count in every "
+          "signed-manifest entry",
+          '"of": len(entries)' in body)
+    check("partial: ...and still refuses the partial batch itself, so the "
+          "guard is on BOTH sides of the sign->relay boundary",
+          "signed_count < len(entries)" in body)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

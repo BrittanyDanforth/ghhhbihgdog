@@ -94,7 +94,7 @@ def disable_core_dumps() -> bool:
 disable_core_dumps()
 
 import argparse
-import contextlib, errno, fcntl, fnmatch, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
+import contextlib, errno, fcntl, fnmatch, hashlib, json, os, re, secrets, shutil, signal, socket, stat as stat_module, sys, time
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional
@@ -2561,9 +2561,123 @@ class MoneroRPC:
             f"address's balance as this one's.")
 
 
+def rpc_lock_scope(url: str) -> str:
+    """Normalise a wallet-rpc URL into a run-lock scope key.
+
+    Two runs are unsafe together when they spend THE SAME WALLET, and a
+    monero-wallet-rpc process serves exactly one wallet, so the endpoint is
+    the wallet. Spelling is not: http://127.0.0.1:18083, http://localhost:18083/
+    and http://127.0.0.1:18083/json_rpc are one wallet written three ways, and
+    keying on the raw string would let those three run at once.
+
+    Host and port only, localhost names folded together, default port filled
+    in. NOT a security boundary -- an operator determined to point two
+    spellings that this cannot equate at one wallet still can (a hostname
+    alias, a proxy). It removes the accidents, and the flock file still
+    catches the same-directory case.
+    """
+    try:
+        u = urlparse((url or "").strip())
+        host = (u.hostname or "").lower()
+        port = u.port
+    except Exception:                                        # noqa: BLE001
+        return (url or "").strip().lower()
+    if not host:
+        return (url or "").strip().lower()
+    if host in _LOCALHOST_NAMES or host == "::1":
+        host = "127.0.0.1"
+    if port is None:
+        port = 443 if (u.scheme or "").lower() == "https" else 80
+    return f"{host}:{port}"
+
+
+def _scope_lock(scope: str, what: str):
+    """A second run-guard that CWD CANNOT MOVE. Returns a socket, or None.
+
+    run_lock's file is the visible half of the guard and it has one hole: a
+    path. GhostSpiral passed a RELATIVE one -- Path(".ghostspiral.lock") --
+    so the lock lived in whatever directory the run happened to start in.
+    Driven, two runs pointed at the SAME --rpc-primary:
+
+        same directory       -> run 2 refused: already running (pid 13019)
+        different directories-> run 2 ALSO acquired
+
+    -- both then spending one wallet, which the comment above the call says
+    is never safe. Nothing in the refusal hinted the guard was scoped to a
+    directory, so the failure is silent and looks like it worked.
+
+    Making the path absolute does not fix it here. The candidates all fail
+    under this toolchain's own systemd unit: PrivateTmp=yes gives the unit a
+    private /tmp, ProtectHome=yes hides $HOME entirely, and ProtectSystem=
+    strict makes everything outside ReadWritePaths= read-only. A lock a
+    manual run and a woken run cannot both see is the same hole again.
+
+    So the second guard holds no file at all. An abstract AF_UNIX socket
+    (Linux, leading NUL, no filesystem entry) is:
+
+      * held by the KERNEL and released when the process dies, however it
+        dies -- the same property flock is used for here, no stale state,
+        nothing an operator is ever told to delete,
+      * outside the filesystem, so PrivateTmp, ProtectHome, ProtectSystem
+        and cwd have no opinion about it -- and paranoia_mode has nothing
+        extra to sweep, because there is no artifact,
+      * per network namespace, and no unit here sets PrivateNetwork, so the
+        wake agent's children and a manual run land in the same one.
+
+    KEYED ON THE WALLET, not on the tool: two runs against DIFFERENT
+    wallet-rpc endpoints are independent and both may proceed. That is the
+    same claim the refusal text makes ("two runs spending the same wallet"),
+    which the directory-scoped file never actually enforced.
+
+    FAILS OPEN, deliberately, and only for a platform that has no abstract
+    namespace: a bind that fails for any reason other than "already taken"
+    leaves the flock guard in place and the run continues. This is a second
+    lock, not a new way for the tool to refuse to start.
+    """
+    if not scope:
+        return None
+    key = hashlib.sha256(f"ghostspiral\x00{scope}".encode()).hexdigest()[:24]
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    except Exception:                                        # noqa: BLE001
+        return None
+    try:
+        sock.bind("\0ghostspiral." + key)
+    except OSError as e:
+        try:
+            sock.close()
+        except Exception:                                    # noqa: BLE001
+            pass
+        if getattr(e, "errno", None) != errno.EADDRINUSE:
+            return None
+        sys.exit(
+            f"[!] {what} is already running against this wallet-rpc.\n"
+            f"    Two runs spending the same wallet at once fight over the "
+            f"same outputs and\n"
+            f"    can leave a mix half-executed. Wait for it, or stop it "
+            f"first.\n"
+            f"    (This guard is keyed on the wallet-rpc endpoint, not on a "
+            f"directory, so the\n"
+            f"     other run may have started anywhere — including from the "
+            f"wake agent. It is\n"
+            f"     held by the kernel, so if it has really died it is already "
+            f"released and there\n"
+            f"     is nothing to delete by hand.)")
+    except Exception:                                        # noqa: BLE001
+        try:
+            sock.close()
+        except Exception:                                    # noqa: BLE001
+            pass
+        return None
+    return sock
+
+
 @contextlib.contextmanager
-def run_lock(path: Path, what: str = "GhostSpiral"):
+def run_lock(path: Path, what: str = "GhostSpiral", scope: str = ""):
     """Refuse to run twice at once. Held by the KERNEL, so it cannot go stale.
+
+    `scope` names the RESOURCE, not the directory -- see _scope_lock. Without
+    it this guard is only as wide as the directory `path` sits in.
 
     The version this replaces was
 
@@ -2597,6 +2711,10 @@ def run_lock(path: Path, what: str = "GhostSpiral"):
     nothing, is gitignored, and paranoia_mode wipes it.
     """
     path = Path(path)
+    # The scope guard FIRST: it is the one that does not depend on cwd, so a
+    # cross-directory collision is refused before this run creates a lock file
+    # in a directory the run it collides with cannot see.
+    scope_sock = _scope_lock(scope, what)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         try:
@@ -2635,6 +2753,11 @@ def run_lock(path: Path, what: str = "GhostSpiral"):
             os.close(fd)
         except OSError:
             pass
+        if scope_sock is not None:
+            try:
+                scope_sock.close()
+            except Exception:                                # noqa: BLE001
+                pass
 
 
 def create_fresh_account(rpc, label: str = "") -> int:

@@ -86,6 +86,8 @@ class Fake:
         p.proxies, p.token, p.key = {}, "x", {}
         p.args = types.SimpleNamespace()
         p.allow = set(allow)
+        p.allow_users = set()
+        p.handle_owner = {}
         p.busy = threading.Lock()
         p.ignored = 0
         p.convos = {}

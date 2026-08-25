@@ -485,6 +485,7 @@ pg.integrity_log = lambda *a, **k: None
 pg.SLIP_RETRY_S = 0
 _p = pg.Pager.__new__(pg.Pager)
 _p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
+_p.handle_owner = {}
 _ok = [True]
 _p.send = lambda cid, t: (_sent.append(t), _ok[0])[1]
 

@@ -55,7 +55,7 @@ from gs_common import (
     swap_arrival_floor,
     progress_line,
     isolated_proxy,
-    create_fresh_account, run_lock,
+    create_fresh_account, run_lock, rpc_lock_scope,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     MAX_SPLIT, fmt_btc, SATOSHI_BTC,
     validate_xmr_address, accept_floor,
@@ -8282,7 +8282,17 @@ def main():
     # dangerous. It is held for the whole run, which is hours for a peel
     # chain, and that is the intent: two GhostSpiral runs against one wallet
     # is never safe.
-    with run_lock(Path(".ghostspiral.lock"), "GhostSpiral"):
+    #
+    # AND THE PATH IS RELATIVE, which is why there is a second argument. The
+    # sentence above says "against one wallet"; the file says "in one
+    # directory". Driven, two runs on the SAME --rpc-primary: same directory,
+    # run 2 refused; different directories, run 2 ALSO acquired, and both went
+    # on to spend the same wallet with nothing printed about it. `scope=` is
+    # the guard that means what that sentence says -- keyed on the wallet-rpc
+    # endpoint, held by the kernel outside the filesystem, so cwd, PrivateTmp
+    # and ProtectHome cannot move it. See _scope_lock.
+    with run_lock(Path(".ghostspiral.lock"), "GhostSpiral",
+                  scope=rpc_lock_scope(args.rpc_primary)):
         sub_account = resolve_mix_account(args, rpc_primary, receive_mode,
                                          receive_account_index)
 

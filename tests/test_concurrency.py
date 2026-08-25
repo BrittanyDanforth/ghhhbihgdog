@@ -269,8 +269,113 @@ check("run lock: GhostSpiral acquires it through the shared helper",
 check("run lock: ...and no longer does exists()-then-write",
       "lock_path.exists()" not in _gs_code)
 
+# ---------------------------------------------------------------------------
+# THE LOCK PATH IS RELATIVE, AND THAT WAS THE HOLE. GhostSpiral takes it as
+# Path(".ghostspiral.lock"), so the guard was only as wide as the directory
+# the run started in -- while the comment above the call, and the refusal
+# text, both say "two runs spending the same wallet". Driven before the fix:
+# same directory refused, DIFFERENT directories BOTH acquired, and both went
+# on to spend one wallet with nothing printed about it.
+#
+# `scope=` closes it: an abstract AF_UNIX socket keyed on the wallet-rpc
+# endpoint. Nothing in the filesystem, so cwd, PrivateTmp=yes and
+# ProtectHome=yes (both set on this toolchain's own unit) cannot move it.
+print("\n== run lock: the scope guard (cwd cannot move it) ==")
+check("rpc_lock_scope folds the spellings of ONE wallet-rpc together, so "
+      "three ways of writing it cannot run three times at once",
+      gs.rpc_lock_scope("http://127.0.0.1:18083")
+      == gs.rpc_lock_scope("http://localhost:18083/")
+      == gs.rpc_lock_scope("http://127.0.0.1:18083/json_rpc")
+      == gs.rpc_lock_scope("http://[::1]:18083"))
+check("...and does NOT fold two different ports together: two wallets are "
+      "independent and both may run",
+      gs.rpc_lock_scope("http://127.0.0.1:18083")
+      != gs.rpc_lock_scope("http://127.0.0.1:18085"))
+check("...and an unparseable endpoint still yields a key rather than "
+      "raising, so the guard never breaks a run by failing to name it",
+      isinstance(gs.rpc_lock_scope("not a url"), str)
+      and isinstance(gs.rpc_lock_scope(""), str))
+
+
+def _scoped_child(cwd, endpoint, q, ready, hold_s):
+    import sys as _s
+    _s.path.insert(0, REPO)
+    import gs_common as _g
+    _g.integrity_log = lambda *a, **k: None
+    os.chdir(cwd)
+    try:
+        with _g.run_lock(Path(".ghostspiral.lock"), "GhostSpiral",
+                         scope=_g.rpc_lock_scope(endpoint)):
+            q.put("won")
+            if ready is not None:
+                ready.set()
+            time.sleep(hold_s)
+    except SystemExit:
+        q.put("blocked")
+
+
+_EP = "http://127.0.0.1:18083"
+_d1 = Path(tempfile.mkdtemp(prefix="gs_lk_a_"))
+_d2 = Path(tempfile.mkdtemp(prefix="gs_lk_b_"))
+_q4 = _mp.Queue(); _r4 = _mp.Event()
+_hold = _mp.Process(target=_scoped_child, args=(str(_d1), _EP, _q4, _r4, 3.0))
+_hold.start(); _r4.wait(10)
+_q5 = _mp.Queue()
+_other = _mp.Process(target=_scoped_child, args=(str(_d2), _EP, _q5, None, 0.2))
+_other.start(); _other.join()
+_cross = _q5.get()
+check("run lock: a second run in a DIFFERENT DIRECTORY against the SAME "
+      "wallet-rpc is refused (before the scope guard it acquired)",
+      _cross == "blocked")
+
+# ...and the legitimate case still runs. Two wallets are two independent
+# resources; a guard that refused them would be a lockout, not a lock.
+_q6 = _mp.Queue()
+_far = _mp.Process(target=_scoped_child,
+                   args=(str(_d2), "http://127.0.0.1:18085", _q6, None, 0.2))
+_far.start(); _far.join()
+check("run lock: ...but a run against a DIFFERENT wallet-rpc still proceeds",
+      _q6.get() == "won")
+_hold.join()
+
+# The scope guard must inherit flock's one indispensable property: the kernel
+# drops it when the holder dies, so there is never a stale lock and never any
+# advice to clear one by hand. An abstract socket has no file to go stale.
+_q7 = _mp.Queue(); _r7 = _mp.Event()
+_kill_me = _mp.Process(target=_scoped_child, args=(str(_d1), _EP, _q7, _r7, 60))
+_kill_me.start(); _r7.wait(10)
+os.kill(_kill_me.pid, 9); _kill_me.join()
+_q8 = _mp.Queue()
+_after = _mp.Process(target=_scoped_child, args=(str(_d2), _EP, _q8, None, 0.2))
+_after.start(); _after.join()
+check("run lock: a SIGKILLed scope holder leaves NOTHING behind — the next "
+      "run in another directory acquires immediately",
+      _q8.get() == "won")
+
+# THE RACE, ACROSS DIRECTORIES. The original 12-way race ran them all in one
+# directory, which is the case that already worked.
+_q9 = _mp.Queue()
+_dirs = [Path(tempfile.mkdtemp(prefix="gs_lk_r_")) for _ in range(12)]
+_rps = [_mp.Process(target=_scoped_child, args=(str(d), _EP, _q9, None, 0.5))
+        for d in _dirs]
+for _p in _rps: _p.start()
+for _p in _rps: _p.join()
+_res2 = [_q9.get() for _ in range(_q9.qsize())]
+check(f"run lock: 12 concurrent runs in 12 DIFFERENT directories against one "
+      f"wallet -> exactly ONE wins (won={_res2.count('won')}, "
+      f"blocked={_res2.count('blocked')})",
+      _res2.count("won") == 1 and _res2.count("blocked") == 11)
+
+# and GhostSpiral must actually pass it. A scope parameter nothing supplies is
+# a guard that is off.
+check("run lock: GhostSpiral passes a scope keyed on --rpc-primary, so the "
+      "guard it takes is the wallet's and not the directory's",
+      "scope=rpc_lock_scope(args.rpc_primary)" in _gs_code)
+
 import shutil as _sh2
 _sh2.rmtree(_lk_dir, ignore_errors=True)
+for _d in [_d1, _d2] + _dirs:
+    _sh2.rmtree(_d, ignore_errors=True)
 
 
 print("=== every real-binary suite must own its ports ===")
