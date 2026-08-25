@@ -182,7 +182,7 @@ def _wizard_params(answers):
     p.limits = _ty.SimpleNamespace(why_not=lambda: "", record=lambda: None,
                                    recent=lambda: [], daily_cap=12)
     seen = []
-    p.send = lambda c, t: (seen.append(t), True)[1]
+    p.send = lambda c, t, buttons=None: (seen.append(t), True)[1]
     p.start_job = lambda c, j, pa: _wiz.append((j, pa))
     for a in answers:
         if a == "<confirm>":
@@ -588,7 +588,7 @@ def _wedge_pager(fail_on):
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
     p.burn, p.burn_after, p.burn_now = [], 0, False
     sent = []
-    p.send = lambda c, t: (sent.append(t), True)[1]
+    p.send = lambda c, t, buttons=None: (sent.append(t), True)[1]
 
     def _rec():
         if fail_on == "record":
@@ -820,7 +820,7 @@ _said = []
 _wp = pg.Pager.__new__(pg.Pager)
 _wp.args = types.SimpleNamespace(no_jitter=False)
 _wp.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None)
-_wp.send = lambda cid, t: (_said.append((cid, t)), True)[1]
+_wp.send = lambda cid, t, buttons=None: (_said.append((cid, t)), True)[1]
 _saved_thread = threading.Thread
 try:
     pg.integrity_log = lambda *a, **k: None
@@ -922,7 +922,7 @@ def _plain_pager(busy=False, why=""):
                                     recent=lambda: [1, 2, 3], daily_cap=12,
                                     offset=0, save=lambda: None)
     seen = []
-    p.send = lambda c, t: (seen.append(t), True)[1]
+    p.send = lambda c, t, buttons=None: (seen.append(t), True)[1]
     return p, seen
 
 
@@ -1338,7 +1338,7 @@ class _BurnPager:
 # 1. THE OPERATOR'S OWN COMMANDS ARE TRACKED, and they are the half that
 #    matters: the replies are boring by design, but "/depo 2" at 03:12 is not.
 _b = _BurnPager()
-_b.p.send = lambda c, t: True
+_b.p.send = lambda c, t, buttons=None: True
 _b.p.handle({"update_id": 1,
              "message": {"chat": {"id": 111}, "message_id": 900,
                          "text": "/status"}})
@@ -1347,7 +1347,7 @@ check("burn: the operator's own command message is tracked for deletion",
 # NON-VACUITY: a chat that is NOT allowlisted must not be tracked -- deleting
 # there is an action taken for somebody who was refused.
 _b2 = _BurnPager()
-_b2.p.send = lambda c, t: True
+_b2.p.send = lambda c, t, buttons=None: True
 _b2.p.handle({"update_id": 1,
               "message": {"chat": {"id": 999}, "message_id": 901,
                           "text": "/status"}})
@@ -1510,7 +1510,7 @@ def _room_pager(allow, users):
                                     recent=lambda: [], daily_cap=12,
                                     offset=0, save=lambda: None)
     seen = []
-    p.send = lambda c, t: (seen.append(t), True)[1]
+    p.send = lambda c, t, buttons=None: (seen.append(t), True)[1]
     return p, seen
 
 
@@ -1684,6 +1684,191 @@ check("handles: poke() records the owner when a wake comes back with one",
       "self.handle_owner[h] = chat_id" in _SRC_PG)
 check("handles: ...and the map never reaches the SD card",
       "handle_owner" not in _SRC_PG.split("def save")[1].split("\n    def ")[0])
+
+
+
+# ===========================================================================
+#  EVERYTHING WAS TYPED. NOTHING WAS TAPPABLE.
+#
+#  Every answer this bot gave was a paragraph ending in an instruction to
+#  type something -- "Reply with one:", "start again with /send", "/cancel to
+#  stop" -- on a surface whose entire client is a touchscreen. An operator
+#  standing in a street with one thumb had to spell /withdraw correctly, then
+#  a depth, then a three-digit confirm, with a Tor round trip between each.
+#
+#  A tap is now the SAME command, not a second one: parse_callback maps
+#  callback data to the exact text the typed path takes, and handle_callback
+#  feeds it through the same handler -- same allowlist, same sender check,
+#  same rate limit, same one-job lock, same handle ownership.
+# ===========================================================================
+print("\n== a tap is the same command as typing it ==")
+
+
+def _tap(p, data, chat=111, frm=111, cb_id="cbq1"):
+    p.handle({"callback_query": {"id": cb_id, "data": data,
+                                 "from": {"id": frm},
+                                 "message": {"chat": {"id": chat},
+                                             "message_id": 9}}})
+
+
+def _tapper(allow=(111,), users=()):
+    """A pager that records (text, buttons) rather than text alone."""
+    p, _ = _room_pager(allow, users)
+    seen, toasts, jobs = [], [], []
+    p.send = lambda c, t, buttons=None: (seen.append((t, buttons)), True)[1]
+    p.answer_callback = lambda i, text="": toasts.append(text)
+    p.start_job = lambda cid, job, params: jobs.append((cid, job, params))
+    return p, seen, toasts, jobs
+
+
+for _data, _text in (("m:status", "/status"), ("m:help", "/help"),
+                     ("m:fee", "/fee"), ("m:speed", "/speed"),
+                     ("m:exit", "/exit"), ("m:settings", "/settings"),
+                     ("m:recv", "/receive"), ("m:depo", "/deposit"),
+                     ("m:send", "/send"), ("m:cancel", "/cancel")):
+    _a, _sa, _, _ja = _tapper()
+    _tap(_a, _data)
+    _b, _sb, _, _jb = _tapper()
+    _b.handle(_msg(111, 111, _text))
+    check(f"tap: {_data} does exactly what typing {_text} does",
+          _sa == _sb and _ja == _jb)
+
+# ...and the table is CLOSED, read the way the doorbell reads a phase name.
+for _bad, _label in (("m:nope", "a button not in the table"),
+                     ("d:9", "a depth the vault does not offer"),
+                     ("c:ZZZZ", "a mangled handle"),
+                     ("", "empty callback data"),
+                     ("m:depo ; rm -rf /", "anything with an argument")):
+    _p, _s, _t, _j = _tapper()
+    _tap(_p, _bad)
+    check(f"tap: {_label} is refused — no job, no message in the chat",
+          _j == [] and _s == [])
+    check(f"tap: ...and answered as a TOAST, which reaches the tapper's "
+          f"screen and not the transcript ({_t[:1]})",
+          len(_t) == 1 and _t[0].startswith("no:"))
+
+# THE MENU IS ON THE TWO MESSAGES SOMEBODY WITHOUT A PLAN ARRIVES AT.
+_mp, _ms, _, _ = _tapper()
+_mp.handle(_msg(111, 111, "/help"))
+_labels = [l for _row in (_ms[0][1] or []) for l, _d in _row]
+check("tap: /help carries the menu", "Deposit" in _labels
+      and "Withdraw" in _labels)
+check("tap: ...and every button on it maps to a real command",
+      all(pg.parse_callback(_d)[1] == ""
+          for _row in (_ms[0][1] or []) for _l, _d in _row))
+_sp, _ss, _, _ = _tapper()
+_sp.handle(_msg(111, 111, "/status"))
+check("tap: /status carries it too — it is the command an operator sends in "
+      "order to decide what to do next",
+      _ss and _ss[0][1])
+check("tap: ...and the ANSWER is still one word, so the buttons added "
+      "nothing to the transcript",
+      _ss[0][0] in ("ready", "wait"))
+
+# EVERY LABEL IS A COMMAND THAT EXISTS. A button wired to nothing is worse
+# than no button.
+for _d in pg.CALLBACK_TEXT.values():
+    _job, _prm, _err = pg.parse_command(_d)
+    check(f"tap: the menu's {_d} is a command parse_command knows",
+          _err != "unknown command")
+
+# THE DEPTH MENU comes from the PROTOCOL's table, like the text beside it, so
+# a depth cannot be offered as a button and not as a line, or the reverse.
+_dp, _ds, _, _ = _tapper()
+_dp.handle(_msg(111, 111, "/send"))
+_dp.handle(_msg(111, 111, "4" + "1" * 94))
+_depth_rows = _ds[-1][1] or []
+_depth_data = [_d for _row in _depth_rows for _l, _d in _row]
+check("tap: the depth question is tappable",
+      all(f"d:{_n}" in _depth_data for _n in P.WITHDRAW_DEPTHS))
+check("tap: ...with exactly the depths the protocol offers and no others",
+      sorted(_d for _d in _depth_data if _d.startswith("d:"))
+      == sorted(f"d:{_n}" for _n in P.WITHDRAW_DEPTHS))
+check("tap: ...and a way out, since the message says '/cancel to stop'",
+      "m:cancel" in _depth_data)
+check("tap: ...and every depth line in the TEXT has a button",
+      all(str(_n) in _ds[-1][0] for _n in P.WITHDRAW_DEPTHS))
+
+# AND THE CONFIRM DOES NOT GET ONE. CONFIRM_NOTE: this gate "stops a
+# pocket-dial and a message pasted into the wrong chat" -- and a tap IS a
+# pocket-dial. A Yes button would put a spend one accidental touch away and
+# leave that sentence claiming a protection that no longer existed.
+_dp.handle({"update_id": 1, "message": {"chat": {"id": 111}, "message_id": 1,
+                                        "from": {"id": 111}, "text": "2"}})
+check("tap: the CONFIRM question carries NO buttons — a tap is exactly the "
+      "pocket-dial that gate exists to stop",
+      _ds[-1][1] is None and "SPENDS" in _ds[-1][0])
+# NON-VACUITY: that same wizard DID get buttons one step earlier, so this is
+# not "the wizard has no buttons".
+check("tap: NON-VACUITY -- the step before it was tappable",
+      _depth_rows != [])
+
+# A HANDLE'S REPLY CARRIES ITS OWN NEXT STEP. /check and /wait both needed a
+# four-character hex label retyped off the screen above, correctly, or the
+# wake was spent on unknown_handle.
+_hp, _hs, _, _hj = _tapper()
+check("tap: a minted handle gets check/wait buttons",
+      [_d for _row in (_hp._handle_buttons("A3F1") or [])
+       for _l, _d in _row] == ["c:A3F1", "w:A3F1"])
+check("tap: ...and a non-handle gets none rather than a broken button",
+      _hp._handle_buttons("") is None
+      and _hp._handle_buttons("ZZZZ") is None
+      and _hp._handle_buttons(None) is None)
+_hp.handle_owner["A3F1"] = 111
+_tap(_hp, "c:A3F1")
+check("tap: tapping it starts the same job /check A3F1 starts",
+      _hj == [(111, "swap_status", {"handle": "A3F1"})])
+# ...AND THE OWNERSHIP RULE APPLIES TO A TAP. The button is a convenience,
+# never a bypass.
+_op, _os, _, _oj = _tapper()
+_op.handle_owner["A3F1"] = 222
+_tap(_op, "c:A3F1")
+check("tap: a handle belonging to another chat is refused through a button "
+      "exactly as it is through a typed command",
+      _oj == [] and _os and "no record" in _os[0][0])
+
+# IN A GROUP THE BUTTON IS IN FRONT OF EVERYONE, which is where the sender
+# check earns its keep: a callback_query carries the room's chat id and a
+# `from` that is the thumb.
+_gp, _gsx, _gt, _gj = _tapper([_ROOM], [_ME])
+_tap(_gp, "m:send", chat=_ROOM, frm=_ME)
+check("tap: in a group, the allowlisted operator's tap works",
+      len(_gsx) == 1)
+_gp2, _gs2, _gt2, _gj2 = _tapper([_ROOM], [_ME])
+_tap(_gp2, "m:send", chat=_ROOM, frm=_THEM)
+check("tap: ...and another member tapping the SAME button starts nothing",
+      _gj2 == [] and _gs2 == [] and _gp2.ignored == 1)
+check("tap: ...and is told so as a toast — they can see the button, so "
+      "saying no discloses nothing, and a silent tap spins for 30s",
+      _gt2 == ["Not for you."])
+# A CHAT THAT IS NOT ALLOWLISTED GETS NOTHING AT ALL, including no
+# acknowledgement: answering confirms the bot is alive to whoever found it.
+_up, _us, _ut, _uj = _tapper([111], [])
+_tap(_up, "m:status", chat=999, frm=999)
+check("tap: an unlisted chat gets no reply AND no acknowledgement",
+      _us == [] and _ut == [] and _uj == [] and _up.ignored == 1)
+
+# THE POLL HAS TO ASK FOR THEM. A getUpdates without callback_query in
+# allowed_updates never receives one, so every button would spin and do
+# nothing -- worse than having no buttons.
+check("tap: getUpdates asks for callback_query as well as message",
+      "callback_query" in _SRC_PG.split("def updates")[1].split("def ")[0])
+# ...and the spinner is closed. An unanswered callback_query holds the
+# client's spinner for about thirty seconds.
+check("tap: the pager answers the callback so the spinner closes",
+      "answerCallbackQuery" in _SRC_PG)
+check("tap: ...and acknowledges BEFORE starting the job, which can hold the "
+      "thread longer than the spinner lives",
+      _SRC_PG.split("def handle_callback")[1].index("self.answer_callback(_id)")
+      < _SRC_PG.split("def handle_callback")[1].index("self.handle({"))
+# NOTHING IS REACHABLE ONLY BY TAPPING. A chat with no keyboard support, an
+# old client, or a burned message must all still work by typing.
+check("tap: buttons are optional on send(), so every reply still works "
+      "without one", "buttons=None" in _SRC_PG.split("def send")[1][:400])
+check("tap: ...and no callback maps to anything the typed vocabulary does "
+      "not already have",
+      all(pg.parse_command(_t)[2] != "unknown command"
+          for _t in pg.CALLBACK_TEXT.values()))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

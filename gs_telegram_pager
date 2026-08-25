@@ -232,6 +232,87 @@ BOT_COMMANDS = [
     ("help", "this list"),
 ]
 
+#: WHAT A TAP MEANS, AS THE TEXT THE OPERATOR WOULD HAVE TYPED.
+#:
+#: EVERYTHING HERE WAS TYPED AND NOTHING WAS TAPPABLE. Every answer this bot
+#: gives is a paragraph ending in an instruction to type something -- "Reply
+#: with one:", "start again with /send", "/cancel to stop" -- on a surface
+#: whose entire client is a touchscreen. An operator standing in a street with
+#: one thumb had to spell /withdraw correctly, then a depth, then a
+#: three-digit confirm, with a Tor round trip between each. That is not a
+#: service, it is a command line with a chat window around it.
+#:
+#: A TAP IS THE SAME COMMAND, NOT A SECOND ONE. Each entry maps callback data
+#: to the exact text the typed path already accepts, and _handle_callback
+#: feeds that text through the SAME handler -- the same allowlist, the same
+#: sender check, the same rate limit, the same one-job lock, the same handle
+#: ownership. This file already learned that lesson from `/depo 2`: "a second
+#: door beside it that skips the confirm makes the confirm optional, which is
+#: the same as not having one." There is no second door here; there is one
+#: door with a button next to the doorbell.
+#:
+#: A CLOSED TABLE, read the way the doorbell reads a phase name. Callback data
+#: comes back from Telegram and cannot be fabricated by a client that did not
+#: receive the button -- but "cannot" about somebody else's server is not a
+#: property this file gets to assume, so an unknown key is refused rather than
+#: interpreted, and the two that take an argument re-check it here.
+#:
+#: 64 BYTES is the Bot API's limit on callback_data. Every key here is under
+#: ten characters plus at most a four-character handle.
+CALLBACK_TEXT = {
+    "m:help": "/help",
+    "m:status": "/status",
+    "m:settings": "/settings",
+    "m:fee": "/fee",
+    "m:speed": "/speed",
+    "m:exit": "/exit",
+    "m:depo": "/deposit",
+    "m:send": "/send",
+    "m:recv": "/receive",
+    "m:cancel": "/cancel",
+}
+
+#: THE MENU, and the reason it is short. Eleven commands are published to
+#: Telegram's "/" list; four of them are what an operator actually does. The
+#: rest are answers to questions, and they hang off /help, which is one tap
+#: away and stays one tap away.
+MENU_BUTTONS = [
+    [("Deposit", "m:depo"), ("Withdraw", "m:send")],
+    [("Status", "m:status"), ("Fresh address", "m:recv")],
+    [("What this does", "m:settings"), ("All commands", "m:help")],
+]
+
+
+def parse_callback(data: str) -> tuple:
+    """(text, error) for one tapped button. Never raises.
+
+    Returns the text the typed path would have received, so a tap and a typed
+    command reach the identical handler. Refuses anything not in the table.
+    """
+    d = (data or "").strip()
+    if d in CALLBACK_TEXT:
+        return CALLBACK_TEXT[d], ""
+    # THE DEPTH MENU. The value is checked against the PROTOCOL's own table
+    # rather than a range written here, exactly as _depth_from does -- a
+    # button offering a depth the vault refuses would spend a wake on a
+    # rejection.
+    if d.startswith("d:"):
+        _n = d[2:]
+        if _n.isdecimal() and int(_n) in proto.WITHDRAW_DEPTHS:
+            return _n, ""
+        return "", "that depth is not one this service offers"
+    # A HANDLE, and it goes through HANDLE_RE here as well as in
+    # parse_command. The button was built from a handle this process minted,
+    # so this can only fail on a mangled callback -- which is the case worth
+    # refusing rather than passing on to a wake.
+    if d[:2] in ("c:", "w:"):
+        _h = d[2:].upper()
+        if not HANDLE_RE.match(_h):
+            return "", "that is not a label"
+        return f"{'/check' if d[0] == 'c' else '/wait'} {_h}", ""
+    return "", "I do not know that button"
+
+
 CHAT_NAME = {
     "receive_and_quote": "depo",
     "receive_new": "recv",
@@ -245,6 +326,20 @@ def chat_name(job: str) -> str:
     """What to call a job in the chat."""
     return CHAT_NAME.get(job, job)
 
+#: THE ONE PLACE THAT STAYS TYPED, AND THE REASON IS THIS SENTENCE.
+#:
+#: Everything else in this bot is now a button -- the menu, the depth choice,
+#: cancel, check, wait -- because an operator standing in a street with one
+#: thumb should not have to spell /withdraw. The confirm is the exception, and
+#: it is not an oversight: the gate exists to stop "a pocket-dial and a
+#: message pasted into the wrong chat", and A TAP IS A POCKET-DIAL. Rendering
+#: this question as a Yes button would put a spend one accidental touch away
+#: and leave the sentence below claiming a protection that no longer existed.
+#:
+#: The arithmetic is small on purpose -- it costs a second of attention, not
+#: of typing -- and it is the last thing between a conversation and money
+#: moving. See the note on `/depo 2`: "a second door beside it that skips the
+#: confirm makes the confirm optional, which is the same as not having one."
 CONFIRM_NOTE = (
     "This gate stops a pocket-dial and a message pasted into the wrong "
     "chat. It is NOT a security control: anyone holding this phone can read "
@@ -328,7 +423,12 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 #: needed at the moment the operator is about to send.
 HELP = "\n".join(
     [f"/{_c:<9s} {_d}" for _c, _d in BOT_COMMANDS]
-    + ["", "The memo goes in an OP_RETURN — desktop wallet, not a phone."]
+    + ["",
+       # THE BUTTONS ARE NOT A SECOND MANUAL. Every one of them sends a
+       # command from the list above, so this list stays the whole vocabulary
+       # and the keyboard is only the short way to reach four of it.
+       "Or use the buttons — they send these same commands.",
+       "The memo goes in an OP_RETURN — desktop wallet, not a phone."]
 )
 
 
@@ -811,9 +911,17 @@ class Pager:
             # label named which pile. The vault finds its own funded output
             # now; the only thing the operator actually has to decide is where
             # it goes.
-            self.send(chat_id, self._exit_question())
+            # A CANCEL BUTTON AND NOTHING ELSE. The answer to this question is
+            # a Monero address, which no button can carry -- and one that
+            # could would be this bot offering to spend to an address it chose,
+            # which is the thing the whole design refuses. So the tappable part
+            # is the way OUT, which is the part an operator standing in a
+            # street with a half-typed address actually needs.
+            self.send(chat_id, self._exit_question(),
+                      buttons=[[("Cancel", "m:cancel")]])
             return
-        self.send(chat_id, self._amount_question())
+        self.send(chat_id, self._amount_question(),
+                  buttons=[[("Cancel", "m:cancel")]])
 
     def _exit_question(self) -> str:
         """Where the withdrawal goes -- and that it may go to more than one place.
@@ -978,6 +1086,41 @@ class Pager:
                   "it — the fees come out of the same pile.\n"
                   "/cancel to stop.")
 
+    def _handle_buttons(self, h: str) -> list:
+        """Check / wait, bound to the label this reply is about, or None.
+
+        THE TWO COMMANDS AN OPERATOR RUNS NEXT, and both used to require
+        retyping a four-character hex label off the screen above -- on a phone,
+        into a chat, correctly, or the wake was spent on unknown_handle. The
+        label is right there; the button carries it.
+
+        Built ONLY from a handle this process just minted and recorded in
+        handle_owner, so a button can never carry somebody else's label into
+        this chat. parse_callback re-checks the shape and handle() applies the
+        ownership rule to the synthesised command exactly as it does to a typed
+        one -- the button is a convenience, never a bypass.
+        """
+        if not (isinstance(h, str) and proto.HANDLE_RE.match(h)):
+            return None
+        return [[("Has it arrived?", f"c:{h}"), ("Wait for it", f"w:{h}")]]
+
+    def _depth_buttons(self) -> list:
+        """The same menu as _depth_question, tappable.
+
+        ONE ROW PER DEPTH, from proto.WITHDRAW_DEPTHS -- the same table the
+        text is built from, so a depth can never appear as a button and not as
+        a line, or the reverse. The label carries the hop count because that is
+        the thing being chosen; the NOTE stays in the message above, where
+        there is room for a sentence.
+
+        Cancel is here because the message it sits under ends with "/cancel to
+        stop", and an operator who has just decided not to do this should not
+        have to type a word to say so.
+        """
+        _rows = [[(f"{proto.WITHDRAW_DEPTHS[_d][0]} hops", f"d:{_d}")]
+                 for _d in sorted(proto.WITHDRAW_DEPTHS)]
+        return _rows + [[("Cancel", "m:cancel")]]
+
     def _depth_from(self, word: str):
         """A depth from what was typed, or None. Never raises.
 
@@ -1105,7 +1248,8 @@ class Pager:
             # ten hops whether the pile could afford it or not. The mix floor
             # rises with the hop count, so that one constant was a floor on
             # what could be withdrawn AT ALL.
-            self.send(chat_id, self._depth_question())
+            self.send(chat_id, self._depth_question(),
+                      buttons=self._depth_buttons())
             return True
         if c.awaiting_depth():
             _d = self._depth_from(word)
@@ -1243,8 +1387,14 @@ class Pager:
     def _url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
-    def send(self, chat_id: int, text: str) -> bool:
+    def send(self, chat_id: int, text: str, buttons=None) -> bool:
         """One reply. Never carries a plaintext address, memo or amount.
+
+        `buttons` is rows of (label, callback_data) and is OPTIONAL EVERYWHERE.
+        A tap is a second way to send text this bot already accepts -- see
+        _callback_text -- so a chat with no keyboard support, an old client, or
+        a burned message all still work by typing. Nothing is reachable only by
+        tapping.
 
         RETURNS WHETHER IT LANDED, and that is not decoration. This used to
         return None and swallow the failure into a print() -- which under the
@@ -1256,9 +1406,14 @@ class Pager:
         cannot walk to, for a quote that expires while they wait.
         """
         try:
-            _r = safe_post(self._url("sendMessage"),
-                           {"chat_id": chat_id, "text": text,
-                            "disable_web_page_preview": True},
+            _payload = {"chat_id": chat_id, "text": text,
+                        "disable_web_page_preview": True}
+            if buttons:
+                _payload["reply_markup"] = json.dumps(
+                    {"inline_keyboard":
+                        [[{"text": _t, "callback_data": _d} for _t, _d in _row]
+                         for _row in buttons]})
+            _r = safe_post(self._url("sendMessage"), _payload,
                            proxies=self.proxies)
             # REMEMBER IT SO IT CAN BE BURNED. Failing to record an id is not
             # an error the operator can act on -- the reply DID land, which is
@@ -1384,7 +1539,13 @@ class Pager:
 
     def updates(self) -> list:
         url = (f"{self._url('getUpdates')}?timeout={POLL_HOLD_S}"
-               f"&offset={self.limits.offset}&allowed_updates=%5B%22message%22%5D")
+               f"&offset={self.limits.offset}"
+               # BOTH KINDS. A tapped button arrives as a
+               # callback_query, and a getUpdates that does not ask for
+               # them never receives one -- so every button this bot
+               # draws would spin for thirty seconds and then do
+               # nothing, which is worse than having no buttons.
+               f"&allowed_updates=%5B%22message%22,%22callback_query%22%5D")
         try:
             d = safe_get(url, proxies=self.proxies)
         except Exception as e:                               # noqa: BLE001
@@ -1604,7 +1765,8 @@ class Pager:
                 lines = proto.plain_lines(plain)
                 body, memo = lines[:-1], lines[-1]
                 self.send(chat_id, f"{chat_name(job)} ready · slip {h}\n\n"
-                                   + "\n".join(body).rstrip())
+                                   + "\n".join(body).rstrip(),
+                          buttons=self._handle_buttons(h))
                 # THE MEMO ALONE IN ITS OWN MESSAGE. Tap-and-hold copies a
                 # WHOLE Telegram message, and this string has to reach a wallet
                 # character-for-character or ThorChain cannot route the swap
@@ -1629,7 +1791,8 @@ class Pager:
                 # this is still the original vocabulary: §5 step 5, "Telegram
                 # gets `depo ready · slip A3F1`". No address, no memo, no
                 # amount.
-                self.send(chat_id, f"{chat_name(job)} ready · slip {h}")
+                self.send(chat_id, f"{chat_name(job)} ready · slip {h}",
+                          buttons=self._handle_buttons(h))
                 return
             # A SEALED SLIP CAME BACK. This process cannot read it: it is
             # sealed to the delivery key, which exists on neither this box nor
@@ -1662,7 +1825,12 @@ class Pager:
                 time.sleep(SLIP_RETRY_S)
                 ok = self.send(chat_id, slip)
             if ok:
-                self.send(chat_id, f"{chat_name(job)} ready · slip {h}")
+                # THE CAPTION CARRIES THE BUTTONS, NOT THE BLOB. The blob is
+                # sent alone on purpose -- tap-and-hold copies a whole Telegram
+                # message -- and a keyboard under it would be one more thing
+                # attached to the message the operator is about to long-press.
+                self.send(chat_id, f"{chat_name(job)} ready · slip {h}",
+                          buttons=self._handle_buttons(h))
             else:
                 integrity_log("pager", "slip_undelivered")
                 # NOT "/watch {h}". That was the first version of this line and
@@ -1717,7 +1885,33 @@ class Pager:
             self.busy.release()
 
     # -- loop -----------------------------------------------------------
+    def answer_callback(self, cb_id, text: str = "") -> None:
+        """Close a tapped button's spinner. Never raises.
+
+        REQUIRED, not cosmetic: the Bot API holds the client's spinner for
+        about thirty seconds on an unanswered callback_query, so a button that
+        works but is not acknowledged reads as a button that hung. Failing to
+        acknowledge costs only the spinner -- the work has already been done by
+        the time this is called -- so this never turns a completed action into
+        a reported failure.
+
+        `text` becomes a toast on the tapper's own screen and is NOT a message
+        in the chat: nothing here reaches the transcript, so it is the one
+        place this bot can say something to a person without writing it down.
+        Used for refusals, which is exactly what should not be permanent.
+        """
+        try:
+            safe_post(self._url("answerCallbackQuery"),
+                      {"callback_query_id": str(cb_id), "text": text[:190]},
+                      proxies=self.proxies)
+        except Exception as e:                               # noqa: BLE001
+            print(f"  [!] callback ack failed: {_redact(e)}")
+
     def handle(self, upd: dict) -> None:
+        cb = upd.get("callback_query")
+        if isinstance(cb, dict):
+            self.handle_callback(cb)
+            return
         msg = upd.get("message")
         if not isinstance(msg, dict):
             return
@@ -1836,7 +2030,11 @@ class Pager:
             self.send(cid, EXIT_ANSWER)
             return
         if err == "help":
-            self.send(cid, HELP)
+            # THE MENU RIDES ON /help AND /start, which is where somebody who
+            # does not know what to do arrives. Every button here is a command
+            # in the list above it, so the list is still the manual and the
+            # buttons are just the short way to say the same four things.
+            self.send(cid, HELP, buttons=MENU_BUTTONS)
             return
         if err == "status":
             # WHETHER A COMMAND WILL BE ACCEPTED, and nothing else.
@@ -1852,8 +2050,13 @@ class Pager:
             # power state -- a busy pager and a rate-limited one both say wait,
             # which is also true.
             _why = self.limits.why_not()
+            # THE ANSWER IS STILL ONE WORD. The buttons are what the operator
+            # asked "can I start one right now" in order to do next, and
+            # attaching them adds nothing to the transcript: a label on a
+            # button is not a line in the chat.
             self.send(cid, _why if _why
-                      else ("wait" if self.busy.locked() else "ready"))
+                      else ("wait" if self.busy.locked() else "ready"),
+                      buttons=MENU_BUTTONS)
             return
         if err:
             # A BARE NUMBER WITH NO LIVE CONVERSATION is the commonest way to
@@ -1898,6 +2101,73 @@ class Pager:
                 self.send(cid, "no: I have no record of that label here.")
                 return
         self.start_job(cid, job, params)
+
+    def handle_callback(self, cb: dict) -> None:
+        """One tapped button. Turns into the text the typed path already takes.
+
+        THE SENDER CHECK IS NOT OPTIONAL HERE, and this is where it earns its
+        keep. A message in a group carries the group's chat id, which is why
+        --user-id exists; a callback_query carries the same chat id AND a
+        `from` that is the person whose thumb it was. In a room, a button this
+        bot drew for the operator sits in front of every member -- including
+        the one on the /send wizard. So the same two gates run, in the same
+        order, before the data is even looked at.
+
+        THE REFUSALS ARE TOASTS, NOT MESSAGES. answerCallbackQuery puts text on
+        the tapper's own screen and writes nothing to the transcript, so a
+        wrong tap leaves no line in the one surface this file cannot delete.
+        The exception is a chat that is not allowlisted at all: that gets no
+        answer whatsoever, because acknowledging it confirms the bot is alive
+        to whoever found it -- the same rule the message path follows.
+        """
+        _id = cb.get("id")
+        _msg = cb.get("message") or {}
+        cid = (_msg.get("chat") or {}).get("id")
+        if not isinstance(cid, int) or isinstance(cid, bool) \
+                or cid not in self.allow:
+            self.ignored += 1
+            integrity_log("pager", "chat_not_allowlisted")
+            return
+        if self.allow_users:
+            _from = (cb.get("from") or {}).get("id")
+            if not isinstance(_from, int) or isinstance(_from, bool) \
+                    or _from not in self.allow_users:
+                self.ignored += 1
+                integrity_log("pager", "sender_not_allowlisted")
+                # ANSWERED, unlike the message path, and the difference is
+                # deliberate: this person is already in an allowlisted room and
+                # already knows the bot is there -- they can see the button.
+                # Nothing is disclosed by saying no, and a silent tap that
+                # spins for thirty seconds reads as a broken bot rather than as
+                # a refusal.
+                if _id is not None:
+                    self.answer_callback(_id, "Not for you.")
+                return
+        _text, _err = parse_callback(cb.get("data"))
+        if _err:
+            integrity_log("pager", "callback_unknown")
+            if _id is not None:
+                self.answer_callback(_id, f"no: {_err}")
+            return
+        # ACKNOWLEDGED FIRST, then the work. start_job can hold this thread
+        # long enough for the spinner to time out on its own -- it takes the
+        # busy lock and posts to the doorbell over Tor -- and a spinner that
+        # expires while the job is being started tells the operator the
+        # opposite of what happened.
+        if _id is not None:
+            self.answer_callback(_id)
+        # THE SAME BODY THE TYPED PATH RUNS. Not a copy of it: a synthesised
+        # message carrying the equivalent text, so the rate limit, the one-job
+        # lock, the live-conversation first refusal and the handle ownership
+        # check are the ones that already exist rather than a second set that
+        # can drift from them.
+        #
+        # NO message_id, so nothing is added to the burn list for it -- there
+        # is no new message in the chat to delete. The message holding the
+        # button was recorded by send() when it was sent.
+        self.handle({"message": {"chat": {"id": cid},
+                                 "from": cb.get("from") or {},
+                                 "text": _text}})
 
     def start_job(self, cid: int, job: str, params: dict) -> None:
         """Every path to a wake goes through here. THE ONLY ONE.
