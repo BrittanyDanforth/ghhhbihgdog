@@ -249,8 +249,18 @@ _EXEMPT = {
 #: make the exemption list a place to hide a real artifact.
 _NOT_ARTIFACTS = {
     "gs_common.py": "this repo's own source",
+    # Named by gs_console's "Compile all" action, which py_compiles every
+    # shipped script. Source, like gs_common.py -- the extensionless entry
+    # points in that same list do not match this scan's shape at all.
+    "gs_wake_proto.py": "this repo's own source, named by the compile action",
     "tumble.py": "JoinMarket's tumbler, named in a comment about a wrong path",
     "tumbler.py": "JoinMarket's tumbler script, an INPUT this tool executes",
+    # The placeholder in the console's JoinMarket wallet field. JoinMarket
+    # writes and owns it; this toolchain only passes the path through to
+    # --joinmarket-wallet, and wiping the operator's tumbler wallet would be
+    # the gs_delivery.key mistake with coins in it.
+    "wallet.jmdat": "JoinMarket's own wallet, an INPUT named as a form "
+                    "placeholder; this toolchain never writes it",
     "tor.exe": "the Tor binary on Windows, a path gs_console searches",
 }
 

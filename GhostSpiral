@@ -1135,6 +1135,108 @@ def min_fanout_usable(fanout_count: int, fee_xmr: Decimal,
                                                      rounding=ROUND_UP)
 
 
+def min_carrier_usable(fanout_count: int, chunks: int, fee_xmr: Decimal,
+                       dag_enabled: bool) -> Decimal:
+    """The smallest `usable` that funds EVERY carrier, not just the sum of them.
+
+    min_fanout_usable answers the ONE-CARRIER question, and with --split N that
+    is the wrong question. The swap arrives on N entry addresses, each veiled
+    into its OWN carrier, and size_distribution then hands each carrier
+    `usable * (its own arrived balance / the total)` to fund the slice of mix
+    targets split_by_weight gave it. No transaction ever spends across two
+    chunks (build_entry_veils states the invariant), so a global figure that
+    clears min_fanout_usable can still leave the SMALLEST chunk unable to pay
+    for its own outputs.
+
+    That failure is expensive and late: size_distribution names the chunk, the
+    stage-4 loop drops it, and the dropped chunk's value stays on its entry
+    address -- which the exit holds back, so nothing sweeps it anywhere. All of
+    it happens AFTER stage4_await_swap, i.e. after the BTC has crossed
+    ThorChain onto an address the swap memo names in plaintext in a Bitcoin
+    OP_RETURN. There is no auto-resume from there.
+
+    TWO FACTS, and the second is measured rather than argued:
+
+      * THE SHARE FLOOR. split_btc_amount draws each chunk weight from
+        [1-SPLIT_JITTER, 1+SPLIT_JITTER] and normalises, so the poorest of N
+        chunks carries at least (1-j) / ((1-j) + (N-1)(1+j)) of the total --
+        0.41 of a 2-way split, 0.090 of an 8-way one. The richest carries at
+        most the mirror figure. Both are bounds on the BTC side; the Monero
+        side tracks them, because each chunk is quoted and swapped separately.
+
+      * THE SLICE COUNT. split_by_weight sizes counts as `max(1, int(n * w/W))`
+        and then reconciles the rounding, so a carrier can hold more targets
+        than its share of the money strictly buys. The reconcile is what bounds
+        it, and it bounds it in two different ways depending on which loop ran:
+
+          - A chunk the ADD loop fed took its last item while it was the
+            SMALLEST count, and counts only grow after that -- so its final
+            count is at most min(counts) + 1, and min(counts) <= n // chunks
+            because the counts sum to n. Such a chunk holds at most
+            `n // chunks + 1` targets no matter how poor it is.
+          - A chunk the add loop never fed still has `max(1, int(n * share))`,
+            possibly reduced by the subtract loop. So above `n // chunks + 1` a
+            count of k is only reachable when the chunk holds at least k/n of
+            the money.
+
+        Derived rather than sampled, then checked: 300,080 real split_by_weight
+        slices over weight vectors far wider than the jitter band produced zero
+        violations. The version before this one assumed the excess never passed
+        ONE target; the same driver found it reaching FIVE at 67 targets, which
+        is where the shortfall it caused was showing up.
+
+    So for every reachable k the run needs `min_fanout_usable(k) / share(k)`,
+    and this returns the largest of those and of the whole-fan-out figure. Like
+    min_fanout_usable it is a BOUND ON the rule rather than a second spelling
+    of it, and it is checked against the real planner rather than argued:
+    tests/test_dag_entry.py drives size_distribution at exactly this figure
+    over every chunk count, wallet count and decoy draw.
+
+    The price of "every carrier" is real and is not hidden: at --split 8 and
+    --wallets 10 this is 1.79x what min_fanout_usable asks for, and the deposit
+    minimum around it goes from 0.2972 to 0.5477 XMR. Splitting buys unlinked
+    deposits and costs a floor. Measured margin over the TRUE 100%-success
+    floor, bisected against size_and_prune_chunks at --wallets 3
+    --dag-mixing: 1.00x at one chunk rising to 1.25x at five. Looser than
+    min_fanout_usable's 0.34%-0.48% because two bounds compose here, and that
+    is the direction to be loose in.
+
+    IT DOES NOT RISE MONOTONICALLY WITH THE CHUNK COUNT, and neither does the
+    run. One more chunk gives each carrier a poorer share AND a smaller slice,
+    and min_fanout_usable is superlinear in the slice, so the second can
+    outweigh the first. The same bisection puts the real floor at 0.2699 XMR
+    for --split 4 and 0.2666 for --split 5. Left as it falls rather than
+    smoothed with a running max: the dip is in the pipeline, and a monotone
+    published figure would be a rule this code does not have.
+    """
+    n = max(0, int(fanout_count))
+    c = max(1, int(chunks))
+    base = min_fanout_usable(n, fee_xmr, dag_enabled)
+    if c <= 1 or n <= 0:
+        return base
+    _one = Decimal(1)
+    lo = (_one - SPLIT_JITTER) / ((_one - SPLIT_JITTER)
+                                  + (c - 1) * (_one + SPLIT_JITTER))
+    hi = (_one + SPLIT_JITTER) / ((_one + SPLIT_JITTER)
+                                  + (c - 1) * (_one - SPLIT_JITTER))
+    # The largest slice the poorest chunk can be handed, so it is priced
+    # against the poorest share there is. min_fanout_usable rises with k, so
+    # only the largest such k matters.
+    balanced = min(n, n // c + 1)
+    worst = max(base, min_fanout_usable(balanced, fee_xmr, dag_enabled) / lo)
+    for k in range(balanced + 1, n + 1):
+        # Past `balanced` a count of k means the chunk was never topped up, so
+        # it holds at least k/n of the money. k/n only rises, so once it passes
+        # the richest chunk's ceiling no larger k is reachable either.
+        share = max(lo, Decimal(k) / Decimal(n))
+        if share > hi:
+            break
+        need = min_fanout_usable(k, fee_xmr, dag_enabled) / share
+        if need > worst:
+            worst = need
+    return worst.quantize(DUST_XMR, rounding=ROUND_UP)
+
+
 def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
                     dag_mixing: bool = True, exit_set: bool = True,
                     chunks: int = 1, usage_pct: Decimal = None) -> Decimal:
@@ -1154,11 +1256,35 @@ def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
     compute_fee_budget uses it: it is the only count that holds for every draw.
 
     THE FEE RESERVE. compute_fee_budget holds back every transaction fee the
-    run will pay, and `usable == bal - total_fees` exactly, with total_fees a
-    function of the SETTINGS and not of the balance -- so the balance floor is
-    the usable floor plus that reserve. Driven and pinned in
-    tests/test_dag_entry.py rather than assumed, because the whole figure rests
-    on it.
+    run will pay, with total_fees a function of the SETTINGS and not of the
+    balance -- so the balance floor is the usable floor plus that reserve.
+    Driven and pinned in tests/test_dag_entry.py rather than assumed, because
+    the whole figure rests on it.
+
+    THE ENTRY VEIL'S OWN FEE, WHICH IS TAKEN OFF FIRST AND WAS MISSING HERE.
+    This paragraph used to say `usable == bal - total_fees` EXACTLY, and that
+    is not the path the run takes. size_and_prune_chunks does
+
+        bal = bal_before_veils - hop_fee_reserve(fee) * len(entries)
+
+    BEFORE it calls compute_fee_budget, so the real relation is
+    `usable == bal - veil - total_fees` and the published minimum was short by
+    exactly one hop_fee_reserve per chunk. Driven, one chunk, --dag-mixing, at
+    the figure this function itself returned: `usable` came out 0.00360 XMR
+    below what min_fanout_usable needs at every wallet count, and on a decoy
+    draw of DECOY_MAX -- one run in six -- 200 of 200 compute_fanout_amounts
+    plans failed. A deposit of exactly the advertised minimum therefore aborted
+    at stage 4, AFTER the swap had settled on an address the swap memo names
+    publicly. The old test modelled `bal - fees - cut` instead of the shipped
+    size_and_prune_chunks path, which is why it stayed green through all of it.
+
+    PER CHUNK, and the chunk count now reaches this function. Every entry
+    address gets its OWN veil transaction and its own fee, and with --split N
+    each carrier then has to fund its own slice unaided -- see
+    min_carrier_usable, which is what this asks instead of min_fanout_usable.
+    `chunks` used to be a parameter no caller ever passed, so every figure this
+    produced silently assumed a single swap chunk; --print-limits, the console
+    and the usage-fee waiver all pass the real --split now.
 
     THE OPERATOR'S CUT, when one is taken, and it binds more often than it
     looks. `usage_pct` of the balance is removed before the fan-out is planned,
@@ -1178,14 +1304,17 @@ def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
     alone.
     """
     w = max(1, int(wallets))
+    c = max(1, int(chunks))
     n = w + DECOY_MAX
     # bal is arbitrary: total_fees does not depend on it (asserted in the
     # tests), so this reads the reserve out of the real budget function rather
     # than restating its arithmetic here.
     _usable, total_fees, _txs = compute_fee_budget(
         Decimal(1), fee_xmr, w, peel=False, dag_mixing=dag_mixing,
-        exit_set=exit_set, chunks=chunks)
-    need = min_fanout_usable(n, fee_xmr, dag_mixing) + total_fees
+        exit_set=exit_set, chunks=c)
+    need = (min_carrier_usable(n, c, fee_xmr, dag_mixing)
+            + total_fees
+            + hop_fee_reserve(fee_xmr) * c)
     if usage_pct and usage_pct > 0:
         need = need / (Decimal(1) - usage_pct)
         # STRICTLY ABOVE the cost of moving it, not equal to it. An output
@@ -2727,6 +2856,75 @@ def refuse_thin_mix(subs: list, entry_addrs, decoy_addrs, wallets: int,
         f"    addresses the swap memo names in public and a send-mode re-run "
         f"mints new ones.\n"
         f"    Use --wallets {n_chunks} or more, or fewer chunks.")
+
+
+def starved_chunk_refusal(wallets: int, chunks: int, jm_utxos=None) -> str:
+    """The refusal for a chunk count no decoy draw can feed, or "" if it can.
+
+    ONE RULE, TWO GATES, for the same reason --peel needed two. The fan-out
+    funds `wallets + randint(DECOY_MIN, DECOY_MAX)` subaddresses and the draw
+    happens at RUN TIME, so `wallets + DECOY_MIN` is the only target count that
+    holds for every run. Below the chunk count it is not a bad draw: EVERY draw
+    leaves a carrier with nothing to distribute into, split_by_weight hands
+    back an empty slice, and stage 4 refuses outright -- because that chunk's
+    value would otherwise sit on its carrier, unmixed, while the run reported
+    success.
+
+    The refusal is worth having early and worthless late. Stage 4 runs after
+    the entry set is minted, after the quotes, after the deposit instructions
+    and after stage4_await_swap has watched the XMR arrive on an address the
+    swap memo names in plaintext in a Bitcoin OP_RETURN.
+
+    WHY TWO CALLERS. resolve_split can only see --split, and --split is not
+    the chunk count: planned_chunk_count's own first line is "JoinMarket first,
+    because when it ran its UTXOs ARE the chunks and --split is not consulted".
+    So `--joinmarket --wallets 3` with a tumbler that produced six UTXOs walks
+    straight past the parse-time gate. That is the exact walk
+    refuse_peel_multichunk was written for, one refusal along, and this one had
+    only the parse-time half. The second gate sits beside it at stage 1, which
+    is the earliest moment the count exists.
+
+    Returns the message rather than exiting, so both gates raise the same words
+    and neither can drift into being about a flag the operator did not pass.
+    """
+    w = max(MIN_WALLETS, int(wallets or MIN_WALLETS))
+    n = max(1, int(chunks or 1))
+    if n <= w + DECOY_MIN:
+        return ""
+    _origin = (f"JoinMarket's tumble produced {len(jm_utxos)} UTXOs, so this "
+               f"run has {n} swap chunks, and --wallets is {w}"
+               if jm_utxos else
+               f"--split {n} with --wallets {w} cannot work on any run")
+    _remedy = ("Run the tumbler with fewer output addresses, or raise "
+               f"--wallets to {n - DECOY_MIN}."
+               if jm_utxos else
+               f"Use --wallets {n - DECOY_MIN} or more, or --split "
+               f"{w + DECOY_MIN} or fewer.")
+    return (f"[!] {_origin}.\n"
+            f"    The fan-out funds --wallets plus {DECOY_MIN}–{DECOY_MAX} "
+            f"decoys drawn at run time, so this\n"
+            f"    shape has at fewest {w + DECOY_MIN} mix subaddresses to "
+            f"spread over {n} swap chunks — at least one\n"
+            f"    chunk would arrive with nothing to distribute into and its "
+            f"value would sit on its\n"
+            f"    carrier, unmixed. {_remedy}")
+
+
+def refuse_starved_chunks(args, jm_utxos) -> None:
+    """The stage-1 half of starved_chunk_refusal, for the count --split cannot see.
+
+    Beside refuse_peel_multichunk and for the identical reason: the tumbler has
+    run so the UTXO count exists, and nothing Monero-side has been created, no
+    quote fetched and no deposit address printed. Asks planned_chunk_count
+    rather than re-deriving the count, so this gate and the entry set it
+    protects cannot answer differently.
+    """
+    _msg = starved_chunk_refusal(getattr(args, "wallets", MIN_WALLETS),
+                                 planned_chunk_count(args, jm_utxos),
+                                 jm_utxos)
+    if _msg:
+        integrity_log("stage1", "chunks_exceed_mix_targets")
+        sys.exit(_msg)
 
 
 def refuse_peel_multichunk(args, jm_utxos) -> None:
@@ -5937,6 +6135,18 @@ def resolve_split(args) -> None:
             f"    (50 by default, fixed when it was created — see "
             f"OPSEC_SETUP.md). Past this point an\n"
             f"    extra run buys more than an extra chunk.")
+    # A CHUNK WITH NO MIX TARGET IS FATAL, AND HALF OF IT IS KNOWABLE HERE.
+    #
+    # The rule and the reasoning live in starved_chunk_refusal, because this
+    # gate can only see --split and --split is not the chunk count: JoinMarket
+    # decides it without consulting the flag. The other half runs at stage 1,
+    # beside refuse_peel_multichunk, which is the earliest point that count
+    # exists. Refused here for the same reason --peel is -- the stage-4 check
+    # speaks only after the operator's Bitcoin has crossed ThorChain.
+    _starved = starved_chunk_refusal(getattr(args, "wallets", MIN_WALLETS), n)
+    if _starved:
+        integrity_log("stage0", "split_exceeds_mix_targets")
+        sys.exit(_starved)
     if n > 1 and getattr(args, "peel", False):
         # HERE, NOT AT THE DISTRIBUTION. This refusal used to live in
         # build_distribution_plan, which runs after the quotes are fetched,
@@ -6777,16 +6987,28 @@ def limits_report(args) -> dict:
     dag = bool(getattr(args, "dag_mixing", False))
     exit_set = bool(getattr(args, "exit_to", None))
     cut = getattr(args, "usage_fee_pct", None) or USAGE_FEE_PCT
+    # THE CHUNK COUNT BELONGS IN THE MINIMUM, and this used to drop it. Every
+    # chunk pays its own entry-veil fee and then has to fund its own slice of
+    # the mix targets from its own share (min_carrier_usable), so --split 4
+    # raises the floor by up to 2x at small wallet counts. A page that reads
+    # this table while the operator has --split set was quoting the
+    # single-chunk figure at them.
+    chunks = max(1, int(getattr(args, "split", 1) or 1))
     rows = {}
     for w in range(MIN_WALLETS, MAX_WALLETS + 1):
         rows[str(w)] = {
             "min_xmr": str(mix_minimum_xmr(fee, w, dag_mixing=dag,
-                                           exit_set=exit_set)),
+                                           exit_set=exit_set, chunks=chunks)),
             "min_xmr_with_cut": str(mix_minimum_xmr(
-                fee, w, dag_mixing=dag, exit_set=exit_set, usage_pct=cut)),
+                fee, w, dag_mixing=dag, exit_set=exit_set, chunks=chunks,
+                usage_pct=cut)),
         }
     return {
         "schema": "gs_limits_v1",
+        "split": chunks,
+        "split_note": ("the minimum is PER RUN and rises with --split: each "
+                       "chunk pays its own entry-veil fee and must fund its "
+                       "own slice of the mix targets from its own share"),
         "fee_assumed_xmr": str(fee),
         "fee_priority": int(getattr(args, "fee_priority", 1) or 1),
         "fee_note": ("computed at the FALLBACK fee for this priority; the real "
@@ -6817,11 +7039,21 @@ def maybe_print_limits() -> bool:
     BEFORE build_cli(), and that is deliberate rather than convenient.
 
     --print-limits reads no wallet, opens no socket and spends nothing; it is
-    arithmetic over constants, so gs_console can put a real minimum beside the
-    box it asks for an amount in without carrying a second copy of
+    arithmetic over constants, so anything that has to put a real minimum in
+    front of an operator can ask for one instead of carrying a second copy of
     min_exit_fundable, hop_fee_reserve and compute_fee_budget. (The console
     already mirrors three timeout constants that way and needed a test to stop
-    them drifting -- see JOB_TIMEOUT_FLOOR_S. One process boundary is cheaper.)
+    them drifting -- see JOB_TIMEOUT_FLOOR_S.)
+
+    WHAT IT IS NOT is the way gs_console gets its figure. This docstring used
+    to name the console as the caller; the console does not shell out, it
+    loads this module in-process via _ghost() and calls mix_minimum_xmr
+    directly, which reaches the same arithmetic without a subprocess. Nothing
+    in the repository invokes --print-limits. It is an operator- and
+    script-facing mode, and it is kept because the alternative for a caller
+    that CANNOT import this file -- the Pi, a shell script, another language
+    -- is a hard-coded number that goes stale silently. Stated plainly so the
+    next reader does not go looking for the call site this claimed to have.
 
     THE TOR GATE IS NOT RELAXED TO MAKE ROOM FOR IT. --tor-proxy is
     required=True on the real parser, so an info mode either runs before that
@@ -6839,6 +7071,11 @@ def maybe_print_limits() -> bool:
         return False
     _lp = argparse.ArgumentParser(add_help=False)
     _lp.add_argument("--wallets", type=int, default=10)
+    # --split, because limits_report puts it in the minimum. Omitting it made
+    # the flag unreachable from this mode entirely: parse_known_args drops it,
+    # limits_report's getattr falls back to 1, and a split run is quoted the
+    # single-chunk floor with nothing saying so.
+    _lp.add_argument("--split", type=int, default=1)
     _lp.add_argument("--fee-priority", type=int, default=1)
     _lp.add_argument("--dag-mixing", action="store_true")
     _lp.add_argument("--exit-to", action="append")
@@ -6977,6 +7214,7 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
             fee_xmr, args.wallets,
             dag_mixing=bool(getattr(args, "dag_mixing", False)),
             exit_set=bool(getattr(args, "exit_to", None)),
+            chunks=max(1, int(getattr(args, "split", 1) or 1)),
             usage_pct=pct)
         print(f"  [!] NO USAGE FEE TAKEN. {(pct * 100).normalize()}% of this "
               f"deposit "
@@ -8001,6 +8239,13 @@ def main():
     # see refuse_peel_multichunk for the walk that lands on the stage-4
     # backstop instead.
     refuse_peel_multichunk(args, jm_utxos)
+    # THE SAME WALK, ONE REFUSAL ALONG. resolve_split checked --split against
+    # the mix-target count at parse time; JoinMarket's UTXOs are the chunk
+    # count and never touched that flag, so `--joinmarket --wallets 3` with a
+    # six-output tumble went past it and landed on the stage-4 empty-slice
+    # abort -- after the entry set, the quotes, the deposit instructions and
+    # the swap. Here the count exists and nothing Monero-side does.
+    refuse_starved_chunks(args, jm_utxos)
 
     ###########################################################################
     # Stage 2 - ThorChain swap definition

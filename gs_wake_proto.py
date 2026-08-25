@@ -1684,9 +1684,12 @@ _xmr_address_field.spec = "xmr address ^[48][base58]{94,105}$"
 #: WHAT DEPTH ACTUALLY BUYS, stated more carefully than the first version of
 #: this comment stated it. That version said a fixed depth is "a FLOOR on what
 #: can be mixed at all", quoting mix_minimum_xmr at 0.1748 XMR for three
-#: wallets and 0.2936 for ten. Both figures are real and both were measured
-#: with NO operator cut -- which was true of this path only because the wake
-#: agent was not passing --usage-fee at all, which was itself a bug. With the
+#: wallets and 0.2936 for ten. Those two figures are now 0.1784 and 0.2972 --
+#: mix_minimum_xmr was understating both by one hop_fee_reserve, the entry
+#: veil's own fee, which size_and_prune_chunks takes off the balance before it
+#: budgets anything. Both were measured with NO operator cut -- which was true
+#: of this path only because the wake agent was not passing --usage-fee at all,
+#: which was itself a bug. With the
 #: cut on, mix_minimum_xmr's own docstring is the authority: the cut's
 #: spendability floor is hop_fee_reserve/usage_pct, and it sits ABOVE the
 #: mixing minimum at every wallet count up to about fifteen. Driven at a

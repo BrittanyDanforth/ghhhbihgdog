@@ -902,7 +902,7 @@ class Pager:
         WITHDRAW_DEPTH_NOTE. The real floor is GhostSpiral.mix_minimum_xmr at
         that hop count, it moves with the network fee, and this box may not
         have GhostSpiral on disk. Saying "lowest minimum" is true whatever the
-        fee is doing; printing "0.1748 XMR" would be a quote this box cannot
+        fee is doing; printing "0.1784 XMR" would be a quote this box cannot
         stand behind.
         """
         return ("How deep? Reply with one:\n"
