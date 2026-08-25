@@ -2687,6 +2687,16 @@ MUTATIONS = [
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
+ # wipe_will_erase asks "would the sweep DELETE this", wipe_covers asks "would
+ # anything written HERE be swept". Building the first on the second put
+ # DIRECTORIES off by one level: a matching directory one level down was
+ # reported safe from the wipe while paranoia_mode really deletes it.
+ ("wipe_will_erase goes back to answering the write-here question",
+  "gs_common.py",
+  "    if not _wipe_sweep_reaches_item(res):\n",
+  "    if not wipe_covers(res):\n",
+  ["test_units"]),
+
  # stem was listed as a SOFT dependency ("guarded or unused on the wake path")
  # and is neither: gs_common.newnym imports it inside a retry loop, so a
  # missing package is caught as a rotation failure and required=True sys.exits.
