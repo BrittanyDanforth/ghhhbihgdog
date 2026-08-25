@@ -952,7 +952,15 @@ check("addr: a well-formed address with a BAD checksum is still refused "
 
 # The console is a format gate in FRONT of this one, so anything it refuses can
 # never be submitted at all. They must agree exactly.
-_con = _load_console_module() if "_load_console_module" in dir() else None
+# LOADED HERE, FULL STOP. This read
+#
+#     _con = _load_console_module() if "_load_console_module" in dir() else None
+#
+# and no such function exists anywhere in tests/ -- so the condition was
+# permanently False, the call was unreachable, and the loader below always
+# ran. It read as "reuse the shared loader if there is one" while never once
+# doing so, and pyflakes flagged the name as undefined in a suite this repo
+# describes as pyflakes-clean.
 import importlib.machinery as _im, importlib.util as _iu
 _ld = _im.SourceFileLoader("gs_console_addr", os.path.join(REPO, "gs_console"))
 _con = _iu.module_from_spec(_iu.spec_from_loader(_ld.name, _ld))

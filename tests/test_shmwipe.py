@@ -346,13 +346,15 @@ _sh.rmtree(sandbox, ignore_errors=True)
 print()
 import io as _io2, contextlib as _ctx2, tempfile as _tf2
 
-_gsm = load_gs_common() if "load_gs_common" in dir() else None
-if _gsm is None:
-    _l2 = importlib.machinery.SourceFileLoader(
-        "gs_common_wipewarn", os.path.join(REPO, "gs_common.py"))
-    _gsm = importlib.util.module_from_spec(
-        importlib.util.spec_from_loader(_l2.name, _l2))
-    _l2.exec_module(_gsm)
+# LOADED HERE, FULL STOP -- see the same note in test_send_gates. This read
+# `load_gs_common() if "load_gs_common" in dir() else None`, and no such
+# function exists in tests/, so the condition was permanently False and this
+# branch always ran. A guard that is never taken is not a fallback.
+_l2 = importlib.machinery.SourceFileLoader(
+    "gs_common_wipewarn", os.path.join(REPO, "gs_common.py"))
+_gsm = importlib.util.module_from_spec(
+    importlib.util.spec_from_loader(_l2.name, _l2))
+_l2.exec_module(_gsm)
 
 # A directory is a path secure_delete_file REFUSES (non-regular file), so this
 # exercises the real failure return rather than a mocked one.
