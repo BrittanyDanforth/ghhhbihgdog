@@ -140,7 +140,100 @@ def _load_manifest(path: Path) -> list:
                 break
     if not isinstance(data, list):
         sys.exit(f"[!] {path} is not a signed manifest (expected a list of entries).")
+    _refuse_short_manifest(data, path)
     return data
+
+
+def _refuse_short_manifest(entries: list, path: Path) -> None:
+    """Refuse a manifest that does not cover the whole plan it came from.
+
+    THE SIGNER ALREADY REFUSES A PARTIAL BATCH -- and that refusal protected
+    only the operator watching the signing terminal. phase_sign writes
+    signed_manifest_v1.json BEFORE it exits, so a batch where 4 of 5
+    transactions signed left a manifest listing 4 next to the 4 blobs, and
+    nothing here looked at completeness at all: this file read the entries it
+    was given and relayed them. Carry that directory to the online box on a
+    USB stick -- which is the entire point of an air-gapped signer -- and the
+    partial chain relays and is reported as a clean run.
+
+    That is not a neutral outcome. A plan is a CHAIN: a peel spends the
+    previous peel's change, a DAG hop spends a fan-out output. Relaying the
+    early links strands the funds on whichever intermediate subaddress the
+    missing link was supposed to move them off, in a distinctive half-executed
+    on-chain shape, with the operator told it succeeded.
+
+    TWO SHAPES OF SHORT, and one of them needs the count:
+
+      * A HOLE.  TX 2 of 5 failed: idx 0,1,3,4. Visible without any extra
+        field, because the indices are no longer contiguous.
+      * A TRUNCATION.  TX 4 of 5 failed: idx 0,1,2,3 -- byte-identical to a
+        four-transaction plan that signed perfectly. Nothing in the entries
+        can distinguish those two, which is why phase_sign now writes "of".
+
+    Manifests written before "of" existed have no count, and those are NOT
+    refused: an old manifest is not evidence of a partial batch, and refusing
+    one would strand a correctly signed directory on the wrong side of an
+    air gap. The contiguity check still covers a hole in those.
+    """
+    dicts = [e for e in entries if isinstance(e, dict)]
+    if not dicts:
+        return
+    ofs = set()
+    for e in dicts:
+        v = e.get("of")
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            continue
+        ofs.add(v)
+    if len(ofs) > 1:
+        sys.exit(
+            f"[!] {path} disagrees with itself about how many transactions "
+            f"the plan had ({sorted(ofs)}).\n"
+            f"    Refusing to relay a manifest that was assembled from more "
+            f"than one signing run.")
+    if ofs:
+        want = ofs.pop()
+        if len(entries) < want:
+            integrity_log("broadcast",
+                          f"short_manifest:{len(entries)}_of_{want}")
+            sys.exit(
+                f"[!] {path} holds {len(entries)} transaction(s) but the plan "
+                f"had {want}.\n"
+                f"    The signing run did not finish. Relaying what did sign "
+                f"would push the early\n"
+                f"    hops onto the chain and strand the funds on an "
+                f"intermediate subaddress, in a\n"
+                f"    half-executed shape that is distinctive on-chain.\n"
+                f"    Re-run the offline signing phase until it reports "
+                f"{want}/{want}, then relay.")
+        if len(entries) > want:
+            integrity_log("broadcast",
+                          f"overlong_manifest:{len(entries)}_of_{want}")
+            sys.exit(
+                f"[!] {path} holds {len(entries)} transaction(s) but says the "
+                f"plan had {want}.\n"
+                f"    Refusing to relay entries the plan does not account "
+                f"for.")
+
+    # A HOLE, which needs no count: the signer numbers a plan's transactions
+    # 0..n-1 and writes one entry per signed transaction, so a gap in the
+    # indices is a transaction that did not sign. Only checked when every
+    # entry carries an idx -- a manifest of bare filenames has none.
+    idxs = [e["idx"] for e in dicts
+            if isinstance(e.get("idx"), int) and not isinstance(e["idx"], bool)]
+    if len(idxs) == len(entries) and idxs and min(idxs) == 0:
+        missing = sorted(set(range(max(idxs) + 1)) - set(idxs))
+        if missing:
+            integrity_log("broadcast", f"gapped_manifest:{len(missing)}_missing")
+            sys.exit(
+                f"[!] {path} is missing transaction(s) "
+                f"{', '.join(str(m) for m in missing[:8])}"
+                f"{'...' if len(missing) > 8 else ''} from a chain of "
+                f"{max(idxs) + 1}.\n"
+                f"    The signing run did not finish. Relaying the "
+                f"transactions around a gap strands\n"
+                f"    the funds on the subaddress the missing one was "
+                f"supposed to move them off.\n"
+                f"    Re-run the offline signing phase, then relay.")
 
 
 def _items_from_manifest(entries: list, mdir: Path) -> List[TxItem]:

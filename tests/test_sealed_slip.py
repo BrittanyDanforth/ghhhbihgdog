@@ -530,6 +530,7 @@ pg.safe_post = lambda url, payload, proxies=None: (
 _pager = pg.Pager.__new__(pg.Pager)
 _pager.proxies = {}
 _pager.token = "123456:TOKEN"
+_pager.handle_owner = {}
 _ok_send = [True]
 _pager.send = lambda cid, text: (_sent.append(text), _ok_send[0])[1]
 

@@ -708,6 +708,16 @@ class Pager:
         self.limits = Limits(Path(args.state), args.min_interval,
                              args.daily_cap)
         self.allow = set(int(c) for c in args.chat_id)
+        #: Allowlisted SENDERS, or empty for "whoever is in an allowlisted
+        #: chat". Empty is only reachable when every allowlisted chat is
+        #: private, because main() refuses a group without one -- see the
+        #: --user-id help and the refusal in main().
+        self.allow_users = set(int(u) for u in (getattr(args, "user_id", None)
+                                                or ()))
+        #: handle -> the chat that created it. IN MEMORY, like convos and burn:
+        #: see the note where it is written for why the vault cannot hold this
+        #: and why the SD card must not.
+        self.handle_owner = {}
         self.busy = threading.Lock()
         self.ignored = 0
         self.poll_failures = 0
@@ -1502,6 +1512,27 @@ class Pager:
         if out == "done":
             res = pending.result or {}
             h = res.get("handle") or "----"
+            # WHOSE HANDLE THIS IS. The vault has no notion of a chat at all --
+            # `chat_id` appears nowhere in gs_wake_agent, gs_wake_proto or
+            # gs_doorbell, deliberately, because the Pi is supposed to learn a
+            # four-character label and nothing else. That is right for the
+            # wire, and it means the handle NAMESPACE IS FLAT: a handle is a
+            # bearer token, and /check or /wait on somebody else's returns
+            # their deposit instructions.
+            #
+            # Driven against the real functions: seal_slip_for_delivery and
+            # plain_slip_for_chat both take (key, artifact_dir, status, handle)
+            # -- there is no chat argument to check an owner against -- and
+            # with `plain_slip` on, a handle its owner never shared came back
+            # as the deposit address, the amount and the memo, in the clear.
+            # The memo names the destination XMR address in full.
+            #
+            # So the ownership lives HERE, on the box that knows which chat
+            # asked. Process memory only, like convos and burn and for the same
+            # reason: the SD card is the leak this box is designed around, and
+            # a handle-to-chat map on it is a record of who asked for what.
+            if proto.HANDLE_RE.match(h):
+                self.handle_owner[h] = chat_id
             slip = res.get("slip") or ""
             plain = res.get("plain") or {}
             phase = res.get("phase") or ""
@@ -1699,6 +1730,29 @@ class Pager:
             self.ignored += 1
             integrity_log("pager", "chat_not_allowlisted")
             return
+        # AND WHO SENT IT, which the chat id does not answer in a group.
+        #
+        # chat.id is the ROOM. In a private chat it equals the sender's user id,
+        # so the check above already gates the person; in a group every
+        # member's message carries the same chat.id and the check above gates
+        # nobody. Driven before this existed: three different `from` ids in one
+        # allowlisted group were all answered, and a non-operator walked the
+        # /send wizard through to a job on the wire.
+        #
+        # SILENT, like the chat refusal above and for the same reason -- a
+        # reply tells whoever tried that the bot is alive and that they found a
+        # live allowlist entry. The counter is what the operator reads.
+        #
+        # Empty allow_users means every allowlisted chat is private (main()
+        # refuses a group without --user-id), so this costs those installs
+        # nothing.
+        if self.allow_users:
+            _from = (msg.get("from") or {}).get("id")
+            if not isinstance(_from, int) or isinstance(_from, bool) \
+                    or _from not in self.allow_users:
+                self.ignored += 1
+                integrity_log("pager", "sender_not_allowlisted")
+                return
         # A PHOTO IS NOT A COMMAND. Without this, every sticker, image or
         # voice note in an allowlisted chat drew the whole help text back --
         # noise in the one channel that is supposed to be almost silent, and
@@ -1823,6 +1877,26 @@ class Pager:
             # and still prints it once, on request.
             self.send(cid, f"no: {err}")
             return
+        # A HANDLE IS A BEARER TOKEN ON THE WIRE, so it is bound to a chat
+        # here. See the note beside handle_owner: the vault answers /check and
+        # /wait for ANY handle in its file, because it has no idea which chat
+        # asked -- and with `plain_slip` on, the answer is the deposit address
+        # and the memo, and the memo names the destination XMR address in full.
+        #
+        # ONLY A HANDLE THIS PROCESS HAS SEEN GO TO SOMEBODY ELSE. An unknown
+        # one is allowed: the map is process memory, so a restart empties it,
+        # and refusing there would lock an operator out of their own swap on
+        # the one box whose whole job is to be reachable. That is the honest
+        # bound -- this closes the live case, not the whole namespace.
+        _h = params.get("handle") if isinstance(params, dict) else None
+        if _h:
+            _owner = self.handle_owner.get(_h)
+            if _owner is not None and _owner != cid:
+                integrity_log("pager", "handle_not_yours")
+                # NEVER "that is somebody else's": confirming a handle exists
+                # is the disclosure. Same answer an unknown one gets.
+                self.send(cid, "no: I have no record of that label here.")
+                return
         self.start_job(cid, job, params)
 
     def start_job(self, cid: int, job: str, params: dict) -> None:
@@ -1934,8 +2008,33 @@ class Pager:
 
     def run(self) -> int:
         self.publish_commands()
-        print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s), "
-              f"Tor only, one wake at a time.")
+        print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
+              + (f", {len(self.allow_users)} allowlisted sender(s)"
+                 if self.allow_users else "")
+              + ", Tor only, one wake at a time.")
+        # WHAT IS SHARED, WHEN MORE THAN ONE PARTY IS ALLOWLISTED.
+        #
+        # This design is single-tenant and nothing said so. Repeating
+        # --chat-id is supported and is the right thing for ONE operator with
+        # a phone and a desktop -- but everything behind it is one pool:
+        #
+        #   * ONE wake budget and one rate limit (a single Limits object), so
+        #     one chat exhausts the other's;
+        #   * ONE `busy` lock, so one chat's withdrawal refuses every command
+        #     from the other for up to 16.75 h;
+        #   * ONE handle namespace on the vault, which has no notion of a chat
+        #     at all -- handle_owner above narrows that to what this process
+        #     has seen, and cannot narrow it further.
+        #
+        # Fine for one person on two devices. Said out loud because it is not
+        # fine for two people, and nothing else in the toolchain mentions it.
+        if len(self.allow) + len(self.allow_users) > 2 or len(self.allow) > 1:
+            print("  [!] More than one chat is allowlisted. They SHARE one "
+                  "wake budget, one")
+            print("      one-job-at-a-time lock, and one handle namespace on "
+                  "the vault — this is")
+            print("      built for one operator on several devices, not for "
+                  "several people.")
         while not shutdown_requested():
             for upd in self.updates():
                 uid = upd.get("update_id")
@@ -2051,10 +2150,32 @@ def whoami(token: str, proxies: dict, waits: int = 30) -> int:
             who = _no_ctrl(terminal_safe(
                 str((msg.get("from") or {}).get("username")
                     or (msg.get("chat") or {}).get("title") or "?")))[:40]
+            # THE SENDER'S ID TOO, because a negative chat id is a ROOM and
+            # the pager now refuses one without --user-id. This printed only
+            # the chat id and then "Start the pager with --chat-id {cid}",
+            # which in a group is an instruction to allowlist everybody in it.
+            _uid = (msg.get("from") or {}).get("id")
+            _uid = _uid if isinstance(_uid, int) and not isinstance(_uid, bool) else None
+            _room = isinstance(cid, int) and cid < 0
             print(f"\n  [+] chat id: {cid}   (from: {who})")
-            print(f"      Start the pager with --chat-id {cid}")
-            print(f"      A chat id is NOT a secret -- it is an allowlist "
-                  f"entry, so it is fine on a command line. The token is not.")
+            if _uid is not None:
+                print(f"      your user id: {_uid}")
+            if _room:
+                print(f"      This is a GROUP: that id is the ROOM, and every "
+                      f"member of it can drive")
+                print(f"      the bot unless the SENDER is checked too. Start "
+                      f"the pager with:")
+                print(f"          --chat-id {cid} --user-id "
+                      f"{_uid if _uid is not None else '<your user id>'}")
+                print(f"      (repeat --user-id for each person who may use "
+                      f"it)")
+            else:
+                print(f"      Start the pager with --chat-id {cid}")
+                print(f"      This is a PRIVATE chat, so that id IS you -- no "
+                      f"--user-id is needed.")
+            print(f"      A chat id and a user id are NOT a secret -- "
+                  f"both are allowlist entries, so they are fine on a "
+                  f"command line. The token is not.")
         if seen:
             return 0
     print("  [!] No message arrived. The bot token may belong to a different "
@@ -2073,7 +2194,29 @@ def build_cli():
                     help="this Pi's keyfile, as gs_doorbell wake takes it")
     ap.add_argument("--chat-id", action="append", default=None, type=int,
                     help="allowlisted Telegram chat id. Repeatable. Anything "
-                         "from another chat is ignored without a reply.")
+                         "from another chat is ignored without a reply. A "
+                         "PRIVATE chat id is a person; a GROUP id (negative) "
+                         "is a room, and every member of that room can drive "
+                         "this bot unless --user-id is also given.")
+    # WHO, NOT WHERE. --chat-id gates the ROOM, and in a private chat that is
+    # the same thing because chat.id == the user's id. In a group it is not:
+    # every member's message carries the group's chat.id, so allowlisting a
+    # group allowlists everyone in it -- including /send, which spends.
+    #
+    # Driven before this existed, against the real handle(): three different
+    # `from` ids in one allowlisted group were all answered, and a non-operator
+    # walked the whole /send wizard to a job on the wire.
+    #
+    # The bot's own code anticipates groups in three places -- parse_command
+    # handles "/depo@mybot", _step_convo names "/cancel@mybot", and
+    # publish_commands registers at default scope "every chat this bot is in,
+    # because the allowlist is what decides who is answered" -- so this is a
+    # supported configuration whose access rule was simply never written.
+    ap.add_argument("--user-id", action="append", default=None, type=int,
+                    help="allowlisted Telegram USER id, checked against the "
+                         "sender of every message. Repeatable. REQUIRED when "
+                         "any --chat-id is a group (negative): without it the "
+                         "room is the allowlist. --whoami prints both ids.")
     ap.add_argument("--whoami", action="store_true",
                     help="print the chat id of the next message this bot "
                          "receives, then exit. Arms nothing, wakes nothing, "
@@ -2163,6 +2306,37 @@ def main(argv=None) -> int:
         sys.exit("[!] --key and --chat-id are both required to run the pager.\n"
                  "    Run with --whoami first (it needs neither) to find the "
                  "chat id.")
+    # A GROUP ID IS A ROOM, NOT A PERSON, AND THE ALLOWLIST HAS TO SAY WHICH.
+    #
+    # Telegram gives private chats a POSITIVE id equal to the user's own, and
+    # groups, supergroups and channels a NEGATIVE one shared by every member.
+    # So `--chat-id <negative>` alone allowlists everybody in that room --
+    # including for /send, which spends -- and nothing said so: the id parsed,
+    # the banner reported "1 allowlisted chat(s)", and --whoami printed
+    # "A chat id is NOT a secret -- it is an allowlist entry", which is true of
+    # a person and not of a room.
+    #
+    # REFUSED AT STARTUP rather than warned about, because the failure is
+    # silent in the direction that costs the most: nothing in the chat ever
+    # looks wrong. --user-id turns the room back into an allowlist of people.
+    _rooms = sorted(c for c in args.chat_id if int(c) < 0)
+    if _rooms and not args.user_id:
+        sys.exit(
+            f"[!] {len(_rooms)} of the --chat-id value(s) given are GROUPS "
+            f"(a negative id is a room,\n"
+            f"    not a person), and no --user-id was given.\n"
+            f"    Every member of that room could then drive this bot -- "
+            f"including /send, which\n"
+            f"    SPENDS -- because a group message carries the group's chat "
+            f"id, not the sender's.\n"
+            f"    Add --user-id <your own id> (repeatable) so the sender is "
+            f"checked too. Run\n"
+            f"    --whoami and send a message from that room: it prints the "
+            f"chat id AND your\n"
+            f"    user id.\n"
+            f"    For a one-to-one chat with the bot this does not arise -- "
+            f"there the chat id IS\n"
+            f"    the person, and it is positive.")
     key = doorbell().load_key(Path(args.key))
 
     st = Path(args.state)
