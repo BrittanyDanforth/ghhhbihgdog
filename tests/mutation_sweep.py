@@ -2687,6 +2687,16 @@ MUTATIONS = [
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
+ # /cancel had two answers for three states. With a wake in flight and no
+ # half-typed wizard it said "nothing to cancel." -- while every other command
+ # was being refused with "a wake is already running". The bot told the
+ # operator nothing was happening and then refused them because something was.
+ ("/cancel goes back to saying nothing is running while a wake runs",
+  "gs_telegram_pager",
+  "            elif self.busy.locked():\n",
+  "            elif False:\n",
+  ["test_depo_wizard"]),
+
  # /receive, /fee, /speed and /exit all worked, all had answers, and none was
  # in BOT_COMMANDS -- so setMyCommands never published them and HELP never
  # mentioned them. A four-command blind spot that a green suite never saw.
