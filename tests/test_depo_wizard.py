@@ -88,6 +88,7 @@ class Fake:
         p.allow = set(allow)
         p.allow_users = set()
         p.handle_owner = {}
+        p.spenders = 1
         p.busy = threading.Lock()
         p.ignored = 0
         p.convos = {}
@@ -1008,15 +1009,18 @@ check("...and is NOT reachable from the pager",
 # the check proved no job schema took a destination. /withdraw takes one now,
 # by reply, per withdrawal -- so the old check would have kept a FALSE answer
 # green, which is the drift this file exists to catch.
-# /send, NOT /withdraw. This asserted the alias: parse_command accepts both
-# spellings but only /send is in BOT_COMMANDS, so the answer was pointing the
-# operator at a command the "/" menu never offers -- and the check was
-# pinning it there.
+# BY THE PUBLISHED NAME, WHICHEVER THAT IS. This asserted the literal "/send"
+# -- correct while /send was the published spelling and wrong the moment the
+# menu started offering /withdraw instead, which is the same drift in the
+# other direction. Checked against BOT_COMMANDS rather than against a
+# spelling, so the answer and the menu cannot disagree whatever they are
+# called next.
+_EXIT_POINTS = set(re.findall(r"/([a-z]+)", pg.EXIT_ANSWER))
 check("/exit points at the command that does set it, by its PUBLISHED name",
-      "/send" in pg.EXIT_ANSWER
+      _EXIT_POINTS and _EXIT_POINTS <= {_c for _c, _d in pg.BOT_COMMANDS}
       and "not settable" not in pg.EXIT_ANSWER.lower())
-check("/exit: ...and that name is one the menu actually offers",
-      "send" in {_c for _c, _d in pg.BOT_COMMANDS})
+check("/exit: ...and that command is the one that takes a destination",
+      "withdraw" in _EXIT_POINTS)
 check("...and exactly one job schema takes a destination, not several",
       [j for j in P.JOBS
        if any("exit" in k or "dest" in k or "addr" in k

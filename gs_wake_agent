@@ -1870,9 +1870,30 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
 
 
 def _load_handles(d: Path) -> dict:
+    """The handle ledger, or {}. NEVER raises, and never yields a bad record.
+
+    THE TOP LEVEL WAS CHECKED AND THE RECORDS WERE NOT. A file holding
+    {"A3F1": "hello"} passed -- it IS a dict -- and handed a string to every
+    caller that then does rec.get("slip"). Driven: it comes back verbatim, and
+    the failure path in _dispatch does `rec.get("slip")` on it, which is an
+    AttributeError on the one branch that runs when a job has already failed.
+    The slip readers survive it only because they are wrapped in a bare except
+    that turns it into "no slip", so a corrupt ledger silently costs a
+    delivery instead of naming itself.
+
+    This file is 0600 in a swept directory and nothing but this tool writes
+    it, so a bad record means corruption or a hand edit rather than an
+    attacker -- which is exactly the case where a quiet AttributeError is the
+    wrong answer. Bad records are DROPPED rather than the whole file
+    discarded: one damaged entry should cost that one handle, not every other
+    handle on the machine.
+    """
     try:
         v = json.loads((d / HANDLES_FILE).read_text())
-        return v if isinstance(v, dict) else {}
+        if not isinstance(v, dict):
+            return {}
+        return {k: r for k, r in v.items()
+                if isinstance(k, str) and isinstance(r, dict)}
     except Exception:                                        # noqa: BLE001
         return {}
 

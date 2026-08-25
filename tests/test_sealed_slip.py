@@ -531,6 +531,7 @@ _pager = pg.Pager.__new__(pg.Pager)
 _pager.proxies = {}
 _pager.token = "123456:TOKEN"
 _pager.handle_owner = {}
+_pager.spenders = 1
 _ok_send = [True]
 _pager.send = lambda cid, text, buttons=None: (_sent.append(text),
                                                _ok_send[0])[1]
@@ -551,7 +552,8 @@ pg.Pager.poke.__wrapped__ if False else None
 # Drive the real reply-building branch by handing poke a doorbell whose
 # run_wake returns our finished Pending. Nothing is stubbed inside poke.
 pg._DOORBELL[0] = type("D", (), {
-    "run_wake": staticmethod(lambda a, k, j, p: _done)})()
+    "run_wake": staticmethod(
+        lambda a, k, j, p, on_event=None: _done)})()
 _pager.key = {}
 _pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 

@@ -206,16 +206,36 @@ USAGE_FEE_LABEL = "1.1%"
 #:
 #: Descriptions are what a stranger would need, not what the author remembers:
 #: "depo" and "slot 0-7" meant nothing to anyone who had not read the source.
+#: ORDERED AND WORDED BY DIRECTION, because the old names did not say one.
+#:
+#: /receive READ AS "RECEIVE MY MONEY" AND MEANT "MINT ME AN ADDRESS". Those
+#: are opposite ends of the pipeline. An operator who has just deposited and
+#: wants their mixed funds back reaches for the word "receive" -- and gets a
+#: fresh empty Monero address, which is not their money, does nothing, and
+#: burns a wake from the day's budget. The command that pays them out was
+#: called /send, which reads as money going the OTHER way.
+#:
+#: So the published spellings now name the direction and nothing else:
+#:
+#:     MONEY IN    /deposit    Bitcoin in, swapped and mixed
+#:                 /address    a Monero address, to be paid directly
+#:     MONEY OUT   /withdraw   mixed funds out, to addresses you name
+#:
+#: Every old spelling still works -- /receive, /recv and /send are accepted
+#: forever, for the reason this file already gives about /depo: "a bot that
+#: answers 'unknown command' to its own old name is a bot that looks broken."
+#: They are simply not what the menu, the buttons or the help text say.
 BOT_COMMANDS = [
-    ("deposit", "get an address to send Bitcoin to — asks the amount"),
-    ("receive", "just a fresh address, no swap quote"),
+    ("start", "what this is, and what it will not do"),
+    ("deposit", "MONEY IN — send Bitcoin, get an address and a memo"),
+    ("address", "MONEY IN — a Monero address to be paid directly, no swap"),
+    ("withdraw", "MONEY OUT — mix what is here and send it to you"),
     ("status", "can I start one right now"),
     # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
     # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
     # so "3 min" would be a figure they never once observe.
     ("check", "has my payment arrived yet (10-25 min)"),
     ("wait", "wait for it to arrive (up to 2h)"),
-    ("send", "send mixed funds out — asks the address, then how deep"),
     ("settings", "what this will do, and where each part is decided"),
     # THE THREE ANSWERS THAT WERE UNREACHABLE IN PRACTICE. /fee, /speed and
     # /exit have always been handled in parse_command and have always had
@@ -223,8 +243,8 @@ BOT_COMMANDS = [
     # published them and HELP (built from this list) never mentioned them. The
     # operator had to already know they existed and how they were spelled,
     # which is the exact state publish_commands' own docstring calls
-    # "indistinguishable from a bot that does not work". /receive was in the
-    # same state and is above.
+    # "indistinguishable from a bot that does not work". The address command
+    # was in the same state and is above.
     ("fee", "what this keeps"),
     ("speed", "can I make it faster"),
     ("exit", "where the mixed funds go"),
@@ -261,6 +281,7 @@ BOT_COMMANDS = [
 #: ten characters plus at most a four-character handle.
 CALLBACK_TEXT = {
     "m:help": "/help",
+    "m:start": "/start",
     "m:status": "/status",
     "m:settings": "/settings",
     "m:fee": "/fee",
@@ -277,8 +298,11 @@ CALLBACK_TEXT = {
 #: rest are answers to questions, and they hang off /help, which is one tap
 #: away and stays one tap away.
 MENU_BUTTONS = [
-    [("Deposit", "m:depo"), ("Withdraw", "m:send")],
-    [("Status", "m:status"), ("Fresh address", "m:recv")],
+    # LABELLED BY DIRECTION, not by command name. "Fresh address" sat next to
+    # "Withdraw" and gave no clue which one pays the operator; the arrows do
+    # in one glance what the paragraph in WELCOME does in three lines.
+    [("⬇ Deposit Bitcoin", "m:depo"), ("⬆ Withdraw", "m:send")],
+    [("⬇ Monero address", "m:recv"), ("Status", "m:status")],
     [("What this does", "m:settings"), ("All commands", "m:help")],
 ]
 
@@ -313,9 +337,19 @@ def parse_callback(data: str) -> tuple:
     return "", "I do not know that button"
 
 
+#: What a job is CALLED in the chat.
+#:
+#: "recv" was the machine's abbreviation of a command name that itself read
+#: backwards -- so "recv ready · slip A3F1" told an operator waiting to be paid
+#: that their money was ready, about a job that mints an empty address. It is
+#: the direction-word now, like the command.
+#:
+#: "depo" STAYS. OPSEC_SETUP section 5 step 5 specifies "depo ready · slip
+#: A3F1" by name and the suites pin it; it is also an abbreviation nobody has
+#: ever misread, because it is the first four letters of the thing it means.
 CHAT_NAME = {
     "receive_and_quote": "depo",
-    "receive_new": "recv",
+    "receive_new": "address",
     "swap_status": "check",
     "watch": "watch",
     "withdraw": "withdraw",
@@ -391,7 +425,7 @@ SPEED_ANSWER = "Not settable here."
 # _exit_question, shown once per withdrawal. Pointing at /send is the whole of
 # what this has to do. tests/test_depo_wizard.py caps these three at 40
 # characters for exactly this reason and caught a 191-character draft.
-EXIT_ANSWER = "Per withdrawal — see /send."
+EXIT_ANSWER = "Per withdrawal — see /withdraw."
 
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
@@ -421,6 +455,86 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 #: The memo line stays. It is not an explanation -- it is the difference
 #: between a payment arriving and a payment being unrecoverable, and it is
 #: needed at the moment the operator is about to send.
+#: THE FIRST MESSAGE ANYBODY EVER GETS, and it used to be a list of commands.
+#:
+#: WHAT IT HAS TO DO, in the order somebody needs it:
+#:   1. Say what this does FOR THEM, so "deposit" and "withdraw" mean
+#:      something before they are asked to pick one.
+#:   2. Say which way the money goes, because that was the confusion:
+#:      /receive read as "receive my money" and meant "mint me an address".
+#:   3. Say the two things that change how they should behave in this chat --
+#:      that nothing here is written down, and that nothing moves until they
+#:      confirm.
+#:
+#: WHAT IT MUST NOT DO, AND THE FIRST DRAFT OF THIS DID IT.
+#:
+#: That draft opened "This is a doorbell, not a wallet. Nothing here holds a
+#: key, and it cannot move money on its own -- it asks a machine that is
+#: switched off most of the time, and that machine decides." Every clause of
+#: that is true, and together they are a description of the ARCHITECTURE:
+#: that there is a second machine, that it is normally powered down, that this
+#: chat is what wakes it, and where the keys are not. Written into the one
+#: surface this entire file is built on the assumption that somebody else
+#: reads.
+#:
+#: This file has cut two other messages back for exactly that reason -- see
+#: the notes on /settings and on FEE_ANSWER: "a reader who has the transcript
+#: and nothing else learns the shape of the operation from the explanations,
+#: not from the answers." A welcome is the LONGEST message this bot sends, so
+#: it is the one where that rule matters most, and it was the one place the
+#: rule had not been applied.
+#:
+#: So it reads as a service. It says what the operator can do and what this
+#: chat will and will not do with what they type. It says nothing about how
+#: any of it is arranged, because that is not a thing a customer needs and it
+#: is a thing a reader would want.
+WELCOME_LINES = [
+    "Monero mixing, from your phone.",
+    "",
+    "MONEY IN",
+    "  /deposit   send Bitcoin — you get an address and a memo to pay",
+    "  /address   a Monero address, if you are being paid in Monero already",
+    "",
+    "MONEY OUT",
+    "  /withdraw  mixes what is here and sends it to addresses you name",
+    "",
+    "The one that pays YOU is /withdraw. (It used to be called \"receive\", "
+    "which read backwards and caught people out — that one is /address now, "
+    "and it only makes you an empty address to be paid into.)",
+    "",
+    "HOW THIS CHAT BEHAVES",
+    "  Nothing you type is written down on this end.",
+    "  Nothing is ever sent until you confirm it — every time.",
+    "  Replies are kept short and dull on purpose. Assume this transcript "
+    "can be read by somebody who is not you.",
+]
+
+#: The deletion line is CONDITIONAL, because --burn-after 0 disables it and a
+#: welcome that promises deletion on an install that does not delete is the
+#: kind of confident false statement this repo keeps removing. The number is
+#: the one actually configured, not a literal.
+_BURN_LINE = ("  Messages here are deleted after {h}h, both sides, as far as "
+              "Telegram allows.")
+
+
+def welcome_text(burn_after: int = 0) -> str:
+    """The welcome, with the lines that are true of THIS install."""
+    lines = list(WELCOME_LINES)
+    try:
+        _b = int(burn_after or 0)
+    except (TypeError, ValueError):
+        _b = 0
+    if _b > 0:
+        lines.append(_BURN_LINE.format(h=max(1, _b // 3600)))
+    lines += ["", "Tap below, or /help for everything."]
+    return "\n".join(lines)
+
+
+#: The default rendering, for the source-level checks and for any caller
+#: without a Pager to ask.
+WELCOME = welcome_text(0)
+
+
 HELP = "\n".join(
     [f"/{_c:<9s} {_d}" for _c, _d in BOT_COMMANDS]
     + ["",
@@ -628,11 +742,26 @@ def parse_command(text: str) -> tuple:
     if len(parts) > 2:
         return "", {}, "too many arguments"
 
-    if cmd in ("/help", "/start"):
+    # /start IS NOT /help, AND ON TELEGRAM IT IS THE ONE MESSAGE EVERY USER
+    # SENDS. It is what the blue Start button sends, it is the first thing
+    # anybody ever sends a bot, and it was answered with a bare list of eleven
+    # slash-commands -- the reply of a command line, to somebody who has not
+    # been told what the thing IS yet.
+    #
+    # A DEEP-LINK PAYLOAD IS IGNORED, NOT REFUSED. Telegram sends
+    # "/start <payload>" when a user arrives through a t.me link, so `arg` can
+    # be non-empty on the one command that must never fail. It is dropped:
+    # nothing here takes a parameter from a link, and refusing would turn the
+    # first message of every deep-linked session into an error.
+    if cmd == "/start":
+        return "", {}, "welcome"
+    if cmd == "/help":
         return "", {}, "help"
     if cmd == "/status":
         return "", {}, "status"
-    if cmd in ("/receive", "/recv"):
+    # /address IS THE PUBLISHED SPELLING NOW. /receive and /recv still work --
+    # see BOT_COMMANDS for why the name changed and why the old ones stay.
+    if cmd in ("/address", "/addr", "/receive", "/recv"):
         n = 1
         if arg:
             # isdecimal, NOT isdigit, and the wizard already carries the note
@@ -674,7 +803,11 @@ def parse_command(text: str) -> tuple:
         if arg:
             return "", {}, "just /depo — it asks"
         return "", {}, "depo_wizard"
-    if cmd in ("/send", "/withdraw"):
+    # /withdraw IS THE PUBLISHED SPELLING NOW, and /send is the alias rather
+    # than the other way round. "Send" does not say which direction the money
+    # goes; on a tool whose other two commands both bring money IN, it read to
+    # at least one operator as another way to pay in.
+    if cmd in ("/withdraw", "/send"):
         # SAME RULE AS /depo, and here it matters more: an argument would be
         # the destination address typed on the same line as the word, which
         # puts it in the transcript attached to the command and skips the
@@ -818,6 +951,12 @@ class Pager:
         #: see the note where it is written for why the vault cannot hold this
         #: and why the SD card must not.
         self.handle_owner = {}
+        #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
+        #: otherwise -- a private chat id IS a person. Used for the one thing
+        #: this number decides: whether the operator has to be told, at the
+        #: moment money moves, that the pot is not only theirs. main() refuses
+        #: to start above 1 without --shared-funds.
+        self.spenders = len(self.allow_users) or len(self.allow)
         self.busy = threading.Lock()
         self.ignored = 0
         self.poll_failures = 0
@@ -1000,8 +1139,8 @@ class Pager:
         lines.append("  mixing depth    "
                      + ", ".join(f"{d} ({proto.WITHDRAW_DEPTH_NOTE[d]})"
                                  for d in sorted(proto.WITHDRAW_DEPTHS))
-                     + ", asked at /send")
-        lines.append("  destination     the address you reply with at /send")
+                     + ", asked at /withdraw")
+        lines.append("  destination     the address you reply with at /withdraw")
         lines.append("")
         # THE COURTESY BOUND, SAID TO BE THE COURTESY BOUND. This box's
         # --daily-cap help calls itself exactly that: "courtesy pokes per 24h.
@@ -1256,7 +1395,7 @@ class Pager:
             if _d is None:
                 del self.convos[chat_id]
                 self.send(chat_id, "no: I did not recognise that. Cancelled — "
-                                   "start again with /send.")
+                                   "start again with /withdraw.")
                 return True
             c.depth = _d
             q, c.expect = _confirm_question(self.rng)
@@ -1283,11 +1422,25 @@ class Pager:
             _spread = (f"across {_n} addresses" if _n > 1 else
                        "onto the ONE address you gave — anyone watching it "
                        "sees them all and can group them")
+            # WHOSE MONEY, ON THE ONE INSTALL WHERE THAT IS A QUESTION.
+            #
+            # There is one wallet, and a withdrawal spends the largest
+            # unlocked balance on it -- the vault is never told who asked, and
+            # cannot be. On a single-operator install that is invisible and
+            # right. With --shared-funds acknowledged at startup it is a real
+            # possibility at exactly this moment, so it is said at exactly
+            # this moment rather than in a banner on a headless box.
+            _pot = ("" if self.spenders <= 1 else
+                    "\n\nThis takes the LARGEST balance on the wallet, "
+                    "whoever put it there — "
+                    f"{self.spenders} people can drive this bot and the money "
+                    "is one pot.")
             self.send(chat_id,
                       f"Send to the {'addresses' if _n > 1 else 'address'} you "
                       f"just sent, {proto.WITHDRAW_DEPTH_NOTE[_d]} — this "
                       f"SPENDS.\n\n"
                       f"At least {_lo} separate transactions, {_spread}."
+                      f"{_pot}"
                       f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
@@ -1633,6 +1786,48 @@ class Pager:
         return [u for u in out if isinstance(u, dict)]
 
     # -- the poke -------------------------------------------------------
+    #: A JOB LONG ENOUGH THAT SILENCE STOPS MEANING "BE PATIENT".
+    #:
+    #: Below this the operator was told a number they can wait out -- a status
+    #: probe is 25 minutes -- and an extra line in the transcript buys nothing.
+    #: Above it, the wait is long enough that "it is working" and "it is dead"
+    #: look identical for hours, which is the state a withdrawal spends two
+    #: thirds of a day in.
+    #:
+    #: Compared against result_budget_s, the same figure start_job already
+    #: quotes, so the message that says "up to 17h" and the decision to report
+    #: progress during those 17h cannot disagree.
+    MILESTONE_FLOOR_S = 3600
+
+    def _milestone(self, chat_id: int, job: str):
+        """A callback for run_wake's milestones, or None for a short job.
+
+        ONE MESSAGE, AT COLLECTION, AND NOT AT THE MAGIC PACKET. Both are real
+        events and only one is worth a permanent line: "the packet went out"
+        is a restatement of the "working" reply the operator already has, and
+        it lands within the pre-WOL ceiling they were told about. "It picked
+        the job up" is the one that changes what they should believe -- before
+        it, nothing has run and nothing is spent; after it, something is
+        running that this box cannot stop.
+
+        A FAILED SEND IS NOT RETRIED. The result has its own retry because a
+        lost slip costs money; a lost progress line costs a sentence, and a
+        retry storm here would hold `busy` against a dead circuit for the rate
+        limit's whole window -- which is the reasoning the slip path already
+        records for capping itself at one.
+        """
+        if proto.result_budget_s(job) < self.MILESTONE_FLOOR_S:
+            return None
+
+        def _say(word):
+            if word != "collected":
+                return
+            integrity_log("pager", f"collected:{job}")
+            self.send(chat_id,
+                      f"{chat_name(job)}: picked up — it is running now. "
+                      f"Nothing else to do; I will say when it is finished.")
+        return _say
+
     def poke(self, chat_id: int, job: str, params: dict) -> None:
         """Run one wake, in this process, and report only its OUTCOME.
 
@@ -1644,7 +1839,8 @@ class Pager:
         """
         db = doorbell()
         try:
-            pending = db.run_wake(self.args, self.key, job, params)
+            pending = db.run_wake(self.args, self.key, job, params,
+                                  on_event=self._milestone(chat_id, job))
         except BaseException as e:                           # noqa: BLE001
             integrity_log("pager", f"wake_failed:{job}")
             self.send(chat_id, f"{chat_name(job)}: failed to start — {_redact(e)[:160]}")
@@ -1737,7 +1933,8 @@ class Pager:
                         "the address you gave.\n\n"
                         "This moves ONE address at a time — merging several "
                         "would prove on-chain that they share an owner. If "
-                        "you had funds in more than one place, /send again "
+                        "you had funds in more than one place, /withdraw "
+                        "again "
                         "for the next.")
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
@@ -1787,6 +1984,39 @@ class Pager:
                                   f"/depo again.")
                 return
             if not slip:
+                # A MINTED ADDRESS IS NOT A READY DEPOSIT, AND THIS SAID IT
+                # WAS. receive_new produces a Monero subaddress and NOTHING
+                # ELSE: no quote, so no thor_pairs file, so nothing for
+                # seal_slip_for_delivery or plain_slip_for_chat to send --
+                # both return empty on it by design ("receive_new quotes
+                # nothing"). Driven with plain_slip ON and a delivery key
+                # configured: the chat got "address ready · slip B7C2" and the
+                # address reached it in neither form.
+                #
+                # So the command whose entire purpose is to hand the operator
+                # an address to be paid at delivered no address, and said
+                # "ready" about it. That is the same defect this file already
+                # fixed once for a finished withdrawal: "'ready' is deposit
+                # vocabulary for something that has not happened yet", used on
+                # a job where the thing the operator wanted did not arrive.
+                #
+                # WHAT IS TRUE INSTEAD: the address exists on the machine, the
+                # label works with /check, and this chat is not carrying it.
+                # Saying so is worth more than a reassuring word -- an
+                # operator who believes an address is on its way waits for a
+                # message that is never coming.
+                if job == "receive_new":
+                    integrity_log("pager", "address_not_delivered")
+                    self.send(chat_id,
+                              f"address {h}: minted.\n"
+                              f"The address itself is NOT sent to this chat — "
+                              f"only the deposit flow carries one, and this "
+                              f"job has no quote to carry it in. Read it at "
+                              f"the machine.\n"
+                              f"/check {h} will say when something arrives on "
+                              f"it.",
+                              buttons=self._handle_buttons(h))
+                    return
                 # NO DELIVERY KEY IS CONFIGURED, so there is nothing to send and
                 # this is still the original vocabulary: §5 step 5, "Telegram
                 # gets `depo ready · slip A3F1`". No address, no memo, no
@@ -1845,7 +2075,18 @@ class Pager:
                           f"Did not get through, twice — and it expires. "
                           f"/depo again for a fresh one.")
         elif out == "refused":
-            self.send(chat_id, f"{chat_name(job)}: refused.")
+            # A REFUSAL IS THE ONE ENDING WHERE "NOTHING RAN" IS CERTAIN, and
+            # for a spend that is the fact the operator most needs. Refused is
+            # raised in preflight and in the dispatcher's own checks, always
+            # BEFORE the first child process starts -- a failure inside a
+            # child reports "failed", not "refused" -- so this can say it
+            # without guessing.
+            self.send(chat_id,
+                      f"{chat_name(job)}: refused before it started"
+                      + (" — nothing was spent and nothing moved."
+                         if job == "withdraw" else ".")
+                      + " Try /status, then again.",
+                      buttons=MENU_BUTTONS)
         elif out == "failed":
             # A FAILED WITHDRAWAL GETS THE ONE THING THE OPERATOR CAN ACT ON.
             #
@@ -1868,15 +2109,59 @@ class Pager:
             # Withdrawals only. The deposit jobs mint and quote; a depth is not
             # a thing they have, and offering this advice there would be a
             # confident answer to a question nobody asked.
+            # AND IT MUST NOT IMPLY THE MONEY IS SAFE. "failed" means the run
+            # started and did not finish, and a run can stop at any point --
+            # planning, which spends nothing, or mid-round, which does not.
+            # This box has never been told a balance and cannot tell those
+            # apart, so it says both are possible rather than picking the
+            # comfortable one. The depth hint stays because it is the cause
+            # the operator can act on; "may be" is doing real work in it.
             _tail = (" It may be too deep for the balance — the deeper "
-                     "options need more to work with. /send again and pick a "
-                     "shallower one." if job == "withdraw" else "")
-            self.send(chat_id, f"{chat_name(job)}: failed.{_tail}")
+                     "options need more to work with.\n"
+                     "Some of it may already have moved: a run can stop "
+                     "before it spends anything or part-way through, and "
+                     "this end cannot tell which. CHECK THE BALANCE before "
+                     "running it again."
+                     if job == "withdraw" else "")
+            self.send(chat_id, f"{chat_name(job)}: failed.{_tail}",
+                      buttons=MENU_BUTTONS)
         elif out == "expired_uncollected":
-            self.send(chat_id, f"{chat_name(job)}: not collected. Nothing was handed "
-                               f"over.")
+            # NOTHING RAN, and for a spend that is the whole message. The job
+            # was never handed over, so it cannot have started.
+            self.send(chat_id,
+                      f"{chat_name(job)}: never picked up, so nothing ran"
+                      + (" and NOTHING WAS SPENT — your funds are exactly "
+                         "where they were." if job == "withdraw" else ".")
+                      + " Try again.",
+                      buttons=MENU_BUTTONS)
         else:
-            self.send(chat_id, f"{chat_name(job)}: no result. Check before trying again.")
+            # collected_no_result: THE ONE ENDING THAT MUST NOT INVITE A
+            # RETRY. The job WAS handed over and then nothing came back for
+            # the whole window -- up to 16.5 h on a withdrawal. It may have
+            # completed and lost its answer; it may have died half-way. Both
+            # readings are live, and the difference between them is whether
+            # running it again spends the same money twice.
+            #
+            # "Check before trying again" was the whole of this message, which
+            # is true and does not say what to check or what the risk of not
+            # checking is.
+            if job == "withdraw":
+                integrity_log("pager", "withdraw_unresolved")
+                self.send(chat_id,
+                          "withdraw: it was picked up and never reported "
+                          "back.\n"
+                          "I do NOT know whether the funds moved. Both are "
+                          "possible: it may have finished and lost the reply, "
+                          "or stopped part-way.\n"
+                          "Do not run /withdraw again until you have checked "
+                          "the balance yourself — a second run could spend "
+                          "what the first one already sent.",
+                          buttons=MENU_BUTTONS)
+            else:
+                self.send(chat_id,
+                          f"{chat_name(job)}: picked up, then no answer came "
+                          f"back. Check before trying again.",
+                          buttons=MENU_BUTTONS)
 
     def _worker(self, chat_id: int, job: str, params: dict) -> None:
         try:
@@ -2029,11 +2314,18 @@ class Pager:
         if err == "exit":
             self.send(cid, EXIT_ANSWER)
             return
+        if err == "welcome":
+            # THE ONE MESSAGE EVERY OPERATOR GETS FIRST. See WELCOME_LINES for
+            # what it says and, more importantly, what it deliberately does
+            # not. Rendered against THIS pager's --burn-after, so the line
+            # about deletion appears only on an install that deletes.
+            self.send(cid, welcome_text(self.burn_after), buttons=MENU_BUTTONS)
+            return
         if err == "help":
-            # THE MENU RIDES ON /help AND /start, which is where somebody who
-            # does not know what to do arrives. Every button here is a command
-            # in the list above it, so the list is still the manual and the
-            # buttons are just the short way to say the same four things.
+            # THE MENU RIDES ON /help TOO, because somebody who typed it is
+            # deciding what to do next. Every button is a command in the list
+            # above it, so the list is still the manual and the buttons are
+            # just the short way to say the same four things.
             self.send(cid, HELP, buttons=MENU_BUTTONS)
             return
         if err == "status":
@@ -2070,8 +2362,12 @@ class Pager:
             # help text instead of "your /depo expired", which is the answer
             # this branch exists to give.
             if msg["text"].strip().isdecimal():
-                self.send(cid, "no live /depo — it expired or was cancelled. "
-                               "Start again with /depo, or /depo <slot>.")
+                # AND NOT "/depo <slot>". The one-shot form was removed --
+                # see parse_command -- so this told an operator who had
+                # just mistyped to use a form that answers
+                # "just /depo — it asks".
+                self.send(cid, "no live /deposit — it expired or was "
+                               "cancelled. Start again with /deposit.")
                 return
             # THE ERROR, NOT THE MANUAL. Appending HELP to every typo put the
             # full command list -- including the memo line -- into the chat
@@ -2298,13 +2594,20 @@ class Pager:
         #
         # Fine for one person on two devices. Said out loud because it is not
         # fine for two people, and nothing else in the toolchain mentions it.
-        if len(self.allow) + len(self.allow_users) > 2 or len(self.allow) > 1:
-            print("  [!] More than one chat is allowlisted. They SHARE one "
-                  "wake budget, one")
-            print("      one-job-at-a-time lock, and one handle namespace on "
-                  "the vault — this is")
-            print("      built for one operator on several devices, not for "
-                  "several people.")
+        # LEADS WITH THE MONEY NOW. This said "one wake budget, one
+        # one-job-at-a-time lock, and one handle namespace" -- all true, all
+        # inconvenience, and it left out the one that is not: the vault takes
+        # the largest balance it can see, whoever put it there. main() refuses
+        # to start in this state without --shared-funds; this is the reminder
+        # for the install that acknowledged it.
+        if self.spenders > 1:
+            print("  [!] {n} people can drive this bot and they SHARE ONE POT."
+                  .format(n=self.spenders))
+            print("      A withdrawal spends the largest balance on the "
+                  "wallet, whoever put it there —")
+            print("      it does not ask who is asking. They also share one "
+                  "wake budget, one rate")
+            print("      limit, and one job at a time.")
         while not shutdown_requested():
             for upd in self.updates():
                 uid = upd.get("update_id")
@@ -2482,6 +2785,26 @@ def build_cli():
     # publish_commands registers at default scope "every chat this bot is in,
     # because the allowlist is what decides who is answered" -- so this is a
     # supported configuration whose access rule was simply never written.
+    # ONE WALLET, AND THE ALLOWLIST DOES NOT DIVIDE IT.
+    #
+    # Driven against the shipped _funded_entry with two piles on one wallet:
+    # it returns the LARGEST single unlocked output and has no chat argument
+    # to filter by -- gs_wake_agent, gs_wake_proto and gs_doorbell contain no
+    # chat_id at all, deliberately. So on an install with two allowlisted
+    # people, the second one taps Withdraw and the vault hands them the first
+    # one's money, correctly, by its own rules.
+    #
+    # There is no fix for that inside this file. Dividing the pot would mean a
+    # persistent chat-to-account ledger on the vault -- exactly the record
+    # this design refuses to keep, and a chat identifier on a wire that
+    # deliberately carries none. So the answer is to make the operator say
+    # they know: --shared-funds is an acknowledgement, not a feature.
+    ap.add_argument("--shared-funds", action="store_true",
+                    help="acknowledge that EVERY allowlisted person shares "
+                         "ONE pot of money. Required when more than one "
+                         "person is allowlisted: a withdrawal spends the "
+                         "largest balance on the wallet, whoever put it "
+                         "there.")
     ap.add_argument("--user-id", action="append", default=None, type=int,
                     help="allowlisted Telegram USER id, checked against the "
                          "sender of every message. Repeatable. REQUIRED when "
@@ -2607,6 +2930,38 @@ def main(argv=None) -> int:
             f"    For a one-to-one chat with the bot this does not arise -- "
             f"there the chat id IS\n"
             f"    the person, and it is positive.")
+    # HOW MANY PEOPLE CAN SPEND, which is not how many chat ids there are.
+    #
+    # With --user-id, the senders ARE the people and the chat ids are just
+    # rooms they might be standing in. Without it, every allowlisted chat is a
+    # private one -- main() refuses a group above -- and a private chat id IS
+    # a person, because Telegram makes it equal to their user id.
+    _spenders = len(set(args.user_id or ())) or len(set(args.chat_id))
+    if _spenders > 1 and not args.shared_funds:
+        sys.exit(
+            f"[!] {_spenders} different people can drive this bot, and they "
+            f"would SHARE ONE POT.\n"
+            f"    There is one wallet behind this. A withdrawal does not ask "
+            f"who is asking: the\n"
+            f"    vault takes the LARGEST unlocked balance it can see and "
+            f"sends it to whatever\n"
+            f"    addresses that person gave. Driven against the shipped "
+            f"code -- with 1000 XMR\n"
+            f"    from one person and 300 from another on one wallet, the "
+            f"second person's\n"
+            f"    withdrawal picks up the first person's 1000.\n"
+            f"\n"
+            f"    They also share one daily wake budget, one rate limit, and "
+            f"one job at a time --\n"
+            f"    a withdrawal refuses everyone else's commands for the "
+            f"better part of a day.\n"
+            f"\n"
+            f"    If that is one person on several devices, or people whose "
+            f"money genuinely is\n"
+            f"    one pot, pass --shared-funds and it will start.\n"
+            f"    If they are separate customers, this tool cannot keep them "
+            f"apart and you need\n"
+            f"    one vault and one bot each.")
     key = doorbell().load_key(Path(args.key))
 
     st = Path(args.state)

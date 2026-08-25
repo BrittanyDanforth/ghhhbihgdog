@@ -1148,8 +1148,47 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
 
 def run_wake(args, key: dict, job: str, params: dict,
              server_factory=None, sock_factory=None, sleep=time.sleep,
-             clock=time.monotonic, rng=None) -> Pending:
+             clock=time.monotonic, rng=None, on_event=None) -> Pending:
+    """Wake the vault, hold one job, wait for its answer.
+
+    `on_event(word)` IS CALLED AT THE MILESTONES THIS PROCESS ACTUALLY KNOWS,
+    and it exists because the caller could not see any of them. A withdrawal
+    holds this function for up to 16.5 hours and the pager reported exactly
+    one thing at the end of it -- so "the vault is dead" and "the vault is
+    working" were the same observation for two thirds of a day, on the job
+    that spends everything.
+
+    Two words, and they are the two that separate those cases:
+
+      "wake_sent"  the magic packet is out; the vault has been told to boot.
+      "collected"  it booted, authenticated, and took the job. From here on,
+                   something is running.
+
+    NOTHING ELSE IS AVAILABLE FROM HERE, and it is worth saying why rather
+    than leaving a caller to expect more. A job is a list of child processes
+    on the vault; gs_wake_agent runs them with stdout to a 0600 file and does
+    not parse it (this repo's rule: "a tool's human-facing output is not an
+    interface"), and a withdrawal is ONE child -- GhostSpiral -- so there is
+    not even a step boundary to report. The vault answers once, over a channel
+    the doorbell deliberately refuses a second record on: see `result_refused`
+    in _report_events, which treats a second answer as "the vault contradicting
+    itself". Per-hop progress would be a new authenticated wire message, not a
+    callback.
+
+    NEVER RAISES INTO THE WAKE. A callback that throws must not lose a job
+    that is running: the exception is swallowed and the wait continues.
+    """
     pending = Pending(key, job, params, clock=clock)
+
+    def _fire(word):
+        if on_event is None:
+            return
+        try:
+            on_event(word)
+        except BaseException:                                # noqa: BLE001
+            # A milestone is a courtesy; the job is not.
+            pass
+
 
     # BIND BEFORE THE MAGIC PACKET. Never wake a machine you have not already
     # proven you can answer: a vault that boots, finds nobody listening and
@@ -1188,9 +1227,22 @@ def run_wake(args, key: dict, job: str, params: dict,
         print(f"  [+] Magic packet sent ({sent} bytes). Waiting up to "
               f"{FETCH_WINDOW_S // 60} min for the vault to collect job "
               f"{job}.")
+        _fire("wake_sent")
         # Poll the state machine rather than sleeping a fixed span, so a job
         # that finishes early releases the socket early.
+        #
+        # COLLECTION IS WATCHED HERE RATHER THAN SIGNALLED FROM THE HANDLER.
+        # on_m1 runs on the HTTP server's thread, inside the request that
+        # hands the job over; calling out from there would put a caller's
+        # network I/O -- the pager sends a Telegram message -- inside the
+        # window the vault is waiting on, and a slow circuit would delay the
+        # handover it is reporting. Watching the timestamp from this loop
+        # costs one comparison a second and cannot touch the handover.
+        _said = False
         while not pending.finished():
+            if not _said and pending.collected_at is not None:
+                _said = True
+                _fire("collected")
             sleep(1)
     finally:
         try:

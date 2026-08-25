@@ -486,6 +486,7 @@ pg.SLIP_RETRY_S = 0
 _p = pg.Pager.__new__(pg.Pager)
 _p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
 _p.handle_owner = {}
+_p.spenders = 1
 _ok = [True]
 _p.send = lambda cid, t, buttons=None: (_sent.append(t), _ok[0])[1]
 
@@ -495,7 +496,8 @@ def _drive(result, job="receive_and_quote", params=None):
     fin = type("F", (), {"result": result,
                          "outcome": staticmethod(lambda: "done")})()
     pg._DOORBELL[0] = type("D", (), {
-        "run_wake": staticmethod(lambda a, k, j, p: fin)})()
+        "run_wake": staticmethod(
+            lambda a, k, j, p, on_event=None: fin)})()
     _p.poke(111, job, params or {"amount_sat": 5000000})
     return list(_sent)
 
@@ -567,7 +569,8 @@ def _drive_out(result, outcome, job="watch"):
     fin = type("F", (), {"result": result,
                          "outcome": staticmethod(lambda: outcome)})()
     pg._DOORBELL[0] = type("D", (), {
-        "run_wake": staticmethod(lambda a, k, j, p: fin)})()
+        "run_wake": staticmethod(
+            lambda a, k, j, p, on_event=None: fin)})()
     _p.poke(111, job, {"handle": "A3F1"})
     return list(_sent)
 
@@ -592,7 +595,14 @@ check("watch: NON-VACUITY -- a failure that saw nothing still says failed",
       _mf == ["watch: failed."])
 _mr = _drive_out(_res("refused", ""), "refused")
 check("watch: NON-VACUITY -- and a refusal still says refused",
-      _mr == ["watch: refused."])
+      len(_mr) == 1 and _mr[0].startswith("watch: refused"))
+# A REFUSAL IS THE ONE ENDING WHERE "NOTHING RAN" IS CERTAIN. Refused is
+# raised in preflight and in the dispatcher's own checks, always BEFORE the
+# first child process starts -- a failure inside a child reports "failed" --
+# so the message can say so without guessing.
+check("watch: ...and says it never started, which is the fact a refusal "
+      "carries and a failure does not",
+      "before it started" in _mr[0])
 
 # ---- A FAILED WITHDRAWAL SAYS THE ONE THING THE OPERATOR CAN ACT ON -----
 #
@@ -605,7 +615,19 @@ check("watch: NON-VACUITY -- and a refusal still says refused",
 _mw = _drive_out(_res("failed", ""), "failed", job="withdraw")
 check("withdraw: a failure points at the depth, which is the one thing the "
       "operator can change",
-      len(_mw) == 1 and "shallower" in _mw[0] and "/send" in _mw[0])
+      len(_mw) == 1 and "too deep" in _mw[0])
+# AND IT MUST NOT IMPLY THE MONEY IS SAFE. "failed" means the run STARTED and
+# did not finish, and a run can stop while planning (nothing spent) or
+# part-way through (something spent). This box has never been told a balance
+# and cannot tell those apart, so it says both are live rather than picking
+# the comfortable one -- the reassuring reading is the expensive one to get
+# wrong.
+check("withdraw: ...and does NOT imply nothing was spent, because a run that "
+      "started can stop after it has moved money",
+      "may already have moved" in _mw[0]
+      and "nothing was spent" not in _mw[0].lower())
+check("withdraw: ...and says to check the balance before running it again",
+      "CHECK THE BALANCE" in _mw[0])
 check("withdraw: ...and still says it failed, rather than burying that",
       "failed" in _mw[0])
 # A HINT, NOT A DIAGNOSIS. This box has never been told a balance and must not
@@ -625,7 +647,63 @@ for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
 # (allow_withdraw off, deadman too short) has nothing to do with the balance.
 _mwr = _drive_out(_res("refused", ""), "refused", job="withdraw")
 check("withdraw: NON-VACUITY -- a refusal gets no depth advice either",
-      _mwr == ["withdraw: refused."])
+      len(_mwr) == 1 and "shallower" not in _mwr[0]
+      and "too deep" not in _mwr[0])
+# ...AND IT IS THE ONE WITHDRAWAL ENDING THAT CAN SAY THE MONEY IS UNTOUCHED.
+check("withdraw: a refusal says nothing was spent, which is certain here and "
+      "is not certain on a failure",
+      "nothing was spent" in _mwr[0])
+
+# ---- THE TWO SILENT ENDINGS, WHICH MEANT OPPOSITE THINGS AND READ ALIKE -
+#
+# A withdrawal that produces no result record ends one of two ways, and the
+# difference is whether running it again spends the same money twice:
+#
+#   expired_uncollected   the job was NEVER handed over. Nothing ran, nothing
+#                         was spent, and the funds are exactly where they were.
+#   collected_no_result   the job WAS handed over and nothing came back for up
+#                         to 16.5 h. It may have finished and lost the reply,
+#                         or stopped part-way. Both are live.
+#
+# They used to read "not collected. Nothing was handed over." and "no result.
+# Check before trying again." -- the second of which invites the retry that is
+# the whole danger.
+_mu = _drive_out(_res("expired_uncollected", ""), "expired_uncollected",
+                 job="withdraw")
+check("withdraw: never picked up says NOTHING WAS SPENT, in as many words",
+      "NOTHING WAS SPENT" in _mu[0])
+check("withdraw: ...and that the funds have not moved",
+      "exactly where they were" in _mu[0])
+check("withdraw: ...and invites a retry, which is safe here",
+      "again" in _mu[0].lower())
+
+_mn = _drive_out(_res("collected_no_result", ""), "collected_no_result",
+                 job="withdraw")
+check("withdraw: picked-up-then-silent does NOT claim the money is safe",
+      "NOTHING WAS SPENT" not in _mn[0]
+      and "exactly where they were" not in _mn[0])
+check("withdraw: ...and says outright that it does not know",
+      "do not know" in _mn[0].lower())
+check("withdraw: ...and names both readings rather than picking one",
+      "lost the reply" in _mn[0] and "part-way" in _mn[0])
+# THE ONE THAT MATTERS: it must not invite a retry, because a second run could
+# spend what the first one already sent.
+check("withdraw: ...and tells the operator NOT to run it again until they "
+      "have checked, naming the cost of not checking",
+      "Do not run" in _mn[0] and "spend what the first one already sent"
+      in _mn[0])
+# NON-VACUITY, both ways: the two endings are different messages, and the
+# non-spending jobs get neither lecture.
+check("withdraw: NON-VACUITY -- the two silent endings are different text",
+      _mu[0] != _mn[0])
+for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
+    _o1 = _drive_out(_res("expired_uncollected", ""), "expired_uncollected",
+                     job=_j)
+    _o2 = _drive_out(_res("collected_no_result", ""), "collected_no_result",
+                     job=_j)
+    check(f"{_j}: no spend-safety language on a job that does not spend",
+          "NOTHING WAS SPENT" not in _o1[0]
+          and "already sent" not in _o2[0])
 
 # ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
 #
@@ -664,15 +742,28 @@ check("withdraw: ...and says it moved ONE ADDRESS, so the rest is not lost "
       "track of",
       "one address" in _mws[0].lower()
       and "everything" not in _mws[0].lower()
-      and "/send again" in _mws[0])
+      and "/withdraw" in _mws[0])
 check("withdraw: ...and states no balance and no count, because this box has "
       "neither", not re.search(r"\d+\.\d", _mws[0]))
-# NON-VACUITY: the deposit jobs still take the ordinary path, so this is a
-# withdrawal-shaped answer and not a rewrite of every completion message.
-for _j in ("receive_and_quote", "receive_new"):
-    _md2 = _drive_out(_res("done", ""), "done", job=_j)
-    check(f"{_j}: NON-VACUITY -- still reports ready with its slip handle",
-          len(_md2) == 1 and "ready" in _md2[0] and "A3F1" in _md2[0])
+# NON-VACUITY: a DEPOSIT still takes the ordinary path, so the withdrawal
+# branch is a branch and not a rewrite of every completion message.
+_md2 = _drive_out(_res("done", ""), "done", job="receive_and_quote")
+check("receive_and_quote: NON-VACUITY -- still reports ready with its slip "
+      "handle", len(_md2) == 1 and "ready" in _md2[0] and "A3F1" in _md2[0])
+
+# ...AND receive_new IS ITS OWN BRANCH NOW, for a reason worth stating: it
+# was in this list, asserted to say "ready", and it produces NO address and no
+# slip. seal_slip_for_delivery and plain_slip_for_chat both return empty on it
+# by design ("receive_new quotes nothing"), so the reply promised a thing that
+# was never coming -- the same "'ready' is deposit vocabulary for something
+# that has not happened" defect this file fixed once for a finished spend.
+_ma = _drive_out(_res("done", ""), "done", job="receive_new")
+check("receive_new: does NOT say ready, because nothing the operator asked "
+      "for arrived", len(_ma) == 1 and "ready" not in _ma[0].lower())
+check("receive_new: ...says the address is not sent to this chat",
+      "NOT sent to this chat" in _ma[0])
+check("receive_new: ...and still carries the handle, which /check does work "
+      "on", "A3F1" in _ma[0] and "/check A3F1" in _ma[0])
 
 # ONE RETRY ON THE COMPLETION NOTICE, and this is the only notification that a
 # spend finished -- at the end of a job that ran up to sixteen hours and moved
