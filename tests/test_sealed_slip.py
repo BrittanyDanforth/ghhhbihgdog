@@ -531,6 +531,7 @@ _pager = pg.Pager.__new__(pg.Pager)
 _pager.proxies = {}
 _pager.token = "123456:TOKEN"
 _pager.handle_owner = {}
+_pager.handle_job = {}
 _pager.spenders = 1
 _ok_send = [True]
 _pager.send = lambda cid, text, buttons=None: (_sent.append(text),

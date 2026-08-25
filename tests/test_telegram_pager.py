@@ -174,6 +174,7 @@ def _wizard_params(answers):
     p.allow = {1}
     p.allow_users = set()
     p.handle_owner = {}
+    p.handle_job = {}
     p.spenders = 1
     p.busy = _th.Lock()
     p.ignored = 0
@@ -340,6 +341,69 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
         check(f"refused: ...and the whole rendered reply stays short "
               f"({len(_text)} chars)", len(_text) <= 420)
 pg.doorbell = _real_doorbell
+
+# ---- "YOUR FUNDS ARE EXACTLY WHERE THEY WERE" -- SAID BY A BOX WITH NO -----
+# ---- IDEA WHERE THEY ARE --------------------------------------------------
+#
+# The pager knows one true thing when a job expires uncollected: it was never
+# handed over, so THIS attempt cannot have started anything. It converted that
+# into a claim about the WALLET, and there is nothing behind it. This box has
+# never been told a balance, and it keeps no record that a wake is in flight:
+# `busy` is process memory and the shipped unit has Restart=on-failure.
+#
+# So the reachable false case is ordinary: the pager dies during a withdrawal
+# and comes back, the vault is still mixing, the next magic packet lands on a
+# machine that is already up and nothing collects it. The operator is told
+# their funds are exactly where they were, and invited to try again -- which,
+# on the one job that spends, is an invitation to spend it twice.
+#
+# The `refused` branch gets this right and defends itself as "THE ONE ENDING
+# WHERE 'NOTHING RAN' IS CERTAIN". It is certain there because the vault said
+# so. Here nobody said anything at all.
+print("\n== an expired withdrawal, and what the pager cannot know ==")
+_xp = pg.Pager(_args, "123456:TOKEN", {}, {"https": "socks5h://x"})
+_xsent = []
+_xp.send = lambda cid, t, buttons=None: (_xsent.append(t), True)[1]
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _FakePending("expired_uncollected", ""))
+try:
+    _xp.poke(111, "withdraw", {"exit_to": ["4" + "1" * 94], "depth": 1})
+    _xt = "\n".join(_xsent)
+finally:
+    pg.doorbell = _real_doorbell
+check("expired: it no longer makes a claim about the wallet",
+      "exactly where they were" not in _xt
+      and "NOTHING WAS SPENT" not in _xt)
+check("expired: ...and scopes what it says to THIS attempt, which is the only "
+      "thing it actually knows",
+      "THIS attempt" in _xt)
+check("expired: ...and says outright that it keeps no record of an earlier one",
+      "no record" in _xt.lower())
+check("expired: ...and sends them to the balance before a second withdrawal, "
+      "rather than inviting one",
+      "check the balance" in _xt.lower())
+check("expired: ...while still saying the one thing that IS certain — this "
+      "attempt handed nothing over",
+      "never picked up" in _xt and "spent nothing" in _xt)
+# NON-VACUITY: a DEPOSIT that expires still just says try again, because
+# nothing about a deposit can have been spent and there is no second reading.
+_dxp = pg.Pager(_args, "123456:TOKEN", {}, {"https": "socks5h://x"})
+_dxs = []
+_dxp.send = lambda cid, t, buttons=None: (_dxs.append(t), True)[1]
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _FakePending("expired_uncollected", ""))
+try:
+    _dxp.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+finally:
+    pg.doorbell = _real_doorbell
+check("expired: NON-VACUITY -- a deposit that expires still simply says to "
+      "try again, so this is a branch and not a blanket hedge",
+      "Try again." in "\n".join(_dxs)
+      and "check the balance" not in "\n".join(_dxs).lower())
+
+
 
 
 print("\n== the rate limit is real, and survives a restart ==")
@@ -613,7 +677,7 @@ def _wedge_pager(fail_on):
     p.proxies, p.token, p.key = {"http": "x"}, "T", {}
     p.args = types.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 0, {}
-    p.allow_users, p.handle_owner = set(), {}
+    p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
     p.spenders = 1
     p.busy = _th2.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
@@ -950,7 +1014,7 @@ def _plain_pager(busy=False, why=""):
     p.proxies, p.token, p.key = {"http": "x"}, "T", {}
     p.args = _ty3.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 4, {}
-    p.allow_users, p.handle_owner = set(), {}
+    p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
     p.spenders = 1
     p.busy = _th3.Lock()
     if busy:
@@ -1345,6 +1409,45 @@ check("card: NON-VACUITY -- and still tells the operator to find their chat "
       "id first", "--whoami" in _pgu)
 check("card: NON-VACUITY -- and documents the burn switch it now has",
       "--burn-after" in _pgu and "USR1" in _pgu)
+
+# ---- THE PAGER COULD NOT START AT ALL, SILENTLY, EVERY 30 SECONDS -------
+#
+# systemd starts a unit with cwd=/ . gs_common's chain is
+# Path("integrity_chain.log") -- RELATIVE, resolved against cwd when it is
+# opened -- and this unit sets ProtectSystem=strict with ReadWritePaths=
+# /var/lib/gs and had no WorkingDirectory. So the chain resolved to
+# /integrity_chain.log on a read-only filesystem, and the first bookkeeping
+# line the pager ever writes raised an unhandled OSError.
+#
+# With StandardError=null that traceback went nowhere, and Restart=on-failure
+# with RestartSec=30 retried it forever. The one box whose entire job is being
+# reachable was unreachable, in a loop, with no message anywhere.
+#
+# gs-wake-agent.service already carries this reasoning and fixes it there; this
+# unit copied the hardening and not the fix.
+check("card: the pager unit says where it runs, because a relative chain path "
+      "and cwd=/ under ProtectSystem=strict is a silent restart loop",
+      "WorkingDirectory=" in _pgu)
+check("card: ...and points it at the one directory the unit may write",
+      any(_l.strip() == "WorkingDirectory=/var/lib/gs"
+          for _l in _pgu.splitlines())
+      and "ReadWritePaths=/var/lib/gs" in _pgu)
+# NON-VACUITY on the premise: the hardening that makes cwd read-only is really
+# there, so this is a fix for a live combination and not a precaution.
+check("card: NON-VACUITY -- the unit really does make everything outside "
+      "ReadWritePaths read-only, and really does swallow stderr",
+      "ProtectSystem=strict" in _pgu and "StandardError=null" in _pgu
+      and "Restart=on-failure" in _pgu)
+# AND THE TOOL SURVIVES A UNIT THAT FORGETS. The example's own header says
+# "read every line, then write your own", so an operator's unit may have no
+# WorkingDirectory at all -- and a full or read-only card would do the same on
+# one that does. A pager that answers is worth more than a chain line about a
+# pager that did not start.
+_ml_src = _SRC_PG_EARLY.split("def main(")[1]
+check("pager: the startup chain line cannot stop the bot from starting",
+      "try:\n        integrity_log(\"pager\", \"start\")" in _ml_src)
+check("pager: ...and says so on stdout rather than dying into a null stderr",
+      "integrity chain unavailable" in _ml_src)
 _dbu = _UNITS["gs-doorbell.service.example"]
 check("card: NON-VACUITY -- the doorbell unit still keeps the job off argv, "
       "which is the defect its own comment records",
@@ -1377,7 +1480,7 @@ class _BurnPager:
         p.proxies, p.token, p.key = {"http": "x"}, "T", {}
         p.args = _ty2.SimpleNamespace()
         p.allow = {111}
-        p.allow_users, p.handle_owner = set(), {}
+        p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
         p.spenders = 1
         p.busy = __import__("threading").Lock()
         p.ignored = 0
@@ -1567,7 +1670,7 @@ def _room_pager(allow, users):
     p.proxies, p.token, p.key = {"http": "x"}, "T", {}
     p.args = _ty4.SimpleNamespace()
     p.allow, p.ignored, p.convos = set(allow), 0, {}
-    p.allow_users, p.handle_owner = set(users), {}
+    p.allow_users, p.handle_owner, p.handle_job = set(users), {}, {}
     p.spenders = len(p.allow_users) or len(p.allow)
     p.burn_after = 0
     p.busy = _th4.Lock()
@@ -1865,6 +1968,64 @@ check("tap: ...and every button on it maps to a real command",
 # the reply was "Deposit 3 BTC" and a confirm sum -- a deposit two orders of
 # magnitude out, with the operator primed to answer because they had just
 # tapped a button and a question appeared.
+# ---- STOPPING MID-WAKE WAS ANNOUNCED WHERE NOBODY READS IT --------------
+#
+# The code names the cost itself: the worker is a daemon thread, so returning
+# from run() tears down the in-process doorbell server, and a vault that is
+# mid-withdrawal reports back to a closed port hours later. Its comment says
+# the defect being fixed is that "the operator was never told" -- and then
+# told them with print(), on a unit that sets StandardOutput=null and
+# StandardError=null.
+#
+# `systemctl restart`, a package upgrade, a Pi reboot, Restart=on-failure or
+# an operator stopping the unit all land here, during the up-to-16 h window a
+# withdrawal holds `busy`. The operator is left with "working" as the last
+# thing they ever heard about a spend.
+print("\n== stopping while something is still running ==")
+_sd, _sds = _room_pager([111, 222], [])
+_sdsent = []
+_sd.send = lambda cid, t, buttons=None: (_sdsent.append((cid, t)), True)[1]
+_sd.busy.acquire()
+# The branch lives in run()'s tail rather than in a helper, so what is checked
+# below is the shipped source of that branch, sliced on the one integrity line
+# only it writes. The behavioural half -- that send() works with `busy` held
+# and no worker thread -- is driven at the end.
+# SLICED ON THE BRANCH, NOT ON THE FIRST OCCURRENCE. `if self.busy.locked():`
+# appears four times in this file; the shutdown one is identified by the
+# integrity line only it writes.
+_sd_src = _SRC_PG_EARLY.split(
+    'integrity_log("pager", "shutdown_with_wake_in_flight")')[1] \
+    .split("return 1")[0]
+check("shutdown: the mid-wake branch also tells the CHAT, not only a stdout "
+      "the shipped unit sets to null",
+      "self.send(_cid," in _sd_src)
+check("shutdown: ...to every allowlisted chat, since nothing here records "
+      "which one started the job", "for _cid in sorted(self.allow):" in _sd_src)
+check("shutdown: ...and says the job keeps going but its result is lost",
+      "keeps going" in _sd_src and "not be told how it" in _sd_src)
+check("shutdown: ...and sends them to the machine rather than to a retry",
+      "CHECK AT THE MACHINE" in _sd_src)
+check("shutdown: ...inside a bare except, so a dead circuit at shutdown does "
+      "not turn stopping into a traceback",
+      "except Exception:" in _sd_src and _sd_src.index("try:")
+      < _sd_src.index("for _cid in sorted(self.allow):"))
+check("shutdown: NON-VACUITY -- the prints are kept for the by-hand case, "
+      "which is the one surface that DOES show them",
+      "Shutdown requested WHILE A WAKE IS IN FLIGHT" in _sd_src)
+# AND IT REALLY REACHES send(): driven, not grepped.
+_sd2, _ = _room_pager([111, 222], [])
+_sd2sent = []
+_sd2.send = lambda cid, t, buttons=None: (_sd2sent.append((cid, t)), True)[1]
+_sd2.busy.acquire()
+try:
+    for _c in sorted(_sd2.allow):
+        _sd2.send(_c, "probe")
+finally:
+    _sd2.busy.release()
+check("shutdown: ...and send() needs neither the busy lock nor the worker "
+      "thread, which is why this branch can use it at all",
+      len(_sd2sent) == 2)
+
 print("\n== a button from an earlier question ==")
 _dp, _ds, _dt, _dj = _tapper()
 _dp.handle(_msg(111, 111, "/withdraw"))
@@ -2486,8 +2647,37 @@ try:
           "NOT sent to this chat" in _atext)
     check("address: ...and where it is instead",
           "at the machine" in _atext)
-    check("address: ...and what the label IS good for, so the handle is not "
-          "a phantom", "/check B7C2" in _atext)
+    # THE LABEL IS FOR MATCHING, NOT FOR /check. This asserted the reply sent
+    # the operator to "/check B7C2" -- a command the vault refuses on an
+    # address label every time, because receive_new records slip=None and both
+    # watching jobs refuse a record with no swap quote. The sentence spent a
+    # wake, a boot and a 5-20 minute jitter to be told so, and the two buttons
+    # under it did the same in one tap.
+    check("address: ...and the label is still there, since it is what the "
+          "operator matches against the machine", "B7C2" in _atext)
+    check("address: ...but nothing points them at a command that is refused "
+          "on it every time", "/check B7C2" not in _atext)
+    check("address: ...and it says where the answer actually is",
+          "watch it from the machine" in _atext.lower())
+    # NOR DO THE BUTTONS, which did the same thing in one tap. The reply keeps
+    # a keyboard -- an operator who has just been told to go to the machine
+    # still needs a way to do the next thing -- and it is the menu.
+    _abtn = [_l for _row in (_as_[0][1] or []) for _l, _d in _row]
+    check(f"address: ...and no button offers a watch either ({_abtn})",
+          not any(_d.startswith(("c:", "w:"))
+                  for _row in (_as_[0][1] or []) for _l, _d in _row))
+    check("address: ...while still leaving somewhere to go next",
+          (_as_[0][1] or []) == pg.MENU_BUTTONS)
+    # NON-VACUITY: a DEPOSIT label really does get the two watching buttons, so
+    # this is a branch and not the buttons being removed everywhere.
+    _wb, _wbs, _, _ = _tapper()
+    pg._DOORBELL[0] = types.SimpleNamespace(
+        run_wake=lambda a, k, j, p, on_event=None: _AddrFin())
+    _wb.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+    check("address: NON-VACUITY -- a DEPOSIT label still gets both watching "
+          "buttons, because the vault really can answer for one",
+          any(_d.startswith("c:")
+              for _row in (_wbs[0][1] or []) for _l, _d in _row))
     check("address: ...and the label is still bound to this chat",
           _ap.handle_owner.get("B7C2") == 111)
     # ...AND THE WELCOME MUST AGREE WITH IT, which is the half that was wrong.
@@ -2522,6 +2712,43 @@ try:
     # so this is a branch and not a rewrite of every finished job.
     _dp2, _ds2, _, _ = _tapper()
     _dp2.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+    # ...AND A TYPED /check ON ONE IS REFUSED HERE, NOT BY A BOOT.
+    #
+    # The buttons are gone, but the operator can still type it -- and the
+    # answer is structural: receive_new records slip=None and both watching
+    # jobs refuse a record with no swap quote. Sending the wake anyway costs a
+    # magic packet, a boot, a 5-20 minute jitter and one of twelve daily
+    # slots, and comes back as a refusal with no reason on it, which reads as
+    # "try again". parse_callback's own comment states the rule: "a button
+    # offering a depth the vault refuses would spend a wake on a rejection."
+    _up2, _us2, _, _uj2 = _tapper()
+    _up2.handle_job["B7C2"] = "receive_new"
+    _up2.handle_owner["B7C2"] = 111
+    _up2.handle(_msg(111, 111, "/check B7C2"))
+    check("address: a typed /check on an address label wakes nothing",
+          _uj2 == [])
+    check("address: ...and says why, in words that do not send them back to "
+          "try it again",
+          _us2 and "address label" in _us2[0][0]
+          and "at the machine" in _us2[0][0])
+    # NON-VACUITY: a DEPOSIT label still reaches the vault, so this refusal is
+    # about the label's kind and not about /check.
+    _up3, _us3, _, _uj3 = _tapper()
+    _up3.handle_job["B7C2"] = "receive_and_quote"
+    _up3.handle_owner["B7C2"] = 111
+    _up3.handle(_msg(111, 111, "/check B7C2"))
+    check("address: NON-VACUITY -- a deposit label still goes to the vault",
+          _uj3 and _uj3[0][1] == "swap_status")
+    # ...AND AN UNKNOWN LABEL STILL GOES THROUGH. The map is process memory, so
+    # a restart empties it; refusing there would lock an operator out of their
+    # own swap on the one box whose whole job is to be reachable. Same honest
+    # bound handle_owner already documents.
+    _up4, _us4, _, _uj4 = _tapper()
+    _up4.handle(_msg(111, 111, "/check B7C2"))
+    check("address: ...and a label this process never saw is still allowed, "
+          "because the map does not survive a restart",
+          _uj4 and _uj4[0][1] == "swap_status")
+
     check("address: NON-VACUITY -- a deposit with no delivery key still says "
           "'depo ready · slip B7C2'",
           _ds2[0][0] == "depo ready · slip B7C2")

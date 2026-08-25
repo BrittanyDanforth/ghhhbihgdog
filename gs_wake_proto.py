@@ -2102,6 +2102,31 @@ SPENDING_JOBS = ("withdraw",)
 #: result -- was sizing its window as though that sleep did not exist.
 VAULT_JITTER_LO_S, VAULT_JITTER_HI_S = 300, 1200
 
+#: EVERYTHING ON THE VAULT THAT IS NOT THE JITTER AND NOT THE CHILD.
+#:
+#: result_budget_s summed the jitter and the per-step budget and stopped, so
+#: the window was EXACTLY the vault's worst case with ZERO margin -- for a
+#: withdrawal, 1 x 58200 + 1200 = 59400 on both sides of the equation. Every
+#: other thing the vault does between collecting a job and reporting on it
+#: therefore ran past the window:
+#:
+#:   preflight (removable-device scan, resource check, unit_is_active),
+#:   verify_tor with a real exit request, extend_deadman's systemd-run and its
+#:   verification, _funded_entry's connect_rpc plus a wallet refresh on a
+#:   just-booted wallet, the slip sealing, and the report POST itself over Tor.
+#:
+#: A job that used its full budget therefore reported into a closed socket,
+#: and the operator was told "collected_no_result" -- "I do NOT know whether
+#: the funds moved ... Do not run /withdraw again until you have checked the
+#: balance yourself" -- about a run that had finished normally. On the one job
+#: that spends, on the exact run where they most need the answer.
+#:
+#: FIVE MINUTES, and the direction of the error is the reason for the number.
+#: Too long costs the pager's one-job lock a few extra minutes on a job that
+#: has already hung; too short costs the operator the only report they get.
+#: The same asymmetry WITHDRAW_DEPTHS' own budget margin is argued from.
+VAULT_FIXED_OVERHEAD_S = 300
+
 
 def result_budget_s(job: str) -> int:
     """How long the Pi must hold the line for a result, worst case.
@@ -2114,7 +2139,9 @@ def result_budget_s(job: str) -> int:
         same budget to run_child for every tool in the job, so a two-tool job
         is allowed twice it (tests/test_wake_agent.py says so in as many
         words: "the budget is PER STEP, not per job");
-      * the work itself, which is what budget_s bounds.
+      * the work itself, which is what budget_s bounds;
+      * and the FIXED per-boot overhead either side of it, which this stopped
+        one term short of. See VAULT_FIXED_OVERHEAD_S.
 
     Measured against the shipped constants, every job could report late:
 
@@ -2129,7 +2156,8 @@ def result_budget_s(job: str) -> int:
     "collected_no_result" for a job that in fact ran to completion.
     """
     spec = JOBS[job]
-    return len(spec["tools"]) * spec["budget_s"] + VAULT_JITTER_HI_S
+    return (len(spec["tools"]) * spec["budget_s"] + VAULT_JITTER_HI_S
+            + VAULT_FIXED_OVERHEAD_S)
 
 
 #: Named so a test can assert they are unreachable rather than merely absent.

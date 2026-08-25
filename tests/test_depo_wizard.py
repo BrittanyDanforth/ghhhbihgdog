@@ -88,6 +88,7 @@ class Fake:
         p.allow = set(allow)
         p.allow_users = set()
         p.handle_owner = {}
+        p.handle_job = {}
         p.spenders = 1
         p.busy = threading.Lock()
         p.ignored = 0
@@ -476,6 +477,49 @@ print("\n-- the settings the dashboard had and the chat did not --")
 _st = Fake()
 _st.say("/settings")
 _stx = _st.sent[-1][1]
+# ---- A TYPO GUARD PRESENTED AS AN OPERATING RANGE STRANDS MONEY ---------
+#
+# gs_wake_proto says it at the constants: "THESE ARE TYPO GUARDS AND NOT
+# PROTOCOL MINIMUMS ... The real lower bound is whatever ThorChain's outbound
+# fee makes uneconomic that day", and the bounds are "wide enough never to
+# obstruct a real deposit". The chat said "Anything from 0.0001 to 100", which
+# is how an operator reads an operating range.
+#
+# The trap is the first-time path and it catches the CAREFUL operator: /start,
+# the deposit button, a deliberate test with the smallest number the bot named.
+# The BTC swaps, the XMR lands, and every /withdraw at every depth then fails
+# against mix_minimum_xmr -- on the order of a third of an XMR, two orders of
+# magnitude away. The chat's explanation is "It may be too deep for the balance
+# -- the deeper options need more to work with", which cannot be acted on
+# because depth 1 is out of reach as well.
+print("\n-- the deposit floor that is not the deposit floor --")
+_aq = Fake()
+_aq.say("/deposit")
+_aqt = _aq.text()
+check("deposit: the bounds are labelled as what they are",
+      "TYPO GUARD" in _aqt and "not a working range" in _aqt)
+check("deposit: ...and the real floor is named as existing and higher",
+      "real floor" in _aqt and "much higher" in _aqt)
+check("deposit: ...and what happens below it is stated, since that is the "
+      "part that costs money",
+      "cannot run at ANY depth" in _aqt and "unmixable" in _aqt)
+# THIS BOX CANNOT COMPUTE IT: the floor needs a live fee estimate and a swap
+# rate, and /settings refuses to fetch a balance at all. Saying "send more,
+# not less" is the whole of what it honestly knows, and a computed figure here
+# would be a quote the vault never made.
+check("deposit: ...and it does not invent a figure it cannot know",
+      "cannot work out what it is" in _aqt
+      and "send more, not less" in _aqt)
+check("deposit: NON-VACUITY -- the typo bounds are still printed, because a "
+      "refusal that only says 'out of range' makes the operator guess",
+      P.btc_display(P.DEPOSIT_MIN_SAT) in _aqt
+      and P.btc_display(P.DEPOSIT_MAX_SAT) in _aqt)
+_aq_src = open(os.path.join(REPO, "gs_telegram_pager"),
+               encoding="utf-8").read()
+check("deposit: ...and the numbers come from the protocol, not from a literal "
+      "retyped here that can drift",
+      "proto.DEPOSIT_MIN_SAT" in _aq_src and "proto.DEPOSIT_MAX_SAT" in _aq_src)
+
 check("settings: it says the operator picks the deposit amount",
       "deposit amount" in _stx.lower())
 check("settings: ...and offers every mixing depth the protocol has",
@@ -1273,8 +1317,15 @@ _all_sent += [(-1, _CURRENCY_RE.sub("", pg.WELCOME))]
 _LABELS = [l for _t in (pg.MENU_BUTTONS,) for _row in _t for l, _d in _row]
 _LABELS += [l for _row in pg.Pager._depth_buttons(
     types.SimpleNamespace()) for l, _d in _row]
+# BOTH SHAPES, because _handle_buttons returns a different keyboard for a
+# label nothing can watch: an /address handle gets the menu instead of two
+# buttons that would each spend a wake to be refused.
 _LABELS += [l for _row in pg.Pager._handle_buttons(
-    types.SimpleNamespace(), "A3F1") for l, _d in _row]
+    types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS),
+    "A3F1", "receive_and_quote") for l, _d in _row]
+_LABELS += [l for _row in pg.Pager._handle_buttons(
+    types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS),
+    "A3F1", "receive_new") for l, _d in _row]
 check(f"the scan reaches the button labels too ({len(_LABELS)} of them), "
       f"which land in the chat and stay under the message",
       len(_LABELS) >= 8)
@@ -1290,7 +1341,7 @@ check("NON-VACUITY -- the surfaces the scrub covers really do name it",
 # EVERY BUTTON TABLE, not the one the menu happens to use. A `buttons=` that
 # named a fourth table would be a keyboard nothing above reads.
 _BTN_TABLES = {"MENU_BUTTONS", "self._depth_buttons()",
-               "self._handle_buttons(h)", "[[('Cancel', 'm:cancel')]]"}
+               "self._handle_buttons(h, job)", "[[('Cancel', 'm:cancel')]]"}
 _btn_seen = {_ast.unparse(_kw.value) for _n in _ast.walk(_pg_tree)
              if isinstance(_n, _ast.Call)
              and getattr(_n.func, "attr", "") == "send"

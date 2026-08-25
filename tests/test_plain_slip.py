@@ -486,6 +486,7 @@ pg.SLIP_RETRY_S = 0
 _p = pg.Pager.__new__(pg.Pager)
 _p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
 _p.handle_owner = {}
+_p.handle_job = {}
 _p.spenders = 1
 _ok = [True]
 _p.send = lambda cid, t, buttons=None: (_sent.append(t), _ok[0])[1]
@@ -662,8 +663,8 @@ check("withdraw: a refusal says nothing was spent, which is certain here and "
 # A withdrawal that produces no result record ends one of two ways, and the
 # difference is whether running it again spends the same money twice:
 #
-#   expired_uncollected   the job was NEVER handed over. Nothing ran, nothing
-#                         was spent, and the funds are exactly where they were.
+#   expired_uncollected   THIS job was never handed over, so this attempt ran
+#                         nothing and spent nothing.
 #   collected_no_result   the job WAS handed over and nothing came back for up
 #                         to 16.5 h. It may have finished and lost the reply,
 #                         or stopped part-way. Both are live.
@@ -671,14 +672,31 @@ check("withdraw: a refusal says nothing was spent, which is certain here and "
 # They used to read "not collected. Nothing was handed over." and "no result.
 # Check before trying again." -- the second of which invites the retry that is
 # the whole danger.
+#
+# AND THE FIRST ONE OVERREACHED, which is what these three checks pinned. It
+# said "NOTHING WAS SPENT — your funds are exactly where they were", and the
+# second half is a claim about the WALLET that this box has no basis for: it
+# has never been told a balance, and it keeps no record that a wake is in
+# flight (`busy` is process memory, and the shipped unit has
+# Restart=on-failure). Pager dies mid-withdrawal, comes back, vault still
+# mixing, next magic packet lands on a machine already up and nothing collects
+# it -- and the operator reads that their funds have not moved, followed by an
+# invitation to try again, on the one job that spends.
+#
+# So the checks now pin the scope rather than the reassurance. The `refused`
+# ending is where "nothing ran" is CERTAIN, and it says so; certainty there
+# comes from the vault having said it, and here nobody said anything.
 _mu = _drive_out(_res("expired_uncollected", ""), "expired_uncollected",
                  job="withdraw")
-check("withdraw: never picked up says NOTHING WAS SPENT, in as many words",
-      "NOTHING WAS SPENT" in _mu[0])
-check("withdraw: ...and that the funds have not moved",
-      "exactly where they were" in _mu[0])
-check("withdraw: ...and invites a retry, which is safe here",
-      "again" in _mu[0].lower())
+check("withdraw: never picked up says THIS attempt spent nothing",
+      "THIS attempt" in _mu[0] and "spent nothing" in _mu[0])
+check("withdraw: ...and makes no claim about where the funds are",
+      "exactly where they were" not in _mu[0]
+      and "NOTHING WAS SPENT" not in _mu[0])
+check("withdraw: ...and says it keeps no record of an earlier attempt, "
+      "instead of inviting a retry it cannot vouch for",
+      "no record" in _mu[0].lower()
+      and "check the balance" in _mu[0].lower())
 
 _mn = _drive_out(_res("collected_no_result", ""), "collected_no_result",
                  job="withdraw")
@@ -825,8 +843,22 @@ check("receive_new: does NOT say ready, because nothing the operator asked "
       "for arrived", len(_ma) == 1 and "ready" not in _ma[0].lower())
 check("receive_new: ...says the address is not sent to this chat",
       "NOT sent to this chat" in _ma[0])
-check("receive_new: ...and still carries the handle, which /check does work "
-      "on", "A3F1" in _ma[0] and "/check A3F1" in _ma[0])
+# "WHICH /check DOES WORK ON" WAS THE PART THAT WAS NOT TRUE, and this check
+# asserted it. Both watching jobs refuse a handle whose record carries no swap
+# quote -- gs_wake_agent: "Only a receive_and_quote handle can be watched" --
+# and receive_new records slip=None ALWAYS, because it mints an address and
+# quotes nothing. So every /address label is permanently unwatchable, and the
+# reply sent the operator to find that out by spending a magic packet, a boot,
+# a 5-20 minute jitter and one of twelve daily wake slots. The refusal carries
+# no reason, so the obvious next move is to try it again.
+check("receive_new: ...and still carries the handle, which is what the "
+      "operator matches against the machine", "A3F1" in _ma[0])
+check("receive_new: ...but does NOT send them to /check, which is refused on "
+      "an address label every time, structurally",
+      "/check A3F1" not in _ma[0])
+check("receive_new: ...and says so, rather than leaving them to discover it "
+      "by spending a wake",
+      "watch it from the machine" in _ma[0].lower())
 
 # ONE RETRY ON THE COMPLETION NOTICE, and this is the only notification that a
 # spend finished -- at the end of a job that ran up to sixteen hours and moved
