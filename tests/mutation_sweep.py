@@ -2687,6 +2687,16 @@ MUTATIONS = [
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
+ # The boot deadman powers the vault off if the agent dies. Its OnActiveSec
+ # covers the largest job that does NOT extend it; shrinking it means a vault
+ # that powers off mid-job, and the derivation lives in the test rather than
+ # in a comment nobody rechecks.
+ ("the boot deadman shrinks below the longest job it backstops",
+  "systemd/gs-wake-deadman.timer",
+  "OnActiveSec=9300",
+  "OnActiveSec=3600",
+  ["test_wake_agent"]),
+
  # /cancel had two answers for three states. With a wake in flight and no
  # half-typed wizard it said "nothing to cancel." -- while every other command
  # was being refused with "a wake is already running". The bot told the
