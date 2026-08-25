@@ -843,8 +843,26 @@ printf 'GS_WALLET_PASSWORD=%s\n' 'your-password' > /etc/gs-wake-spend.env
 chmod 0400 /etc/gs-wake-spend.env
 #    then uncomment the EnvironmentFile line in systemd/gs-wake-agent.service
 
-# 3. The vault's monero-wallet-rpc must serve that SPEND-CAPABLE wallet at
-#    boot. A view-only wallet can plan a mix and cannot sign one.
+# 3. THE WALLET-RPC KEEPS SERVING THE VIEW-ONLY WALLET. Do not point it at
+#    the spend wallet -- this step used to say to, and it was wrong in the
+#    way that makes every withdrawal fail.
+#
+#    GhostSpiral's stage-0 refuse_hot_wallet EXITS on a full wallet, before
+#    anything is planned: every round is built as an UNSIGNED transaction and
+#    monero-wallet-rpc only returns an unsigned txset for a WATCH-ONLY wallet.
+#    Serving the spend wallet gets "--rpc-primary is serving a FULL (hot)
+#    wallet, and this pipeline cannot use one" on every single /send.
+#
+#    Section 4 already said this ("monero-wallet-rpc with a view-only wallet")
+#    and this step contradicted it. Nothing is spent when it fires, but a
+#    withdrawal that has never once worked is not a safe failure, it is a
+#    broken feature.
+#
+#    The spend-capable wallet is the FILE named by --wallet-file above.
+#    airgap_tx_signer opens it directly, per round, to sign -- it is never
+#    served by the RPC and the two are different wallets. That is also why the
+#    password goes in the agent unit's EnvironmentFile rather than anywhere
+#    near monero-wallet-rpc.
 
 # 4. The DAEMON, if yours is not on the default port. GhostSpiral reads the
 #    network fee from it and REFUSES the run rather than guessing -- the
@@ -888,8 +906,12 @@ XMR at a typical fee, 1.1% is worth less than the fee to move it, so
 GhostSpiral skips it and the mix goes ahead in full rather than creating a
 permanent on-chain output nobody can spend.
 
-That third line is the whole trade in one sentence: the vault stops being a
-view-only machine. Everything below is what that costs.
+**The trade is the wallet FILE, not the RPC.** The wallet-rpc stays view-only
+— it has to, or stage 0 refuses the run — so the vault keeps every property
+that gave it. What changes is that a spend-capable wallet file and its
+password now live on a machine a pager can wake, and `airgap_tx_signer` opens
+that file, on this box, to sign each round. The air gap that used to be a
+second machine is now a second FILE. Everything below is what that costs.
 
 The password reaches the mix and **nothing else**. `run_child` strips every
 `GS_` variable out of the environment it inherits and puts back only what the

@@ -114,9 +114,25 @@ StandardError=null
 #   psutil              absent -> resource_check raises and the agent refuses
 #                       "no_sentinel" (gs_wake_agent:374)
 #   monero              create_receive_wallet, which every job runs
-# stem, gnupg and yaml are deliberately NOT here: they are guarded or unused on
-# the wake path, and a pre-check stricter than the code would itself be the
-# thing that stops the vault working.
+#   stem                newnym(required=True) SYS.EXITS without it, and
+#                       create_receive_wallet calls exactly that at line 258
+#
+# stem WAS LISTED AS SOFT HERE, under "guarded or unused on the wake path",
+# and it is neither. gs_common.newnym imports stem inside its retry loop, so a
+# missing package is caught as just another rotation failure -- and with
+# required=True the handler is sys.exit. Driven with stem made unimportable:
+#
+#     [!] Tor circuit rotation FAILED after 1 attempts: No module named 'stem'
+#
+# create_receive_wallet runs for BOTH receive_new and receive_and_quote, i.e.
+# every /deposit and every /receive. So on a box without stem this pre-check
+# passed, the agent started, and every deposit died pointing the operator at
+# Tor -- which was working fine.
+#
+# gnupg IS still soft and stays off this list: thor_swap_preparer imports it
+# lazily inside the --gpg-recipient branch, with its own message, and the wake
+# path never passes that flag. yaml is gone from requirements.txt entirely --
+# nothing in the repository imports it.
 #
 # WHY THIS IS WORTH A PRE-CHECK RATHER THAN A COMMENT. Without it the failure
 # is invisible AND destructive: gs_common imports requests at module scope, so
@@ -126,7 +142,7 @@ StandardError=null
 # operator pokes the doorbell, the vault boots, powers off, and NOTHING
 # anywhere says why. This writes the reason into the same 0600 job log the
 # agent already uses, which paranoia_mode wipes with the rest of the run.
-ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, socks, psutil, monero" 2>>/var/lib/ghostspiral/gs_wake_job.log || { echo "gs-wake-agent: a Python dependency is missing or not visible under ProtectHome=yes -- see requirements.txt and the install note in this unit" >>/var/lib/ghostspiral/gs_wake_job.log; exit 1; }'
+ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, socks, psutil, monero, stem" 2>>/var/lib/ghostspiral/gs_wake_job.log || { echo "gs-wake-agent: a Python dependency is missing or not visible under ProtectHome=yes -- see requirements.txt and the install note in this unit" >>/var/lib/ghostspiral/gs_wake_job.log; exit 1; }'
 # THE SPEND PASSWORD, ONLY IF YOU PAIRED WITH --allow-withdraw.
 #
 # Leave this commented out and nothing changes: the withdraw job does not
