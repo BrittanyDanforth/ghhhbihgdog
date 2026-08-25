@@ -1946,6 +1946,31 @@ _cp.handle(_msg(111, 111, "/cancel"))
 _ctext = "\n".join(t for t, _b in _cs)
 check("abandon: /cancel says it once, in its own words, not twice",
       "dropped the" not in _ctext and "cancelled" in _ctext.lower())
+# THE SAME COMMAND AGAIN IS A RESTART, NOT AN INTERRUPTION. "That dropped the
+# /deposit you were part-way through", printed immediately before re-asking
+# "How much?", reads as an error report about the thing the operator just
+# deliberately did -- they typed it again BECAUSE they wanted to start over.
+for _c1, _c2, _lbl in (("/deposit", "/deposit", "the same command"),
+                       ("/deposit", "/depo", "an alias of it"),
+                       ("/withdraw", "/send", "the withdraw alias")):
+    _rp, _rs, _, _ = _tapper()
+    _rp.handle(_msg(111, 111, _c1))
+    _rs.clear()
+    _rp.handle(_msg(111, 111, _c2))
+    check(f"abandon: {_c1} then {_lbl} says it is starting over, not that "
+          f"something was dropped",
+          _rs[0][0] == "(starting that over.)")
+    check(f"abandon: ...and the wizard really did restart",
+          _rp.convos.get(111) is not None)
+# ...AND A DIFFERENT COMMAND STILL GETS THE DROP NOTICE, so this is a branch
+# and not a way of making the notice disappear.
+_xp, _xs, _, _ = _tapper()
+_xp.handle(_msg(111, 111, "/deposit"))
+_xs.clear()
+_xp.handle(_msg(111, 111, "/withdraw"))
+check("abandon: NON-VACUITY -- a DIFFERENT wizard still says what it dropped",
+      "dropped the /deposit" in _xs[0][0])
+
 # AND NO SPURIOUS NOTICE when there was nothing to drop.
 _np, _ns, _, _ = _tapper()
 _np.handle(_msg(111, 111, "/status"))

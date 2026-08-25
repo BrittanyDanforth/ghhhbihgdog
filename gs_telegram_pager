@@ -1268,7 +1268,11 @@ class Pager:
         lines.append("Set on the machine, with physical access:")
         lines.append("  whether sending out is allowed at all")
         lines.append("  the real allowance, and the ceiling on new addresses")
-        lines.append("  where the usage fee goes, if anywhere fixed")
+        # "IF ANYWHERE FIXED" WAS TRUE OF A DIFFERENT ARRANGEMENT. It read as
+        # an optional refinement -- name a destination or one is minted for
+        # you. On this path there is no minting: the destinations paired on the
+        # machine are what decides whether a fee is taken at all.
+        lines.append("  whether a usage fee is taken, and where it goes")
         lines.append("")
         lines.append("Fixed in the software, the same for everyone:")
         lines.append("  the delay between hops")
@@ -1432,7 +1436,15 @@ class Pager:
             # written and then disagreed with the first one.
             _kind = c.kind
             del self.convos[chat_id]
-            if parse_command(text)[2] != "cancel":
+            _route = parse_command(text)[2]
+            # THE SAME COMMAND AGAIN IS A RESTART, NOT AN INTERRUPTION, and
+            # saying "that dropped the /deposit you were part-way through"
+            # immediately before re-asking "How much?" reads as an error
+            # report about the thing the operator just deliberately did. They
+            # typed it again because they wanted to start over. Say that.
+            if _route == f"{'depo' if _kind == 'depo' else 'withdraw'}_wizard":
+                self.send(chat_id, "(starting that over.)")
+            elif _route != "cancel":
                 self.send(chat_id,
                           f"(that dropped the "
                           f"{'/deposit' if _kind == 'depo' else '/withdraw'} "
