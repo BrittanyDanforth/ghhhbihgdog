@@ -229,13 +229,31 @@ BOT_COMMANDS = [
     ("start", "what this is, and what it will not do"),
     ("deposit", "MONEY IN — send Bitcoin, get an address and a memo"),
     ("address", "MONEY IN — a Monero address to be paid directly, no swap"),
-    ("withdraw", "MONEY OUT — mix what is here and send it to you"),
+    # "MIX WHAT IS HERE" NAMES MORE THAN THE JOB DOES. _funded_entry takes
+    # the LARGEST SINGLE unlocked output and never sums -- summing would spend
+    # inputs from several subaddresses in one transaction, which is permanent
+    # public proof they share an owner. So a withdrawal moves ONE arrival, and
+    # an operator with money in three places reads "what is here", gets a
+    # third of it, and has no reason to look for the rest.
+    ("withdraw", "MONEY OUT — mix ONE arrival and send it to you"),
     ("status", "can I start one right now"),
     # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
     # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
     # so "3 min" would be a figure they never once observe.
-    ("check", "has my payment arrived yet (10-25 min)"),
-    ("wait", "wait for it to arrive (up to 2h)"),
+    # THE ARGUMENT IS NAMED, AND THE TIMES ARE GONE.
+    #
+    # Both are published as bare words, and both refuse without a 4-hex label
+    # ("handle must be 4 hex characters") -- a word the chat never uses
+    # anywhere else, about an argument the menu never mentioned. The label IS
+    # in the reply that minted it, so the example is what connects the two.
+    #
+    # AND THE DURATIONS CONTRADICTED THE BOT ONE TAP LATER. These were typed
+    # here; start_job computes the real hold from result_budget_s plus the
+    # doorbell's own two windows and says it on every run. Two numbers for one
+    # wait, and the typed pair was the wrong one -- so it is not restated
+    # here, where it cannot be derived.
+    ("check", "has my payment arrived yet — /check A3F1"),
+    ("wait", "wait for it to arrive — /wait A3F1"),
     ("settings", "what this will do, and where each part is decided"),
     # THE THREE ANSWERS THAT WERE UNREACHABLE IN PRACTICE. /fee, /speed and
     # /exit have always been handled in parse_command and have always had
@@ -450,7 +468,41 @@ FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Not the network fee."
 #: how that drift happens.
 BUSY_ANSWER = ("no: something is already running. One at a time — wait for it "
                "to report, then try again.")
-SPEED_ANSWER = "Not settable here."
+#: "Not settable here." IS THE STRING EXIT_ANSWER WAS FIXED FOR, left standing
+#: one line below the fix. That note says an answer naming no alternative
+#: "reads as a refusal to say rather than a fact about the design", and speed
+#: IS settable -- the depth menu is the control, it is offered on every
+#: /withdraw, and fewer hops is the faster option. Pointing at it costs
+#: nothing this file is trying to save: the depths are a table in a public
+#: repository, identical on every install, and /settings already lists them.
+#: THE DOORBELL'S EVENTS, AS SENTENCES, IN A CLOSED SET.
+#:
+#: gs_doorbell records what happened on the switch and _report_events prints
+#: the ones that matter -- to a terminal. The pager read pending.outcome() and
+#: pending.result and nothing else, so the operator whose only surface is a
+#: chat never learned any of it.
+#:
+#: TWO OF THEM, not all of them. The rest are bookkeeping ("m1_retry",
+#: "result_bad" -- any host on the LAN can post noise and land in that count).
+#: These two change what the operator should DO, which is the bar for a
+#: permanent line in a transcript.
+#:
+#: A DICT KEYED ON A FIXED TUPLE, so the vault cannot put text in a chat: this
+#: box renders its own sentence for a word the doorbell chose from a set it
+#: also fixes. Same rule as PHASE_LINES.
+EVENT_VOCAB = ("m1_second_ephemeral", "result_refused")
+EVENT_LINES = {
+    "m1_second_ephemeral":
+        "A second signed request for this job arrived from somewhere else. "
+        "It may have gone to the wrong place, in which case nothing ran. "
+        "Check before assuming either way.",
+    "result_refused":
+        "An answer came back for this job and was refused — it named the "
+        "wrong job, or arrived after one was already in. Treat what follows "
+        "as incomplete.",
+}
+
+SPEED_ANSWER = "Fewer hops is faster — see /withdraw."
 # WAS "Not settable here." AND THAT IS NO LONGER TRUE. /withdraw sets it, by
 # reply, per withdrawal. An answer that still said "not settable" would be the
 # tool lying about its own capability on the one surface the operator asks.
@@ -552,8 +604,8 @@ WELCOME_LINES = [
     "it with.",
     "",
     "MONEY OUT",
-    "  /withdraw  this is the one that pays YOU. It mixes what is here and "
-    "sends it to the addresses you give it.",
+    "  /withdraw  the one that pays YOU. It mixes ONE arrival — the largest "
+    "— and sends it where you say. Money that came in twice is two of these.",
     "",
     "WHAT IT COSTS",
     f"  USAGE FEE {USAGE_FEE_LABEL} — that is what this service keeps, and "
@@ -1269,8 +1321,21 @@ class Pager:
         lines.append("")
         lines.append("Counted here (the machine keeps its own, and its is the "
                      "real one):")
-        lines.append(f"  daily allowance {self.limits.daily_cap} a day, "
-                     f"{len(self.limits.recent())} used")
+        # THE CAP, NOT THE RUNNING TOTAL. This printed "N a day, M used", and
+        # the /status branch was deliberately rewritten to stop doing exactly
+        # that, with the reason recorded there: "The count is how many deposits
+        # were started today ... Both sat permanently in the transcript, on a
+        # command that exists to answer 'can I send one'."
+        #
+        # It is worse here. /settings is one tap from almost every message this
+        # bot sends -- it is the "What a run does" button, attached to the
+        # welcome, /help, /status and every job outcome -- and it is not rate
+        # limited. Read off successive messages the count is a timeline of
+        # activity, and with --burn-after on it reconstructs what was deleted.
+        #
+        # Nothing is lost: why_not() already tells the operator whether they
+        # are blocked, at the moment they are blocked, without a total.
+        lines.append(f"  daily allowance {self.limits.daily_cap} a day")
         lines.append("")
         # ONLY WHAT IS ACTUALLY THERE. This block used to read "Set on the
         # machine, not here: hop delay, and the depth ceiling" and two thirds
@@ -1743,7 +1808,23 @@ class Pager:
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
     def send(self, chat_id: int, text: str, buttons=None) -> bool:
-        """One reply. Never carries a plaintext address, memo or amount.
+        """One reply. What it may carry is CONFIGURATION, not a law.
+
+        This said "Never carries a plaintext address, memo or amount", and
+        that is the sentence most likely to talk the next reader out of
+        noticing a new leak. It is false three ways, all deliberate:
+
+          * the /deposit confirm echoes the BTC figure the operator typed, in
+            every configuration -- that trade is argued at _amount_question;
+          * with `plain_slip` set on the vault's keyfile, plain_lines puts the
+            deposit address, the amount and the ThorChain memo (which names
+            the destination XMR address in full) into two messages;
+          * /withdraw carries the destinations the operator replies with, and
+            the confirm names the depth and the arrival count.
+
+        What is true BY DEFAULT is narrower and is the actual property: with
+        no delivery key and no plain_slip, the most this says about a finished
+        deposit is "depo ready · slip A3F1".
 
         `buttons` is rows of (label, callback_data) and is OPTIONAL EVERYWHERE.
         A tap is a second way to send text this bot already accepts -- see
@@ -2048,6 +2129,30 @@ class Pager:
             self.send(chat_id, f"{chat_name(job)}: failed to start — {_redact(e)[:160]}")
             return
         out = pending.outcome()
+        # WHAT HAPPENED ON THE SWITCH, WHICH THIS SURFACE NEVER SAW.
+        #
+        # gs_doorbell collects `events` and _report_events prints the two that
+        # change what the operator should believe -- under a docstring saying
+        # `events` "was collected and never read by anything ... and worse
+        # here, because the one event that means 'your job did not go where
+        # you think' was among the ones being thrown away."
+        #
+        # That was fixed for the CLI and left unfixed for the surface the whole
+        # feature exists for. Driven: a replayed M1 collects, the real vault's
+        # M1 is refused, events are ['job_collected', 'm1_second_ephemeral'] --
+        # the CLI prints "the job went to a boot that cannot read it, and
+        # nothing ran", and the chat gets "I do NOT know whether the funds
+        # moved", forbidding the retry that is in fact the right move.
+        #
+        # A CLOSED VOCABULARY, in PHASE_LINES' style: this box renders words
+        # the doorbell chose from a fixed set, so the vault gains no free-text
+        # channel into a chat. Sent BEFORE the outcome branch, because it
+        # changes how that outcome should be read.
+        _ev = getattr(pending, "events", None) or []
+        _notes = [EVENT_LINES[_e] for _e in EVENT_VOCAB if _e in _ev]
+        if _notes:
+            integrity_log("pager", "event_reported")
+            self.send(chat_id, "\n".join(_notes))
         # BOOKKEEPING MUST NOT PRE-EMPT THE REPORT. integrity_log re-raises an
         # OSError, and this line sits above every reply branch -- so a full or
         # read-only SD card turned "your withdrawal finished" into silence.
@@ -2965,7 +3070,23 @@ class Pager:
             # when --no-jitter says it will not happen. Rounded up to whole
             # hours past an hour: they need the order of magnitude, and
             # "16.75h" reads like a precision this cannot honour.
-            _hold = proto.result_budget_s(job)
+            # THREE TERMS, AND IT COUNTED TWO. The comment above says the
+            # figure cannot drift from the window actually held; the window
+            # actually held is PRE_WOL_MAX_S, then the doorbell's FETCH_WINDOW_S
+            # while it waits to be collected, and only THEN result_budget_s
+            # from collected_at. Pending.finished() is false while fetch_open()
+            # holds, so the three are strictly sequential.
+            #
+            # The fetch window is unconditional -- arm() runs on the
+            # magic-packet path whether or not the jitter does -- so it is
+            # added outside the --no-jitter test. Hour-rounding hid it on the
+            # three long jobs and not on the short ones: /deposit was quoted 50
+            # minutes against a real 60, /check 40 against 50. What the
+            # operator does in that gap is send another command, and get "no:
+            # something is already running" -- the exact experience this
+            # message was added to prevent.
+            _hold = (proto.result_budget_s(job)
+                     + getattr(doorbell(), "FETCH_WINDOW_S", 0))
             if not getattr(self.args, "no_jitter", False):
                 _hold += getattr(doorbell(), "PRE_WOL_MAX_S", 0)
             _how = (f"up to {_hold // 3600 + 1}h" if _hold >= 3600

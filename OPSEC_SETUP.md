@@ -728,9 +728,20 @@ pocket-dial — and a tap is a pocket-dial.
    rung is that amount only if it happened to be foreseen at pairing time.
    Every other time it quoted a number that was not the number. The figure is
    a Bitcoin transaction and is public on two chains before the mix even
-   starts; the pager deletes the operator's own messages; and the thing the Pi
+   starts; the pager deletes the operator's own messages **when
+   `--burn-after` is set, which it is not by default**; and the thing the Pi
    still cannot do — name the destination subaddress, which is minted inside
    the job on the vault — was always the half that mattered.
+
+   That middle clause used to be stated flatly, and it is the one of the three
+   that is a setting rather than a fact. `--burn-after` defaults to 0, and the
+   unit example's `--burn-after 3600` sits inside a fully commented-out
+   `ExecStart`, so deletion is opt-in twice over. `welcome_text` already
+   handles this correctly in code — it appends the deletion sentence only when
+   the setting is on, because "a welcome that promises deletion on an install
+   that does not delete is the kind of confident false statement this repo
+   keeps removing." The same default silently weakens `/withdraw`, where the
+   operator types full Monero destinations into the chat.
 
    `/deposit` asks the amount and then confirms, because the one command that
    spends a wake and quotes real money should not be a single keystroke. The
@@ -1200,7 +1211,11 @@ effort on the swap and the phone.
 - [ ] `am.i.mullvad.net` is connected **before** Tor starts
 - [ ] ThinkPad `curl` to anything with Tor down **fails**
 - [ ] `gs_console` still only on `127.0.0.1`
-- [ ] `find` on the Pi SD: no `wallet`, no `thor_pairs`, no `.keys`
+- [ ] `find` on the Pi SD: no `wallet`, no `thor_pairs`, no `.keys` — **and
+      check what the pager leaves**: `pager_state.json` (a dated record of
+      every wake), `integrity_chain.log` (append-only, never rotated) and
+      `pager.log`. `paranoia_mode`'s search roots do not reach `/var/lib/gs`
+      from a shell; run it from there (§8)
 - [ ] Spend USB not in the ThinkPad
 - [ ] Router: no port forwards, especially UDP 9
 - [ ] Throwaway Telegram, not the account with your face
@@ -1353,9 +1368,23 @@ rotation.
 
 The trigger INTO the Pi is now shipped — `gs_telegram_pager` — under the
 constraint this paragraph has always stated. Do not “just run a Telegram bot”
-that prints the memo: that throws away the only reason to have a Pi. The pager
-therefore has no word for an address, a memo, a slip or an amount. The most it
-ever says is `depo ready · slip A3F1`, which is step 5 below.
+that prints the memo: that throws away the only reason to have a Pi.
+
+**By default** the pager names no address, no memo and no slip contents: the
+most it says about a finished deposit is `depo ready · slip A3F1`, which is
+step 5 below. Three things qualify that, and this paragraph used to state the
+rule without them — which is the sentence most likely to talk the next reader
+out of noticing a new leak:
+
+- the BTC figure you type at `/deposit` is echoed back to you for
+  confirmation, in every configuration (see §5 above for why that trade was
+  made);
+- with `plain_slip` set on the vault's keyfile, the deposit address, the
+  amount and the ThorChain memo — which names the destination XMR address in
+  full — are sent to the chat deliberately. That is the whole point of that
+  setting, and §8's "If you have only a phone" argues the cost properly;
+- `/withdraw` carries the destinations you reply with, and the confirm names
+  the mixing depth and the arrival count.
 
 Do not have a chat id yet? You cannot get one out of this bot by asking it —
 an unallowlisted chat is ignored in silence, on purpose, because a reply
@@ -1561,7 +1590,25 @@ way to watch it would be `--any` — which stops on **any** balance, so a
 piconero of dust from anyone holding the address would page you that
 your money had landed.
 
-Pi-side artifacts are **not** covered by `paranoia_mode`: it sweeps the
-host it runs on, and nothing in this repo runs on the Pi except
-`gs_doorbell`. The doorbell persists nothing — its only file is the
-keyfile.
+Pi-side artifacts are **not** covered by `paranoia_mode` by default, and
+there is more on the Pi than this used to say. Two things from this repo run
+there: `gs_doorbell`, which persists nothing but the keyfile, and
+**`gs_telegram_pager`**, which persists three files:
+
+| file | what it holds |
+|---|---|
+| `pager_state.json` | up to 200 wake timestamps in 5-minute buckets, plus the last one. `gs_common`'s own wipe-list calls this "a dated record of every time you woke the vault from a phone — which is exactly the correlation the jitters exist to break". |
+| `integrity_chain.log` | append-only, never rotated: `poke:<job>`, `collected:<job>`, `outcome:<job>:<out>`, `burn_signal`, `messages_burned`, `start`. |
+| `pager.log` | whatever the unit's `ExecStartPre` writes, plus anything you redirect there. |
+
+`paranoia_mode`'s search roots are the working directory, `$HOME`, and
+`$HOME/ghostspiral`, at depth 0–1. `/var/lib/gs` is in none of them from an
+operator's shell — so the wipe-list entry gives the appearance of coverage the
+roots do not deliver. **Run it from the directory that holds them:**
+
+```bash
+cd /var/lib/gs && python3 /opt/gs/paranoia_mode      # on the Pi
+```
+
+That is the same run-from-the-artifact-directory form the vault's own unit
+uses (`WorkingDirectory=/var/lib/ghostspiral`), and for the same reason.

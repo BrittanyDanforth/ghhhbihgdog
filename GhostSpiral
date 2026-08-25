@@ -318,6 +318,14 @@ USAGE_FEE_PCT = Decimal("0.011")
 #: is far above any real fee and far below anything that breaks the arithmetic.
 USAGE_FEE_PCT_MAX = Decimal("0.25")
 
+#: The other end of the band, and it exists because "> 0" admits denormals.
+#: See _check_fee_pct: a rate this small quantizes the cut to zero, takes the
+#: waiver path, and makes mix_minimum_xmr raise on a division it cannot
+#: represent -- after the swap has settled. A Monero atomic unit is 1e-12 XMR,
+#: so anything under this cannot become an output at any balance this tool
+#: will mix, whatever the operator meant by it.
+USAGE_FEE_PCT_MIN = Decimal("0.000001")
+
 # FALLBACK FEE, and the old value here was not conservative -- it was 48x LOW.
 #
 # It was Decimal("0.00005") with the comment "conservative estimate for typical
@@ -6097,6 +6105,35 @@ def resolve_usage_fee(args) -> None:
     _pct_given = env_or_argv("GS_USAGE_FEE_PCT",
                              getattr(args, "usage_fee_pct", None),
                              "The usage-fee fraction")
+    # VALIDATED ONCE, HERE, BEFORE EITHER ASSIGNMENT SITE.
+    #
+    # THE PREFERRED CHANNEL WAS THE UNVALIDATED ONE, which is the exact defect
+    # decimal_env's own docstring was written for and this variable was added
+    # after it. --usage-fee-pct is type=decimal_arg; GS_USAGE_FEE_PCT went
+    # straight into Decimal(str(...)) twice below. OPSEC_SETUP lists it among
+    # the values that must travel by environment, so the channel the document
+    # recommends is the one with no gate on it.
+    #
+    # Two things get through:
+    #
+    #   * "1.1%" -- the natural typo, since the help and the docs both write
+    #     the rate as "0.011 = 1.1%" -- raises a raw decimal.InvalidOperation
+    #     out of the middle of parse time.
+    #   * "1e-400" is ACCEPTED as Decimal('1E-400'), passes _check_fee_pct
+    #     (0 < p <= 0.25), quantizes the cut to zero and takes the WAIVER
+    #     path -- whose message calls mix_minimum_xmr(usage_pct=1E-400), and
+    #     the (hop_fee_reserve + DUST_XMR)/usage_pct term in there is ~3.7E+397
+    #     and cannot be quantized in a 28-digit context. Driven: it raises.
+    #     That crash lands AFTER stage4_await_swap, i.e. after the BTC is
+    #     gone, which is the one outcome the waive-rather-than-abort design
+    #     exists to prevent.
+    #
+    # Bounding it here closes the traceback, NaN/Infinity, and the
+    # denormal-to-zero case in one place, on the value both branches read.
+    if _pct_given is not None:
+        _pct_given = decimal_env("GS_USAGE_FEE_PCT", _pct_given,
+                                 positive=True,
+                                 max_value=USAGE_FEE_PCT_MAX)
     _addr = env_or_argv("GS_USAGE_FEE_ADDRESS",
                         getattr(args, "usage_fee_address", None),
                         "The usage-fee destination")
@@ -6201,6 +6238,29 @@ def _check_fee_pct(args) -> None:
     if _p <= 0:
         sys.exit(f"[!] --usage-fee-pct must be positive (got {_p}). A zero fee "
                  f"is the default already -- leave --usage-fee off.")
+    # A FLOOR AS WELL AS A CEILING, and the floor is the half that crashed.
+    #
+    # "> 0" admits denormals. Decimal("1e-400") is positive, is under the
+    # ceiling, and quantizes the cut to zero -- so the run takes the WAIVER
+    # path, whose own message calls mix_minimum_xmr(usage_pct=1E-400). The
+    # (hop_fee_reserve + DUST_XMR)/usage_pct term in there is about 3.7E+397
+    # and cannot be quantized in a 28-digit context, so it raises
+    # decimal.InvalidOperation -- AFTER stage4_await_swap, i.e. after the BTC
+    # has gone. That is precisely the outcome the waive-rather-than-abort
+    # design exists to prevent, reached through the rate rather than the
+    # balance.
+    #
+    # USAGE_FEE_PCT_MIN IS ABOUT REPRESENTABILITY, not policy. A monero atomic
+    # unit is 1e-12 XMR, so below this a cut is not a small fee -- it is a
+    # number that cannot become an output at any balance this tool will mix.
+    if _p < USAGE_FEE_PCT_MIN:
+        sys.exit(
+            f"[!] --usage-fee-pct {_p} is below the floor of "
+            f"{USAGE_FEE_PCT_MIN}.\n"
+            f"    That is not a small fee, it is a fee that cannot become an "
+            f"output: a Monero\n"
+            f"    atomic unit is 1e-12 XMR. Leave --usage-fee off to take "
+            f"nothing.")
     if _p > USAGE_FEE_PCT_MAX:
         sys.exit(
             f"[!] --usage-fee-pct {_p} is above the ceiling of "

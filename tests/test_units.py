@@ -2564,10 +2564,43 @@ for _bad, _why in [({"address": "8" + "Z" * 94}, "missing index"),
         _raised = True
     check(f"a create_address response with a {_why} raises, never defaults", _raised)
 
-# explicit 0 IS valid and must be accepted (account 0's first subaddress)
+# ...AND 0 IS REFUSED TOO, WHICH THIS FILE USED TO ASSERT THE OPPOSITE OF.
+#
+# The old check read "address_index 0 is accepted (it is a real index, not
+# 'missing')", and that conflates two different questions. 0 IS a real index
+# to READ -- get_subaddress_balance below is asked about it legitimately. It
+# is not a possible answer to CREATE_ADDRESS, which is the only thing this
+# method calls: subaddress 0 of an account is created WITH the account, so a
+# freshly created subaddress is never 0. create_fresh_account one function
+# away already refuses the analogous zero, with the same argument.
+#
+# And the comment four lines above states the harm this file then accepted:
+# "polling index 0 of a fresh account watches its CHANGE SINK, which would
+# report the wrong money." A receive bundle naming index 0 puts the address
+# the swap memo publishes and the address the run's change comes to rest on in
+# the same place -- the convergence the fresh-account-per-receive rule exists
+# to prevent, with the aggregator already holding that address in plaintext.
+# Nothing downstream catches it: get_address(account, [0]) resolves and
+# validate_address reports subaddress: true, so the tool prints "Address
+# verified" over it.
 _ok0 = _rpc_with({"address": "8" + "Q" * 94, "address_index": 0})
-check("address_index 0 is accepted (it is a real index, not 'missing')",
-      _ok0.new_subaddress_indexed(account_index=0)[1] == 0)
+_zero_raised = False
+try:
+    _ok0.new_subaddress_indexed(account_index=0)
+except RuntimeError:
+    _zero_raised = True
+check("a create_address response naming index 0 raises: index 0 is created "
+      "with the account, so a NEW subaddress is never 0", _zero_raised)
+check("...and the refusal names why it is the harmful one, not merely the "
+      "unexpected one",
+      "change sink" in open(os.path.join(REPO, "gs_common.py"),
+                            encoding="utf-8").read()
+      .split("def new_subaddress_indexed")[1].split("\n    def ")[0])
+# NON-VACUITY: a normal index still comes back, so this refuses one value and
+# not the method.
+check("NON-VACUITY -- a create_address response naming index 1 is accepted",
+      _rpc_with({"address": "8" + "Q" * 94, "address_index": 1})
+      .new_subaddress_indexed(account_index=0)[1] == 1)
 
 
 # ---------------------------------------------------------------------------

@@ -394,6 +394,27 @@ class Pending:
         #: they did not already have. What it must not do is happen SILENTLY,
         #: which is why `report()` prints the event.
         self._issued = {}
+        #: THE AT-MOST-ONCE CLAIM WAS A CHECK-THEN-ACT ON A THREADED SERVER.
+        #:
+        #: on_m1 tests `if self._issued:`, then seals an M2, then inserts. The
+        #: server is a ThreadingHTTPServer, and PyNaCl's cffi releases the GIL
+        #: across the seal -- so two authenticated M1s from two different
+        #: boots, posted together, both passed the emptiness test and both got
+        #: a valid note for the same job. Driven: 26 of 30 trials handed the
+        #: job to both. `m1_second_ephemeral` is not recorded in that
+        #: interleaving either, so even the CLI warning does not print.
+        #:
+        #: The honest bound is that this is rare -- a replayed M1's M2 is
+        #: sealed to a dead ephemeral, so real harm needs two GENUINE boots.
+        #: But the comment below states an invariant ("Queue depth is one"),
+        #: and an invariant that holds only when the scheduler cooperates is
+        #: not one.
+        #:
+        #: HELD ACROSS THE WHOLE READ-MODIFY-WRITE, seal included. The seal is
+        #: microseconds and a handover that is at-most-once by definition has
+        #: nothing to parallelise; the same lock serialises on_m3, whose
+        #: "already reported a result" test has the identical shape.
+        self._lock = threading.Lock()
         #: THIS WINDOW, AND ONLY THIS ONE. 32 fresh bytes the vault must echo
         #: in M1, fetched from /window before it seals anything.
         #:
@@ -493,26 +514,31 @@ class Pending:
         if not hmac.compare_digest(_window, self.window):
             self.events.append("m1_stale_window")
             raise Doorbell("that note was written for a different wake window")
-        cached = self._issued.get((eph, chal))
-        if cached is not None:
-            self.events.append("m1_retry")
-            return cached
-        if not self.fetch_open():
-            raise Doorbell("fetch window closed")
-        if self._issued:
-            # A DIFFERENT authenticated ephemeral after one was already served.
-            # Queue depth is one: the second boot gets nothing rather than a
-            # second copy of the job.
-            self.events.append("m1_second_ephemeral")
-            raise Doorbell("job already handed over to a different boot")
-        m2 = proto.seal(
-            pi_sk, nacl.public.PublicKey(eph), proto.TAG_M2,
-            {"job_id": self.job_id, "challenge": chal.hex(),
-             "job": self.job, **self.params})
-        self._issued[(eph, chal)] = m2
-        self.collected_at = self.clock()
-        self.events.append("job_collected")
-        return m2
+        # EVERYTHING FROM THE CACHE LOOKUP TO THE INSERT, UNDER ONE LOCK. See
+        # _lock: the test, the seal and the insert were three separate steps on
+        # a threading server, so two boots could both be told the job was
+        # theirs.
+        with self._lock:
+            cached = self._issued.get((eph, chal))
+            if cached is not None:
+                self.events.append("m1_retry")
+                return cached
+            if not self.fetch_open():
+                raise Doorbell("fetch window closed")
+            if self._issued:
+                # A DIFFERENT authenticated ephemeral after one was already
+                # served. Queue depth is one: the second boot gets nothing
+                # rather than a second copy of the job.
+                self.events.append("m1_second_ephemeral")
+                raise Doorbell("job already handed over to a different boot")
+            m2 = proto.seal(
+                pi_sk, nacl.public.PublicKey(eph), proto.TAG_M2,
+                {"job_id": self.job_id, "challenge": chal.hex(),
+                 "job": self.job, **self.params})
+            self._issued[(eph, chal)] = m2
+            self.collected_at = self.clock()
+            self.events.append("job_collected")
+            return m2
 
     def on_m3(self, record: bytes) -> None:
         import nacl.public
@@ -526,132 +552,138 @@ class Pending:
         # attacker path -- it is a buggy or double-booted vault making the
         # doorbell's report nondeterministic, which is the same class of defect
         # as a message that contradicts what happened.
-        if self.result is not None:
-            raise Doorbell("this job already reported a result")
-        if proto.job_id_of(body) != self.job_id:
-            raise Doorbell("result names a different job")
-        # AN EXACT KEY SET, so a HALF-UPGRADED PAIR FAILS LOUDLY.
-        #
-        # gs_wake_proto's header promises that a version mismatch is caught on
-        # LENGTH, before any crypto, and is "loud, immediate and impossible to
-        # misread". That is true of a PAD_BLOCK change and was not true of a
-        # field addition: every field here was read with .get() and no key set
-        # was enforced, while WIRE_VERSION is declared and never read by
-        # anything. So a vault upgraded ahead of its Pi would send deposit
-        # instructions, this box would silently drop them, and the operator
-        # would be told "read the address and memo on the vault" with no error
-        # recorded anywhere -- the exact silent partial upgrade the header says
-        # is the one outcome worth ruling out.
-        #
-        # validate_job already enforces an exact key set on M2. This is the
-        # same rule on the record going the other way.
-        _want = {"job_id", "challenge", "status", "handle", "slip", "plain",
-                 "phase"}
-        if set(body) != _want:
-            missing, extra = sorted(_want - set(body)), sorted(set(body) - _want)
-            raise Doorbell(
-                f"result does not match this protocol version "
-                f"(missing {missing}, unexpected {extra}). The vault and this "
-                f"Pi are running different versions of gs_wake_proto: update "
-                f"both, in the same sitting.")
-        status = body.get("status")
-        if status not in ("done", "refused", "failed"):
-            raise Doorbell("result carries no usable status")
-        handle = body.get("handle", "")
-        if not isinstance(handle, str):
-            raise Doorbell("result handle is not a string")
-        # A 95-character "handle" is an address wearing a hat.
-        #
-        # THIS USED TO BE THE SECOND OF TWO DEFENCES AND IT IS NOW THE ONLY
-        # ONE. The comment here said the wire format already refused a long
-        # handle because an M3 that size would not fit the single padded
-        # block -- true when PAD_BLOCK was 256 and MAX_INNER 255. PAD_BLOCK is
-        # 1024 now (gs_wake_proto, "THE SEALED SLIP"), and a 95-character
-        # handle fits an M3 with room to spare. The backstop the sentence was
-        # counting on is gone, so this check is load-bearing on its own.
-        #
-        # EMPTY IS ONLY LEGAL WHEN THERE IS NOTHING TO NAME. The first version
-        # read `if handle and not HANDLE_RE.match(...)`, so an empty string
-        # skipped the check entirely and a "done" with no handle was recorded
-        # as success the operator could not act on -- they are told the job
-        # finished and given nothing to look up. Refused and failed jobs
-        # genuinely have no handle, so those may be empty and only those.
-        if status == "done":
-            if not proto.HANDLE_RE.match(handle):
-                raise Doorbell("a completed job must name its 4-character "
-                               "handle; without one the operator is told it "
-                               "worked and given nothing to find")
-        elif handle and not proto.HANDLE_RE.match(handle):
-            raise Doorbell("result handle is not a 4-character label")
-        # THE SEALED SLIP, WHICH THIS BOX CANNOT READ AND MUST NOT TRY TO.
-        #
-        # The Pi has no delivery key -- that is the whole design -- so the only
-        # honest check available here is SHAPE, and shape is checked strictly
-        # rather than waved through: exactly SLIP_B64_LEN characters that
-        # base64-decode to exactly one padded box. Anything else is refused
-        # outright instead of being relayed onward, because the operator's next
-        # move after receiving a slip is to send Bitcoin, and a mangled blob
-        # must fail HERE, on the vault's own channel, and not later in a chat
-        # window where the failure looks like the vault's fault.
-        #
-        # A blob of the right shape is still opaque: it is carried, logged as
-        # present, and never parsed. gs_doorbell holds no key that opens it.
-        slip = body.get("slip", "")
-        # A TYPE CHECK BEFORE THE TRUTHINESS ONE. `if slip and not
-        # wellformed(slip)` reads as a complete gate and is not: 0, [] and {}
-        # are all falsy, so each would skip validation entirely and be stored
-        # as this job's slip. Nothing downstream would crash -- the pager does
-        # `res.get("slip") or ""` -- which is exactly what makes it worth
-        # closing here rather than discovering it as a silently missing slip.
-        if not isinstance(slip, str):
-            raise Doorbell("result's slip field is not text")
-        if slip and not proto.slip_is_wellformed(slip):
-            raise Doorbell("result carries something in the slip field that is "
-                           "not a sealed slip")
-        if slip and status != "done":
-            # A refused or failed job has nothing to deliver. A slip attached
-            # to one is the vault contradicting itself.
-            raise Doorbell("a job that did not finish cannot carry a slip")
-        # THE PLAINTEXT SLIP. This box CAN read this one, and that is the whole
-        # cost of the mode -- see gs_wake_proto's "THE PLAINTEXT SLIP".
-        #
-        # It is still checked strictly rather than forwarded on trust, because
-        # the next hop is a chat message a human copies into a wallet: an EXACT
-        # key set (a field this Pi has never heard of must not reach Telegram
-        # unexamined), strings only, bounded, and no control characters, which
-        # would forge a line of the block being copied.
-        plain = body.get("plain", {})
-        if not isinstance(plain, dict):
-            raise Doorbell("result's plain field is not an object")
-        if plain and not proto.plain_slip_is_wellformed(plain):
-            raise Doorbell("result carries something in the plain field that "
-                           "is not a set of deposit instructions")
-        if plain and status != "done":
-            raise Doorbell("a job that did not finish cannot carry deposit "
-                           "instructions")
-        # ONE PAYLOAD, NEVER TWO. Sealed and plaintext are two answers to one
-        # question; an M3 carrying both would put the payload in the transcript
-        # AND in a blob, doubling the exposure for a single delivery. The vault
-        # refuses this at keyfile load; this is the second, independent place.
-        if slip and plain:
-            raise Doorbell("result carries BOTH a sealed and a plaintext slip")
-        # THE STATUS WORD, against a CLOSED SET.
-        #
-        # A membership test, never a substring or a length check: this word is
-        # rendered into a sentence the operator acts on, so an unknown word
-        # must be refused rather than passed through as itself. It is also what
-        # stops the vault gaining a free-text channel into a chat.
-        phase = body.get("phase", "")
-        if not proto.phase_is_known(phase):
-            raise Doorbell("result carries a status word this protocol has no "
-                           "meaning for")
-        self.result = {"status": status, "handle": handle, "slip": slip,
-                       "plain": plain, "phase": phase}
-        self.events.append("result_ok")
-        if slip:
-            self.events.append("slip_carried")
-        if plain:
-            self.events.append("plain_carried")
+        # THE SAME READ-MODIFY-WRITE, THE SAME LOCK. "already reported a
+        # result" is tested here and `self.result` is assigned at the bottom,
+        # with a full record validation in between -- so two M3s arriving
+        # together could both pass the test and the second would overwrite the
+        # first, which is the very defect the comment above says was fixed.
+        with self._lock:
+            if self.result is not None:
+                raise Doorbell("this job already reported a result")
+            if proto.job_id_of(body) != self.job_id:
+                raise Doorbell("result names a different job")
+            # AN EXACT KEY SET, so a HALF-UPGRADED PAIR FAILS LOUDLY.
+            #
+            # gs_wake_proto's header promises that a version mismatch is caught on
+            # LENGTH, before any crypto, and is "loud, immediate and impossible to
+            # misread". That is true of a PAD_BLOCK change and was not true of a
+            # field addition: every field here was read with .get() and no key set
+            # was enforced, while WIRE_VERSION is declared and never read by
+            # anything. So a vault upgraded ahead of its Pi would send deposit
+            # instructions, this box would silently drop them, and the operator
+            # would be told "read the address and memo on the vault" with no error
+            # recorded anywhere -- the exact silent partial upgrade the header says
+            # is the one outcome worth ruling out.
+            #
+            # validate_job already enforces an exact key set on M2. This is the
+            # same rule on the record going the other way.
+            _want = {"job_id", "challenge", "status", "handle", "slip", "plain",
+                     "phase"}
+            if set(body) != _want:
+                missing, extra = sorted(_want - set(body)), sorted(set(body) - _want)
+                raise Doorbell(
+                    f"result does not match this protocol version "
+                    f"(missing {missing}, unexpected {extra}). The vault and this "
+                    f"Pi are running different versions of gs_wake_proto: update "
+                    f"both, in the same sitting.")
+            status = body.get("status")
+            if status not in ("done", "refused", "failed"):
+                raise Doorbell("result carries no usable status")
+            handle = body.get("handle", "")
+            if not isinstance(handle, str):
+                raise Doorbell("result handle is not a string")
+            # A 95-character "handle" is an address wearing a hat.
+            #
+            # THIS USED TO BE THE SECOND OF TWO DEFENCES AND IT IS NOW THE ONLY
+            # ONE. The comment here said the wire format already refused a long
+            # handle because an M3 that size would not fit the single padded
+            # block -- true when PAD_BLOCK was 256 and MAX_INNER 255. PAD_BLOCK is
+            # 1024 now (gs_wake_proto, "THE SEALED SLIP"), and a 95-character
+            # handle fits an M3 with room to spare. The backstop the sentence was
+            # counting on is gone, so this check is load-bearing on its own.
+            #
+            # EMPTY IS ONLY LEGAL WHEN THERE IS NOTHING TO NAME. The first version
+            # read `if handle and not HANDLE_RE.match(...)`, so an empty string
+            # skipped the check entirely and a "done" with no handle was recorded
+            # as success the operator could not act on -- they are told the job
+            # finished and given nothing to look up. Refused and failed jobs
+            # genuinely have no handle, so those may be empty and only those.
+            if status == "done":
+                if not proto.HANDLE_RE.match(handle):
+                    raise Doorbell("a completed job must name its 4-character "
+                                   "handle; without one the operator is told it "
+                                   "worked and given nothing to find")
+            elif handle and not proto.HANDLE_RE.match(handle):
+                raise Doorbell("result handle is not a 4-character label")
+            # THE SEALED SLIP, WHICH THIS BOX CANNOT READ AND MUST NOT TRY TO.
+            #
+            # The Pi has no delivery key -- that is the whole design -- so the only
+            # honest check available here is SHAPE, and shape is checked strictly
+            # rather than waved through: exactly SLIP_B64_LEN characters that
+            # base64-decode to exactly one padded box. Anything else is refused
+            # outright instead of being relayed onward, because the operator's next
+            # move after receiving a slip is to send Bitcoin, and a mangled blob
+            # must fail HERE, on the vault's own channel, and not later in a chat
+            # window where the failure looks like the vault's fault.
+            #
+            # A blob of the right shape is still opaque: it is carried, logged as
+            # present, and never parsed. gs_doorbell holds no key that opens it.
+            slip = body.get("slip", "")
+            # A TYPE CHECK BEFORE THE TRUTHINESS ONE. `if slip and not
+            # wellformed(slip)` reads as a complete gate and is not: 0, [] and {}
+            # are all falsy, so each would skip validation entirely and be stored
+            # as this job's slip. Nothing downstream would crash -- the pager does
+            # `res.get("slip") or ""` -- which is exactly what makes it worth
+            # closing here rather than discovering it as a silently missing slip.
+            if not isinstance(slip, str):
+                raise Doorbell("result's slip field is not text")
+            if slip and not proto.slip_is_wellformed(slip):
+                raise Doorbell("result carries something in the slip field that is "
+                               "not a sealed slip")
+            if slip and status != "done":
+                # A refused or failed job has nothing to deliver. A slip attached
+                # to one is the vault contradicting itself.
+                raise Doorbell("a job that did not finish cannot carry a slip")
+            # THE PLAINTEXT SLIP. This box CAN read this one, and that is the whole
+            # cost of the mode -- see gs_wake_proto's "THE PLAINTEXT SLIP".
+            #
+            # It is still checked strictly rather than forwarded on trust, because
+            # the next hop is a chat message a human copies into a wallet: an EXACT
+            # key set (a field this Pi has never heard of must not reach Telegram
+            # unexamined), strings only, bounded, and no control characters, which
+            # would forge a line of the block being copied.
+            plain = body.get("plain", {})
+            if not isinstance(plain, dict):
+                raise Doorbell("result's plain field is not an object")
+            if plain and not proto.plain_slip_is_wellformed(plain):
+                raise Doorbell("result carries something in the plain field that "
+                               "is not a set of deposit instructions")
+            if plain and status != "done":
+                raise Doorbell("a job that did not finish cannot carry deposit "
+                               "instructions")
+            # ONE PAYLOAD, NEVER TWO. Sealed and plaintext are two answers to one
+            # question; an M3 carrying both would put the payload in the transcript
+            # AND in a blob, doubling the exposure for a single delivery. The vault
+            # refuses this at keyfile load; this is the second, independent place.
+            if slip and plain:
+                raise Doorbell("result carries BOTH a sealed and a plaintext slip")
+            # THE STATUS WORD, against a CLOSED SET.
+            #
+            # A membership test, never a substring or a length check: this word is
+            # rendered into a sentence the operator acts on, so an unknown word
+            # must be refused rather than passed through as itself. It is also what
+            # stops the vault gaining a free-text channel into a chat.
+            phase = body.get("phase", "")
+            if not proto.phase_is_known(phase):
+                raise Doorbell("result carries a status word this protocol has no "
+                               "meaning for")
+            self.result = {"status": status, "handle": handle, "slip": slip,
+                           "plain": plain, "phase": phase}
+            self.events.append("result_ok")
+            if slip:
+                self.events.append("slip_carried")
+            if plain:
+                self.events.append("plain_carried")
 
 
 def make_handler(pending: Pending):

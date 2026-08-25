@@ -721,8 +721,22 @@ def test_count_refuses_a_repeating_wallet():
     check("control: a fresh address in a fresh account is NOT refused", _ok)
 
     src = open(os.path.join(REPO, "create_receive_wallet")).read()
-    check("--count: main() routes every mint through the shipped guard",
-          "refuse_duplicate_receive(_addr, _acct, _seen_addrs," in src)
+    # THE GUARD MOVED INSIDE THE MINT, and that is the fix rather than a
+    # relocation. It ran from main()'s loop AFTER mint_one_receive returned --
+    # so by the time it printed "Refusing rather than writing bundles that all
+    # name it", two 0600 JSON files naming the same address were already on
+    # disk, and main() sys.exits inside the loop so nothing removes them.
+    check("--count: every mint is routed through the shipped guard, from "
+          "inside the mint",
+          "refuse_duplicate_receive(addr_str, acct_idx, seen_addrs, seen_accts,"
+          in src)
+    check("--count: ...and it is asked BEFORE the bundle is written, which is "
+          "the only place its own sentence is true",
+          src.index("refuse_duplicate_receive(addr_str,")
+          < src.index("atomic_write_json(out, fname)"))
+    check("--count: ...and main() still passes its whole-run bookkeeping in, "
+          "so the comparison spans every mint and not just the last",
+          "wallet_rpc, args, _seen_addrs, _seen_accts, n, args.count)" in src)
     check("--count: mint_one_receive reports the (account, subaddress) it used, "
           "so the caller can compare across calls",
           "return addr_str, fname, (acct_idx, sub_idx)" in src)
@@ -926,14 +940,61 @@ def test_half_minted_receive():
               "no account",
               "WAS created" not in _hm_msg2
               and _hm_msg2.startswith("[!] Could not mint the receive subaddress"))
-        # NON-VACUITY: the account-create failure is still its own message, so the
-        # widened try did not swallow the one that already worked.
-        _hm_chain.clear()
+        # AND NOTHING IS LEFT BEHIND WHEN A DUPLICATE IS REFUSED. Driven: a
+        # wallet-rpc that hands back the same address twice leaves ONE bundle.
+        import glob as _glob_d
+        import io as _io_d
+        _dupe_dir = tempfile.mkdtemp(prefix="dupe_")
 
+        class _StuckRPC2:
+            def new_subaddress_indexed(self, account_index=0, label=""):
+                return "8" + "A" * 94, 3
+
+        # SAVED BEFORE STUBBING, RESTORED AFTER. verify_receive_address is a
+        # SHIPPED guard other tests in this file drive; leaving a stub of it
+        # on the module made five of them fail two hundred lines later, which
+        # is the kind of failure that reads as a broken tool rather than a
+        # leaked fixture.
+        _d_verify = crw.verify_receive_address
+        _d_newnym, _d_wipe = crw.newnym, crw.wipe_will_erase
+        crw.create_fresh_account = lambda rpc, label: 7
+        crw.verify_receive_address = lambda *a, **k: None
+        crw.newnym = lambda *a, **k: None
+        crw.wipe_will_erase = lambda p: True
+        try:
+            _dargs = types.SimpleNamespace(account=None, label="",
+                                           output_dir=_dupe_dir, tor_proxy="",
+                                           rpc="http://127.0.0.1:18083")
+            _sa, _sc, _refused = set(), set(), False
+            for _n in range(2):
+                try:
+                    _real2, sys.stdout = sys.stdout, _io_d.StringIO()
+                    try:
+                        _a2, _f2, (_ac2, _sb2) = crw.mint_one_receive(
+                            _StuckRPC2(), _dargs, _sa, _sc, _n, 2)
+                    finally:
+                        sys.stdout = _real2
+                    _sa.add(_a2)
+                    _sc.add(_ac2)
+                except SystemExit:
+                    _refused = True
+            check("dupe: a repeating wallet-rpc is refused on the second mint",
+                  _refused)
+            check("dupe: ...and leaves ONE bundle on disk, not two — which is "
+                  "what the refusal's own sentence claims",
+                  len(_glob_d.glob(
+                      os.path.join(_dupe_dir, "wallet_*.json"))) == 1)
+        finally:
+            crw.verify_receive_address = _d_verify
+            crw.newnym, crw.wipe_will_erase = _d_newnym, _d_wipe
+
+        # NON-VACUITY: the account-create failure is still its own message,
+        # so the widened try did not swallow the one that already worked.
         def _boom_acct(rpc, label):
             raise RuntimeError("create_account refused")
 
         crw.create_fresh_account = _boom_acct
+        _hm_chain.clear()
         _hm_msg3 = ""
         try:
             crw.mint_one_receive(_HalfMintRPC("unused"),

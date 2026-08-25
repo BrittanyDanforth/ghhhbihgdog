@@ -3990,6 +3990,79 @@ for _p in ("on_fanout:4_chunks", "subaddress_minted"):
           not any(_c.isdigit() for _c in _gsc_mod.chain_safe(_p)))
 
 _finished()
+# ---- THE PREFERRED CHANNEL FOR THE FEE RATE WAS THE UNVALIDATED ONE -----
+#
+# --usage-fee-pct is type=decimal_arg. GS_USAGE_FEE_PCT went straight into
+# Decimal(str(...)) at both assignment sites in resolve_usage_fee -- and
+# OPSEC_SETUP lists it among the values that must travel by environment, so
+# the channel the document recommends is the one with no gate on it. That is
+# the exact defect decimal_env's own docstring was written for; this variable
+# was added after it and did not get one.
+#
+# Two values got through, and the second is the one that costs money:
+#
+#   * "1.1%" -- the natural typo, since the help and the docs both write the
+#     rate as "0.011 = 1.1%" -- raised a raw decimal.InvalidOperation.
+#   * "1e-400" was ACCEPTED. It is positive and under the ceiling, so
+#     _check_fee_pct passed it; the cut then quantizes to zero and the run
+#     takes the WAIVER path, whose message calls
+#     mix_minimum_xmr(usage_pct=1E-400) -- and the
+#     (hop_fee_reserve + DUST_XMR)/usage_pct term in there is about 3.7E+397
+#     and cannot be quantized in a 28-digit context. That raise lands AFTER
+#     stage4_await_swap: after the BTC is gone, which is the one outcome the
+#     waive-rather-than-abort design exists to prevent.
+print("\n-- the fee rate, and the channel it arrives on --")
+import os as _os_fee
+
+
+def _resolve_pct(_v, _env=True):
+    """resolve_usage_fee's verdict on one value. Returns ('ok', p) or ('no',)."""
+    if _env:
+        _os_fee.environ["GS_USAGE_FEE_PCT"] = _v
+    _a = types.SimpleNamespace(usage_fee_pct=None if _env else _v,
+                               usage_fee=True, usage_fee_address=None,
+                               exit_to=[], split=1, peel=False, btc_entry=None)
+    try:
+        ghost.resolve_usage_fee(_a)
+        return ("ok", _a.usage_fee_pct)
+    except SystemExit:
+        return ("no",)
+    finally:
+        _os_fee.environ.pop("GS_USAGE_FEE_PCT", None)
+
+
+check("feepct: the rate written the way the docs write it is refused, not "
+      "raised", _resolve_pct("1.1%") == ("no",))
+check("feepct: ...and so are the two words that parse as Decimals",
+      _resolve_pct("NaN") == ("no",) and _resolve_pct("Infinity") == ("no",))
+check("feepct: ...and a rate above the ceiling", _resolve_pct("0.5") == ("no",))
+check("feepct: ...and a negative one", _resolve_pct("-0.01") == ("no",))
+# THE FLOOR IS THE HALF THAT CRASHED. "> 0" admits denormals.
+check("feepct: a denormal rate is refused at parse time, not discovered after "
+      "the swap has settled", _resolve_pct("1e-400") == ("no",))
+check("feepct: ...and the floor is about representability -- a Monero atomic "
+      "unit is 1e-12 XMR, so below it a cut cannot become an output at all",
+      ghost.USAGE_FEE_PCT_MIN > 0
+      and _resolve_pct(str(ghost.USAGE_FEE_PCT_MIN / 10)) == ("no",))
+check("feepct: NON-VACUITY -- the real rate is still accepted, by env and by "
+      "flag alike",
+      _resolve_pct("0.011") == ("ok", Decimal("0.011"))
+      and _resolve_pct(Decimal("0.011"), _env=False)[0] == "ok")
+check("feepct: ...and the floor itself is accepted, so the band is closed at "
+      "both ends rather than shifted",
+      _resolve_pct(str(ghost.USAGE_FEE_PCT_MIN)) == ("ok", ghost.USAGE_FEE_PCT_MIN))
+# AND THE CRASH IT AVOIDS IS REAL, not theoretical: driven against the shipped
+# function with the value the old gate let through.
+_mm_raised = False
+try:
+    ghost.mix_minimum_xmr(Decimal("0.0002"), 20, usage_pct=Decimal("1e-400"))
+except Exception:                                            # noqa: BLE001
+    _mm_raised = True
+check("feepct: NON-VACUITY -- that value really does make mix_minimum_xmr "
+      "raise, which is what the waiver path calls after the swap",
+      _mm_raised)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

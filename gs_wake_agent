@@ -856,7 +856,8 @@ def _tool(name: str) -> str:
 
 
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
-               bundle: str = None, slip: str = None, handle: str = None) -> list:
+               bundle: str = None, slip: str = None, handle: str = None,
+               owned_fee=()) -> list:
     """(argv, env_extra) pairs for one job, composed ENTIRELY from the fixed
     template plus this machine's own keyfile.
 
@@ -1020,7 +1021,9 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  # arithmetic so they cannot drift apart.
                  "--wallets", str(withdraw_wallets(params["depth"])),
                  "--output", str(artifact_dir)]
-                + _withdraw_fee_argv(key, params.get("exit_to") or [])]
+                + _withdraw_fee_argv(key, params.get("exit_to") or [],
+                                     owned=owned_fee)]
+
     raise Refused("unknown_job", "no argv template for this job")
 
 
@@ -1087,6 +1090,54 @@ def fee_addresses(key: dict, exclude=()) -> list:
     return out
 
 
+def wallet_owned_fee_addresses(key: dict, rpc=None) -> list:
+    """Which paired fee addresses this wallet already holds the keys to.
+
+    A FEE PAID TO THE WALLET IT CAME OUT OF IS NOT A FEE, and GhostSpiral
+    already knows it: plan_usage_fee asks _wallet_owns_address and WAIVES the
+    cut when the answer is yes. The trouble is where that discovery happens --
+    once per withdrawal, on the vault, onto a stdout gs_wake_agent diverts to a
+    0600 job log that paranoia_mode then erases. The exit code is unaffected,
+    so the phone says "withdraw: sent", the operator collects nothing, and
+    there is nothing anywhere to say why. Forever.
+
+    AND PASTING SUCH AN ADDRESS IS THE EASY MISTAKE. This bot's own /address
+    mints receive subaddresses on that very wallet, so the most available
+    Monero address an operator has is one that triggers the waiver.
+
+    Asked here, once, on the run that is about to spend, from the machine that
+    has the wallet. The addresses are simply not offered for the draw -- the
+    same treatment a destination collision gets, for the same reason.
+
+    NONE ON ANY ERROR, and that is deliberate rather than lax. wallet-rpc
+    answers get_address_index for a FOREIGN address with an error, so an error
+    is the expected reply for a correctly-supplied external destination;
+    treating it as "unknown, so exclude" would waive the fee on every correct
+    configuration. GhostSpiral's own helper records this reasoning at length.
+    """
+    addrs = fee_addresses(key)
+    if not addrs:
+        return []
+    try:
+        if rpc is None:
+            from gs_common import connect_rpc
+            rpc = connect_rpc(key["rpc_primary"],
+                              proxy_url=key.get("tor_proxy", ""))
+    except Exception:                                        # noqa: BLE001
+        return []
+    owned = []
+    for _a in addrs:
+        try:
+            res = rpc.raw_request("get_address_index", {"address": _a})
+        except Exception:                                    # noqa: BLE001
+            continue
+        _ix = (res or {}).get("index") if isinstance(res, dict) else None
+        if isinstance(_ix, dict) and isinstance(_ix.get("major"), int) \
+                and not isinstance(_ix.get("major"), bool):
+            owned.append(_a)
+    return owned
+
+
 def pick_fee_address(key: dict, rng=None, exclude=()) -> str:
     """One of them, uniformly, or "" when none is usable this run.
 
@@ -1101,7 +1152,7 @@ def pick_fee_address(key: dict, rng=None, exclude=()) -> str:
     return (rng or random.SystemRandom()).choice(addrs)
 
 
-def _withdraw_fee_argv(key: dict, dests=()) -> list:
+def _withdraw_fee_argv(key: dict, dests=(), owned=()) -> list:
     """["--usage-fee"], but only where the keyfile says where it goes.
 
     `dests` MUST BE THE SAME LIST pick_fee_address is given, or the flag and
@@ -1144,7 +1195,8 @@ def _withdraw_fee_argv(key: dict, dests=()) -> list:
     reuse is divided by however many the operator paired, which is a reduction
     and is not unlinkability -- see fee_addresses.
     """
-    return ["--usage-fee"] if fee_addresses(key, exclude=dests) else []
+    return ["--usage-fee"] if fee_addresses(
+        key, exclude=list(dests) + list(owned)) else []
 
 
 #: Where a woken job's children write. NOT the journal. 0600, in the artifact
@@ -1972,8 +2024,14 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 f"({e.strerror}). Refusing to run a probe that might report "
                 f"the last one's result.")
 
+    # ASKED ONCE, USED TWICE. The flag and the drawn address must agree --
+    # --usage-fee with no GS_USAGE_FEE_ADDRESS is the configuration that mints
+    # the cut onto the mixing wallet -- so the same list feeds both, and the
+    # wallet is asked a single time rather than once per consultation.
+    _owned_fee = (wallet_owned_fee_addresses(key)
+                  if job == "withdraw" else [])
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
-                       slip=slip, handle=handle)
+                       slip=slip, handle=handle, owned_fee=_owned_fee)
 
     before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
     for i, argv in enumerate(steps):
@@ -2068,7 +2126,13 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # to prefer GS_USAGE_FEE_ADDRESS for exactly this reason.
             # DRAWN, NOT READ. The keyfile may name several; picking one per
             # run is the whole reason it may. See fee_addresses.
-            _fee_addr = pick_fee_address(key, exclude=_dests)
+            # ...AND ADDRESSES THIS WALLET ALREADY OWNS, for the same
+            # reason: GhostSpiral waives the cut on those, once per
+            # withdrawal, into a log that is wiped. Asked here instead, on the
+            # machine that has the wallet, so the draw can simply pick one of
+            # the others. See wallet_owned_fee_addresses.
+            _fee_addr = pick_fee_address(
+                key, exclude=list(_dests) + list(_owned_fee))
             if _fee_addr:
                 # VALIDATED HERE TOO. It came off this machine's keyfile rather
                 # than off the wire, so it is not attacker-controlled -- but a

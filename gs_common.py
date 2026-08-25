@@ -2512,6 +2512,36 @@ class MoneroRPC:
                 f"({idx!r}) for account {account_index}. Refusing to guess: the "
                 f"index is written into the receive bundle and is what the "
                 f"watcher polls for the payment.")
+        # ZERO, TOO, AND FOR create_fresh_account'S OWN REASON.
+        #
+        # That function refuses a reported account index of 0 because account 0
+        # always pre-exists, so a freshly CREATED account is never 0. The
+        # identical argument holds one call deeper: subaddress 0 of an account
+        # is created WITH the account, so a freshly created subaddress is never
+        # 0 either -- and this check stopped at `idx < 0`, so zero passed.
+        #
+        # It is the one index value that is silently harmful. Subaddress 0 of
+        # an account is that account's CHANGE SINK, so a receive bundle naming
+        # it puts the address the swap memo publishes and the address the run's
+        # change comes to rest on in the same place -- the exact convergence
+        # the fresh-account-per-receive rule exists to prevent, with the
+        # aggregator already holding that address in plaintext.
+        #
+        # Nothing downstream catches it: get_address(account, [0]) resolves
+        # consistently and validate_address reports subaddress: true, so the
+        # tool prints "Address verified" over it.
+        #
+        # DEFENCE IN DEPTH against a proxied, cached or older wallet-rpc rather
+        # than a reproduced wallet bug -- which is the stated standard of every
+        # other check in this method, and the sibling refuses the analogous
+        # zero already.
+        if idx == 0:
+            raise RuntimeError(
+                f"create_address reported the NEW subaddress of account "
+                f"{account_index} as index 0. Index 0 is created with the "
+                f"account and is that account's change sink, so a receive "
+                f"bundle naming it would publish the address the run's own "
+                f"change lands on.")
         return addr, idx
 
     def new_subaddress(self, account_index: int = 0, label: str = "") -> str:

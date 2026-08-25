@@ -342,6 +342,83 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
               f"({len(_text)} chars)", len(_text) <= 420)
 pg.doorbell = _real_doorbell
 
+# ---- THE DOORBELL SAW SOMETHING AND ONLY THE TERMINAL WAS TOLD ----------
+#
+# gs_doorbell collects `events` and _report_events prints the two that change
+# what the operator should believe -- under a docstring saying `events` "was
+# collected and never read by anything ... and worse here, because the one
+# event that means 'your job did not go where you think' was among the ones
+# being thrown away." It was fixed for the CLI and left unfixed for the
+# surface the feature exists for: grep for `events` in the pager found one
+# hit, inside a comment.
+#
+# The case that matters: a replayed M1 collects the job, the real vault's M1
+# is then refused, and events are ['job_collected', 'm1_second_ephemeral'].
+# The CLI prints "the job went to a boot that cannot read it, and nothing
+# ran". The chat got "I do NOT know whether the funds moved. ... Do not run
+# /withdraw again until you have checked" -- forbidding the retry that is in
+# fact the right move.
+print("\n== what the doorbell saw, told to the operator ==")
+
+
+class _EventPending:
+    def __init__(self, events, out="collected_no_result"):
+        self.events = list(events)
+        self.result = None
+        self._out = out
+
+    def outcome(self):
+        return self._out
+
+
+_ep = pg.Pager(_args, "123456:TOKEN", {}, {"https": "socks5h://x"})
+_eps = []
+_ep.send = lambda cid, t, buttons=None: (_eps.append(t), True)[1]
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _EventPending(["job_collected", "m1_second_ephemeral"]))
+try:
+    _ep.poke(111, "withdraw", {"exit_to": ["4" + "1" * 94], "depth": 1})
+finally:
+    pg.doorbell = _real_doorbell
+_eptext = "\n".join(_eps)
+check("events: a second signed request for the job reaches the CHAT, not just "
+      "a terminal", "second signed request" in _eptext)
+check("events: ...and says what it means for what follows",
+      "nothing ran" in _eptext and "Check before assuming" in _eptext)
+check("events: ...before the outcome, since it changes how that reads",
+      _eps and "second signed request" in _eps[0])
+check("events: ...and the outcome still arrives after it",
+      len(_eps) >= 2 and "never reported" in _eptext.lower())
+# A CLOSED VOCABULARY, so the vault gains no free-text channel into a chat:
+# this box renders its OWN sentence for a word the doorbell chose from a set
+# it also fixes. Same rule as PHASE_LINES.
+_ep2 = pg.Pager(_args, "123456:TOKEN", {}, {"https": "socks5h://x"})
+_eps2 = []
+_ep2.send = lambda cid, t, buttons=None: (_eps2.append(t), True)[1]
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _EventPending(["job_collected", "; DROP TABLE --", "m1_retry"]))
+try:
+    _ep2.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+finally:
+    pg.doorbell = _real_doorbell
+check("events: a word this box has no sentence for is not rendered at all",
+      "DROP TABLE" not in "\n".join(_eps2))
+check("events: ...and neither is bookkeeping nobody can act on",
+      "m1_retry" not in "\n".join(_eps2))
+check("events: NON-VACUITY -- an ordinary run with nothing to report says "
+      "nothing extra",
+      not any("second signed request" in _t for _t in _eps2))
+# THE VOCABULARY IS A REAL SUBSET of what the doorbell can record, or this is
+# a filter that lets everything through.
+_dbsrc_ev = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
+check("events: every word rendered is one the doorbell actually records",
+      all(f'"{_w}"' in _dbsrc_ev for _w in pg.EVENT_VOCAB))
+check("events: ...and it is a subset, not everything the doorbell records",
+      len(pg.EVENT_VOCAB) < len(set(re.findall(
+          r'events\.append\("([a-z0-9_]+)"\)', _dbsrc_ev))))
+
 # ---- "YOUR FUNDS ARE EXACTLY WHERE THEY WERE" -- SAID BY A BOX WITH NO -----
 # ---- IDEA WHERE THEY ARE --------------------------------------------------
 #
@@ -955,9 +1032,32 @@ check("working: the withdrawal is reported in HOURS, not 'a while'",
 # DERIVED, NOT TYPED. The figure must track result_budget_s, or it becomes the
 # next 9900 -- a hand-copied duration that stopped being true when a job was
 # added and that nothing noticed.
-_want_h = (P.result_budget_s("withdraw") + DB.PRE_WOL_MAX_S) // 3600 + 1
+#
+# AND IT IS THREE TERMS, NOT TWO. This summed result_budget_s and the pre-WOL
+# ceiling. The window actually held is PRE_WOL_MAX_S, then the doorbell's
+# FETCH_WINDOW_S while it waits to be collected, and only THEN result_budget_s
+# from collected_at -- Pending.finished() is false while fetch_open() holds,
+# so the three are strictly sequential. Hour-rounding hid the missing term on
+# the long jobs and not on the short ones: /deposit was quoted 50 minutes
+# against a real 60, /check 40 against 50. What an operator does in that gap
+# is send another command and be told something is already running, which is
+# the experience this message exists to prevent.
+_want_h = (P.result_budget_s("withdraw") + DB.FETCH_WINDOW_S
+           + DB.PRE_WOL_MAX_S) // 3600 + 1
 check(f"working: the withdrawal figure is derived from result_budget_s "
       f"({_want_h}h)", f"up to {_want_h}h" in _durations["withdraw"])
+# THE SHORT JOBS ARE WHERE IT SHOWED, so they are what pins it: no rounding to
+# absorb the missing ten minutes.
+for _sj in ("swap_status", "receive_new"):
+    _want_s = (P.result_budget_s(_sj) + DB.FETCH_WINDOW_S + DB.PRE_WOL_MAX_S)
+    _txt = (f"up to {_want_s // 3600 + 1}h" if _want_s >= 3600
+            else f"up to {max(1, _want_s // 60)} min")
+    check(f"working: {_sj} quotes the whole window it holds, fetch window "
+          f"included ({_txt})", _txt in _durations[_sj])
+# NON-VACUITY: the fetch window is a real, non-zero term, so the checks above
+# are about something rather than about adding zero.
+check("working: NON-VACUITY -- the fetch window is minutes, not nothing",
+      DB.FETCH_WINDOW_S >= 300)
 check("updates: ...and True is not accepted as an id (True == 1 would move "
       "the cursor to 2)", _lp.ignored == 2 and _lp.limits.offset == 6)
 # The source-level half, because the loop above is a paraphrase of run():
@@ -1093,12 +1193,36 @@ check("names: no reply interpolates the raw job identifier any more",
 #    operator reaches for when money has not appeared.
 check("help: /status is described as what it now answers, not as counters",
       "counters" not in pg.HELP)
-check("help: /check's quoted time includes the wake jitter it always waits",
-      "10-25 min" in pg.HELP)
+# ...AND THEN THE FIGURE ITSELF BECAME THE PROBLEM, one layer up.
+#
+# "10-25 min" was TYPED here, and start_job computes the real hold on every
+# run from result_budget_s plus the doorbell's pre-WOL ceiling and its fetch
+# window -- and says it. Two numbers for one wait, and the typed one was the
+# smaller: the menu promised 10-25 minutes and the bot answered "up to 55 min"
+# one tap later, on the command an operator reaches for when money has not
+# appeared.
+#
+# A published list cannot derive that figure: BOT_COMMANDS is a module
+# constant and the windows live in gs_doorbell, which is loaded by path at
+# call time. So the list stops quoting a duration it cannot keep true, and the
+# derived one -- which every job already prints -- is the only one.
+check("help: the command list quotes no duration it cannot derive",
+      not re.search(r"\d+\s*-\s*\d+\s*min|up to \d+\s*(min|h)\b", pg.HELP))
 _jit_lo, _jit_hi = _AG_JIT
-check(f"help: ...and that figure is consistent with the real jitter "
-      f"({_jit_lo // 60}-{_jit_hi // 60} min) plus the 3-minute probe",
-      _jit_lo // 60 + 3 <= 10 and 25 >= _jit_hi // 60 + 3)
+check(f"help: ...and the derived one covers the jitter it always waits "
+      f"({_jit_lo // 60}-{_jit_hi // 60} min), which is what the typed figure "
+      f"was added for",
+      P.result_budget_s("swap_status") > _jit_hi)
+# THE ARGUMENT IS NAMED INSTEAD, which is the thing the list CAN say and the
+# thing an operator cannot guess: both refuse without a 4-hex label, in a word
+# ("handle") the chat uses nowhere else.
+_cmds = dict(pg.BOT_COMMANDS)
+check("help: /check and /wait show the argument they refuse without",
+      "/check A3F1" in _cmds["check"] and "/wait A3F1" in _cmds["wait"])
+check("help: NON-VACUITY -- they really do refuse without one, in a word the "
+      "chat never otherwise uses",
+      pg.parse_command("/check")[2] == "handle must be 4 hex characters"
+      and pg.parse_command("/wait")[2] == "handle must be 4 hex characters")
 # NON-VACUITY: the help still lists the commands, so this is not passing on an
 # emptied string.
 # THE ADVERTISED NAMES, which are now words rather than abbreviations: "depo"
@@ -2805,6 +2929,18 @@ check("welcome: ...and names both money-in commands and the money-out one",
 check("welcome: ...and says outright which one pays them, since that is the "
       "question the old names got wrong",
       "the one that pays YOU" in pg.WELCOME)
+# ...AND WHAT IT WILL AND WILL NOT SWEEP UP. _funded_entry takes the LARGEST
+# SINGLE unlocked output and never sums, because summing would spend inputs
+# from several subaddresses in one transaction -- permanent public proof they
+# share an owner. So a withdrawal moves ONE arrival, and "mixes what is here"
+# told an operator with money in three places that all three were going.
+check("welcome: ...and that a withdrawal moves ONE arrival, not everything",
+      "ONE arrival" in pg.WELCOME
+      and "mixes what is here" not in pg.WELCOME)
+check("welcome: ...and what to do about the rest, which is the actionable half",
+      "came in twice is two of these" in pg.WELCOME)
+check("welcome: ...and the published command list says the same thing",
+      "ONE arrival" in dict(pg.BOT_COMMANDS)["withdraw"])
 # THE RENAME NOTE IS IN /help, NOT HERE, and that is the point of this pair.
 #
 # The welcome is read by somebody who has never used this bot. A sentence

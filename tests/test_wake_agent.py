@@ -2219,9 +2219,93 @@ check("fee: NON-VACUITY -- an ordinary destination still pays the cut",
       "--usage-fee" in _fee_argv_for(["4" + "9" * 94])
       and A.pick_fee_address(_FK, exclude=["4" + "9" * 94]) in _FA)
 # THE PREDICATE IS ASKED ONCE AND USED TWICE, which is what keeps them in step.
-check("fee: the argv and the draw consult the same excluded list",
-      "_withdraw_fee_argv(key, params.get(\"exit_to\") or [])" in _ag_src
-      and "pick_fee_address(key, exclude=_dests)" in _ag_src)
+# ONE PREDICATE, ASKED TWICE, FROM ONE LIST. The flag and the drawn address
+# must agree: --usage-fee with no GS_USAGE_FEE_ADDRESS is the configuration
+# that mints the cut onto the mixing wallet, which is the recapture the fee
+# gate exists to prevent.
+check("fee: the argv and the draw consult the same excluded lists",
+      'params.get("exit_to") or [],' in _ag_src
+      and "owned=owned_fee)" in _ag_src
+      and "exclude=list(_dests) + list(_owned_fee))" in _ag_src)
+check("fee: ...and the wallet is asked once per run, not once per consultation",
+      _ag_src.count("wallet_owned_fee_addresses(key)") == 1)
+
+# ---- ...AND A FEE ADDRESS ON THE MIXING WALLET WAIVED THE CUT SILENTLY ---
+#
+# GhostSpiral already knows: plan_usage_fee asks _wallet_owns_address and
+# WAIVES the cut when the answer is yes. The trouble is where it finds out --
+# once per withdrawal, on the vault, onto a stdout gs_wake_agent diverts to a
+# 0600 job log that paranoia_mode erases. The exit code is unaffected, so the
+# phone says "withdraw: sent", the operator collects nothing, and there is
+# nothing anywhere saying why. Every run, forever.
+#
+# AND IT IS THE EASY MISTAKE TO MAKE: this bot's own /address mints receive
+# subaddresses on that very wallet, so the most available Monero address the
+# operator has is one that triggers the waiver.
+print("\n-- a fee address the mixing wallet already owns --")
+
+
+class _OwnRPC:
+    """Answers like monero-wallet-rpc: an ERROR for a FOREIGN address."""
+
+    def __init__(self, mine):
+        self.mine = set(mine)
+
+    def raw_request(self, m, p=None):
+        if m != "get_address_index":
+            return {}
+        if p["address"] in self.mine:
+            return {"index": {"major": 3, "minor": 9}}
+        raise RuntimeError("Address doesn't belong to the wallet (-2)")
+
+
+def _argv_owned(_owned):
+    return A.build_argv("withdraw", {"exit_to": ["4" + "9" * 94], "depth": 2},
+                        _FK, Path("/tmp"), bundle="b", slip=None,
+                        handle="A3F1", owned_fee=_owned)[0]
+
+
+_own_saved = _gsc_pat.connect_rpc
+try:
+    _gsc_pat.connect_rpc = lambda *a, **k: _OwnRPC([_FA[1]])
+    _owned = A.wallet_owned_fee_addresses(_FK)
+    check("owned: the wallet is asked which paired addresses it already holds",
+          _owned == [_FA[1]])
+    check("owned: ...and that address is never drawn for the cut",
+          all(A.pick_fee_address(_FK, exclude=_owned) != _FA[1]
+              for _ in range(400)))
+    check("owned: ...while the other three still are, so one bad address does "
+          "not waive the fee",
+          len({A.pick_fee_address(_FK, exclude=_owned)
+               for _ in range(400)}) == 3)
+    check("owned: ...and the run still asks for the cut",
+          "--usage-fee" in _argv_owned(_owned))
+    # EVERY paired address owned by the wallet -> waive, and the FLAG has to
+    # agree, or --usage-fee with no address mints the cut onto that same
+    # wallet, which is the recapture this whole gate exists to prevent.
+    _gsc_pat.connect_rpc = lambda *a, **k: _OwnRPC(_FA)
+    _owned_all = A.wallet_owned_fee_addresses(_FK)
+    check("owned: with every paired address on the wallet, the cut is waived",
+          A.pick_fee_address(_FK, exclude=_owned_all) == ""
+          and "--usage-fee" not in _argv_owned(_owned_all))
+    # FAIL OPEN, and deliberately. wallet-rpc answers get_address_index for a
+    # FOREIGN address with an ERROR, so an error is the expected reply for a
+    # correctly-supplied external destination; treating "cannot tell" as
+    # "exclude" would waive the fee on every correct configuration.
+    def _own_boom(*a, **k):
+        raise OSError("wallet-rpc unreachable")
+
+    _gsc_pat.connect_rpc = _own_boom
+    check("owned: a wallet that cannot be asked excludes nothing, because an "
+          "error is what a FOREIGN address answers with",
+          A.wallet_owned_fee_addresses(_FK) == []
+          and "--usage-fee" in _argv_owned([]))
+finally:
+    _gsc_pat.connect_rpc = _own_saved
+# NON-VACUITY: it is only asked on the spending job. A status probe has no
+# business opening the wallet.
+check("owned: NON-VACUITY -- the wallet is asked only for a withdrawal",
+      'if job == "withdraw" else []' in _ag_src)
 
 # ---- ...AND THE DESK RE-OPENS WHAT THE PHONE PATH CLOSED -----------------
 #
