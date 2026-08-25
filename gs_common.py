@@ -1129,6 +1129,42 @@ GS_ARTIFACT_DIR_PATTERNS = [
 ]
 
 
+def _wipe_sweep_reaches_item(res: Path) -> bool:
+    """Would the sweep MATCH `res` ITSELF by name -- file or directory?
+
+    NOT the same question as wipe_covers, and conflating the two is a real
+    defect that was driven rather than argued.
+
+    wipe_covers answers "would anything WRITTEN AT this location be swept",
+    which is what `--output <dir>` and WorkingDirectory ask: files land inside
+    that directory, and the sweep reaches inside a root (depth 0) and one
+    level down (`*/pattern`). For a directory D that means D itself must BE a
+    root or sit directly under one.
+
+    wipe_will_erase asks the other question -- "would the sweep DELETE this
+    target" -- and for a DIRECTORY target the sweep matches the directory by
+    name via `root.glob(dirname)` and `root.glob(f"*/{dirname}")`. So the
+    level that must line up is the directory's PARENT, not the directory.
+
+    Building the delete question on the write-here answer put directories off
+    by exactly one level. Driven against paranoia_mode's real dry-run sweep
+    with a matching directory name at each depth:
+
+        depth 0   wipe_will_erase True    really swept True
+        depth 1   wipe_will_erase FALSE   really swept TRUE   <-- disagreed
+        depth 2   wipe_will_erase False   really swept False
+
+    Files were never wrong, because wipe_covers replaces a file with its
+    parent first and that happens to produce this same test -- which is why
+    the three shipped callers, all of which pass files, never saw it.
+
+    One rule for both kinds: the matched item sits at depth 0 or 1, so its
+    parent is a root or its grandparent is.
+    """
+    return any(res.parent == r or res.parent.parent == r
+               for r in paranoia_search_roots())
+
+
 def wipe_will_erase(target) -> bool:
     """True if paranoia_mode's artifact sweep would actually DELETE `target`.
 
@@ -1154,7 +1190,11 @@ def wipe_will_erase(target) -> bool:
         res = Path(target).resolve()
     except OSError:
         return False
-    if not wipe_covers(res):
+    # _wipe_sweep_reaches_item, NOT wipe_covers. See that function: the two
+    # answer different questions, and for a DIRECTORY target wipe_covers is
+    # off by one level -- it says a matching directory one level down will not
+    # be erased when the sweep really does erase it.
+    if not _wipe_sweep_reaches_item(res):
         return False
     return _wipe_name_matches(res)
 
@@ -1283,7 +1323,14 @@ def wipe_miss_reason(target) -> str:
     """
     if wipe_will_erase(target):
         return ""
-    loc = wipe_covers(target)
+    # THE SAME LOCATION TEST wipe_will_erase USED, or this explains a refusal
+    # that function did not make: with wipe_covers here, a matching directory
+    # one level down was reported as a LOCATION problem while wipe_will_erase
+    # had already said it would be erased.
+    try:
+        loc = _wipe_sweep_reaches_item(Path(target).resolve())
+    except OSError:
+        loc = False
     try:
         res = Path(target).resolve()
     except OSError:

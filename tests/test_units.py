@@ -3806,6 +3806,77 @@ check("wipe_covers: ...nor three levels down",
 check("wipe_covers: a DIRECTORY two levels down is NOT covered either "
       "(--output plans/run7)",
       not _gsc.wipe_covers(Path.cwd() / "plans" / "run7"))
+
+# ---- AND wipe_will_erase ANSWERS A DIFFERENT QUESTION FROM wipe_covers ----
+#
+# wipe_covers: "would anything WRITTEN AT this location be swept" -- what
+# --output <dir> and WorkingDirectory ask, since files land INSIDE.
+# wipe_will_erase: "would the sweep DELETE this target" -- and for a DIRECTORY
+# target the sweep matches the directory BY NAME, so the level that must line
+# up is the directory's PARENT, not the directory.
+#
+# wipe_will_erase was built on wipe_covers, which put directories off by
+# exactly one level: a matching directory ONE level down was reported as safe
+# from the wipe while paranoia_mode really deletes it. Files were never wrong,
+# because wipe_covers replaces a file with its parent first and that happens to
+# produce the right test -- which is why all three shipped callers, every one
+# of which passes a file, never saw it.
+#
+# DRIVEN AGAINST THE REAL SWEEP rather than reasoned about: the check below
+# builds a matching directory and a matching file at depths 0, 1 and 2 under a
+# scratch root, runs paranoia_mode's own _wipe_gs_artifacts_inner in DRY mode,
+# and compares what it names against what wipe_will_erase predicts.
+_wd_root = Path(tempfile.mkdtemp(prefix="wipe_agree_"))
+_wd_saved_home, _wd_saved_cwd = os.environ.get("HOME"), os.getcwd()
+try:
+    os.environ["HOME"] = str(_wd_root)
+    os.chdir(_wd_root)
+    _pm_ld = importlib.machinery.SourceFileLoader(
+        "paranoia_for_wipe", os.path.join(REPO, "paranoia_mode"))
+    _PM = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(_pm_ld.name, _pm_ld))
+    _pm_ld.exec_module(_PM)
+    _PM.integrity_log = lambda *a, **k: None
+    _fpat = _gsc.GS_ARTIFACT_FILE_PATTERNS[0].replace("*", "x")
+    _dpat = _gsc.GS_ARTIFACT_DIR_PATTERNS[0].replace("*", "x")
+    _made = []
+    for _depth, _base in ((0, _wd_root), (1, _wd_root / "d1"),
+                          (2, _wd_root / "d1" / "d2")):
+        _base.mkdir(parents=True, exist_ok=True)
+        _f = _base / _fpat
+        _f.write_text("x")
+        _made.append(("file", _depth, _f))
+        _d = _base / _dpat
+        _d.mkdir(exist_ok=True)
+        (_d / "inner").write_text("x")
+        _made.append(("dir", _depth, _d))
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _PM._wipe_gs_artifacts_inner(dry=True)
+    _swept = _buf.getvalue()
+    _disagree = [(k, d, str(pth)) for k, d, pth in _made
+                 if _gsc.wipe_will_erase(pth) != (str(pth) in _swept)]
+    check(f"wipe_will_erase agrees with the REAL sweep for every kind and "
+          f"depth (disagreements: {len(_disagree)})", _disagree == [])
+    # NON-VACUITY: the sweep actually named things, or every prediction of
+    # False would agree with an empty listing.
+    check("wipe_will_erase: NON-VACUITY -- the dry sweep really did name "
+          "artifacts", str(_wd_root / _fpat) in _swept)
+    # AND THE DIRECTORY-AT-DEPTH-1 CASE SPECIFICALLY, which is the one that
+    # was wrong. Named on its own so a future regression says which case.
+    _d1 = _wd_root / "d1" / _dpat
+    check("wipe_will_erase: a matching DIRECTORY one level down IS erased, "
+          "and says so", _gsc.wipe_will_erase(_d1))
+    check("wipe_will_erase: ...and the real sweep agrees", str(_d1) in _swept)
+    # wipe_miss_reason MUST NOT CONTRADICT IT. It used wipe_covers for the
+    # location half, so it explained a refusal wipe_will_erase had not made.
+    check("wipe_miss_reason: says nothing is wrong when the file WILL be "
+          "erased", _gsc.wipe_miss_reason(_d1) == "")
+finally:
+    os.chdir(_wd_saved_cwd)
+    if _wd_saved_home is not None:
+        os.environ["HOME"] = _wd_saved_home
+    shutil.rmtree(_wd_root, ignore_errors=True)
 # ...and the boundary still holds from the other side, so this is not simply
 # "refuse everything".
 check("control: a directory ONE level down is still covered (--output plans)",
