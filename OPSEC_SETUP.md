@@ -1292,6 +1292,26 @@ confirms the bot is alive to whoever found it. Run `gs_telegram_pager --whoami`
 once: it needs no `--key` and no `--chat-id`, arms nothing, wakes nothing,
 prints the chat id of the next message it sees and exits.
 
+**One person per bot, and the pager refuses anything else.** There is a single
+wallet behind this. A withdrawal does not ask who is asking — the vault takes
+the largest unlocked balance it can see and sends it to whatever addresses that
+person gave, because it is never told which chat the job came from and could
+not act on it if it were. Driven against the shipped code: with 1000 XMR from
+one person and 300 from another on one wallet, the second person's withdrawal
+picks up the first person's 1000.
+
+So `--chat-id` (or `--user-id`, in a group) may name exactly **one** person, and
+the pager exits at startup if it names more. There is deliberately no flag to
+override it: the operator who would pass such a flag is not the person who
+would be robbed, and consent from one party to a loss that falls on a second
+party is not consent. To serve several people, give each their own vault, their
+own wallet and their own bot — then they share nothing and cannot reach each
+other's funds.
+
+If you were thinking of a second `--chat-id` for your own second device: you do
+not need one. Telegram gives one account one chat with a given bot, on every
+device that account is signed in to.
+
 ### The slip travels sealed, or it does not travel
 
 “Read it on the vault” is the right rule and it has one assumption: that you
