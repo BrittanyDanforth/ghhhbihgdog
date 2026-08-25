@@ -544,6 +544,16 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
     # from "do not skim".
     if p.get("usage_fee"):
         a.append("--usage-fee")
+    # NOTHING IS DROPPED IN SILENCE. secret_env sends the fee address only when
+    # the box is ticked, so a value typed with it off would otherwise vanish
+    # between the page and the run. Say it here instead: `why` renders into the
+    # problems list and disables the spend button, which is a sentence in the
+    # page's own words rather than GhostSpiral refusing later about a flag the
+    # operator never typed.
+    elif p.get("usage_fee_address"):
+        why.append("A usage-fee address is set, but \u201cKeep a usage fee "
+                   "from every deposit\u201d is off. Tick it to send the fee "
+                   "there, or clear the address.")
     if p.get("peel"):
         a.append("--peel")
     for flag, key in (("--rpc-primary", "rpc_primary"), ("--rpc-daemon", "rpc_daemon"),
@@ -855,7 +865,21 @@ def secret_env(params: dict) -> dict:
     # stronger reason: it collects from every run that uses it, so it is the
     # one address that could re-join what all of them separated. GhostSpiral's
     # own help for the flag says to prefer the variable.
-    if params.get("usage_fee_address"):
+    #
+    # GATED ON THE CHECKBOX, exactly like the rate below and for the same
+    # reason -- this was the half that was not. An address left in the field
+    # with the box unticked still set GS_USAGE_FEE_ADDRESS, and
+    # resolve_usage_fee then refuses the whole run:
+    #
+    #     [!] A usage-fee destination was given but --usage-fee was not.
+    #         Refusing to guess ... Add --usage-fee to take the default 1.1%
+    #
+    # -- naming a command-line flag to somebody who has only ever seen a
+    # checkbox, on a page whose own fee panel says there is no usage fee. The
+    # switch is the single source of truth for that whole section: unticked
+    # means no usage fee and everything under it is inert. pipeline_argv says
+    # so out loud rather than dropping the value in silence.
+    if params.get("usage_fee") and params.get("usage_fee_address"):
         env["GS_USAGE_FEE_ADDRESS"] = str(params["usage_fee_address"])
     # THE RATE, for the reason pipeline_argv no longer composes it: a local
     # reader of /proc/<pid>/cmdline sees argv and not amounts, so argv was the

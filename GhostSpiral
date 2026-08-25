@@ -1293,10 +1293,24 @@ def mix_minimum_xmr(fee_xmr: Decimal, wallets: int, *,
     the fee to spend it is unspendable by anyone (see exit_is_fundable), so a
     cut that merely clears DUST_XMR is a fee the operator can never collect and
     a permanent on-chain output created to do it. At the shipped 1.1% and a
-    0.0024 fee that floor is hop_fee_reserve/0.011 = 0.3273 XMR, which is
-    ABOVE the mixing minimum at every wallet count up to about 15 -- so with a
-    cut enabled the cut, not the mix, is what sets the minimum for a default
-    run. Returned as one number so a UI cannot show the smaller half of that.
+    0.0024 fee that floor is
+
+        (hop_fee_reserve + DUST_XMR) / 0.011 = (0.00360 + 0.0001) / 0.011
+                                             = 0.3364 XMR
+
+    which is ABOVE the mixing minimum at every wallet count up to about 15 --
+    so with a cut enabled the cut, not the mix, is what sets the minimum for a
+    default run. Returned as one number so a UI cannot show the smaller half
+    of that.
+
+    THE DUST TERM IS PART OF THE FLOOR and this line said it was not: it read
+    "hop_fee_reserve/0.011 = 0.3273 XMR", which is the figure without it,
+    while the code three paragraphs down is
+    max(need, (hop_fee_reserve(fee) + DUST_XMR) / usage_pct) and the comment
+    beside that line explains exactly why the term is there ("an output worth
+    exactly the fee to spend it is worth nothing once spent"). 0.3273 is the
+    smaller half of the number this docstring's own closing sentence says a UI
+    must not be able to show.
 
     NOT FOR --peel. A peel chain sizes itself with fit_peel_distribution
     walking PEEL_BUDGET_FRACTIONS, which is a different rule; this would be a
@@ -2995,6 +3009,77 @@ def refuse_peel_multichunk(args, jm_utxos) -> None:
         f"{n} chunks, or run the\n"
         f"    tumbler with a single output address and swap the rest in "
         f"another run.")
+
+
+def refuse_fee_multichunk(args, jm_utxos) -> None:
+    """Refuse --usage-fee with more than one swap chunk, BEFORE the swap.
+
+    THE SAME HOLE refuse_peel_multichunk exists to close, in the sibling gate,
+    left open. _refuse_fee_combinations refuses `--usage-fee --split N` at
+    parse time and states the reason precisely: "the spendability floor is
+    checked against the TOTAL while the operator receives N separate outputs --
+    each of which can be individually below the fee to move it, which is the
+    exact uncollectable output the floor exists to prevent."
+
+    It tests args.split. The chunk count is not args.split; it is
+    planned_chunk_count, whose first line is "JoinMarket first, because when it
+    ran its UTXOs ARE the chunks and --split is not consulted". And
+    resolve_usage_fee runs at parse time, fifty-odd lines before
+    stage1_joinmarket, so it could not see a count that does not exist yet.
+    Nothing reconciled the two afterwards.
+
+    Driven through the shipped functions, `--usage-fee --joinmarket` with a
+    tumble that produced three UTXOs and --split left at its default of 1:
+
+        planned_chunk_count      -> 3
+        refuse_peel_multichunk   -> passes (no --peel)
+        _refuse_fee_combinations -> passes  <-- the gate, with 3 chunks
+        stage 4                  -> build_distribution_plan divides the cut
+                                    by 3 and pays three outputs
+
+    -- so the floor was checked against the whole cut and the operator
+    receives a third of it three times, which is the uncollectable output the
+    floor exists to prevent, arrived at by the one route the flag cannot see.
+
+    HERE, for the same reason the peel gate is here: the tumbler has run so the
+    count exists, and no quote has been fetched, no deposit address printed and
+    nothing Monero-side created. Asks planned_chunk_count rather than
+    re-deriving, so this gate and the entry set cannot answer differently.
+
+    The --split path is refused earlier still, by _refuse_fee_combinations at
+    parse time, so in a real run this never sees it. The message reads the
+    count the same way the peel gate does all the same, rather than naming
+    JoinMarket to somebody who did not use it.
+    """
+    if not getattr(args, "usage_fee_pct", None):
+        return
+    n = planned_chunk_count(args, jm_utxos)
+    if n <= 1:
+        return
+    integrity_log("stage1", "fee_multichunk_refused")
+    # `n` and a reason that matches how the count was reached. The peel gate's
+    # own note records why: its message named --split to an operator who never
+    # passed it, "about a count they did not choose, so the one instruction
+    # they are given does not apply to their command line".
+    _why = (f"JoinMarket's tumble produced {len(jm_utxos)} UTXOs, so this run "
+            f"has {n} swap chunks"
+            if jm_utxos else
+            f"--split {n} gives this run {n} swap chunks")
+    sys.exit(
+        f"[!] --usage-fee needs a SINGLE swap chunk, and {_why}.\n"
+        f"    The fee would be split across {n} fan-out transactions: a "
+        f"partial relay pays a\n"
+        f"    partial fee, and the spendability floor is checked against the "
+        f"TOTAL while you\n"
+        f"    would receive one output per chunk \u2014 each of which can be "
+        f"worth less than the fee\n"
+        f"    to move it.\n"
+        f"\n"
+        f"    NOTHING HAS BEEN SWAPPED. No quote has been fetched, no deposit "
+        f"address has been\n"
+        f"    printed and no Monero has moved.\n"
+        f"    Drop --usage-fee for this run, or run the tumbler with a single "
+        f"output address.")
 
 
 def create_entry_set(rpc, n: int) -> list:
@@ -8233,18 +8318,16 @@ def main():
     else:
         jm_utxos = stage1_joinmarket(args, args.btc_entry)
     integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
-    # THE CHUNK COUNT IS KNOWN NOW, AND --peel NEEDS ONE. resolve_split can
-    # only see --split; JoinMarket's UTXOs decide the count without it. Asked
-    # here, before the entry set, the quotes and the deposit instructions --
-    # see refuse_peel_multichunk for the walk that lands on the stage-4
-    # backstop instead.
+    # THREE GATES, ONE QUESTION: how many swap chunks will this run have?
+    # resolve_split answers it at parse time from --split alone, and
+    # JoinMarket's UTXOs decide the count without ever touching that flag -- so
+    # each of these three walks past the parse-time gate and lands on a stage-4
+    # backstop instead, after the entry set, the quotes, the deposit
+    # instructions and, for two of them, the swap. Asked HERE the tumbler has
+    # run, so the count exists, and nothing Monero-side has been created.
+    # Each function's docstring carries its own walk.
     refuse_peel_multichunk(args, jm_utxos)
-    # THE SAME WALK, ONE REFUSAL ALONG. resolve_split checked --split against
-    # the mix-target count at parse time; JoinMarket's UTXOs are the chunk
-    # count and never touched that flag, so `--joinmarket --wallets 3` with a
-    # six-output tumble went past it and landed on the stage-4 empty-slice
-    # abort -- after the entry set, the quotes, the deposit instructions and
-    # the swap. Here the count exists and nothing Monero-side does.
+    refuse_fee_multichunk(args, jm_utxos)
     refuse_starved_chunks(args, jm_utxos)
 
     ###########################################################################
@@ -8282,15 +8365,8 @@ def main():
     # dangerous. It is held for the whole run, which is hours for a peel
     # chain, and that is the intent: two GhostSpiral runs against one wallet
     # is never safe.
-    #
-    # AND THE PATH IS RELATIVE, which is why there is a second argument. The
-    # sentence above says "against one wallet"; the file says "in one
-    # directory". Driven, two runs on the SAME --rpc-primary: same directory,
-    # run 2 refused; different directories, run 2 ALSO acquired, and both went
-    # on to spend the same wallet with nothing printed about it. `scope=` is
-    # the guard that means what that sentence says -- keyed on the wallet-rpc
-    # endpoint, held by the kernel outside the filesystem, so cwd, PrivateTmp
-    # and ProtectHome cannot move it. See _scope_lock.
+    # ...but that path is RELATIVE, so the file alone means "one directory",
+    # not "one wallet". `scope=` is the half that means it: see _scope_lock.
     with run_lock(Path(".ghostspiral.lock"), "GhostSpiral",
                   scope=rpc_lock_scope(args.rpc_primary)):
         sub_account = resolve_mix_account(args, rpc_primary, receive_mode,
@@ -9712,8 +9788,20 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     complete" has no reason to suspect a tenth of it stayed behind.
 
     So the change is swept -- sweep_all, whole balance, ZERO change of its own
-    (proven on-chain in tests/real_hop_sweep_testnet.py) -- into a fresh mix
-    subaddress, which then hops with everything else.
+    (proven on-chain in tests/real_hop_sweep_testnet.py) -- onto a fresh
+    address, where it RESTS. It does not hop with everything else, and this
+    sentence used to say it did: it read "into a fresh mix subaddress, which
+    then hops with everything else", forty-five lines below the paragraph at
+    the top of this docstring that exists to correct exactly that claim. The
+    ordering settles it and it is not close --
+
+        stage 4, in order:
+          select_fanout_targets     the mix targets are chosen
+          build_dag_plan            the hop round is planned
+          build_change_sweep_jobs   the destination is MINTED
+
+    -- the destination does not exist when the hop round is planned, so it
+    cannot be a hop source.
 
     This SPENDS one account's subaddress 0, exactly once. That is safe here and
     would not have been before the account rotation: these are per-run
@@ -9808,7 +9896,12 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                   f"take it. It is safe, but it is UNMIXED and it is the one "
                   f"output that never moves. Sweep it by hand once it unlocks.")
         else:
-            _note("swept_into_mix")
+            # "swept_and_rests", not "swept_into_mix". The name was the
+            # fourth place carrying the claim this docstring opens by
+            # correcting, and the only one that survived into the integrity
+            # chain -- where it is the sentence a later reader reconstructs
+            # the run from.
+            _note("swept_and_rests")
             print(f"  [+] The change on account {account} was swept to a fresh "
                   f"address (it moves once and rests there -- it does NOT go "
                   f"through the hop rounds; see _run_change_sweep); "

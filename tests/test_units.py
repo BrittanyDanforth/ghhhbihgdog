@@ -3883,6 +3883,58 @@ check("control: a directory ONE level down is still covered (--output plans)",
       _gsc.wipe_covers(Path.cwd() / "plans"))
 shutil.rmtree(_cov_dir, ignore_errors=True)
 
+# THE DRY RUN COUNTED THE SAME FILE TWICE. _wipe_gs_artifacts_inner dedupes
+# its search roots with set(), which compares Paths by TEXT -- and "." is never
+# textually equal to "/home/you", so running paranoia_mode FROM the home
+# directory, the ordinary way to run it, put one tree in the list twice. A real
+# wipe survives that (the second pass finds the files gone); --dry-run deletes
+# nothing, so it named and counted every artifact twice, in the one function
+# whose own comment says the reported number "never overstates what happened".
+# The preview is what an operator reads before the irreversible run.
+_dr_root = Path(tempfile.mkdtemp(prefix="dryroot_"))
+_dr_home, _dr_cwd = os.environ.get("HOME"), os.getcwd()
+try:
+    os.environ["HOME"] = str(_dr_root)
+    (_dr_root / "thor_pairs.json").write_text("{}")
+    (_dr_root / "pager_state.json").write_text("{}")
+    _dr_ld = importlib.machinery.SourceFileLoader(
+        "paranoia_for_dry", os.path.join(REPO, "paranoia_mode"))
+    _DR = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(_dr_ld.name, _dr_ld))
+    _dr_ld.exec_module(_DR)
+    _DR.integrity_log = lambda *a, **k: None
+
+    def _dry_count(where, extra=None):
+        os.chdir(where)
+        _b = _io.StringIO()
+        with _ctx.redirect_stdout(_b):
+            _DR._wipe_gs_artifacts_inner(True, extra)
+        for _l in _b.getvalue().splitlines():
+            if "Would delete" in _l:
+                return int(_l.split("Would delete")[1].split()[0])
+        return -1
+
+    _elsewhere = tempfile.mkdtemp(prefix="dryelse_")
+    _n_away = _dry_count(_elsewhere)
+    _n_home = _dry_count(str(_dr_root))
+    check(f"paranoia dry-run: the preview counts each artifact ONCE when run "
+          f"from the home directory ({_n_home}, not {_n_home * 2 if _n_home != 2 else 4})",
+          _n_home == 2)
+    check(f"paranoia dry-run: NON-VACUITY -- it finds them at all from "
+          f"elsewhere too ({_n_away})", _n_away == 2)
+    check("paranoia dry-run: ...and the two agree, so the count does not "
+          "depend on which directory the operator happened to be in",
+          _n_home == _n_away)
+    # A --search-dir naming a root by another spelling folds onto it as well.
+    check("paranoia dry-run: a --search-dir that names an existing root by "
+          "another spelling is not swept twice",
+          _dry_count(_elsewhere, [str(_dr_root) + "/."]) == 2)
+finally:
+    os.chdir(_dr_cwd)
+    if _dr_home is not None:
+        os.environ["HOME"] = _dr_home
+    shutil.rmtree(_dr_root, ignore_errors=True)
+
 # GhostSpiral must actually WARN, not merely be able to. An incomplete run
 # keeps its plans on purpose, so an --output the wipe cannot reach is exactly
 # the case that strands every hop's destination and amount on disk.

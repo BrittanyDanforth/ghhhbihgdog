@@ -1722,9 +1722,15 @@ xmr_address = _xmr_address_field
 #: it carries. Seven is what that format has room for.
 MAX_WAKE_EXIT_DESTS = 7
 
-#: The worst case this cap has to fit: eight integrated addresses (106
-#: characters, the longer of the two forms) plus the envelope. Computed rather
-#: than asserted from a literal so the two cannot drift.
+#: The worst case this cap has to fit: MAX_WAKE_EXIT_DESTS integrated addresses
+#: (106 characters, the longer of the two forms) plus the envelope. Computed
+#: rather than asserted from a literal so the two cannot drift -- which is
+#: exactly what this sentence did: it said "eight" while the expression below
+#: has always used MAX_WAKE_EXIT_DESTS, which is SEVEN. Both numbers check out
+#: (seven is 942 bytes against a 1023-byte inner limit; eight is 1051 and
+#: seal() refuses it), so the guard was correct and only its description was
+#: off by one -- and naming the constant rather than a literal is the fix that
+#: cannot go stale a second time.
 _MAX_WITHDRAW_NOTE = (
     TAG_LEN
     + len(json.dumps({"job_id": "0" * 32, "challenge": "0" * 64,
@@ -1811,10 +1817,26 @@ _xmr_address_list.spec = (f"1-{MAX_WAKE_EXIT_DESTS} xmr addresses "
 #: of this path only because the wake agent was not passing --usage-fee at all,
 #: which was itself a bug. With the
 #: cut on, mix_minimum_xmr's own docstring is the authority: the cut's
-#: spendability floor is hop_fee_reserve/usage_pct, and it sits ABOVE the
-#: mixing minimum at every wallet count up to about fifteen. Driven at a
-#: 0.0024 fee: 0.3364 XMR at three hops and 0.3364 at ten -- the same number,
-#: because the cut is what sets it, not the hops.
+#: spendability floor is (hop_fee_reserve + DUST_XMR)/usage_pct, and it sits
+#: ABOVE the mixing minimum at every wallet count up to about fifteen.
+#:
+#: THE TABLE HAS THREE ROWS AND THIS PARAGRAPH USED TO STOP AT TWO. It read
+#: "0.3364 XMR at three hops and 0.3364 at ten -- the same number, because the
+#: cut is what sets it, not the hops", which is true of exactly the two rows it
+#: names. Computed by calling the shipped mix_minimum_xmr at a 0.0024 fee, with
+#: --dag-mixing, one chunk and an exit destination (a withdrawal always has
+#: one):
+#:
+#:                        no cut     with the shipped 1.1% cut
+#:   depth 1 (3 hops)     0.1784     0.3364   <- the cut sets it
+#:   depth 2 (10 hops)    0.2972     0.3364   <- the cut sets it
+#:   depth 3 (20 hops)    0.4764     0.4817   <- the HOPS set it again
+#:
+#: At the deepest depth the phone offers, the cut stops being the binding
+#: constraint and the minimum is 43% above the figure the old sentence gave.
+#: The operator-facing menu was never wrong -- WITHDRAW_DEPTH_NOTE[3] says
+#: "highest minimum" and deliberately quotes no number -- but this is the
+#: analysis a future reader would size that menu from.
 #:
 #: So the honest claim is narrower and still worth the change:
 #:

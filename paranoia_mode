@@ -647,12 +647,40 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
     file_patterns = GS_ARTIFACT_FILE_PATTERNS
     dir_patterns = GS_ARTIFACT_DIR_PATTERNS
 
-    search_roots = list(set([
-        Path("."),
-        Path.home(),
-        Path.home() / "ghostspiral",
-        Path.home() / "GhostSpiral",
-    ] + [Path(d) for d in (extra_dirs or [])]))
+    # RESOLVED BEFORE THE set(), because set() dedupes Paths by their TEXT and
+    # "." is never textually equal to "/home/you" -- so running paranoia_mode
+    # from the home directory, which is the ordinary way to run it, put the
+    # same tree in this list twice. A real wipe survives that (the second pass
+    # finds the files already gone), but --dry-run does not delete anything, so
+    # every artifact was named and COUNTED twice. Driven with two files in a
+    # fake home:
+    #
+    #     run from somewhere else     -> "Would delete 2 artifact(s)"
+    #     run from the home dir       -> "Would delete 4 artifact(s)"
+    #
+    # in the one function whose own comment two lines down says the reported
+    # number "never overstates what happened". The preview is what an operator
+    # reads before the irreversible run, and it was reading double.
+    #
+    # Resolving also folds an --search-dir that names a root by another
+    # spelling (a symlink, a trailing "/.", a relative path) onto the same
+    # entry, and makes the dry-run listing print absolute paths.
+    _roots = [Path("."), Path.home(),
+              Path.home() / "ghostspiral", Path.home() / "GhostSpiral"]
+    _roots += [Path(d) for d in (extra_dirs or [])]
+    _seen, search_roots = set(), []
+    for _r in _roots:
+        try:
+            _r = _r.resolve()
+        except OSError:
+            # A cwd that has been deleted, or an unresolvable --search-dir.
+            # Keep it as given rather than dropping it: the sweep's own
+            # is_dir() check below is what decides whether it is usable.
+            pass
+        if _r in _seen:
+            continue
+        _seen.add(_r)
+        search_roots.append(_r)
 
     # count = files ACTUALLY deleted; failed (e.g. permission-denied) deletes
     # are NOT counted, so the reported number never overstates what happened.

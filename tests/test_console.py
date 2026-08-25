@@ -2293,6 +2293,39 @@ def test_the_fee_rate_never_reaches_a_command_line():
           "4" + "z" * 94 not in c.pipeline_argv(_withaddr)[0]
           and c.secret_env(_withaddr).get("GS_USAGE_FEE_ADDRESS")
           == "4" + "z" * 94)
+    # ...AND THE DESTINATION IS GATED ON THE SAME BOX, which it was not. The
+    # rate's gate above exists because an ungated rate makes a run skim while
+    # the page shows no fee. The address failed differently and just as badly:
+    # an address left in the field with the box unticked still set
+    # GS_USAGE_FEE_ADDRESS, and resolve_usage_fee then REFUSED the whole run --
+    #
+    #   [!] A usage-fee destination was given but --usage-fee was not.
+    #       ... Add --usage-fee to take the default 1.1%, or drop the address.
+    #
+    # -- naming a command-line flag to somebody who has only seen a checkbox,
+    # on a page whose fee panel says there is no usage fee. Driven through the
+    # real secret_env into the real resolve_usage_fee.
+    _addr_only = {"btc_entry": "bc1x", "wallets": 10,
+                  "usage_fee_address": "4" + "z" * 94}
+    check("fee address: an address left in the field with the box UNTICKED "
+          "sets no variable, so the run is not refused about a flag the "
+          "operator never typed",
+          "GS_USAGE_FEE_ADDRESS" not in c.secret_env(_addr_only))
+    # NOTHING IS DROPPED IN SILENCE, though: the page says so in its own
+    # words, and `problems` disables the spend button.
+    _probs = c.pipeline_argv(_addr_only)[1]
+    check("fee address: ...and the page SAYS the address is being ignored "
+          "rather than dropping it quietly",
+          any("usage-fee address" in x and "off" in x for x in _probs))
+    check("fee address: ...in the page's own words, not as a flag name",
+          not any("--usage-fee" in x for x in _probs))
+    # NON-VACUITY: ticking the box sends it and raises no problem.
+    check("fee address: NON-VACUITY -- with the box ticked the address is "
+          "sent and the page raises nothing about it",
+          c.secret_env(_withaddr).get("GS_USAGE_FEE_ADDRESS")
+          == "4" + "z" * 94
+          and not any("usage-fee address" in x
+                      for x in c.pipeline_argv(_withaddr)[1]))
 
 
 def test_sensitive_inputs_do_not_go_into_browser_history():

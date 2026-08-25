@@ -63,9 +63,30 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         required it in both phases, which rejected a legitimate sign-only run
         on an older or hand-authored plan for no security benefit.
     """
+    # THE SHAPE BEFORE THE FIELDS. Everything below reads tx.get(...), and
+    # .get exists on a dict and on nothing else a JSON file can hold. Driven
+    # with nine malformed plans -- a bare string, a list of strings, a null
+    # entry, a list of [address, amount] pairs, a destination that is a plain
+    # address string -- and all nine produced
+    #
+    #     AttributeError: 'str' object has no attribute 'get'
+    #
+    # a Python traceback rather than one of this function's refusals. That is
+    # the wrong failure in the wrong place: the plan crosses an air gap on a
+    # removable stick, the operator is standing at an offline machine with no
+    # way to look anything up, and a traceback reads as "the signer is broken"
+    # rather than "this file is not a plan". Every other refusal in this
+    # validator names the field and says what it should have been.
+    if not isinstance(plan, list):
+        sys.exit(f"[!] Plan is a {type(plan).__name__}, not a list of "
+                 f"transactions. This file is not an unsigned_v1 plan.")
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
+        if not isinstance(tx, dict):
+            sys.exit(f"[!] Schema error at TX {i}: a transaction must be an "
+                     f"object with named fields, got a {type(tx).__name__}. "
+                     f"Refusing to sign a plan this tool cannot read.")
         if not isinstance(tx.get("src"), str):
             sys.exit(f"[!] Schema error at TX {i}: 'src' missing or wrong type")
         si = tx.get("src_index")
@@ -216,6 +237,14 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
                          f"EXACTLY ONE fixed destination alongside it -- it "
                          f"means 'the rest', and 'the rest' of an unspecified "
                          f"number of fixed outputs is not a number.")
+            # ...and it must be an OBJECT, checked before .get is called on it.
+            # The destinations loop below does this too, but it runs after this
+            # block, so a string destination crashed here first.
+            if not isinstance(tx["destinations"][0], dict):
+                sys.exit(f"[!] Schema error at TX {i}: the fixed destination "
+                         f"beside 'consume_to' must be an object with "
+                         f"'address' and 'amount', got a "
+                         f"{type(tx['destinations'][0]).__name__}.")
             if _consume == tx["destinations"][0].get("address"):
                 sys.exit(f"[!] Schema error at TX {i}: 'consume_to' is the "
                          f"same address as the fixed destination, so the "
@@ -226,6 +255,14 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
             if not isinstance(dests, list) or not dests:
                 sys.exit(f"[!] Schema error at TX {i}: 'destinations' must be a non-empty list")
             for j, d in enumerate(dests):
+                # Same shape-before-fields rule as the entry above: a
+                # destinations list of bare address STRINGS is the obvious way
+                # to hand-write one, and it crashed here instead of being told
+                # what the field wants.
+                if not isinstance(d, dict):
+                    sys.exit(f"[!] TX {i} dest {j}: a destination must be an "
+                             f"object with 'address' and 'amount', got a "
+                             f"{type(d).__name__}.")
                 if not isinstance(d.get("address"), str):
                     sys.exit(f"[!] TX {i} dest {j}: 'address' missing or wrong type")
                 try:
@@ -1509,7 +1546,24 @@ def phase_sign(args, plan: List[dict]):
         # (tempfile is imported at module scope -- a function-local `import
         # tempfile` here made the name local to the WHOLE function, so the
         # output-import block above raised UnboundLocalError.)
-        work_dir = tempfile.mkdtemp(prefix="gs_sign_")
+        #
+        # STAGED IN tmpfs WHERE THERE IS ONE, like the password file below and
+        # the output-import scratch above. This was the only one of the three
+        # created with a bare mkdtemp(), so it landed on physical disk -- and
+        # the cleanup below claims to "overwrite every file's full extent
+        # first, then remove the directory", which is a claim that only holds
+        # on a medium that overwrites in place. On a journalling filesystem or
+        # an SSD's wear-levelled flash it does not, and what is left behind is
+        # unsigned_monero_tx plus the signed_monero_tx wallet-cli writes: a
+        # fully signed, relayable transaction.
+        #
+        # _pw_scratch_dir falls back to $TMPDIR on a host with no usable
+        # /dev/shm, which is what this line did unconditionally before, so
+        # nothing that worked stops working. paranoia_mode sweeps gs_sign_* by
+        # prefix from BOTH roots (_wipe_targeted_temp_roots), so a SIGKILL
+        # before the finally is still covered either way -- this makes the
+        # normal path leave nothing on a disk to begin with.
+        work_dir = tempfile.mkdtemp(prefix="gs_sign_", dir=_pw_scratch_dir())
         pw_files: list = []      # password files to securely erase in `finally`
         try:
             # phase_create saved the RPC's `unsigned_txset`, which is a HEX
