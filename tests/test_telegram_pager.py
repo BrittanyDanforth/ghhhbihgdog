@@ -174,6 +174,7 @@ def _wizard_params(answers):
     p.allow = {1}
     p.allow_users = set()
     p.handle_owner = {}
+    p.spenders = 1
     p.busy = _th.Lock()
     p.ignored = 0
     p.convos = {}
@@ -293,7 +294,7 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
                  ("expired_uncollected", ""), ("collected_no_result", "")):
     _sent.clear()
     pg.doorbell = lambda _o=_out, _hh=_h: types.SimpleNamespace(
-        run_wake=lambda a, k, j, p: _FakePending(_o, _hh))
+        run_wake=lambda a, k, j, p, on_event=None: _FakePending(_o, _hh))
     _pv.poke(111, "receive_and_quote", {"amount_sat": 5000000})
     _text = "\n".join(t for _, t in _sent)
     check(f"outcome {_out}: no XMR address reaches the chat", XMR not in _text)
@@ -471,9 +472,9 @@ _e2e_args = types.SimpleNamespace(state=os.path.join(_d, "e2e.json"),
                                   no_jitter=True, key="unused")
 _pe = pg.Pager(_e2e_args, "123456:TOKEN", _KEY, {"https": "socks5h://x"})
 _real_rw = DB.run_wake
-DB.run_wake = lambda a, k, j, p: _real_rw(
+DB.run_wake = lambda a, k, j, p, on_event=None: _real_rw(
     a, k, j, p, sock_factory=lambda: _FakeSock(),
-    sleep=lambda n: time.sleep(min(n, 0.05)))
+    sleep=lambda n: time.sleep(min(n, 0.05)), on_event=on_event)
 threading.Thread(target=_vault, args=("A3F1",), daemon=True).start()
 # THROUGH THE WIZARD, because that is the only path to a wake now. The
 # end-to-end drive used the one-shot form, which is refused.
@@ -584,6 +585,7 @@ def _wedge_pager(fail_on):
     p.args = types.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 0, {}
     p.allow_users, p.handle_owner = set(), {}
+    p.spenders = 1
     p.busy = _th2.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
     p.burn, p.burn_after, p.burn_now = [], 0, False
@@ -774,7 +776,7 @@ check("polls: ...and it stops on the next poll once the wake finishes, so "
 # which publish_commands' own docstring calls "indistinguishable from a bot
 # that does not work". A four-command blind spot survived a green suite.
 _HANDLED_ERRS = {"depo_wizard", "withdraw_wizard", "settings", "fee", "speed",
-                 "exit", "cancel", "help", "status"}
+                 "exit", "cancel", "help", "welcome", "status"}
 _unresolved = []
 for _c, _desc in pg.BOT_COMMANDS:
     _job, _params, _err = pg.parse_command(f"/{_c}")
@@ -788,7 +790,13 @@ check(f"menu: every published command resolves in parse_command "
 # AND THE OTHER DIRECTION, which is the one that was broken. Aliases are
 # deliberately unpublished -- one spelling in the menu, several accepted --
 # so they are named here rather than inferred.
-_ALIASES = {"depo", "dep", "recv", "withdraw", "stop", "watch", "start"}
+# THE PUBLISHED SPELLINGS CHANGED, AND SO DID WHICH SIDE OF THIS LINE THEY SIT
+# ON. /receive read as "receive my money" and meant "mint me an address" --
+# opposite ends of the pipeline -- and the command that actually pays the
+# operator was /send, which does not say a direction at all. The menu now
+# offers /address and /withdraw; /receive, /recv and /send are accepted
+# forever, for the reason this file gives about /depo.
+_ALIASES = {"depo", "dep", "recv", "receive", "addr", "send", "stop", "watch"}
 _pub = {c for c, _ in pg.BOT_COMMANDS}
 _handled = set(re.findall(r'cmd (?:==|in) \(?"/([a-z]+)"', _SRC_PG_EARLY))
 _handled |= set(re.findall(r'"/([a-z]+)"[,)]',
@@ -913,6 +921,7 @@ def _plain_pager(busy=False, why=""):
     p.args = _ty3.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 4, {}
     p.allow_users, p.handle_owner = set(), {}
+    p.spenders = 1
     p.busy = _th3.Lock()
     if busy:
         p.busy.acquire()
@@ -1003,8 +1012,20 @@ check(f"help: ...and that figure is consistent with the real jitter "
 # spellings still WORK -- parse_command takes both -- but the menu and the help
 # offer the ones a stranger could guess.
 check("help: NON-VACUITY -- every advertised command is listed",
-      all(c in pg.HELP for c in ("/deposit", "/check", "/wait", "/send",
-                                 "/settings", "/cancel", "/status")))
+      all(c in pg.HELP for c in ("/deposit", "/check", "/wait", "/withdraw",
+                                 "/address", "/settings", "/cancel",
+                                 "/status")))
+# AND THE DIRECTION IS ON THE LINE, not left to the verb. This is the whole
+# of the rename: an operator waiting to be paid must not be able to read the
+# list and pick the wrong one.
+check("help: the two money-in commands say MONEY IN and the money-out one "
+      "says MONEY OUT",
+      pg.HELP.count("MONEY IN") == 2 and pg.HELP.count("MONEY OUT") == 1)
+for _c, _d in pg.BOT_COMMANDS:
+    if _c in ("deposit", "address"):
+        check(f"help: /{_c} is marked MONEY IN", _d.startswith("MONEY IN"))
+    if _c == "withdraw":
+        check(f"help: /{_c} is marked MONEY OUT", _d.startswith("MONEY OUT"))
 # ONE LIST, so the "/" menu Telegram renders and the help cannot disagree.
 check("help: the help is BUILT from the command list, not kept beside it",
       all(f"/{_c}" in pg.HELP for _c, _d in pg.BOT_COMMANDS)
@@ -1314,6 +1335,7 @@ class _BurnPager:
         p.args = _ty2.SimpleNamespace()
         p.allow = {111}
         p.allow_users, p.handle_owner = set(), {}
+        p.spenders = 1
         p.busy = __import__("threading").Lock()
         p.ignored = 0
         p.convos = {}
@@ -1503,6 +1525,7 @@ def _room_pager(allow, users):
     p.args = _ty4.SimpleNamespace()
     p.allow, p.ignored, p.convos = set(allow), 0, {}
     p.allow_users, p.handle_owner = set(users), {}
+    p.spenders = len(p.allow_users) or len(p.allow)
     p.busy = _th4.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
     p.burn, p.burn_after, p.burn_now = [], 0, False
@@ -1751,8 +1774,17 @@ for _bad, _label in (("m:nope", "a button not in the table"),
 _mp, _ms, _, _ = _tapper()
 _mp.handle(_msg(111, 111, "/help"))
 _labels = [l for _row in (_ms[0][1] or []) for l, _d in _row]
-check("tap: /help carries the menu", "Deposit" in _labels
-      and "Withdraw" in _labels)
+check("tap: /help carries the menu",
+      any("Deposit" in l for l in _labels)
+      and any("Withdraw" in l for l in _labels))
+# THE LABELS SAY WHICH WAY THE MONEY GOES. "Fresh address" sat next to
+# "Withdraw" and gave no clue which of them pays the operator -- the same
+# confusion as the command name it was drawn from.
+check("tap: the money-in buttons and the money-out button are marked with "
+      "different arrows, so the direction is readable without the words",
+      any("\u2b07" in l and "Deposit" in l for l in _labels)
+      and any("\u2b07" in l and "Monero address" in l for l in _labels)
+      and any("\u2b06" in l and "Withdraw" in l for l in _labels))
 check("tap: ...and every button on it maps to a real command",
       all(pg.parse_callback(_d)[1] == ""
           for _row in (_ms[0][1] or []) for _l, _d in _row))
@@ -1869,6 +1901,259 @@ check("tap: ...and no callback maps to anything the typed vocabulary does "
       "not already have",
       all(pg.parse_command(_t)[2] != "unknown command"
           for _t in pg.CALLBACK_TEXT.values()))
+
+
+# ===========================================================================
+#  ONE WALLET, AND THE ALLOWLIST DOES NOT DIVIDE IT
+#
+#  Driven against the shipped _funded_entry with two piles on one wallet: it
+#  returns the LARGEST single unlocked output and takes no chat argument --
+#  gs_wake_agent, gs_wake_proto and gs_doorbell contain no chat_id at all, on
+#  purpose. So with two allowlisted people, the second one taps Withdraw and
+#  the vault hands them the first one's money, correctly, by its own rules.
+#
+#  There is no fix for that inside the pager: dividing the pot needs a
+#  persistent chat-to-account ledger on the vault -- the record this design
+#  refuses to keep -- and a chat identifier on a wire that deliberately
+#  carries none. So the operator is made to say they know.
+# ===========================================================================
+print("\n== one wallet, several people ==")
+_saved_m = (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy, pg.load_token)
+pg.validate_proxy = lambda u: "socks5h://x"
+pg.verify_tor = lambda p: None
+pg.isolated_proxy = lambda u, tag: {"https": "socks5h://x"}
+pg.load_token = lambda f: "123456:TOKEN"
+try:
+    def _boot(argv):
+        try:
+            pg.main(argv)
+            return ""
+        except SystemExit as _e:
+            return str(_e)
+        except Exception as _e:                              # noqa: BLE001
+            return f"{type(_e).__name__}: {_e}"
+
+    _K = ["--key", "/nonexistent.key"]
+    _two = _boot(_K + ["--chat-id", "111", "--chat-id", "222"])
+    check("pot: two allowlisted people is REFUSED at startup",
+          "SHARE ONE POT" in _two)
+    check("pot: ...and the refusal names what actually happens — the largest "
+          "balance, whoever put it there",
+          "LARGEST unlocked balance" in _two)
+    check("pot: ...with the driven figures, not an abstraction",
+          "1000 XMR" in _two and "300" in _two)
+    check("pot: ...and says the shared budget and the shared lock too",
+          "wake budget" in _two and "one job at a time" in _two)
+    check("pot: ...and offers the acknowledgement rather than only refusing",
+          "--shared-funds" in _two)
+    check("pot: ...and says what to do if they really are separate customers",
+          "one vault and one bot each" in _two)
+    # SENDERS, NOT CHATS. With --user-id the people are the senders and the
+    # chat ids are rooms they stand in.
+    _grp = _boot(_K + ["--chat-id", "-100123", "--user-id", "4242",
+                       "--user-id", "777001"])
+    check("pot: two allowlisted SENDERS in one group is refused too",
+          "SHARE ONE POT" in _grp)
+    # NON-VACUITY, four ways: every legitimate shape still starts. They fail
+    # later on the missing keyfile, which is the proof they got past this gate.
+    for _argv, _label in (
+            (_K + ["--chat-id", "111"], "one private chat"),
+            (_K + ["--chat-id", "111", "--chat-id", "111"],
+             "the same chat id twice — one person, deduplicated"),
+            (_K + ["--chat-id", "-100123", "--user-id", "4242"],
+             "a group with one allowlisted sender"),
+            (_K + ["--chat-id", "111", "--chat-id", "222", "--shared-funds"],
+             "two people WITH --shared-funds")):
+        check(f"pot: NON-VACUITY -- {_label} still starts",
+              "SHARE ONE POT" not in _boot(_argv))
+finally:
+    (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
+     pg.load_token) = _saved_m
+
+# AND IT IS SAID AGAIN AT THE MOMENT MONEY MOVES, because a startup banner is
+# printed to a headless box and the confirm is read by a person.
+_pp1, _ps1 = _room_pager([111], [])
+_pp1.spenders = 1
+_pp1.handle(_msg(111, 111, "/withdraw"))
+_pp1.handle(_msg(111, 111, "4" + "1" * 94))
+_pp1.handle(_msg(111, 111, "2"))
+check("pot: a single-operator install says nothing about a shared pot",
+      "one pot" not in _ps1[-1].lower())
+_pp2, _ps2 = _room_pager([111], [])
+_pp2.spenders = 3
+_pp2.handle(_msg(111, 111, "/withdraw"))
+_pp2.handle(_msg(111, 111, "4" + "1" * 94))
+_pp2.handle(_msg(111, 111, "2"))
+check("pot: a shared install says so on the CONFIRM, which is the moment the "
+      "money moves",
+      "LARGEST balance" in _ps2[-1] and "one pot" in _ps2[-1])
+check("pot: ...and says how many people can drive it",
+      "3 people" in _ps2[-1])
+check("pot: NON-VACUITY -- both are still the confirm question",
+      "SPENDS" in _ps1[-1] and "SPENDS" in _ps2[-1]
+      and "= ?" in _ps1[-1] and "= ?" in _ps2[-1])
+
+
+# ===========================================================================
+#  /address MINTED AN ADDRESS AND SENT "READY" WITHOUT IT
+#
+#  receive_new produces a Monero subaddress and no quote, so there is no
+#  thor_pairs file -- and both delivery paths are keyed on one. Driven with
+#  plain_slip ON and a delivery key configured: seal_slip_for_delivery
+#  returned "", plain_slip_for_chat returned {}, and the chat got
+#  "address ready · slip B7C2". The command whose whole purpose is to hand
+#  over an address handed over none, and called it ready.
+# ===========================================================================
+print("\n== /address says what actually happened ==")
+
+
+class _AddrFin:
+    result = {"status": "done", "handle": "B7C2", "slip": "", "plain": {},
+              "phase": ""}
+
+    def outcome(self):
+        return "done"
+
+
+_ap, _as_, _, _ = _tapper()
+_saved_db = pg._DOORBELL[0]
+pg._DOORBELL[0] = types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None: _AddrFin())
+try:
+    _ap.poke(111, "receive_new", {"count": 1})
+    _atext = _as_[0][0]
+    check("address: it does NOT say 'ready', which is deposit vocabulary for "
+          "a thing that has not happened", "ready" not in _atext.lower())
+    check("address: ...it says the address is not sent to this chat",
+          "NOT sent to this chat" in _atext)
+    check("address: ...and where it is instead",
+          "at the machine" in _atext)
+    check("address: ...and what the label IS good for, so the handle is not "
+          "a phantom", "/check B7C2" in _atext)
+    check("address: ...and the label is still bound to this chat",
+          _ap.handle_owner.get("B7C2") == 111)
+    # NON-VACUITY: a DEPOSIT with no slip still uses the original vocabulary,
+    # so this is a branch and not a rewrite of every finished job.
+    _dp2, _ds2, _, _ = _tapper()
+    _dp2.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+    check("address: NON-VACUITY -- a deposit with no delivery key still says "
+          "'depo ready · slip B7C2'",
+          _ds2[0][0] == "depo ready · slip B7C2")
+finally:
+    pg._DOORBELL[0] = _saved_db
+
+
+# ===========================================================================
+#  /start IS THE ONE MESSAGE EVERY USER SENDS, AND IT WAS A LIST OF COMMANDS
+#
+#  It is what the blue Start button sends and the first thing anybody ever
+#  sends a bot -- answered, until now, with eleven slash-commands and no
+#  sentence saying what the thing IS. And the names themselves were the
+#  problem the welcome now fixes in its first six lines: /receive read as
+#  "receive my money" and meant "mint me an address".
+# ===========================================================================
+print("\n== the welcome ==")
+check("welcome: /start is its own answer, not an alias of /help",
+      pg.parse_command("/start")[2] == "welcome"
+      and pg.parse_command("/help")[2] == "help")
+check("welcome: ...and they really are different text",
+      pg.WELCOME != pg.HELP)
+# A DEEP-LINK PAYLOAD MUST NOT BREAK IT. Telegram sends "/start <payload>"
+# when a user arrives through a t.me link, so `arg` is non-empty on the one
+# command that must never fail.
+check("welcome: /start with a deep-link payload still welcomes",
+      pg.parse_command("/start abc123")[2] == "welcome")
+check("welcome: ...and the group form does too",
+      pg.parse_command("/start@mybot")[2] == "welcome")
+
+_wp, _wsn = _room_pager([111], [])
+_wp.burn_after = 0
+_wp.handle(_msg(111, 111, "/start"))
+check("welcome: an allowlisted chat gets it", _wsn == [pg.WELCOME])
+# ...rendered against THIS pager's setting, not the module default.
+_wp2, _wsn2 = _room_pager([111], [])
+_wp2.burn_after = 7200
+_wp2.handle(_msg(111, 111, "/start"))
+check("welcome: ...and it reflects the burn setting the pager is running with",
+      _wsn2 == [pg.welcome_text(7200)] and "deleted after 2h" in _wsn2[0])
+# ...AND A STRANGER STILL GETS NOTHING. A welcome is a reply, and a reply to
+# an unlisted chat confirms the bot is alive to whoever found it.
+_sp2, _ss2 = _room_pager([111], [])
+_sp2.handle(_msg(999, 999, "/start"))
+check("welcome: a chat that is not allowlisted gets NO welcome — a reply is "
+      "still a reply", _ss2 == [] and _sp2.ignored == 1)
+
+# WHAT IT SAYS. Three things, in the order somebody needs them.
+check("welcome: it says which way each command moves money",
+      "MONEY IN" in pg.WELCOME and "MONEY OUT" in pg.WELCOME)
+check("welcome: ...and names the rename directly, because an operator who "
+      "learned the old word has to be told it moved",
+      "/address" in pg.WELCOME and "/withdraw" in pg.WELCOME
+      and "receive" in pg.WELCOME.lower())
+check("welcome: ...and says outright which one pays them, since that is the "
+      "question the old names got wrong",
+      "pays YOU is /withdraw" in pg.WELCOME)
+check("welcome: ...and the two things that change how the operator should "
+      "behave in this chat",
+      "written down" in pg.WELCOME and "until you confirm" in pg.WELCOME)
+check("welcome: ...and that the transcript should be assumed readable",
+      "read by somebody who is not you" in pg.WELCOME)
+
+# WHAT IT MUST NOT SAY, AND THE FIRST DRAFT SAID ALL OF IT.
+#
+# That draft opened "This is a doorbell, not a wallet. Nothing here holds a
+# key, and it cannot move money on its own -- it asks a machine that is
+# switched off most of the time, and that machine decides." Every clause is
+# true, and together they say: there is a second machine, it is normally
+# powered down, this chat is what wakes it, and the keys are not here. That is
+# the shape of the operation, written into the surface this file is built on
+# the assumption that somebody else reads.
+#
+# The same rule already cut /settings and FEE_ANSWER back from paragraphs --
+# "a reader who has the transcript and nothing else learns the shape of the
+# operation from the explanations, not from the answers." A welcome is the
+# LONGEST message this bot sends, so it is where that rule matters most.
+_ARCH = ("doorbell", "switched off", "powered", "holds a key", "holds no key",
+         "another machine", "that machine", "second machine", "wakes",
+         "wake ", "offline", "air gap", "air-gapped", "ThinkPad", "Raspberry",
+         "systemd", "vault", "gs_", "127.0.0.1", "socks5", "Tor",
+         "ThorChain", ".key", "keyfile", "wallet file", "server", "LAN")
+for _leak in _ARCH:
+    check(f"welcome: describes no part of the setup — no {_leak.strip()!r}",
+          _leak.lower() not in pg.WELCOME.lower())
+# NON-VACUITY on that sweep: the welcome is not empty, and it DOES contain the
+# service words -- so this is a filter that lets the right things through.
+check("welcome: NON-VACUITY -- it still says what the service does",
+      "Monero" in pg.WELCOME and "/deposit" in pg.WELCOME
+      and len(pg.WELCOME) > 300)
+
+# THE DELETION PROMISE IS CONDITIONAL, because --burn-after 0 disables it and
+# a welcome promising deletion on an install that does not delete is the class
+# of confident false statement this repo keeps removing.
+check("welcome: an install with no --burn-after does not promise deletion",
+      "deleted" not in pg.welcome_text(0))
+check("welcome: ...and one with it says so, with the hours it is set to",
+      "deleted after 2h" in pg.welcome_text(7200))
+check("welcome: ...reading the real setting rather than a literal",
+      "deleted after 13h" in pg.welcome_text(13 * 3600))
+check("welcome: ...and a malformed value is treated as off, not as a crash",
+      "deleted" not in pg.welcome_text(None)
+      and "deleted" not in pg.welcome_text("x"))
+check("welcome: no address, amount or memo is in it",
+      not re.search(r"[48][0-9A-Za-z]{50,}", pg.WELCOME)
+      and "OP_RETURN" not in pg.WELCOME)
+# ...and it is short enough to read on a phone without scrolling past the
+# buttons. Telegram's own limit is 4096; the constraint here is a thumb.
+check(f"welcome: it fits on a screen ({len(pg.WELCOME)} chars, "
+      f"{pg.WELCOME.count(chr(10)) + 1} lines)",
+      len(pg.WELCOME) < 1200 and pg.WELCOME.count("\n") < 30)
+
+# AND THE BUTTONS COME WITH IT, which is the whole point of answering /start
+# with something other than a list of things to type.
+_bp, _bs, _, _ = _tapper()
+_bp.handle(_msg(111, 111, "/start"))
+check("welcome: the menu is under it",
+      _bs and _bs[0][1] == pg.MENU_BUTTONS)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
