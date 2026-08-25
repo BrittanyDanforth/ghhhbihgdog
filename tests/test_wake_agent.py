@@ -1435,6 +1435,54 @@ check("daemon: gs_wake_keys writes rpc_daemon into the keyfile",
       '"rpc_daemon": args.rpc_daemon,' in _kp_src
       and '"--rpc-daemon"' in _kp_src)
 
+# ---- THE BOOT DEADMAN MUST STILL COVER THE JOBS IT IS THE BACKSTOP FOR ---
+#
+# gs-wake-deadman.timer is armed at boot, before any job is known, and powers
+# the vault off if the agent dies. Its OnActiveSec was derived as
+# jitter + Tor + "the largest job's budget" + slack -- and `withdraw` at
+# 58200s is now the largest job, which this timer neither covers nor should.
+# Spending jobs extend it (extend_deadman arms a transient longer one,
+# verifies it, then disarms this one), so what this number has to cover is the
+# largest job that does NOT extend it.
+#
+# Derived from the real budgets rather than restated, so ADDING a non-spending
+# job longer than `watch` goes red here instead of silently arriving as a
+# vault that powers off mid-job.
+_timer_src = open(os.path.join(REPO, "systemd", "gs-wake-deadman.timer"),
+                  encoding="utf-8").read()
+_on_active = int(re.search(r"OnActiveSec=(\d+)", _timer_src).group(1))
+_spending = set(getattr(P, "SPENDING_JOBS", ()))
+_nonspend = {j: sp["budget_s"] for j, sp in P.JOBS.items() if j not in _spending}
+_worst_ns = max(_nonspend.values())
+_need = P.VAULT_JITTER_HI_S + 300 + _worst_ns
+check(f"deadman: the boot timer ({_on_active}s) covers the longest job that "
+      f"does NOT extend it ({_worst_ns}s + jitter + Tor = {_need}s)",
+      _on_active >= _need)
+# NON-VACUITY 1: it is not simply enormous. A backstop sized for the spending
+# job would leave the vault powered on for most of a day after an agent died
+# during a status probe, which is the power signature this design hides.
+check("deadman: ...and is NOT sized for the spending job, which would keep "
+      "the vault up for hours after a two-minute job died",
+      _on_active < max(sp["budget_s"] for sp in P.JOBS.values()))
+# NON-VACUITY 2: a spending job really is longer than this timer, so the
+# extension is load-bearing rather than decorative.
+check("deadman: NON-VACUITY -- a withdrawal really does outlast this timer, "
+      "so extend_deadman is what protects it",
+      P.JOBS["withdraw"]["budget_s"] > _on_active)
+# AND THE TIMER STARTS THE UNIT THE AGENT'S EXTENSION ALSO STARTS, or the two
+# paths power off by different means and only one of them was reasoned about.
+check("deadman: the boot timer and the extension start the SAME poweroff unit",
+      "Unit=gs-wake-poweroff.service" in _timer_src
+      and "gs-wake-poweroff.service" in open(
+          os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read())
+# AND THE ORDER IS ARM, VERIFY, DISARM. Disarming first would leave an instant
+# with no backstop at all.
+_ag_txt = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+_ext = _ag_txt.split("def extend_deadman")[1].split("\ndef ")[0]
+check("deadman: the extension disarms the short timer only AFTER verifying "
+      "the long one is active",
+      _ext.index("unit_is_active") < _ext.index("disarm_deadman()"))
+
 # ---- AND THE FEE DESTINATION WAS READ BY CODE NOTHING COULD REACH --------
 #
 # gs_wake_agent reads key["usage_fee_address"], the vault's keyfile is the

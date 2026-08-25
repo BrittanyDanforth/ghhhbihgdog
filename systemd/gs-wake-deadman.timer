@@ -1,12 +1,31 @@
 # ARMED AT BOOT, INDEPENDENT OF THE AGENT. This is the path that survives the
 # agent being SIGKILLed, wedged, or never starting at all.
 #
-# 9300s = 1200 (max jitter) + 300 (Tor allowance) + 7200 (the largest job's
-# budget) + 600 (slack). Sized for the LARGEST job because it is armed before
-# any job is known. The stated cost: a boot whose agent DIED on a short job
-# sits up to ~2h35m instead of ~20 min. The agent's own per-job budget bounds
-# the normal case; generous-but-bounded is the right shape for a backstop that
-# only runs when the thing that should have bounded it is dead.
+# 9300s = 1200 (max jitter) + 300 (Tor allowance) + 7200 + 600 (slack).
+#
+# 7200 IS THE LARGEST JOB THAT DOES NOT EXTEND THIS TIMER -- `watch`. It is
+# NOT the largest job: `withdraw` is 58200s, and this number does not cover it
+# and must not be raised to.
+#
+# The comment used to say "7200 (the largest job's budget) ... sized for the
+# LARGEST job", which was true when every job only minted and watched. It is
+# now wrong in both directions a reader could take it: someone could believe
+# this backstop covers a withdrawal (it does not -- it would fire 9300s into a
+# 58200s spend), or "correct" it to 60300 and leave the vault powered on for
+# seventeen hours after an agent died during a two-minute status probe.
+#
+# WHY IT DOES NOT NEED TO COVER withdraw. gs_wake_agent.extend_deadman arms a
+# TRANSIENT longer timer for spending jobs, verifies it is really active, and
+# only then calls disarm_deadman() to stop THIS one -- so during a withdrawal
+# this timer is not running. If the extension cannot be armed the agent
+# refuses the job outright rather than starting a spend under a short
+# backstop. Arm-verify-disarm, in that order, so there is no instant with no
+# backstop at all.
+#
+# The stated cost of the number that remains: a boot whose agent DIED on a
+# short job sits up to ~2h35m instead of ~20 min. The agent's own per-job
+# budget bounds the normal case; generous-but-bounded is the right shape for a
+# backstop that only runs when the thing that should have bounded it is dead.
 [Unit]
 Description=GhostSpiral wake deadman (power off even if the agent dies)
 
