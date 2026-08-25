@@ -2687,6 +2687,16 @@ MUTATIONS = [
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
+ # THE WORST ONE: Type=oneshot applies TimeoutStartSec to the whole ExecStart,
+ # so systemd killed the unit 2.5h into every withdrawal and OnFailure powered
+ # the vault off -- mid-mix, money already moving, defeating the job budget,
+ # the deadman extension and everything else sized for a spend.
+ ("systemd goes back to killing the agent before the longest job can finish",
+  "systemd/gs-wake-agent.service",
+  "TimeoutStartSec=61200",
+  "TimeoutStartSec=9000",
+  ["test_wake_agent"]),
+
  # wipe_will_erase asks "would the sweep DELETE this", wipe_covers asks "would
  # anything written HERE be swept". Building the first on the second put
  # DIRECTORIES off by one level: a matching directory one level down was

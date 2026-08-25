@@ -63,10 +63,39 @@ UMask=0077
 # claimed wipe coverage and then failed to write its ledger.
 WorkingDirectory=/var/lib/ghostspiral
 Environment=HOME=/var/lib/ghostspiral
-# Long enough for the largest job (watch, 7200s) plus jitter and Tor, and
-# SHORTER than the deadman, so the ordinary path is bounded by this and the
-# deadman is only the backstop for a wedged or SIGKILLed agent.
-TimeoutStartSec=9000
+# THE OUTER BOUND, AND IT WAS KILLING EVERY WITHDRAWAL AT 2.5 HOURS.
+#
+# This is Type=oneshot, so TimeoutStartSec applies to the WHOLE ExecStart --
+# the entire job, not just process launch. It was 9000s, and the comment here
+# said why: "long enough for the largest job (watch, 7200s) plus jitter and
+# Tor, and SHORTER than the deadman".
+#
+# `watch` stopped being the largest job when `withdraw` arrived. A withdrawal
+# runs up to result_budget_s = 59400s, and the agent extends the deadman to
+# 60000s to cover it. systemd was killing the unit at 9000s -- 6.7x earlier
+# than the backstop it was supposed to precede -- and OnFailure above then
+# powers the machine off. Mid-mix, with the money already moving. Every
+# withdrawal, at every depth: the shallowest needs 6.1h.
+#
+# That defeated the job budget, the deadman extension and everything else
+# sized for a spend, because all of those bound run_child and the poweroff
+# timer, and none of them can survive systemd killing the whole unit.
+#
+# THE RELATIONSHIP IS NOW THE OTHER WAY ROUND, deliberately. This number is
+# static and the deadman is job-aware, so this has to fit the LONGEST job the
+# agent can legitimately run and let the deadman be the tight bound:
+#
+#   non-spending job   deadman 9300s fires first; this never comes near
+#   withdrawal         deadman extended to 60000s fires first
+#   wedged agent       whichever deadman is armed fires first
+#
+# So systemd is the outer backstop for a deadman that failed to arm at all,
+# which is the only case left. 61200 = 60000 + 20 min of margin.
+#
+# tests/test_wake_agent.py derives the floor from result_budget_s, so a job
+# whose budget grows past it goes red instead of arriving as a vault killed
+# part way through spending.
+TimeoutStartSec=61200
 # NOTHING TO THE JOURNAL. This is not tidiness. Without these two lines systemd
 # journals everything this unit and its children print, and the children are
 # create_receive_wallet and thor_swap_preparer -- which print the BTC deposit
