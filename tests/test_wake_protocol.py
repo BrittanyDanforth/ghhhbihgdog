@@ -360,16 +360,38 @@ for _bad, _why in ((_SAMPLE_XMR[:94], "one character short"),
 # has one shape to handle and gs_wake_agent's " ".join is total.
 check("address gate NON-VACUITY -- a real 95-character address passes",
       _ax(_SAMPLE_XMR) == [_SAMPLE_XMR])
+# A 4, NOT AN 8, AND THAT IS NOT A STYLE CHOICE. This sample used to be
+# "8" + "Ad"*52 + "A" -- a 106-character string with a subaddress prefix,
+# which is not a shape Monero produces. Netbytes, from the monero library's
+# own tables: standard 18 -> "4", subaddress 42 -> "8", INTEGRATED 19 -> "4".
+# Encoded for real: 95/"4", 95/"8", 106/"4". There is no 106-character "8".
+#
+# gs_common.XMR_ADDR_RE has always said so (^4[b58]{105}\Z) and gs_console's
+# copy is pinned equal to it; proto._xmr_address_field, hand-rolled because
+# this file imports nothing, took any length in (95, 106) with either prefix.
+# So this test's own data was the one shape where the phone and the vault
+# disagreed -- accepted here, refused there, a wake spent.
+from gs_common import XMR_ADDR_RE as _GSC_ADDR                # noqa: E402
+_INTEGRATED = "4" + "Ad" * 52 + "A"
 check("address gate NON-VACUITY -- and an integrated 106-character one does "
       "too, so the length rule is a set and not a single number",
-      _ax("8" + "Ad" * 52 + "A") == ["8" + "Ad" * 52 + "A"])
+      _ax(_INTEGRATED) == [_INTEGRATED])
+check("address gate: a 106-character string with a SUBADDRESS prefix is "
+      "refused -- netbyte 42 encodes to '8' and is 95 characters; an "
+      "integrated address is netbyte 19, always '4'",
+      _refuses(_ax, "8" + "Ad" * 52 + "A"))
+check("address gate: ...which is what gs_common's regex has always said, so "
+      "the phone and the vault now agree about every length/prefix pair",
+      all(bool(_GSC_ADDR.match(_a)) == (_refuses(_ax, _a) is False)
+          for _a in ("4" + "1" * 94, "8" + "1" * 94,
+                     "4" + "1" * 105, "8" + "1" * 105)))
 # A BARE STRING IS STILL ACCEPTED, because an older pager sends one and the
 # failure mode of refusing it is a vault turning down its owner's withdrawal
 # with a schema error they cannot act on from a phone.
 check("a bare string is normalised to a list of one, so an older pager still "
       "reaches a newer vault",
       _ax(_SAMPLE_XMR) == [_SAMPLE_XMR] and isinstance(_ax(_SAMPLE_XMR), list))
-_two = [_SAMPLE_XMR, "8" + "Ad" * 52 + "A"]
+_two = [_SAMPLE_XMR, _INTEGRATED]
 check("...and several are carried in order", _ax(_two) == _two)
 check("the cap is enforced", _refuses(_ax, [_SAMPLE_XMR] * (P.MAX_WAKE_EXIT_DESTS + 1)))
 check("NON-VACUITY -- exactly the cap is accepted, so the refusal above is a "
