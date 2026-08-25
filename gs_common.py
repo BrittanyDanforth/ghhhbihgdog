@@ -2672,6 +2672,49 @@ def _scope_lock(scope: str, what: str):
     return sock
 
 
+def scope_lock_taken(scope: str) -> bool:
+    """Is a run already holding the scope lock for this wallet? Read-only.
+
+    THE PROBE THE WAKE AGENT NEEDED AND DID NOT HAVE. Its preflight asks
+    whether a mix is running by looking for artifact_dir/".ghostspiral.lock" --
+    and GhostSpiral takes that lock at Path(".ghostspiral.lock"), RELATIVE to
+    cwd, which gs_console sets to the repo. Two different files, always, so the
+    check answered "no mix running" while one was. _scope_lock exists precisely
+    because that path is not the guard; this exposes the same name derivation
+    so the asker and the holder cannot drift apart.
+
+    NON-DESTRUCTIVE. It binds and immediately closes, so a bind that SUCCEEDS
+    means nobody held it and leaves nothing behind. There is a hair of a race
+    -- a run starting in the microseconds between the close and the caller's
+    decision -- and it is the right trade: this is an advisory "is somebody
+    using this machine" check, not the mutual exclusion itself, which is
+    _scope_lock's own bind and is unaffected.
+
+    FAILS OPEN (False) on a platform with no abstract namespace, for the same
+    reason _scope_lock does: a second guard that cannot be evaluated must not
+    become a new way to refuse.
+    """
+    if not scope:
+        return False
+    key = hashlib.sha256(f"ghostspiral\x00{scope}".encode()).hexdigest()[:24]
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    except Exception:                                        # noqa: BLE001
+        return False
+    try:
+        sock.bind("\0ghostspiral." + key)
+    except OSError as e:
+        return getattr(e, "errno", None) == errno.EADDRINUSE
+    except Exception:                                        # noqa: BLE001
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:                                    # noqa: BLE001
+            pass
+    return False
+
+
 @contextlib.contextmanager
 def run_lock(path: Path, what: str = "GhostSpiral", scope: str = ""):
     """Refuse to run twice at once. Held by the KERNEL, so it cannot go stale.

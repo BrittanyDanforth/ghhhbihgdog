@@ -545,20 +545,19 @@ MUTATIONS = [
  # THE ONE THAT MATTERS MOST: without this the vault stays powered on, on the
  # LAN, with the disk auto-unlocked, on every refusal path there is.
  ("the vault does not power off when a wake refuses", "gs_wake_agent",
-  '        if code not in ("inhibited", "mix_running"):\n'
-  "            power_off(dry_run=args.dry_run)",
-  "        pass",
+  "            else:\n"
+  "                power_off(dry_run=args.dry_run)",
+  "            else:\n                pass",
   ["test_wake_agent"]),
 
  # Every refusal PAST COLLECTION owes the doorbell an answer. Without this the
  # Pi times out and tells the operator "this job may already be done. CHECK THE
  # VAULT" when nothing ran.
  ("a post-collection refusal never reaches the doorbell", "gs_wake_agent",
-  "    except BaseException as e:\n"
-  '        report_back(key, job_id, challenge.hex(), "refused", "",\n'
-  '                    poster=d.get("post_record"))\n'
-  "        raise e",
-  "    except BaseException as e:\n        raise e",
+  "        report_back(key, job_id, challenge.hex(),\n"
+  '                    "failed" if _CHILD_STARTED[0] else "refused", "",\n'
+  '                    poster=d.get("post_record"))',
+  "        pass",
   ["test_wake_agent"]),
 
  # A slow answer was structurally unreportable while the window was checked
@@ -2643,7 +2642,7 @@ MUTATIONS = [
  # channel exists for -- took no cut at all while gs_console's did.
  ("the wake path goes back to taking no usage fee at all",
   "gs_wake_agent",
-  '    return ["--usage-fee"] if fee_addresses(key) else []',
+  '    return ["--usage-fee"] if fee_addresses(key, exclude=dests) else []',
   "    return []",
   ["test_wake_agent"]),
 
@@ -2696,14 +2695,8 @@ MUTATIONS = [
  # said "CHECK THE VAULT" for a job that died in its first second.
  ("a crash after collection goes back to telling the doorbell nothing",
   "gs_wake_agent",
-  "    except BaseException as e:\n"
-  "        report_back(key, job_id, challenge.hex(), \"refused\", \"\",\n"
-  "                    poster=d.get(\"post_record\"))\n"
-  "        raise e",
-  "    except (Refused, SystemExit) as e:\n"
-  "        report_back(key, job_id, challenge.hex(), \"refused\", \"\",\n"
-  "                    poster=d.get(\"post_record\"))\n"
-  "        raise e",
+  "    except BaseException as e:",
+  "    except (Refused, SystemExit) as e:",
   ["test_wake_agent"]),
 
  # THE WORST ONE: Type=oneshot applies TimeoutStartSec to the whole ExecStart,
@@ -2804,8 +2797,8 @@ MUTATIONS = [
  # ...AND THE OTHER DIRECTION: a keyfile field holding a dict or a None would
  # reach str() and become a destination made of the word "None".
  ("the fee address list stops checking what is in it", "gs_wake_agent",
-  "        out += [a.strip() for a in v if isinstance(a, str) and a.strip()]",
-  "        out += [str(a) for a in v]",
+  "                if isinstance(a, str) and a.strip() and a.strip() not in _skip]",
+  "                if True]",
   ["test_wake_agent"]),
 
  # GhostSpiral refuses rather than guessing a fee it could not fetch (the

@@ -1035,6 +1035,21 @@ class Pager:
         #: see the note where it is written for why the vault cannot hold this
         #: and why the SD card must not.
         self.handle_owner = {}
+        #: WHICH JOB MINTED EACH LABEL, for the one question the vault answers
+        #: with a certainty this box could have had for free.
+        #:
+        #: /check and /wait are refused on the vault for any handle whose
+        #: record carries no swap quote ("Only a receive_and_quote handle can
+        #: be watched"), and receive_new records slip=None ALWAYS -- it mints
+        #: an address and quotes nothing. So every /address label is
+        #: permanently unwatchable, and asking costs a magic packet, a boot, a
+        #: 5-20 minute jitter and one of twelve daily wake slots to be told so.
+        #:
+        #: Process memory, like handle_owner and convos and for the same
+        #: reason: the SD card is the leak this box is designed around. A
+        #: restart empties it and the refusal simply stops firing, which is the
+        #: same honest bound handle_owner already documents.
+        self.handle_job = {}
         #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
         #: otherwise -- a private chat id is a Telegram ACCOUNT, and Telegram
         #: gives one account one chat with a given bot however many devices it
@@ -1300,11 +1315,38 @@ class Pager:
         makes the operator guess at the range. They are stated as BTC because
         that is the unit being sent; the satoshi count is an implementation
         detail of the wire and never appears in the chat.
+
+        "ANYTHING FROM 0.0001 TO 100" READ AS AN OPERATING RANGE AND IS NOT
+        ONE. gs_wake_proto says so at the constants themselves: "THESE ARE
+        TYPO GUARDS AND NOT PROTOCOL MINIMUMS ... The real lower bound is
+        whatever ThorChain's outbound fee makes uneconomic that day", and the
+        bounds are "wide enough never to obstruct a real deposit".
+
+        The trap is the first-time path, and it is the CAUTIOUS operator who
+        walks into it: /start, the deposit button, and a deliberate test with
+        the smallest number the bot named. The BTC swaps, the XMR lands, and
+        then every /withdraw at every depth fails at GhostSpiral's stage 4
+        against mix_minimum_xmr -- on the order of a third of an XMR, two
+        orders of magnitude away. What the chat says about that failure is
+        "It may be too deep for the balance -- the deeper options need more to
+        work with", which cannot be acted on, because depth 1 is out of reach
+        too. The money is in and it cannot be mixed out.
+
+        This box CANNOT compute the real floor: it needs a live fee estimate
+        and a swap rate, and it has never been told either. So it says the
+        floor exists and which way to err, which is the whole of what it
+        honestly knows.
         """
         return (f"How much? Reply with the BTC amount you are about to send "
-                f"— for example 0.05.\n"
-                f"Anything from {proto.btc_display(proto.DEPOSIT_MIN_SAT)} to "
-                f"{proto.btc_display(proto.DEPOSIT_MAX_SAT)}. /cancel to stop.")
+                f"— for example 0.05.\n\n"
+                f"{proto.btc_display(proto.DEPOSIT_MIN_SAT)} to "
+                f"{proto.btc_display(proto.DEPOSIT_MAX_SAT)} is a TYPO GUARD, "
+                f"not a working range — it catches a slipped decimal point.\n"
+                f"There is a real floor as well, and it is much higher: "
+                f"below it the mix cannot run at ANY depth, and the money "
+                f"sits here unmixable. This end cannot work out what it is "
+                f"today. If in doubt send more, not less.\n"
+                f"/cancel to stop.")
 
     def _depth_question(self) -> str:
         """The mixing-depth menu, drawn from the protocol's own table.
@@ -1328,8 +1370,25 @@ class Pager:
                   "it — the fees come out of the same pile.\n"
                   "/cancel to stop.")
 
-    def _handle_buttons(self, h: str) -> list:
+    #: The jobs whose labels the vault will never watch. receive_new mints an
+    #: address and quotes nothing, so its handle record carries slip=None and
+    #: both watching jobs refuse it with "Only a receive_and_quote handle can
+    #: be watched". There is no configuration in which this changes.
+    UNWATCHABLE_JOBS = ("receive_new",)
+
+    def _handle_buttons(self, h: str, job: str = "") -> list:
         """Check / wait, bound to the label this reply is about, or None.
+
+        NONE FOR A LABEL NOTHING CAN WATCH, and this used to offer both
+        buttons unconditionally. An /address label is refused by the vault
+        every time -- see UNWATCHABLE_JOBS -- and the refusal happens after
+        the magic packet, the boot and the 5-20 minute jitter, having spent one
+        of twelve daily wake slots. The reason is deliberately not on the wire,
+        so what came back was a generic refusal, and the obvious next move is
+        to tap it again.
+
+        parse_callback's own comment states the rule this broke: "a button
+        offering a depth the vault refuses would spend a wake on a rejection."
 
         THE TWO COMMANDS AN OPERATOR RUNS NEXT, and both used to require
         retyping a four-character hex label off the screen above -- on a phone,
@@ -1344,6 +1403,8 @@ class Pager:
         """
         if not (isinstance(h, str) and proto.HANDLE_RE.match(h)):
             return None
+        if job in self.UNWATCHABLE_JOBS:
+            return MENU_BUTTONS
         return [[("Has it arrived?", f"c:{h}"), ("Wait for it", f"w:{h}")]]
 
     def _depth_buttons(self) -> list:
@@ -2042,6 +2103,7 @@ class Pager:
             # a handle-to-chat map on it is a record of who asked for what.
             if proto.HANDLE_RE.match(h):
                 self.handle_owner[h] = chat_id
+                self.handle_job[h] = job
             slip = res.get("slip") or ""
             plain = res.get("plain") or {}
             phase = res.get("phase") or ""
@@ -2158,7 +2220,7 @@ class Pager:
                           f"a group, and they would go to everyone in it. "
                           f"Read them at the machine, or set up a delivery "
                           f"key and use a one-to-one chat.",
-                          buttons=self._handle_buttons(h))
+                          buttons=self._handle_buttons(h, job))
                 return
             if plain:
                 # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
@@ -2169,7 +2231,7 @@ class Pager:
                 body, memo = lines[:-1], lines[-1]
                 self.send(chat_id, f"{chat_name(job)} ready · slip {h}\n\n"
                                    + "\n".join(body).rstrip(),
-                          buttons=self._handle_buttons(h))
+                          buttons=self._handle_buttons(h, job))
                 # THE MEMO ALONE IN ITS OWN MESSAGE. Tap-and-hold copies a
                 # WHOLE Telegram message, and this string has to reach a wallet
                 # character-for-character or ThorChain cannot route the swap
@@ -2212,6 +2274,19 @@ class Pager:
                 # operator who believes an address is on its way waits for a
                 # message that is never coming.
                 if job == "receive_new":
+                    # "/check WILL SAY WHEN SOMETHING ARRIVES ON IT" IS FALSE,
+                    # and it is the confident kind: it names a command that
+                    # cannot ever work for this label. Both watching jobs
+                    # refuse a handle whose record carries no swap quote --
+                    # "Only a receive_and_quote handle can be watched" -- and
+                    # receive_new records slip=None always, because it mints an
+                    # address and quotes nothing.
+                    #
+                    # So the sentence sent the operator to spend a wake, a
+                    # boot and a 5-20 minute jitter to be refused, with two
+                    # buttons under it doing the same in one tap. The label is
+                    # still worth having -- it is what the operator matches
+                    # against the machine -- and that is all it is.
                     integrity_log("pager", "address_not_delivered")
                     self.send(chat_id,
                               f"address {h}: minted.\n"
@@ -2219,16 +2294,17 @@ class Pager:
                               f"only the deposit flow carries one, and this "
                               f"job has no quote to carry it in. Read it at "
                               f"the machine.\n"
-                              f"/check {h} will say when something arrives on "
-                              f"it.",
-                              buttons=self._handle_buttons(h))
+                              f"Nothing here can tell you when it is paid "
+                              f"either: watch it from the machine. {h} is the "
+                              f"label to match it by.",
+                              buttons=self._handle_buttons(h, job))
                     return
                 # NO DELIVERY KEY IS CONFIGURED, so there is nothing to send and
                 # this is still the original vocabulary: §5 step 5, "Telegram
                 # gets `depo ready · slip A3F1`". No address, no memo, no
                 # amount.
                 self.send(chat_id, f"{chat_name(job)} ready · slip {h}",
-                          buttons=self._handle_buttons(h))
+                          buttons=self._handle_buttons(h, job))
                 return
             # A SEALED SLIP CAME BACK. This process cannot read it: it is
             # sealed to the delivery key, which exists on neither this box nor
@@ -2266,7 +2342,7 @@ class Pager:
                 # message -- and a keyboard under it would be one more thing
                 # attached to the message the operator is about to long-press.
                 self.send(chat_id, f"{chat_name(job)} ready · slip {h}",
-                          buttons=self._handle_buttons(h))
+                          buttons=self._handle_buttons(h, job))
             else:
                 integrity_log("pager", "slip_undelivered")
                 # NOT "/watch {h}". That was the first version of this line and
@@ -2359,13 +2435,31 @@ class Pager:
             self.send(chat_id, f"{chat_name(job)}: failed.{_tail}",
                       buttons=MENU_BUTTONS)
         elif out == "expired_uncollected":
-            # NOTHING RAN, and for a spend that is the whole message. The job
-            # was never handed over, so it cannot have started.
+            # ONE TRUE THING, NOT TWO. This job was never handed over, so THIS
+            # attempt cannot have started anything. That is what the pager
+            # knows.
+            #
+            # "your funds are exactly where they were" is a claim about the
+            # WALLET, and there is nothing behind it. This box has never been
+            # told a balance, and it keeps no record that a wake is in flight:
+            # `busy` is process memory, and the shipped unit has
+            # Restart=on-failure. So the reachable false case is ordinary --
+            # the pager dies during a withdrawal and comes back, the vault is
+            # still mixing, the next magic packet lands on a machine that is
+            # already up and nothing collects it -- and the operator is told
+            # their funds are exactly where they were, and invited to retry.
+            #
+            # The `refused` branch above gets this right and defends itself as
+            # "THE ONE ENDING WHERE 'NOTHING RAN' IS CERTAIN". It is certain
+            # there because the vault said so. Here nobody said anything.
             self.send(chat_id,
                       f"{chat_name(job)}: never picked up, so nothing ran"
-                      + (" and NOTHING WAS SPENT — your funds are exactly "
-                         "where they were." if job == "withdraw" else ".")
-                      + " Try again.",
+                      + (" — THIS attempt handed nothing over and spent "
+                         "nothing.\nThat is all I can tell you: I keep no "
+                         "record of an earlier one, so if you have a "
+                         "withdrawal outstanding, check the balance before "
+                         "starting another."
+                         if job == "withdraw" else ". Try again."),
                       buttons=MENU_BUTTONS)
         else:
             # collected_no_result: THE ONE ENDING THAT MUST NOT INVITE A
@@ -2667,6 +2761,20 @@ class Pager:
         # bound -- this closes the live case, not the whole namespace.
         _h = params.get("handle") if isinstance(params, dict) else None
         if _h:
+            # REFUSED HERE, NOT AFTER A BOOT. This box recorded which job
+            # minted the label; the vault refuses every watching job on an
+            # /address one, always, for a structural reason that no setting
+            # changes. Sending the wake anyway costs a magic packet, a boot, a
+            # 5-20 minute jitter and one of twelve daily slots, and returns a
+            # refusal with no reason on it -- which reads as "try again".
+            if self.handle_job.get(_h) in self.UNWATCHABLE_JOBS:
+                integrity_log("pager", "unwatchable_handle")
+                self.send(cid,
+                          f"no: {_h} is an address label, and nothing here "
+                          f"can watch one — it has no expected amount to "
+                          f"watch for. Check it at the machine.",
+                          buttons=MENU_BUTTONS)
+                return
             _owner = self.handle_owner.get(_h)
             if _owner is not None and _owner != cid:
                 integrity_log("pager", "handle_not_yours")
@@ -3023,6 +3131,37 @@ class Pager:
             print("      The job itself is not: it completes on the vault and "
                   "its artifacts are in the vault's artifact directory. Check "
                   "there before starting another one.")
+            # ...AND TO THE CHAT, WHICH IS WHERE THE OPERATOR IS.
+            #
+            # The comment above says the defect being fixed is that "the
+            # operator was never told", and then told them on a stdout the
+            # shipped unit sets to null. `systemctl restart`, a package
+            # upgrade, a Pi reboot or Restart=on-failure during the up-to-16 h
+            # window a withdrawal holds `busy` all land here, and the operator
+            # is left with "working" as the last thing they ever heard about a
+            # spend.
+            #
+            # This process is still alive and Tor is still up: send() needs
+            # neither `busy` nor the worker thread, and _worker already uses
+            # it for the analogous case. Every allowlisted chat, because there
+            # is no record here of which one started the job -- normally there
+            # is exactly one, since main() refuses more than one spender.
+            #
+            # A BARE EXCEPT, and it wraps the whole loop: a dead circuit at
+            # shutdown must not turn "stopping" into a traceback, and there is
+            # nothing useful left to do about a failure here anyway.
+            try:
+                for _cid in sorted(self.allow):
+                    self.send(_cid,
+                              "STOPPING while something is still running.\n\n"
+                              "The job itself keeps going — it is not on this "
+                              "end and nothing here can stop it — but its "
+                              "result comes back to this process, which is "
+                              "going away, so you will not be told how it "
+                              "ended.\n"
+                              "CHECK AT THE MACHINE before starting another.")
+            except Exception:                                # noqa: BLE001
+                pass
             return 1
         print("  [*] Shutdown requested.")
         return 0
@@ -3339,7 +3478,28 @@ def main(argv=None) -> int:
     except OSError as e:
         sys.exit(f"[!] cannot create {st.parent}: {e.strerror}")
 
-    integrity_log("pager", "start")
+    # BOOKKEEPING MUST NOT BE WHAT STOPS THE BOT FROM STARTING.
+    #
+    # This was outside every try. gs_common's chain is
+    # Path("integrity_chain.log") -- relative, resolved against cwd at open
+    # time -- and the shipped unit sets ProtectSystem=strict with no
+    # WorkingDirectory, so systemd's cwd=/ made it /integrity_chain.log on a
+    # read-only filesystem. integrity_log downgrades a failure on its LOCK
+    # file to "stage!nolock" and re-raises a failure on the log itself, so the
+    # first line the pager ever writes raised an unhandled OSError -- into
+    # StandardError=null, with Restart=on-failure retrying every 30 seconds,
+    # forever, silently, on the box whose entire purpose is being reachable.
+    #
+    # The unit gained a WorkingDirectory. This is the other half: the example
+    # unit says in its own header "read every line, then write your own", so
+    # an operator's unit may not have one, and a full or read-only card would
+    # do it anyway on a unit that does. A pager that answers is worth more
+    # than a chain line about a pager that did not start.
+    try:
+        integrity_log("pager", "start")
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  [!] integrity chain unavailable ({type(e).__name__}); "
+              f"starting anyway. Check the working directory in the unit.")
     _pager = Pager(args, token, key, proxies)
     # SIGUSR1 BURNS THE CHAT. Registered here rather than in __init__ because
     # a Pager built by a test must not install a process-wide handler -- the

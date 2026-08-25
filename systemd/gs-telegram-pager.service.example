@@ -83,6 +83,11 @@ RestartSec=30
 # A crash loop must not become a rate-limit bypass: the counters are persisted
 # to --state, so a restart reloads them rather than starting from zero.
 
+# systemd's cwd is / and the integrity chain is a relative path. Without this
+# the chain lands on a read-only filesystem. OPSEC_SETUP.md §5 says what that
+# cost before it was fixed.
+WorkingDirectory=/var/lib/gs
+
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 PrivateDevices=yes

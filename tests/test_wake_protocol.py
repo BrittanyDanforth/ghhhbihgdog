@@ -907,6 +907,47 @@ check("PAIR_ABORT['info'] is no longer dead code",
       "_pair_abort(sock, \"info\")" in src and "\"info\":" in src)
 
 _finished()
+# ---- THE RESULT WINDOW HAD ZERO MARGIN, BY CONSTRUCTION -----------------
+#
+# result_budget_s summed the jitter and the per-step budget and stopped there,
+# so the window was EXACTLY the vault's worst case on both sides of the
+# equation: for a withdrawal, 1 x 58200 + 1200 = 59400 either way.
+#
+# Everything else the vault does between collecting a job and reporting on it
+# therefore ran past the window -- preflight's removable-device scan and
+# resource check, verify_tor with a real exit request, extend_deadman's
+# systemd-run plus its verification, _funded_entry's connect_rpc and a wallet
+# refresh on a just-booted wallet, the slip sealing, and the report POST over
+# Tor. A job that used its full budget reported into a closed socket.
+#
+# What the operator then reads is collected_no_result: "I do NOT know whether
+# the funds moved ... Do not run /withdraw again until you have checked the
+# balance yourself" -- about a run that finished normally, on the one job that
+# spends, on the exact run where the answer matters most.
+print("\n-- the window the vault has to report inside --")
+for _j in P.JOBS:
+    _spec = P.JOBS[_j]
+    _worst = len(_spec["tools"]) * _spec["budget_s"] + P.VAULT_JITTER_HI_S
+    check(f"window: {_j} leaves the vault room to report after its worst case "
+          f"({P.result_budget_s(_j)}s window vs {_worst}s of jitter+budget)",
+          P.result_budget_s(_j) > _worst)
+    check(f"window: ...and the margin is the declared fixed overhead, not a "
+          f"number typed per job",
+          P.result_budget_s(_j) - _worst == P.VAULT_FIXED_OVERHEAD_S)
+# THE MARGIN IS REAL WORK, not a rounding allowance: it has to cover a Tor
+# bootstrap check and a wallet refresh, both of which are tens of seconds on a
+# machine that has just powered on.
+check(f"window: the overhead allowance is minutes, not seconds "
+      f"({P.VAULT_FIXED_OVERHEAD_S}s)", P.VAULT_FIXED_OVERHEAD_S >= 120)
+# ...AND IT STILL COMPOSES WITH THE DEADMAN. gs_wake_agent arms
+# result_budget_s + 600, so lengthening the window lengthens the backstop by
+# the same amount rather than leaving the job unprotected at the new end.
+check("window: NON-VACUITY -- the withdrawal window is still the longest, so "
+      "the ordering the deadman sizing depends on is unchanged",
+      P.result_budget_s("withdraw")
+      == max(P.result_budget_s(_j) for _j in P.JOBS))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

@@ -473,7 +473,8 @@ print("\n== POWER OFF: the table ==")
 saved_run_once, saved_power, saved_disarm = A.run_once, A.power_off, A.disarm_deadman
 calls = []
 A.power_off = lambda dry_run=False: calls.append("power_off") or True
-A.disarm_deadman = lambda: calls.append("disarm")
+A.disarm_deadman = lambda runner=None, ext=True: (
+    calls.append("disarm") or True)
 
 TABLE = [
     ("no_job", "no job pending (a hostile magic packet)"),
@@ -539,6 +540,122 @@ with contextlib.redirect_stdout(io.StringIO()):
     A.main(["--key", "/nonexistent"])
 check("the happy path powers off exactly ONCE", calls.count("power_off") == 1)
 check("...and AFTER the job, not instead of it", order == ["job", "power_off"])
+
+# ---- ...AND THE DECISION IS RE-TAKEN AT THE INSTANT IT IS TAKEN ---------
+#
+# `code` is a verdict reached at preflight, or between two steps of a job that
+# mostly has one step. Both guards behind it were stale by the time the finally
+# read them:
+#
+#   * INHIBIT_FILE is read in preflight and inside _dispatch's
+#     `for i, argv in enumerate(steps)` loop. Tools per job: receive_new 1,
+#     receive_and_quote 2, watch 1, swap_status 1, withdraw 1. So for FOUR of
+#     the five the check runs once, right after the jitter, and never again --
+#     while the job runs for up to 8400 s (watch) or 58200 s (withdraw).
+#   * The mix-running check read artifact_dir/".ghostspiral.lock" and
+#     GhostSpiral takes its lock at Path(".ghostspiral.lock"), relative to
+#     cwd, which gs_console sets to the repo. Different files, always.
+#
+# Together: a `watch` job holds the box up for ~2 h and takes no GhostSpiral
+# lock, so the operator can start the by-hand mix OPSEC_SETUP documents on the
+# same machine -- and watch ends first and powers it off mid-mix.
+print("\n-- and whether anybody is here, asked when it is acted on --")
+_lg_dir = Path(tempfile.mkdtemp(prefix="lateguard_"))
+_LG_RPC = "http://127.0.0.1:18083"
+A._LATE_GUARD["dir"] = _lg_dir
+A._LATE_GUARD["rpc"] = _LG_RPC
+check("late: an empty machine says nobody is here",
+      A.somebody_is_here() == "")
+(_lg_dir / A.INHIBIT_FILE).touch()
+check("late: the inhibit file is seen at the moment of the decision, which is "
+      "the only moment a one-step job could ever be told about it",
+      "is using this machine" in A.somebody_is_here())
+(_lg_dir / A.INHIBIT_FILE).unlink()
+check("late: ...and removing it lets the machine go down again",
+      A.somebody_is_here() == "")
+# THE LOCK, ASKED OF THE GUARD THAT EXISTS. Held from a DIFFERENT directory,
+# which is the case the file probe could never answer and gs_console always
+# produces.
+_lg_sock = _gsc_pat._scope_lock(
+    _gsc_pat.rpc_lock_scope(_LG_RPC), "GhostSpiral")
+try:
+    check("late: NON-VACUITY -- the old file probe answers 'no mix running' "
+          "for a mix that IS running, because the file is somewhere else",
+          not ((_lg_dir / ".ghostspiral.lock").exists()
+               and A._lock_is_held(_lg_dir / ".ghostspiral.lock")))
+    check("late: ...and the socket guard, which is what GhostSpiral actually "
+          "holds, answers correctly",
+          "mix mid-flight" in A.somebody_is_here())
+finally:
+    _lg_sock.close()
+check("late: ...and it is released when the mix ends, with nothing to delete",
+      A.somebody_is_here() == "")
+# KEYED ON THE WALLET, not on the machine: two runs against different
+# wallet-rpc endpoints are independent, which is the claim the refusal makes.
+_lg_other = _gsc_pat._scope_lock(
+    _gsc_pat.rpc_lock_scope("http://127.0.0.1:18099"), "GhostSpiral")
+try:
+    check("late: a mix against a DIFFERENT wallet does not hold this box up",
+          A.somebody_is_here() == "")
+finally:
+    _lg_other.close()
+# AND main()'s finally REALLY ASKS. Source-level, because the behavioural
+# table above stubs power_off and cannot see which branch chose it.
+_lg_src = open(os.path.join(REPO, "gs_wake_agent"),
+               encoding="utf-8").read()
+check("late: main's finally asks before powering off, rather than trusting a "
+      "verdict reached hours earlier",
+      "_late = somebody_is_here()" in _lg_src
+      and _lg_src.index("_late = somebody_is_here()")
+          < _lg_src.index("power_off(dry_run=args.dry_run)"))
+check("late: ...and disarms the deadman when it refuses, so the timer does "
+      "not do what the refusal just declined to do",
+      "disarm_deadman()" in _lg_src.split("_late = somebody_is_here()")[1]
+      .split("power_off(dry_run=args.dry_run)")[0])
+# AND preflight HAS TO PUT THE ENDPOINT THERE FROM THE KEYFILE. The first
+# version read it from `probes`, which is the test-injection dict -- every
+# entry in it is a function override -- so the value was "" on every real run
+# and the whole lock half was dead code. The behavioural checks above passed
+# anyway, because they set _LATE_GUARD by hand. This one drives preflight.
+A._LATE_GUARD.clear()
+_pf_dir = Path(tempfile.mkdtemp(prefix="pfguard_"))
+_pf_key = {"rpc_primary": "http://127.0.0.1:18083",
+           "tor_proxy": "socks5h://127.0.0.1:9050",
+           "artifact_dir": str(_pf_dir), "account_ceiling": 45}
+_pf_probes = {"unit_is_active": lambda u: True,
+              "removable_devices": lambda: [],
+              "resource_check": lambda *a, **k: None,
+              "tor_bootstrapped": lambda *a, **k: True}
+try:
+    A.preflight(_pf_key, _pf_dir, dry_run=True, probes=dict(_pf_probes))
+except Exception:                                            # noqa: BLE001
+    pass
+check("late: preflight records the wallet-rpc endpoint from the KEYFILE, not "
+      "from the stub dict, or the lock half never runs in production",
+      A._LATE_GUARD.get("rpc") == "http://127.0.0.1:18083")
+# ...AND preflight ITSELF REFUSES when a mix holds that wallet, which is the
+# check that has never once been true: it read artifact_dir/".ghostspiral.lock"
+# and GhostSpiral locks a path relative to cwd.
+_pf_sock = _gsc_pat._scope_lock(
+    _gsc_pat.rpc_lock_scope(_pf_key["rpc_primary"]), "GhostSpiral")
+try:
+    _pf_refused = ""
+    try:
+        A.preflight(_pf_key, _pf_dir, dry_run=True, probes=dict(_pf_probes))
+    except A.Refused as _e:
+        _pf_refused = _e.code
+    check(f"late: ...and preflight refuses a job while a mix holds that "
+          f"wallet ({_pf_refused!r})", _pf_refused == "mix_running")
+finally:
+    _pf_sock.close()
+_pf_refused2 = ""
+try:
+    A.preflight(_pf_key, _pf_dir, dry_run=True, probes=dict(_pf_probes))
+except A.Refused as _e:
+    _pf_refused2 = _e.code
+check("late: NON-VACUITY -- with no mix holding it, preflight does not refuse "
+      "for that reason", _pf_refused2 != "mix_running")
+A._LATE_GUARD.clear()
 
 A.run_once, A.power_off, A.disarm_deadman = saved_run_once, saved_power, saved_disarm
 
@@ -780,7 +897,8 @@ def _fake_run(argv):
 
 _saved_disarm = A.disarm_deadman
 try:
-    A.disarm_deadman = lambda: _ord_calls.append("disarm")
+    A.disarm_deadman = lambda runner=None, ext=True: (
+        _ord_calls.append("disarm") or True)
     _armed = A.extend_deadman(15600, runner=_fake_run, is_active=lambda u: True)
     check("deadman: the extension arms, verifies, and only then disarms the "
           "short one", _armed and _ord_calls == ["arm", "disarm"])
@@ -1213,7 +1331,16 @@ def _capture3(argv, env_extra, budget_s):
     return 0, False
 
 
-_kfee = dict(_k, usage_fee_address=_XMR_SAMPLE)
+# A DIFFERENT ADDRESS FROM THE DESTINATION, and this fixture used the same one
+# for both. That is the collision GhostSpiral's resolve_usage_fee sys.exits on
+# -- "--usage-fee-address is also an --exit-to destination ... Then it is not a
+# fee: it lands in the same place as the mixed funds" -- so this block was
+# driving a combination that could never have completed a real run, in order to
+# assert what the environment carried on the way there. The agent now declines
+# to offer a colliding address at all (see fee_addresses), which is what turned
+# this fixture's accident into a failing check.
+_XMR_FEE_SAMPLE = "4" + "Bc" * 47
+_kfee = dict(_k, usage_fee_address=_XMR_FEE_SAMPLE)
 _saved_il3 = A.integrity_log
 try:
     A.integrity_log = lambda *a, **k: None
@@ -1226,7 +1353,12 @@ finally:
 _fenv = _seen3[0][1] if _seen3 else {}
 check("fee/type: GS_USAGE_FEE_ADDRESS is the address itself, not the text of "
       "a list",
-      _fenv.get("GS_USAGE_FEE_ADDRESS") == _XMR_SAMPLE)
+      _fenv.get("GS_USAGE_FEE_ADDRESS") == _XMR_FEE_SAMPLE)
+# ...AND IT IS NOT THE DESTINATION, which is the whole reason this fixture had
+# to be changed and is worth asserting rather than leaving to the two literals
+# happening to differ.
+check("fee/type: ...and it is not the address the money is being sent to",
+      _fenv.get("GS_USAGE_FEE_ADDRESS") != _XMR_SAMPLE)
 check("fee/type: NON-VACUITY -- it really was set, so the check above is not "
       "comparing two absent values",
       "GS_USAGE_FEE_ADDRESS" in _fenv)
@@ -1676,6 +1808,69 @@ check(f"crash: ...which is what stops the Pi waiting "
       f"{P.result_budget_s('withdraw')}s for an answer that was never coming",
       P.result_budget_s("withdraw") > 3600)
 
+# ---- AND THE WORD IT REPORTS HAS TO BE THE TRUE ONE ---------------------
+#
+# The handler above reported "refused" for EVERYTHING raised inside
+# _run_validated, and gs_telegram_pager renders "refused" as, verbatim:
+#
+#     "refused before it started - nothing was spent and nothing moved."
+#
+# That is the only sentence in this toolchain that promises with no hedge that
+# the money did not move, and it is correct for the refusals the handler was
+# written for: a replayed job_id, the 24 h budget, the account ceiling, a Tor
+# abort. Every one of those happens before any tool runs.
+#
+# The crash driven above is not one of those. seal_slip_for_delivery is called
+# AFTER _dispatch returns -- the mix has run, the money has moved -- and the
+# operator was told it had not. There is no second report: the crash is before
+# report_back, so that sentence is the last word on a completed withdrawal.
+# THE M3 IS A SEALED RECORD, not a dict: it has to be opened with the Pi's
+# key the way gs_doorbell opens it, exactly as the earlier check in this file
+# does. Guarded rather than indexed blind, so a report that stops being sent
+# is a FAILED CHECK and not an IndexError landing in the crash handler.
+def _reported_status(dp):
+    _recs = [_r for _pth, _r in dp["_posted"] if _pth == "/result"]
+    if not _recs:
+        return None
+    return P.open_record(NP.PrivateKey(PI.encode()), TP.public_key,
+                         _recs[-1], P.TAG_M3).get("status")
+
+
+_crash_status = [_reported_status(_crash_dp)]
+check(f"crash: a failure AFTER the tools ran reports 'failed', not 'refused' "
+      f"({_crash_status})",
+      _crash_status and _crash_status[-1] == "failed")
+check("crash: ...and 'failed' is a word the doorbell accepts, so this is not "
+      "a report that gets dropped on the way",
+      '("done", "refused", "failed")' in open(
+          os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read())
+# THE OTHER DIRECTION, and it is the half that keeps "refused" meaning
+# something: a refusal raised BEFORE any child started still reports the word
+# whose sentence is true. Driven on the wake budget, which is checked at the
+# top of _run_validated.
+_pre_d, _pre_kf, _pre_key, _pre_bell = new_env()
+_pre_dp = deps_for(_pre_d, _pre_bell)
+_pre_state = A.load_state(_pre_d)
+_pre_state["wakes"] = [int(time.time())] * 99
+A.save_state(_pre_d, _pre_state)
+try:
+    run(_pre_kf, _pre_dp)
+except BaseException:                                        # noqa: BLE001
+    pass
+_pre_status = [_reported_status(_pre_dp)]
+check(f"crash: NON-VACUITY -- a refusal before any tool ran still reports "
+      f"'refused' ({_pre_status})",
+      _pre_status and _pre_status[-1] == "refused")
+# AND THE MARKER IS PER RUN. A stale True left by an earlier job in the same
+# process would report a pre-dispatch refusal as a run that may have spent.
+check("crash: ...and run_once clears the marker on the way in, so it means "
+      "'this run' and not 'ever'",
+      "_CHILD_STARTED[0] = False" in
+      _A_SRC.split("def run_once")[1].split("\ndef ")[0])
+check("crash: ...and _dispatch sets it at the last instant 'nothing ran' is "
+      "still true — immediately before the child",
+      "_CHILD_STARTED[0] = True\n        rc, hard = run_child" in _A_SRC)
+
 # ---- SYSTEMD MUST NOT KILL THE JOB BEFORE THE DEADMAN DOES --------------
 #
 # THE WORST ONE IN THIS FILE'S HISTORY, and it defeated every other bound.
@@ -1766,7 +1961,93 @@ _ag_txt = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 _ext = _ag_txt.split("def extend_deadman")[1].split("\ndef ")[0]
 check("deadman: the extension disarms the short timer only AFTER verifying "
       "the long one is active",
-      _ext.index("unit_is_active") < _ext.index("disarm_deadman()"))
+      _ext.index("unit_is_active") < _ext.index("disarm_deadman("))
+
+# ---- ...AND THE LONG ONE WAS NEVER DISARMED AT ALL -----------------------
+#
+# extend_deadman arms a TRANSIENT gs-wake-deadman-ext timer for a spending
+# job -- result_budget_s + 600, over sixteen hours for a withdrawal -- and
+# DEADMAN_EXT_UNIT appeared in exactly three places in the whole file: the
+# name, the systemd-run that starts it, and the is-active that verifies it
+# started. Nothing stopped it, ever.
+#
+# Both callers of disarm_deadman are the refusal whose entire message is
+# "somebody is at the machine ... NOT powering off". main() then returns 0
+# believing the box is safe, and up to sixteen hours later the timer nobody
+# disarmed starts gs-wake-poweroff.service under whoever sat down.
+print("\n-- the backstop that outlived the refusal that stopped it --")
+_stopped = []
+
+
+def _stop_runner(argv):
+    _stopped.append(argv[2])
+    return types.SimpleNamespace(returncode=0)
+
+
+check("deadman: disarming stops the SHIPPED timer", 
+      A.disarm_deadman(runner=_stop_runner) is True
+      and A.DEADMAN_UNIT in _stopped)
+check("deadman: ...and the transient LONG one a spending job armed",
+      f"{A.DEADMAN_EXT_UNIT}.timer" in _stopped)
+# systemd-run --unit=NAME creates NAME.timer AND NAME.service. Stopping only
+# the timer leaves a queued service that can still fire.
+check("deadman: ...and the service systemd-run created alongside it",
+      f"{A.DEADMAN_EXT_UNIT}.service" in _stopped)
+check("deadman: NON-VACUITY -- those are three distinct units, not one name "
+      "counted three times", len(set(_stopped)) == 3)
+# THE STOPS ARE CHECKED. This discarded the returncode entirely, so a stop
+# that failed was indistinguishable from one that worked -- while the ARM
+# half is verified under a comment calling that check "the one thing standing
+# between a four-hour spend and no backstop at all".
+check("deadman: a failed stop of the shipped timer is reported, not swallowed",
+      A.disarm_deadman(
+          runner=lambda a: types.SimpleNamespace(
+              returncode=1 if a[2] == A.DEADMAN_UNIT else 0)) is False)
+# ...BUT A TRANSIENT UNIT THAT WAS NEVER CREATED IS NOT A FAILURE. Only a
+# spending job arms the ext timer, so on every other job systemctl answers
+# non-zero for a unit that correctly does not exist.
+check("deadman: ...and a transient unit that never existed is not one",
+      A.disarm_deadman(
+          runner=lambda a: types.SimpleNamespace(
+              returncode=0 if a[2] == A.DEADMAN_UNIT else 5)) is True)
+# AND extend_deadman NOW DEPENDS ON THAT ANSWER. It returned True whatever
+# the stop did; a failed stop leaves the shipped 9300 s timer armed across a
+# job budgeted for up to 58200 s, which is the vault powering off mid-round.
+# False sends the caller to deadman_too_short, which refuses -- a wasted wake,
+# and the safe end.
+# THE INVARIANT, STATED AS AN INVARIANT: a successful extension leaves
+# EXACTLY ONE backstop armed, and it is the long one. Widening disarm_deadman
+# to close the bug above, without this, made extend_deadman arm the long
+# timer, verify it, and then stop it -- returning True. A withdrawal would run
+# for up to sixteen hours with no backstop at all: the always-on vault the
+# whole feature exists to end, reached by the fix for its opposite.
+_swap = []
+check("deadman: a successful extension stops the SHORT timer",
+      A.extend_deadman(
+          58200,
+          runner=lambda a: (_swap.append(list(a)),
+                            types.SimpleNamespace(returncode=0))[1],
+          is_active=lambda u: True) is True
+      and any(a[:3] == ["systemctl", "stop", A.DEADMAN_UNIT] for a in _swap))
+check("deadman: ...and does NOT stop the long one it just armed",
+      not any(a[:2] == ["systemctl", "stop"]
+              and A.DEADMAN_EXT_UNIT in a[2] for a in _swap))
+check("deadman: NON-VACUITY -- it really did arm the long one first, so the "
+      "absence above is an absence from a real sequence",
+      any(a and a[0] == "systemd-run"
+          and any(A.DEADMAN_EXT_UNIT in _x for _x in a) for a in _swap))
+check("deadman: ...and the human-present path still stops BOTH, which is the "
+      "bug the flag was added to keep fixed",
+      A.disarm_deadman(
+          runner=lambda a: types.SimpleNamespace(returncode=0), ext=True)
+      is True)
+
+check("deadman: an extension whose disarm FAILED does not claim to be armed",
+      A.extend_deadman(
+          15600,
+          runner=lambda a: types.SimpleNamespace(
+              returncode=1 if a[:2] == ["systemctl", "stop"] else 0),
+          is_active=lambda u: True) is False)
 
 # ---- AND THE FEE DESTINATION WAS READ BY CODE NOTHING COULD REACH --------
 #
@@ -1885,6 +2166,62 @@ check("fee: the pairing help calls it a reduction and not unlinkability",
 # while the keyfile reads as spreading wider than it does.
 check("fee: pairing refuses the same address given twice",
       "if len(set(_seen)) != len(_seen):" in _kp_src)
+
+# ---- ...AND WITHDRAWING TO YOUR OWN FEE ADDRESS KILLED THE RUN ----------
+#
+# GhostSpiral's resolve_usage_fee sys.exits when a fee address is also an
+# --exit-to destination: "Then it is not a fee: it lands in the same place as
+# the mixed funds". Right, and at PARSE time, before stage 0 -- so nothing
+# ran, and the refusal names command-line flags a phone operator never typed,
+# onto a stdout the unit diverts to a 0600 log on a machine that then powers
+# off. What reaches the chat is "withdraw: failed" plus a hint about mixing
+# depth that is wrong, and a warning that some of it may already have moved,
+# which is false.
+#
+# ON A SINGLE-TENANT BOT THE OVERLAP IS THE NATURAL SETUP -- the operator is
+# the user -- and the address LIST made it intermittent: with N paired,
+# roughly one withdrawal in N drew the colliding one and died while the rest
+# worked.
+print("\n-- withdrawing to an address the cut is also paid to --")
+_FK = {"tor_proxy": "socks5h://x", "rpc_primary": "http://127.0.0.1:18083",
+       "rpc_daemon": "http://127.0.0.1:18081", "wallet_file": "/w",
+       "allow_withdraw": True, "usage_fee_addresses": _FA}
+
+
+def _fee_argv_for(dests):
+    return A.build_argv("withdraw", {"exit_to": list(dests), "depth": 2},
+                        _FK, Path("/tmp"), bundle="/tmp/b.json", slip=None,
+                        handle="A3F1")[0]
+
+
+check("fee: an address that is a destination this run is not offered for the "
+      "cut", all(A.pick_fee_address(_FK, exclude=[_FA[2]]) != _FA[2]
+                 for _ in range(400)))
+check("fee: ...and the other paired addresses still are, so one collision "
+      "does not waive the fee",
+      len({A.pick_fee_address(_FK, exclude=[_FA[2]]) for _ in range(400)}) == 3)
+check("fee: ...and the run still asks for the cut",
+      "--usage-fee" in _fee_argv_for([_FA[2]]))
+# EVERY PAIRED ADDRESS A DESTINATION -> WAIVE, DO NOT REFUSE. The money lands
+# in the operator's own hands either way, which is what GhostSpiral's refusal
+# says; plan_usage_fee already waives rather than aborts when the cut is not
+# worth moving, for the same reason.
+check("fee: withdrawing to ALL of them waives the cut rather than failing "
+      "the run", A.pick_fee_address(_FK, exclude=_FA) == "")
+# AND THE FLAG MUST AGREE WITH THE DRAW. --usage-fee with no
+# GS_USAGE_FEE_ADDRESS is exactly the configuration that mints the cut onto
+# the mixing wallet -- the recapture the fee gate exists to prevent -- so a
+# waived draw that still composed the flag would trade one bug for a worse one.
+check("fee: ...and the flag is not composed when no address is usable, so "
+      "nothing mints on the mixing wallet",
+      "--usage-fee" not in _fee_argv_for(_FA))
+check("fee: NON-VACUITY -- an ordinary destination still pays the cut",
+      "--usage-fee" in _fee_argv_for(["4" + "9" * 94])
+      and A.pick_fee_address(_FK, exclude=["4" + "9" * 94]) in _FA)
+# THE PREDICATE IS ASKED ONCE AND USED TWICE, which is what keeps them in step.
+check("fee: the argv and the draw consult the same excluded list",
+      "_withdraw_fee_argv(key, params.get(\"exit_to\") or [])" in _ag_src
+      and "pick_fee_address(key, exclude=_dests)" in _ag_src)
 
 # ---- ...AND THE DESK RE-OPENS WHAT THE PHONE PATH CLOSED -----------------
 #

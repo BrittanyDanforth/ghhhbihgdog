@@ -688,6 +688,7 @@ def test_count_refuses_a_repeating_wallet():
 
     check("--count: a repeating wallet-rpc IS caught (control: the defect is "
           "reachable at all)", len(made) >= 2 and made[0][0] == made[1][0])
+
     check("--count: the shipped guard REFUSES the second mint rather than "
           "writing a bundle for it", len(refusals) == 1 and len(got) == 1)
     check("--count: ...and the refusal says why one address across several "
@@ -850,6 +851,102 @@ def test_swap_dest_must_not_be_the_exit_address():
             os.environ.pop("GS_EXIT_TO", None)
         else:
             os.environ["GS_EXIT_TO"] = _saved
+
+
+def test_half_minted_receive():
+    """A receive whose subaddress mint fails leaves an orphan account."""
+    # ---- A HALF-MINTED RECEIVE LEFT AN ORPHAN ACCOUNT ON THE WALLET ---------
+    #
+    # mint_one_receive wraps create_fresh_account and names its failure cleanly.
+    # The SUBADDRESS mint and verify_receive_address were bare -- and both raise
+    # for ordinary reasons: wallet-rpc dies or the Tor circuit drops between the
+    # two calls, the wallet is locked (-21), or create_address answers without an
+    # `address` or a usable `address_index`, which gs_common deliberately raises
+    # on. All of those happen AFTER the account exists.
+    #
+    # What is left is a brand-new empty account with no subaddress and nothing
+    # referencing it. paranoia_mode never touches the wallet file, so it is
+    # permanent, and it counts against gs_wake_agent's 45-account ceiling, which
+    # refuses every minting job once reached. Nothing reached the integrity chain
+    # either, while the failure path ten lines above writes one. On the vault the
+    # traceback goes to a 0600 log on a machine that then powers off, and the
+    # operator's whole message is "address: failed".
+    print("\n-- a receive that half-minted --")
+
+
+    class _HalfMintRPC:
+        """Answers create_account, then dies on the subaddress."""
+
+        def __init__(self, how):
+            self.how = how
+
+        def new_subaddress_indexed(self, account_index=0, label=""):
+            raise RuntimeError(self.how)
+
+
+    _hm_chain = []
+    _hm_saved = (crw.create_fresh_account, crw.integrity_log,
+                 crw.integrity_log_once)
+    try:
+        crw.create_fresh_account = lambda rpc, label: 7
+        crw.integrity_log = lambda *a, **k: _hm_chain.append(a[1])
+        crw.integrity_log_once = lambda *a, **k: None
+        _hm_args = types.SimpleNamespace(account=None, label="")
+        _hm_msg = ""
+        try:
+            crw.mint_one_receive(_HalfMintRPC("connection reset by peer"),
+                                 _hm_args)
+        except SystemExit as _e:
+            _hm_msg = str(_e)
+        check("half-mint: it exits cleanly instead of a raw traceback",
+              _hm_msg.startswith("[!] Could not mint the receive subaddress"))
+        check("half-mint: ...and names the residue, because the operator is the "
+              "only one who can decide what to do with it",
+              "Account 7 WAS created and is empty" in _hm_msg)
+        check("half-mint: ...and says it survives the wipe and costs a ceiling "
+              "slot, which is why it is worth telling them",
+              "never" in _hm_msg and "wiped" in _hm_msg
+              and "account ceiling" in _hm_msg)
+        check("half-mint: ...and says the one reassuring thing that IS true",
+              "no payment can have been sent" in _hm_msg)
+        check(f"half-mint: ...and it reaches the integrity chain, like every "
+              f"neighbouring failure ({_hm_chain})",
+              "receive_mint_FAILED" in _hm_chain)
+        # NO RESIDUE TO NAME when the operator chose the account: nothing here
+        # created it, and claiming otherwise would send them looking for an empty
+        # account that is not there.
+        _hm_chain.clear()
+        _hm_args2 = types.SimpleNamespace(account=7, label="")
+        _hm_msg2 = ""
+        try:
+            crw.mint_one_receive(_HalfMintRPC("wallet is locked (-21)"), _hm_args2)
+        except SystemExit as _e:
+            _hm_msg2 = str(_e)
+        check("half-mint: --account N names no residue, because this run created "
+              "no account",
+              "WAS created" not in _hm_msg2
+              and _hm_msg2.startswith("[!] Could not mint the receive subaddress"))
+        # NON-VACUITY: the account-create failure is still its own message, so the
+        # widened try did not swallow the one that already worked.
+        _hm_chain.clear()
+
+        def _boom_acct(rpc, label):
+            raise RuntimeError("create_account refused")
+
+        crw.create_fresh_account = _boom_acct
+        _hm_msg3 = ""
+        try:
+            crw.mint_one_receive(_HalfMintRPC("unused"),
+                                 types.SimpleNamespace(account=None, label=""))
+        except SystemExit as _e:
+            _hm_msg3 = str(_e)
+        check("half-mint: NON-VACUITY -- a failure to create the ACCOUNT is still "
+              "its own message, about falling back to account 0",
+              "Could not create a fresh account" in _hm_msg3
+              and "account_create_FAILED" in _hm_chain)
+    finally:
+        (crw.create_fresh_account, crw.integrity_log,
+         crw.integrity_log_once) = _hm_saved
 
 
 def run_all():

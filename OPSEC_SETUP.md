@@ -1024,6 +1024,39 @@ Until the bot exists: skip 1–3. You are at the ThinkPad. Same files,
 same “memo never leaves the machine except to the sender.”
 
 
+### The pager's unit needs a `WorkingDirectory`, and the reason is not obvious
+
+`gs_common`'s integrity chain is `Path("integrity_chain.log")` — **relative**,
+resolved against the working directory at the moment it is opened. systemd
+starts a unit with `cwd=/`.
+
+`gs-telegram-pager.service.example` sets `ProtectSystem=strict` with
+`ReadWritePaths=/var/lib/gs`, so `/` is read-only: the chain resolved to
+`/integrity_chain.log`, and the first bookkeeping line the pager ever wrote
+raised an unhandled `OSError`. With `StandardError=null` the traceback went
+nowhere and `Restart=on-failure` / `RestartSec=30` retried it every thirty
+seconds, forever. The one box whose entire job is being reachable was
+unreachable, in a loop, with nothing printed anywhere to say so.
+
+`gs-wake-agent.service` already carried this reasoning and fixed it there —
+"systemd starts a unit with cwd=/ and HOME=/root", hence its
+`WorkingDirectory=/var/lib/ghostspiral`. The pager's unit had copied the
+hardening and not the fix.
+
+Both halves are closed now, and both are worth keeping:
+
+- the unit sets `WorkingDirectory=/var/lib/gs`, so the chain lands in the one
+  directory the unit may write;
+- `main()` no longer dies if the chain cannot be written. The example unit's
+  own header says "read every line, then write your own", so an operator's
+  unit may have no `WorkingDirectory` at all — and a full or read-only card
+  would do the same on one that does. A pager that answers is worth more than
+  a chain line about a pager that did not start. It prints one line to stdout
+  and carries on.
+
+**If you write your own unit, set it.** Without it the chain is silently
+missing on a box where it is the only tamper-evidence there is.
+
 ## 6. Bad situations (and whether this beats them)
 
 | happens | beaten? |
