@@ -265,16 +265,81 @@ check("there is no swap_quote job — a job that takes a destination is how a "
 # bounded int or a 4-hex label. The address is admitted because of what it is
 # used FOR -- gs_wake_agent puts it in GS_EXIT_TO and never on an argv -- and
 # because its own gate refuses anything shaped like a flag, a path or a URL.
+#
+# IT CARRIES A LIST NOW, and that is a widening, so it is checked as one. The
+# exit relays one transaction per mixed output, so a single destination
+# collects every arrival the run spent hours separating -- the wire had room
+# for exactly one address and the phone therefore had no choice. What the
+# widening must NOT buy is an unbounded field: a list with no ceiling is a way
+# to overflow the fixed-size record, and a fixed-size record is the whole
+# reason a wake note reveals nothing about the job it carries.
+_SPECS = [getattr(c, "spec", "")
+          for spec in P.JOBS.values() for c in spec["schema"].values()]
 check("no schema field is free-form: every one is a bounded int, a handle, or "
       "the address gate",
-      all(getattr(c, "spec", "").startswith(("int ", "handle ", "xmr address"))
-          for spec in P.JOBS.values() for c in spec["schema"].values()))
+      all(s.startswith(("int ", "handle ", "xmr address", "1-"))
+          and ("xmr address" in s or s.startswith(("int ", "handle ")))
+          for s in _SPECS))
 check("...and the text field is on the spending job and nowhere else",
       [j for j in P.JOBS
-       if any(getattr(c, "spec", "").startswith("xmr address")
+       if any("xmr address" in getattr(c, "spec", "")
               for c in P.JOBS[j]["schema"].values())] == ["withdraw"])
+check("...and the address list is BOUNDED, so it cannot overflow the "
+      "fixed-size wake record",
+      isinstance(P.MAX_WAKE_EXIT_DESTS, int)
+      and 1 <= P.MAX_WAKE_EXIT_DESTS <= 32
+      and str(P.MAX_WAKE_EXIT_DESTS) in getattr(
+          P.JOBS["withdraw"]["schema"]["exit_to"], "spec", ""))
+# THE CAP IS THE WIRE'S, and the module proves it at import rather than
+# asserting a literal. A field added to the withdraw schema later makes the
+# largest note bigger; this is what stops the ceiling quietly becoming a lie.
+check("the largest withdraw note at the cap really fits the wire format",
+      P._MAX_WITHDRAW_NOTE <= P.MAX_INNER)
+check("NON-VACUITY -- one more destination would NOT fit, so the cap is the "
+      "wire's own limit and not a round number",
+      P._MAX_WITHDRAW_NOTE + (len("4" + "1" * 105) + 3) > P.MAX_INNER)
+# AND THE GUARD REALLY FIRES. The two checks above assert the FACT; a mutation
+# that deleted the guard left both of them green, because with the shipped cap
+# the condition is false either way. What the guard is for is the day someone
+# adds a field to the withdraw schema -- so it is driven by re-importing the
+# module with a cap the wire cannot carry, and the module must refuse to load.
+_pf = os.path.join(REPO, "gs_wake_proto.py")
+_psrc = open(_pf, encoding="utf-8").read()
+_bad_src = _psrc.replace(f"MAX_WAKE_EXIT_DESTS = {P.MAX_WAKE_EXIT_DESTS}",
+                         "MAX_WAKE_EXIT_DESTS = 64", 1)
+check("the import-time proof is REACHABLE -- raising the cap really changes "
+      "the source, so the drive below is not a no-op",
+      _bad_src != _psrc)
+_raised = ""
+try:
+    exec(compile(_bad_src, "<proto-with-impossible-cap>", "exec"), {"__name__": "_p"})
+except Exception as _e:                                      # noqa: BLE001
+    _raised = f"{type(_e).__name__}: {_e}"
+check("a cap the wire cannot carry makes gs_wake_proto REFUSE TO LOAD, rather "
+      f"than shipping a maximum that fails on the wire ({_raised[:60]})",
+      "WakeError" in _raised and "wire format" in _raised)
+check("...and the refusal names the number to change",
+      "MAX_WAKE_EXIT_DESTS" in _raised)
+# NON-VACUITY: the UNMODIFIED source still imports, so the check above is
+# about the cap and not about the file being broken.
+_ok_raised = ""
+try:
+    exec(compile(_psrc, "<proto-as-shipped>", "exec"), {"__name__": "_p2"})
+except Exception as _e:                                      # noqa: BLE001
+    _ok_raised = f"{type(_e).__name__}: {_e}"
+check("NON-VACUITY -- the shipped cap loads cleanly", _ok_raised == "")
 # The gate itself, driven against the shapes that would matter if it were lax.
 _ax = P.JOBS["withdraw"]["schema"]["exit_to"]
+
+
+def _refuses(fn, v):
+    try:
+        fn(v)
+        return False
+    except Exception:                                        # noqa: BLE001
+        return True
+
+
 for _bad, _why in ((_SAMPLE_XMR[:94], "one character short"),
                    (_SAMPLE_XMR + "A", "one character long"),
                    ("-" + _SAMPLE_XMR[1:], "starts like a flag"),
@@ -291,11 +356,31 @@ for _bad, _why in ((_SAMPLE_XMR[:94], "one character short"),
         check(f"address gate refuses {_why}", False)
     except Exception:                                        # noqa: BLE001
         check(f"address gate refuses {_why}", True)
+# A LIST COMES BACK, ALWAYS, even for the one-address case -- so every caller
+# has one shape to handle and gs_wake_agent's " ".join is total.
 check("address gate NON-VACUITY -- a real 95-character address passes",
-      _ax(_SAMPLE_XMR) == _SAMPLE_XMR)
+      _ax(_SAMPLE_XMR) == [_SAMPLE_XMR])
 check("address gate NON-VACUITY -- and an integrated 106-character one does "
       "too, so the length rule is a set and not a single number",
-      _ax("8" + "Ad" * 52 + "A") == "8" + "Ad" * 52 + "A")
+      _ax("8" + "Ad" * 52 + "A") == ["8" + "Ad" * 52 + "A"])
+# A BARE STRING IS STILL ACCEPTED, because an older pager sends one and the
+# failure mode of refusing it is a vault turning down its owner's withdrawal
+# with a schema error they cannot act on from a phone.
+check("a bare string is normalised to a list of one, so an older pager still "
+      "reaches a newer vault",
+      _ax(_SAMPLE_XMR) == [_SAMPLE_XMR] and isinstance(_ax(_SAMPLE_XMR), list))
+_two = [_SAMPLE_XMR, "8" + "Ad" * 52 + "A"]
+check("...and several are carried in order", _ax(_two) == _two)
+check("the cap is enforced", _refuses(_ax, [_SAMPLE_XMR] * (P.MAX_WAKE_EXIT_DESTS + 1)))
+check("NON-VACUITY -- exactly the cap is accepted, so the refusal above is a "
+      "ceiling and not a blanket refusal of lists",
+      len(_ax([_SAMPLE_XMR[:-1] + c
+               for c in "ABCDEFGHJKLMNPQRST"[:P.MAX_WAKE_EXIT_DESTS]]))
+      == P.MAX_WAKE_EXIT_DESTS)
+check("a repeated address is refused -- repeating one spreads nothing",
+      _refuses(_ax, [_SAMPLE_XMR, _SAMPLE_XMR]))
+check("an empty list is refused -- a withdrawal needs somewhere to go",
+      _refuses(_ax, []))
 
 for job in P.JOBS:
     body = {"job_id": P.new_job_id(), "challenge": P.new_challenge().hex(),

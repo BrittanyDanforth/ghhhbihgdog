@@ -809,10 +809,21 @@ doorbell, so anything it does you can do from a terminal.
    `--hop-delay`, which is an OPSEC parameter and not overhead: **do not
    interrupt it.**
 
-   **From the phone, with `/withdraw`.** Two messages: the command, then the
-   address. Nothing else — no handle, no account, no amount. The vault looks at
-   its own wallet, takes the largest unlocked output, mixes it and sends it
-   there. It needs nothing from you that you would have to look up.
+   **From the phone, with `/withdraw`.** Three messages: the command, the
+   destination, then the depth. Nothing else — no handle, no account, no
+   amount. The vault looks at its own wallet, takes the largest unlocked
+   output, mixes it and sends it there. It needs nothing from you that you
+   would have to look up.
+
+   **Give it more than one address.** The exit sends **one transaction per
+   mixed output** — at least 5, 12 or 22 of them at the three depths — and a
+   single destination collects every one of them, minutes apart, from a wallet
+   that just spent hours making sure they could not be grouped. Reply with up
+   to seven addresses separated by spaces and the withdrawal is spread across
+   them. One address is a legitimate choice (an exchange deposit address
+   cannot be split) and the chat says what it costs before you confirm; what
+   it must not be is the *only* choice, which is what it was until the wire
+   learned to carry a list.
 
    Only if you have paired with
    `--allow-withdraw`, and read §4b first, because it is a real trade and not
@@ -939,10 +950,15 @@ What you give up by turning it on, stated plainly:
 
 What it still refuses:
 
-- The address is checked three times — at the pager, on the wire, and at the
-  vault with a real checksum before a coin moves — and it never reaches an
-  argv. It travels in `GS_EXIT_TO`, so it cannot become a flag however it is
-  shaped.
+- Every address is checked three times — at the pager, on the wire, and at the
+  vault with a real checksum before a coin moves — and none of them reaches an
+  argv. They travel in `GS_EXIT_TO`, space-separated, so none can become a flag
+  however it is shaped.
+- At most **seven** destinations, and that ceiling is the wire's rather than a
+  policy: a wake record is a fixed-size padded block, and seven of the longer
+  (integrated, 106-character) address form is what fits in it. `gs_wake_proto`
+  re-derives that at import and refuses to load if a future field makes the
+  number a lie.
 - `/withdraw` with the address on the same line is refused. It asks, then
   confirms. Same rule as `/depo`, and for a stronger reason.
 - The mix runs `--dag-mixing`: a withdrawal you are not watching takes the

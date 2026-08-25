@@ -189,6 +189,19 @@ print("\n-- the withdraw wizard, driven end to end --")
 # cannot move its owner's money and a documented cycle that ends with the
 # funds sitting on an address the Bitcoin chain already published.
 _WA = "4" + "Ad" * 47
+
+
+def _wjob_ok(params):
+    """Does the wire really accept this withdraw note? Asked of the real gate."""
+    try:
+        P.validate_job({"job_id": P.new_job_id(),
+                        "challenge": P.new_challenge().hex(),
+                        "job": "withdraw", **params})
+        return True
+    except P.WakeError:
+        return False
+
+
 w = Fake()
 w.say("/withdraw")
 check("wd: /withdraw starts a conversation", 111 in w.p.convos)
@@ -217,9 +230,15 @@ check("wd: ...and the confirm repeats neither the address nor an amount",
       _WA not in w.sent[-1][1]
       and not re.search(r"\d+\.\d{2,}", w.sent[-1][1]))
 w.answer_confirm()
+# A LIST, EVEN FOR ONE ADDRESS. The exit relays one transaction per mixed
+# output, so a single destination collects every arrival the run spent hours
+# separating -- and the wire used to have room for exactly one, which meant the
+# phone had no choice about it. exit_to carries 1..MAX_WAKE_EXIT_DESTS now and
+# always comes back as a list, so gs_wake_agent's " ".join into GS_EXIT_TO is
+# total and there is one shape for every caller to handle.
 check("wd: answering correctly pokes exactly one withdraw job, carrying the "
       "destination and the chosen depth",
-      w.pokes == [(111, "withdraw", {"exit_to": _WA, "depth": 2})])
+      w.pokes == [(111, "withdraw", {"exit_to": [_WA], "depth": 2})])
 check("wd: ...and the conversation is gone", 111 not in w.p.convos)
 _wok = True
 try:
@@ -265,7 +284,97 @@ check("wd: a rejected address is NOT echoed back into the chat",
 # NON-VACUITY: the good path really does carry the address, so the check above
 # is about the REJECTED value and not about a bot that never says addresses.
 check("wd: NON-VACUITY -- the accepted address really does reach the job",
-      w.pokes[0][2]["exit_to"] == _WA)
+      w.pokes[0][2]["exit_to"] == [_WA])
+
+# ===========================================================================
+# 1b-ii. IT TAKES MORE THAN ONE DESTINATION, AND SAYS WHY THAT MATTERS
+# ===========================================================================
+#
+# THE EXIT SENDS ONE TRANSACTION PER MIXED OUTPUT. A withdrawal funds
+# `wallets + randint(DECOY_MIN, DECOY_MAX)` of them, so the floor is 5, 12 and
+# 22 arrivals at the three depths -- and with a single destination every one of
+# them lands on the same address, minutes apart, from a wallet that just spent
+# hours making sure they could not be grouped.
+#
+# resolve_exit_destinations warns about exactly that, and says it is a warning
+# rather than a refusal because "one destination is a legitimate choice ... The
+# operator has to be told what it costs, not overruled." It prints onto the
+# vault's stdout, which the unit diverts to a 0600 file on a machine that
+# powers off -- so on the phone path nobody has ever read it, and the wire took
+# one address, so the wizard could not have offered a second even if they had.
+print("\n-- the withdrawal can be spread, and the chat says what one costs --")
+_WB = "4" + "Ad" * 46 + "Ae"
+_WC = "4" + "Ad" * 46 + "Af"
+
+_m = Fake()
+_m.say("/withdraw")
+_ask = _m.sent[-1][1]
+check("wd/spread: the question offers more than one address",
+      str(P.MAX_WAKE_EXIT_DESTS) in _ask and "several" in _ask.lower())
+check("wd/spread: ...and states the arrival count that makes it matter",
+      str(P.exit_arrivals_floor(min(P.WITHDRAW_DEPTHS))) in _ask)
+check("wd/spread: ...and still calls one address a legitimate choice, because "
+      "an exchange deposit address cannot be split",
+      "exchange" in _ask.lower())
+_m.say(f"{_WA} {_WB} {_WC}")
+_m.say("3")
+_conf = _m.sent[-1][1]
+check("wd/spread: three addresses are accepted in one message",
+      "= ?" in _conf)
+check("wd/spread: the confirm says how many separate transactions there will "
+      "be, at the depth just chosen",
+      str(P.exit_arrivals_floor(3)) in _conf)
+check("wd/spread: ...and how many places they land in",
+      "across 3 addresses" in _conf)
+# THE ADDRESSES ARE STILL NOT REPEATED. A count is not a destination: it says
+# nothing about where the money goes, and the transcript has no masker.
+check("wd/spread: the confirm still repeats no address",
+      _WA not in _conf and _WB not in _conf and _WC not in _conf)
+_m.answer_confirm()
+check("wd/spread: all three reach the job, in order",
+      _m.pokes[0][2]["exit_to"] == [_WA, _WB, _WC])
+check("wd/spread: ...and the wire accepts that note",
+      _wjob_ok(_m.pokes[0][2]))
+
+# ONE DESTINATION GETS THE SENTENCE, because that is the case where the count
+# is the bad news. NON-VACUITY for the branch above: the two differ.
+_o = Fake()
+_o.say("/withdraw"); _o.say(_WA); _o.say("3")
+_oc = _o.sent[-1][1]
+check("wd/spread: one address is told what it costs, at the confirm",
+      "ONE address" in _oc and "group" in _oc)
+check("wd/spread: NON-VACUITY -- the three-address confirm says no such thing",
+      "ONE address" not in _conf)
+check("wd/spread: both confirms quote the SAME arrival floor for the same "
+      "depth, so the number is about the depth and not about the spread",
+      str(P.exit_arrivals_floor(3)) in _oc)
+
+# THE CAP AND THE DUPLICATE RULE ARE THE WIRE'S, enforced where the operator
+# is typing rather than after a wake has been spent.
+_c = Fake()
+_c.say("/withdraw")
+_c.say(" ".join("4" + "Ad" * 46 + "A" + c
+                for c in "bcdefghijklmnop"[:P.MAX_WAKE_EXIT_DESTS + 1]))
+check("wd/spread: one more than the cap is refused here, not at the vault",
+      "no:" in _c.sent[-1][1].lower() and 111 not in _c.p.convos)
+_d2 = Fake()
+_d2.say("/withdraw"); _d2.say(f"{_WA} {_WA}")
+check("wd/spread: the same address twice is refused -- repeating one spreads "
+      "nothing", "no:" in _d2.sent[-1][1].lower() and 111 not in _d2.p.convos)
+# NON-VACUITY: exactly the cap still works, so the two refusals above are a
+# ceiling and a duplicate rule, not a blanket refusal of several addresses.
+_f = Fake()
+_f.say("/withdraw")
+_f.say(" ".join("4" + "Ad" * 46 + "A" + c
+                for c in "bcdefghijklmnop"[:P.MAX_WAKE_EXIT_DESTS]))
+_f.say("1")
+check("wd/spread: NON-VACUITY -- exactly the cap is accepted",
+      "= ?" in _f.sent[-1][1])
+_f.answer_confirm()
+check("wd/spread: ...and all of them reach the job",
+      len(_f.pokes[0][2]["exit_to"]) == P.MAX_WAKE_EXIT_DESTS)
+check("wd/spread: ...and the wire carries a note at the cap",
+      _wjob_ok(_f.pokes[0][2]))
 
 # ===========================================================================
 # 1c. IT ASKS FOR THE AMOUNT, AND ONLY ACCEPTS ONE

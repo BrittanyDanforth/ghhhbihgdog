@@ -288,6 +288,14 @@ SPEED_ANSWER = "Not settable here."
 # but only /send is in BOT_COMMANDS, so /withdraw is the one the "/" menu
 # never offers -- pointing the operator at it from inside an answer sent
 # them to a command they cannot see.
+# STILL ONE SHORT LINE, and the temptation to grow it here was the wrong one.
+# /send now takes up to MAX_WAKE_EXIT_DESTS destinations and explains why that
+# matters -- but this answer is a STANDING one, and everything written into it
+# sits permanently in a server-side transcript describing the arrangement. The
+# explanation belongs where the operator is about to act on it, which is
+# _exit_question, shown once per withdrawal. Pointing at /send is the whole of
+# what this has to do. tests/test_depo_wizard.py caps these three at 40
+# characters for exactly this reason and caught a 191-character draft.
 EXIT_ANSWER = "Per withdrawal — see /send."
 
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
@@ -601,18 +609,26 @@ def parse_command(text: str) -> tuple:
 class Convo:
     """One chat's half-finished /depo. Process memory only, never a file.
 
-    ONE STRING FIELD, AND IT IS NAMED, and that is a weakening of what this
+    ONE TEXT FIELD, AND IT IS NAMED, and that is a weakening of what this
     used to say. The rule was "not one string among them" -- a struct that
     cannot hold an address however the prompts around it are later edited.
-    /withdraw needs to hold exactly one, because the operator types their
-    destination into the chat and it has to survive until the confirm.
+    /withdraw needs to hold destinations, because the operator types them into
+    the chat and they have to survive until the confirm.
 
-    So the rule becomes the narrower thing it was always FOR: exactly one
-    string, `exit_to`, holding a value already checked against the protocol's
-    address gate, and NOTHING here reaches disk -- Limits.save writes the
-    cursor and the counters and this object is not in it. Both halves are
-    asserted in tests/test_depo_wizard.py; the second was always the real
-    invariant and the first was the cheap way to enforce it.
+    So the rule becomes the narrower thing it was always FOR: one named field,
+    `exit_to`, holding ONLY values the protocol's address gate has already
+    accepted, and NOTHING here reaches disk -- Limits.save writes the cursor
+    and the counters and this object is not in it. Both halves are asserted in
+    tests/test_depo_wizard.py; the second was always the real invariant and the
+    first was the cheap way to enforce it.
+
+    IT IS A LIST OF ADDRESSES NOW, not one, and the count is the point rather
+    than a convenience. The exit relays one transaction per mixed output, so a
+    single destination collects every arrival the run spent hours separating --
+    see _exit_question. proto's field returns a list of 1..MAX_WAKE_EXIT_DESTS
+    and that list is what is stored, so the "already checked" half is unchanged:
+    every element came back from the same gate, and a list of strings the gate
+    accepted is no more free text than one was.
 
     What it still cannot hold: a memo, a slip, an amount, or free text of any
     other shape. `exit_to` is set in exactly one place, from a value
@@ -785,10 +801,50 @@ class Pager:
             # label named which pile. The vault finds its own funded output
             # now; the only thing the operator actually has to decide is where
             # it goes.
-            self.send(chat_id,
-                      "Send where? Reply with the address. /cancel to stop.")
+            self.send(chat_id, self._exit_question())
             return
         self.send(chat_id, self._amount_question())
+
+    def _exit_question(self) -> str:
+        """Where the withdrawal goes -- and that it may go to more than one place.
+
+        THIS USED TO SAY "Reply with the address", SINGULAR, AND THAT WAS THE
+        WHOLE PROBLEM. GhostSpiral's exit relays ONE TRANSACTION PER OUTPUT. A
+        withdrawal funds `wallets + randint(DECOY_MIN, DECOY_MAX)` of them, so
+        at the three depths this service offers the floor is 5, 12 and 22
+        separate arrivals -- and with one destination every one of them lands
+        on the same address, minutes apart, from a wallet that just spent hours
+        making sure they could not be grouped.
+
+        resolve_exit_destinations says exactly that, and says it is a warning
+        rather than a refusal because "one destination is a legitimate choice:
+        an exchange deposit address is one address and cannot be spread. The
+        operator has to be told what it costs, not overruled." It prints that
+        onto the vault's stdout -- which the unit diverts to a 0600 file on a
+        machine that powers off. On the phone path it has never been read by
+        anyone, and the wire could not have carried a second address anyway.
+
+        So the choice is offered HERE, where the operator is, with the cost
+        attached. The count is the protocol's own floor for the shallowest
+        depth, so the sentence is true whichever depth they pick next.
+
+        THE SEPARATOR IS THE ONE THE REST OF THE TOOLKIT USES: whitespace or
+        commas, the same split resolve_exit_destinations applies to GS_EXIT_TO.
+        One message, not one per address -- every message is a line in a
+        server-side transcript this tool cannot delete, and asking N times
+        would write N of them.
+        """
+        _lo = proto.exit_arrivals_floor(min(proto.WITHDRAW_DEPTHS))
+        return (f"Send where? Reply with the address — or several.\n\n"
+                f"You can give up to {proto.MAX_WAKE_EXIT_DESTS}, separated by "
+                f"spaces — and it is worth it. This sends one transaction per "
+                f"mixed output (at least {_lo} at the shallowest depth, more "
+                f"at the others), so a single address collects every one of "
+                f"them and anyone watching it can group them again. Splitting "
+                f"them up is the last thing that stops that.\n\n"
+                f"One address is fine if that is what you have — an exchange "
+                f"deposit address cannot be split.\n\n"
+                f"/cancel to stop.")
 
     def _settings_text(self) -> str:
         """What a run does, and who decides each part.
@@ -1011,9 +1067,17 @@ class Pager:
             # NOT lower-cased and NOT stripped beyond the ends: base58 is
             # case-significant, and an address that only differs by case is a
             # different address.
-            _a = text.strip()
+            # SPLIT ON WHITESPACE OR COMMAS, the same separator
+            # resolve_exit_destinations applies to GS_EXIT_TO -- so the phone,
+            # the console and the command line all take a destination list the
+            # same way, and an operator who has read one has read all three.
+            #
+            # ONE MESSAGE, NOT ONE PER ADDRESS. Every message is a line in a
+            # server-side transcript this tool cannot delete; asking N times
+            # would write N of them for no gain.
+            _a = [t for t in re.split(r"[\s,]+", text.strip()) if t]
             try:
-                proto.JOBS["withdraw"]["schema"]["exit_to"](_a)
+                _a = proto.JOBS["withdraw"]["schema"]["exit_to"](_a)
             except Exception:                                # noqa: BLE001
                 del self.convos[chat_id]
                 # THE REASON, NOT THE VALUE. Echoing what they typed would put
@@ -1052,9 +1116,24 @@ class Pager:
             # operator chose from a list and could have mistyped, and unlike
             # the address it reveals nothing -- it is a property of the
             # service, not of the money.
+            #
+            # AND HOW MANY ARRIVALS LAND ON HOW MANY ADDRESSES, because the
+            # depth is what decides the first number and this is the last
+            # moment either can be changed. A COUNT is not an address: it says
+            # nothing about where the money goes and everything about whether
+            # the operator has just undone the run's whole purpose. The
+            # single-destination case gets a sentence rather than a number,
+            # since that is the case where the count is the bad news.
+            _n = len(c.exit_to)
+            _lo = proto.exit_arrivals_floor(_d)
+            _spread = (f"across {_n} addresses" if _n > 1 else
+                       "onto the ONE address you gave — anyone watching it "
+                       "sees them all and can group them")
             self.send(chat_id,
-                      f"Send to the address you just sent, "
-                      f"{proto.WITHDRAW_DEPTH_NOTE[_d]} — this SPENDS."
+                      f"Send to the {'addresses' if _n > 1 else 'address'} you "
+                      f"just sent, {proto.WITHDRAW_DEPTH_NOTE[_d]} — this "
+                      f"SPENDS.\n\n"
+                      f"At least {_lo} separate transactions, {_spread}."
                       f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because

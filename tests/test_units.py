@@ -4759,28 +4759,96 @@ check("...so it no longer claims a bare 'detects tampering'",
 # `^...$` validator, because enumerating the thirteen would not stop a
 # fourteenth. \Z is the anchor that means what these all intend.
 # ===========================================================================
-import re as _re2
+# THE DETECTOR ITSELF WAS THE HOLE, and it survived two rounds of this check
+# passing while two real offenders sat in the two most important files.
+#
+# It was a regex over single lines:
+#
+#     re[.](?:compile|match|fullmatch)[(]\s*r?"\^[^"]*[$]"
+#
+# which requires a DOUBLE-QUOTED, optionally-r-prefixed literal opening `^` and
+# closing `$`, all on ONE line. The two validators left in this toolchain were
+# gs_common.XMR_ADDR_RE and gs_console.XMR_RE -- the Monero address gate, in
+# two copies -- and both are f-strings (so `r?"` never matches `f"`), and the
+# gs_common one is split across two lines as well. Three independent reasons it
+# could not see them, in a check whose own comment promises it "walks the
+# shipped source and fails on ANY new `^...$` validator".
+#
+# So it PARSES now. ast.walk finds every re.* call in the file, reconstructs
+# the literal parts of a plain string OR an f-string, and asks whether the
+# pattern is anchored `^...$`. Quoting style, prefix and line breaks stop
+# mattering, which is what "structural" was always supposed to mean.
+import ast as _ast_dz
 
 _TOOLS = ["gs_common.py", "gs_wake_proto.py", "GhostSpiral", "airgap_tx_signer",
           "broadcast_signed_xmr", "thor_swap_preparer", "receive_watch",
           "create_receive_wallet", "gs_console", "gs_doorbell", "gs_wake_agent",
-          "gs_wake_keys", "exit_strategy_simulator"]
-_DOLLAR = _re2.compile('re[.](?:compile|match|fullmatch)[(]\\s*r?"\\^[^"]*[$]"')
+          "gs_wake_keys", "exit_strategy_simulator", "gs_telegram_pager",
+          "gs_delivery_key", "gs_unseal", "paranoia_mode"]
+
+
+def _dz_pattern(node):
+    """The literal text of a str or f-string argument, or None.
+
+    An interpolation becomes "\x00": it cannot introduce or remove an anchor,
+    and standing in for it keeps the surrounding literal text intact so `^`
+    and `$` are still found where they are.
+    """
+    if isinstance(node, _ast_dz.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, _ast_dz.JoinedStr):
+        out = ""
+        for _v in node.values:
+            out += (_v.value
+                    if isinstance(_v, _ast_dz.Constant)
+                    and isinstance(_v.value, str) else "\x00")
+        return out
+    return None
+
+
+def _dz_offenders(src):
+    """(lineno, pattern) for every `^...$`-anchored re.* call in `src`."""
+    out = []
+    for _n in _ast_dz.walk(_ast_dz.parse(src)):
+        if not (isinstance(_n, _ast_dz.Call)
+                and isinstance(_n.func, _ast_dz.Attribute)
+                and isinstance(_n.func.value, _ast_dz.Name)
+                and _n.func.value.id == "re"
+                and _n.func.attr in ("compile", "match", "fullmatch",
+                                     "search", "sub", "split")
+                and _n.args):
+            continue
+        _p = _dz_pattern(_n.args[0])
+        if _p and _p.startswith("^") and _p.rstrip().endswith("$"):
+            out.append((_n.lineno, _p[:60]))
+    return out
+
+
 _offenders = []
 for _t in _TOOLS:
     _fp = os.path.join(REPO, _t)
     if not os.path.exists(_fp):
         continue
-    for _i, _l in enumerate(open(_fp, encoding="utf-8").read().splitlines(), 1):
-        if _DOLLAR.search(_l):
-            _offenders.append(f"{_t}:{_i}")
+    for _ln, _pat in _dz_offenders(open(_fp, encoding="utf-8").read()):
+        _offenders.append(f"{_t}:{_ln}")
 check("no shipped validator anchors with $ where it means \\Z "
       f"(offenders: {_offenders[:4]})", _offenders == [])
-# NON-VACUITY: the detector must actually detect one.
+# NON-VACUITY: the detector must actually detect one -- in EVERY shape the old
+# one was blind to, because those are the shapes that were really there.
 check("...and that check is not vacuous — it flags a $-anchored validator",
-      bool(_DOLLAR.search('X = re.compile(r"^[a-z]+$")')))
+      len(_dz_offenders('X = re.compile(r"^[a-z]+$")')) == 1)
+check("...including an F-STRING, which is what both real offenders were and "
+      "what the old line-regex could not match",
+      len(_dz_offenders('X = re.compile(f"^[48][{_B}]{{94}}$")')) == 1)
+check("...and one split across LINES, which is what gs_common's was",
+      len(_dz_offenders('X = re.compile(\n    f"^[48][{_B}]{{94}}$")')) == 1)
+check("...and an alternation whose LAST branch is the anchored one",
+      len(_dz_offenders('X = re.compile(f"^a{{9}}$|^b{{9}}$")')) == 1)
 check("...while leaving a correctly anchored one alone",
-      not _DOLLAR.search('X = re.compile(r"^[a-z]+\\Z")'))
+      _dz_offenders('X = re.compile(r"^[a-z]+\\Z")') == [])
+check("...and leaving an f-string \\Z alone too, so the fix is not just "
+      "'flag every f-string'",
+      _dz_offenders('X = re.compile(f"^[48][{_B}]{{94}}\\Z")') == [])
 
 
 _finished()

@@ -2335,10 +2335,10 @@ MUTATIONS = [
  # withdrawn -- and the operator had to remember which label named which pile.
  # The machine holding the wallet is the one that can see where the money is.
  ("the withdraw job goes back to demanding a handle", "gs_wake_proto.py",
-  '        "schema": {"exit_to": _xmr_address_field,\n'
+  '        "schema": {"exit_to": _xmr_address_list,\n'
   '                   "depth": _int_range(1, 3)},',
   '        "schema": {"handle": _handle_field,\n'
-  '                   "exit_to": _xmr_address_field,\n'
+  '                   "exit_to": _xmr_address_list,\n'
   '                   "depth": _int_range(1, 3)},',
   ["test_wake_agent"]),
 
@@ -2510,8 +2510,8 @@ MUTATIONS = [
  # In the environment it cannot become a flag; on an argv it is world-readable
  # for the whole run.
  ("the withdrawal address goes on the argv again", "gs_wake_agent",
-  '            env_extra["GS_EXIT_TO"] = _dest',
-  "            argv.append(_dest)",
+  '            env_extra["GS_EXIT_TO"] = " ".join(_dests)',
+  "            argv.extend(_dests)",
   ["test_wake_agent"]),
 
  # The argv template interpolates `bundle`, and the resolver that fills it in
@@ -3295,6 +3295,122 @@ MUTATIONS = [
   '    _lp.add_argument("--split", type=int, default=1)\n',
   "",
   ["test_console", "test_dag_entry"]),
+
+ # -- the withdrawal's destinations --------------------------------------
+ #
+ # The exit relays ONE TRANSACTION PER MIXED OUTPUT -- at fewest 5, 12 and 22
+ # at the three depths. Every one of them used to land on the same address,
+ # because the wire carried exactly one and the phone therefore had no choice.
+ ("the wake wire carries only ONE exit destination again", "gs_wake_proto.py",
+  '        "schema": {"exit_to": _xmr_address_list,',
+  '        "schema": {"exit_to": _xmr_address_field,',
+  ["test_wake_protocol", "test_depo_wizard"]),
+
+ ("the destination list is unbounded, so it can overflow the fixed-size "
+  "wake record", "gs_wake_proto.py",
+  "    if len(v) > MAX_WAKE_EXIT_DESTS:",
+  "    if False:",
+  ["test_wake_protocol", "test_depo_wizard"]),
+
+ ("the same address twice is accepted, which spreads nothing",
+  "gs_wake_proto.py",
+  "        if a in out:",
+  "        if False:",
+  ["test_wake_protocol", "test_depo_wizard"]),
+
+ # An older pager sends a bare string. Refusing it is a vault turning down its
+ # owner's withdrawal with a schema error they cannot act on from a phone.
+ ("a bare string from an older pager is refused", "gs_wake_proto.py",
+  "    if isinstance(v, str):\n        v = [v]",
+  "    if False:\n        v = [v]",
+  ["test_wake_protocol", "test_depo_wizard"]),
+
+ # The cap is the WIRE's, proven at import rather than asserted from a literal.
+ ("the wire ceiling is no longer proven at import", "gs_wake_proto.py",
+  "if _MAX_WITHDRAW_NOTE > MAX_INNER:                           # pragma: no cover",
+  "if False:                                                    # pragma: no cover",
+  ["test_wake_protocol"]),
+
+ ("only the first destination reaches GhostSpiral", "gs_wake_agent",
+  'env_extra["GS_EXIT_TO"] = " ".join(_dests)',
+  'env_extra["GS_EXIT_TO"] = _dests[0]',
+  ["test_wake_agent"]),
+
+ # The fee address is ONE address and asks for the one-address check by name.
+ # Borrowing the withdraw job's field put the text of a Python list into
+ # GS_USAGE_FEE_ADDRESS the moment that field became a list.
+ ("the fee address borrows the withdraw job's destination-LIST gate",
+  "gs_wake_agent",
+  "                    proto.xmr_address(str(_fee_addr))",
+  '                    proto.JOBS["withdraw"]["schema"]["exit_to"](str(_fee_addr))',
+  ["test_wake_agent"]),
+
+ ("the pairing validates the fee address with the LIST gate", "gs_wake_keys",
+  "            proto.xmr_address(args.usage_fee_address)",
+  '            proto.JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)',
+  ["test_wake_agent"]),
+
+ # The wizard is the only place an operator can choose to spread it.
+ ("the wizard takes one address again, whatever they type",
+  "gs_telegram_pager",
+  '            _a = [t for t in re.split(r"[\\s,]+", text.strip()) if t]',
+  "            _a = [text.strip()]",
+  ["test_depo_wizard"]),
+
+ ("the confirm no longer says how many arrivals land where",
+  "gs_telegram_pager",
+  '                      f"At least {_lo} separate transactions, {_spread}."',
+  '                      f""',
+  ["test_depo_wizard"]),
+
+ ("the single-destination case is no longer called out at the confirm",
+  "gs_telegram_pager",
+  '    _spread = (f"across {_n} addresses" if _n > 1 else',
+  '    _spread = (f"across {_n} addresses" if True else',
+  ["test_depo_wizard"]),
+
+ ("the question stops offering more than one destination", "gs_telegram_pager",
+  '        return (f"Send where? Reply with the address — or several.\\n\\n"',
+  '        return (f"Send where? Reply with the address.\\n\\n"',
+  ["test_depo_wizard"]),
+
+ # The mirrored decoy floor is what makes the arrival count true.
+ ("the mirrored decoy floor drifts from GhostSpiral's", "gs_wake_proto.py",
+  "DECOY_MIN_MIRROR = 2",
+  "DECOY_MIN_MIRROR = 0",
+  ["test_wake_agent", "test_depo_wizard"]),
+
+ ("the arrival floor forgets the decoys and reports --wallets",
+  "gs_wake_proto.py",
+  "    return WITHDRAW_DEPTHS[depth][0] + DECOY_MIN_MIRROR",
+  "    return WITHDRAW_DEPTHS[depth][0]",
+  ["test_wake_agent"]),
+
+ # -- $ is not end-of-string ----------------------------------------------
+ #
+ # The address gate is the cheap pre-filter for the value the ENTIRE mixed
+ # balance is sent to. `$` also matches before a trailing newline.
+ ("the address gate anchors with $ again, in gs_common", "gs_common.py",
+  'f"^[48][{_B58}]{{94}}\\\\Z|^4[{_B58}]{{105}}\\\\Z")',
+  'f"^[48][{_B58}]{{94}}$|^4[{_B58}]{{105}}$")',
+  ["test_units"]),
+
+ ("the address gate anchors with $ again, in the console", "gs_console",
+  'XMR_RE = re.compile(f"^[48][{_B58_C}]{{94}}\\\\Z|^4[{_B58_C}]{{105}}\\\\Z")',
+  'XMR_RE = re.compile(f"^[48][{_B58_C}]{{94}}$|^4[{_B58_C}]{{105}}$")',
+  ["test_units"]),
+
+ # ...and the detector that is supposed to find those. It was a line-oriented
+ # regex that could not match an f-string or a call split across lines, which
+ # is what both real offenders were.
+ ("the $-detector goes back to being blind to f-strings", "tests/test_units.py",
+  "    if isinstance(node, _ast_dz.Constant) and isinstance(node.value, str):\n"
+  "        return node.value\n"
+  "    if isinstance(node, _ast_dz.JoinedStr):",
+  "    if isinstance(node, _ast_dz.Constant) and isinstance(node.value, str):\n"
+  "        return node.value\n"
+  "    if False:",
+  ["test_units"]),
 
 ]
 

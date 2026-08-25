@@ -1664,9 +1664,23 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # protocol's own gate: this value came off a chat, through a
             # doorbell, out of a sealed record, and this is the last place that
             # can refuse it before it reaches a process that spends.
-            _dest = proto.JOBS["withdraw"]["schema"]["exit_to"](
+            # SPACE-SEPARATED, BECAUSE THE VARIABLE HOLDS A LIST.
+            #
+            # resolve_exit_destinations splits GS_EXIT_TO on r"[\s{,}]+" and
+            # its own docstring gives the form: GS_EXIT_TO="addr1 addr2". One
+            # address joins to itself, so the single-destination case is
+            # byte-identical to what this sent before.
+            #
+            # This is what the schema change is FOR. The exit relays one
+            # transaction per output -- at fewest 5, 12 or 22 of them at the
+            # three depths -- and every one used to land on the same address,
+            # because the wire had room for exactly one and nothing here could
+            # have used a second. resolve_exit_destinations warns about that
+            # in as many words, onto a stdout this unit diverts to a 0600 log
+            # on a machine that powers off. Nobody has ever read it.
+            _dests = proto.JOBS["withdraw"]["schema"]["exit_to"](
                 params["exit_to"])
-            env_extra["GS_EXIT_TO"] = _dest
+            env_extra["GS_EXIT_TO"] = " ".join(_dests)
             # THE SPEND PASSWORD, TO THIS CHILD AND NO OTHER.
             #
             # run_child strips every GS_ variable from the inherited
@@ -1710,8 +1724,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 # than off the wire, so it is not attacker-controlled -- but a
                 # typo in a paired address is a cut sent somewhere nobody can
                 # spend it, discovered after the mix has already run.
+                #
+                # proto.xmr_address, NOT the withdraw schema's exit_to field.
+                # This used to borrow that one, which was fine only while the
+                # two happened to be the same check: exit_to is a LIST now, so
+                # the borrowed validator would have put the text of a Python
+                # list into GS_USAGE_FEE_ADDRESS and sent the operator's cut
+                # nowhere. The fee address is one address and asks for the
+                # one-address check by name.
                 env_extra["GS_USAGE_FEE_ADDRESS"] = \
-                    proto.JOBS["withdraw"]["schema"]["exit_to"](str(_fee_addr))
+                    proto.xmr_address(str(_fee_addr))
         # WHO IS WATCHING DECIDES WHERE THE OUTPUT GOES.
         #
         # The diversion exists because systemd journals whatever the children

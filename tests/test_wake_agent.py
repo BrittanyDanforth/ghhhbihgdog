@@ -1138,6 +1138,11 @@ check("dispatch: the spending job ran exactly one child", len(_seen) == 1)
 _wargv, _wenv = _seen[0] if _seen else ([], {})
 check("dispatch: the destination is in the ENVIRONMENT",
       _wenv.get("GS_EXIT_TO") == _XMR_SAMPLE)
+# A BARE STRING STILL WORKS, because an older pager sends one -- and the
+# single-destination case must stay byte-identical to what it was, or an
+# upgrade would change where money goes.
+check("dispatch: ...as a plain string for one address, exactly as before",
+      isinstance(_wenv.get("GS_EXIT_TO"), str))
 # THE CHECK THE MUTATION ESCAPED. /proc/<pid>/cmdline is 0444 for the life of
 # the run, and a value that never reaches an argv cannot become a flag however
 # it is shaped.
@@ -1146,6 +1151,91 @@ check("dispatch: and NOWHERE on the argv the child is executed with",
 check("dispatch: not even a 16-character prefix of it, which is enough to "
       "confirm an address a watcher already suspects",
       not any(_XMR_SAMPLE[:16] in str(x) for x in _wargv))
+
+# SEVERAL DESTINATIONS, WHICH IS WHAT THE SCHEMA CHANGE IS FOR.
+#
+# The exit relays one transaction per mixed output -- at fewest 5, 12 and 22 at
+# the three depths -- and every one of them used to land on the same address,
+# because the wire had room for exactly one and nothing here could have used a
+# second. resolve_exit_destinations warns about that onto a stdout this unit
+# diverts to a 0600 log on a machine that powers off.
+#
+# GS_EXIT_TO takes them SPACE-SEPARATED: resolve_exit_destinations splits on
+# whitespace or commas and its own docstring gives that form.
+_seen2 = []
+
+
+def _capture2(argv, env_extra, budget_s):
+    _seen2.append((list(argv), dict(env_extra or {})))
+    return 0, False
+
+
+_XMR_B = _XMR_SAMPLE[:-1] + ("b" if _XMR_SAMPLE[-1] != "b" else "c")
+_XMR_C = _XMR_SAMPLE[:-1] + ("d" if _XMR_SAMPLE[-1] != "d" else "e")
+_saved_il2 = A.integrity_log
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("withdraw",
+                    {"exit_to": [_XMR_SAMPLE, _XMR_B, _XMR_C], "depth": 1},
+                    _k, _wdir, "A3F2", _capture2, "job-2",
+                    funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
+finally:
+    A.integrity_log = _saved_il2
+_margv, _menv = _seen2[0] if _seen2 else ([], {})
+check("dispatch/spread: three destinations reach GS_EXIT_TO, space-separated "
+      "in the form resolve_exit_destinations splits",
+      _menv.get("GS_EXIT_TO") == f"{_XMR_SAMPLE} {_XMR_B} {_XMR_C}")
+check("dispatch/spread: ...and none of them is anywhere on the argv",
+      not any(a in str(x) for a in (_XMR_SAMPLE, _XMR_B, _XMR_C)
+              for x in _margv))
+check("dispatch/spread: NON-VACUITY -- the one-address case really produces a "
+      "different value, so the join is doing something",
+      _menv.get("GS_EXIT_TO") != _wenv.get("GS_EXIT_TO"))
+# AND GhostSpiral PARSES IT BACK to the same three. The two sides of this
+# boundary are a join and a split in different files; asserting the join alone
+# would pin half a contract.
+# THE FEE ADDRESS IS ONE ADDRESS AND MUST STAY ONE STRING.
+#
+# This block used to ask JOBS["withdraw"]["schema"]["exit_to"] to vouch for it,
+# which was fine only while that field happened to be a single-address check.
+# It returns a LIST now -- so the borrowed gate would have put "['44Ad...']",
+# the text of a Python list, into GS_USAGE_FEE_ADDRESS and sent the operator's
+# cut to an address that does not exist. Driven rather than grepped: a source
+# check for the right function name would pass on any call that returned the
+# wrong type.
+_seen3 = []
+
+
+def _capture3(argv, env_extra, budget_s):
+    _seen3.append((list(argv), dict(env_extra or {})))
+    return 0, False
+
+
+_kfee = dict(_k, usage_fee_address=_XMR_SAMPLE)
+_saved_il3 = A.integrity_log
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("withdraw", {"exit_to": [_XMR_SAMPLE], "depth": 1},
+                    _kfee, _wdir, "A3F3", _capture3, "job-3",
+                    funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
+finally:
+    A.integrity_log = _saved_il3
+_fenv = _seen3[0][1] if _seen3 else {}
+check("fee/type: GS_USAGE_FEE_ADDRESS is the address itself, not the text of "
+      "a list",
+      _fenv.get("GS_USAGE_FEE_ADDRESS") == _XMR_SAMPLE)
+check("fee/type: NON-VACUITY -- it really was set, so the check above is not "
+      "comparing two absent values",
+      "GS_USAGE_FEE_ADDRESS" in _fenv)
+check("fee/type: ...and it carries no bracket or quote, which is what a list "
+      "rendered as text would leave behind",
+      not any(c in _fenv.get("GS_USAGE_FEE_ADDRESS", "") for c in "[]'\""))
+
+check("dispatch/spread: GhostSpiral's own splitter recovers exactly three",
+      len([t for t in re.split(r"[\s,]+", _menv.get("GS_EXIT_TO", "")) if t])
+      == 3)
 # NOT ASSUMING THE HANDLE. _dispatch REDRAWS it when it collides with one
 # already in the handles file, and the bundle name follows the handle -- so a
 # test that hard-codes A3F1 here passes or fails on whether the fixture
@@ -1352,6 +1442,29 @@ for _d, (_w, _claimed) in sorted(P.WITHDRAW_DEPTHS.items()):
     check(f"budget: choosing depth {_d} composes --wallets {_w}",
           "--wallets" in _argv
           and _argv[_argv.index("--wallets") + 1] == str(_w))
+
+# THE DECOY FLOOR IS MIRRORED, SO IT IS PINNED.
+#
+# gs_wake_proto.DECOY_MIN_MIRROR exists because the pager has to state how many
+# separate arrivals a withdrawal produces -- the number that decides whether
+# giving one exit address throws away the whole run -- and the pager may not
+# have GhostSpiral on disk at all. A mirror with a test is the shape this repo
+# uses when a constant must cross a box that cannot import its owner. A mirror
+# WITHOUT one is how the console's job timeout drifted 6x from the pipeline's.
+check(f"decoys: gs_wake_proto's mirrored floor ({P.DECOY_MIN_MIRROR}) is "
+      f"GhostSpiral.DECOY_MIN ({_GS.DECOY_MIN})",
+      P.DECOY_MIN_MIRROR == _GS.DECOY_MIN)
+# AND THE FIGURE BUILT ON IT is the one the pipeline itself computes when it
+# warns about a single destination: resolve_exit_destinations does
+# `_lo = _w + DECOY_MIN`. Recomputed here rather than restated.
+for _d, (_w, _t) in sorted(P.WITHDRAW_DEPTHS.items()):
+    check(f"decoys: exit_arrivals_floor({_d}) is {_w} wallets + "
+          f"{_GS.DECOY_MIN} decoys = {P.exit_arrivals_floor(_d)}",
+          P.exit_arrivals_floor(_d) == _w + _GS.DECOY_MIN)
+check("decoys: NON-VACUITY -- the floor really exceeds the wallet count, so "
+      "the decoys are in it and it is not just --wallets renamed",
+      all(P.exit_arrivals_floor(_d) > P.WITHDRAW_DEPTHS[_d][0]
+          for _d in P.WITHDRAW_DEPTHS))
 
 # THE BUDGET IS SIZED FROM THE DEEPEST ROW, so adding a fourth depth without
 # raising the budget goes red here rather than in production at hour thirteen.
@@ -1657,9 +1770,18 @@ check("fee: the pairing offers a flag for the fee destination",
       '"--usage-fee-address"' in _kp_src)
 check("fee: ...and actually writes it into the keyfile the agent reads",
       '"usage_fee_address": str(args.usage_fee_address or ""),' in _kp_src)
+# proto.xmr_address, NOT the withdraw schema's exit_to field. This used to
+# borrow that one, which was fine only while the two happened to be the same
+# check -- exit_to takes a LIST of destinations now, so the borrowed gate would
+# have accepted a list of fee addresses at pairing and written whichever one
+# str() produced. A job schema is about that job's fields; "is this an address"
+# has its own name.
 check("fee: ...and validates it at pairing, not after a mix has run",
-      'proto.JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)'
-      in _kp_src)
+      'proto.xmr_address(args.usage_fee_address)' in _kp_src)
+check("fee: ...with the ONE-address gate, not the withdraw job's destination "
+      "list, which is a different question that now returns a different type",
+      'JOBS["withdraw"]["schema"]["exit_to"](args.usage_fee_address)'
+      not in _kp_src)
 # THE FIELD NAMES MUST MATCH ON BOTH SIDES, which is the half that was broken.
 _ag_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 check("fee: the name the agent reads is the name the pairing writes",
