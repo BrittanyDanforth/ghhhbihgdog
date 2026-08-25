@@ -1370,13 +1370,103 @@ finally:
     ghost.split_by_weight = _saved_sbw
 
 # -- --split bounds --------------------------------------------------------
+# THE UPPER BOUND IS NO LONGER --split ALONE. A chunk with no mix subaddress to
+# distribute into is fatal at stage 4, and the fan-out funds
+# `wallets + randint(DECOY_MIN, DECOY_MAX)` targets, so `wallets + DECOY_MIN`
+# is the only count that holds for every draw. These cases therefore carry a
+# --wallets that can actually feed them; the refusal below drives the pair that
+# cannot.
 for _ok in (1, 2, 8, None):
     _r = None
     try:
-        ghost.resolve_split(types.SimpleNamespace(split=_ok))
+        ghost.resolve_split(types.SimpleNamespace(split=_ok, wallets=10))
     except SystemExit as _e:
         _r = str(_e.code)
-    check(f"split: --split {_ok!r} is allowed", _r is None)
+    check(f"split: --split {_ok!r} is allowed at --wallets 10", _r is None)
+_starved = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=8, wallets=ghost.MIN_WALLETS))
+except SystemExit as _e:
+    _starved = str(_e.code)
+check("split: --split 8 at the minimum --wallets is refused BEFORE the swap — "
+      "every decoy draw leaves a chunk with nowhere to distribute",
+      _starved is not None)
+check("split: ...and the refusal names both numbers the operator can change",
+      _starved and "--wallets" in _starved and "--split" in _starved)
+check("split: ...and says it cannot work on ANY run, not that it might",
+      _starved and "cannot work on any run" in _starved)
+check("split: NON-VACUITY -- one more than the borderline chunk count really "
+      "is the boundary, so the refusal is not refusing everything",
+      ghost.resolve_split(types.SimpleNamespace(
+          split=ghost.MIN_WALLETS + ghost.DECOY_MIN,
+          wallets=ghost.MIN_WALLETS)) is None)
+# WALLETS MISSING IS TREATED AS THE SMALLEST, not as the CLI default. main()
+# always sets it, so this only decides what an incomplete namespace gets: the
+# conservative answer refuses a shape it cannot vouch for rather than letting
+# it through to a stage-4 abort after the money has moved.
+_noswallets = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=ghost.MAX_SPLIT))
+except SystemExit as _e:
+    _noswallets = str(_e.code)
+check("split: a namespace with no --wallets is judged at MIN_WALLETS, so the "
+      "refusal fails closed",
+      _noswallets is not None
+      and f"--wallets {ghost.MIN_WALLETS}" in _noswallets)
+
+# THE STAGE-1 HALF, for the count --split cannot see. planned_chunk_count's
+# own first line is "JoinMarket first, because when it ran its UTXOs ARE the
+# chunks and --split is not consulted", so `--joinmarket --wallets 3` with a
+# six-output tumble walks past the parse-time gate above -- the exact walk
+# refuse_peel_multichunk exists for, one refusal along.
+
+
+def _starved_jm(n_utxos, wallets):
+    _ns = types.SimpleNamespace(split=1, wallets=wallets, peel=False)
+    try:
+        ghost.refuse_starved_chunks(_ns, ["u"] * n_utxos)
+        return ""
+    except SystemExit as _e:
+        return str(_e.code)
+
+
+def _refused_split(ns):
+    try:
+        ghost.resolve_split(ns)
+        return False
+    except SystemExit:
+        return True
+
+
+_jm6 = _starved_jm(6, ghost.MIN_WALLETS)
+check("split: a JoinMarket tumble with more UTXOs than the mix has targets is "
+      "refused at STAGE 1 — before the entry set, the quotes and the swap",
+      bool(_jm6))
+check("split: NON-VACUITY -- resolve_split alone does NOT catch it, because "
+      "--split is still 1 on that command line",
+      not _refused_split(types.SimpleNamespace(split=1,
+                                               wallets=ghost.MIN_WALLETS,
+                                               peel=False)))
+check("split: ...and the refusal names the TUMBLER, not a --split the "
+      "operator never passed",
+      "JoinMarket" in _jm6 and "UTXO" in _jm6 and "--split" not in _jm6)
+check("split: ...and its remedy is one the operator can act on",
+      "fewer output addresses" in _jm6)
+check("split: NON-VACUITY -- a tumble the mix CAN feed is left alone",
+      not _starved_jm(ghost.MIN_WALLETS + ghost.DECOY_MIN, ghost.MIN_WALLETS)
+      and not _starved_jm(ghost.MAX_SPLIT, 10))
+check("split: the two gates share one rule, so they cannot drift into "
+      "disagreeing about the same shape",
+      ghost.starved_chunk_refusal(ghost.MIN_WALLETS, ghost.MAX_SPLIT) != ""
+      and ghost.starved_chunk_refusal(10, ghost.MAX_SPLIT) == "")
+_rsc_src = open(os.path.join(REPO, "GhostSpiral")).read()
+_rsc_body = _rsc_src[_rsc_src.index("def refuse_starved_chunks"):][:900]
+check("split: ...and the stage-1 gate asks planned_chunk_count rather than "
+      "re-deriving the count, so it and the entry set cannot disagree",
+      "planned_chunk_count(args, jm_utxos)" in _rsc_body)
+check("split: NON-VACUITY -- it does NOT read --split there, which is the "
+      "flag that cannot see a JoinMarket tumble",
+      '"split"' not in _rsc_body)
 _too_many = None
 try:
     ghost.resolve_split(types.SimpleNamespace(split=99))
@@ -2798,6 +2888,12 @@ _MM_CUT = Decimal("0.011")               # the shipped operator cut
 # reserve out of compute_fee_budget at an arbitrary balance, which is only
 # legitimate because total_fees does not depend on the balance. Pinned here
 # rather than believed, because every figure below is wrong if it stops holding.
+#
+# WHAT IT DOES NOT SAY is that the run's usable equals its balance minus this
+# reserve. compute_fee_budget's own return does; the PATH does not, because
+# size_and_prune_chunks takes the entry veils' fee off first. Reading the two
+# checks below as one statement about the run is exactly the mistake that put
+# a short minimum in front of operators -- see _mm_survives.
 _mm_fees = {b: ghost.compute_fee_budget(Decimal(b), _MFU_FEE, 10, peel=False,
                                         dag_mixing=True, exit_set=True)[1]
             for b in ("0.3", "1", "10", "1000")}
@@ -2821,16 +2917,66 @@ check("min: NON-VACUITY -- the decoy count is really drawn above zero, so the "
       ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
 
 
-def _mm_survives(bal, wallets, cut=None, draws=120):
-    """Take the cut, hold back the fees, and see if the fan-out really funds."""
-    _, _fees, _ = ghost.compute_fee_budget(bal, _MFU_FEE, wallets, peel=False,
-                                           dag_mixing=True, exit_set=True)
-    _cut = (bal * cut).quantize(ghost.DUST_XMR) if cut else Decimal(0)
-    _usable = bal - _fees - _cut
+class _MMArgs:
+    """The three fields size_and_prune_chunks reads off `args`."""
+
+    peel = False
+    dag_mixing = True
+    exit_veil = True
+    entry_veil = True
+
+    def __init__(self, wallets):
+        self.wallets = wallets
+        self.exit_to = ["x"]
+
+
+def _mm_survives(bal, wallets, cut=None, draws=120, chunks=1):
+    """Drive THE SHIPPED PATH at `bal` and count the draws that plan.
+
+    THIS USED TO RE-DERIVE THE BUDGET INSTEAD OF CALLING IT, and that is why it
+    stayed green through a real shortfall. It computed
+
+        _usable = bal - _fees - _cut
+
+    which is mix_minimum_xmr's docstring premise, not the code. The shipped
+    stage-4 path is size_and_prune_chunks, and its FIRST act is to take the
+    entry veils' fee reserve off the balance -- one hop_fee_reserve per chunk
+    -- BEFORE compute_fee_budget ever sees it. The published minimum was short
+    by exactly that, so a deposit of precisely the advertised figure planned
+    fine in this test and failed on the vault, at stage 4, after the swap had
+    settled on an address the swap memo names publicly.
+
+    So this now calls size_and_prune_chunks itself, over the real chunk splits
+    split_btc_amount produces and the real decoy draw, and asks the one
+    question that matters: did every mix target get an amount?
+    """
     _n = wallets + ghost.DECOY_MAX
-    return sum(1 for _ in range(draws)
-               if len(ghost.compute_fanout_amounts(
-                   _usable, _n, _MFU_FEE, True, rng=_mfu_rng)) == _n)
+    _dests = ["d%d" % i for i in range(_n)]
+    _ok = 0
+    # STDOUT SUPPRESSED, because the non-vacuity draws below are MEANT to fail
+    # and each failure prints the operator's chunk-dropped warning. Left on,
+    # the suite's own result scrolls past a thousand lines of correct output
+    # from a check that is asserting the failure happened.
+    import contextlib as _ctx_mm
+    import io as _io_mm
+    with _ctx_mm.redirect_stdout(_io_mm.StringIO()):
+        for _ in range(draws):
+            _bal = bal - ((bal * cut).quantize(ghost.DUST_XMR) if cut
+                          else Decimal(0))
+            _weights = ghost.split_btc_amount(Decimal(1), chunks, _mfu_rng)
+            _unlocked = [_bal * _wt for _wt in _weights]
+            _entries = [("a%d" % i, i) for i in range(chunks)]
+            try:
+                _r = ghost.size_and_prune_chunks(
+                    _MMArgs(wallets), _entries, _unlocked, _dests, _bal,
+                    _MFU_FEE, _mfu_rng)
+            except SystemExit:
+                continue
+            # (entries, unlocked, bal, usable, slices, slice_usable, amounts)
+            if (len(_r[6]) == _n and all(_sl for _sl in _r[4])
+                    and len(_r[0]) == chunks):
+                _ok += 1
+    return _ok
 
 
 for _w in (3, 10, 20, 60):
@@ -2842,6 +2988,162 @@ for _w in (3, 10, 20, 60):
           f"is worth more than the fee to spend it",
           (_b * _MM_CUT).quantize(ghost.DUST_XMR)
           > ghost.hop_fee_reserve(_MFU_FEE))
+
+# THE ENTRY VEIL'S FEE, WHICH THE PUBLISHED MINIMUM USED TO OMIT.
+#
+# size_and_prune_chunks subtracts hop_fee_reserve per chunk before it budgets,
+# so a figure that only covered min_fanout_usable + total_fees was short by
+# exactly one reserve on a single-chunk run. On a decoy draw of DECOY_MAX --
+# one run in six -- that shortfall took every plan with it. Driven WITHOUT the
+# cut, because the cut's own floor is larger below ~15 wallets and would hide
+# the mixing shortfall behind it.
+for _w in (3, 10, 20, 60):
+    for _dag in (True, False):
+        _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, dag_mixing=_dag)
+        _MMArgs.dag_mixing = _dag
+        check(f"min: --wallets {_w} dag={_dag} at {_b} XMR plans through the "
+              f"real size_and_prune_chunks on every draw, veil fee included",
+              _mm_survives(_b, _w) == 120)
+        check(f"min: NON-VACUITY -- one hop_fee_reserve less than {_b} does "
+              f"NOT plan on every draw, so the reserve is what carries it",
+              _mm_survives(_b - ghost.hop_fee_reserve(_MFU_FEE), _w) < 120)
+_MMArgs.dag_mixing = True
+
+# EVERY CARRIER, NOT THE SUM OF THEM. With --split N the money lands on N entry
+# addresses and each one funds its own slice out of its own share, so a global
+# figure that clears min_fanout_usable can still leave the poorest chunk unable
+# to pay for its outputs -- which drops that chunk, strands its value on an
+# address the exit holds back, and can then shortfall the rest of the run.
+for _c in (2, 4, 8):
+    for _w in (10, 20, 60):
+        _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, chunks=_c)
+        check(f"min: --split {_c} --wallets {_w} at {_b} XMR plans on every "
+              f"draw, every carrier funding its own slice",
+              _mm_survives(_b, _w, chunks=_c) == 120)
+    check(f"min: NON-VACUITY -- the single-chunk figure does NOT survive "
+          f"--split {_c}, so wiring the chunk count is doing real work",
+          _mm_survives(ghost.mix_minimum_xmr(_MFU_FEE, 10), 10,
+                       chunks=_c) < 120)
+    check(f"min: ...and --split {_c} therefore asks for strictly more than "
+          f"one chunk does",
+          ghost.mix_minimum_xmr(_MFU_FEE, 10, chunks=_c)
+          > ghost.mix_minimum_xmr(_MFU_FEE, 10))
+    # ONE VEIL FEE PER CHUNK, ASSERTED AS ARITHMETIC. The behavioural checks
+    # above cannot see this term: min_carrier_usable's margin over the true
+    # floor is larger than (chunks-1) veil fees, so counting the reserve once
+    # still plans on every draw -- it just publishes a number that is wrong.
+    # A mutation sweep found exactly that, so the term is pinned directly.
+    # Each side is built from the shipped functions but composed differently
+    # from mix_minimum_xmr, so this is a bound and not an identity.
+    _d1 = ghost.compute_fee_budget(Decimal(1), _MFU_FEE, 10, peel=False,
+                                   dag_mixing=True, exit_set=True, chunks=1)[1]
+    _dc = ghost.compute_fee_budget(Decimal(1), _MFU_FEE, 10, peel=False,
+                                   dag_mixing=True, exit_set=True,
+                                   chunks=_c)[1]
+    check(f"min: --split {_c} carries {_c} entry-veil fees, not one -- the "
+          f"gap over a single chunk covers every extra veil AND the extra "
+          f"transaction reserve",
+          ghost.mix_minimum_xmr(_MFU_FEE, 10, chunks=_c)
+          - ghost.mix_minimum_xmr(_MFU_FEE, 10)
+          >= (_c - 1) * ghost.hop_fee_reserve(_MFU_FEE) + (_dc - _d1))
+    check(f"min: NON-VACUITY -- {_c} veils really cost more than one, so the "
+          f"bound above is not trivially satisfied",
+          (_c - 1) * ghost.hop_fee_reserve(_MFU_FEE) > 0)
+
+# --print-limits IS THE ONLY WAY A CALLER THAT CANNOT IMPORT THIS FILE GETS A
+# MINIMUM, and its own tiny parser has to carry every flag the figure depends
+# on. It parses with parse_known_args, so a flag it does not declare is not an
+# error -- it is silently dropped, limits_report's getattr falls back to one
+# chunk, and a split run is quoted the single-chunk floor. Driven through the
+# real entry point rather than by reading the parser.
+import json as _json_pl                                       # noqa: E402
+_pl_saved = sys.argv[:]
+try:
+    def _pl(argv):
+        sys.argv = ["GhostSpiral"] + argv
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            _done = ghost.maybe_print_limits()
+        return _done, _json_pl.loads(_buf.getvalue())
+
+    _d1, _r1 = _pl(["--print-limits", "--wallets", "10", "--dag-mixing",
+                    "--exit-to", "x"])
+    _d8, _r8 = _pl(["--print-limits", "--wallets", "10", "--dag-mixing",
+                    "--exit-to", "x", "--split", "8"])
+    check("limits: --print-limits handles the run and stops main()",
+          _d1 is True and _d8 is True)
+    check("limits: it reports the chunk count it computed for, so a reader "
+          "can tell which question was answered",
+          _r1.get("split") == 1 and _r8.get("split") == 8)
+    check("limits: ...and --split really reaches the figure, rather than "
+          "being dropped by parse_known_args",
+          _r8["by_wallets"]["10"]["min_xmr"] != _r1["by_wallets"]["10"]["min_xmr"])
+    check("limits: ...to exactly the split-aware minimum the pipeline uses",
+          _r8["by_wallets"]["10"]["min_xmr"]
+          == str(ghost.mix_minimum_xmr(
+              ghost.FALLBACK_FEE_BY_PRIORITY[1], 10, dag_mixing=True,
+              exit_set=True, chunks=8)))
+    check("limits: ...and the cut row is split-aware too",
+          _r8["by_wallets"]["10"]["min_xmr_with_cut"]
+          != _r1["by_wallets"]["10"]["min_xmr_with_cut"])
+    check("limits: the payload says the minimum is per-run and rises with "
+          "--split, so a page cannot quote it as a fixed floor",
+          "split" in _r8.get("split_note", ""))
+    check("limits: NON-VACUITY -- every wallet count the CLI accepts has a "
+          "row, so the checks above are not reading a one-row table",
+          len(_r8["by_wallets"]) == ghost.MAX_WALLETS - ghost.MIN_WALLETS + 1)
+finally:
+    sys.argv = _pl_saved
+
+# min_carrier_usable's own two bounds, stated as the code states them.
+check("min: min_carrier_usable is min_fanout_usable exactly at one chunk, so "
+      "the split-aware bound cannot move the single-chunk figure",
+      ghost.min_carrier_usable(17, 1, _MFU_FEE, True)
+      == ghost.min_fanout_usable(17, _MFU_FEE, True))
+check("min: ...and is never below it at any chunk count, wallet count or "
+      "fee priority",
+      all(ghost.min_carrier_usable(_n, _c, _f, _d)
+          >= ghost.min_fanout_usable(_n, _f, _d)
+          for _f in ghost.FALLBACK_FEE_BY_PRIORITY.values()
+          for _n in (5, 10, 17, 27, 67)
+          for _c in range(1, ghost.MAX_SPLIT + 1)
+          for _d in (True, False)))
+# NOT MONOTONIC IN THE CHUNK COUNT, AND THE RUN IS NOT EITHER. Splitting one
+# more way gives each carrier a poorer share AND a smaller slice, and
+# min_fanout_usable is superlinear in the slice, so the second can outweigh the
+# first. Pinned as an observation rather than left to surprise a reader who
+# "fixes" it with a running max: bisecting the REAL size_and_prune_chunks for
+# the 100%-success floor at --wallets 3 --dag-mixing gives 0.2699 XMR at
+# --split 4 and 0.2666 at --split 5. The dip is in the pipeline, not in the
+# bound, and forcing the published figure to rise would be inventing a rule the
+# code does not have.
+check("min: NON-VACUITY -- the chunk count really moves the figure, so the "
+      "bound above is not constant in it",
+      len({ghost.min_carrier_usable(17, _c, _MFU_FEE, True)
+           for _c in range(1, ghost.MAX_SPLIT + 1)}) >= ghost.MAX_SPLIT - 1)
+
+# THE SLICE-COUNT BOUND min_carrier_usable IS DERIVED FROM. An earlier version
+# assumed a carrier never holds more than ceil(n * share) + 1 targets; at 67
+# targets split_by_weight really hands out five more than that, and the
+# minimum built on it was short at --wallets 60. The bound that replaced it is
+# stated in two halves, and both are driven here against the real function over
+# weight vectors far wider than split_btc_amount's jitter band.
+_sbw_bad = 0
+for _ in range(4000):
+    _c = _mfu_rng.randint(2, ghost.MAX_SPLIT)
+    _n = _mfu_rng.randint(_c, ghost.MAX_WALLETS + ghost.DECOY_MAX)
+    _wts = [Decimal(_mfu_rng.randint(1, 1000)) for _ in range(_c)]
+    _tot = sum(_wts)
+    for _i, _part in enumerate(ghost.split_by_weight(list(range(_n)), _wts)):
+        _bound = max(max(1, int(Decimal(_n) * _wts[_i] / _tot)), _n // _c + 1)
+        if len(_part) > _bound:
+            _sbw_bad += 1
+check("min: split_by_weight never gives a carrier more than "
+      "max(floor(n*share), n//chunks + 1) targets -- the bound "
+      "min_carrier_usable inverts",
+      _sbw_bad == 0)
+check("min: NON-VACUITY -- the loop above really ran over many slices",
+      _sbw_bad == 0 and ghost.MAX_SPLIT >= 2)
 
 # THE CUT IS THE BINDING CONSTRAINT AT A DEFAULT RUN, and that is the finding
 # worth pinning: an operator reading only the mixing minimum would be told a

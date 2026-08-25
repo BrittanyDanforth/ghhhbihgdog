@@ -2332,6 +2332,162 @@ def test_sensitive_inputs_do_not_go_into_browser_history():
               bool(_tag) and 'autocomplete="off"' not in _tag.group(0))
 
 
+def test_the_joinmarket_control_can_actually_run_a_tumble():
+    """Ticking "JoinMarket tumble first" must not build an argv GhostSpiral refuses.
+
+    stage1_joinmarket's second statement is `if not args.joinmarket_wallet:
+    sys.exit(...)`, and no field for it existed anywhere on this page -- not in
+    SCHEMA (the whitelist: "Anything not here cannot reach an argv"), not in
+    the form, not in collect(). So the checkbox could only ever end the run,
+    and it ended it AFTER stage0_preflight had verified Tor, opened the wallet
+    and read the daemon's fee, and after a required newnym.
+
+    Driven through the real clean() and pipeline_argv, and the resulting argv
+    is handed to GhostSpiral's own parser -- a console-side field that the
+    pipeline does not accept would be the same bug with the sides swapped.
+    """
+    c = load_console()
+    _base = {"mode": "send", "wallets": 10,
+             "btc_entry": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+             "btc_amount": "0.05", "tor_proxy": "socks5h://127.0.0.1:9050"}
+    for _f in ("joinmarket_wallet", "joinmarket_tumbler", "joinmarket_python"):
+        check(f"jm: {_f} is in SCHEMA, so it can reach an argv at all",
+              _f in c.SCHEMA)
+        check(f"jm: ...and the page has a box for {_f}",
+              f'id="{_f}"' in _src_console())
+        check(f"jm: ...and collect() actually sends it",
+              f"{_f}:v('{_f}')" in _src_console())
+    _bare = c.clean({**_base, "joinmarket": True})
+    _argv, _why = c.pipeline_argv(_bare["params"])
+    check("jm: the checkbox alone is REFUSED here rather than aborting the "
+          "run at stage 1, after Tor and the wallet are already up",
+          any("joinmarket" in w.lower() for w in _why))
+    check("jm: ...and no half-built --joinmarket reaches the argv",
+          "--joinmarket" not in _argv)
+    _full = c.clean({**_base, "joinmarket": True,
+                     "joinmarket_wallet": "/opt/jm/w.jmdat",
+                     "joinmarket_tumbler": "/opt/jm/scripts/tumbler.py",
+                     "joinmarket_python": "/opt/jmvenv/bin/python"})
+    _argv, _why = c.pipeline_argv(_full["params"])
+    check("jm: with the wallet supplied the run is allowed", not _why)
+    for _flag, _val in (("--joinmarket-wallet", "/opt/jm/w.jmdat"),
+                        ("--joinmarket-tumbler", "/opt/jm/scripts/tumbler.py"),
+                        ("--joinmarket-python", "/opt/jmvenv/bin/python")):
+        check(f"jm: ...and {_flag} carries the operator's value",
+              _flag in _argv and _argv[_argv.index(_flag) + 1] == _val)
+    # THE OPTIONAL TWO ARE OMITTED WHEN BLANK, not sent empty: GhostSpiral
+    # defaults them to "tumbler.py" and "python3", and overriding a default
+    # with "" is worse than leaving it alone.
+    _min = c.pipeline_argv(c.clean({**_base, "joinmarket": True,
+                                    "joinmarket_wallet": "w.jmdat"})["params"])[0]
+    check("jm: a blank tumbler path is omitted rather than sent empty",
+          "--joinmarket-tumbler" not in _min
+          and "--joinmarket-python" not in _min)
+    check("jm: NON-VACUITY -- the wallet flag IS there in that same argv, so "
+          "the check above is not looking at an empty list",
+          "--joinmarket-wallet" in _min)
+    # And GhostSpiral's real parser accepts the whole thing.
+    _g = c._ghost()
+    _ns = _g.build_cli().parse_args(_argv[2:])
+    check("jm: GhostSpiral's own parser accepts the composed argv",
+          _ns.joinmarket is True
+          and _ns.joinmarket_wallet == "/opt/jm/w.jmdat")
+    check("jm: ...and stage1_joinmarket's own refusal no longer fires on it",
+          bool(_ns.joinmarket_wallet))
+
+
+def test_compile_all_compiles_all():
+    """"every shipped script parses" must not mean nine of the seventeen.
+
+    The eight it left out were the whole wake path, the delivery pair and this
+    console itself -- so a syntax error in the code that runs unattended on the
+    vault passed a check whose own description says otherwise.
+
+    Checked against the DIRECTORY rather than a second list, because a second
+    list is the thing that drifted.
+    """
+    c = load_console()
+    _argv = c.ACTIONS["compile"]["build"]({})
+    _named = set(_argv[3:])
+    _ship = set()
+    for _f in os.listdir(REPO):
+        _p = os.path.join(REPO, _f)
+        if not os.path.isfile(_p) or _f.startswith("test"):
+            continue
+        if _f.endswith(".py"):
+            _ship.add(_f)
+            continue
+        try:
+            with open(_p, "rb") as _fh:
+                if _fh.read(2) == b"#!" and b"python" in open(_p, "rb").readline():
+                    _ship.add(_f)
+        except OSError:
+            pass
+    check(f"compile: every shipped script is named "
+          f"(missing: {sorted(_ship - _named)})", not (_ship - _named))
+    check(f"compile: ...and nothing is named that is not shipped "
+          f"(extra: {sorted(_named - _ship)})", not (_named - _ship))
+    check("compile: NON-VACUITY -- the directory scan really found the "
+          "scripts, so 'nothing missing' is not an empty comparison",
+          len(_ship) >= 15)
+    for _f in ("gs_console", "gs_wake_agent", "gs_telegram_pager",
+               "gs_wake_proto.py", "gs_doorbell", "gs_wake_keys",
+               "gs_delivery_key", "gs_unseal"):
+        check(f"compile: {_f} -- one of the eight this used to skip -- is in",
+              _f in _named)
+    check("compile: and the action still says what it does",
+          c.ACTIONS["compile"]["desc"] == "every shipped script parses")
+
+
+def test_the_minimum_moves_with_the_split():
+    """--split raises the deposit floor, and both surfaces used to drop it.
+
+    Each chunk pays its own entry-veil fee and then has to fund its own slice
+    of the mix targets out of its own share (min_carrier_usable), so the
+    single-chunk figure is an understatement for a split run -- and the
+    shortfall only speaks at stage 4, after the swap has settled.
+    """
+    c = load_console()
+    _g = c._ghost()
+    _base = {"wallets": 10, "dag_mixing": True, "exit_to": ["x"]}
+    _one = c.limits_note(_base)
+    _eight = c.limits_note({**_base, "split": 8})
+    check("split min: the note quotes the pipeline's split-aware figure",
+          str(_g.mix_minimum_xmr(_g.FALLBACK_FEE_XMR, 10, dag_mixing=True,
+                                 exit_set=True, chunks=8)) in _eight)
+    check("split min: ...which is NOT the single-chunk one, so the split is "
+          "really reaching the figure", _one != _eight)
+    check("split min: ...and the note says how many chunks it is quoting for",
+          "8 swap chunks" in _eight and "swap chunks" not in _one)
+    _badge = c.limits_badge({**_base, "split": 8})
+    check("split min: the spend button carries the same split-aware number",
+          str(_g.mix_minimum_xmr(_g.FALLBACK_FEE_XMR, 10, dag_mixing=True,
+                                 exit_set=True, chunks=8)) in _badge)
+    # A SHAPE NO DEPOSIT CAN RESCUE IS SAID SO, rather than left to a stage-0
+    # abort. split and wallets are independent number inputs on this page.
+    _starved = c.limits_note({**_base, "wallets": _g.MIN_WALLETS, "split": 8})
+    check("split min: 8 chunks at the minimum wallets is called impossible, "
+          "not merely expensive",
+          "cannot work" in _starved and "No deposit size fixes that" in _starved)
+    check("split min: NON-VACUITY -- a workable split is NOT called impossible",
+          "cannot work" not in c.limits_note({**_base, "split": 4}))
+    check("split min: ...and GhostSpiral refuses the same pair before any "
+          "network work, which is where the rule lives",
+          _refuses_split(_g, 8, _g.MIN_WALLETS))
+    check("split min: NON-VACUITY -- it does not refuse the workable pair",
+          not _refuses_split(_g, 4, 10))
+
+
+def _refuses_split(g, split, wallets):
+    import types as _t
+    try:
+        g.resolve_split(_t.SimpleNamespace(split=split, wallets=wallets,
+                                           peel=False))
+        return False
+    except SystemExit:
+        return True
+
+
 def _src_console():
     return open(os.path.join(REPO, "gs_console")).read()
 

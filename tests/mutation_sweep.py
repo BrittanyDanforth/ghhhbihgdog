@@ -3172,6 +3172,130 @@ MUTATIONS = [
   '                                                label="usage fee")',
   ["test_dag_entry"]),
 
+ # -- the published deposit minimum ----------------------------------------
+ #
+ # The entry veil's own fee. size_and_prune_chunks takes hop_fee_reserve per
+ # chunk off the balance BEFORE compute_fee_budget sees it, so a minimum that
+ # omits it is short by exactly that -- and on a DECOY_MAX draw, one run in
+ # six, every fan-out plan then fails. At stage 4, after the swap has settled
+ # on an address the swap memo names publicly.
+ ("the published minimum omits the entry veil's fee", "GhostSpiral",
+  "    need = (min_carrier_usable(n, c, fee_xmr, dag_mixing)\n"
+  "            + total_fees\n"
+  "            + hop_fee_reserve(fee_xmr) * c)",
+  "    need = min_carrier_usable(n, c, fee_xmr, dag_mixing) + total_fees",
+  ["test_dag_entry"]),
+
+ # ...and it must be PER CHUNK. One reserve covers a single-chunk run and
+ # understates every split one, which is the shape the veil fee is largest in.
+ ("the veil reserve is counted once however many chunks", "GhostSpiral",
+  "            + hop_fee_reserve(fee_xmr) * c)",
+  "            + hop_fee_reserve(fee_xmr))",
+  ["test_dag_entry"]),
+
+ # EVERY CARRIER, not the sum. With --split N each chunk funds its own slice
+ # from its own share, so min_fanout_usable answers the wrong question.
+ ("the minimum prices the whole fan-out instead of the poorest carrier",
+  "GhostSpiral",
+  "    need = (min_carrier_usable(n, c, fee_xmr, dag_mixing)",
+  "    need = (min_fanout_usable(n, fee_xmr, dag_mixing)",
+  ["test_dag_entry"]),
+
+ # The share floor min_carrier_usable inverts. Widen it to the equal share and
+ # the poorest chunk of a jittered split is priced as though it were average.
+ ("the poorest chunk is priced at the AVERAGE share", "GhostSpiral",
+  "    lo = (_one - SPLIT_JITTER) / ((_one - SPLIT_JITTER)\n"
+  "                                  + (c - 1) * (_one + SPLIT_JITTER))",
+  "    lo = _one / c",
+  ["test_dag_entry"]),
+
+ # The slice-count bound. `n // c` alone is the balanced count with no room for
+ # the reconcile loop's top-up, which is exactly the target a poor carrier gets.
+ ("the reconcile loop's extra target is not priced", "GhostSpiral",
+  "    balanced = min(n, n // c + 1)",
+  "    balanced = min(n, n // c)",
+  ["test_dag_entry"]),
+
+ # A chunk with no mix subaddress to distribute into is fatal at stage 4, and
+ # `wallets + DECOY_MIN` is knowable long before. Refusing early is the whole
+ # difference between one flag and a swap stranded on a publicly-named address.
+ ("a chunk count no decoy draw can feed is never refused", "GhostSpiral",
+  '    if n <= w + DECOY_MIN:\n        return ""',
+  '    if True:\n        return ""',
+  ["test_dag_entry"]),
+
+ # ...and it must be DECOY_MIN, the only count that holds for every draw.
+ # DECOY_MAX makes the gate pass shapes that fail on most draws.
+ ("the starved-chunk rule assumes the LUCKIEST decoy draw", "GhostSpiral",
+  "    if n <= w + DECOY_MIN:\n",
+  "    if n <= w + DECOY_MAX:\n",
+  ["test_dag_entry"]),
+
+ # THE PARSE-TIME GATE IS ONLY HALF OF IT. JoinMarket's UTXOs are the chunk
+ # count and never touch --split, so without the stage-1 call the whole rule is
+ # unreachable on the one path that can exceed the flag.
+ ("the stage-1 half of the starved-chunk gate is gone", "GhostSpiral",
+  "    refuse_starved_chunks(args, jm_utxos)",
+  "    pass",
+  ["test_dag_entry"]),
+
+ ("the stage-1 gate reads --split instead of the real chunk count",
+  "GhostSpiral",
+  "                                 planned_chunk_count(args, jm_utxos),\n"
+  "                                 jm_utxos)",
+  '                                 getattr(args, "split", 1) or 1,\n'
+  "                                 jm_utxos)",
+  ["test_dag_entry"]),
+
+ # -- the console's three surfaces -----------------------------------------
+ #
+ # --joinmarket alone is an argv stage1_joinmarket refuses outright, after
+ # stage0 has already verified Tor, opened the wallet and read the fee.
+ ("the JoinMarket box builds an argv the pipeline always refuses",
+  "gs_console",
+  '            if not p.get("joinmarket_wallet"):',
+  "            if False:",
+  ["test_console"]),
+
+ ("the JoinMarket wallet never reaches the argv", "gs_console",
+  '                a += ["--joinmarket",\n'
+  '                      "--joinmarket-wallet", p["joinmarket_wallet"]]',
+  '                a += ["--joinmarket"]',
+  ["test_console"]),
+
+ # "every shipped script parses" naming a subset is a check that passes while
+ # the vault's unattended code is broken.
+ ("Compile all skips the whole wake path again", "gs_console",
+  '                                        "receive_watch", "gs_console",',
+  '                                        "receive_watch",',
+  ["test_console"]),
+
+ # The minimum the operator reads must move with the split they chose.
+ ("the note's minimum ignores --split", "gs_console",
+  '        base = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set,\n'
+  "                                 chunks=chunks)",
+  "        base = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set)",
+  ["test_console"]),
+
+ ("the spend button's minimum ignores --split", "gs_console",
+  '                                chunks=max(1, int(p.get("split") or 1)),\n',
+  "",
+  ["test_console"]),
+
+ # A shape no deposit can rescue must be named as one.
+ ("a split that cannot work at these wallets is quoted a price anyway",
+  "gs_console",
+  "        if chunks > w + g.DECOY_MIN:",
+  "        if False:",
+  ["test_console"]),
+
+ # --print-limits is how the console asks the pipeline; dropping --split from
+ # its parser makes the flag unreachable from the only caller there is.
+ ("--print-limits cannot be told the chunk count", "GhostSpiral",
+  '    _lp.add_argument("--split", type=int, default=1)\n',
+  "",
+  ["test_console", "test_dag_entry"]),
+
 ]
 
 

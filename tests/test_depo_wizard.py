@@ -203,7 +203,7 @@ check("wd: ...and asks ONLY for the address, with no handle to remember",
 w.say(_WA)
 # THEN THE DEPTH, and it is not a confirm yet. A hard-coded depth is what made
 # this job refuse most real deposits: GhostSpiral's mix floor rises with the
-# hop count (0.1748 XMR at 3 wallets, 0.2936 at 10), so the single pinned
+# hop count (0.1784 XMR at 3 wallets, 0.2972 at 10), so the single pinned
 # WITHDRAW_WALLETS = 10 was a floor on what could be withdrawn AT ALL.
 check("wd: ...then asks how deep, offering every depth the protocol has",
       all(str(_d) in w.sent[-1][1] for _d in P.WITHDRAW_DEPTHS)

@@ -662,8 +662,26 @@ _outside.mkdir(parents=True, exist_ok=True)
 _prev_home = os.environ.get("HOME")
 os.environ["HOME"] = str(_wd)
 try:
+    # ONE LEVEL DOWN IS INSIDE THE SWEEP, TWO IS NOT, and this fixture used to
+    # call `$HOME/gs/<dir>` "two levels down" and expect it to be MISSED. The
+    # sweep globs `root.glob(dirname)` AND `root.glob(f"*/{dirname}")`, so
+    # `$HOME/gs/tx_staging` is matched by the second and really is erased.
+    # Driven against paranoia_mode's own dry run with a matching directory at
+    # each depth, HOME pointed at this fixture:
+    #
+    #     $HOME/<d>          swept True    wipe_will_erase True
+    #     $HOME/gs/<d>       swept True    wipe_will_erase True
+    #     $HOME/gs/x/<d>     swept False   wipe_will_erase False
+    #     outside the roots  swept False   wipe_will_erase False
+    #
+    # The row that was here asserted FALSE for the second of those, which is
+    # the off-by-one-level defect _wipe_sweep_reaches_item was written to
+    # remove -- so the suite was pinning the bug and went red on the fix rather
+    # than catching it. Both depths are covered now, at their real names.
     _deep = _wd / "gs"
     _deep.mkdir(parents=True, exist_ok=True)
+    _deeper = _wd / "gs" / "x"
+    _deeper.mkdir(parents=True, exist_ok=True)
     # A directory NAME that is really on the sweep's directory list, so only
     # the location can be at fault.
     _dirname = _GW.GS_ARTIFACT_DIR_PATTERNS[2]               # "tx_staging"
@@ -674,8 +692,10 @@ try:
     for _label, _p, _isdir, _want in (
             ("a staging DIR outside the roots", _outside / _dirname, True,
              "location"),
-            ("a staging DIR two levels down", _deep / _dirname, True,
-             "location"),
+            ("a staging DIR ONE level down, which `*/<dir>` really reaches",
+             _deep / _dirname, True, ""),
+            ("a staging DIR two levels down, which nothing reaches",
+             _deeper / _dirname, True, "location"),
             ("a DIR with an unswept name, at a root", _wd / "my_notes", True,
              "name"),
             ("a FILE with a swept name, outside", _outside / "thor_pairs.json",

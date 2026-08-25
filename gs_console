@@ -277,6 +277,16 @@ SCHEMA = {
     "dag_mixing":   ("bool", None),
     "peel":         ("bool", None),
     "joinmarket":   ("bool", None),
+    # THE THREE FLAGS THE CHECKBOX ABOVE ACTUALLY NEEDS. SCHEMA is the
+    # whitelist -- "Anything not here cannot reach an argv" -- and none of
+    # these were in it, so --joinmarket could only ever be sent alone, which
+    # stage1_joinmarket refuses outright. JoinMarket is a separate project with
+    # its own virtualenv (see GhostSpiral's --joinmarket-python help), so the
+    # interpreter and the tumbler path are as much a part of wiring it up as
+    # the wallet is.
+    "joinmarket_wallet":  ("re", PATH_RE),
+    "joinmarket_tumbler": ("re", PATH_RE),
+    "joinmarket_python":  ("re", PATH_RE),
     "allow_clearnet_relay": ("bool", None),
     "tor_proxy":    ("re", SOCKS_RE),
     "rpc_primary":  ("re", URL_RE),
@@ -458,7 +468,36 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         if p.get("split", 1) > 1:
             a += ["--split", str(p["split"])]
         if p.get("joinmarket"):
-            a.append("--joinmarket")
+            # THE CHECKBOX ALONE BUILT AN ARGV GhostSpiral ALWAYS REFUSES.
+            #
+            # stage1_joinmarket's second line is
+            #   if not args.joinmarket_wallet:
+            #       sys.exit("[!] --joinmarket-wallet required ...")
+            # and no field for it existed anywhere on this page -- not in
+            # SCHEMA, not in the form, not in collect(). So ticking "JoinMarket
+            # tumble first" could only ever end the run, and it ended it LATE:
+            # stage1 runs after stage0_preflight has verified Tor, opened the
+            # wallet and read the daemon's fee, and after a required newnym.
+            # The operator watched a minute of real network work and got an
+            # abort naming a flag the console cannot set.
+            #
+            # Refused here instead, beside the other build-time refusals, and
+            # the three flags it needs are now real fields. The tumbler and the
+            # interpreter are only sent when set: GhostSpiral defaults them to
+            # "tumbler.py" and "python3", which resolve on CWD/PATH, and
+            # overriding a default with an empty string is worse than leaving
+            # it alone.
+            if not p.get("joinmarket_wallet"):
+                why.append("JoinMarket tumbling needs the JoinMarket wallet "
+                           "file — GhostSpiral refuses --joinmarket without "
+                           "it.")
+            else:
+                a += ["--joinmarket",
+                      "--joinmarket-wallet", p["joinmarket_wallet"]]
+                if p.get("joinmarket_tumbler"):
+                    a += ["--joinmarket-tumbler", p["joinmarket_tumbler"]]
+                if p.get("joinmarket_python"):
+                    a += ["--joinmarket-python", p["joinmarket_python"]]
     # Both modes: in receive mode it is the only way to get a target at all,
     # and in send mode it is the fallback for when a quote is unreadable and
     # the summed-from-quotes target would silently be built from fewer chunks
@@ -616,13 +655,31 @@ ACTIONS = {
     "leakaudit":   {"group": "Verify", "label": "Disk leak audit", "risk": "safe",
                     "desc": "runs 3 stages on testnet, audits what hits disk",
                     "build": lambda p: _suite("leak_audit_testnet", VENV_PY)},
+    # EVERY SHIPPED SCRIPT, which this used to claim while naming nine of the
+    # seventeen. The eight it left out were the whole wake path (gs_wake_agent,
+    # gs_wake_keys, gs_wake_proto.py, gs_doorbell, gs_telegram_pager), the
+    # delivery pair (gs_delivery_key, gs_unseal) and this console itself -- so
+    # a syntax error in the code that runs unattended on the vault, or in the
+    # bot that is the operator's only interface to it, passed a check whose
+    # own description is "every shipped script parses". The console being
+    # absent was the sharpest of them: the page that runs this action could
+    # not tell the operator it was broken.
+    #
+    # Listed rather than globbed. A glob over *.py plus the extensionless
+    # entry points is not expressible here, and a directory listing would pick
+    # up whatever an operator has left in the working directory and report
+    # THEIR syntax error as this tool's.
     "compile":     {"group": "Verify", "label": "Compile all", "risk": "safe",
                     "desc": "every shipped script parses",
                     "build": lambda p: [PY, "-m", "py_compile", "gs_common.py", "GhostSpiral",
                                         "airgap_tx_signer", "broadcast_signed_xmr",
                                         "create_receive_wallet", "exit_strategy_simulator",
                                         "paranoia_mode", "thor_swap_preparer",
-                                        "receive_watch"]},
+                                        "receive_watch", "gs_console",
+                                        "gs_delivery_key", "gs_unseal",
+                                        "gs_doorbell", "gs_telegram_pager",
+                                        "gs_wake_agent", "gs_wake_keys",
+                                        "gs_wake_proto.py"]},
 }
 
 PREFLIGHT_TOR = """
@@ -1388,7 +1445,13 @@ def limits_badge(p: dict) -> str:
         if p.get("usage_fee"):
             _p = p.get("usage_fee_pct")
             pct = _D(str(_p)) if _p else g.USAGE_FEE_PCT
+        # --split RAISES THE MINIMUM AND THIS BUTTON DROPPED IT. Each chunk
+        # pays its own entry-veil fee and then has to fund its own slice of the
+        # mix targets out of its own share -- see min_carrier_usable. At
+        # --split 8 --wallets 10 that is 0.5477 XMR against the 0.2972 this was
+        # printing, and the shortfall only speaks at stage 4, after the swap.
         low = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set,
+                                chunks=max(1, int(p.get("split") or 1)),
                                 usage_pct=pct)
         # "your balance" rather than the sanity ceiling. Quoting 100,000,000
         # XMR would read as the limit; the real one is a balance and a swap
@@ -1442,14 +1505,18 @@ def limits_note(p: dict) -> str:
         fee = g.FALLBACK_FEE_BY_PRIORITY.get(prio, g.FALLBACK_FEE_XMR)
         dag = bool(p.get("dag_mixing"))
         exit_set = bool(p.get("exit_to"))
-        base = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set)
+        chunks = max(1, int(p.get("split") or 1))
+        base = g.mix_minimum_xmr(fee, w, dag_mixing=dag, exit_set=exit_set,
+                                 chunks=chunks)
         out = (f"Minimum {base} XMR to mix at {w} wallets"
-               f"{'' if dag else ' (no DAG mixing)'}")
+               f"{'' if dag else ' (no DAG mixing)'}"
+               f"{'' if chunks <= 1 else f' across {chunks} swap chunks'}")
         if p.get("usage_fee"):
             _pct = p.get("usage_fee_pct")
             cut = _D(str(_pct)) if _pct else g.USAGE_FEE_PCT
             withcut = g.mix_minimum_xmr(fee, w, dag_mixing=dag,
-                                        exit_set=exit_set, usage_pct=cut)
+                                        exit_set=exit_set, chunks=chunks,
+                                        usage_pct=cut)
             # "USAGE FEE", NOT "CUT", HERE TOO. The badge on the spend button
             # says "Usage fee" and this line said "cut" about the same number
             # on the same page. The flags are --usage-fee/--usage-fee-pct and
@@ -1466,6 +1533,21 @@ def limits_note(p: dict) -> str:
         out += (" No maximum is enforced beyond a sanity ceiling — what "
                 "actually limits you is your wallet balance and the swap's "
                 "liquidity, and this tool knows neither.")
+        # A SHAPE NO DEPOSIT CAN RESCUE, said here rather than left to a
+        # stage-0 abort. `split` and `wallets` are independent number inputs on
+        # this page, so 8 chunks against 3 wallets is two keystrokes away. The
+        # fan-out funds wallets plus DECOY_MIN..DECOY_MAX targets drawn at run
+        # time, so below `wallets + DECOY_MIN` chunks there is a carrier with
+        # nothing to distribute into on EVERY draw. GhostSpiral refuses it in
+        # resolve_split -- before any network work, and that refusal stays the
+        # single source of the rule -- but quoting a minimum for it without
+        # saying so reads as "deposit this and it will run".
+        if chunks > w + g.DECOY_MIN:
+            out += (f" Note: {chunks} swap chunks cannot work at {w} wallets — "
+                    f"the fan-out has at fewest {w + g.DECOY_MIN} mix targets "
+                    f"to spread over them, so at least one chunk would arrive "
+                    f"with nowhere to distribute. No deposit size fixes that; "
+                    f"raise the wallets or lower the split.")
         return out
     except Exception:                                        # noqa: BLE001
         return ""
@@ -2276,7 +2358,13 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         <span class="d limits"></span></div>
       <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="8" value="1"></div>
       <label class="chk"><input type="checkbox" id="joinmarket">
-        <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
+        <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap — needs the three paths below</span></span></label>
+      <div class="f"><label for="joinmarket_wallet">JoinMarket wallet</label><input id="joinmarket_wallet" autocomplete="off" spellcheck="false" placeholder="wallet.jmdat">
+        <span class="d">Required by --joinmarket. Without it the run aborts at stage 1, after Tor and the wallet are already up.</span></div>
+      <div class="f"><label for="joinmarket_tumbler">JoinMarket tumbler.py</label><input id="joinmarket_tumbler" autocomplete="off" spellcheck="false" placeholder="/path/to/joinmarket-clientserver/scripts/tumbler.py">
+        <span class="d">Optional. Left blank GhostSpiral looks for "tumbler.py" on PATH/CWD.</span></div>
+      <div class="f"><label for="joinmarket_python">JoinMarket interpreter</label><input id="joinmarket_python" autocomplete="off" spellcheck="false" placeholder="/path/to/jmvenv/bin/python">
+        <span class="d">Optional. JoinMarket has its own virtualenv; blank means plain "python3", which will not have its dependencies.</span></div>
       <!-- THE SAME INPUT THE RECEIVE FLOW USES, AND IT BELONGS HERE TOO.
            secret_env sends expect_total_xmr in BOTH modes, deliberately: in
            send mode it is the fallback for when a quote is unreadable and the
@@ -2690,6 +2778,11 @@ function collect(){
   // the request it was computed from had no delay in it.
   hop_delay:v('hop_delay'),
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
+  // Sent with the checkbox, because the checkbox is useless without them:
+  // GhostSpiral refuses --joinmarket unless --joinmarket-wallet comes with it.
+  joinmarket_wallet:v('joinmarket_wallet'),
+  joinmarket_tumbler:v('joinmarket_tumbler'),
+  joinmarket_python:v('joinmarket_python'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),
   rpc_primary:v('rpc_primary'), rpc_daemon:v('rpc_daemon'),
   wallet_file:v('wallet_file'),
