@@ -1,5 +1,21 @@
 # GhostSpiral Toolchain — Full Codebase Audit & OPSEC Hardening
 
+> ## ⚠ THIS DOCUMENT IS A SNAPSHOT, NOT THE AUDIT OF RECORD
+>
+> It describes the codebase **as of 2026-04-12** and has not been updated
+> since. It is kept for the reasoning it records, not as a description of
+> what the tools do now. Do not act on it without checking the code.
+>
+> **What is current instead:**
+>
+> * `OPSEC_SETUP.md` — checked flag by flag against the real parsers,
+>   including subcommands, with zero mismatches.
+> * `tests/` — the executable record. Every claim worth relying on is
+>   asserted there, and the suites run in seconds.
+> * The source comments — this repo puts the reasoning next to the code
+>   precisely so it cannot drift the way this file has.
+
+
 > Generated: 2026-04-12 | Updated: 2026-04-12 (v2 - deep hardening pass)
 
 ---

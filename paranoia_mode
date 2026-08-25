@@ -976,6 +976,18 @@ def wipe_xdg_traces(dry: bool):
     file opened by GUI apps (with timestamps), thumbnails cache previews of
     files (including JSON plans), Trash retains 'deleted' files, and
     bookmarks may reference working directories.
+
+    NOT COVERED, AND NAMED HERE BECAUSE THIS IS THE PHASE AN OPERATOR WOULD
+    ASSUME COVERS IT: the BROWSER HISTORY. gs_console prints a URL and tells
+    the operator to open it, and a browser keeps the full URL and the page
+    title with a visit timestamp -- the same shape as recently-used.xbel, in a
+    store this list does not reach. Nothing here touches places.sqlite,
+    ~/.mozilla, ~/.config/chromium or any other profile, deliberately: a
+    profile holds the operator's whole browsing life, the formats differ per
+    browser and per version, and destroying it is not a decision an artifact
+    sweep should make on its own. gs_console says so at start-up and its page
+    title is now just "Console" so the row does not name the toolchain. Use a
+    private window if the row itself matters.
     """
     targets = [
         Path.home() / ".local/share/recently-used.xbel",

@@ -2328,6 +2328,52 @@ def test_the_fee_rate_never_reaches_a_command_line():
                       for x in c.pipeline_argv(_withaddr)[1]))
 
 
+def test_the_page_itself_does_not_name_the_toolchain_in_history():
+    """The URL and title land in a store paranoia_mode does not reach.
+
+    The console prints one line the operator is told to act on -- "open THIS
+    url" -- and a browser keeps the full URL and the page TITLE with a visit
+    timestamp. paranoia_mode's XDG phase exists for exactly this class of
+    artifact (recently-used.xbel, thumbnails, Trash) and reaches no browser
+    profile; grepping the repo for places.sqlite, ~/.mozilla, Default/History
+    or "browser history" returned nothing, so the surface was neither swept
+    nor named.
+
+    It is NOT a credential leak: the token is regenerated per run, the URL is
+    loopback, and the page loads no external resource and has no <a href>, so
+    the token never leaves the browser in a Referer. What it is, is a durable
+    timestamped row naming the toolchain -- and the title was
+    "GhostSpiral Console".
+    """
+    c = load_console()
+    check("history: the page title does not name the toolchain",
+          "<title>Console</title>" in c.PAGE
+          and "GhostSpiral Console" not in c.PAGE)
+    # NON-VACUITY: there IS a title, so this is not passing on a page that
+    # lost its <title> tag entirely (which browsers replace with the URL --
+    # worse, because the URL carries the token).
+    check("history: NON-VACUITY -- the page still HAS a title, or the browser "
+          "shows the URL instead, token and all", "<title>" in c.PAGE)
+    # ...and the operator is TOLD, because this tool cannot erase it and
+    # wiping somebody's browser profile is not its call to make.
+    _src = open(os.path.join(REPO, "gs_console"), encoding="utf-8").read()
+    _main = _src.split("def main(")[1]
+    check("history: start-up says the browser keeps that URL and title",
+          "keep that URL and the page title" in _main)
+    check("history: ...and that paranoia_mode will not clear it, rather than "
+          "leaving the operator to assume the sweep covers it",
+          "does not touch browser profiles" in _main)
+    check("history: ...and offers the one thing that does work",
+          "private window" in _main)
+    # AND THE SWEEP NAMES IT AS NOT-COVERED, in the phase an operator would
+    # assume covers it.
+    _pm = open(os.path.join(REPO, "paranoia_mode"), encoding="utf-8").read()
+    _xdg = _pm.split("def wipe_xdg_traces")[1].split("\ndef ")[0]
+    check("history: paranoia_mode's XDG phase names the browser history as "
+          "NOT covered, and says why it is not",
+          "BROWSER HISTORY" in _xdg and "places.sqlite" in _xdg)
+
+
 def test_sensitive_inputs_do_not_go_into_browser_history():
     """autocomplete/spellcheck on the fields that carry an identity.
 
