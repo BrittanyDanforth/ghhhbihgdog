@@ -19,7 +19,16 @@ stem>=1.8
 monero>=0.8
 psutil>=5.9
 python-gnupg>=0.5
-PyYAML>=6.0
+# PyYAML WAS HERE AND NOTHING IMPORTED IT. Not one `import yaml` anywhere in
+# the repository -- the shipped tools, the suites, or the testnet drivers.
+# systemd/gs-wake-agent.service already said so in passing ("stem, gnupg and
+# yaml are deliberately NOT here: they are guarded or unused on this path"),
+# and it was still an install requirement.
+#
+# On a vault that holds a spend key, a package installed for nothing is
+# attack surface bought for nothing. Removed, and tests/test_ipleak.py now
+# checks the direction that let it sit here: every line in this file must be
+# a module something actually imports, or be listed as a justified exception.
 # Dev/test only: the suite runs pyflakes over every shipped tool to prove no
 # undefined names. Coverage measured 214 warning/abort lines that no test ever
 # executes, so a NameError in one of them is invisible to the suite -- a static

@@ -216,6 +216,66 @@ finally:
 # 6. PySocks must be declared, or a clean install cannot use Tor at all.
 # ---------------------------------------------------------------------------
 _reqs = open(os.path.join(REPO, "requirements.txt")).read().lower()
+# ---- AND THE OTHER DIRECTION: NOTHING DECLARED THAT NOTHING USES ---------
+#
+# The check below catches a dependency that is MISSING. Nothing caught one
+# that is SURPLUS, and PyYAML sat in requirements.txt with not a single
+# `import yaml` anywhere in the repository -- shipped tools, suites or
+# testnet drivers. On a vault holding a spend key, a package installed for
+# nothing is attack surface bought for nothing.
+import ast as _ast
+import glob as _glob
+import re as _re
+_DIST_TO_MODULE = {"pysocks": "socks", "pynacl": "nacl",
+                   "python-gnupg": "gnupg", "pyyaml": "yaml"}
+# EXEMPTIONS ARE NAMED AND JUSTIFIED, never a blanket skip -- an exemption
+# list that grows silently is the same defect as the surplus dependency.
+_NOT_IMPORTED_BY_US = {
+    # requests imports it to speak socks5h; we never `import socks` ourselves,
+    # and without it every Tor-routed request raises InvalidSchema.
+    "socks",
+}
+# pyflakes IS NOT EXEMPT, and the first draft of this listed it as "a dev tool
+# the suite INVOKES over the shipped files, never imported". That was wrong:
+# tests/test_units.py does `import pyflakes.api`. The check below caught it
+# immediately, which is the whole reason the exemptions are re-verified rather
+# than trusted.
+_declared = []
+for _l in open(os.path.join(REPO, "requirements.txt"), encoding="utf-8"):
+    _l = _l.split("#")[0].strip()
+    if not _l:
+        continue
+    _name = _re.split(r"[<>=!~\[]", _l)[0].strip().lower()
+    if _name:
+        _declared.append(_DIST_TO_MODULE.get(_name, _name))
+_imported = set()
+for _f in _glob.glob(os.path.join(REPO, "*")) + _glob.glob(os.path.join(REPO, "tests", "*.py")):
+    if not os.path.isfile(_f) or _f.endswith((".md", ".log", ".lock", ".txt", ".json")):
+        continue
+    try:
+        _t = _ast.parse(open(_f, encoding="utf-8").read())
+    except Exception:                                        # noqa: BLE001
+        continue
+    for _n in _ast.walk(_t):
+        if isinstance(_n, _ast.Import):
+            _imported.update(a.name.split(".")[0] for a in _n.names)
+        elif isinstance(_n, _ast.ImportFrom) and _n.module and _n.level == 0:
+            _imported.add(_n.module.split(".")[0])
+_surplus = sorted(set(_declared) - _imported - _NOT_IMPORTED_BY_US)
+check(f"requirements.txt declares nothing that nothing imports "
+      f"(surplus: {_surplus or 'none'})", _surplus == [])
+# NON-VACUITY 1: the scan really did find imports, or an empty set would
+# make every declaration look surplus and the check above would be inverted.
+check("requirements: NON-VACUITY -- the import scan actually found modules",
+      {"requests", "nacl", "monero"} <= _imported)
+# NON-VACUITY 2: the declaration parse really produced names.
+check("requirements: NON-VACUITY -- the file parsed into real names",
+      len(_declared) >= 6 and "requests" in _declared)
+# AND THE EXEMPTIONS ARE STILL TRUE. If something starts importing socks
+# directly, it belongs in the ordinary set rather than the exception list.
+check("requirements: the exemptions are still exemptions, not stale entries",
+      all(_e not in _imported for _e in _NOT_IMPORTED_BY_US))
+
 check("requirements.txt declares PySocks (socks5h is unusable without it)",
       "pysocks" in _reqs)
 
