@@ -13,21 +13,24 @@ Before=shutdown.target
 
 [Service]
 Type=oneshot
-# NO CORE DUMPS, FROM execve ONWARD.
+# NO CORE DUMPS. Set here for consistency with gs-wake-agent.service, NOT
+# because this unit holds a secret -- it runs `systemctl kill` and
+# `systemctl poweroff` and has no key material, no wallet password and no
+# plan in its address space.
 #
-# The tools suppress this themselves at module import (gs_common's first
-# executable statement; gs_console and gs_doorbell carry their own, because
-# neither may import gs_common). That covers every third-party and crypto
-# import -- nacl/libsodium, requests, tenacity -- but it CANNOT cover the
-# window before the interpreter runs any of our code: exec, dynamic linking,
-# site.py, and the entry script's own `import hashlib, decimal`. No Python
-# statement is early enough for that; the launcher is.
+# THE AGENT UNIT'S COMMENT WAS COPY-PASTED HERE AND THEN PATCHED, and the
+# patch left a sentence contradicting itself: "the secret arrives in the
+# ENVIRONMENT (nothing itself, but it shares the agent's cgroup)", followed
+# by a driven measurement -- "a SIGABRT wrote a 5 MB core and the secret was
+# in it" -- that is a measurement of the AGENT, not of this. A parenthetical
+# saying "nothing itself" inside a sentence about a secret is how a reader
+# comes to believe this unit handles one.
 #
-# It matters here because the secret arrives in the ENVIRONMENT
-# (nothing itself, but it shares the agent's cgroup), so it is in the process image from execve --
-# a dump taken at ANY point after that contains it. Driven: with
-# `ulimit -c unlimited` and the variable set, a SIGABRT wrote a 5 MB core and
-# the secret was in it.
+# The real reason to keep the line: a shutdown path that dumps core writes a
+# file at the exact moment the machine is going down, when nothing is left
+# running to erase it -- and it costs nothing to forbid. See
+# gs-wake-agent.service for the case where a dump genuinely does carry the
+# secret, and for why a Python statement cannot be early enough to prevent it.
 LimitCORE=0
 # Give the agent's process group a chance to run its cleanup, then insist.
 ExecStart=/bin/sh -c 'systemctl kill --signal=SIGTERM gs-wake-agent.service 2>/dev/null || true; sleep 20; systemctl kill --signal=SIGKILL gs-wake-agent.service 2>/dev/null || true'

@@ -2178,7 +2178,7 @@ class H(BaseHTTPRequestHandler):
 
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>GhostSpiral Console</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Console</title>
 <style>
 :root{--bg:#F5F7F9;--sf:#fff;--sf2:#EDF1F4;--ink:#10151B;--ink2:#39434F;--mut:#64717F;
 --line:#D6DEE4;--line2:#C2CCD5;--acc:#A85A24;--accs:#F3E4D8;--ok:#136F52;--oks:#DCEFE7;
@@ -3138,6 +3138,30 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)      # loopback ONLY
     print(f"  GhostSpiral console → http://127.0.0.1:{a.port}/?t={TOKEN}")
     print( "  ^ open THIS url — the token is required, and it changes every run")
+    # THE ONE ARTIFACT THIS TOOL CAUSES AND CANNOT ERASE.
+    #
+    # The operator is told to open a URL in a browser, and a browser keeps the
+    # full URL and the page TITLE with a visit timestamp. paranoia_mode's XDG
+    # phase exists for exactly this class of thing -- recently-used.xbel,
+    # thumbnails, Trash -- and reaches no browser profile; grepping the whole
+    # repo for places.sqlite, ~/.mozilla, Default/History or "browser history"
+    # returned nothing, so the surface was neither swept nor named.
+    #
+    # It is not a credential leak: the token is secrets.token_urlsafe(24),
+    # regenerated per run, so a stale one in history is dead, and the URL is
+    # loopback so it discloses nothing about the network. The page loads no
+    # external resource and contains no <a href>, so the token never leaves the
+    # browser in a Referer either.
+    #
+    # What it IS is a durable, timestamped row naming the toolchain, on the
+    # machine, in a store this project deliberately does not touch -- so the
+    # title is now just "Console" and the operator is told the row exists.
+    # Wiping somebody's browser profile is not this tool's call to make.
+    print( "  Your browser will keep that URL and the page title in its "
+           "history, with a")
+    print( "  timestamp. paranoia_mode does not touch browser profiles and "
+           "will not clear it.")
+    print( "  Use a private window, or clear the entry yourself.")
     print(f"  {len(ACTIONS)} actions · funds require the arm phrase '{ARM_PHRASE}'")
     print(f"  wallet password: {'from GS_WALLET_PASSWORD' if os.environ.get('GS_WALLET_PASSWORD') else 'not set'}")
     try:

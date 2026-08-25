@@ -1,5 +1,32 @@
 # GhostSpiral Toolchain — BRUTAL Feature-vs-Reality Audit
 
+> ## ⚠ THIS DOCUMENT IS A SNAPSHOT, NOT THE AUDIT OF RECORD
+>
+> It describes the codebase **as of 2026-04-12** and has not been updated
+> since. It is kept for the reasoning it records, not as a description of
+> what the tools do now. Do not act on it without checking the code.
+>
+> **What is current instead:**
+>
+> * `OPSEC_SETUP.md` — checked flag by flag against the real parsers,
+>   including subcommands, with zero mismatches.
+> * `tests/` — the executable record. Every claim worth relying on is
+>   asserted there, and the suites run in seconds.
+> * The source comments — this repo puts the reasoning next to the code
+>   precisely so it cannot drift the way this file has.
+>
+> **Its line citations no longer resolve.** This file makes 37 citations of
+> the form `89:90:GhostSpiral`. Every file it names has grown since (
+> GhostSpiral alone is over 11,000 lines), so the anchors point somewhere
+> else entirely. Two spot-checks:
+>
+> ```
+> cited as the --split help text        GhostSpiral:89  is a fee-margin note
+> cited as "the only path reading       GhostSpiral:278 is DECOY_MIN = 2
+> --split"
+> ```
+
+
 > Generated: 2026-04-12 | Scope: Every file in /workspace
 > Method: Line-by-line trace of every advertised feature against actual code behavior
 
