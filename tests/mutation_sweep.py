@@ -2687,6 +2687,26 @@ MUTATIONS = [
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
+ # stem was listed as a SOFT dependency ("guarded or unused on the wake path")
+ # and is neither: gs_common.newnym imports it inside a retry loop, so a
+ # missing package is caught as a rotation failure and required=True sys.exits.
+ # create_receive_wallet:258 calls exactly that, for every /deposit.
+ ("the dependency pre-check goes back to treating stem as optional",
+  "systemd/gs-wake-agent.service",
+  "import requests, tenacity, nacl, socks, psutil, monero, stem",
+  "import requests, tenacity, nacl, socks, psutil, monero",
+  ["test_wake_agent"]),
+
+ # OPSEC_SETUP section 4b step 3 told the operator to serve the SPEND-capable
+ # wallet on the wallet-rpc. stage0_preflight calls refuse_hot_wallet
+ # unconditionally and exits on exactly that, so every /send failed for anyone
+ # who followed the setup.
+ ("the setup doc goes back to telling the operator to serve a hot wallet",
+  "OPSEC_SETUP.md",
+  "# 3. THE WALLET-RPC KEEPS SERVING THE VIEW-ONLY WALLET.",
+  "# 3. The vault's monero-wallet-rpc must serve that SPEND-CAPABLE wallet",
+  ["test_wake_agent"]),
+
  # The boot deadman powers the vault off if the agent dies. Its OnActiveSec
  # covers the largest job that does NOT extend it; shrinking it means a vault
  # that powers off mid-job, and the derivation lives in the test rather than

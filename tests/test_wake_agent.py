@@ -1435,6 +1435,56 @@ check("daemon: gs_wake_keys writes rpc_daemon into the keyfile",
       '"rpc_daemon": args.rpc_daemon,' in _kp_src
       and '"--rpc-daemon"' in _kp_src)
 
+# ---- THE SETUP DOC MUST NOT TELL THE OPERATOR TO BREAK EVERY WITHDRAWAL --
+#
+# OPSEC_SETUP section 4b step 3 said: "The vault's monero-wallet-rpc must
+# serve that SPEND-CAPABLE wallet at boot." GhostSpiral's stage0_preflight
+# calls refuse_hot_wallet(rpc_primary) UNCONDITIONALLY and sys.exits on
+# exactly that, because monero-wallet-rpc only returns an unsigned txset for a
+# WATCH-ONLY wallet and every round of this pipeline is built as one.
+#
+# So an operator who followed the withdrawal setup got "--rpc-primary is
+# serving a FULL (hot) wallet, and this pipeline cannot use one" on every
+# single /send. Nothing was spent -- it fires before anything is planned --
+# but a feature that has never once worked is not a safe failure.
+#
+# Section 4 of the same document said the opposite and correct thing
+# ("monero-wallet-rpc with a view-only wallet"). The document contradicted
+# itself, and the wrong half was the one an operator setting up withdrawals
+# reads.
+_doc = open(os.path.join(REPO, "OPSEC_SETUP.md"), encoding="utf-8").read()
+_gs_txt = open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read()
+check("wallet: GhostSpiral really does refuse a hot wallet before planning",
+      "refuse_hot_wallet(rpc_primary)" in _gs_txt
+      and "def refuse_hot_wallet" in _gs_txt)
+# UNCONDITIONAL, or the doc could be right for some runs. It sits in stage 0
+# with no flag guarding it.
+_s0 = _gs_txt.split("def stage0_preflight")[1].split("\ndef ")[0]
+check("wallet: ...and does so on EVERY run, not behind a flag",
+      "refuse_hot_wallet(rpc_primary)" in _s0)
+# THE DOC MUST NOT INSTRUCT THE OPPOSITE. Checked as a phrase because that is
+# how it was written, and it is the sentence that cost the feature.
+check("wallet: the setup doc no longer tells the operator to serve the "
+      "spend-capable wallet on the wallet-rpc",
+      "monero-wallet-rpc must serve that SPEND-CAPABLE wallet" not in _doc)
+check("wallet: ...and says the rpc stays view-only where withdrawals are "
+      "set up",
+      "VIEW-ONLY WALLET" in _doc or "view-only wallet" in _doc)
+# AND THE TWO WALLETS ARE NAMED AS TWO THINGS. --wallet-file is the spend
+# wallet the signer opens; --rpc-primary is the view-only one it plans with.
+# Conflating them is precisely what the broken step did.
+check("wallet: the doc distinguishes the signing FILE from the served wallet",
+      "--wallet-file" in _doc and "airgap_tx_signer opens it" in _doc)
+# NON-VACUITY: the agent really does compose both, so they are genuinely two
+# separate settings and not one described twice.
+_wargv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                      _k, _wdir, bundle="b", slip=None, handle="A3F1")[0]
+check("wallet: NON-VACUITY -- a withdrawal composes BOTH --rpc-primary and "
+      "--wallet-file, so they are two settings",
+      "--rpc-primary" in _wargv and "--wallet-file" in _wargv
+      and _wargv[_wargv.index("--rpc-primary") + 1]
+          != _wargv[_wargv.index("--wallet-file") + 1])
+
 # ---- THE BOOT DEADMAN MUST STILL COVER THE JOBS IT IS THE BACKSTOP FOR ---
 #
 # gs-wake-deadman.timer is armed at boot, before any job is known, and powers
@@ -1806,12 +1856,43 @@ check("...and there is exactly one such check", len(_pre) == 1)
 _preline = _pre[0] if _pre else ""
 # EXACTLY THE HARD SET. A pre-check stricter than the code would itself be the
 # thing that stops the vault working.
-for _hard in ("requests", "tenacity", "nacl", "socks", "psutil", "monero"):
+for _hard in ("requests", "tenacity", "nacl", "socks", "psutil", "monero",
+              "stem"):
     check(f"the pre-check covers {_hard}, which the wake path hard-requires",
           _hard in _preline)
-for _soft in ("stem", "gnupg", "yaml"):
-    check(f"...and NOT {_soft}, which is guarded or unused on the wake path",
+# stem MOVED FROM SOFT TO HARD, and this loop used to PIN the wrong answer.
+#
+# It asserted stem was absent from the pre-check "because it is guarded or
+# unused on the wake path". It is neither. gs_common.newnym imports stem
+# INSIDE its retry loop, so a missing package is caught as just another
+# rotation failure -- and with required=True the handler is sys.exit.
+# create_receive_wallet:258 calls newnym(required=True), and it runs for both
+# receive_new and receive_and_quote, i.e. every /deposit and every /receive.
+#
+# Driven with stem made unimportable:
+#   [!] Tor circuit rotation FAILED after 1 attempts: No module named 'stem'
+# -- a message that sends the operator to debug Tor, which is working.
+for _soft in ("gnupg",):
+    check(f"...and NOT {_soft}, which is genuinely guarded on the wake path",
           _soft not in _preline)
+# AND THE REASON gnupg STAYS SOFT IS CHECKED, not asserted: it is imported
+# lazily inside the --gpg-recipient branch, and the wake path never composes
+# that flag.
+_tsp = open(os.path.join(REPO, "thor_swap_preparer"), encoding="utf-8").read()
+# THE INDENTATION IS THE WHOLE TEST, so it must not be stripped. The first
+# draft compared l.strip() against "import gnupg", which removes the very
+# thing that distinguishes a module-scope import from a lazy one -- and went
+# red on correct code.
+_gn_lines = [l for l in _tsp.splitlines() if l.rstrip().endswith("import gnupg")]
+check("...and gnupg really is imported lazily rather than at module scope",
+      _gn_lines
+      and not any(l == l.lstrip() for l in _gn_lines))
+check("...and no wake job composes --gpg-recipient",
+      not any("--gpg-recipient" in _a
+              for _j in P.JOBS
+              for _argv in A.build_argv(_j, _sample[_j], _k, _wdir,
+                                        bundle="b", slip="s", handle="A3F1")
+              for _a in _argv))
 check("the failure is written somewhere durable, not to the null stderr "
       "this unit sets",
       "gs_wake_job.log" in _preline)
