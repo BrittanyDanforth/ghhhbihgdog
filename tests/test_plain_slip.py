@@ -558,12 +558,15 @@ check("NON-VACUITY -- the plaintext-off reply is a real message",
 print("\n-- a watch that saw something is not a failed watch --")
 
 
-def _drive_out(result, outcome, job="watch"):
+def _drive_out(result, outcome, job="watch", chat_id=111):
     """Like _drive, but the OUTCOME is what the caller says.
 
     _drive stubs outcome() to "done" unconditionally, which is right for the
     slip cases it was written for and makes it structurally unable to see this
     defect: the bug only exists when the outcome is NOT done.
+
+    `chat_id` because a NEGATIVE one is a group, and a group is a broadcast
+    surface -- which is a different question from what the outcome was.
     """
     _sent.clear()
     fin = type("F", (), {"result": result,
@@ -571,13 +574,13 @@ def _drive_out(result, outcome, job="watch"):
     pg._DOORBELL[0] = type("D", (), {
         "run_wake": staticmethod(
             lambda a, k, j, p, on_event=None: fin)})()
-    _p.poke(111, job, {"handle": "A3F1"})
+    _p.poke(chat_id, job, {"handle": "A3F1"})
     return list(_sent)
 
 
-def _res(status, phase):
-    return {"status": status, "handle": "A3F1", "slip": "", "plain": {},
-            "phase": phase}
+def _res(status, phase, plain=None):
+    return {"status": status, "handle": "A3F1", "slip": "",
+            "plain": plain or {}, "phase": phase}
 
 
 for _ph in ("not_yet", "arriving", "short", "stuck"):
@@ -704,6 +707,46 @@ for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
     check(f"{_j}: no spend-safety language on a job that does not spend",
           "NOTHING WAS SPENT" not in _o1[0]
           and "already sent" not in _o2[0])
+
+# ---- A GROUP IS A BROADCAST SURFACE, AND A PAYLOAD IS NOT FOR ONE ------
+#
+# main() allows a negative --chat-id when --user-id is given, and its refusal
+# text OFFERS --user-id as the fix. --user-id is inbound only: it gates who
+# may DRIVE the bot. Every send() posts to chat_id, so with plain_slip set in
+# the vault's keyfile the whole deposit slip went to the room. Driven with
+# --chat-id -1001999999999 --user-id 555: the amount, the deposit address and
+# a memo naming the destination XMR address in full, to everyone in it.
+_GROUP = -1001999999999
+_gp = _drive_out(_res("done", "", plain={
+    "b": "0.05000000", "d": "bc1qdeposit0000000000000000000000",
+    "m": "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0",
+    "x": "1.2345", "h": "A3F1"}), "done", job="receive_and_quote",
+    chat_id=_GROUP)
+_gtext = "\n".join(_gp)
+check("group: the deposit address is NOT posted into a room",
+      "bc1qdeposit" not in _gtext)
+check("group: ...nor the amount", "0.05000000" not in _gtext)
+check("group: ...nor the memo, which names the destination XMR address whole",
+      "=:XMR.XMR:" not in _gtext and "8" + "d" * 94 not in _gtext)
+check("group: ...and the operator is told why, rather than left waiting",
+      "this is a group" in _gtext and "everyone in it" in _gtext)
+check("group: ...and told where the details are and how to get them properly",
+      "at the machine" in _gtext and "one-to-one" in _gtext)
+check("group: ...and still gets the handle, so /check works",
+      "A3F1" in _gtext)
+# NON-VACUITY: the SAME slip in a one-to-one chat is still delivered in full.
+# The keyfile decision is real and this must not quietly cancel it.
+_pp = _drive_out(_res("done", "", plain={
+    "b": "0.05000000", "d": "bc1qdeposit0000000000000000000000",
+    "m": "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0",
+    "x": "1.2345", "h": "A3F1"}), "done", job="receive_and_quote")
+_ptext = "\n".join(_pp)
+check("group: NON-VACUITY -- a one-to-one chat still gets the whole slip",
+      "bc1qdeposit" in _ptext and "0.05000000" in _ptext
+      and "=:XMR.XMR:" in _ptext)
+check("group: ...with the memo still alone in its own message, because "
+      "tap-and-hold copies a whole message",
+      any(t.strip().startswith("=:XMR.XMR:") for t in _pp))
 
 # ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
 #

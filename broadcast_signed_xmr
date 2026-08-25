@@ -543,9 +543,53 @@ def load_progress(args, blob_fp: str, items: list) -> tuple:
             prog = json.load(f)
         prog.setdefault("log", [])
         saved_fp = prog.get("blob_fingerprint", "")
+        # A PROGRESS FILE THAT NAMES NO BLOB SET IS NOT USABLE ON ANY BLOB SET.
+        #
+        # Both fences below read `if saved_fp and saved_fp != ...`, so an
+        # absent, empty or null fingerprint disabled BOTH of them -- and the
+        # `relayed` list was then applied to whatever batch happened to be in
+        # hand. Driven against the shipped main(), three unsent transactions
+        # and a progress file listing all three as relayed:
+        #
+        #     blob_fingerprint missing  -> relayed 0/3, exit 0, silent
+        #     blob_fingerprint ""       -> relayed 0/3, exit 0, silent
+        #     v1 legacy shape           -> relayed 0/3, exit 0, and it prints
+        #                                  "Migrated v1 progress file: 3 relayed"
+        #
+        # Money that never leaves, reported as delivered, which is the worst
+        # failure shape this tool has. `len(relayed) < len(items)` is what
+        # decides the exit code, and every item was skipped, so the count
+        # agreed with itself.
+        #
+        # How a file gets into that state without anybody being careless: a
+        # build from before the fingerprint existed, a partial restore, a
+        # hand-edit, or an operator trimming the field to get past a
+        # stale-batch refusal -- which the refusal above explicitly tells them
+        # not to do by deleting the file, and says nothing about editing it.
+        #
+        # REFUSED, not repaired. airgap_tx_signer made exactly this change for
+        # plan_fingerprint ("nothing would tie this manifest to the plan you
+        # passed, so a swapped or truncated manifest could not be detected");
+        # this is the same rule one stage later, where the consequence is
+        # on-chain rather than on-disk.
+        if not isinstance(saved_fp, str) or not saved_fp:
+            integrity_log("broadcast", "progress_missing_fingerprint")
+            sys.exit(
+                "[!] This progress file records no blob set "
+                "('blob_fingerprint' is missing or empty),\n"
+                "    so nothing ties it to the transactions in front of it. "
+                "Applying it would skip\n"
+                "    every transaction it lists as relayed — including ones "
+                "that were never sent —\n"
+                "    and exit reporting success.\n"
+                "    Re-run WITHOUT --resume to relay this set from the start, "
+                "or point --resume at\n"
+                "    the progress file that belongs to it. Do not add the "
+                "field by hand: it is a\n"
+                "    hash of the blob set, and a wrong one is worse than none.")
 
         if prog.get("schema") == PROGRESS_SCHEMA:
-            if saved_fp and saved_fp != blob_fp:
+            if saved_fp != blob_fp:
                 integrity_log("broadcast", "STALE_PROGRESS:blob_set_changed")
                 sys.exit(
                     "[!] Broadcast progress is from a DIFFERENT set of blobs!\n"
@@ -590,7 +634,7 @@ def load_progress(args, blob_fp: str, items: list) -> tuple:
             legacy_fp = hashlib.sha256(
                 "|".join(i.key for i in present).encode()
             ).hexdigest()[:32]
-            if saved_fp and saved_fp != legacy_fp:
+            if saved_fp != legacy_fp:
                 integrity_log("broadcast", "STALE_PROGRESS:v1_unmappable")
                 sys.exit(
                     "[!] This progress file is in the old position-keyed format and its\n"

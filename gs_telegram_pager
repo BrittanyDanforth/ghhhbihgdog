@@ -1846,7 +1846,18 @@ class Pager:
             self.send(chat_id, f"{chat_name(job)}: failed to start — {_redact(e)[:160]}")
             return
         out = pending.outcome()
-        integrity_log("pager", f"outcome:{job}:{out}")
+        # BOOKKEEPING MUST NOT PRE-EMPT THE REPORT. integrity_log re-raises an
+        # OSError, and this line sits above every reply branch -- so a full or
+        # read-only SD card turned "your withdrawal finished" into silence.
+        # _worker now catches that and says something, but the right answer
+        # here is that a chain write failing must not cost the message at all:
+        # the chain records what happened, the message IS what happened as far
+        # as the operator is concerned.
+        try:
+            integrity_log("pager", f"outcome:{job}:{out}")
+        except Exception:                                    # noqa: BLE001
+            print("  [!] could not write the integrity chain for this "
+                  "outcome; reporting it anyway.")
         # A PHASE OUTRANKS THE OUTCOME, and it is checked before the branch
         # that reads `out`.
         #
@@ -1953,6 +1964,44 @@ class Pager:
                     time.sleep(SLIP_RETRY_S)
                     if not self.send(chat_id, _msg):
                         integrity_log("pager", "withdraw_result_undelivered")
+                return
+            if plain and chat_id < 0:
+                # A GROUP IS A BROADCAST SURFACE, AND A PAYLOAD IS NOT FOR ONE.
+                #
+                # main() allows a negative --chat-id when --user-id is given,
+                # and the refusal text offers --user-id as the fix. --user-id
+                # is consulted INBOUND ONLY -- handle() and handle_callback()
+                # check who is driving. Every send() posts to chat_id, so with
+                # plain_slip set in the vault's keyfile the whole deposit slip
+                # went to the room. Driven with --chat-id -1001999999999
+                # --user-id 555:
+                #
+                #   -> the room: "Send exactly: 0.05000000 BTC / To address:
+                #      bc1q... / Expected out: ~1.2345 XMR"
+                #   -> the room: "=:XMR.XMR:8ddd...ddd:0/1/0"
+                #
+                # -- the amount, the deposit address, and a memo naming the
+                # destination XMR address in full, to everyone in the room.
+                #
+                # THE OPERATOR MADE THE plain_slip DECISION AT THE VAULT, and
+                # it is a real one: this file's own argument is that the
+                # transcript is assumed readable, so plaintext costs what it
+                # costs. A group changes that bargain without asking them
+                # again -- from "whoever ends up with my phone" to "these
+                # twenty people, right now, by design". That is not a decision
+                # the keyfile was making.
+                #
+                # The SEALED slip is still sent to a group: it is sealed to a
+                # key nobody in the room holds, which is the whole argument
+                # for putting one in a chat at all.
+                integrity_log("pager", "plain_slip_withheld_group")
+                self.send(chat_id,
+                          f"{chat_name(job)} ready · slip {h}\n"
+                          f"The deposit details are NOT posted here — this is "
+                          f"a group, and they would go to everyone in it. "
+                          f"Read them at the machine, or set up a delivery "
+                          f"key and use a one-to-one chat.",
+                          buttons=self._handle_buttons(h))
                 return
             if plain:
                 # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
@@ -2164,8 +2213,53 @@ class Pager:
                           buttons=MENU_BUTTONS)
 
     def _worker(self, chat_id: int, job: str, params: dict) -> None:
+        """The wake, on its own thread. THE REPORT MUST SURVIVE EVERYTHING.
+
+        This was try/finally with no except, so anything poke() raised killed
+        the thread silently: `busy` was released by the finally, the pager
+        went on answering /status with "ready", and the operator got nothing.
+        Under the shipped unit's StandardOutput=null the traceback went
+        nowhere either.
+
+        Driven with a full SD card at the moment a withdrawal reported back --
+        integrity_log re-raises OSError, and poke() writes the chain BEFORE
+        every reply branch:
+
+            messages the operator received: []
+            busy released (pager looks healthy): True
+            worker thread alive: False
+
+        -- after 16.5 hours, on the job that spends everything. One screen
+        below, the slip and withdraw paths retry their sends specifically so
+        that this message cannot be lost to one bad circuit; losing it to one
+        bad bookkeeping write instead would be absurd.
+
+        SO THE OPERATOR IS TOLD SOMETHING, ALWAYS. This box does not know what
+        happened -- the exception could have come before or after the wake --
+        so it says exactly that rather than guessing a comfortable answer, and
+        it is careful not to imply the money is safe.
+        """
         try:
             self.poke(chat_id, job, params)
+        except BaseException as e:                           # noqa: BLE001
+            # send() itself may be what failed. It never raises (it returns
+            # whether it landed), but this is the last line of defence and it
+            # must not become the thing that eats the exception silently.
+            try:
+                self.send(chat_id,
+                          f"{chat_name(job)}: the wake ran and this box then "
+                          f"failed to report it cleanly "
+                          f"({_redact(e)[:80]}).\n"
+                          f"I cannot tell you whether it finished. Check "
+                          f"before starting another one.",
+                          buttons=MENU_BUTTONS)
+            except BaseException:                            # noqa: BLE001
+                pass
+            try:
+                integrity_log("pager", "worker_crashed")
+            except BaseException:                            # noqa: BLE001
+                pass
+            raise
         finally:
             self.busy.release()
 
@@ -2617,7 +2711,35 @@ class Pager:
                     # Advance the cursor BEFORE acting: a message that crashes
                     # the handler must not be replayed on every restart.
                     self.limits.offset = max(self.limits.offset, uid + 1)
-                    self.limits.save()
+                    # AND A CARD THAT WILL NOT TAKE IT MUST NOT KILL THE
+                    # PROCESS. save() writes the state file through
+                    # atomic_write_json, which re-raises -- and this call sits
+                    # OUTSIDE the per-update try below, with nothing above it
+                    # to catch anything either.
+                    #
+                    # What that costs: a withdrawal holds `busy` for up to
+                    # 16.75 h, and the doorbell's HTTP server runs IN THIS
+                    # PROCESS. A full or read-only SD card, plus any incoming
+                    # update -- including one from a stranger the allowlist
+                    # would have ignored a line later -- tore the interpreter
+                    # down mid-wake and took the socket with it. updates()
+                    # carries a long note about exactly that outcome ("it
+                    # POSTs to a port nothing is bound to any more"), and this
+                    # line walked around it. The offset was never persisted
+                    # either, so the same update came back and did it again.
+                    #
+                    # start_job guards the identical call for the identical
+                    # reason. THE IN-MEMORY OFFSET IS KEPT either way, so this
+                    # batch is not reprocessed inside this process; what is
+                    # lost is the cursor surviving a restart, which is a
+                    # smaller loss than the restart.
+                    try:
+                        self.limits.save()
+                    except Exception as e:                   # noqa: BLE001
+                        print(f"  [!] could not persist the update cursor "
+                              f"({_redact(e)[:80]}). Continuing: dropping a "
+                              f"wake in flight would cost more than replaying "
+                              f"a message after a restart.")
                 else:
                     # NOT SILENTLY HANDLED ANYWAY. An update whose update_id is
                     # not an int can never be confirmed to Telegram, because
@@ -2929,6 +3051,13 @@ def main(argv=None) -> int:
             f"    --whoami and send a message from that room: it prints the "
             f"chat id AND your\n"
             f"    user id.\n"
+            f"\n"
+            f"    NOTE THAT --user-id GATES WHO MAY DRIVE IT, NOT WHO MAY "
+            f"READ IT. Every reply\n"
+            f"    still goes to the room, so plaintext deposit details are "
+            f"withheld in a group\n"
+            f"    even with plain_slip set. A one-to-one chat is the only "
+            f"place they are sent.\n"
             f"    For a one-to-one chat with the bot this does not arise -- "
             f"there the chat id IS\n"
             f"    the person, and it is positive.")

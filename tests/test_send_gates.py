@@ -412,6 +412,84 @@ check("self-exit: the mix message does NOT claim the memo risk (it is not "
       "true of a mix subaddress, and a wrong reason teaches the wrong lesson)",
       _x is not None and "OP_RETURN" not in _x)
 
+# -- AND THE WALLET'S ANSWER, NOT ONLY THIS RUN'S INDEX -------------------
+#
+# Everything above asks addr_index, which holds what THIS RUN created.
+# _wallet_owns_address's own docstring already names the gap that leaves:
+# "'an address the run did not create' is NOT the same as 'an address the exit
+# will not touch'" -- _exit_account_list includes bal_account, account 0 in
+# send mode. So an address from an EARLIER run of the same wallet passed every
+# check above and was then swept to.
+#
+# How that is reached without anybody being careless: GS_EXIT_TO set once in a
+# shell profile to the address create_receive_wallet printed for run 1. Run 2
+# has a new bundle, so run 1's address is not in ITS addr_index; the loop
+# `continue`s, the run mixes for hours, and the exit merges by hand exactly
+# what create_subs kept apart -- then prints "pipeline complete".
+PRIOR_RUN = _addr(11)
+
+
+class _OwnRPC:
+    """monero-wallet-rpc: an OWNED address answers, a foreign one ERRORS.
+
+    That asymmetry is the whole reason _wallet_owns_address fails OPEN -- an
+    error is the EXPECTED answer for a correctly-supplied external address.
+    """
+
+    def __init__(self, owned):
+        self.owned = owned
+
+    def raw_request(self, method, params=None):
+        if method != "get_address_index":
+            return {}
+        _a = (params or {}).get("address")
+        if _a in self.owned:
+            return {"index": {"major": self.owned[_a][0],
+                              "minor": self.owned[_a][1]}}
+        raise RuntimeError("Address doesn't belong to the wallet")
+
+
+def _rse_rpc(dests, rpc):
+    return aborts(ghost.reject_self_exit,
+                  types.SimpleNamespace(exit_to=dests), dict(IDX), ENTRY_A,
+                  rpc)
+
+
+_WALLET = _OwnRPC({PRIOR_RUN: (0, 4), MIX_A: (11, 1)})
+_m = _rse_rpc([PRIOR_RUN], _WALLET)
+check("self-exit: an address of THIS WALLET that this run did not create is "
+      "refused", _m is not None)
+check("self-exit: ...and locates it (account 0 / subaddr 4)",
+      _m is not None and "account 0" in _m and "subaddr 4" in _m)
+check("self-exit: ...and says it is inside this wallet, which is the fact "
+      "that distinguishes it from the two cases above",
+      _m is not None and "inside THIS WALLET" in _m)
+check("self-exit: ...and names the shell-profile GS_EXIT_TO that produces it",
+      _m is not None and "GS_EXIT_TO" in _m)
+check("self-exit: ...and it is a THIRD message, not one of the other two",
+      _m not in (_rse([ENTRY_A]), _rse([MIX_A])))
+
+# FAIL-OPEN ON AN RPC ERROR, and this is not laxity: monero-wallet-rpc answers
+# get_address_index for a FOREIGN address with an error, so refusing on an
+# error would refuse every correct configuration.
+class _DeadRPC:
+    def raw_request(self, method, params=None):
+        raise RuntimeError("connection refused")
+
+
+check("self-exit: a foreign address with the wallet-rpc DOWN still passes — "
+      "an error is the expected answer for an external address",
+      _rse_rpc([FOREIGN], _DeadRPC()) is None)
+check("self-exit: ...and a caller that hands in no rpc at all still works",
+      _rse_rpc([PRIOR_RUN], None) is None)
+# NON-VACUITY on the new branch: a genuinely foreign address is not refused by
+# it, so this is a check and not a blanket.
+check("self-exit: NON-VACUITY -- a foreign address passes the wallet check",
+      _rse_rpc([FOREIGN], _WALLET) is None)
+check("self-exit: ...and main() hands the rpc in, or the branch never runs",
+      "reject_self_exit(args, addr_index, ENTRY_ADDRS, rpc=rpc_primary)"
+      in open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read())
+
 # -- NON-VACUITY: it must let a real destination through -------------------
 check("control: a FOREIGN address does not abort", _rse([FOREIGN]) is None)
 check("control: several foreign addresses do not abort",
