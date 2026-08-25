@@ -1665,18 +1665,43 @@ _B58_XMR = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 def _xmr_address_field(v):
+    """One Monero address, checked the way the other two validators check it.
+
+    HAND-ROLLED BECAUSE THIS FILE IMPORTS NOTHING (see the module header: a
+    doorbell that imported gs_common would drag requests, tenacity and psutil
+    onto the Pi), which is right -- and it had drifted. gs_common.XMR_ADDR_RE
+    and gs_console.XMR_RE are the same expression and a test pins them
+    together:
+
+        ^[48][base58]{94}\Z | ^4[base58]{105}\Z
+
+    -- the 106-character INTEGRATED form starts with 4, always, because an
+    integrated address carries netbyte 19. This accepted a leading 8 at 106
+    too, so there was one string shape the two regexes reject and this admits.
+    No such Monero address exists, so it is a typo shape rather than an attack.
+
+    IT MATTERS BECAUSE OF WHICH BOX HOLDS WHICH CHECK. _xmr_address_list is
+    what the pager applies to an address the operator types into the chat, and
+    its own docstring says why duplicates are refused there: so "the operator
+    is told by the box they are typing at, rather than by a vault that has
+    already been woken". This one shape got the other outcome -- accepted on
+    the phone, refused on the vault, a wake spent.
+    """
     if not isinstance(v, str):
         raise WakeError("expected a Monero address as text")
     if len(v) not in (95, 106):
         raise WakeError("expected a Monero address of 95 or 106 characters")
     if v[0] not in ("4", "8"):
         raise WakeError("a Monero address starts with 4 or 8")
+    if len(v) == 106 and v[0] != "4":
+        raise WakeError("an integrated address (106 characters) starts with 4")
     if any(c not in _B58_XMR for c in v):
         raise WakeError("a Monero address is base58 and this is not")
     return v
 
 
-_xmr_address_field.spec = "xmr address ^[48][base58]{94,105}$"
+_xmr_address_field.spec = ("xmr address "
+                           "^[48][base58]{94}\Z|^4[base58]{105}\Z")
 
 #: ONE Monero address, under a name a caller may use.
 #:
