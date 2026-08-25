@@ -101,7 +101,12 @@ class Fake:
             recent=lambda: [], daily_cap=12)
         self.sent = []
         self.pokes = []
-        p.send = lambda cid, t: (self.sent.append((cid, t)), True)[1]
+        #: The inline keyboard each reply carried, index-aligned with `sent`.
+        #: None where a reply had none, which is most of them.
+        self.keyboards = []
+        p.send = lambda cid, t, buttons=None: (
+            self.sent.append((cid, t)), self.keyboards.append(buttons),
+            True)[2]
         self._real_start = pg.Pager.start_job.__get__(p, pg.Pager)
         p.start_job = lambda cid, job, params: self.pokes.append(
             (cid, job, params))

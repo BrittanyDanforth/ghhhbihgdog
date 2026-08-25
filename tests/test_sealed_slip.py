@@ -532,7 +532,8 @@ _pager.proxies = {}
 _pager.token = "123456:TOKEN"
 _pager.handle_owner = {}
 _ok_send = [True]
-_pager.send = lambda cid, text: (_sent.append(text), _ok_send[0])[1]
+_pager.send = lambda cid, text, buttons=None: (_sent.append(text),
+                                               _ok_send[0])[1]
 
 
 class _Done:

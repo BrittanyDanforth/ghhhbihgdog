@@ -705,6 +705,18 @@ Steps 1–2 are `gs_telegram_pager`. Step 3 onward is `gs_doorbell` and
 `gs_wake_agent`. You can still do steps 1–2 by hand — the pager only pokes the
 doorbell, so anything it does you can do from a terminal.
 
+**Most of it is buttons.** `/help` and `/status` carry a keyboard —
+Deposit, Withdraw, Status, Fresh address — and the depth menu, cancel,
+and the "has it arrived / wait for it" step after a deposit are all
+tappable. Every button sends a command from the list `/help` prints, so
+nothing is reachable only by tapping and an old client still works by
+typing.
+
+**Two things stay typed, on purpose.** The withdrawal *address*, because no
+button can carry one and a button that could would be the bot choosing where
+your money goes. And the **confirm**, because that gate exists to stop a
+pocket-dial — and a tap is a pocket-dial.
+
 1. Phone: `/recv` then `/deposit` to the throwaway account. **It asks for the
    amount you are about to send**, in BTC, and puts it on the wire as an exact
    satoshi count.
@@ -810,7 +822,9 @@ doorbell, so anything it does you can do from a terminal.
    interrupt it.**
 
    **From the phone, with `/withdraw`.** Three messages: the command, the
-   destination, then the depth. Nothing else — no handle, no account, no
+   destination, then the depth — and only the destination has to be typed.
+   The command is a button on `/help`, the depth is a button, and cancel is a
+   button on both. Nothing else — no handle, no account, no
    amount. The vault looks at its own wallet, takes the largest unlocked
    output, mixes it and sends it there. It needs nothing from you that you
    would have to look up.

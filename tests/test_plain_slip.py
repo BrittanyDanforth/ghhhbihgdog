@@ -487,7 +487,7 @@ _p = pg.Pager.__new__(pg.Pager)
 _p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
 _p.handle_owner = {}
 _ok = [True]
-_p.send = lambda cid, t: (_sent.append(t), _ok[0])[1]
+_p.send = lambda cid, t, buttons=None: (_sent.append(t), _ok[0])[1]
 
 
 def _drive(result, job="receive_and_quote", params=None):
@@ -690,7 +690,8 @@ def _drive_withdraw_send(ok_on):
     _tries.clear()
     _saved_send = _p.send
     try:
-        _p.send = lambda cid, t: (_tries.append(t), len(_tries) >= ok_on)[1]
+        _p.send = lambda cid, t, buttons=None: (_tries.append(t),
+                                                len(_tries) >= ok_on)[1]
         _drive_out(_res("done", ""), "done", job="withdraw")
     finally:
         _p.send = _saved_send
