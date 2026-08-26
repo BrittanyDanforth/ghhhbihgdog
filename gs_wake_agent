@@ -1200,13 +1200,26 @@ def _withdraw_fee_argv(key: dict, dests=(), owned=()) -> list:
     deposit this operator ever took. Making the fee CONDITIONAL on a fixed
     address made the linkable configuration the only one that pays.
 
-    So the marker moved to where it belongs: gs_common.USAGE_FEE_ACCOUNT_LABEL
-    is written into the wallet by plan_usage_fee, and _funded_entry skips it.
-    The wallet is the one durable store both processes share, a label never
-    reaches the chain, and fresh-mint-per-run keeps working.
+    SO A MARKER WAS PROPOSED AND IS NOT SHIPPED. READ THE NEXT PARAGRAPH
+    BEFORE BELIEVING THIS ONE. The proposal was:
 
-    THE MARKER CANNOT LIVE IN THE WALLET EITHER, and that was tried second.
-    (Kept below because it is the reasoning for the shape this settled into.)
+        gs_common.USAGE_FEE_ACCOUNT_LABEL is written into the wallet by
+        plan_usage_fee, and _funded_entry skips it. The wallet is the one
+        durable store both processes share, a label never reaches the chain,
+        and fresh-mint-per-run keeps working.
+
+    That was written here in the PRESENT TENSE, as though it had been built.
+    It has not: USAGE_FEE_ACCOUNT_LABEL does not exist in gs_common or
+    anywhere else in this repository, plan_usage_fee writes label="" at the
+    mint and says at length why it must, and _funded_entry has nothing to
+    skip. AGENTS.md rule 3 cites this very constant as THE example of a
+    rejected design recorded as shipped -- and the sentence it was citing was
+    still here, unmarked, which is how a reader arrives at "the fee account is
+    marked, so _funded_entry is safe" and builds on nothing.
+
+    THE MARKER CANNOT LIVE IN THE WALLET, WHICH IS WHY IT WAS REJECTED.
+    (The proposal is kept above because it is the reasoning for the shape this
+    settled into, and deleting it would invite a third attempt at it.)
     Labelling the fee account would let _funded_entry tell it apart -- and
     paranoia_mode deliberately never deletes the wallet file, so a label
     outlives every artifact wipe. It would survive a seizure that erased the
@@ -1236,14 +1249,36 @@ def _withdraw_fee_argv(key: dict, dests=(), owned=()) -> list:
     # machine that already knows every one of these values; putting a fee
     # configuration into the transcript would be publishing the one number an
     # analyst divides by to read the deposit.
+    # THREE CAUSES, THREE TOKENS, AND IT WROTE TWO. The paragraph above says
+    # "the three ways of taking none are told apart in the chain" and then
+    # names all three -- never asked; the destination is also an --exit-to;
+    # the destination is an address of the wallet being mixed -- while the
+    # code merged the last two into one `fee_all_excluded`, because both
+    # exclusions were applied in a single call and only their union was
+    # visible afterwards.
+    #
+    # That collapse is not cosmetic: the two need DIFFERENT operator actions.
+    # "every paired address is on this wallet" is fixed by pairing one that is
+    # not; "every paired address is also somewhere you withdraw to" is fixed
+    # by pairing one you do not. An operator reading one token cannot tell
+    # which, which is the state the comment says this exists to prevent.
+    #
+    # Asked as three separate questions so each answer means one thing.
     _all = fee_addresses(key)
+    _off_wallet = fee_addresses(key, exclude=list(owned))
     _usable = fee_addresses(key, exclude=list(dests) + list(owned))
     if _usable:
         return ["--usage-fee"]
     if not _all:
         integrity_log("wake", "fee_none_configured")
+    elif not _off_wallet:
+        # Every paired destination is one this wallet already holds the keys
+        # to, so a cut paid to any of them is swept back out by the exit.
+        integrity_log("wake", "fee_all_on_this_wallet")
     else:
-        integrity_log("wake", "fee_all_excluded")
+        # Some are off the wallet, and every one of those is also a
+        # destination for THIS withdrawal.
+        integrity_log("wake", "fee_all_are_destinations")
     return []
 
 
@@ -2028,6 +2063,45 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 "nothing to mix. If a payment is still confirming it is not "
                 "spendable yet; ask again once it has.")
         _fa, _fs, _fad, _famt = _found
+        # ...AND IT HAS TO BE BIG ENOUGH TO MIX, WHICH NOTHING ASKED HERE.
+        #
+        # THE SAME FLOOR EXISTS ON THE OTHER SIDE OF THIS BOUNDARY AND NOT ON
+        # THIS ONE. _phase_of applies exactly this test to decide whether to
+        # report "more_left" and chain another leg, and its comment gives the
+        # reason at length: an arrival too small to mix is "a wake spent to
+        # fail at stage 0", costing "a magic packet, a boot, a 5-20 minute
+        # jitter and one of twelve daily slots", coming back as
+        # "withdraw: failed" with a hint about mixing depth that is not the
+        # reason. Every word of that is true of the FIRST leg too, and the
+        # first leg had no such check: _famt was unpacked here and thrown
+        # away, so the only gate was `not _found`, which fires on a zero
+        # balance and on nothing else.
+        #
+        # So a wallet holding a dust arrival -- above DUST_XMR, below the mix
+        # minimum -- answered /withdraw by waking the machine, unlocking the
+        # SPEND wallet, running GhostSpiral to stage 0 and failing there. The
+        # unlocked spend wallet is the signature this whole design spends its
+        # effort not producing, and it was produced for a run that could not
+        # have worked.
+        #
+        # REFUSED BEFORE THE SPEND WALLET IS TOUCHED, not before the wake: the
+        # wake has already happened by the time this runs, and it must -- the
+        # pager has never been told a balance and must not be (see
+        # /settings, which refuses to fetch one). What this saves is the
+        # unlock, the run, and an operator being told the wrong reason.
+        #
+        # THE SAME FLOOR, SPELLED THE SAME WAY, so the two sides cannot drift:
+        # proto.deposit_min_out_xmr() and Decimal(10 ** 12), which is how
+        # GhostSpiral itself converts atomic units.
+        _fxmr = Decimal(str(_famt)) / Decimal(10 ** 12)
+        if _fxmr < Decimal(proto.deposit_min_out_xmr()):
+            integrity_log("wake", "withdraw_below_mix_minimum")
+            raise Refused(
+                "below_mix_minimum",
+                "what is here is too small to mix. It is not lost and "
+                "nothing was spent — a mix has a floor, and one arrival on "
+                "its own is under it. Send more in and withdraw once, or "
+                "take it out by hand at the machine.")
         # A BUNDLE IS WRITTEN, and it is the same 0600 file in the same swept
         # directory every other job's bundle already lives in -- not a new
         # class of artifact. GhostSpiral's receive mode reads a
@@ -2196,13 +2270,47 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # handing it to thor_swap_preparer or create_receive_wallet. This
             # is the one step that needs it, and it is put back only here.
             #
-            # An EMPTY password is a legitimate configuration -- a wallet with
-            # no password -- so this cannot distinguish "not set" from "set to
-            # nothing", and does not try. What it must not do is silently pass
-            # nothing when the operator meant to pass something, and the
-            # preflight refusal above is where that is caught.
-            env_extra["GS_WALLET_PASSWORD"] = os.environ.get(
-                "GS_WALLET_PASSWORD", "")
+            # An EMPTY password is a legitimate configuration -- a wallet
+            # with no password -- so an empty value is passed through as
+            # meant. What must not happen is passing nothing when the operator
+            # meant to pass something.
+            #
+            # "THE PREFLIGHT REFUSAL ABOVE IS WHERE THAT IS CAUGHT" WAS FALSE.
+            # That is what this comment said, and preflight() never looks at
+            # the environment at all: it checks the inhibit file, the scope
+            # lock, the deadman unit, removable devices, resources, wipe
+            # coverage, the directory mode and Tor. Grepping the whole
+            # function for os.environ returns nothing. So the case the
+            # sentence promised was handled was handled nowhere, and the
+            # failure it produces is the one this file keeps fixing: the wake
+            # is spent, the box boots, GhostSpiral opens the wallet with ""
+            # (resolve_wallet_password takes an empty value as "no password"
+            # and accepts it), monero-wallet-rpc refuses, and the chat says
+            # "withdraw: failed" with no reason in it.
+            #
+            # AND THE TWO CASES ARE DISTINGUISHABLE, which is what made the
+            # old sentence give up too early. os.environ.get(k, "") collapses
+            # them; `k in os.environ` does not. A passwordless wallet is
+            # declared by SETTING the variable to empty, which is a thing an
+            # operator does on purpose; an absent variable is a thing they
+            # forgot. Only the second is refused, and the message says which
+            # to type.
+            #
+            # BEFORE THE WALLET IS OPENED, which is the only place a refusal
+            # is free. The wake has already been spent by the time this runs
+            # -- the pager cannot know this and must not be told the wallet's
+            # configuration -- but nothing has been unlocked and nothing has
+            # moved.
+            if "GS_WALLET_PASSWORD" not in os.environ:
+                integrity_log("wake", "wallet_password_unset")
+                raise Refused(
+                    "wallet_password_unset",
+                    "the machine has no spend password configured, so the "
+                    "wallet cannot be opened. Nothing was spent. Set it at "
+                    "the machine — and if the wallet genuinely has no "
+                    "password, set it to an empty value so that choice is "
+                    "on the record rather than assumed.")
+            env_extra["GS_WALLET_PASSWORD"] = os.environ["GS_WALLET_PASSWORD"]
             # THE OPERATOR'S CUT, WHICH THIS PATH WAS NOT TAKING AT ALL.
             #
             # --usage-fee is action="store_true" and defaults OFF ("a run that
@@ -2354,8 +2462,19 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 continue
         if rc != 0:
             if hard:
-                print(f"  [!] Step {i + 1} had to be SIGKILLed after its "
-                      f"budget. Its cleanup did NOT run — run paranoia_mode.")
+                # agent_say, NOT print, AND THAT IS THE WHOLE FIX. The unit
+                # sets StandardOutput=null and StandardError=null -- it has
+                # to, because the children print the deposit address -- so a
+                # bare print() on the woken path goes nowhere at all. This is
+                # the message that tells the operator a child was SIGKILLed
+                # with its cleanup skipped, i.e. that plaintext may be left in
+                # the artifact directory and paranoia_mode has to be run by
+                # hand. It is the single most consequential line this file can
+                # emit and it was the one line in this loop that could not be
+                # read: two agent_say calls sit ten lines above it.
+                agent_say(f"  [!] Step {i + 1} had to be SIGKILLed after its "
+                          f"budget. Its cleanup did NOT run — run "
+                          f"paranoia_mode.")
             integrity_log("wake", f"job_failed:{job}")
             # NEVER RECORD A SLIP THAT WAS NOT WRITTEN. The handle is recorded
             # before the quote step runs, because the argv needs the path. If

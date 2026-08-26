@@ -72,6 +72,14 @@ def load(name):
 
 
 A = load("gs_wake_agent")
+
+# THE SPEND PASSWORD IS DECLARED FOR THE WHOLE MODULE. _dispatch now refuses a
+# withdrawal when GS_WALLET_PASSWORD is ABSENT from the environment, because
+# an absent variable and one explicitly set to "" mean different things and
+# the code used to collapse them -- see the dispatch/pw checks. Every driver
+# below that reaches the spending job therefore needs one; the checks that are
+# ABOUT the absence remove it and put it back themselves.
+os.environ.setdefault("GS_WALLET_PASSWORD", "hunter2")
 # The wipe patterns live in gs_common now; paranoia_mode re-exports them.
 import gs_common as _gsc_pat
 DB = load("gs_doorbell")
@@ -1266,6 +1274,103 @@ finally:
     A.integrity_log = _saved_il
 
 check("dispatch: the spending job ran exactly one child", len(_seen) == 1)
+
+
+import decimal as _dec                                        # noqa: E402
+_AGENT_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+
+
+def _dispatch_withdraw(env_pw, amount_atomic=5_000_000_000_000):
+    """Drive the real withdraw dispatch. Returns (Refused-code or "", seen)."""
+    _s2 = []
+
+    def _cap(argv, env_extra, budget_s):
+        _s2.append((list(argv), dict(env_extra or {})))
+        return 0, False
+
+    _old_pw = os.environ.get("GS_WALLET_PASSWORD")
+    _old_il = A.integrity_log
+    _code = ""
+    try:
+        A.integrity_log = lambda *a, **k: None
+        if env_pw is None:
+            os.environ.pop("GS_WALLET_PASSWORD", None)
+        else:
+            os.environ["GS_WALLET_PASSWORD"] = env_pw
+        with contextlib.redirect_stdout(io.StringIO()):
+            A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                        _k, _wdir, "A3F1", _cap, "job-x",
+                        funded=lambda: (9, 4, _XMR_SAMPLE, amount_atomic))
+    except A.Refused as _e:
+        _code = getattr(_e, "code", "") or str(_e)
+    finally:
+        A.integrity_log = _old_il
+        if _old_pw is None:
+            os.environ.pop("GS_WALLET_PASSWORD", None)
+        else:
+            os.environ["GS_WALLET_PASSWORD"] = _old_pw
+    return _code, _s2
+
+
+# ---- THE SPEND PASSWORD: ABSENT IS NOT THE SAME AS EMPTY ----------------
+#
+# The comment here said "the preflight refusal above is where that is caught".
+# preflight() never looks at the environment -- it checks the inhibit file,
+# the scope lock, the deadman unit, removable devices, resources, wipe
+# coverage, the directory mode and Tor. So an operator who never set
+# GS_WALLET_PASSWORD had "" passed to GhostSpiral, which takes an empty value
+# as "no password" and accepts it, and the run died opening the wallet: a wake
+# spent, the box booted, and "withdraw: failed" with no reason in it.
+#
+# The two cases ARE distinguishable -- `in os.environ` rather than `.get(k,"")`
+# -- and they mean different things: an empty value is a passwordless wallet
+# declared on purpose, an absent one is a machine nobody configured.
+_pw_absent, _ = _dispatch_withdraw(None)
+check("dispatch/pw: an UNSET spend password is refused before the wallet is "
+      "opened, rather than passed through as an empty one",
+      _pw_absent == "wallet_password_unset")
+_pw_empty, _seen_empty = _dispatch_withdraw("")
+check("dispatch/pw: ...while an EXPLICIT empty password still runs, because a "
+      "wallet with no password is a legitimate configuration",
+      _pw_empty == "" and len(_seen_empty) == 1
+      and _seen_empty[0][1].get("GS_WALLET_PASSWORD") == "")
+_pw_set, _seen_set = _dispatch_withdraw("hunter2")
+check("dispatch/pw: ...and a real one reaches the child that needs it",
+      _pw_set == ""
+      and _seen_set[0][1].get("GS_WALLET_PASSWORD") == "hunter2")
+
+# ---- AND THE FIRST LEG HAS A MIX FLOOR, WHICH IT DID NOT ----------------
+#
+# _phase_of applies exactly this floor to decide whether to chain ANOTHER leg,
+# and says why at length: an arrival too small to mix is "a wake spent to fail
+# at stage 0", costing a magic packet, a boot, a 5-20 minute jitter and one of
+# twelve daily slots, reported as "withdraw: failed" with a hint about mixing
+# depth that is not the reason. All of that is true of the FIRST leg, which
+# had no floor: _famt was unpacked and discarded, so the only gate was a zero
+# balance. The wallet was woken and the SPEND wallet unlocked for a run that
+# could not have worked.
+_floor_atomic = int(_dec.Decimal(P.deposit_min_out_xmr()) * (10 ** 12))
+_below, _ = _dispatch_withdraw("hunter2", _floor_atomic - 1)
+check(f"dispatch/floor: an arrival one piconero under the mix minimum "
+      f"({P.deposit_min_out_xmr()} XMR) is refused before the spend wallet is "
+      f"unlocked",
+      _below == "below_mix_minimum")
+_at, _seen_at = _dispatch_withdraw("hunter2", _floor_atomic)
+check("dispatch/floor: ...and exactly the minimum still runs, so the bound is "
+      "not off by one",
+      _at == "" and len(_seen_at) == 1)
+_dust, _ = _dispatch_withdraw("hunter2", 50_000_000_000)
+check("dispatch/floor: ...and a dust arrival above zero is refused rather "
+      "than spending a wake to fail at stage 0",
+      _dust == "below_mix_minimum")
+# THE SAME FLOOR ON BOTH SIDES OF THE BOUNDARY. That is the whole guarantee:
+# the question "is this leg worth running?" and the question "is there another
+# one?" must not be able to disagree, or a chain stops on an arrival the first
+# leg would have taken, or starts on one it would have refused.
+check("dispatch/floor: ...and it is the SAME floor _phase_of chains on, so "
+      "the two sides of the boundary cannot drift",
+      'Decimal(proto.deposit_min_out_xmr())' in _AGENT_SRC
+      and _AGENT_SRC.count("proto.deposit_min_out_xmr()") >= 2)
 _wargv, _wenv = _seen[0] if _seen else ([], {})
 check("dispatch: the destination is in the ENVIRONMENT",
       _wenv.get("GS_EXIT_TO") == _XMR_SAMPLE)

@@ -4308,13 +4308,19 @@ def build_cli() -> argparse.ArgumentParser:
                           "reuse this toolchain refuses everywhere else, and "
                           "it survives the mix. The default mints a fresh one "
                           "per run for that reason.")
+    # NOT WHAT gs_console DOES, and this help said it was. maybe_print_limits'
+    # own docstring corrects it in as many words -- "the console does not shell
+    # out, it loads this module in-process and calls mix_minimum_xmr directly"
+    # -- 2900 lines away, in a docstring, while the string the operator
+    # actually reads claimed a caller that does not exist. Nothing in this
+    # repository invokes --print-limits; it is for the operator and for
+    # anything they write themselves.
     cli.add_argument("--print-limits", action="store_true",
                      help="Print the minimum and maximum amounts this "
                           "configuration accepts, as JSON, and exit. Reads no "
-                          "wallet and opens no socket -- gs_console uses it to "
-                          "put a real minimum beside its amount fields "
-                          "instead of carrying a second copy of the "
-                          "arithmetic.")
+                          "wallet and opens no socket, so it is safe to call "
+                          "from anything that needs a real minimum instead of "
+                          "carrying a second copy of the arithmetic.")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--allow-test-chain", action="store_true",
@@ -7209,11 +7215,23 @@ def limits_report(args) -> dict:
         "exit_set": exit_set,
         "usage_pct": str(cut),
         "cut_spend_floor_xmr": str(hop_fee_reserve(fee)),
+        # WAIVED, NOT REFUSED, AND THIS SAID REFUSED. plan_usage_fee's own
+        # docstring opens "FOUR WAYS TO TAKE NOTHING, and every one of them
+        # WAIVES rather than exits" -- because this runs after the swap has
+        # settled, so aborting to protect a fee strands a publicly-named
+        # balance. This note told the operator the opposite of the thing that
+        # was carefully made true, in the JSON they read to decide how much to
+        # send: it says the run stops below the with-fee minimum, so an
+        # operator with a balance between the two figures concludes they
+        # cannot mix at all, when in fact the mix runs in full and only the
+        # cut is skipped. min_xmr_with_cut in the rows above is therefore an
+        # EARNINGS floor, not a refusal floor, and this is the sentence that
+        # has to say so.
         "cut_note": (f"a usage fee worth less than {hop_fee_reserve(fee)} XMR "
-                     f"cannot "
-                     f"be spent by anyone, so below the with-fee minimum the "
-                     f"run is refused rather than taking a fee that cannot be "
-                     f"collected"),
+                     f"cannot be spent by anyone, so below min_xmr_with_cut "
+                     f"the cut is WAIVED and the mix runs in full -- that "
+                     f"figure is the floor for EARNING a fee, not for running "
+                     f"a mix. The floor for the mix is min_xmr"),
         "by_wallets": rows,
         "max_xmr": str(XMR_ABSURD_TOTAL),
         "max_btc": str(BTC_ABSURD_TOTAL),

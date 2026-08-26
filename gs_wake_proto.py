@@ -55,11 +55,18 @@ EVERY RECORD IS EXACTLY 1064 BYTES
 `Box.encrypt()` is length-preserving: it returns the 24-byte nonce prepended to
 the ciphertext and its 16-byte MAC, so the wire size is len(plaintext) + 40.
 Unpadded, that leaks which job was requested by size alone. Measured on the
-real vocabulary:
+real vocabulary -- recomputed, because this table named `receive_new` (a job
+JOBS no longer has), omitted `withdraw` and `swap_status`, and quoted figures
+from a vocabulary roughly a third of today's size:
 
-    receive_new   76 bytes
-    receive_and_quote / swap-shaped  91 bytes
-    watch        100 bytes
+    watch                170 bytes
+    swap_status          176 bytes
+    receive_and_quote    187 bytes
+    withdraw             277 bytes
+
+(TAG_LEN plus the compact JSON, which is what `seal` pads. `withdraw` is the
+outlier and it is the point: it carries a destination list, so its unpadded
+length would announce the one job that spends.)
 
 An observer on the switch reads the job off the length without touching the
 crypto. So every plaintext is padded with `sodium_pad` (ISO/IEC 7816-4) to
@@ -132,6 +139,23 @@ import time
 #: Wire version. A peer that does not recognise a tag REFUSES. There is no
 #: negotiation and no "try v1 if v2 fails" -- a downgrade path is a way to be
 #: talked back to the version whose flaw you are patching.
+#:
+#: THIS CONSTANT IS A CHANGELOG, NOT A CHECK, and gs_doorbell already says so
+#: in passing -- "WIRE_VERSION is declared and never read by anything" -- one
+#: file over, while the sentence above reads as though something enforces it.
+#: Nothing does: it is on no message, in no keyfile, and consulted by no
+#: branch. The three mechanisms that actually make a half-upgraded pair fail
+#: are the fixed TAGS (a tag this box does not know is refused before any
+#: crypto), the exact padded LENGTH (a PAD_BLOCK change fails with "wake
+#: record is 1064 bytes, not 296"), and the exact KEY SETS enforced by
+#: validate_job on the way in and by gs_doorbell on the record coming back --
+#: that last one added precisely because a FIELD addition slipped past the
+#: other two while this constant sat here looking like a guard.
+#:
+#: Kept because the paragraph below is the record of what changed at v2 and
+#: deleting the constant would orphan it. Do not add a check that reads it
+#: without also putting it on the wire; a version compared against itself is
+#: not a version check.
 #:
 #: 2: M3 may carry a SEALED SLIP, which took PAD_BLOCK from 256 to 1024. Both
 #: boxes must be updated together and there is no compatibility mode: an old
@@ -262,9 +286,16 @@ if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
 #: An allowlist with bounds, not "whatever the pair record holds", for the same
 #: reason the sealed slip has one: the pair is written by another tool and the
 #: next field somebody adds there must not ride along into a chat window.
-#: The bounds are generous enough for a 106-character integrated Monero
-#: address and a taproot deposit address, and tight enough that no field can
-#: become a channel.
+#: THE BOUNDS NO LONGER ADMIT A 106-CHARACTER MONERO ADDRESS, and this said
+#: they were "generous enough" for one. The only field that ever held 106+
+#: characters was the memo ("m", capped at 220), which named the destination
+#: address in full and went with the memo. Nothing here carries a Monero
+#: address any more: "d" is the BITCOIN deposit address, and 100 is generous
+#: for a taproot one and short of a Monero address on purpose.
+#:
+#: So the bound is now also a shape check. A value that could hold 106
+#: characters here would be a field able to carry the destination back into a
+#: chat window, which is the exact leak removing the memo closed.
 PLAIN_FIELDS = {
     "b": 24,      # btc_in, as a decimal string
     "d": 100,     # the pooled inbound deposit address
@@ -691,7 +722,12 @@ def plain_slip_is_wellformed(obj) -> bool:
 
     Control characters matter here more than anywhere else in this file: the
     pager pastes these values into a message a human reads and copies into a
-    wallet, and a newline in the memo forges a line of it.
+    wallet, and a newline forges a line of it. That sentence used to end "a
+    newline in the MEMO forges a line of it" -- the memo is not a field of
+    this record any more, and the exact-key-set test on the first line is what
+    refuses one outright, before the control-character loop is ever reached.
+    The reasoning survives the field: "d" and "b" are still pasted, and a
+    newline in either still forges a line of the message around them.
     """
     if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):
         return False
@@ -765,10 +801,15 @@ def plain_lines(plain: dict, label: str = "") -> list:
     chat would have shown, or the by-hand path stops being a way to check the
     automated one.
 
-    THE MEMO IS ON ITS OWN LINE, LAST, AND UNDECORATED. It is the field that
-    has to be copied character-for-character into a wallet, and anything
-    wrapped around it -- a bullet, a trailing note, a closing bracket -- ends
-    up in the paste.
+    THE MEMO IS NOT AMONG THESE LINES, and this paragraph used to explain how
+    it was formatted ("on its own line, last, and undecorated ... anything
+    wrapped around it ends up in the paste"). The field went with PLAIN_FIELDS
+    and the sentence describing its layout stayed, which is a docstring
+    promising a line the function does not emit -- and the reader most likely
+    to be misled by it is the one checking whether the memo can reach the
+    chat, since the answer here reads "yes, last, on its own line".
+    plain_slip_is_wellformed refuses a record carrying one; this renders no
+    "m" whatever the dict holds.
     """
     return [
         f"Send exactly:  {plain.get('b', '')} BTC",
@@ -918,8 +959,23 @@ def job_id_of(body: dict) -> str:
 # a NIC cannot, and it is the one value that survives reinstalling both boxes.
 #
 # So the Pi's keyfile is now a sealed container: Argon2id over a passphrase,
-# then XSalsa20-Poly1305 over the whole payload. An imaged SD card yields the
-# KDF parameters and a salt, which are not secrets, and nothing else.
+# then XSalsa20-Poly1305 over the whole payload.
+#
+# WHAT AN IMAGED SD CARD ACTUALLY YIELDS, stated exactly, because this said
+# "the KDF parameters and a salt, which are not secrets, and nothing else"
+# and the head has three more fields than that: "schema", "version" and
+# "role". None is a secret and every one is a fact: that this card belongs to
+# a wake pair built from this repository, which generation of the keyfile
+# format it is, and which of the two boxes it came off. An adversary holding
+# the physical Pi knows all three anyway -- they are holding the Pi -- so the
+# sentence is corrected rather than the format changed.
+#
+# "role" IN THE HEAD HAS NO READER. unlock_keyfile checks schema, version,
+# kdf, ops, mem, salt and box, and never looks at it; the role checks in
+# gs_doorbell and gs_wake_agent read the DECRYPTED payload's own "role". It
+# is kept because a plaintext label on a container somebody may have to
+# identify by hand is worth more than the nothing it discloses -- but nobody
+# should build a check on it thinking one already exists.
 #
 # THE FILE SAYS WHAT IT IS. "kdf": "none" is a real, supported value and it
 # stores the payload as plain JSON under "plain" rather than as unencrypted
@@ -1319,6 +1375,27 @@ def _pair_step(sock, expect: str, budget_s: float = PAIR_MSG_S) -> dict:
         exc = PairAborted if code == "declined" else WakeError
         raise exc(f"pairing abandoned: {why} Nothing was written here.")
     if body.get("t") != expect or body.get("v") != PAIR_PROTO:
+        # SAY SO BEFORE HANGING UP, WHICH THIS DID NOT.
+        #
+        # PAIR_ABORT["protocol"] -- "the other box did not understand this
+        # pairing protocol. Are both boxes running the same version of this
+        # repository?" -- was the one entry in that table with no writer
+        # anywhere in the repository. It was read (by the branch above, when
+        # the PEER sends it) and never sent, so the version mismatch it
+        # describes could only ever be reported by a box that was not the one
+        # detecting it. Nobody detects it but here.
+        #
+        # The table's own comment says exactly what that costs: "Without any
+        # abort message at all the operator standing at the other screen sees
+        # only 'closed the connection' and has to guess -- which is how a
+        # person decides to just try again on a network that has something on
+        # it." A mismatched pair of boxes is the single likeliest cause of
+        # that, since upgrading one and not the other is a thing that happens.
+        #
+        # BEST EFFORT AND BEFORE THE RAISE. _pair_abort never raises, so a
+        # peer that has already gone costs nothing; the local failure is
+        # unchanged either way.
+        _pair_abort(sock, "protocol")
         raise WakeError("the other box is not speaking this pairing protocol")
     return body
 
@@ -1910,8 +1987,17 @@ def _xmr_address_list(v):
     return out
 
 
+#: THE SHAPE THE VALIDATOR ACTUALLY ACCEPTS, and this described one it was
+#: fixed to REJECT. "^[48][base58]{94,105}$" admits an 8-prefixed 106-character
+#: string -- and _xmr_address_field refuses exactly that, deliberately: "an
+#: integrated address (106 characters) starts with 4". The list gate applies
+#: that same field validator to every element, so the spec and the code
+#: disagreed about the one shape whose acceptance had already been argued out.
+#:
+#: Spelled the way _xmr_address_field.spec spells it, so the two cannot drift
+#: again: the alternation is what says the 106-character form is 4-only.
 _xmr_address_list.spec = (f"1-{MAX_WAKE_EXIT_DESTS} xmr addresses "
-                          f"^[48][base58]{{94,105}}$")
+                          f"^[48][base58]{{94}}\Z|^4[base58]{{105}}\Z")
 
 
 #: THE DEPTHS THE SERVICE OFFERS, and the numbers are the whole point.
@@ -2034,10 +2120,25 @@ WITHDRAW_HOPS = {v[0]: k for k, v in WITHDRAW_DEPTHS.items()}
 #: TWO FIGURES, AND ONLY THE FIRST IS A FLOOR. The second is the balance below
 #: which no usage fee can be taken -- a cut has to be worth more than it costs
 #: to spend -- and plan_usage_fee WAIVES it there rather than refusing, so the
-#: mix goes ahead in full. It is published because an operator depositing
-#: between the two should know their run will earn nothing, and it must NEVER
-#: gate: doing that refuses deposits that would mix, and abandons arrivals a
-#: withdrawal should have taken.
+#: mix goes ahead in full. It must NEVER gate: doing that refuses deposits
+#: that would mix, and abandons arrivals a withdrawal should have taken.
+#:
+#: "IT IS PUBLISHED BECAUSE AN OPERATOR DEPOSITING BETWEEN THE TWO SHOULD KNOW
+#: THEIR RUN WILL EARN NOTHING" -- that is what this said, and nothing
+#: publishes it. No shipped module reads MIX_MINIMUM_XMR_WITH_CUT_MIRROR: not
+#: the pager, not the agent, not the doorbell. The sentence describes a job
+#: that IS done, by somebody else -- GhostSpiral's --print-limits emits
+#: min_xmr_with_cut per wallet count, computed live rather than mirrored -- so
+#: a reader looking for the disclosure finds it, eventually, in the other
+#: file. What was wrong is a constant claiming to be the disclosure.
+#:
+#: WHAT THIS IS: a DRIFT PIN. tests/test_wake_agent.py asserts both strings
+#: equal GhostSpiral's own mix_minimum_xmr at the shallowest depth, with and
+#: without the shipped cut, so a change to that arithmetic fails here loudly
+#: instead of leaving the deposit gate quoting a stale floor. The first string
+#: is also read at run time (deposit_min_out_xmr); the second is the half of
+#: the pair that makes the pin meaningful -- pinning only the no-cut figure
+#: would not notice the cut's floor moving.
 #:
 #: BOTH ARE UNDERSTATEMENTS, deliberately and unavoidably. They are computed
 #: at GhostSpiral's FALLBACK network fee; the real fee comes from the daemon
@@ -2086,9 +2187,21 @@ def deposit_min_out_xmr() -> str:
 #: The fan-out funds `wallets + randint(DECOY_MIN, DECOY_MAX)` outputs and the
 #: exit relays one transaction per output, so the number of separate arrivals a
 #: withdrawal produces is not `wallets` -- it is at fewest `wallets +
-#: DECOY_MIN`. The pager has to say that number out loud when it asks where the
-#: money goes, and the pager may not have GhostSpiral on disk at all (see
-#: WITHDRAW_DEPTH_NOTE for the same argument about the XMR minimum).
+#: DECOY_MIN`.
+#:
+#: THE PAGER NO LONGER SAYS THIS NUMBER, and this comment said it "has to say
+#: that number out loud when it asks where the money goes". It did, and the
+#: count came out of both the question and the confirm: "At least 12 separate
+#: transactions" hands a directly usable figure to somebody holding the chat
+#: and nothing else, which is the reader this design assumes. The messages say
+#: the payments are many and say what a single destination costs; they do not
+#: count them.
+#:
+#: SO WHAT IS THIS FOR NOW. It is the authoritative definition, and the
+#: test suite's oracle for the number that must NOT appear: test_depo_wizard
+#: computes it here and asserts the chat contains it nowhere. A check for an
+#: absent value needs something to tell it which value is absent, and that
+#: cannot be a literal or the check stops tracking the thing it is about.
 #:
 #: MIRRORED, NOT GUESSED, and pinned: tests/test_wake_protocol.py asserts this
 #: equals GhostSpiral.DECOY_MIN, the way tests/test_wake_agent.py already
@@ -2102,11 +2215,15 @@ DECOY_MIN_MIRROR = 2
 def exit_arrivals_floor(depth: int) -> int:
     """The fewest separate transactions a withdrawal at `depth` sends out.
 
-    A FLOOR, not an estimate, and it is the number the operator needs before
-    choosing how many destinations to give. resolve_exit_destinations computes
-    the same figure on the vault (`_lo = _w + DECOY_MIN`) to warn about a
-    single destination -- onto a stdout nobody reads. This is that figure,
-    available to the box the operator is actually typing at.
+    A FLOOR, not an estimate. resolve_exit_destinations computes the same
+    figure on the vault (`_lo = _w + DECOY_MIN`) to warn about a single
+    destination -- onto a stdout nobody reads.
+
+    NOT PRINTED IN THE CHAT ANY MORE, and this said it was "available to the
+    box the operator is actually typing at", which read as "and that box shows
+    it". See DECOY_MIN_MIRROR above for why it came out and what this is for
+    now: the definition, and the test suite's oracle for the value that must
+    not appear anywhere in a reply.
 
     A FAN-OUT ADDS ONE MORE PER SWAP CHUNK for its change, which this does not
     include; a withdrawal is one chunk, and a floor that could be too HIGH
@@ -2423,12 +2540,19 @@ def result_budget_s(job: str) -> int:
       * and the FIXED per-boot overhead either side of it, which this stopped
         one term short of. See VAULT_FIXED_OVERHEAD_S.
 
-    Measured against the shipped constants, every job could report late:
+    Measured against the shipped constants -- recomputed, because this table
+    named `receive_new`, which JOBS no longer has (result_budget_s("receive_new")
+    raises KeyError), omitted the two jobs that matter most, and quoted figures
+    from before VAULT_FIXED_OVERHEAD_S was added to the sum:
 
-        job                tools  budget   old window   vault worst case
-        receive_new            1     900          900               2100
-        receive_and_quote      2    1800         1800               4800
-        watch                  1    7200         7200               8400
+        job                tools   budget_s   window this returns
+        swap_status            1        300               1800
+        receive_and_quote      2       1800               5100
+        watch                  1       7200               8700
+        withdraw               1      58200              59700
+
+    The withdraw row is the one worth reading: nearly seventeen hours, and it
+    is why the pager tells the operator nothing else can run for that long.
 
     Past the window Pending.finished() goes true, do_wake's `while not
     pending.finished()` loop exits and the server is shut down -- so the vault

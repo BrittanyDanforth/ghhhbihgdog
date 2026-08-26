@@ -2540,10 +2540,31 @@ MUTATIONS = [
   "    pass",
   ["test_wake_agent"]),
 
+ # Re-anchored: the read is os.environ[...] now, not .get(k, ""). An absent
+ # variable and one set to "" mean different things -- a machine nobody
+ # configured, and a passwordless wallet declared on purpose -- and .get
+ # collapsed them, so a forgotten password reached GhostSpiral as "no
+ # password", was accepted, and died opening the wallet after the wake.
  ("the spending step is not handed the password it needs", "gs_wake_agent",
-  '            env_extra["GS_WALLET_PASSWORD"] = os.environ.get(\n'
-  '                "GS_WALLET_PASSWORD", "")',
+  '            env_extra["GS_WALLET_PASSWORD"] = os.environ["GS_WALLET_PASSWORD"]',
   "            pass",
+  ["test_wake_agent"]),
+
+ # ...AND AN ABSENT ONE IS REFUSED RATHER THAN PASSED THROUGH AS EMPTY.
+ ("an unset spend password is silently treated as no password again",
+  "gs_wake_agent",
+  '            if "GS_WALLET_PASSWORD" not in os.environ:',
+  "            if False:",
+  ["test_wake_agent"]),
+
+ # AND THE FIRST LEG OF A WITHDRAWAL HAS A MIX FLOOR. _phase_of applies this
+ # exact test to decide whether to chain ANOTHER leg; the first leg had none,
+ # so a dust arrival woke the box and unlocked the SPEND wallet for a run that
+ # could not have reached stage 1.
+ ("the first leg of a withdrawal loses its mix-minimum floor",
+  "gs_wake_agent",
+  "        if _fxmr < Decimal(proto.deposit_min_out_xmr()):",
+  "        if False:",
   ["test_wake_agent"]),
 
  # --allow-withdraw without --wallet-file writes a keyfile whose withdraw job
@@ -2989,13 +3010,30 @@ MUTATIONS = [
  # limits.record() and integrity_log() both write the SD card and both ran
  # after acquire() and outside the release guard. A full card leaves the wake
  # lock held by nobody for the life of the process.
+ # Re-anchored: self._chain_leg is assigned in this block too now (it used to
+ # sit above the refusals, where every refused call clobbered it and the chain
+ # cap never fired). The guarantee is unchanged -- every state write is inside
+ # the try whose finally releases the lock -- so the mutation still lifts them
+ # all out of it.
  ("a failed state write wedges the wake lock forever", "gs_telegram_pager",
-  "        try:\n            self._running = cid\n"
-  "            self.limits.record()\n"
-  '            integrity_log("pager", f"poke:{job}")',
-  "        self._running = cid\n        self.limits.record()\n"
-  '        integrity_log("pager", f"poke:{job}")\n'
-  "        try:",
+  '        try:\n            self._running = cid\n            # WHICH LEG THIS IS, recorded before the thread starts so the\n            # worker reads it rather than a slot _worker has already cleared.\n            # A fresh /withdraw takes the default and resets the count.\n            #\n            # ...AND IT USED TO BE ASSIGNED ABOVE, BEFORE THE REFUSALS, WHICH\n            # PUT THE CAP BACK IN THE STATE IT WAS ADDED TO FIX.\n            #\n            # Every call to start_job wrote this, including the ones that then\n            # returned without starting anything -- rate limited, or refused\n            # for `busy`. A withdrawal chain holds `busy` for hours, so any\n            # other command during it takes exactly that path: the operator\n            # taps "Has it arrived?" while leg 3 is running, start_job sets\n            # _chain_leg = 0 for the swap_status job, fails to take the lock,\n            # answers "something is already running" and returns -- and the\n            # withdrawal\'s own leg counter is now 0.\n            #\n            # The completion then computes `_next_leg = _more and 0 + 1 <\n            # MAX_CHAIN_LEGS`, which is true forever, and every message says\n            # "withdraw 1 sent". Driven: with one tap of /check per leg, a\n            # wallet holding 99 arrivals ran 99 mixes against a cap of 6 --\n            # 99 spends, 99 magic packets, 99 boots, from one /withdraw. The\n            # cap whose entire job is to stop an unbounded run of spends did\n            # nothing, which is precisely what the comment two hundred lines\n            # down says was already fixed once.\n            #\n            # ASSIGNED WHERE THE JOB BECOMES REAL: below every refusal, below\n            # the lock, one statement before the thread that reads it. A call\n            # that does not start a job now leaves the counter alone.\n            self._chain_leg = int(leg)\n            self.limits.record()\n            integrity_log("pager", f"poke:{job}")',
+  '        self._running = cid\n        self._chain_leg = int(leg)\n        self.limits.record()\n        integrity_log("pager", f"poke:{job}")\n        try:',
+  ["test_telegram_pager"]),
+
+ # ...AND THE LEG NUMBER IS ASSIGNED BELOW THE REFUSALS, WHICH IS THE FIX.
+ # Above them, every call that returned without starting a job still wrote it
+ # -- so one tap of "Has it arrived?" per leg reset the counter to 0 and
+ # MAX_CHAIN_LEGS never fired. Driven: 99 mixes against a cap of 6.
+ ("the leg number is written by calls that never start a job, so the chain "
+  "cap stops firing",
+  "gs_telegram_pager",
+  "        why = self.limits.why_not()\n"
+  "        if why:\n"
+  '            self.send(cid, f"no: {why}")',
+  "        self._chain_leg = int(leg)\n"
+  "        why = self.limits.why_not()\n"
+  "        if why:\n"
+  '            self.send(cid, f"no: {why}")',
   ["test_telegram_pager"]),
 
  # run() reads upd.get("update_id") in the FOR HEADER, outside the per-update
@@ -3298,6 +3336,74 @@ MUTATIONS = [
  # "Done." is about the SWAP, and shortening it to "Done" changed which noun.
  # The mix has not run; the money is sitting un-mixed; the operator is reading
  # the surface they check most.
+ # THE FEE IS NOT ALWAYS TAKEN AND THE CHAT MUST NOT SAY IT IS.
+ #
+ # plan_usage_fee WAIVES the cut when it would come to less than the network
+ # fee to move it -- driven against the shipped function, that is EVERY
+ # withdrawal from the mixing minimum up to about a third of an XMR, i.e. the
+ # band immediately above the smallest run this service does. All three fee
+ # lines asserted the opposite; the confirm asserted it on the message the
+ # operator agrees to a spend on.
+ ("the withdraw confirm promises a cut that is often not taken",
+  "gs_telegram_pager",
+  '                      f"Up to {USAGE_FEE_LABEL} usage fee \u2014 this service\'s "\n'
+  '                      f"cut, and some runs take none. The network fee is "',
+  '                      f"{USAGE_FEE_LABEL} usage fee comes out of it \u2014 this "\n'
+  '                      f"service\'s cut. The network fee is "',
+  ["test_depo_wizard"]),
+
+ # ...AND THE WELCOME IS WHERE THE RULE LIVES, because /fee is capped at 40
+ # characters precisely so a paragraph about the arrangement cannot grow there.
+ ("the welcome stops saying the cut is not always taken",
+  "gs_telegram_pager",
+  '    "  Taken once, out of what you withdraw \u2014 but not always: a small one "\n'
+  '    "takes none, and so does any withdrawal where the machine names nowhere "\n'
+  '    "to put a cut. Nothing is charged for depositing, for waiting, or for "\n'
+  '    "asking.",',
+  '    "  Taken once, out of what you withdraw. Nothing is charged for "\n'
+  '    "depositing, for waiting, or for asking.",',
+  ["test_depo_wizard"]),
+
+ # ...AND NAMES BOTH CAUSES. Naming only the amount sends an operator whose
+ # machine was paired with nowhere to put a cut -- who therefore earns nothing
+ # on EVERY withdrawal -- after the wrong explanation.
+ ("the welcome blames a zero fee on the amount alone",
+  "gs_telegram_pager",
+  '    "takes none, and so does any withdrawal where the machine names nowhere "\n'
+  '    "to put a cut. Nothing is charged for depositing, for waiting, or for "\n'
+  '    "asking.",',
+  '    "takes none. Nothing is charged for depositing, for waiting, or for "\n'
+  '    "asking.",',
+  ["test_depo_wizard"]),
+
+ # A FINISHED SPEND IS NOT A READY DEPOSIT. report() branched on the OUTCOME
+ # and never on the job, so a completed withdrawal printed "Handle (none)" and
+ # then the deposit path's "the deposit address, the memo and the slip stayed
+ # on the vault" -- deposit instructions, on a run that issued none.
+ ("the doorbell reports a finished spend as a ready deposit again",
+  "gs_doorbell",
+  '        if pending.job == "withdraw":',
+  "        if False:",
+  ["test_wake_doorbell"]),
+
+ # PAIR_ABORT["protocol"] was READ and never WRITTEN: a version mismatch closed
+ # the socket in silence, which the table's own comment says is how "a person
+ # decides to just try again on a network that has something on it".
+ ("a pairing version mismatch hangs up without saying why",
+  "gs_wake_proto.py",
+  '        _pair_abort(sock, "protocol")\n'
+  '        raise WakeError("the other box is not speaking this pairing protocol")',
+  '        raise WakeError("the other box is not speaking this pairing protocol")',
+  ["test_wake_protocol"]),
+
+ # The welcome floor-divided --burn-after, so 5400 s printed "deleted after
+ # 1h" -- a promise of deletion half an hour before it happens.
+ ("the welcome rounds the retention DOWN, promising deletion before it happens",
+  "gs_telegram_pager",
+  "        lines.append(_BURN_LINE.format(h=max(1, -(-_b // 3600))))",
+  "        lines.append(_BURN_LINE.format(h=max(1, _b // 3600)))",
+  ["test_telegram_pager"]),
+
  # THE DEPOSIT LINE IS SINGLE-USE AND THE READER IS TOLD SO. "To address:
  # bc1q..." reads as "my deposit address" to anybody who has used an exchange,
  # and a second payment to it -- or the same one next week -- arrives belonging

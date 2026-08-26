@@ -1478,10 +1478,56 @@ check("the signer's TX-failed line uses terminal_safe, not chain_safe",
       "terminal_safe(str(e))" in _sg_src and "chain_safe(str(e))" not in _sg_src)
 check("GhostSpiral's JoinMarket failure uses terminal_safe",
       "terminal_safe((e.stderr" in _gs_src)
-check("integrity_log still uses the digit-stripping form",
-      "keep_digits" not in (Path(__file__).resolve().parent.parent
-                            / "gs_common.py").read_text().split(
-          "def integrity_log(")[1][:2000])
+# ---- THIS CHECK COULD NOT FAIL, AND A REAL EDIT WALKED PAST IT ---------
+#
+# It read the first 2000 characters after "def integrity_log(" and asserted
+# "keep_digits" was not among them. integrity_log's body is 8247 characters
+# and the chain_safe call it is guarding sits at offset 3658 -- outside the
+# window, every time, on every version of this file. So the guard was green
+# against a source that had been edited to
+#
+#     line = f"{ts}|{VERSION}|{_stage}|{chain_safe(_msg, keep_digits=True)}"
+#
+# which is the one thing chain_safe's own comment forbids in as many words:
+# "keep_digits is for TERMINAL lines, never for the chain ... integrity_log
+# never passes it." That edit puts raw amounts, counts and account indices
+# into the PERSISTENT hash chain, which is the entire leak this module exists
+# to close.
+#
+# HOW BAD IT WAS, STATED ACCURATELY. The BEHAVIOURAL checks in this file do
+# catch it -- driven against a tree carrying that edit, eight checks go red,
+# including "every line integrity_log wrote is digit-free". What was broken
+# was only this SOURCE-SCAN guard, which is the one written to fail fast and
+# name the cause. So the guarantee was held; the check whose whole job was to
+# say WHY it broke was the one that could not fire.
+#
+# That is still worth fixing rather than shrugging at: a source scan with a
+# window shorter than the function it scans is a check that cannot fail, and
+# the next one may be guarding something the behavioural tests do not reach.
+#
+# Windowed on the whole function now, and driven as well, so the guarantee
+# does not rest on where in the body somebody puts the call.
+_GSC_SRC = (Path(__file__).resolve().parent.parent / "gs_common.py").read_text()
+_il_body = _GSC_SRC.split("def integrity_log(")[1].split("\ndef ")[0]
+check(f"the integrity_log window is the WHOLE function, not a prefix "
+      f"({len(_il_body)} chars)",
+      len(_il_body) > 4000 and "chain_safe(" in _il_body)
+check("integrity_log still uses the digit-stripping form, checked across all "
+      "of it",
+      "keep_digits" not in _il_body)
+# AND DRIVEN, because a source scan cannot see a call that moves to a helper.
+# The chain line is what lands on disk; that is what must carry no digits.
+_dig_dir = tempfile.mkdtemp(prefix="chdig_")
+_dig_log = Path(_dig_dir) / "integrity_chain.log"
+gsc.integrity_log("stage4", "fanout_plan:7_tx:19_dests", log_path=_dig_log)
+_dig_txt = _dig_log.read_text()
+check("integrity_log: the line that lands on disk carries NO digits from the "
+      "message",
+      "7_tx" not in _dig_txt and "19_dests" not in _dig_txt
+      and "#_tx:#_dests" in _dig_txt)
+check("integrity_log: ...and the EVENT survives, so this is redaction and not "
+      "an empty log",
+      "fanout_plan" in _dig_txt and "stage4" in _dig_txt)
 
 
 # ===========================================================================

@@ -177,8 +177,17 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         super().__init__(*a, **kw)
         self._live = 0
         self._live_lock = threading.Lock()
-        #: Counted, so report() can tell the operator this happened rather
-        #: than leaving a silent refusal that reads as a flaky network.
+        #: Counted, and report() CANNOT reach it -- which is the defect this
+        #: comment described as the fix. report() takes a Pending and nothing
+        #: else, and a Pending holds no reference to the server, so nothing
+        #: has ever printed this number. The refusal it counts is exactly the
+        #: "silent refusal that reads as a flaky network" the sentence was
+        #: worried about.
+        #:
+        #: Printed by run_wake instead, which is the function that HOLDS the
+        #: server and therefore can. Kept as a counter rather than an event on
+        #: Pending because it happens at the socket, before any note has been
+        #: parsed, so there may be no Pending to attach it to.
         self.refused_connections = 0
 
     def process_request(self, request, client_address):
@@ -365,6 +374,14 @@ class Pending:
         self.job_id = proto.new_job_id()
         self.clock = clock
         self.opened = clock()
+        #: ASSIGNED AND READ BY NOTHING. Kept deliberately, and labelled so,
+        #: because its NAME is the trap: result_open() and report() both want
+        #: result_budget_s, and a reader reaching for the obvious-looking
+        #: `budget_s` gets the per-step figure, which is what closed the
+        #: socket on a job that was still legitimately running. Removing it
+        #: would leave `pending.budget_s` an AttributeError, which is loud;
+        #: leaving it unlabelled left it a plausible wrong answer, which is
+        #: not. See the field below and proto.result_budget_s.
         self.budget_s = proto.JOBS[job]["budget_s"]
         #: NOT budget_s. The vault sleeps up to VAULT_JITTER_HI_S BEFORE it
         #: starts, and _dispatch spends budget_s PER STEP -- so waiting only
@@ -387,12 +404,26 @@ class Pending:
         #: for, and leaving the real vault to meet `m1_second_ephemeral` below.
         #: The job is denied, not disclosed.
         #:
-        #: It is left that way ON PURPOSE rather than patched with a
-        #: pre-handshake for a window nonce. Capturing an M1 requires sitting
-        #: ON the Pi-vault path (mirrored port, ARP spoof); anyone in that
-        #: position can simply DROP the packet, so the replay buys them nothing
-        #: they did not already have. What it must not do is happen SILENTLY,
-        #: which is why `report()` prints the event.
+        #: THE PARAGRAPH THAT USED TO FOLLOW SAID THE FIX WAS NOT MADE, AND
+        #: IT IS MADE, TWENTY LINES BELOW. It read: "It is left that way ON
+        #: PURPOSE rather than patched with a pre-handshake for a window
+        #: nonce ... What it must not do is happen SILENTLY, which is why
+        #: report() prints the event." The pre-handshake it declines IS
+        #: shipped -- `self.window = proto.new_window()` below, served
+        #: unauthenticated at /window, and every M1 is checked against it --
+        #: and the next attribute's own comment says that reasoning "was
+        #: wrong, and the error is worth naming".
+        #:
+        #: So a cross-window replay is refused on the window field before the
+        #: cache is consulted at all, and the paragraph describing the
+        #: cross-window hole was describing a hole that had been closed one
+        #: screen further down. Left as a record of the reasoning, marked as
+        #: superseded, because the argument it makes about WHERE an attacker
+        #: has to sit is still the right frame for the next such decision.
+        #:
+        #: The silence half stands and is now actually true both ways:
+        #: _report_events prints m1_second_ephemeral, and prints
+        #: m1_no_window_field and m1_stale_window too, which it did not.
         self._issued = {}
         #: THE AT-MOST-ONCE CLAIM WAS A CHECK-THEN-ACT ON A THREADED SERVER.
         #:
@@ -1277,6 +1308,28 @@ def run_wake(args, key: dict, job: str, params: dict,
                 _fire("collected")
             sleep(1)
     finally:
+        # THE OVER-CAP REFUSALS, SAID BY THE ONLY FUNCTION THAT CAN SEE THEM.
+        #
+        # BoundedHTTPServer.refused_connections carries the comment "Counted,
+        # so report() can tell the operator this happened rather than leaving
+        # a silent refusal that reads as a flaky network" -- and report()
+        # takes a Pending, which holds no reference to the server, so it never
+        # could. This function holds `srv`. Printed here, once, on the way
+        # out, before the socket is closed.
+        #
+        # A NON-ZERO COUNT IS NOT NECESSARILY AN ATTACK, and the wording says
+        # so for the same reason the result_bad line does: anything on the LAN
+        # can open sockets. What it rules out is the operator concluding the
+        # vault never answered.
+        try:
+            _over = int(getattr(srv, "refused_connections", 0) or 0)
+            if _over:
+                print(f"  [*] {_over} connection(s) were refused at the "
+                      f"door because this box was already holding "
+                      f"{MAX_CONNECTIONS}. If the vault's report is missing, "
+                      f"that is where it went — this is not a flaky network.")
+        except Exception:                                    # noqa: BLE001
+            pass
         try:
             srv.shutdown()
         except Exception:                                    # noqa: BLE001
@@ -1312,6 +1365,31 @@ def _report_events(pending: Pending) -> None:
         # bytes of noise here and land in this count.
         print(f"  [*] {bad} record(s) posted to /result did not authenticate "
               f"and were discarded.")
+    # THE TWO WIRE-BREAK EVENTS, WHICH WERE RECORDED AND NEVER PRINTED.
+    #
+    # This function exists because "`events` was collected and never read by
+    # anything" -- and it still read only three of the five words the code
+    # writes. The two it missed are the two that say a HALF-UPGRADED PAIR is
+    # on the switch, and the comment at the site that writes the first of them
+    # says in as many words that the wire break "has to name itself".
+    #
+    # Their absence has the shape the header warns about: a Pi older than the
+    # per-window nonce, or a note written for a previous window, is refused
+    # with a Doorbell exception on that one request -- and if a later note
+    # succeeds, the wake reports normally and nothing anywhere says the
+    # operator has two boxes on different builds.
+    _nowin = pending.events.count("m1_no_window_field")
+    if _nowin:
+        print(f"  [!] {_nowin} wake note(s) arrived with no wake window in "
+              f"them, which only a box running a build older than the "
+              f"per-window nonce produces.")
+        print(f"      UPDATE BOTH BOXES AND PAIR AGAIN. A pair on two builds "
+              f"fails in ways that look like a flaky network.")
+    _stale = pending.events.count("m1_stale_window")
+    if _stale:
+        print(f"  [*] {_stale} wake note(s) were written for a different wake "
+              f"window and were discarded — an earlier boot answering late, "
+              f"or a note replayed on the LAN.")
     refused = pending.events.count("result_refused")
     if refused:
         # A DIFFERENT FACT, and it used to share the line above. These DID
@@ -1327,6 +1405,30 @@ def report(pending: Pending) -> int:
     _report_events(pending)
     out = pending.outcome()
     if out == "done":
+        # A SPEND IS NOT A DEPOSIT, AND THIS REPORTED IT AS ONE.
+        #
+        # Everything below branches on the OUTCOME and never on the job, so a
+        # finished withdrawal fell through the deposit path: a withdrawal
+        # carries no handle, so it printed "Handle (none)"; it carries no
+        # slip, so it printed "The deposit address, the memo and the slip
+        # stayed on the vault. Read them there" -- deposit instructions, on a
+        # run that just spent money and issued none.
+        #
+        # This terminal is the by-hand path, and the module's own rule is that
+        # an operator running the doorbell by hand "must see exactly what the
+        # chat would have shown, or the by-hand path stops being a way to
+        # check the automated one". The chat says a spend was sent and whether
+        # more is left; this said a deposit was ready.
+        if pending.job == "withdraw":
+            print(f"  [+] Vault finished job {pending.job}. It SPENT.")
+            _ph = pending.result.get("phase") or ""
+            # NO HANDLE LINE. A withdrawal registers none, so printing one
+            # would name a label nothing can be asked about.
+            if _ph:
+                print(f"      {proto.PHASE_LINES.get(_ph, _ph)}")
+            else:
+                print(f"      Nothing is left on this wallet.")
+            return 0
         h = pending.result.get("handle") or "(none)"
         print(f"  [+] Vault finished job {pending.job}. Handle {h}.")
         phase = pending.result.get("phase") or ""

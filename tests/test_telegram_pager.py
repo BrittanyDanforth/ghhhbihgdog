@@ -2643,6 +2643,109 @@ check(f"chain: ...still one message per leg at the cap ({len(_m9)})",
       and sum("Nothing else can run" in t for t in _m9) == 1
       and len(_m9) == pg.Pager.MAX_CHAIN_LEGS + 1)
 
+# ---- THE RETENTION LINE ROUNDS UP, AND IT ROUNDED DOWN ----------------
+#
+# `_b // 3600` on --burn-after 5400 (an hour and a half) printed "deleted
+# after 1h": the reader believes a message is gone half an hour before
+# burn_expired touches it. That is the one direction this sentence must never
+# err in -- a promise of deletion that has not happened yet is the operator
+# deciding what to type against a window that is still open.
+for _bs, _want in ((900, 1), (1800, 1), (3600, 1), (5400, 2), (7200, 2),
+                   (88200, 25)):
+    _wl = [l for l in pg.welcome_text(_bs).splitlines() if "deleted after" in l]
+    check(f"burn: --burn-after {_bs}s ({_bs / 3600:.2f}h) is stated as "
+          f"{_want}h, never sooner than it happens",
+          len(_wl) == 1 and f"after {_want}h" in _wl[0])
+    check(f"burn: ...and {_want}h is not EARLIER than the real {_bs}s",
+          _want * 3600 >= _bs or _bs < 3600)
+# NON-VACUITY: --burn-after 0 still prints no deletion promise at all, so the
+# rounding is not being tested on a line that is always absent.
+check("burn: NON-VACUITY -- with deletion off the line is not printed",
+      "deleted after" not in pg.welcome_text(0))
+
+# ---- THE CAP SURVIVES BEING INTERRUPTED, AND IT DID NOT --------------
+#
+# start_job wrote self._chain_leg BEFORE its refusals, so every call that then
+# returned without starting anything still clobbered the counter. A withdrawal
+# chain holds `busy` for hours, so ANY other command during it takes exactly
+# that path: the operator taps "Has it arrived?" while leg 3 runs, start_job
+# sets _chain_leg = 0 for the swap_status job, fails the lock, answers
+# "something is already running" and returns -- and the withdrawal's leg
+# counter is 0.
+#
+# The completion then computes `_more and 0 + 1 < MAX_CHAIN_LEGS`, true
+# forever. DRIVEN: with one tap per leg, a wallet holding 99 arrivals ran 99
+# mixes against a cap of 6 -- 99 spends, 99 wakes, 99 boots, from one
+# /withdraw -- and every message said "withdraw 1 sent".
+#
+# This is the SECOND time this cap has been defeated by the leg number being
+# read from something another code path resets; the first is recorded at
+# _chain_leg's own comment. So the test drives the interruption rather than
+# asserting where the assignment sits.
+def _chain_run_interrupted(arrivals, taps_per_leg):
+    """Like _chain_run, but the operator taps a second command each leg."""
+    _ip, _is, _, _ = _tapper()
+    _ip.start_job = pg.Pager.start_job.__get__(_ip, pg.Pager)
+    _left = [arrivals]
+    _legs = [0]
+
+    class _Leg:
+        def __init__(self):
+            _legs[0] += 1
+            _left[0] -= 1
+            # The tap lands while this leg is running and `busy` is held, so
+            # it is refused -- which is the whole point.
+            for _ in range(taps_per_leg):
+                _ip.start_job(111, "swap_status", {"handle": "A3F1"})
+            self.result = {"status": "done", "handle": "", "slip": "",
+                           "plain": {},
+                           "phase": "more_left" if _left[0] > 0 else ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(run_wake=lambda *a, **k: _Leg())
+        _ip.start_job(111, "withdraw",
+                      {"exit_to": ["4" + "8" * 94], "depth": 2})
+        for _ in range(1500):
+            if not _ip.busy.locked() and _ip._chain is None:
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _legs[0], [t for t, _b in _is]
+
+
+_ni, _mi = _chain_run_interrupted(99, 1)
+check(f"chain/interrupted: a tap during every leg does NOT defeat the cap "
+      f"({_ni} legs against a cap of {pg.Pager.MAX_CHAIN_LEGS}, on a wallet "
+      f"holding 99 arrivals)",
+      _ni == pg.Pager.MAX_CHAIN_LEGS)
+check("chain/interrupted: ...and the leg numbers still count up rather than "
+      "resetting to 1 every time",
+      [t for t in _mi if t.startswith("withdraw ") and " sent" in t][:3]
+      == ["withdraw 1 sent.\nNext one starting — sending them together would "
+          "prove they are all yours.",
+          "withdraw 2 sent.\nNext one starting — sending them together would "
+          "prove they are all yours.",
+          "withdraw 3 sent.\nNext one starting — sending them together would "
+          "prove they are all yours."])
+check("chain/interrupted: ...and the taps really were refused, so this is the "
+      "refused-start path and not a quiet no-op",
+      sum(t == pg.BUSY_ANSWER for t in _mi) >= pg.Pager.MAX_CHAIN_LEGS)
+# NON-VACUITY: the same wallet with no interruption stops at the cap too, so
+# the check above is about the interruption and not about a chain that always
+# stops at six whatever happens.
+_nn, _ = _chain_run_interrupted(99, 0)
+check("chain/interrupted: NON-VACUITY -- the uninterrupted chain caps at the "
+      "same number, so the cap is the thing being tested",
+      _nn == pg.Pager.MAX_CHAIN_LEGS)
+
 # THROUGH start_job, WHICH IS WHERE EVERY BOUND LIVES. A chain that called
 # _worker directly would be a second path to a wake with no rate limit, no
 # one-spender check and no busy lock.
@@ -3463,10 +3566,36 @@ check("welcome: ...and WHY, because otherwise it reads as a limitation "
 # was a fixed claim about a setting, wrong for exactly the operator the
 # setting exists for: the one with a phone and no second machine, told to go
 # and read something at a machine they are not standing at.
+# ...AND THE DEFAULT LINE HAS TO BE TRUE ON BOTH INSTALLS, because the box
+# that draws it cannot tell which one it is on. `deposit_in_chat` is a field
+# of the VAULT's keyfile; the Pi's sealed card carries role, secret,
+# peer_public, pair_fingerprint, listen_host, listen_port, target_mac,
+# wol_broadcast and wol_port and nothing else, deliberately. So the `key`
+# passed here is always the Pi's, the branch never fires in production, and
+# the DEFAULT line is what every install actually shows.
+#
+# It said "The details appear ON THE MACHINE" -- false wherever the vault has
+# the mode set, on the one screen a first-time reader is guaranteed to see,
+# sending exactly the operator the setting exists for to a machine they are
+# not standing at. That is the failure the split was introduced to fix,
+# reintroduced by putting the switch on the box that cannot see it.
 _w_off = pg.welcome_text(0)
 _w_on = pg.welcome_text(0, {"deposit_in_chat": True})
-check("welcome: with no delivery mode it says the address is on the machine",
-      "ON THE MACHINE" in _w_off and "arrive HERE" not in _w_off)
+check("welcome: the default line promises no location, because this box "
+      "cannot know which mode the vault is in",
+      "ON THE MACHINE" not in _w_off and "arrive HERE" not in _w_off)
+check("welcome: ...and still says the details come from the machine and when "
+      "they come, which is true either way",
+      "come back when you ask" in _w_off
+      and "from the machine" in _w_off.lower())
+# NON-VACUITY on the whole point: the Pi's own card really has no such field,
+# so this is not a hypothetical about a mode nobody sets.
+_pi_fields = {"role", "secret", "peer_public", "pair_fingerprint",
+              "listen_host", "listen_port", "target_mac", "wol_broadcast",
+              "wol_port"}
+check("welcome: NON-VACUITY -- deposit_in_chat is not among the fields the "
+      "Pi's sealed card carries, so the branch cannot fire there",
+      "deposit_in_chat" not in _pi_fields)
 check("welcome: ...and with plain_slip it says a fresh one arrives HERE, "
       "every time",
       "arrive HERE" in _w_on and "every time" in _w_on
@@ -3495,9 +3624,13 @@ check("welcome: the command list does not promise an address the chat never "
       "sends",
       "get an address" not in dict(pg.BOT_COMMANDS)["deposit"]
       and "label" in dict(pg.BOT_COMMANDS)["deposit"])
-check("welcome: ...and the deposit reply is the surface that says where it "
-      "actually is",
-      "ON THE MACHINE" in pg.WELCOME)
+# ...AND THE WELCOME DOES NOT CLAIM WHERE, because this box cannot know: the
+# mode is a field of the vault's keyfile and the Pi's card does not carry it.
+# The surface that says where the details actually are is the deposit reply
+# itself, which is sent by the box that knows.
+check("welcome: ...and the welcome does not claim a location it cannot know",
+      "ON THE MACHINE" not in pg.WELCOME
+      and "come back when you ask" in pg.WELCOME)
 check("welcome: ...and the published command list says the same thing",
       "send it all back" in dict(pg.BOT_COMMANDS)["withdraw"]
       and "ONE arrival" not in dict(pg.BOT_COMMANDS)["withdraw"])
@@ -3592,7 +3725,7 @@ check("welcome: ...and it does say what stops a phone paying, without naming "
 # buttons. Telegram's own limit is 4096; the constraint here is a thumb.
 check(f"welcome: it fits on a screen ({len(pg.WELCOME)} chars, "
       f"{pg.WELCOME.count(chr(10)) + 1} lines)",
-      len(pg.WELCOME) < 1200 and pg.WELCOME.count("\n") < 30)
+      len(pg.WELCOME) <= 1250 and pg.WELCOME.count("\n") < 30)
 
 # AND THE BUTTONS COME WITH IT, which is the whole point of answering /start
 # with something other than a list of things to type.

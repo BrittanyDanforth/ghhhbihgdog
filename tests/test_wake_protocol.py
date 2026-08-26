@@ -906,6 +906,60 @@ check("...and aborts the peer rather than leaving it holding a keyfile "
 check("PAIR_ABORT['info'] is no longer dead code",
       "_pair_abort(sock, \"info\")" in src and "\"info\":" in src)
 
+# ---- EVERY ABORT CODE HAS A WRITER, AND ONE DID NOT ---------------------
+#
+# PAIR_ABORT["protocol"] -- "the other box did not understand this pairing
+# protocol. Are both boxes running the same version of this repository?" --
+# was READ (by _pair_step, when the PEER sends it) and never SENT. The only
+# place that DETECTS a protocol mismatch is _pair_step itself, and it raised
+# without telling the other side, so the box that noticed was the one box that
+# could not report it.
+#
+# The table's own comment says exactly what that costs: "Without any abort
+# message at all the operator standing at the other screen sees only 'closed
+# the connection' and has to guess -- which is how a person decides to just
+# try again on a network that has something on it." Upgrading one box and not
+# the other is the likeliest way to reach it.
+_ab_written = {c for c in P.PAIR_ABORT
+               if f'_pair_abort(sock, "{c}")' in src}
+check(f"every PAIR_ABORT code is actually sent somewhere ({sorted(_ab_written)})",
+      _ab_written == set(P.PAIR_ABORT))
+# ...AND IT IS SENT BY THE BRANCH THAT DETECTS THE MISMATCH, before the raise:
+# an abort after the exception would never run.
+_ps_body = src.split("def _pair_step")[1].split("\ndef ")[0]
+check("...and the protocol abort is sent from the branch that detects the "
+      "mismatch, before it raises",
+      '_pair_abort(sock, "protocol")' in _ps_body
+      and _ps_body.index('_pair_abort(sock, "protocol")')
+      < _ps_body.index("not speaking this pairing protocol"))
+# DRIVEN, not grepped: a peer sending a message with the wrong version really
+# does get an abort back rather than a closed socket.
+_ab_seen = []
+
+
+class _FakeSock:
+    def sendall(self, b):
+        _ab_seen.append(bytes(b))
+
+    def settimeout(self, _t):
+        pass
+
+
+_saved_recv = P._pair_recv
+try:
+    P._pair_recv = lambda _s, _b=None: {"t": "reveal", "v": P.PAIR_PROTO + 1}
+    _mismatch = None
+    try:
+        P._pair_step(_FakeSock(), "reveal")
+    except P.WakeError as _e:
+        _mismatch = str(_e)
+finally:
+    P._pair_recv = _saved_recv
+check("...and driving a version mismatch really does put an abort on the "
+      "wire before the local failure",
+      _mismatch is not None and _ab_seen
+      and b"protocol" in _ab_seen[0])
+
 _finished()
 # ---- THE RESULT WINDOW HAD ZERO MARGIN, BY CONSTRUCTION -----------------
 #
