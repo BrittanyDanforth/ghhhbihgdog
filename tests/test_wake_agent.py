@@ -375,7 +375,7 @@ def _static_m2(url, path, rec, timeout=30):
         return 200, P.seal(PI, TP.public_key, P.TAG_M2,
                            {"job_id": P.new_job_id(),
                             "challenge": body["challenge"],
-                            "job": "receive_new", "count": 1})
+                            "job": "receive_and_quote", "amount_sat": 5000000})
     return 200, b""
 
 
@@ -397,7 +397,7 @@ def _wrong_chal(url, path, rec, timeout=30):
         return 200, P.seal(PI, eph, P.TAG_M2,
                            {"job_id": P.new_job_id(),
                             "challenge": P.new_challenge().hex(),
-                            "job": "receive_new", "count": 1})
+                            "job": "receive_and_quote", "amount_sat": 5000000})
     return 200, b""
 
 
@@ -438,12 +438,16 @@ check("...and the message names when it was started and where to look",
 
 
 print("\n== the account ceiling ==")
-d14, kf14, _k, bell14 = new_env(job="receive_new", params={"count": 1})
+# receive_and_quote IS THE MINTING JOB NOW -- it is the only one left that
+# creates an account, so it is the one the ceiling has to stop.
+d14, kf14, _k, bell14 = new_env(job="receive_and_quote",
+                                params={"amount_sat": 5000000})
 out14, err14, _t = run(kf14, deps_for(d14, bell14, account_count=lambda: 45))
 check("a minting job is refused at the ceiling — a pwned doorbell must not "
       "burn accounts past the offline wallet's lookahead",
       out14 is None and err14.code == "account_ceiling")
-d15, kf15, _k, bell15 = new_env(job="receive_new", params={"count": 1})
+d15, kf15, _k, bell15 = new_env(job="receive_and_quote",
+                                params={"amount_sat": 5000000})
 out15, err15, _t = run(kf15, deps_for(d15, bell15, account_count=lambda: None))
 check("...and refused when the account count cannot be READ, rather than "
       "assumed fine", out15 is None and err15.code == "account_count_unreadable")
@@ -548,7 +552,7 @@ check("...and AFTER the job, not instead of it", order == ["job", "power_off"])
 # read them:
 #
 #   * INHIBIT_FILE is read in preflight and inside _dispatch's
-#     `for i, argv in enumerate(steps)` loop. Tools per job: receive_new 1,
+#     `for i, argv in enumerate(steps)` loop. Tools per job:
 #     receive_and_quote 2, watch 1, swap_status 1, withdraw 1. So for FOUR of
 #     the five the check runs once, right after the jitter, and never again --
 #     while the job runs for up to 8400 s (watch) or 58200 s (withdraw).
@@ -754,7 +758,8 @@ print("\n== a four-character handle collides, and the file does not grow forever
 # dict is keyed on the handle -- so a repeat used to silently overwrite the
 # record it landed on, after which a `watch` on the older label watched the
 # newer job's address.
-dh1, kfh1, _k, bellh1 = new_env(job="receive_new", params={"count": 1})
+dh1, kfh1, _k, bellh1 = new_env(job="receive_and_quote",
+                                params={"amount_sat": 5000000})
 (dh1 / A.HANDLES_FILE).write_text(json.dumps(
     {"AAAA": {"bundle": "/old/wallet_old.json", "minted": 1, "slip": None}}))
 _saved_nh = A.proto.new_handle
@@ -774,7 +779,7 @@ check("...and the doorbell is told the handle that was actually recorded",
 
 # The refusal exists and is reachable: an exhausted draw is a refusal with a
 # remedy, not an infinite loop and not a silent overwrite.
-dh2, kfh2, _k, bellh2 = new_env(job="receive_new", params={"count": 1})
+dh2, kfh2, _k, bellh2 = new_env(job="swap_status", params={"handle": "A3F1"})
 (dh2 / A.HANDLES_FILE).write_text(json.dumps(
     {"DEAD": {"bundle": "/x.json", "minted": 1, "slip": None}}))
 try:
@@ -1089,25 +1094,32 @@ check("...naming both backstops that start over: the replay guard and the "
 
 
 print("\n== one handle names one watchable address, or none ==")
-# `--count 4` writes FOUR wallet_<random>.json files. The first version
-# recorded new[0] -- whichever of them sorted first -- so a later `watch` on
-# that handle watched an address the operator had no way to predict.
-dw1, kfw1, _k, bellw1 = new_env(job="receive_new", params={"count": 4})
+# receive_new's `--count 4` wrote FOUR wallet_<random>.json files and the
+# first version recorded new[0] -- whichever sorted first -- so a later watch
+# followed an address the operator could not have predicted. That job is gone,
+# and the invariant it taught is enforced one layer down and still worth
+# driving: a mint step that produces more than one bundle is REFUSED rather
+# than resolved by picking one.
+dw1, kfw1, _k, bellw1 = new_env(job="receive_and_quote",
+                                params={"amount_sat": 5000000})
 
 
 def _mint4(argv, env_extra, budget):
-    for i in range(4):
-        (dw1 / f"wallet_recv_{i}.json").write_text("{}")
+    if "create_receive_wallet" in " ".join(argv):
+        for i in range(4):
+            (dw1 / f"wallet_recv_{i}.json").write_text("{}")
     return 0, False
 
 
 dpw1 = deps_for(dw1, bellw1, run_child=_mint4)
 outw1, errw1, _t = run(kfw1, dpw1)
-_recs1 = json.loads((dw1 / A.HANDLES_FILE).read_text())
-_rec1 = _recs1[outw1[2]]
-check("receive_new --count 4 records the handle with NO single bundle, rather "
-      "than an arbitrary one of the four",
-      outw1[0] == "done" and _rec1["bundle"] is None and _rec1["minted"] == 4)
+check("a mint step that writes FOUR bundles is refused, not resolved by hex "
+      "sort order",
+      outw1 is None and errw1.code == "bundle_ambiguous")
+check("...and the quote step never ran, so nothing was priced against an "
+      "address nobody chose",
+      not any("thor_swap_preparer" in " ".join(argv)
+              for argv, _e in dpw1["_ran"]))
 
 
 def _watch_env(rec):
@@ -1123,7 +1135,7 @@ check("...and watching that handle is REFUSED, not resolved by hex sort order",
       outw2 is None and errw2.code == "handle_not_watchable")
 check("...and no child ran for it", dpw2["_ran"] == [])
 
-# A handle minted by receive_new has no slip. str(None) put the literal string
+# A handle recorded before its quote step ran has no slip. str(None) put the literal string
 # "None" on receive_watch's --pairs, load_pairs exited on a missing file, and
 # the doorbell was told "failed": a wake and a boot spent to learn that a
 # string is not a filename.
@@ -1179,7 +1191,7 @@ _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
       # NO-RESULT outcome mutation_sweep scores as no verdict at all.
       "wallet_file": "/var/lib/gs/spend.wallet"}
 _XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
-_sample = {"receive_new": {"count": 1}, "receive_and_quote": {"amount_sat": 5000000},
+_sample = {"receive_and_quote": {"amount_sat": 5000000},
            "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
            "withdraw": {"exit_to": _XMR_SAMPLE, "depth": 1}}
 # Asserted rather than assumed: this loop runs over P.JOBS, so a job added
@@ -2893,7 +2905,7 @@ for _hard in ("requests", "tenacity", "nacl", "socks", "psutil", "monero",
 # INSIDE its retry loop, so a missing package is caught as just another
 # rotation failure -- and with required=True the handler is sys.exit.
 # create_receive_wallet:258 calls newnym(required=True), and it runs for both
-# receive_new and receive_and_quote, i.e. every /deposit and every /receive.
+# receive_and_quote, i.e. every /deposit.
 #
 # Driven with stem made unimportable:
 #   [!] Tor circuit rotation FAILED after 1 attempts: No module named 'stem'

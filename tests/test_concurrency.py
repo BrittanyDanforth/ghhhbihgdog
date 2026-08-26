@@ -574,7 +574,7 @@ def _m1_for(_pend, _eph):
 
 _both, _trials = 0, 25
 for _i in range(_trials):
-    _pend = _dbm.Pending(_k2, "receive_new", {"count": 1}, clock=lambda: 0.0)
+    _pend = _dbm.Pending(_k2, "swap_status", {"handle": "A3F1"}, clock=lambda: 0.0)
     _ra = _m1_for(_pend, _NP2.PrivateKey.generate())
     _rb = _m1_for(_pend, _NP2.PrivateKey.generate())
     _got = []
@@ -601,7 +601,7 @@ check("handover: ...and the loser is RECORDED, so the CLI's own warning can "
 # genuine retry from the SAME boot reuses its ephemeral and gets the same note
 # back, consuming nothing -- which is what makes this at-most-once without a
 # counter.
-_pend3 = _dbm.Pending(_k2, "receive_new", {"count": 1}, clock=lambda: 0.0)
+_pend3 = _dbm.Pending(_k2, "swap_status", {"handle": "A3F1"}, clock=lambda: 0.0)
 _r3 = _m1_for(_pend3, _NP2.PrivateKey.generate())
 check("handover: NON-VACUITY -- a retry from the SAME boot still gets its own "
       "note back", _pend3.on_m1(_r3) == _pend3.on_m1(_r3))

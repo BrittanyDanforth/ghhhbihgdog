@@ -417,7 +417,10 @@ check("a job that was REFUSED seals nothing",
                                 reader=lambda p: [PAIR]) == "")
 
 _recv = _Dir({"B2C4": {"bundle": "w.json", "minted": 1, "slip": None}})
-check("receive_new has no quote to deliver, so no slip and no complaint",
+# receive_new is gone -- see test_plain_slip. What remains true, and is what
+# this check was really about, is that a handle with no quote behind it yields
+# no slip and no complaint.
+check("a handle with no quote behind it yields no slip and no complaint",
       AG.seal_slip_for_delivery(vault_key(), _recv.path, "done", "B2C4",
                                 reader=lambda p: [PAIR]) == "")
 
@@ -532,6 +535,8 @@ _pager.proxies = {}
 _pager.token = "123456:TOKEN"
 _pager.handle_owner = {}
 _pager.handle_job = {}
+_pager._chain = None
+_pager._chain_leg = 0
 _pager._status_at = None
 _pager.spenders = 1
 _ok_send = [True]
@@ -658,8 +663,18 @@ _pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 # "depo ready · slip A3F1"; the code sent "receive_and_quote ready · slip A3F1"
 # -- the pipeline's own identifier for the job, in the vocabulary of the
 # machine rather than of the person reading a phone.
-check("with no delivery key the reply is the handle line and nothing more",
-      any(t.strip() == "depo ready · slip A3F1" for t in _sent))
+# "depo ready · slip A3F1" WAS THE WHOLE REPLY, and it said ready for WHAT.
+# With no delivery key the address and memo stay on the machine -- which, on
+# one laptop and one Pi, is every install: a delivery key wants a THIRD
+# machine, the one you send the BTC from. The label is still the pointer; what
+# is added is where to read it and that paying needs a desktop wallet, because
+# the memo goes in an OP_RETURN and no phone wallet can compose one.
+check("with no delivery key the reply carries the handle and says where the "
+      "address is",
+      any("A3F1" in t and "ON THE MACHINE" in t for t in _sent))
+import re as _re_sl                                            # noqa: E402
+check("...and names no address, memo or amount even so",
+      not any(_re_sl.search(r"[48][0-9A-Za-z]{50,}", t) for t in _sent))
 check("...and it uses the short name the doc specifies, not the internal one",
       not any("receive_and_quote" in t for t in _sent))
 check("...and it names no machine", not any("vault" in t.lower() for t in _sent))

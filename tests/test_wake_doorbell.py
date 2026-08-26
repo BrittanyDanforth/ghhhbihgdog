@@ -491,7 +491,7 @@ def _boom(addr, handler):
 
 
 try:
-    DB.run_wake(Args(), KEY, "receive_new", {"count": 1},
+    DB.run_wake(Args(), KEY, "swap_status", {"handle": "A3F1"},
                 server_factory=_boom,
                 sock_factory=lambda: (order.append("wol"), FakeSock())[1])
     check("a doorbell that cannot listen refuses", False)
@@ -833,14 +833,24 @@ for _job in P.JOBS:
           P.result_budget_s(_job) >= _worst)
     check(f"{_job}: ...which is strictly longer than the old budget_s",
           P.result_budget_s(_job) > _spec["budget_s"])
-_bc = Bell("receive_new")
+# ...AND DRIVEN ON THE SHORTEST ONE, which is where the defect lived: a job
+# whose budget is smaller than the jitter has its window close before the
+# vault has started, and the operator is told "collected_no_result" about a
+# run that went fine. This was written against receive_new's 900 s; that job
+# is gone and swap_status's 300 s is now the tightest margin in the table,
+# so the drive follows the smallest budget rather than a job name.
+_SHORTEST = min(P.JOBS, key=lambda j: P.JOBS[j]["budget_s"])
+check(f"the tightest window in the table is {_SHORTEST}, and it is smaller "
+      f"than the jitter that precedes it",
+      P.JOBS[_SHORTEST]["budget_s"] < P.VAULT_JITTER_HI_S)
+_bc = Bell(_SHORTEST, params={"handle": "A3F1"})
 _bc.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
                          _bc.pending.window))
 _bc.t[0] += P.VAULT_JITTER_HI_S        # the jitter alone, no work done yet
-check("receive_new is STILL open after the maximum jitter — before the fix "
-      "its 900 s window had closed and the vault had not started",
+check(f"{_SHORTEST} is STILL open after the maximum jitter — before the fix "
+      f"its own budget_s had run out and the vault had not started",
       _bc.pending.result_open() and not _bc.pending.finished())
-_bc.t[0] += P.result_budget_s("receive_new")
+_bc.t[0] += P.result_budget_s(_SHORTEST)
 check("NON-VACUITY: it does still close eventually",
       _bc.pending.finished()
       and _bc.pending.outcome() == "collected_no_result")

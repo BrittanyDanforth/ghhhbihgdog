@@ -178,11 +178,21 @@ def mint_pair(port, artifact_dir, kdf="interactive"):
     return d, tp, pi, out
 
 
+#: A COUNTER THAT DOES NOT RESTART. The mint stub named its bundle after
+#: len(ran), and `ran` is a fresh list per caller -- so the second block to
+#: mint into the same bay wrote a path the first had already written. The
+#: dispatcher identifies a bundle by DIRECTORY DIFF, so the diff was empty and
+#: the job refused with "expected exactly one new receive bundle, found 0"
+#: about a stub that had done its job. One bay, one sequence.
+_E2E_MINT = [0]
+
+
 def agent_deps(bay, ran, **over):
     def child(argv, env_extra, budget):
         ran.append((list(argv), dict(env_extra or {})))
         if "create_receive_wallet" in " ".join(argv):
-            (bay / f"wallet_e2e_{len(ran)}.json").write_text("{}")
+            _E2E_MINT[0] += 1
+            (bay / f"wallet_e2e_{_E2E_MINT[0]}.json").write_text("{}")
         return 0, False
 
     base = dict(sleep=lambda s: None, clock=lambda: 0.0,
@@ -380,8 +390,14 @@ try:
     _clk = [0.0]
 
     def pi2_side():
+        # THE JOB IS INCIDENTAL HERE -- what is under test is the queue
+        # depth over the wire -- but it has to be one the wire still carries.
+        # This named receive_new, which is gone, and a job name the protocol
+        # does not know raises inside Pending's constructor on the Pi thread,
+        # so the doorbell never bound and the agent's own refusal was the
+        # first sign anything was wrong.
         hold["p"] = DB.run_wake(types.SimpleNamespace(no_jitter=True), pi2,
-                                "receive_new", {"count": 1},
+                                "receive_and_quote", {"amount_sat": 5000000},
                                 sock_factory=lambda: FakeWOL(),
                                 sleep=lambda s: time.sleep(0.02),
                                 clock=lambda: _clk[0])
