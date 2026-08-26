@@ -302,7 +302,7 @@ check("...and NON-VACUITY -- with no delivery mode set no address, amount or "
 # have -- or a mode the Pi could switch on -- is exactly the drift this file
 # exists to catch.
 check("§1's table names the two keyfile fields that select a delivery mode",
-      "`delivery_public`" in DOC and "`plain_slip: true`" in DOC)
+      "`delivery_public`" in DOC and "`deposit_in_chat: true`" in DOC)
 _AGENT = src("gs_wake_agent")
 
 
@@ -331,9 +331,9 @@ def _sets_field(source, field):
 # NON-VACUITY for the loop below: the detector finds a real writer, so "the Pi
 # does not write it" is a fact about the Pi and not about the detector.
 check("...and the same check DOES find the vault-side writers",
-      _sets_field(src("gs_wake_keys"), "plain_slip")
+      _sets_field(src("gs_wake_keys"), "deposit_in_chat")
       and _sets_field(src("gs_delivery_key"), "delivery_public"))
-for _f in ("delivery_public", "plain_slip"):
+for _f in ("delivery_public", "deposit_in_chat"):
     check(f"...and the VAULT is what reads {_f}", f'"{_f}"' in _AGENT)
     # CODE, NOT PROSE. This banned the STRING anywhere in the pager, so it
     # caught the comments explaining why the Pi may not set the field -- and
@@ -345,6 +345,54 @@ for _f in ("delivery_public", "plain_slip"):
     check(f"...and the PI never writes {_f}", not _sets_field(_PAGER, _f))
 check("the two modes are mutually exclusive, refused where the operator is "
       "standing", "delivery_mode_ambiguous" in _AGENT)
+
+# ---- A DOC MAY NOT NAME A SYMBOL THAT DOES NOT EXIST --------------------
+#
+# THE DEFECT THIS FOUND. This file said the fee account "carries a wallet
+# label (gs_common.USAGE_FEE_ACCOUNT_LABEL) and _funded_entry skips it". There
+# is no such constant in this repository and _funded_entry has no label check
+# -- it walks every account and takes the largest unlocked output. The label
+# was CONSIDERED and REJECTED (see _withdraw_fee_argv's docstring: a label
+# outlives every artifact wipe and names which account is the operator's
+# revenue), and the doc recorded the discarded design as shipped. An operator
+# reading it believed their fee was protected by a mechanism nobody built.
+#
+# Prose is not checkable in general. `module.SYMBOL` is: it names a file and a
+# name in it, and either that name is there or the sentence around it is
+# describing something imaginary.
+_SHIP_FILES = ("gs_common", "gs_wake_proto", "gs_wake_agent", "gs_doorbell",
+               "gs_telegram_pager", "GhostSpiral", "gs_wake_keys",
+               "thor_swap_preparer", "receive_watch", "create_receive_wallet",
+               "paranoia_mode", "gs_delivery_key", "gs_unseal", "gs_console")
+# BACKTICKS OPTIONAL, because the doc writes it both ways, and NOT ".py" as a
+# symbol: `gs_wake_proto.py` is a FILENAME, and reading its extension as an
+# attribute made the first version of this report a module with no member
+# called "py". Requiring backticks made the second version match nothing at
+# all, which is a check that cannot fail and therefore is not one.
+_named = set(m for m in re.findall(
+    r"\b(" + "|".join(_SHIP_FILES) + r")(?:\.py)?\.([A-Za-z_][A-Za-z0-9_]*)",
+    DOC) if m[1] != "py")
+_missing = []
+for _mod, _sym in sorted(_named):
+    _f = _mod if os.path.exists(os.path.join(REPO, _mod)) else _mod + ".py"
+    try:
+        _body = src(_f)
+    except OSError:
+        _missing.append(f"{_mod} (file not found)")
+        continue
+    # A definition, an assignment, or a name bound at all -- not a mention in
+    # a comment, which is what the false claim itself was.
+    if not re.search(r"^\s*(?:def|class)\s+" + re.escape(_sym) + r"\b"
+                     r"|^\s*" + re.escape(_sym) + r"\s*(?::[^=]*)?=",
+                     _body, re.M):
+        _missing.append(f"{_mod}.{_sym}")
+check(f"every module.SYMBOL this doc names actually exists "
+      f"({len(_named)} checked){': ' + ', '.join(_missing) if _missing else ''}",
+      _missing == [])
+# NON-VACUITY: the scan really found symbols, so an empty miss-list is not an
+# empty scan.
+check(f"...and the scan found them ({len(_named)}: "
+      f"{sorted('.'.join(m) for m in _named)})", len(_named) >= 1)
 check("the doc states the MONEY cost of plaintext, not only the privacy one",
       "shared pooled vault" in DOC and "irreversibly" in DOC)
 check("...and that a phone still cannot attach an OP_RETURN, so the doc does "

@@ -3085,6 +3085,45 @@ MUTATIONS = [
   "            _last = max(self._status_at.values(), default=None)",
   ["test_telegram_pager"]),
 
+ # "THERE IS MORE HERE" MEANT ANY UNLOCKED OUTPUT, so the chain chased
+ # leftovers it could not mix -- dust, and a usage fee a DESK run minted onto
+ # this wallet, which _funded_entry cannot tell from a deposit. Each leg costs
+ # a boot, a jitter and one of twelve daily slots to come back "failed".
+ ("the chain follows a leftover it cannot mix", "gs_wake_agent",
+  '            return "more_left" if _left_xmr >= _floor else ""',
+  '            return "more_left"',
+  ["test_wake_agent"]),
+
+ # A DEPOSIT TOO SMALL TO MIX WAS QUOTED, PAID, AND THEN STUCK. The wire took
+ # anything from 0.0001 BTC upward and nothing asked whether the XMR that
+ # arrives could be mixed -- so the refusal landed at /withdraw, after the
+ # swap had settled, with the money on an address the memo names in a public
+ # OP_RETURN. This gate moves it to the quote, where nothing has been sent.
+ ("a quote too small to mix is issued as deposit instructions anyway",
+  "thor_swap_preparer",
+  "        if _min_out and expected_xmr < _min_out:",
+  "        if False:",
+  ["test_wake_agent"]),
+
+ # ...AND THE VAULT HAS TO PUT IT ON THE ARGV. A floor computed and never
+ # passed is the "declared in one place, never wired to the thing that runs"
+ # shape this repo keeps finding.
+ ("the vault stops telling the quote step what the mix needs",
+  "gs_wake_agent",
+  '             "--min-out-xmr",\n'
+  "             proto.deposit_min_out_xmr(bool(fee_addresses(key))),",
+  '             "--outfile-unused-marker", "0",',
+  ["test_wake_agent"]),
+
+ # AN OLD KEYFILE MUST FAIL LOUDLY. Reading the new name with .get() would
+ # turn plain_slip=true into a silent false: the vault stops sending the
+ # deposit details and nothing says why.
+ ("a keyfile from before the rename silently loses the mode",
+  "gs_wake_agent",
+  '    if "plain_slip" in k:',
+  "    if False:",
+  ["test_plain_slip"]),
+
  # ---- a label belongs to the chat it was issued to ----------------------
  #
  # The vault answers /check and /wait for ANY handle in its file -- it has no
@@ -3139,7 +3178,7 @@ MUTATIONS = [
  # writer, so the doc's "set plain_slip: true in the vault's keyfile"
  # described an edit to a sealed container that nobody could make.
  ("plain_slip goes back to having no way to switch it on", "gs_wake_keys",
-  '        "plain_slip": bool(args.plain_slip),',
+  '        "deposit_in_chat": bool(args.deposit_in_chat),',
   "",
   ["test_wake_agent"]),
 
@@ -3148,7 +3187,7 @@ MUTATIONS = [
  # one would be written, not where it is read.
  ("a delivery key can be written over plain_slip and brick the vault",
   "gs_delivery_key",
-  '    if key.get("plain_slip"):',
+  '    if key.get("deposit_in_chat"):',
   "    if False:",
   ["test_wake_agent"]),
 

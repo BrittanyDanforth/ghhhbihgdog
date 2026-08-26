@@ -316,7 +316,7 @@ def build_cli() -> argparse.ArgumentParser:
     # bot token can leave the address correct and put their own address in the
     # memo. A sealed slip refuses anything the vault did not seal; a plaintext
     # one cannot.
-    p.add_argument("--plain-slip", action="store_true",
+    p.add_argument("--deposit-in-chat", action="store_true",
                    help="send the deposit address, amount and memo to the "
                         "chat as text. Off by default. This is the mode for "
                         "an operator whose only other device is a phone - "
@@ -707,7 +707,7 @@ def do_pair(args) -> int:
         # read the same to .get(), but only one of them says the pairing was
         # asked. See gs_wake_agent's loader: it refuses a value that is not a
         # bool, so writing the bool is also what makes that check reachable.
-        "plain_slip": bool(args.plain_slip),
+        "deposit_in_chat": bool(args.deposit_in_chat),
         # BOTH FIELDS, and the singular is not vestigial: it is what an agent
         # from before the list existed reads, and it must name a real
         # destination on that agent rather than the text of a Python list.

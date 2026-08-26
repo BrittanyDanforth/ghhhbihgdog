@@ -112,7 +112,7 @@ def bay(handles=None, slip_pairs=PAIR):
 
 def vkey(**over):
     k = {"secret": bytes(VAULT).hex(),
-         "peer_public": bytes(PI.public_key).hex(), "plain_slip": True}
+         "peer_public": bytes(PI.public_key).hex(), "deposit_in_chat": True}
     k.update(over)
     return k
 
@@ -124,9 +124,9 @@ BAY = bay()
 # ===========================================================================
 print("\n-- off unless the vault's keyfile says otherwise --")
 check("with plain_slip unset, nothing is built",
-      AG.plain_slip_for_chat(vkey(plain_slip=None), BAY, "done", "A3F1") == {})
+      AG.plain_slip_for_chat(vkey(deposit_in_chat=None), BAY, "done", "A3F1") == {})
 check("with plain_slip false, nothing is built",
-      AG.plain_slip_for_chat(vkey(plain_slip=False), BAY, "done", "A3F1") == {})
+      AG.plain_slip_for_chat(vkey(deposit_in_chat=False), BAY, "done", "A3F1") == {})
 PLAIN = AG.plain_slip_for_chat(vkey(), BAY, "done", "A3F1")
 check("with plain_slip true, the deposit instructions are built", bool(PLAIN))
 
@@ -174,23 +174,23 @@ def _writes_field(source, field):
 
 
 check("the pager never writes plain_slip: the switch is not on this box",
-      not _writes_field(_pgsrc, "plain_slip"))
+      not _writes_field(_pgsrc, "deposit_in_chat"))
 check("...nor does the doorbell, which is the other thing on that card",
       not _writes_field(
           open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read(),
-          "plain_slip"))
+          "deposit_in_chat"))
 # NON-VACUITY: the detector really does find a writer, so "no writer" is not
 # "no detector". gs_wake_keys is the one tool that has one.
 check("NON-VACUITY -- the same check DOES find the vault-side writer",
       _writes_field(
           open(os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read(),
-          "plain_slip"))
+          "deposit_in_chat"))
 # ...AND THE PAGER MAY STILL READ IT. The welcome's deposit line describes
 # where the address turns up, which is a statement about this exact field: a
 # fixed sentence there was wrong for every install that set it.
 check("...and the pager DOES read it, so the welcome describes the mode the "
       "vault actually chose rather than asserting one",
-      '.get("plain_slip")' in _pgsrc)
+      '.get("deposit_in_chat")' in _pgsrc)
 
 # ===========================================================================
 # 2. EXACTLY THE ALLOWED FIELDS, AND dest_xmr AND ts ARE NOT AMONG THEM.
@@ -276,12 +276,28 @@ def _loadkey_with(**over):
 
 check("a keyfile setting BOTH plain_slip and delivery_public is refused at "
       "load, before the machine has done anything",
-      _loadkey_with(plain_slip=True,
+      _loadkey_with(deposit_in_chat=True,
                     delivery_public="aa" * 32) == "delivery_mode_ambiguous")
-check("...either one ALONE is fine", _loadkey_with(plain_slip=True) == ""
+check("...either one ALONE is fine", _loadkey_with(deposit_in_chat=True) == ""
       and _loadkey_with(delivery_public="aa" * 32) == "")
 check("a non-boolean plain_slip is refused rather than being truthy",
-      _loadkey_with(plain_slip="yes") == "plain_slip_malformed")
+      _loadkey_with(deposit_in_chat="yes") == "deposit_in_chat_malformed")
+# ---- AN OLD KEYFILE FAILS LOUDLY RATHER THAN LOSING THE MODE ------------
+#
+# The field was called plain_slip. Reading the new name with .get() would turn
+# an old keyfile's `true` into a silent `false`: the vault stops sending the
+# deposit details, the chat goes back to "read them on the machine", and
+# nothing anywhere says why. On this setting the operator finds out by having
+# nothing to pay.
+_old_refused = _loadkey_with(plain_slip=True)
+check("a keyfile still carrying plain_slip is REFUSED, not silently read as "
+      "the mode being off",
+      _old_refused == "keyfile_field_renamed")
+check("...and the same is true when it carried false, because the point is "
+      "that the operator is told, not which way it was set",
+      _loadkey_with(plain_slip=False) == "keyfile_field_renamed")
+check("NON-VACUITY -- the new name is accepted",
+      _loadkey_with(deposit_in_chat=True) == "")
 
 
 def pending(job="receive_and_quote", params=None):

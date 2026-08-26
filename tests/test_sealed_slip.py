@@ -845,7 +845,7 @@ _ag_src_rp = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 _dry = _ag_src_rp.split("if args.dry_run:")[1].split("raise Refused")[0]
 check("re-pair: --dry-run reports WHICH delivery mode is in force — it is the "
       "command the pairing tells the operator to run",
-      "delivery_public" in _dry and "plain_slip" in _dry)
+      "delivery_public" in _dry and "deposit_in_chat" in _dry)
 check("re-pair: ...and names the sealed case with the key it will seal to",
       "SEALED" in _dry)
 check("re-pair: ...and the plaintext case",

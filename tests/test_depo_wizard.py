@@ -1334,7 +1334,7 @@ _COMPOSED = [
     # only one of them was ever scanned, so the sentence the phone-only
     # operator actually reads went unchecked for banned words and for the
     # currency ceiling below.
-    ("welcome_text_plain", pg.welcome_text(0, {"plain_slip": True})),
+    ("welcome_text_plain", pg.welcome_text(0, {"deposit_in_chat": True})),
     ("_settings_text", pg.Pager._settings_text(_cs.p)),
     ("_amount_question", pg.Pager._amount_question(_cs.p)),
     ("_exit_question", pg.Pager._exit_question(_cs.p)),

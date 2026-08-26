@@ -77,7 +77,7 @@ and it is the operator's to make, on the vault, in a 0400 file. Three modes:
 |---|---|---|
 | neither field | a handle | to reach the vault |
 | `delivery_public` | a sealed blob | `gs_delivery.key` on some machine |
-| `plain_slip: true` (`gs_wake_keys pair --plain-slip`) | the address and memo, in the clear | a phone |
+| `deposit_in_chat: true` (`gs_wake_keys pair --deposit-in-chat`) | the address and memo, in the clear | a phone |
 
 Nothing on the Pi and nothing in a chat can change which mode is in force.
 §8 has what each costs — including the part of the plaintext cost that is
@@ -778,7 +778,7 @@ pocket-dial — and a tap is a pocket-dial.
    a second Tor client appearing in the Mullvad tunnel*. The ThinkPad's
    jitter is the floor because a pwned Pi can zero its own.
 5. Slip stays on the ThinkPad (`0600`). Telegram gets a **confirmation
-   number** — `A3F1-9C2B7E` — and, with `--plain-slip`, the address and memo
+   number** — `A3F1-9C2B7E` — and, with `--deposit-in-chat`, the address and memo
    with it.
 6. You copy BTC address + memo from the bay (or the file). Not from chat.
 
@@ -1426,7 +1426,7 @@ out of noticing a new leak:
 - the BTC figure you type at `/deposit` is echoed back to you for
   confirmation, in every configuration (see §5 above for why that trade was
   made);
-- with `plain_slip` set on the vault's keyfile, the deposit address, the
+- with `deposit_in_chat` set on the vault's keyfile, the deposit address, the
   amount and the ThorChain memo — which names the destination XMR address in
   full — are sent to the chat deliberately. That is the whole point of that
   setting, and §8's "If you have only a phone" argues the cost properly;
@@ -1452,15 +1452,37 @@ than the user's balance also becomes the target of *every* withdrawal, and if
 it is under the mixing minimum the user's money cannot be withdrawn from the
 phone at all.
 
-The fee account now carries a wallet label (`gs_common.USAGE_FEE_ACCOUNT_LABEL`)
-and `_funded_entry` skips it. The marker lives in the **wallet** rather than in
-a file, because `paranoia_mode` wipes the artifact directory and a skip-list
-there would vanish exactly when the operator had been most careful. A label is
-local metadata and never reaches the chain.
+**That paragraph used to end by claiming a fix that does not exist.** It said
+the fee account carries a wallet label, naming a constant USAGE_FEE_ACCOUNT_LABEL in gs_common,
+and that `_funded_entry` skips it. There is no such constant anywhere in this
+repository and `_funded_entry` has no label check: it walks every account and
+every subaddress and takes the largest unlocked output. An operator reading
+that believed their revenue was protected by a mechanism that was never built.
 
-One thing it does not cover: a fee account minted by a build from before the
-label existed carries none, and is indistinguishable from the user's money.
-Sweep those out by hand once.
+What is actually true, and it is a different shape:
+
+- **The woken path cannot create the problem.** `_withdraw_fee_argv` passes
+  `--usage-fee` only when the keyfile names a destination *off* this wallet,
+  so a phone withdrawal either pays the cut somewhere the mix cannot reach or
+  takes no cut at all. Nothing is minted onto the mixing wallet.
+- **The desk path still can.** `gs_console`'s fee panel recommends leaving the
+  address box empty so a fresh account is minted per run — sound advice about
+  address reuse, and it mints onto *this* wallet. A later `/withdraw` picks it
+  up, because `_funded_entry` genuinely cannot tell your cut from a deposit.
+  Since `/withdraw` now chains until the wallet is empty, it will find every
+  such account rather than occasionally one.
+- **Both places that can see the collision say so.** The console panel says
+  "if this wallet is paired for withdrawals, put an address in the box", and
+  `gs_wake_keys pair --allow-withdraw` with no `--usage-fee-address` prints
+  the same warning before you type the confirmation code. Neither is a gate,
+  and the label idea that would have been one was considered and rejected —
+  `_withdraw_fee_argv`'s docstring argues why at length: a label outlives
+  every artifact wipe, names which account is the operator's revenue, and
+  hands over the deposit size to anyone who divides by the published rate.
+
+**So: pair at least one `--usage-fee-address` if a phone can spend from this
+wallet, and do not tick the desk panel's fee box with an empty address.** That
+is the whole protection. There is no marker doing it for you.
 
 **One person per bot, and the pager refuses anything else.** There is a single
 wallet behind this. A withdrawal does not ask who is asking — the vault takes
@@ -1542,19 +1564,30 @@ names one already-spent swap — it is not a wallet, not a seed, and cannot move
 anything. Set no delivery key and none of this happens: no slip is sealed and
 `/depo` answers exactly as it did before.
 
-### If you have only a phone: `--plain-slip`
+### If you have only a phone: `--deposit-in-chat`
 
-**This is the mode for the ordinary setup** — one laptop, one Pi, one phone —
-because the other two both end with "go and read it on the machine", and the
-whole point of the chat is that you are not standing at the machine.
+**Read this before you turn it on, and on a one-laptop setup you probably
+should not.** The mode sends the address *and the memo*, and it has to send
+both: the ThorChain inbound address is a shared pooled vault, so the memo is
+the entire binding between your Bitcoin and your Monero. An address without
+its memo is not a partial delivery, it is a trap — BTC paid to that address
+with no memo is not routed to you. There is no configuration in which the
+chat carries one and not the other, deliberately.
+
+So if the laptop that runs the vault is also the machine you send BTC from —
+which it is, unless you have a second one, because composing an OP_RETURN
+needs a desktop wallet — then the pair is already in front of you on that
+laptop and putting it in a chat buys nothing and costs a transcript. Leave
+this off. The chat tells you a swap is quoted and gives you a confirmation
+number; you read the pair where it was minted.
 
 The sealed slip assumes a *second* machine that can run `gs_unseal`. With only
-a phone you have none, so there is a third mode: pair with `--plain-slip` and
+a phone you have none, so there is a third mode: pair with `--deposit-in-chat` and
 the deposit address, the amount and the memo arrive in the chat as text. The
 memo comes in its own message so a tap-and-hold copies it alone.
 
 ```bash
-python3 gs_wake_keys pair --plain-slip ...        # ON THE VAULT
+python3 gs_wake_keys pair --deposit-in-chat ...        # ON THE VAULT
 ```
 
 **The flag is how you set it, and for two turns there was no how.** This
@@ -1565,11 +1598,11 @@ reader, a renderer, a wire format, a well-formedness check on the doorbell and
 a test suite — and no writer, which meant the one mode that hands a
 phone-only operator something to pay could not be turned on at all.
 
-`--plain-slip` and a delivery key are mutually exclusive, and both ends now
+`--deposit-in-chat` and a delivery key are mutually exclusive, and both ends now
 say so before you can get it wrong: the vault refuses a keyfile carrying both
 at load (on *every* wake, so it is not a conflict you resolve later — it stops
 the vault answering until you re-pair), and `gs_delivery_key new` refuses to
-write one into a keyfile paired with `--plain-slip`.
+write one into a keyfile paired with `--deposit-in-chat`.
 
 ```
 /deposit               -> How much? Reply with the BTC amount…

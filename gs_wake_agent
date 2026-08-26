@@ -558,10 +558,26 @@ def load_key(path: Path) -> dict:
     # It lives here and nowhere else on purpose: the Pi has no way to ask for
     # it, so a compromised Pi -- or a stolen bot token -- cannot turn the chat
     # into a plaintext channel. Changing it means being at the vault.
-    ps = k.get("plain_slip")
+    # A KEYFILE FROM BEFORE THE RENAME FAILS LOUDLY.
+    #
+    # This field was called plain_slip. Reading the new name with .get() would
+    # turn an old keyfile's `true` into a silent `false`: the vault would stop
+    # sending the deposit details and the chat would go back to "read them on
+    # the machine", with nothing anywhere saying why. A setting that quietly
+    # stops applying is worse than one that refuses -- the operator is not
+    # told they have lost it, and on this one they find out by having nothing
+    # to pay.
+    if "plain_slip" in k:
+        raise Refused(
+            "keyfile_field_renamed",
+            f"{path} carries plain_slip, which is what deposit_in_chat used "
+            f"to be called. Re-pair with gs_wake_keys (add --deposit-in-chat "
+            f"if that is the mode you want); this machine will not guess "
+            f"which way you meant it.")
+    ps = k.get("deposit_in_chat")
     if ps is not None and not isinstance(ps, bool):
-        raise Refused("plain_slip_malformed",
-                      f"{path} carries a plain_slip that is not true or false.")
+        raise Refused("deposit_in_chat_malformed",
+                      f"{path} carries a deposit_in_chat that is not true or false.")
     # ONE MODE, NOT TWO. Sealed and plaintext answer the same question for
     # different operators, and an M3 carrying both would put the payload in the
     # transcript AND in a blob -- twice the exposure for one delivery. Refusing
@@ -569,7 +585,7 @@ def load_key(path: Path) -> dict:
     if ps and (k.get("delivery_public") or "").strip():
         raise Refused(
             "delivery_mode_ambiguous",
-            f"{path} sets BOTH plain_slip and delivery_public. Those are two "
+            f"{path} sets BOTH deposit_in_chat and delivery_public. Those are two "
             f"answers to one question and this machine will not guess: sealed "
             f"delivery puts the payload where only gs_delivery.key can read "
             f"it, plaintext puts it in the chat. Remove one.")
@@ -894,6 +910,20 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
             [sys.executable, _tool("thor_swap_preparer"),
              "--tor-proxy", proxy,
              "--dest-from-receive-wallet", str(bundle),
+             # A QUOTE TOO SMALL TO MIX IS REFUSED BEFORE ANY DEPOSIT
+             # INSTRUCTION IS ISSUED. Without this the payment settled
+             # through ThorChain and only THEN met the mixing minimum -- at
+             # /withdraw, with the money already sitting on an address the
+             # swap memo names in a public OP_RETURN, and nothing the phone
+             # could do about it. gs_wake_proto.MIX_MINIMUM_XMR_MIRROR has
+             # the sequence in full.
+             #
+             # WHICH FLOOR depends on whether a cut will be taken, decided by
+             # the same predicate _withdraw_fee_argv uses: a keyfile naming a
+             # fee destination means the withdrawal takes one, and the cut's
+             # own spend floor is what sets the minimum at three wallets.
+             "--min-out-xmr",
+             proto.deposit_min_out_xmr(bool(fee_addresses(key))),
              "--outfile", str(artifact_dir / f"thor_pairs_{handle}.json")],
         ]
     if job == "watch":
@@ -1445,9 +1475,9 @@ def run_once(args, deps: dict = None) -> tuple:
         if _dp:
             agent_say(f"      Slips will be SEALED to delivery key "
                       f"{_dp[:16]}... — only gs_delivery.key opens them.")
-        elif key.get("plain_slip"):
+        elif key.get("deposit_in_chat"):
             agent_say("      Slips will be sent as PLAIN TEXT into the chat "
-                      "(plain_slip is set in this keyfile).")
+                      "(deposit_in_chat is set in this keyfile).")
         else:
             agent_say("      Slips will STAY ON THIS MACHINE: this keyfile "
                       "names no delivery key. If you")
@@ -1773,7 +1803,31 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
         if status != "done":
             return ""
         try:
-            return "more_left" if _funded_entry(key) else ""
+            _left = _funded_entry(key)
+            if not _left:
+                return ""
+            # ...AND IT HAS TO BE BIG ENOUGH TO MIX, or the next leg is a wake
+            # spent to fail at stage 0.
+            #
+            # "There is more here" was answered by ANY unlocked output, so the
+            # chain chased leftovers it could not process: a dust arrival, or
+            # a usage fee a desk run minted onto this wallet -- which
+            # _funded_entry genuinely cannot tell from a deposit, and which is
+            # typically about a hundredth of one. Each such leg costs a magic
+            # packet, a boot, a 5-20 minute jitter and one of twelve daily
+            # slots, and comes back "withdraw: failed" with a hint about
+            # mixing depth that is not the reason.
+            #
+            # The same floor the deposit gate uses, by the same predicate --
+            # a keyfile naming a fee destination means a cut is taken, and the
+            # cut's own spend floor is what binds at three wallets.
+            # Decimal(10 ** 12) is how GhostSpiral itself converts atomic
+            # units, spelled the same way here so the two cannot disagree
+            # about what a piconero is.
+            _left_xmr = Decimal(str(_left[3])) / Decimal(10 ** 12)
+            _floor = Decimal(proto.deposit_min_out_xmr(
+                bool(fee_addresses(key))))
+            return "more_left" if _left_xmr >= _floor else ""
         except Exception:                                    # noqa: BLE001
             # The wallet could not be asked. "" is honest: the operator is
             # told the withdrawal finished and nothing more, which is where
@@ -2465,7 +2519,7 @@ def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
     not turned this on, and NEVER raises -- a job that ran is a job that ran.
     """
     try:
-        if status != "done" or not key.get("plain_slip"):
+        if status != "done" or not key.get("deposit_in_chat"):
             return {}
         rec = (_load_handles(artifact_dir) or {}).get(handle) or {}
         path = rec.get("slip")
