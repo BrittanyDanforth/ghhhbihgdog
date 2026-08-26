@@ -730,7 +730,8 @@ check("control: ...while every carrier is still registered for the exit to "
 _VA2 = types.SimpleNamespace
 
 
-def _dist(sources, slices, by_addr, peel=False, bal=None, usable=None):
+def _dist(sources, slices, by_addr, peel=False, bal=None, usable=None,
+          fee_addr=None, fee_amt=Decimal(0)):
     """Drive the real planner. bal/usable are REQUIRED by the planner now --
     the peel branch runs the affordability gate with them, and defaulting them
     to None is what let that gate be skipped. Default here to a balance that
@@ -745,7 +746,8 @@ def _dist(sources, slices, by_addr, peel=False, bal=None, usable=None):
         _r = ghost.build_distribution_plan(
             _args, None, _ai, sources, [d for sl in slices for d in sl],
             by_addr, slices, Decimal("0.0024"), sources[0][1],
-            sum(len(sl) for sl in slices), (0, 0), _secretsmod, _bal, _use)
+            sum(len(sl) for sl in slices), (0, 0), _secretsmod, _bal, _use,
+            fee_addr=fee_addr, fee_amt=fee_amt)
         # (plan, change_accounts, mode) -- the 4th element is the amounts the
         # planner actually used, checked separately below.
         return _r[:3]
@@ -777,6 +779,104 @@ check("split: NO mix subaddress is funded by two different chunks — the "
 check("split: every change location is its own carrier's account, so no "
       "change sweep merges two chunks either",
       sorted(_chg) == [20, 21, 22])
+
+# -- THE CUT IS CHARGED IN PROPORTION TO WHAT EACH CARRIER PAYS ------------
+#
+# UNREACHABLE IN A REAL RUN, AND FIXED ANYWAY. A cut with more than one chunk
+# is refused twice before anything is swapped -- _refuse_fee_combinations on
+# --split at parse time, refuse_fee_multichunk on planned_chunk_count at stage
+# 1, which is the gate that catches the JoinMarket route where the UTXOs are
+# the chunks and --split is never consulted. Both are checked elsewhere in this
+# file. So len(SPEND_SOURCES) is 1 whenever fee_amt is non-zero.
+#
+# This branch is written as though it handles N carriers all the same, and its
+# own comment claims the split is "by each chunk's share" -- while it divided
+# fee_amt EQUALLY. The chunks are deliberately unequal: split_btc_amount
+# jitters them across a band its docstring derives as 0.70x to 1.44x of the
+# equal share. So the smallest carrier was charged the largest carrier's fee,
+# in the arm that runs the day either refusal is relaxed.
+#
+# Measured over 4710 fundable configurations, comparing each carrier's holdings
+# against what its fan-out is planned to spend: at the shipped 1.1% the equal
+# split never overdraws (thinnest margin 0.0171 XMR), at 20% it does, and at
+# USAGE_FEE_PCT_MAX (25%) 281 of 410 overdraw, the worst carrier short 1.12
+# XMR. Proportional: 0 of 4710. An overdrawn fan-out fails at RELAY, after the
+# veils have paid their fees and after the swap has settled.
+_FSRC = [("C0", 30, 1), ("C1", 31, 1), ("C2", 32, 1)]
+_FSLICES = [["f0", "f1"], ["f2", "f3"], ["f4", "f5"]]
+# Payouts in the ratio 0.70 : 1.00 : 1.30 -- the band split_btc_amount states.
+_FBY = {"f0": Decimal("0.35"), "f1": Decimal("0.35"),
+        "f2": Decimal("0.50"), "f3": Decimal("0.50"),
+        "f4": Decimal("0.65"), "f5": Decimal("0.65")}
+_FEE_TOTAL = Decimal("0.3300")
+_fplan, _fchg, _fmode = _dist(_FSRC, _FSLICES, _FBY,
+                              fee_addr="FEEADDR", fee_amt=_FEE_TOTAL)
+
+
+def _fee_on(tx):
+    return sum((Decimal(d["amount"]) for d in tx["destinations"]
+                if d["address"] == "FEEADDR"), Decimal(0))
+
+
+def _paid_by(tx):
+    return sum((Decimal(d["amount"]) for d in tx["destinations"]
+                if d["address"] != "FEEADDR"), Decimal(0))
+
+
+_fcharged = [_fee_on(t) for t in _fplan]
+_fpays = [_paid_by(t) for t in _fplan]
+check("fee/split: every carrier gets exactly one cut destination",
+      all(len([d for d in t["destinations"] if d["address"] == "FEEADDR"]) == 1
+          for t in _fplan))
+check(f"fee/split: the cut is charged in proportion to what each carrier pays "
+      f"out, not equally ({_fcharged})",
+      len({(_c / _p).quantize(Decimal("0.0001"))
+           for _c, _p in zip(_fcharged, _fpays)}) == 1)
+# NON-VACUITY: an equal split would have failed the check above, so it is
+# testing the ratio and not merely that three numbers exist.
+check("fee/split: NON-VACUITY -- the carriers really do pay out different "
+      "amounts, so 'equal' and 'proportional' are distinguishable here",
+      len(set(_fpays)) == 3)
+check("fee/split: ...and the smallest payer is charged the smallest cut",
+      _fcharged.index(min(_fcharged)) == _fpays.index(min(_fpays))
+      and _fcharged.index(max(_fcharged)) == _fpays.index(max(_fpays)))
+# EXACT. The operator is paid the cut plan_usage_fee computed, to the atomic
+# unit -- a split that lost a tick would be a fee quietly smaller than the rate
+# the chat and the console both state.
+check("fee/split: the parts sum to EXACTLY the cut, so nothing is lost to "
+      "rounding", sum(_fcharged, Decimal(0)) == _FEE_TOTAL)
+# ...AND NO CARRIER IS ASKED FOR MORE THAN ITS SHARE. This is the property the
+# equal split broke: the remainder lands on the BIGGEST payer, which is the one
+# with headroom by construction, rather than on whichever chunk happens to be
+# last.
+check("fee/split: the remainder lands on the biggest payer, not on whichever "
+      "chunk is last",
+      _fcharged.index(max(_fcharged)) == _fpays.index(max(_fpays)))
+# A CHUNK TOO SMALL TO OWE A TICK GETS NO CUT OUTPUT, rather than a dust output
+# nobody can spend -- and the total is still exact, so the operator is paid in
+# full either way.
+_tiny = {"f0": Decimal("0.0001"), "f1": Decimal("0.0001"),
+         "f2": Decimal("5"), "f3": Decimal("5"),
+         "f4": Decimal("5"), "f5": Decimal("5")}
+_tplan, _, _ = _dist(_FSRC, _FSLICES, _tiny,
+                     fee_addr="FEEADDR", fee_amt=Decimal("0.1100"))
+check("fee/split: a chunk whose share rounds below one tick gets NO cut "
+      "output, rather than an unspendable one",
+      _fee_on(_tplan[0]) == 0)
+check("fee/split: ...and the cut is still paid in full by the others",
+      sum((_fee_on(t) for t in _tplan), Decimal(0)) == Decimal("0.1100"))
+# THE SINGLE-CHUNK CASE IS THE ONLY ONE A REAL RUN REACHES, so it is checked
+# rather than assumed: the whole cut, on the one carrier.
+_s1plan, _, _ = _dist([("C0", 30, 1)], [["f0", "f1"]],
+                      {"f0": Decimal("1"), "f1": Decimal("1")},
+                      fee_addr="FEEADDR", fee_amt=Decimal("0.0550"))
+check("fee/split: one chunk carries the whole cut in one destination",
+      len(_s1plan) == 1 and _fee_on(_s1plan[0]) == Decimal("0.0550"))
+# AND NO CUT MEANS NO EXTRA DESTINATION AT ALL.
+_n1plan, _, _ = _dist([("C0", 30, 1)], [["f0", "f1"]],
+                      {"f0": Decimal("1"), "f1": Decimal("1")})
+check("fee/split: NON-VACUITY -- a run with no cut has no cut destination",
+      [d["address"] for d in _n1plan[0]["destinations"]] == ["f0", "f1"])
 
 # CONTROL: with one chunk this is exactly the old single fan-out.
 _p1, _c1, _m1 = _dist([("C0", 20, 1)], [["m0", "m1", "m2"]],

@@ -2568,26 +2568,52 @@ def _chain_run(arrivals):
     return _legs[0], [t for t, _b in _cs]
 
 
+# ONE MESSAGE PER LEG, AND THERE WERE TWO.
+#
+# The completion message said "Next one starting" and _worker then sent
+# "withdraw: starting the next one (2 of at most 6)" seconds later -- two
+# messages for one event, on the surface this whole design spends its effort
+# keeping short, with the CAP in the parenthesis dressed as a total.
 _n1, _m1 = _chain_run(1)
 check("chain: one arrival runs one mix", _n1 == 1)
 check("chain: ...and says there is nothing left, so the operator is not left "
       "wondering whether they were paid in full",
-      any("nothing is left on this wallet" in t.lower() for t in _m1))
+      any("wallet empty" in t.lower() for t in _m1))
 check("chain: ...and does not announce a next leg that is not coming",
-      not any("starting the next" in t for t in _m1))
+      not any("next one starting" in t.lower() for t in _m1))
+check("chain: ...in ONE message, not a completion and an announcement",
+      sum("sent." in t for t in _m1) == 1 and len(_m1) == 2)
+# AND THE "working" ACKNOWLEDGEMENT IS SENT ONCE, FOR THE WHOLE CHAIN. It
+# quotes how long this pager will refuse every other command, and that window
+# does not change between legs -- so repeating it per leg was a second message
+# saying nothing new, on top of a completion message that had just said the
+# next one was starting.
+check("chain: ...and the working acknowledgement is sent once, not per leg",
+      sum("Nothing else can run" in t for t in _m1) == 1)
 
 _n3, _m3 = _chain_run(3)
 check("chain: three arrivals run three mixes off ONE /withdraw", _n3 == 3)
 check("chain: ...each announced before it starts, so the operator is never "
       "left watching silence",
-      sum("starting the next" in t for t in _m3) == 2)
+      sum("next one starting" in t.lower() for t in _m3) == 2)
+check("chain: ...still one message per leg, not two",
+      sum("sent." in t for t in _m3) == 3
+      and sum("Nothing else can run" in t for t in _m3) == 1
+      and len(_m3) == 4)
 check("chain: ...numbered, so a long chain is followable",
-      any("(2 of at most" in t for t in _m3)
-      and any("(3 of at most" in t for t in _m3))
+      any(t.startswith("withdraw 2 sent") for t in _m3)
+      and any(t.startswith("withdraw 3 sent") for t in _m3))
+# NO DENOMINATOR. MAX_CHAIN_LEGS is the cap that stops a runaway chain, not a
+# count of what is coming: a run ends when the wallet has no funded entry
+# left. Printing "1/6" promised six spends to an operator who was going to get
+# three, and then made the third read as the run stopping halfway.
+check("chain: ...without inventing a total nothing knows",
+      not any(f"/{pg.Pager.MAX_CHAIN_LEGS}" in t or "of at most" in t
+              for t in _m3))
 check("chain: ...and the reason they go separately is given once they matter",
       any("all yours" in t for t in _m3))
 check("chain: ...and the last leg still says nothing is left",
-      any("nothing is left on this wallet" in t.lower() for t in _m3))
+      any("wallet empty" in t.lower() for t in _m3))
 
 # THE CAP. The daily wake budget bounds this anyway; the cap is what stops a
 # wallet reporting "more left" forever -- a stuck scan, or dust that can never
@@ -2597,9 +2623,25 @@ check(f"chain: a wallet with nine arrivals stops at the cap "
       f"({_n9} of {pg.Pager.MAX_CHAIN_LEGS})",
       _n9 == pg.Pager.MAX_CHAIN_LEGS)
 check("chain: ...and says so, rather than stopping silently mid-drain",
-      any("Stopping after" in t and "still more here" in t for t in _m9))
+      any("is enough for one run" in t for t in _m9))
 check("chain: ...and hands it back to the operator rather than to a retry loop",
-      any("send /withdraw again" in t for t in _m9))
+      any("/withdraw again" in t for t in _m9))
+# AND IT DOES NOT ALSO SAY THE OPPOSITE. On the last leg the cap allows,
+# `_more` is true and no leg is left to run it -- and the completion message
+# tested only `_more`, so it said "Starting the next one now" and the cap
+# branch then said "Stopping after 6 in a row". Two messages, seconds apart,
+# contradicting each other, at the end of a run that had moved real money six
+# times. Whether a next leg RUNS is `_more AND under the cap`; that is now
+# computed once and read by the sentence and by the arming.
+check("chain: ...and never claims a next leg on the run that hit the cap",
+      not any("next one starting" in t.lower() for t in _m9[-1:]))
+check("chain: ...with the cap's own ending on exactly the last message",
+      "is enough for one run" in _m9[-1]
+      and not any("is enough for one run" in t for t in _m9[:-1]))
+check(f"chain: ...still one message per leg at the cap ({len(_m9)})",
+      sum("sent." in t for t in _m9) == pg.Pager.MAX_CHAIN_LEGS
+      and sum("Nothing else can run" in t for t in _m9) == 1
+      and len(_m9) == pg.Pager.MAX_CHAIN_LEGS + 1)
 
 # THROUGH start_job, WHICH IS WHERE EVERY BOUND LIVES. A chain that called
 # _worker directly would be a second path to a wake with no rate limit, no
@@ -2614,6 +2656,10 @@ check("chain: the handover block ends where the test thinks it does",
 _ch_src = _ch_src.split(_CH_END)[0]
 check("chain: the next leg goes through start_job like everything else",
       "self.start_job(_cid" in _ch_src and "_worker" not in _ch_src)
+# AND IT SAYS NOTHING ON THE WAY IN. The announcement that used to live here
+# duplicated the completion message that had just been sent.
+check("chain: the handover announces nothing of its own",
+      "self.send(" not in _ch_src)
 # THE LEG COUNT SURVIVES THE HANDOVER. The first version read it out of the
 # slot, which _worker clears before the next poke runs -- so it was 0 on every
 # leg, the message said "2 of at most 6" forever, and the cap never fired.
@@ -2870,9 +2916,17 @@ check("tap: NON-VACUITY -- the step before it was tappable",
 # four-character hex label retyped off the screen above, correctly, or the
 # wake was spent on unknown_handle.
 _hp, _hs, _, _hj = _tapper()
-check("tap: a minted handle gets check/wait buttons",
+# ONE BUTTON, NOT TWO. "Wait for it" sat beside "Has it arrived?" and asked
+# the reader to choose between them with nothing on either label to choose ON:
+# waiting is what happens either way, and the only real difference -- three
+# minutes of looking against a hundred and ten, with the long one holding
+# every other command for the duration -- appeared on neither. /wait is still
+# a typed command on the published list for an operator who knows they want
+# the long look; what is gone is a keyboard offering a decision without the
+# information to make it.
+check("tap: a minted handle gets the ask-again button",
       [_d for _row in (_hp._handle_buttons("A3F1") or [])
-       for _l, _d in _row] == ["c:A3F1", "w:A3F1"])
+       for _l, _d in _row] == ["c:A3F1"])
 check("tap: ...and a non-handle gets none rather than a broken button",
       _hp._handle_buttons("") is None
       and _hp._handle_buttons("ZZZZ") is None
@@ -3111,7 +3165,7 @@ check("chain: a chain write that fails does NOT cost the completion message "
       "— the message IS what happened, as far as the operator is concerned",
       _cs != [])
 check("chain: ...and the message that lands is the real completion one",
-      any("withdraw: done" in t for t in _cs))
+      any("sent." in t for t in _cs))
 check("chain: ...and busy is still released, so the pager is not wedged",
       not _cp.busy.locked())
 

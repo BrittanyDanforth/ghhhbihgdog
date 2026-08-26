@@ -7827,17 +7827,101 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # fan-out fundable and gives them all the same +1 destination, rather
         # than making one of them the odd one out.
         #
-        # The remainder from the division lands on the LAST chunk, and it is at
-        # most a DUST_XMR tick per chunk -- the same treatment split_btc_amount
-        # gives its satoshi remainder, for the same reason: it has to go
-        # somewhere and a fixed choice is the only one that cannot be a draw.
+        # ...AND IT SPLIT EQUALLY, WHICH IS NOT EACH CHUNK'S SHARE. This read
+        # `fee_amt / len(SPEND_SOURCES)`, one identical slice per carrier,
+        # under the paragraph above claiming proportionality. The chunks are
+        # NOT equal and deliberately so: split_btc_amount jitters them, and its
+        # own docstring states the derived band as 0.70x to 1.44x of the equal
+        # share. So the smallest carrier was charged the largest carrier's fee.
+        #
+        # MEASURED, over 4710 fundable (deposit, chunk weights, wallet count,
+        # dag/peel/exit, network-fee, cut) combinations, comparing what each
+        # carrier holds against what its fan-out is planned to spend. 2389 of
+        # them are at the shipped rate and 2321 at the ceiling:
+        #
+        #   cut 1.1% (shipped)  equal: 0 of 2389 overdrawn, thinnest margin
+        #                       0.0082 XMR -- about two network fees
+        #   cut 20%             equal: overdrawn, worst carrier short 0.15 XMR
+        #   cut 25% (the max)   equal: 1342 of 2321 overdrawn, worst short 1.12
+        #   every cut           proportional: 0 of 4710 overdrawn
+        #
+        # AND NO REAL RUN CAN REACH IT TODAY, which is the honest half and was
+        # nearly left out. A cut with more than one chunk is refused twice
+        # before anything is swapped: _refuse_fee_combinations rejects
+        # `--usage-fee --split N` at parse time, and refuse_fee_multichunk
+        # rejects it again at stage 1 by planned_chunk_count -- the gate that
+        # catches the JoinMarket route, where the UTXOs are the chunks and
+        # --split is never consulted. So len(SPEND_SOURCES) is 1 whenever
+        # fee_amt is non-zero, and this loop has one iteration.
+        #
+        # It is still fixed rather than annotated. This branch is written as
+        # though it handles N carriers, its own paragraph above claims the
+        # split is "by each chunk's share", and it divided equally -- so the
+        # code contradicted the comment directly over it, in the arm that runs
+        # if either refusal is ever relaxed. The failure it would produce is
+        # the worst shape this file has: a fan-out planned to spend more than
+        # its carrier holds fails at RELAY, with "not enough money", after the
+        # veils have paid their fees and after the swap has settled onto an
+        # address a public OP_RETURN names. size_distribution cannot catch it
+        # either -- it sizes the slices and never sees the cut.
+        #
+        # WEIGHTED BY WHAT EACH CARRIER IS ACTUALLY PAYING OUT, which is the
+        # literal reading of "each chunk's share" and needs nothing new
+        # threaded in: size_distribution already sized every slice from its own
+        # chunk's arrived balance (slice_usable[i] = usable * u_i / total), so
+        # a slice's payout total is proportional to its carrier's holdings by
+        # construction. Charging the cut against the same quantity cannot
+        # outrun it.
+        #
+        # THE REMAINDER LANDS ON THE BIGGEST PAYER, NOT ON THE LAST ONE.
+        #
+        # It is at most one DUST_XMR tick per chunk, so on any run that takes a
+        # cut at all it is noise -- but "the last one" is an ARBITRARY carrier
+        # and this one is the carrier with the most headroom by construction,
+        # which is the only choice that cannot make some chunk pay more than
+        # its share. Still a fixed rule and not a draw, which is what
+        # split_btc_amount's own remainder note asks for; it just picks the
+        # index that can always absorb it. Ties take the lowest index, so it is
+        # deterministic.
+        #
+        # WHY A SHARE CAN ROUND TO NOTHING, AND WHY THAT IS FINE. At a very low
+        # network fee and many chunks, the smallest chunk's share of a cut that
+        # only just cleared the spendability floor is under a tick: measured,
+        # 0.0004 XMR fees and 8+ chunks put it at 0.00006 XMR. That chunk then
+        # gets no fee destination, the others carry the whole cut, and the
+        # total is still exact -- so the operator is paid in full. The fan-out
+        # it leaves is one output shorter than its siblings', which is not a
+        # shape signal: split_by_weight already gives the chunks slices of
+        # different LENGTHS, so the fan-outs of one run differ in arity anyway.
         _fee_by_chunk = []
         if fee_addr and fee_amt > 0:
             _n_src = len(SPEND_SOURCES)
-            _per = (fee_amt / Decimal(_n_src)).quantize(DUST_XMR,
-                                                        rounding=ROUND_DOWN)
-            _fee_by_chunk = [_per] * _n_src
-            _fee_by_chunk[-1] = fee_amt - _per * Decimal(_n_src - 1)
+            _weights = [sum((fanout_by_addr[a] for a in _dest_slices[_i]),
+                            Decimal(0))
+                        for _i in range(_n_src)]
+            _wtotal = sum(_weights, Decimal(0))
+            if _wtotal <= 0:
+                # UNREACHABLE, AND NOT ASSUMED. Every slice is non-empty
+                # (size_distribution refuses an empty one outright) and every
+                # amount clears the fundable floor, so this cannot be zero --
+                # but the alternative to checking is a ZeroDivisionError at
+                # stage 4, after the swap, which is the one place in this file
+                # where a traceback costs a settled deposit. Falling back to
+                # the equal split keeps the run alive with a cut that is at
+                # worst mis-apportioned.
+                _per = (fee_amt / Decimal(_n_src)).quantize(
+                    DUST_XMR, rounding=ROUND_DOWN)
+                _fee_by_chunk = [_per] * _n_src
+            else:
+                _fee_by_chunk = [
+                    (fee_amt * _w / _wtotal).quantize(DUST_XMR,
+                                                      rounding=ROUND_DOWN)
+                    for _w in _weights]
+            _big = max(range(_n_src), key=lambda _i: _weights[_i])
+            _fee_by_chunk[_big] = (
+                fee_amt
+                - sum((_v for _j, _v in enumerate(_fee_by_chunk)
+                       if _j != _big), Decimal(0)))
         for _si, (_src_addr, _src_acct, _src_idx) in enumerate(SPEND_SOURCES):
             _slice = _dest_slices[_si]
             _dests = [{"address": a, "amount": str(fanout_by_addr[a])}

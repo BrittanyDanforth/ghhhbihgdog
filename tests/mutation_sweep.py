@@ -2326,12 +2326,51 @@ MUTATIONS = [
  # minimum balance of the three, and a run that dies at stage 0 if their
  # balance sits between the two minimums -- after confirming something else.
  # Nothing on screen was wrong and nothing on the wire was wrong.
- ("the depth question goes back to numbering rows instead of hops",
+ # Re-anchored again, and the second break was mine: the row led with the
+ # RUNTIME ("~6h · lightest cover"), so the salient numbers became 6, 9 and 13
+ # and none of them is an accepted answer. proto.depth_choice owns the ordering
+ # rule now -- the typed number first, always -- so a mutation that reverts to
+ # a hand-built row is what this catches.
+ ("the depth question stops leading each row with the number that is typed",
   "gs_telegram_pager",
   '        return ("How deep? Reply with the number of hops:\\n"\n'
-  '                + "\\n".join(f"  {proto.WITHDRAW_DEPTH_NOTE[d]}"',
+  '                + "\\n".join(f"  {proto.depth_choice(d)}"',
   '        return ("How deep? Reply with one:\\n"\n'
-  '                + "\\n".join(f"  {d}  {proto.WITHDRAW_DEPTH_NOTE[d]}"',
+  '                + "\\n".join(f"  {proto.WITHDRAW_DEPTH_NOTE[d]}"',
+  ["test_depo_wizard"]),
+
+ # THE ROW ORDER, AT ITS SOURCE. depth_choice is the one place that decides
+ # what leads a menu row, so a mutation there moves every box that draws one.
+ ("depth_choice puts the runtime first again, so the salient number on each "
+  "row is one the step refuses",
+  "gs_wake_proto.py",
+  '    return (f"{depth_hops(depth)} hops \u00b7 about {depth_hours(depth)}h \u00b7 "\n'
+  '            f"{WITHDRAW_DEPTH_NOTE[depth]}")',
+  '    return (f"about {depth_hours(depth)}h \u00b7 {WITHDRAW_DEPTH_NOTE[depth]} \u00b7 "\n'
+  '            f"answer {depth_hops(depth)}")',
+  ["test_depo_wizard"]),
+
+ # AND A REFUSED DEPTH RE-ASKS RATHER THAN CANCELLING. The menu prints numbers
+ # that are not answers (the runtimes), so a plausible misread reaches this
+ # branch -- and cancelling here discards destination addresses the operator
+ # has already typed into a transcript with no eraser, which means typing them
+ # a second time.
+ ("a depth the step does not recognise cancels the withdraw again, throwing "
+  "away the addresses already given",
+  "gs_telegram_pager",
+  "                c.tries += 1\n"
+  "                if c.tries > self.DEPTH_RETRIES:",
+  "                c.tries += 1\n"
+  "                if c.tries > 0:",
+  ["test_depo_wizard"]),
+
+ # THE HOURS ARE DERIVED FROM THE BUDGET THEY DESCRIBE. A hand-typed figure
+ # beside a 22080-second budget is a mirror with nothing checking it.
+ ("the menu's runtime stops coming from WITHDRAW_DEPTHS, so it can promise a "
+  "figure the vault no longer budgets",
+  "gs_wake_proto.py",
+  "    return int(round(WITHDRAW_DEPTHS[depth][1] / 3600.0))",
+  "    return {1: 6, 2: 9, 3: 13}[depth]",
   ["test_depo_wizard"]),
 
  # ...AND THE BUTTON CARRIES WHAT THE STEP READS. parse_callback hands back
@@ -3259,9 +3298,27 @@ MUTATIONS = [
  # "Done." is about the SWAP, and shortening it to "Done" changed which noun.
  # The mix has not run; the money is sitting un-mixed; the operator is reading
  # the surface they check most.
+ # THE DEPOSIT LINE IS SINGLE-USE AND THE READER IS TOLD SO. "To address:
+ # bc1q..." reads as "my deposit address" to anybody who has used an exchange,
+ # and a second payment to it -- or the same one next week -- arrives belonging
+ # to nobody: the binding that makes a payment theirs is issued per quote and
+ # is not part of the address, which is not unique to them either.
+ ("the deposit instructions stop saying the address is for one payment only",
+  "gs_wake_proto.py",
+  '        "One payment, once. This line is not yours to keep \u2014 sending to it "\n'
+  '        "again, or later, loses the money.",',
+  '        "",',
+  ["test_depo_wizard"]),
+
+ # Re-anchored: the line opens "CONFIRMED" now rather than "landed" -- a
+ # status that leads with the jargon of the step it describes tells the reader
+ # nothing they can act on. The property is unchanged and is the reason the
+ # anchor exists: WHICH step finished has to be in the sentence, because the
+ # mix has not run.
  ("the landed line claims the whole job is finished", "gs_wake_proto.py",
-  '    "landed": "landed and spendable. The swap is done.",',
-  '    "landed": "landed and spendable. Done.",',
+  '    "landed": "CONFIRMED \u2014 the money is here and spendable. That was the "\n'
+  '              "swap; the mix has not run yet.",',
+  '    "landed": "CONFIRMED \u2014 the money is here and spendable. Done.",',
   ["test_plain_slip"]),
 
  # ---- the bot says the answer and stops -----------------------------------
@@ -3633,10 +3690,25 @@ MUTATIONS = [
   "            _a = [text.strip()]",
   ["test_depo_wizard"]),
 
- ("the confirm no longer says how many arrivals land where",
+ # Re-anchored: the COUNT came out and the CONSEQUENCE stayed. "At least 12
+ # separate transactions" handed a directly usable figure to somebody holding
+ # the transcript and nothing else -- not a Kerckhoffs defence, since
+ # exit_arrivals_floor is a public function of a depth the same message names,
+ # but a real reduction in what the readable surface gives away. What must not
+ # be lost is the sentence that decides whether one destination throws the run
+ # away, so that is what this anchor now pins.
+ ("the confirm no longer says the payments are many, or where they land",
   "gs_telegram_pager",
-  '                      f"At least {_lo} separate transactions, {_spread}.\\n"',
+  '                      f"It arrives as many separate payments, {_spread}.\\n"',
   '                      f""',
+  ["test_depo_wizard"]),
+
+ # AND THE COUNT MUST NOT COME BACK. A mutation that restores it is the
+ # regression this pair exists to catch from the other side.
+ ("the arrival count is printed into the confirm again",
+  "gs_telegram_pager",
+  '                      f"It arrives as many separate payments, {_spread}.\\n"',
+  '                      f"At least {_lo} separate payments, {_spread}.\\n"',
   ["test_depo_wizard"]),
 
  ("the single-destination case is no longer called out at the confirm",

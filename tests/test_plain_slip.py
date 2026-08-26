@@ -434,8 +434,15 @@ check("...and does not read as the whole job being over",
       or "swap" in _landed.lower())
 # NON-VACUITY: the line is a real sentence that still says the money arrived,
 # so this is not passing on an empty or unrelated string.
+# THE WORD IS "CONFIRMED", NOT "landed". A status line that opens with the
+# jargon of the step it describes tells the reader nothing they can act on;
+# what they want to know is whether the money is theirs to spend yet. The
+# check is on the two FACTS, not on either spelling -- a check pinned to the
+# word would have to be rewritten every time the sentence is, which is how a
+# non-vacuity check stops being about anything.
 check("NON-VACUITY -- it still tells the operator the money is there",
-      "landed" in _landed.lower() and "spendable" in _landed.lower())
+      "the money is here" in _landed.lower()
+      and "spendable" in _landed.lower())
 # AND NO PHASE LINE NAMES THE OPERATOR'S HARDWARE. These are sent verbatim to
 # the chat by gs_telegram_pager, so they are chat text living in a file that
 # does not look like chat text -- which is how two of them kept saying "check
@@ -955,8 +962,16 @@ check("withdraw: ...and advertises no slip handle, because none was registered",
 # then reads as the bot assuming a context the reader has to scroll for.
 check("withdraw: ...and says what happened without leaning on a conversation "
       "the reader may not have in front of them",
-      "the money has been sent" in _mws[0].lower()
+      "sent" in _mws[0].lower()
       and "you gave" not in _mws[0].lower())
+# AND IT SAYS WHICH LEG, WITHOUT PROMISING A TOTAL IT CANNOT KNOW. This read
+# "withdraw 1/6: sent", where 6 is MAX_CHAIN_LEGS -- the cap that stops a
+# runaway chain, not a count of what is coming. A run ends when the wallet has
+# no funded entry left, so the operator who got three legs was reading the
+# third as the run stopping halfway.
+check("withdraw: ...and numbers the leg without inventing a total",
+      re.search(r"withdraw 1 sent", _mws[0])
+      and f"/{pg.Pager.MAX_CHAIN_LEGS}" not in _mws[0])
 # THE SCOPE IS NAMED, AND THE CHAIN DECIDES WHICH SENTENCE FOLLOWS.
 #
 # A run empties ONE arrival -- _funded_entry takes the largest single unlocked
@@ -967,12 +982,11 @@ check("withdraw: ...and says what happened without leaning on a conversation "
 # shortchanging them. The vault answers that now (phase "more_left") and the
 # pager keeps going.
 check("withdraw: with nothing left, it says so plainly",
-      "nothing is left on this wallet" in _mws[0].lower())
+      "wallet empty" in _mws[0].lower())
 _mwm = _drive_out(_res("done", "more_left"), "done", job="withdraw")
 check("withdraw: with more left, it says another is starting rather than "
       "leaving the operator to notice",
-      "more on this wallet" in _mwm[0].lower()
-      and "starting the next" in _mwm[0].lower())
+      "next one starting" in _mwm[0].lower())
 check("withdraw: ...and gives the reason they go separately, which is why it "
       "is not a limitation to be fixed later",
       "all yours" in _mwm[0].lower())
@@ -1101,7 +1115,13 @@ try:
     # Telegram keyboards never expire, and a button holding a bare handle
     # stops working the moment this process restarts and forgets who owned it.
     _WCN = pg.confirmation_number(_p.key, 111, "A3F1")
-    for _w, _want in ((("not_yet", f"w:{_WCN}"), ("arriving", f"w:{_WCN}"),
+    # ONE BUTTON WHERE THERE WERE TWO. "Wait for it" sat beside "Has it
+    # arrived?" and asked the reader to choose between them with nothing on
+    # the labels to choose ON: waiting is what happens either way, and the
+    # only real difference -- three minutes of looking against a hundred and
+    # ten, the long one holding every other command -- was on neither. /wait
+    # is still a typed command for an operator who knows they want it.
+    for _w, _want in ((("not_yet", f"c:{_WCN}"), ("arriving", f"c:{_WCN}"),
                        ("landed", "m:send"), ("short", "m:help"),
                        ("stuck", "m:help"))):
         _btns.clear()

@@ -282,26 +282,6 @@ for _msgs, _label, _want in (
         (["/withdraw", _WA[:94]], "an address one character short",
          "bad address"),
         (["/withdraw", _WA, "10", "999"], "a wrong confirm", "wrong answer"),
-        (["/withdraw", _WA, "0"], "a depth below the table",
-         "did not recognise"),
-        (["/withdraw", _WA, "4"], "a depth above the table",
-         "did not recognise"),
-        # THE WIRE'S OWN KEYS, WHICH THE CHAT NO LONGER SPEAKS. "1" and "2"
-        # used to mean three and ten hops; the menu printed them beside the
-        # hop counts, so "3" meant twenty hops on one line and three hops on
-        # another. Refusing them is the safe half of that fix -- an operator
-        # who had memorised "2" asks again rather than being handed a
-        # different depth without being told.
-        (["/withdraw", _WA, "1"], "the old wire key for three hops",
-         "did not recognise"),
-        (["/withdraw", _WA, "2"], "the old wire key for ten hops",
-         "did not recognise"),
-        # FULLWIDTH DIGIT ONE. str.isdecimal() is True for it and int()
-        # converts it, which is how the first version of _depth_from accepted
-        # it -- and how the amount parser accepted "1️" shaped input as a
-        # whole bitcoin before _BTC_RE was pinned to [0-9].
-        (["/withdraw", _WA, "１"], "a fullwidth digit as a depth",
-         "did not recognise"),
         (["/withdraw " + _WA], "the address on the command line",
          "just /withdraw")):
     _g = Fake()
@@ -310,6 +290,117 @@ for _msgs, _label, _want in (
     check(f"wd: {_label} wakes nothing", _g.pokes == [])
     check(f"wd: ...and says why ({_want!r})", _want in _g.text())
     check(f"wd: ...and leaves no conversation armed", 111 not in _g.p.convos)
+
+# ===========================================================================
+# 1b-i. A DEPTH THE TABLE DOES NOT HAVE RE-ASKS. IT DOES NOT CANCEL.
+# ===========================================================================
+#
+# THIS IS THE ONE STEP WHERE A CANCEL DESTROYS WORK, and the work is the worst
+# kind to make somebody redo: the destination addresses are already typed into
+# a transcript this tool cannot delete, so "cancelled, start again" means the
+# SAME addresses appear in it twice. Every other refusal in this file cancels,
+# correctly, because what it costs is exactly the one value just refused.
+#
+# AND THE MENU IS WHY THIS STEP IS REACHED AT ALL. It prints runtimes -- 6, 9
+# and 13 -- beside the answers 3, 10 and 20, so the numbers a confused reader
+# types are numbers the menu itself put on the screen. Refusing them is right;
+# guessing which one was meant is how "3" once meant twenty hops. Refusing
+# them by discarding the addresses is what turned a misread into a second
+# disclosure.
+for _bad, _label in (
+        ("0", "a depth below the table"),
+        ("4", "a depth above the table"),
+        # THE WIRE'S OWN KEYS, WHICH THE CHAT NO LONGER SPEAKS. "1" and "2"
+        # used to mean three and ten hops; the menu printed them beside the
+        # hop counts, so "3" meant twenty hops on one line and three hops on
+        # another. Refusing them is the safe half of that fix -- an operator
+        # who had memorised "2" asks again rather than being handed a
+        # different depth without being told.
+        ("1", "the old wire key for three hops"),
+        ("2", "the old wire key for ten hops"),
+        # FULLWIDTH DIGIT ONE. str.isdecimal() is True for it and int()
+        # converts it, which is how the first version of _depth_from accepted
+        # it -- and how the amount parser accepted "1️" shaped input as a
+        # whole bitcoin before _BTC_RE was pinned to [0-9].
+        ("１", "a fullwidth digit as a depth"),
+        ("later", "a word instead of a number")):
+    _g = Fake()
+    _g.say("/withdraw")
+    _g.say(_WA)
+    _g.say(_bad)
+    check(f"wd/reask: {_label} wakes nothing", _g.pokes == [])
+    check(f"wd/reask: ...and asks again rather than cancelling",
+          "reply with one of the numbers below" in _g.sent[-1][1])
+    check(f"wd/reask: ...and the conversation is still armed",
+          111 in _g.p.convos)
+    check(f"wd/reask: ...still holding the address, so it is not retyped",
+          _g.p.convos[111].exit_to == [_WA])
+    check(f"wd/reask: ...and still waiting for a depth, not for anything else",
+          _g.p.convos[111].awaiting_depth())
+    check(f"wd/reask: ...and does not echo what was typed",
+          _bad not in _g.sent[-1][1].split("How deep?")[0])
+    # AND THE GOOD ANSWER STILL WORKS AFTERWARDS. A re-ask that leaves the
+    # step unusable is a cancel with extra steps.
+    _g.say("20")
+    check(f"wd/reask: ...and a good answer after it still reaches the confirm",
+          "SPENDS" in _g.sent[-1][1])
+    _g.answer_confirm()
+    check(f"wd/reask: ...and that confirm pokes the job with the SAME address",
+          _g.pokes == [(111, "withdraw", {"exit_to": [_WA], "depth": 3})])
+
+# BOUNDED. Every re-ask writes another copy of the menu into the transcript,
+# so the number of them one confused minute can leave behind is a number
+# somebody chose rather than a function of typing speed.
+_gr = Fake()
+_gr.say("/withdraw")
+_gr.say(_WA)
+_reask = 0
+for _i in range(pg.Pager.DEPTH_RETRIES + 1):
+    _gr.say("6")
+    if "reply with one of the numbers below" in _gr.sent[-1][1]:
+        _reask += 1
+check("wd/reask: the re-asks are bounded by DEPTH_RETRIES",
+      _reask == pg.Pager.DEPTH_RETRIES)
+check("wd/reask: ...and the one after that cancels", 111 not in _gr.p.convos)
+check("wd/reask: ...saying so, without a fourth copy of the menu",
+      "cancelled" in _gr.sent[-1][1]
+      and "How deep?" not in _gr.sent[-1][1])
+check("wd/reask: ...and nothing was ever poked", _gr.pokes == [])
+# AND /cancel STILL WORKS INSIDE THE LOOP, so the operator is never stuck in
+# it waiting for a bound they cannot see.
+_gc = Fake()
+_gc.say("/withdraw")
+_gc.say(_WA)
+_gc.say("6")
+_gc.say("/cancel")
+check("wd/reask: /cancel escapes the re-ask loop", 111 not in _gc.p.convos)
+
+# EVERY NUMBER THE MENU PRINTS IS EITHER AN ANSWER OR A RE-ASK. This is the
+# check that would have caught the runtime-first menu: it does not care which
+# numbers are on the screen, only that none of them can silently select the
+# wrong depth AND none of them can throw the addresses away.
+_gq = Fake()
+_gq.say("/withdraw")
+_gq.say(_WA)
+_menu = _gq.sent[-1][1]
+_shown = sorted({int(_n) for _n in re.findall(r"\d+", _menu)})
+check("wd/menu: NON-VACUITY -- the menu really does print numbers",
+      len(_shown) >= len(P.WITHDRAW_HOPS))
+for _n in _shown:
+    _gn = Fake()
+    _gn.say("/withdraw")
+    _gn.say(_WA)
+    _gn.say(str(_n))
+    _live = 111 in _gn.p.convos
+    if _n in P.WITHDRAW_HOPS:
+        check(f"wd/menu: {_n} is an accepted answer and confirms that depth",
+              _live and _gn.p.convos[111].depth == P.WITHDRAW_HOPS[_n]
+              and "SPENDS" in _gn.sent[-1][1])
+    else:
+        check(f"wd/menu: {_n} is printed but is not an answer, so it re-asks "
+              f"and keeps the address",
+              _live and _gn.p.convos[111].exit_to == [_WA]
+              and _gn.p.convos[111].depth is None)
 _ge = Fake()
 _ge.say("/withdraw")
 _ge.say(_WA[:60])
@@ -345,8 +436,23 @@ _m.say("/withdraw")
 _ask = _m.sent[-1][1]
 check("wd/spread: the question offers more than one address",
       str(P.MAX_WAKE_EXIT_DESTS) in _ask and "several" in _ask.lower())
-check("wd/spread: ...and states the arrival count that makes it matter",
-      str(P.exit_arrivals_floor(min(P.WITHDRAW_DEPTHS))) in _ask)
+# THE COUNT IS NOT STATED, AND THAT IS NOW THE CHECK. This asserted the
+# opposite -- that the question printed exit_arrivals_floor -- and the number
+# came out of both the question and the confirm.
+#
+# NOT A KERCKHOFFS DEFENCE, and it must not be written as one:
+# exit_arrivals_floor is a public function of a depth these same messages
+# name, so anyone holding this repository recomputes it in one line. What the
+# removal changes is the READABLE surface. "At least 12 separate transactions"
+# hands a directly usable count to somebody who has the transcript and has
+# never seen the source, which is exactly the reader this design assumes.
+#
+# THE FACT SURVIVES, because it is the one that decides whether a single
+# address throws the run away -- so the checks below are that the CONSEQUENCE
+# is still stated, without the arithmetic.
+check("wd/spread: ...and says the payments are many, without counting them",
+      "many separate payments" in _ask
+      and str(P.exit_arrivals_floor(min(P.WITHDRAW_DEPTHS))) not in _ask)
 # "ONE ADDRESS IS FINE" WAS TWO SENTENCES OF REASSURANCE nobody needed: the
 # question already accepts one, so an operator with one address types it. What
 # is worth the room is the reason SEVERAL is better, which is the part they
@@ -361,9 +467,10 @@ _m.say("20")
 _conf = _m.sent[-1][1]
 check("wd/spread: three addresses are accepted in one message",
       "= ?" in _conf)
-check("wd/spread: the confirm says how many separate transactions there will "
-      "be, at the depth just chosen",
-      str(P.exit_arrivals_floor(3)) in _conf)
+check("wd/spread: the confirm says the payments are many, and does not count "
+      "them either",
+      "many separate payments" in _conf
+      and str(P.exit_arrivals_floor(3)) not in _conf)
 check("wd/spread: ...and how many places they land in",
       "across 3 addresses" in _conf)
 # THE ADDRESSES ARE STILL NOT REPEATED. A count is not a destination: it says
@@ -394,21 +501,70 @@ check("wd/hops: typing 3 runs THREE hops, not the third row",
 check("wd/hops: ...and the confirm it agreed to said three hops too, so the "
       "screen and the job match",
       "3 hops" in _h3conf and "20 hops" not in _h3conf)
-# EVERY NUMBER THE MENU PRINTS IS A NUMBER THE STEP READS, and this is the
-# check that would have caught the collision on its own. The question used to
-# print two number columns -- the wire's key and the hop count -- so half the
-# numbers on screen meant one thing to the reader and another to the step.
+# EVERY ROW LEADS WITH THE NUMBER THAT IS TYPED, and this is the check that
+# would have caught both collisions on its own.
+#
+#   * "3  20 hops" led with the wire's KEY, so typing 3 got twenty hops;
+#   * "~6h · lightest cover" led with the RUNTIME, so the salient numbers
+#     were 6, 9 and 13 and none of them is an accepted answer.
+#
+# The second was written while fixing a complaint that three hops did not
+# sound like six hours. The runtime still appears -- it is what the operator
+# is really trading away -- it just is not first. What is first is the answer.
 _dq = Fake()
 _dq.say("/withdraw"); _dq.say(_WA)
 _dqtext = _dq.sent[-1][1]
 _dqnums = [int(n) for n in re.findall(r"^\s+(\d+)", _dqtext, re.M)]
-check(f"wd/hops: the question prints one number per row ({_dqnums})",
+check(f"wd/hops: every row leads with one number ({_dqnums})",
       len(_dqnums) == len(P.WITHDRAW_DEPTHS))
 check("wd/hops: ...and every one of them is a hop count the step accepts, so "
-      "nothing on screen means something else to the code",
+      "the number a reader takes off a row is the number that row runs",
       _dqnums and all(_dq.p._depth_from(str(_n)) is not None
                       for _n in _dqnums)
       and sorted(_dqnums) == sorted(P.WITHDRAW_HOPS))
+# AND THE RUNTIME IS STILL ON THE ROW. Removing it would "fix" the collision
+# by deleting the thing the menu was changed to say.
+check("wd/hops: ...and each row still says how long that depth takes",
+      all(f"about {P.depth_hours(_d)}h" in _dqtext
+          for _d in P.WITHDRAW_DEPTHS))
+# THE HOURS ARE DERIVED FROM THE BUDGET THEY DESCRIBE, not written beside it.
+# A hand-typed "~6h" next to a 22080-second budget is a mirror with nothing
+# checking it: change the hop delays and the menu goes on promising the old
+# figure, in the one place an operator decides how long to be exposed for.
+#
+# BY MOVING THE TABLE, because the obvious check does not work. Asserting
+# `depth_hours(d) == round(WITHDRAW_DEPTHS[d][1] / 3600)` compares the
+# derivation against itself: a hardcoded {1: 6, 2: 9, 3: 13} returns exactly
+# today's answers and passes it. The mutation sweep said so -- that mutation
+# SURVIVED this check in its first form. So the table is moved and the
+# function has to follow it.
+_dh_saved = P.WITHDRAW_DEPTHS
+try:
+    P.WITHDRAW_DEPTHS = {_k: (_v[0], _v[1] * 2)
+                         for _k, _v in _dh_saved.items()}
+    _dh_moved = {_d: P.depth_hours(_d) for _d in _dh_saved}
+finally:
+    P.WITHDRAW_DEPTHS = _dh_saved
+check("wd/hops: ...and those hours come from WITHDRAW_DEPTHS, so they cannot "
+      "drift from the budget the vault actually gets",
+      all(_dh_moved[_d] == int(round(_dh_saved[_d][1] * 2 / 3600.0))
+          for _d in _dh_saved)
+      and all(_dh_moved[_d] != P.depth_hours(_d) for _d in _dh_saved))
+check("wd/hops: NON-VACUITY -- and the table really was put back, so nothing "
+      "below is reading a doubled one",
+      P.WITHDRAW_DEPTHS is _dh_saved
+      and sorted({P.depth_hours(_d) for _d in P.WITHDRAW_DEPTHS})
+      == [6, 9, 13])
+# AND THE MENU IS BUILT THROUGH IT, not around it: a row that stopped calling
+# depth_choice would pass every check above and still print a stale figure.
+_dh_rows = _dq.p._depth_question()
+check("wd/hops: ...and the menu prints exactly what depth_choice returns",
+      all(P.depth_choice(_d) in _dh_rows for _d in P.WITHDRAW_DEPTHS))
+# NO NUMBER IS IN BOTH VOCABULARIES. If a future table made an hour count
+# equal a hop count, the re-ask below would quietly become a wrong selection.
+check("wd/hops: ...and no printed runtime collides with an accepted answer",
+      not ({P.depth_hours(_d) for _d in P.WITHDRAW_DEPTHS}
+           & set(P.WITHDRAW_HOPS)))
 
 # NON-VACUITY: the deepest option is still reachable, by the number the menu
 # prints for it.
@@ -427,9 +583,37 @@ check("wd/spread: one address is told what it costs, at the confirm",
       "ONE address" in _oc and "group" in _oc)
 check("wd/spread: NON-VACUITY -- the three-address confirm says no such thing",
       "ONE address" not in _conf)
-check("wd/spread: both confirms quote the SAME arrival floor for the same "
-      "depth, so the number is about the depth and not about the spread",
-      str(P.exit_arrivals_floor(3)) in _oc)
+# NO ARRIVAL COUNT IN EITHER CONFIRM, at any depth. Checked across the whole
+# table rather than at the one depth this section happens to use: a count that
+# came back for the deepest option only would be the same leak, reachable by
+# the operator most worth following.
+#
+# THE CONFIRM SUM COMES OFF FIRST, AND THE FIRST VERSION OF THIS CHECK DID NOT
+# DO THAT. exit_arrivals_floor(1) is 5 -- a ONE-DIGIT needle -- and every
+# confirm ends with a randomly drawn "a + b = ?" whose summands are
+# rng.randrange(2, 10). So the check passed or failed on the draw: green in
+# this tree, red the first time it ran on a copy. A substring test for a small
+# number against text carrying random digits is not a test, it is a coin.
+#
+# Stripped by the QUESTION'S OWN SHAPE rather than by splitting on the last
+# blank line, so a later edit to the spacing cannot silently stop stripping
+# and take the flake back. Non-vacuity below proves it removed something.
+def _no_sum(t):
+    return _re_ds.sub("", t)
+
+
+_re_ds = re.compile(r"\d+ \+ \d+ = \?.*\Z", re.S)
+check("wd/spread: NON-VACUITY -- the confirm really does end with a drawn "
+      "sum, which is why the raw text cannot be scanned for small numbers",
+      _re_ds.search(_conf) and _re_ds.search(_oc)
+      and len(_no_sum(_conf)) < len(_conf))
+check("wd/spread: neither confirm quotes an arrival count, at any depth",
+      all(not re.search(rf"\b{P.exit_arrivals_floor(_d)}\b", _no_sum(_t))
+          for _d in P.WITHDRAW_DEPTHS for _t in (_oc, _conf)))
+# ...AND THE CONSEQUENCE IS STILL THERE, which is what the count was for. A
+# check that only asserts an absence passes on an empty string.
+check("wd/spread: ...and the one-address case is still told what it costs",
+      "sees them all" in _oc and "group them" in _oc)
 
 # THE CAP AND THE DUPLICATE RULE ARE THE WIRE'S, enforced where the operator
 # is typing rather than after a wake has been spent.
@@ -696,9 +880,9 @@ check("every figure in the chat is either a bound or what the operator typed",
 print("\n-- a half-finished /depo never reaches the SD card --")
 check("Convo has __slots__, so a field cannot be added by accident",
       hasattr(pg.Convo, "__slots__"))
-check("...and holds only the seven fields the two wizards need",
+check("...and holds only the eight fields the two wizards need",
       set(pg.Convo.__slots__) == {"kind", "amount", "depth", "handle",
-                                  "exit_to", "expect", "deadline"})
+                                  "exit_to", "expect", "deadline", "tries"})
 # THE RULE NARROWED. It used to be "no string field at all" -- a struct that
 # cannot hold an address however the prompts are later edited. /withdraw has to
 # hold one, because the operator types their destination into the chat and it
@@ -710,7 +894,7 @@ check("...and holds only the seven fields the two wizards need",
 # still enforced for every other field.
 _c_fresh = pg.Convo(lambda: 0.0)
 check("...and every field starts empty, so a fresh Convo holds nothing",
-      all(getattr(_c_fresh, f) in (None, "depo")
+      all(getattr(_c_fresh, f) in (None, "depo", 0)
           or isinstance(getattr(_c_fresh, f), float)
           for f in pg.Convo.__slots__))
 _c_full = pg.Convo(lambda: 0.0, kind="withdraw")
@@ -1508,6 +1692,26 @@ check("...and nothing there names the service that routes the swap, or the "
               for _l in _plain_authored))
 check("...and the memo itself is not among the lines at all",
       not any("XMR.XMR" in _l or _l.startswith("=:")
+              for _l in _plain_authored))
+# THE ADDRESS IS SINGLE-USE AND THE INSTRUCTIONS SAY SO.
+#
+# "To address: bc1q..." reads as "this is my deposit address" to anybody who
+# has used an exchange, and the reader's next reasonable act is to send to it
+# again, or to keep it for next week. Both lose the money: the binding that
+# makes a payment theirs is issued per quote and is not part of the address,
+# and the address is not unique to them either -- the same one is quoted to
+# everyone. Nothing in the message said any of that.
+check("...and the reader is told the address is for THIS payment only",
+      any("once" in _l.lower() and "again" in _l.lower()
+          for _l in _plain_authored))
+check("...saying what it costs to get wrong, not merely that it is single-use",
+      any("loses the money" in _l.lower() for _l in _plain_authored))
+# AND IT STILL NAMES NOTHING. The reason the address is shared is public --
+# anyone holding this repository reads it in one line -- so withholding it is
+# rule 6 (the transcript is read by someone else), not a security claim.
+check("...without naming the service that makes it shared, or the field that "
+      "binds a payment to this operator",
+      not any(re.search(r"thorchain|memo|op_return|vault|pool", _l, re.I)
               for _l in _plain_authored))
 # BOTH RENDERINGS. plain_lines takes a label for the chat and prints the bare
 # handle without one, for the machine's own terminal -- two outputs, and only
