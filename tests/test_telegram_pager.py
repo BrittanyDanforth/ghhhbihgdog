@@ -175,6 +175,7 @@ def _wizard_params(answers):
     p.allow_users = set()
     p.handle_owner = {}
     p.handle_job = {}
+    p._status_at = None
     p.spenders = 1
     p.busy = _th.Lock()
     p.ignored = 0
@@ -755,6 +756,7 @@ def _wedge_pager(fail_on):
     p.args = types.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 0, {}
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
+    p._status_at = None
     p.spenders = 1
     p.busy = _th2.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
@@ -1115,6 +1117,7 @@ def _plain_pager(busy=False, why=""):
     p.args = _ty3.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 4, {}
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
+    p._status_at = None
     p.spenders = 1
     p.busy = _th3.Lock()
     if busy:
@@ -1605,6 +1608,7 @@ class _BurnPager:
         p.args = _ty2.SimpleNamespace()
         p.allow = {111}
         p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
+        p._status_at = None
         p.spenders = 1
         p.busy = __import__("threading").Lock()
         p.ignored = 0
@@ -1795,6 +1799,7 @@ def _room_pager(allow, users):
     p.args = _ty4.SimpleNamespace()
     p.allow, p.ignored, p.convos = set(allow), 0, {}
     p.allow_users, p.handle_owner, p.handle_job = set(users), {}, {}
+    p._status_at = None
     p.spenders = len(p.allow_users) or len(p.allow)
     p.burn_after = 0
     p.busy = _th4.Lock()
@@ -2149,6 +2154,56 @@ finally:
 check("shutdown: ...and send() needs neither the busy lock nor the worker "
       "thread, which is why this branch can use it at all",
       len(_sd2sent) == 2)
+
+# ---- /status WAS THE ONE COMMAND WITH NO COST TO SEND -------------------
+#
+# start_job charges the rate limit, and /status never reaches it. It wakes
+# nothing, so it cannot spend the vault's budget -- what it spends is one
+# Telegram POST over Tor per tap, on a Pi with 1 GB of RAM and Tor resident,
+# from a button that sits under almost every message this bot sends. A thumb
+# resting on it is a Tor circuit per second.
+#
+# A COOLDOWN, NOT A BUDGET: the honest answer cannot change faster than this,
+# so a repeat inside the window would return the same word anyway. Silent,
+# because a "slow down" line is itself a message, which is the thing being
+# rationed.
+print("\n== /status cannot be leaned on ==")
+_stp, _sts, _, _ = _tapper()
+_stclock = [500.0]
+_stp.clock = lambda: _stclock[0]
+for _ in range(10):
+    _stp.handle(_msg(111, 111, "/status"))
+check(f"status: ten taps in the same second answer once ({len(_sts)})",
+      len(_sts) == 1)
+check("status: ...and the answer is still the one word",
+      _sts[0][0] in ("ready", "wait"))
+_stclock[0] += pg.Pager.STATUS_COOLDOWN_S + 1
+_stp.handle(_msg(111, 111, "/status"))
+check("status: ...and it answers again once the window passes", len(_sts) == 2)
+# THE FIRST TAP AFTER A RESTART MUST ANSWER, and the first version of this
+# swallowed it. It initialised the marker to 0.0 and compared clock() - 0.0 --
+# self.clock is time.monotonic, which counts from an arbitrary point, so on a
+# freshly booted Pi that difference is inside the cooldown. "Never answered" is
+# a different state from "answered at time zero".
+for _t0, _lbl in ((0.0, "a Pi that has just booted"),
+                  (604800.0, "a Pi up for a week")):
+    _bp, _bs, _, _ = _tapper()
+    _bp.clock = lambda _v=_t0: _v
+    _bp.handle(_msg(111, 111, "/status"))
+    check(f"status: the first tap answers on {_lbl}", len(_bs) == 1)
+check("status: ...because 'never' is spelled differently from 'at zero'",
+      pg.Pager(_args, "123456:TOKEN", {}, {"https": "x"})._status_at is None)
+# NON-VACUITY: the throttle is /status's alone. It must not swallow the
+# commands that do something.
+_np, _ns, _, _nj = _tapper()
+_np.clock = lambda: 500.0
+_np.handle(_msg(111, 111, "/status"))
+_np.handle(_msg(111, 111, "/fee"))
+_np.handle(_msg(111, 111, "/help"))
+check("status: NON-VACUITY -- other commands in the same second still answer",
+      len(_ns) == 3)
+
+
 
 print("\n== a button from an earlier question ==")
 _dp, _ds, _dt, _dj = _tapper()

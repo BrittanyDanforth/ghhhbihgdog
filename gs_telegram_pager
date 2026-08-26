@@ -1102,6 +1102,10 @@ class Pager:
         #: restart empties it and the refusal simply stops firing, which is the
         #: same honest bound handle_owner already documents.
         self.handle_job = {}
+        #: When /status last answered, or None for never. Process memory,
+        #: like everything else here: a restart clears it, which costs one
+        #: extra reply and nothing else.
+        self._status_at = None
         #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
         #: otherwise -- a private chat id is a Telegram ACCOUNT, and Telegram
         #: gives one account one chat with a given bot however many devices it
@@ -1248,15 +1252,11 @@ class Pager:
         would write N of them.
         """
         _lo = proto.exit_arrivals_floor(min(proto.WITHDRAW_DEPTHS))
-        return (f"Send where? Reply with the address — or several.\n\n"
-                f"You can give up to {proto.MAX_WAKE_EXIT_DESTS}, separated by "
-                f"spaces — and it is worth it. This sends one transaction per "
-                f"mixed output (at least {_lo} at the shallowest depth, more "
-                f"at the others), so a single address collects every one of "
-                f"them and anyone watching it can group them again. Splitting "
-                f"them up is the last thing that stops that.\n\n"
-                f"One address is fine if that is what you have — an exchange "
-                f"deposit address cannot be split.\n\n"
+        return (f"Send where? Reply with the address — or several, "
+                f"separated by spaces (up to {proto.MAX_WAKE_EXIT_DESTS}).\n"
+                f"Several is better: this sends at least {_lo} separate "
+                f"transactions, and one address collects them all where "
+                f"anyone can group them.\n"
                 f"/cancel to stop.")
 
     def _settings_text(self) -> str:
@@ -1402,15 +1402,9 @@ class Pager:
         floor exists and which way to err, which is the whole of what it
         honestly knows.
         """
-        return (f"How much? Reply with the BTC amount you are about to send "
-                f"— for example 0.05.\n\n"
-                f"{proto.btc_display(proto.DEPOSIT_MIN_SAT)} to "
-                f"{proto.btc_display(proto.DEPOSIT_MAX_SAT)} is a TYPO GUARD, "
-                f"not a working range — it catches a slipped decimal point.\n"
-                f"There is a real floor as well, and it is much higher: "
-                f"below it the mix cannot run at ANY depth, and the money "
-                f"sits here unmixable. This end cannot work out what it is "
-                f"today. If in doubt send more, not less.\n"
+        return (f"How much? Reply with the BTC amount — for example 0.05.\n"
+                f"Too little and the mix cannot run at all. If in doubt, "
+                f"send more.\n"
                 f"/cancel to stop.")
 
     def _depth_question(self) -> str:
@@ -1440,6 +1434,11 @@ class Pager:
     #: both watching jobs refuse it with "Only a receive_and_quote handle can
     #: be watched". There is no configuration in which this changes.
     UNWATCHABLE_JOBS = ("receive_new",)
+
+    #: How often /status will answer. It is a cooldown rather than a budget
+    #: because the answer cannot change faster than this: `busy` flips when a
+    #: job starts or ends, and the rate limiter's own window is minutes.
+    STATUS_COOLDOWN_S = 15
 
     def _handle_buttons(self, h: str, job: str = "") -> list:
         """Check / wait, bound to the label this reply is about, or None.
@@ -2818,6 +2817,33 @@ class Pager:
             # "ready" or "wait Ns" answers that and discloses no history and no
             # power state -- a busy pager and a rate-limited one both say wait,
             # which is also true.
+            # ...AND IT IS THE ONE COMMAND WITH NO COST TO SEND.
+            #
+            # start_job charges the rate limit, and /status never reaches it --
+            # so this was free and unlimited. It wakes nothing, so it cannot
+            # spend the vault's budget; what it DOES spend is one Telegram POST
+            # over Tor per tap, on a Pi with 1 GB of RAM, from a button that
+            # sits under almost every message this bot sends. A thumb resting
+            # on it is a Tor circuit per second.
+            #
+            # A COOLDOWN, NOT A BUDGET. The honest answer to "can I start one"
+            # cannot change faster than this, so repeating inside the window
+            # would return the same word anyway. Answered from memory, with no
+            # reply at all on the second tap: a "slow down" line is itself a
+            # message, which is the thing being rationed.
+            # None, NOT 0.0, AND THAT IS NOT A STYLE CHOICE. The first
+            # version initialised this to 0.0 and compared `clock() - 0.0`.
+            # self.clock is time.monotonic, which counts from an arbitrary
+            # point -- on a freshly booted Pi it is a small number, so the
+            # FIRST /status after start was inside its own cooldown and was
+            # silently swallowed. "Never answered" is a different state from
+            # "answered at time zero", and it has to be spelled differently.
+            _now = self.clock()
+            if self._status_at is not None \
+                    and _now - self._status_at < self.STATUS_COOLDOWN_S:
+                integrity_log("pager", "status_throttled")
+                return
+            self._status_at = _now
             _why = self.limits.why_not()
             # THE ANSWER IS STILL ONE WORD. The buttons are what the operator
             # asked "can I start one right now" in order to do next, and

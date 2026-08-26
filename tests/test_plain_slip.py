@@ -487,6 +487,7 @@ _p = pg.Pager.__new__(pg.Pager)
 _p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
 _p.handle_owner = {}
 _p.handle_job = {}
+_p._status_at = None
 _p.spenders = 1
 _ok = [True]
 _p.send = lambda cid, t, buttons=None: (_sent.append(t), _ok[0])[1]
