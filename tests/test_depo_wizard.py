@@ -1438,18 +1438,66 @@ check(f"the scan reaches the button labels too ({len(_LABELS)} of them), "
       f"which land in the chat and stay under the message",
       len(_LABELS) >= 8)
 _all_sent += [(-1, _CURRENCY_RE.sub("", l)) for l in _LABELS]
-_exempt_total = _wc + sum(len(_CURRENCY_RE.findall(l)) for l in _LABELS)
+#: The deposit instructions name the currency too ("Expected out: ~1.2 XMR"),
+#: and the ceiling below is a TOTAL across every surface the scrub covers --
+#: so this has to be in it before it is checked, or the scrub would let a
+#: whole extra surface name the currency for free.
+_PLAIN_SAMPLE = {"b": "0.05000000", "d": "bc1qexample", "x": "1.23",
+                 "h": "A3F1", "m": "=:XMR.XMR:4example:0/1/0"}
+_plain_authored = [
+    _l for _l in P.plain_lines(_PLAIN_SAMPLE, label="A3F1-9C2B7E")
+    if _l and _l != _PLAIN_SAMPLE["m"]]
+_exempt_total = (_wc
+                 + sum(len(_CURRENCY_RE.findall(l)) for l in _LABELS)
+                 + sum(len(_CURRENCY_RE.findall(l)) for l in _plain_authored))
 # THE EXEMPTION SHRANK WHEN /address WENT. "⬇ Monero in" was the second
 # mention; with the command gone the welcome's headline is the only one left,
 # which is the smallest the exemption can be while the service still says what
 # it deals in.
 check(f"the currency exemption stays bounded across every surface it covers "
-      f"({_exempt_total} mentions in the welcome and the labels together)",
-      _exempt_total <= 2)
+      f"({_exempt_total} mentions across the welcome, the button labels and "
+      f"the deposit instructions)",
+      _exempt_total <= 3)
 # NON-VACUITY on the scrub: it is what lets those surfaces through, so it has
 # to actually be doing something, or the cap above is guarding nothing.
 check("NON-VACUITY -- the surfaces the scrub covers really do name it",
       _exempt_total >= 1)
+# ---- AND THE DEPOSIT INSTRUCTIONS, WHICH LIVE IN ANOTHER FILE -----------
+#
+# THE DEFECT THIS FOUND. gs_wake_proto.plain_lines builds the message the chat
+# sends with --deposit-in-chat on, and the pager forwards it verbatim. It said
+#
+#     "A payment without it is one ThorChain cannot route."
+#
+# THORCHAIN IS ON THE BANNED LIST above -- the same list that keeps "vault",
+# "keyfile" and "ghostspiral" out of every reply -- and it reached the chat
+# anyway, because _sent_strings reads literals in gs_telegram_pager and these
+# are in gs_wake_proto. That is the identical defect already recorded for
+# PHASE_LINES, on the one surface that carries an address and an amount.
+#
+# THE AUTHORED TEXT, NOT THE VALUES. The address, the amount and the memo are
+# runtime values off a quote -- nobody wrote them and no scan can read them
+# from source. What is authored is the labels and the OP_RETURN sentence, and
+# that is what a banned word can hide in.
+check(f"the scan reaches the deposit instructions too, which live in "
+      f"gs_wake_proto and are sent verbatim ({len(_plain_authored)} lines)",
+      len(_plain_authored) >= 5)
+_all_sent += [(-1, _CURRENCY_RE.sub("", _l)) for _l in _plain_authored]
+# NON-VACUITY: the line the defect was in really is among them, so this is
+# scanning the thing it was written for.
+check("...including the OP_RETURN instruction, which is where the service "
+      "name was",
+      any("OP_RETURN" in _l for _l in _plain_authored))
+check("...and it no longer names the service that routes the swap",
+      not any(re.search(r"thorchain", _l, re.I) for _l in _plain_authored))
+# BOTH RENDERINGS. plain_lines takes a label for the chat and prints the bare
+# handle without one, for the machine's own terminal -- two outputs, and only
+# one of them was being looked at.
+_all_sent += [(-1, _CURRENCY_RE.sub("", _l))
+              for _l in P.plain_lines(_PLAIN_SAMPLE)
+              if _l and _l != _PLAIN_SAMPLE["m"]
+              and _l not in _plain_authored]
+
 # EVERY BUTTON TABLE, not the one the menu happens to use. A `buttons=` that
 # named a fifth table would be a keyboard nothing above reads.
 #

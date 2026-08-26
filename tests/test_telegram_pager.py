@@ -1184,6 +1184,7 @@ def _plain_pager(busy=False, why="", spenders=1):
     p._chain = None
     p._chain_leg = 0
     p._status_at = {}
+    p._running = None
     p.spenders = spenders
     p.busy = _th3.Lock()
     if busy:
@@ -1257,16 +1258,58 @@ _sp5.handle({"update_id": 1, "message": {"chat": {"id": 111},
 check("status: NON-VACUITY -- one spender still answers 'ready'",
       _ss5 == ["ready"])
 
-# 2. THE WHOLE MANUAL ON EVERY TYPO. f"no: {err}\n\n{HELP}" put the full
-#    command list -- including the memo line -- back into the chat on each
-#    mistake.
+# 2. AN UNKNOWN COMMAND GETS NOTHING BACK.
+#
+#    It used to get the whole manual -- f"no: {err}\n\n{HELP}" put the command
+#    list, memo line and all, into the chat on every mistake -- and then, for
+#    a while, "no: unknown command". Both are a POST from the Pi over Tor for
+#    a command that does not exist, and both tell whoever typed it that this
+#    bot is alive and listening. That is the same disclosure an unallowlisted
+#    chat is refused for; the menu is published and Telegram autocompletes it,
+#    so answering buys nothing else.
 _hp, _hs = _plain_pager()
 _hp.handle({"update_id": 1, "message": {"chat": {"id": 111},
                                         "message_id": 1, "text": "/nope"}})
-check("help: a typo is answered with the error alone",
-      len(_hs) == 1 and _hs[0].startswith("no:"))
-check("help: ...and does not reprint the command list",
-      "OP_RETURN" not in _hs[0] and "/watch" not in _hs[0])
+# THE SENTINEL IS NOT A MESSAGE, and it must never become one. It is the
+# third slot's third state -- "no job AND nothing to say" -- and "" was
+# already taken by "no error". A NUL is in it on purpose: _CTRL_RE strips
+# those from anything this bot renders, so even a path that mistook it for
+# text could not put it on the wire intact.
+check("help: the silence sentinel carries a control character, so it cannot "
+      "be confused with a reply",
+      "\x00" in pg.IGNORE and pg._CTRL_RE.search(pg.IGNORE))
+check("help: an unknown command is answered with silence", _hs == [])
+check("help: ...and is COUNTED, so a burst of them is visible rather than "
+      "vanishing", _hp.ignored == _plain_pager()[0].ignored + 1)
+# THE RETIRED SPELLINGS TOO. /address used to explain itself -- "nothing here
+# swaps Monero to Bitcoin, so it could take money in and never say where" --
+# which is a description of the toolchain's shape in the one surface every
+# other reply is scrubbed of.
+for _gone in ("/address", "/addr", "/receive", "/recv"):
+    _gp, _gs = _plain_pager()
+    _gp.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                            "message_id": 1, "text": _gone}})
+    check(f"help: {_gone} is silent too, and explains nothing about the "
+          f"toolchain",
+          _gs == [] and _gp.ignored == _plain_pager()[0].ignored + 1)
+# NON-VACUITY: a bare message is NOT a typo -- it is an answer with no
+# question, and telling somebody their answer is an unknown command is how
+# this reads as broken. That one still gets a sentence.
+_bp, _bs = _plain_pager()
+_bp.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                        "message_id": 1, "text": "0.05"}})
+check("help: NON-VACUITY -- an answer with no question still gets one",
+      len(_bs) == 1 and "waiting for an answer" in _bs[0])
+# AND NOTHING THIS BOT SENDS IS EVER THE SENTINEL, driven across every command
+# it has: a path that returned it as text would print a NUL into the chat.
+_zp, _zs = _plain_pager()
+for _cmd in ([f"/{_c}" for _c, _d in pg.BOT_COMMANDS]
+             + ["/address", "/nope", "0.05", "/check ZZZZ", "/depo 2"]):
+    _zp.handle({"update_id": 1,
+                "message": {"chat": {"id": 111}, "message_id": 1,
+                            "text": _cmd}})
+check(f"help: no reply on any command is the sentinel ({len(_zs)} replies)",
+      _zs and not any(pg.IGNORE in _t or "\x00" in _t for _t in _zs))
 # NON-VACUITY: /help itself still prints it, once, on request.
 _hp2, _hs2 = _plain_pager()
 _hp2.handle({"update_id": 1, "message": {"chat": {"id": 111},
@@ -1376,12 +1419,14 @@ for _old, _want in (("/depo", "depo_wizard"), ("/withdraw", "withdraw_wizard"),
     _j, _p2, _e = pg.parse_command(_old)
     check(f"help: the old spelling {_old!r} still works",
           _j == _want or _e == _want)
-# /recv and /address are ANSWERED rather than routed: the job is gone, and a
-# sentence saying so beats "unknown command", which reads as a broken bot.
+# /recv and /address are NEITHER routed NOR answered. They used to get a
+# sentence saying why the job was removed -- which is a description of the
+# toolchain's shape in the surface every other reply is scrubbed of, and a
+# POST from the Pi for a command that does not exist.
 for _gone in ("/recv", "/receive", "/address", "/addr"):
-    check(f"help: {_gone!r} is answered with a reason rather than routed",
+    check(f"help: {_gone!r} composes no job and says nothing",
           pg.parse_command(_gone)[0] == ""
-          and "gone" in pg.parse_command(_gone)[2].lower())
+          and pg.parse_command(_gone)[2] == pg.IGNORE)
 
 
 # ===========================================================================
@@ -2770,8 +2815,10 @@ check("orphan answer: ...it says nothing is waiting, and what to type",
 check("orphan answer: ...and does not echo what they typed back into the "
       "transcript, which may be an amount or an address",
       "0.05" not in _utext)
-check("orphan answer: NON-VACUITY -- a mistyped COMMAND still gets the "
-      "command answer", pg.parse_command("/nope")[2] == "unknown command")
+check("orphan answer: NON-VACUITY -- the two really are different paths: a "
+      "mistyped COMMAND is silent where a bare answer is not",
+      pg.parse_command("/nope")[2] == pg.IGNORE
+      and pg.parse_command("0.05")[2] != pg.IGNORE)
 _sp, _ss, _, _ = _tapper()
 _sp.handle(_msg(111, 111, "/status"))
 check("tap: /status carries it too — it is the command an operator sends in "
@@ -3253,16 +3300,22 @@ print("\n== /address is gone, and says so ==")
 check("address: the job is off the wire", "receive_new" not in P.JOBS)
 check("address: ...and the pager cannot compose it either",
       "receive_new" not in pg.CHAT_NAME)
-# ANSWERED, NOT IGNORED. An operator with the word in their fingers gets a
-# sentence; "unknown command" reads as a broken bot.
+# IGNORED, NOT ANSWERED, and this reversed an earlier decision here.
+#
+# The first version answered with a sentence, on the reasoning that "unknown
+# command" reads as a broken bot. True of "unknown command" -- and the fix was
+# to stop saying that to ANY unknown command, not to write an explanation for
+# these four. What the sentence actually did was put "nothing here swaps
+# Monero to Bitcoin, so it could take money in and never say where" into the
+# readable surface: a description of the toolchain's SHAPE, in the one place
+# every other reply is scrubbed of exactly that.
 for _old in ("/address", "/addr", "/receive", "/recv"):
     _j, _p, _e = pg.parse_command(_old)
-    check(f"address: {_old} is answered with a reason, not a job",
-          _j == "" and _p == {} and "gone" in _e.lower())
-    check(f"address: ...and points at the way in that exists",
-          "/deposit" in _e)
-check("address: ...and says WHY, since 'gone' alone invites asking for it back",
-      "swaps Monero to Bitcoin" in pg.parse_command("/address")[2])
+    check(f"address: {_old} composes no job and says nothing",
+          _j == "" and _p == {} and _e == pg.IGNORE)
+check("address: ...and nothing anywhere explains what the tool does not swap",
+      not any("swaps" in str(pg.parse_command(_c)[2]).lower()
+              for _c in ("/address", "/addr", "/receive", "/recv")))
 # NOTHING OFFERS IT ANY MORE.
 check("address: it is off the published command list",
       "address" not in dict(pg.BOT_COMMANDS))
@@ -3401,13 +3454,14 @@ check("welcome: ...and neither surface still promises only one",
 # with the old word already in their fingers, and that reader types /help.
 check("welcome: the removed command is not explained to a first-time reader",
       "receive" not in pg.WELCOME.lower() and "/address" not in pg.WELCOME)
-# ...BUT AN OPERATOR WITH THE OLD WORD IS STILL ANSWERED, in parse_command
-# rather than in the welcome: the welcome is read by somebody who has never
-# used this bot, and a sentence about a command that no longer exists is a
-# fact about a thing they have never seen.
-check("welcome: ...but the old spellings are still answered somewhere, so an "
-      "operator who learned them is not left guessing",
-      all("gone" in pg.parse_command(_c)[2].lower()
+# ...AND NOT ANYWHERE ELSE EITHER. parse_command used to answer the old
+# spellings with a sentence, so this pair of checks said "not in the welcome,
+# but explained over there". The explanation is gone from both: it described
+# the toolchain's shape, which is what the whole scrub exists to keep out, and
+# it was a POST from the Pi for a command that does not exist.
+check("welcome: ...and the old spellings are not explained anywhere else "
+      "either, because the explanation was the leak",
+      all(pg.parse_command(_c)[2] == pg.IGNORE
           for _c in ("/address", "/addr", "/receive", "/recv")))
 check("welcome: ...and the aliases /help DOES name really are accepted",
       all(pg.parse_command(_c)[0] == _j or pg.parse_command(_c)[2] == _j

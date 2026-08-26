@@ -760,8 +760,23 @@ def plain_lines(plain: dict, label: str = "") -> list:
         f"Confirmation:  {label}" if label else
         f"Slip:          {plain.get('h', '')}",
         "",
-        "The memo below MUST go in an OP_RETURN in the same transaction.",
-        "A payment without it is one ThorChain cannot route.",
+        # ONE LINE, AND IT NAMES NO SERVICE.
+        #
+        # This was two lines and the second said "A payment without it is one
+        # ThorChain cannot route." THORCHAIN IS ON THE BANNED LIST -- the same
+        # list that keeps "vault", "keyfile" and "ghostspiral" out of every
+        # reply -- and this text reached the chat anyway, because the scan
+        # that enforces it reads string literals in gs_telegram_pager and
+        # these live here. That is the identical defect already recorded for
+        # PHASE_LINES, where two lines said "check it on the vault" and "the
+        # vault's wallet is not scanning" for exactly the same reason: chat
+        # text that lives in another file is still chat text.
+        #
+        # The instruction survives without the noun. Which aggregator routes
+        # the swap is the operator's business and nobody else's; what the
+        # person paying has to do is put the line below in the OP_RETURN.
+        "The line below MUST go in the transaction's OP_RETURN, or the "
+        "payment cannot be matched to you.",
         "",
         plain.get("m", ""),
     ]
@@ -1974,10 +1989,13 @@ WITHDRAW_HOPS = {v[0]: k for k, v in WITHDRAW_DEPTHS.items()}
 #: minimum NO depth can mix it and the refusal is unambiguous; above it, the
 #: withdrawal confirm already names the depth it is about to use.
 #:
-#: TWO FIGURES, because the usage fee changes it. A cut has to be worth more
-#: than it costs to spend, and that floor is well above the mixing one at
-#: three wallets -- so on a keyfile that names a fee destination it is the
-#: CUT, not the mix, that sets how small a deposit may be.
+#: TWO FIGURES, AND ONLY THE FIRST IS A FLOOR. The second is the balance below
+#: which no usage fee can be taken -- a cut has to be worth more than it costs
+#: to spend -- and plan_usage_fee WAIVES it there rather than refusing, so the
+#: mix goes ahead in full. It is published because an operator depositing
+#: between the two should know their run will earn nothing, and it must NEVER
+#: gate: doing that refuses deposits that would mix, and abandons arrivals a
+#: withdrawal should have taken.
 #:
 #: BOTH ARE UNDERSTATEMENTS, deliberately and unavoidably. They are computed
 #: at GhostSpiral's FALLBACK network fee; the real fee comes from the daemon
@@ -1994,10 +2012,30 @@ MIX_MINIMUM_XMR_MIRROR = "0.1784"
 MIX_MINIMUM_XMR_WITH_CUT_MIRROR = "0.3364"
 
 
-def deposit_min_out_xmr(with_cut: bool) -> str:
-    """The floor a quote must clear for the mix to be able to run at all."""
-    return (MIX_MINIMUM_XMR_WITH_CUT_MIRROR if with_cut
-            else MIX_MINIMUM_XMR_MIRROR)
+def deposit_min_out_xmr() -> str:
+    """The floor a quote must clear for the mix to be able to run at all.
+
+    NO ARGUMENT, AND THE FIRST VERSION TOOK ONE. It picked the with-cut figure
+    when the keyfile named a fee destination, on the assumption that a run
+    which takes a cut needs more. It does not: GhostSpiral's plan_usage_fee
+    WAIVES a cut worth less than it costs to spend and says so --
+
+        "NO USAGE FEE TAKEN ... The mix is going ahead in full."
+
+    -- because that branch runs after the swap has settled, and aborting there
+    would strand a settled deposit to protect one run's fee. So the with-cut
+    number answers "can a FEE be taken", which is a different question from
+    "can this be MIXED", and only the second one is a floor.
+
+    Using it as one was wrong in both directions and worse in the second:
+    the deposit gate refused quotes between the two figures that would have
+    mixed perfectly well with the fee waived, and the withdraw chain ABANDONED
+    arrivals in that band -- telling the operator "that was the last one here,
+    nothing left to send" about money that is still there. A false statement
+    about their balance, which is the class of defect the chain was added to
+    remove.
+    """
+    return MIX_MINIMUM_XMR_MIRROR
 
 
 #: GhostSpiral.DECOY_MIN, mirrored, because the box that has to state the

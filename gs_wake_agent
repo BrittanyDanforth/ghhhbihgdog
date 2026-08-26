@@ -918,12 +918,12 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
              # could do about it. gs_wake_proto.MIX_MINIMUM_XMR_MIRROR has
              # the sequence in full.
              #
-             # WHICH FLOOR depends on whether a cut will be taken, decided by
-             # the same predicate _withdraw_fee_argv uses: a keyfile naming a
-             # fee destination means the withdrawal takes one, and the cut's
-             # own spend floor is what sets the minimum at three wallets.
-             "--min-out-xmr",
-             proto.deposit_min_out_xmr(bool(fee_addresses(key))),
+             # ONE FLOOR, AND IT IS NOT THE ONE A FEE WOULD NEED. This first
+             # passed the with-cut figure when the keyfile named a fee
+             # destination, which refused quotes that would have mixed
+             # perfectly well: plan_usage_fee waives a cut too small to spend
+             # and the mix goes ahead in full.
+             "--min-out-xmr", proto.deposit_min_out_xmr(),
              "--outfile", str(artifact_dir / f"thor_pairs_{handle}.json")],
         ]
     if job == "watch":
@@ -1220,8 +1220,31 @@ def _withdraw_fee_argv(key: dict, dests=(), owned=()) -> list:
     reuse is divided by however many the operator paired, which is a reduction
     and is not unlinkability -- see fee_addresses.
     """
-    return ["--usage-fee"] if fee_addresses(
-        key, exclude=list(dests) + list(owned)) else []
+    # A SILENT ZERO IS A HIDDEN BROKEN FEE, so the three ways of taking none
+    # are told apart in the chain rather than all looking like "no fee".
+    #
+    # Driven across every configuration: a keyfile with a fee destination
+    # takes nothing when that destination is ALSO an --exit-to (GhostSpiral
+    # refuses the whole run when they overlap, so it is dropped here first)
+    # and when it turns out to be an address of the wallet being mixed. Both
+    # are correct -- a cut landing on the exit is not a cut, and one on the
+    # mixing wallet is swept back out -- and both used to be indistinguishable
+    # from "the operator never asked for a fee". Over many runs that is an
+    # operator earning nothing and having no way to find out why.
+    #
+    # THE CHAIN AND NOT THE CHAT. The vault's integrity log is 0600 on the
+    # machine that already knows every one of these values; putting a fee
+    # configuration into the transcript would be publishing the one number an
+    # analyst divides by to read the deposit.
+    _all = fee_addresses(key)
+    _usable = fee_addresses(key, exclude=list(dests) + list(owned))
+    if _usable:
+        return ["--usage-fee"]
+    if not _all:
+        integrity_log("wake", "fee_none_configured")
+    else:
+        integrity_log("wake", "fee_all_excluded")
+    return []
 
 
 #: Where a woken job's children write. NOT the journal. 0600, in the artifact
@@ -1818,15 +1841,20 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             # slots, and comes back "withdraw: failed" with a hint about
             # mixing depth that is not the reason.
             #
-            # The same floor the deposit gate uses, by the same predicate --
-            # a keyfile naming a fee destination means a cut is taken, and the
-            # cut's own spend floor is what binds at three wallets.
+            # The same floor the deposit gate uses: what can be MIXED, not
+            # what a fee would need. This first used the with-cut figure when
+            # the keyfile named a fee destination, which ABANDONED arrivals
+            # between the two and told the operator "that was the last one
+            # here, nothing left to send" about money still sitting there --
+            # a false statement about their balance, on the surface this chain
+            # was added to stop making one. plan_usage_fee waives a cut too
+            # small to spend and the mix goes ahead in full.
+            #
             # Decimal(10 ** 12) is how GhostSpiral itself converts atomic
             # units, spelled the same way here so the two cannot disagree
             # about what a piconero is.
             _left_xmr = Decimal(str(_left[3])) / Decimal(10 ** 12)
-            _floor = Decimal(proto.deposit_min_out_xmr(
-                bool(fee_addresses(key))))
+            _floor = Decimal(proto.deposit_min_out_xmr())
             return "more_left" if _left_xmr >= _floor else ""
         except Exception:                                    # noqa: BLE001
             # The wallet could not be asked. "" is honest: the operator is

@@ -577,6 +577,15 @@ DEFAULT_DAILY_CAP = 12
 #: `$` also matches before a trailing newline (see gs_common's validators).
 HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 
+#: "SAY NOTHING", as a value rather than an empty string.
+#:
+#: parse_command's third slot is an error to show, and "" already means "there
+#: is no error, the job is in slot one". A third state was needed: there is no
+#: job AND there is nothing to say. Spelled as a sentinel so handle() cannot
+#: confuse it with a message that happens to be empty, and so a grep for it
+#: finds every silent path.
+IGNORE = "\x00ignore"
+
 # ---------------------------------------------------------------------------
 #  THE CONFIRMATION NUMBER
 # ---------------------------------------------------------------------------
@@ -1035,9 +1044,16 @@ def parse_command(text: str) -> tuple:
     # ANSWERED, NOT IGNORED. An operator with the word in their fingers gets a
     # sentence rather than "unknown command", which reads as a broken bot.
     if cmd in ("/address", "/addr", "/receive", "/recv"):
-        return "", {}, ("/address is gone — nothing here swaps Monero to "
-                        "Bitcoin, so it could take money in and never say "
-                        "where. /deposit is the way in.")
+        # SILENCE, LIKE ANY OTHER COMMAND THIS BOT DOES NOT HAVE.
+        #
+        # This used to answer "/address is gone -- nothing here swaps Monero
+        # to Bitcoin, so it could take money in and never say where." Two
+        # things wrong with that. It puts an explanation of the toolchain's
+        # SHAPE into the readable surface, which is the thing every other
+        # reply is scrubbed of; and it is a reply, which is a POST from the Pi
+        # over Tor for a command that does not exist. Retired spellings are
+        # not a special case worth either cost.
+        return "", {}, IGNORE
     # ONE COMMAND, SEVERAL SPELLINGS. "depo" was the only name and it is not a
     # word: nobody who had not read the source knew what it did. The long form
     # is what the menu advertises; the short ones keep working because they are
@@ -1127,7 +1143,20 @@ def parse_command(text: str) -> tuple:
     if not cmd.startswith("/"):
         return "", {}, ("nothing here is waiting for an answer. /deposit to "
                         "pay in, /withdraw to be paid out.")
-    return "", {}, "unknown command"
+    # AN UNKNOWN COMMAND GETS NOTHING.
+    #
+    # It used to get "no: unknown command". Every reply is a POST from the Pi,
+    # over Tor, on a box whose whole job is to be reachable -- and the menu is
+    # published, so a "/" in Telegram autocompletes the real ones. What
+    # answering buys is telling somebody who typed a command this bot does not
+    # have that it is alive and listening, which is the same disclosure an
+    # unallowlisted chat is already refused for.
+    #
+    # THE BARE-MESSAGE BRANCH ABOVE STAYS. That is an ANSWER WITH NO QUESTION
+    # -- somebody typing the amount a dropped wizard asked for -- and telling
+    # them their answer is an unknown command is how this reads as broken.
+    # They are asking for something; this branch is a typo.
+    return "", {}, IGNORE
 
 
 class Convo:
@@ -3286,6 +3315,13 @@ class Pager:
             self.send(cid, _why if _why
                       else ("wait" if self.busy.locked() else "ready"),
                       buttons=MENU_BUTTONS)
+            return
+        if err == IGNORE:
+            # NOTHING GOES BACK. Counted, so a burst of them is visible in the
+            # chain and in /status's own bookkeeping rather than vanishing --
+            # silence is the reply, not the absence of one.
+            self.ignored += 1
+            integrity_log("pager", "unknown_command")
             return
         if err:
             # A BARE NUMBER WITH NO LIVE CONVERSATION is the commonest way to
