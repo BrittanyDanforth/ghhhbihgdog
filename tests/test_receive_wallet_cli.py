@@ -16,6 +16,7 @@ These are argument-parsing and gate checks: no daemon, no wallet, no binaries.
 They run the REAL main() and assert on its exit, rather than re-implementing
 the conditions.
 """
+import re
 import importlib.machinery, importlib.util, io, os, sys, contextlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -102,6 +103,26 @@ check("a failed fresh-account creation refuses to fall back to account 0",
       "Refusing to fall back to account 0" in _src)
 check("...and an explicit --account 0 is still warned about as the PRIMARY "
       "address", "You asked for account 0" in _src)
+
+# ---- THE GUIDANCE MUST NOT WALK PAST A GATE THIS TOOLCHAIN ADDED --------
+#
+# print_next_steps prints the thor_swap_preparer command the operator is meant
+# to run next, and it omitted --min-out-xmr -- the gate that refuses a quote
+# too small to mix, at the one moment refusing is free. Following the printed
+# command produced a quote with no minimum, so the payment settled and only
+# then met the mixing floor, with the money on an address the swap memo names
+# publicly. The function's own docstring states the rule it was breaking:
+# "a fix that the guidance walks the operator around is not a fix."
+check("next steps: the printed quote command carries the minimum gate",
+      "--min-out-xmr" in _src)
+check("next steps: ...and does not print a figure for it, because the figure "
+      "moves with the network fee and only GhostSpiral can compute it",
+      "--print-limits" in _src
+      and not re.search(r"--min-out-xmr\s+0\.\d", _src))
+# NON-VACUITY: it still prints the two flags that were always there, so this
+# is an addition rather than a rewrite that dropped something.
+check("next steps: NON-VACUITY -- the destination and proxy flags survive",
+      "--dest-from-receive-wallet" in _src and "--tor-proxy" in _src)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

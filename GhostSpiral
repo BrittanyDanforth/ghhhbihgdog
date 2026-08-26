@@ -7377,6 +7377,40 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
     ROUND_DOWN, so the cut is never larger than the fraction asked for. The
     remainder stays with the mix, which is the direction that cannot surprise
     the depositor.
+
+    ---- WHY THE CUT IS NOT TAKEN MID-MIX, ASKED AND MEASURED ----------------
+
+    The obvious improvement is to take the cut from a LATER hop instead of
+    straight off the fan-out, so it inherits the mixing the rest of the money
+    gets. It does not fix the thing it looks like it fixes.
+
+    Mixing hides the GRAPH. It does not hide AMOUNTS. The cut is a published
+    fraction of the deposit, and the quantization here is to DUST_XMR
+    (0.0001 XMR), which is far too fine to blur one. Measured on this code:
+
+        deposit 0.5     -> cut 0.0055  -> /0.011 = 0.5
+        deposit 3.7     -> cut 0.0407  -> /0.011 = 3.7
+        deposit 98.7654 -> cut 1.0864  -> /0.011 = 98.7636
+
+    Four significant figures, from an output twenty hops deep just as readily
+    as from one. So a mid-mix cut buys graph distance against an adversary who
+    already has the amount, which is the one they do not need help with.
+
+    What it COSTS is not nothing: the fee value would have to be carried
+    through every hop (raising the minimum deposit), and the cut would then
+    exist among outputs the exit enumerates -- where the only thing keeping it
+    off --exit-to today is that it is absent from addr_index, an omission a
+    hop planner would have to reproduce at every round.
+
+    JITTERING THE CUT was the other candidate and is worse than it looks. A
+    down-jitter preserves "never more than asked", but an analyst who knows
+    the distribution recovers a band rather than a number -- and it costs the
+    operator real revenue for that band.
+
+    The leak is where the fee is SPENT, and that is the operator's action, not
+    this tool's: gs_console's fee panel already states it, and the answer is
+    one account per run (which this does) and never spending two of them in
+    one transaction (which nothing here can enforce).
     """
     pct = getattr(args, "usage_fee_pct", None)
     if not pct or pct <= 0:

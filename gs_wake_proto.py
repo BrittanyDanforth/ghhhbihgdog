@@ -267,11 +267,33 @@ if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
 #: become a channel.
 PLAIN_FIELDS = {
     "b": 24,      # btc_in, as a decimal string
-    "d": 100,     # the ThorChain inbound deposit address
-    "m": 220,     # the swap memo
+    "d": 100,     # the pooled inbound deposit address
     "x": 32,      # expected_xmr
     "h": 4,       # the handle
 }
+#: THE MEMO IS GONE FROM THIS RECORD, and it is the field that mattered.
+#:
+#: It used to travel: "m", 220 characters, rendered into the chat in its own
+#: message. It is the ONLY field here that identifies anybody. The deposit
+#: address is a shared pooled vault paid by everyone swapping the same pair
+#: and identifies nobody; the amount is already in the transcript because the
+#: confirm echoes it back; the handle is four hex characters this box drew.
+#: The memo NAMES THE DESTINATION MONERO ADDRESS IN FULL -- so sending it put
+#: a permanent link between this chat and one Monero address into a surface
+#: this design assumes is read by somebody else.
+#:
+#: AND IT CLOSES THE ONE WAY THIS CHANNEL COULD LOSE THE DEPOSIT. The memo is
+#: the entire binding between the Bitcoin and the Monero, so whoever held the
+#: bot token could leave the address correct, substitute their own memo, and
+#: take the payment -- irreversibly, with nothing the phone could check,
+#: because someone holding the token IS the bot as far as the phone can tell.
+#: OPSEC_SETUP.md argued at length that no scheme rescues that. Not sending a
+#: memo does: there is no longer one in the chat to replace.
+#:
+#: NOTHING IS LOST. Composing the OP_RETURN needs a desktop wallet, which is
+#: the machine that ran the job and already holds the memo on disk. The chat's
+#: job is to say a swap is quoted, for how much, and to what address -- and
+#: it still does all three.
 #: dest_xmr is DELIBERATELY ABSENT. The sealed slip carries it so gs_unseal can
 #: re-check memo_binds_destination on a second machine. A phone cannot run that
 #: check, so the field would be a second copy of the destination in the
@@ -748,6 +770,7 @@ def plain_lines(plain: dict, label: str = "") -> list:
         f"Expected out:  ~{plain.get('x', '')} XMR",
         # THE LABEL THE READER CAN ACTUALLY USE, and the caller decides what
         # that is because this function does not know who is reading.
+        # (see below: the memo is no longer among these lines at all)
         #
         # It printed "Slip:" and the bare four-hex handle for both readers.
         # For the doorbell's terminal that is right -- it is the operator's own
@@ -760,25 +783,17 @@ def plain_lines(plain: dict, label: str = "") -> list:
         f"Confirmation:  {label}" if label else
         f"Slip:          {plain.get('h', '')}",
         "",
-        # ONE LINE, AND IT NAMES NO SERVICE.
+        # THE MEMO IS NOT HERE AND NEITHER IS AN INSTRUCTION FOR IT.
         #
-        # This was two lines and the second said "A payment without it is one
-        # ThorChain cannot route." THORCHAIN IS ON THE BANNED LIST -- the same
-        # list that keeps "vault", "keyfile" and "ghostspiral" out of every
-        # reply -- and this text reached the chat anyway, because the scan
-        # that enforces it reads string literals in gs_telegram_pager and
-        # these live here. That is the identical defect already recorded for
-        # PHASE_LINES, where two lines said "check it on the vault" and "the
-        # vault's wallet is not scanning" for exactly the same reason: chat
-        # text that lives in another file is still chat text.
-        #
-        # The instruction survives without the noun. Which aggregator routes
-        # the swap is the operator's business and nobody else's; what the
-        # person paying has to do is put the line below in the OP_RETURN.
-        "The line below MUST go in the transaction's OP_RETURN, or the "
-        "payment cannot be matched to you.",
-        "",
-        plain.get("m", ""),
+        # These two lines used to be a sentence about OP_RETURN and
+        # then the memo itself, in its own message so tap-and-hold
+        # would copy it alone. Both are gone with the field: see
+        # PLAIN_FIELDS. What replaces them is the one thing a reader
+        # can get wrong and lose the payment for -- paying this from
+        # a phone wallet, which cannot attach the part that routes
+        # it. Said once, without naming what that part is.
+        "Pay it from the machine that quoted it. A phone wallet "
+        "CANNOT complete this and the money would be lost.",
     ]
 
 

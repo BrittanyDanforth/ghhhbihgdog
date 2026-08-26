@@ -643,7 +643,30 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
         #
         # last_height is still required: without one successful read there is
         # no baseline and "has not moved" means nothing.
+        # ...AND THE WINDOW HAS TO BE LONG ENOUGH TO MEAN ANYTHING.
+        #
+        # Monero targets a TWO MINUTE block. This verdict fired on `stall_s`
+        # alone, and gs_wake_agent's swap_status probe -- which is what
+        # /check runs -- passes --stall-min 3, because the whole probe is only
+        # three minutes and stall_min may not exceed timeout_min. So the
+        # window was 180 s, and P(no block in 180 s) on a PERFECTLY HEALTHY
+        # wallet is e^-1.5, about 22%.
+        #
+        # Better than one /check in five returned "not scanning, so this says
+        # NOTHING about your money. Check." -- an alarm, about the operator's
+        # own hardware, whose remedy is to go to the machine, produced by a
+        # wallet doing exactly what it should. It cost a magic packet, a boot
+        # and one of twelve daily wake slots to say it.
+        #
+        # LIVENESS_DOUBT_S is the number this file already picked for "long
+        # enough to doubt" (0.67% at a two-minute block), so it is the floor
+        # here too rather than a second constant meaning the same thing. Below
+        # it the probe reaches no conclusion about the wallet at all and times
+        # out into "nothing yet", which is what a three-minute look honestly
+        # supports. The long watch -- 110 minutes, a 30-minute stall window --
+        # still reaches it.
         if (last_height is not None
+                and stall_s >= LIVENESS_DOUBT_S
                 and (clock() - last_height_move) >= stall_s):
             integrity_log("recv", "wallet_not_scanning")
             return {"state": "not_syncing", "sync": "stuck",

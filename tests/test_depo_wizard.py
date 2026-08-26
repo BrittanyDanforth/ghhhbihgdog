@@ -1384,8 +1384,15 @@ check("...and no more than twice, so it stays a naming and not a description",
 # likes. The cap is checked after the labels are collected, below.
 # Line -1 marks "composed, not a literal": the ceiling below is per
 # surface and reads that marker to tell the two groups apart.
+# THE WITHDRAW QUESTION GOES IN SCRUBBED, like the welcome, because it is the
+# one place the reader has to be told WHICH KIND of address to paste -- "Send
+# a Monero address" plus an example. Its mention is counted in the ceiling
+# above rather than exempted quietly.
 _all_sent += [(-1, t) for n, t in _COMPOSED
-              if n not in ("welcome_text", "welcome_text_plain")]
+              if n not in ("welcome_text", "welcome_text_plain",
+                           "_exit_question")]
+_all_sent += [(-1, _CURRENCY_RE.sub("", t)) for n, t in _COMPOSED
+              if n == "_exit_question"]
 # The two welcomes go in with the currency names scrubbed, like the default
 # one below, because "Monero mixing, from your phone" is the headline and the
 # exemption for it is counted rather than hidden.
@@ -1447,17 +1454,23 @@ _PLAIN_SAMPLE = {"b": "0.05000000", "d": "bc1qexample", "x": "1.23",
 _plain_authored = [
     _l for _l in P.plain_lines(_PLAIN_SAMPLE, label="A3F1-9C2B7E")
     if _l and _l != _PLAIN_SAMPLE["m"]]
+#: AND THE WITHDRAW QUESTION, which is the one place the reader has to know
+#: WHICH KIND of address to paste. "Send a Monero address" plus an example is
+#: the fastest this can be; the alternative is three sentences of reasoning
+#: and no example, which is what it was.
+_EXIT_Q = dict(_COMPOSED)["_exit_question"]
 _exempt_total = (_wc
                  + sum(len(_CURRENCY_RE.findall(l)) for l in _LABELS)
-                 + sum(len(_CURRENCY_RE.findall(l)) for l in _plain_authored))
+                 + sum(len(_CURRENCY_RE.findall(l)) for l in _plain_authored)
+                 + len(_CURRENCY_RE.findall(_EXIT_Q)))
 # THE EXEMPTION SHRANK WHEN /address WENT. "⬇ Monero in" was the second
 # mention; with the command gone the welcome's headline is the only one left,
 # which is the smallest the exemption can be while the service still says what
 # it deals in.
 check(f"the currency exemption stays bounded across every surface it covers "
-      f"({_exempt_total} mentions across the welcome, the button labels and "
-      f"the deposit instructions)",
-      _exempt_total <= 3)
+      f"({_exempt_total} mentions across the welcome, the button labels, the "
+      f"deposit instructions and the withdraw question)",
+      _exempt_total <= 4)
 # NON-VACUITY on the scrub: it is what lets those surfaces through, so it has
 # to actually be doing something, or the cap above is guarding nothing.
 check("NON-VACUITY -- the surfaces the scrub covers really do name it",
@@ -1485,11 +1498,17 @@ check(f"the scan reaches the deposit instructions too, which live in "
 _all_sent += [(-1, _CURRENCY_RE.sub("", _l)) for _l in _plain_authored]
 # NON-VACUITY: the line the defect was in really is among them, so this is
 # scanning the thing it was written for.
-check("...including the OP_RETURN instruction, which is where the service "
-      "name was",
-      any("OP_RETURN" in _l for _l in _plain_authored))
-check("...and it no longer names the service that routes the swap",
-      not any(re.search(r"thorchain", _l, re.I) for _l in _plain_authored))
+# THE MEMO INSTRUCTION IS GONE ENTIRELY, along with the memo. What is left is
+# the one thing a reader can get wrong and lose the payment for.
+check("...including the line that replaced the OP_RETURN instruction",
+      any("phone wallet" in _l for _l in _plain_authored))
+check("...and nothing there names the service that routes the swap, or the "
+      "field it routes on",
+      not any(re.search(r"thorchain|OP_RETURN", _l, re.I)
+              for _l in _plain_authored))
+check("...and the memo itself is not among the lines at all",
+      not any("XMR.XMR" in _l or _l.startswith("=:")
+              for _l in _plain_authored))
 # BOTH RENDERINGS. plain_lines takes a label for the chat and prints the bare
 # handle without one, for the machine's own terminal -- two outputs, and only
 # one of them was being looked at.
