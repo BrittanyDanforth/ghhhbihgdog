@@ -295,6 +295,36 @@ def build_cli() -> argparse.ArgumentParser:
                         "machine a pager can wake, so whoever holds the bot "
                         "token can trigger a withdrawal - to an address they "
                         "type. Read OPSEC_SETUP.md before using it.")
+    # HOW THE DEPOSIT ADDRESS REACHES THE OPERATOR, and until now there was
+    # NO WAY TO SET THIS EITHER.
+    #
+    # gs_wake_agent reads key["plain_slip"] and refuses a keyfile that sets it
+    # alongside a delivery key; gs_telegram_pager renders it, gs_doorbell
+    # validates its shape on the wire, gs_wake_proto defines the field, and
+    # OPSEC_SETUP.md tells the operator to "set "plain_slip": true in the
+    # vault's keyfile". That keyfile is a SEALED CONTAINER written by this
+    # tool and by nothing else, so the instruction described an edit nobody
+    # could make: a reader, a renderer, a wire format, a well-formedness check
+    # and a suite, with no writer. It is the same defect --usage-fee-address
+    # was added for, on the one mode that decides whether an operator with a
+    # phone and no second machine can be handed anything to pay at all.
+    #
+    # OFF BY DEFAULT, because an upgrade must not start posting deposit
+    # addresses into a transcript that did not carry them yesterday. Read the
+    # help, and then OPSEC_SETUP.md, before turning it on: the memo is the
+    # ENTIRE binding between the Bitcoin and the Monero, and whoever holds the
+    # bot token can leave the address correct and put their own address in the
+    # memo. A sealed slip refuses anything the vault did not seal; a plaintext
+    # one cannot.
+    p.add_argument("--plain-slip", action="store_true",
+                   help="send the deposit address, amount and memo to the "
+                        "chat as text. Off by default. This is the mode for "
+                        "an operator whose only other device is a phone - "
+                        "with it off, the chat says the details are on the "
+                        "machine and hands over nothing to pay. It cannot be "
+                        "combined with a delivery key. Whoever holds the bot "
+                        "token can substitute the memo and take the deposit: "
+                        "read OPSEC_SETUP.md section 4a first.")
     # WHICH WALLET THE MIX SIGNS WITH. Not a job parameter and it must never
     # become one: a wake note that could name a wallet file could name any file
     # on this machine. Only meaningful with --allow-withdraw, and the pairing
@@ -673,6 +703,11 @@ def do_pair(args) -> int:
         "account_ceiling": int(args.account_ceiling),
         "daily_wake_budget": int(args.daily_wake_budget),
         "allow_withdraw": bool(args.allow_withdraw),
+        # WRITTEN ALWAYS, not only when true. An absent field and a false one
+        # read the same to .get(), but only one of them says the pairing was
+        # asked. See gs_wake_agent's loader: it refuses a value that is not a
+        # bool, so writing the bool is also what makes that check reachable.
+        "plain_slip": bool(args.plain_slip),
         # BOTH FIELDS, and the singular is not vestigial: it is what an agent
         # from before the list existed reads, and it must name a real
         # destination on that agent rather than the text of a Python list.

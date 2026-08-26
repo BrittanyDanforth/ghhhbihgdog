@@ -195,10 +195,16 @@ _PAGER = src("gs_telegram_pager")
 # in tests/test_telegram_pager.py, which runs every outcome path and asserts
 # no address, memo or deposit address reaches the chat. What belongs HERE is
 # the structural half: the pager never reads a field that holds one.
+# "slip {h}" WAS THE ANCHOR AND IT NAMED TWO THINGS THAT ARE BOTH GONE: the
+# word "slip", which the chat used nowhere else, and the bare four-hex handle,
+# which is the WIRE's identifier and is now refused from a chat unless this
+# process minted it there. What the chat carries is a confirmation number --
+# the handle plus a MAC over (chat, handle) -- so that is what the reply
+# interpolates.
 check("the pager's replies are built from a fixed vocabulary, not from job "
-      "output: the only interpolations are the job name and the handle",
+      "output: the only interpolations are the job name and the label",
       _PAGER.count("self.send(") >= 5
-      and "slip {h}" in _PAGER
+      and "Confirmation number: {_cn}" in _PAGER
       and "pending.result" in _PAGER)
 # A READ, NOT AN OCCURRENCE, and the paragraph directly above warns against
 # exactly the mistake this line was making. It hunted for the quoted word
@@ -226,8 +232,70 @@ check("the pager cannot name a destination: no job it sends takes one",
 # confident lie the moment it did. The behavioural half -- that with plaintext
 # OFF no address, memo or amount reaches a chat on any outcome -- is driven in
 # tests/test_plain_slip.py and tests/test_telegram_pager.py.
-check("by default the pager reports a handle and says where the address is",
-      "slip {h}" in _PAGER and "on the vault" in _PAGER)
+# DRIVEN, NOT GREPPED. This asserted `"on the vault" in _PAGER`, which was
+# true of a COMMENT: the reply itself has not said "vault" since the machine
+# names were stripped from the readable surface, so the check was passing on
+# prose about a string that no longer existed.
+import importlib.machinery as _im                            # noqa: E402
+import importlib.util as _iu                                 # noqa: E402
+import threading as _thd                                     # noqa: E402
+import types as _tps                                         # noqa: E402
+
+_ld = _im.SourceFileLoader("gs_telegram_pager",
+                           os.path.join(REPO, "gs_telegram_pager"))
+_pgmod = _iu.module_from_spec(_iu.spec_from_loader(_ld.name, _ld))
+sys.modules.setdefault(_ld.name, _pgmod)
+_ld.exec_module(_pgmod)
+
+
+def _default_deposit_replies():
+    """What a chat is told about a finished deposit with NO delivery mode set.
+
+    The whole point of §5 step 5, driven end to end: no delivery key, no
+    plain_slip, so the vault sends back neither a slip nor a plaintext one.
+    """
+    p = _pgmod.Pager.__new__(_pgmod.Pager)
+    p.proxies, p.token, p.key = {}, "T", {"secret": "11" * 32}
+    p.args = _tps.SimpleNamespace(burn_after=0)
+    p.allow, p.allow_users, p.convos, p.ignored = {111}, set(), {}, 0
+    p.handle_owner, p.handle_job = {}, {}
+    p._chain, p._chain_leg, p._status_at, p._running = None, 0, {}, None
+    p.spenders, p.busy = 1, _thd.Lock()
+    p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
+    p.burn, p.burn_after, p.burn_now = [], 0, False
+    p.limits = _tps.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                    recent=lambda: [], daily_cap=12,
+                                    offset=0, save=lambda: None)
+    said = []
+    p.send = lambda c, t, buttons=None: (said.append(t), True)[1]
+    _res = {"status": "done", "handle": "A3F1", "slip": "", "plain": {},
+            "phase": ""}
+    _pgmod._DOORBELL[0] = _tps.SimpleNamespace(
+        run_wake=lambda a, k, j, pa, on_event=None: _tps.SimpleNamespace(
+            result=_res, outcome=lambda: "done", events=[]))
+    p.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+    return said
+
+
+_dep_said = _default_deposit_replies()
+_deposit_reply = [t for t in _dep_said if "ON THE MACHINE" in t]
+# CONFIRM_RE is anchored with \Z -- it decides whether a WHOLE argument is a
+# confirmation number -- so it cannot be used to find one inside a sentence.
+_CN_IN_TEXT = re.compile(r"\b[0-9A-F]{4}-[0-9A-F]{6}\b")
+check("by default the pager reports a confirmation number and says where the "
+      "address is, without naming it",
+      len(_deposit_reply) == 1
+      and _CN_IN_TEXT.search(_deposit_reply[0]))
+check("...and the number it prints is one the parser accepts whole, so what "
+      "is shown can be typed back",
+      _pgmod.CONFIRM_RE.match(_CN_IN_TEXT.search(_deposit_reply[0]).group(0)))
+check("...and it is the SHAPE the chat can act on, not the wire's handle",
+      "Confirmation number:" in _deposit_reply[0]
+      and "slip A3F1" not in _deposit_reply[0])
+check("...and NON-VACUITY -- with no delivery mode set no address, amount or "
+      "memo is in any of it",
+      not any(w in "\n".join(_dep_said)
+              for w in ("bc1q", "OP_RETURN in", "=:XMR.XMR:")))
 
 # THE THREE MODES: the doc's table and the code must name the same fields, and
 # the choice must live on the VAULT. A doc that offered a mode the code did not
@@ -236,10 +304,45 @@ check("by default the pager reports a handle and says where the address is",
 check("§1's table names the two keyfile fields that select a delivery mode",
       "`delivery_public`" in DOC and "`plain_slip: true`" in DOC)
 _AGENT = src("gs_wake_agent")
+
+
+def _sets_field(source, field):
+    """Does this file SET `field`? Assignment, dict key or CLI flag."""
+    for n in ast.walk(ast.parse(source)):
+        if isinstance(n, ast.Dict):
+            for k in n.keys:
+                if isinstance(k, ast.Constant) and k.value == field:
+                    return True
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if (isinstance(t, ast.Subscript)
+                        and isinstance(t.slice, ast.Constant)
+                        and t.slice.value == field):
+                    return True
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", "") \
+                == "add_argument":
+            for a in n.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str) \
+                        and a.value.strip("-").replace("-", "_") == field:
+                    return True
+    return False
+
+
+# NON-VACUITY for the loop below: the detector finds a real writer, so "the Pi
+# does not write it" is a fact about the Pi and not about the detector.
+check("...and the same check DOES find the vault-side writers",
+      _sets_field(src("gs_wake_keys"), "plain_slip")
+      and _sets_field(src("gs_delivery_key"), "delivery_public"))
 for _f in ("delivery_public", "plain_slip"):
     check(f"...and the VAULT is what reads {_f}", f'"{_f}"' in _AGENT)
-    check(f"...and the PI never writes {_f}",
-          f'"{_f}"' not in _PAGER and f"'{_f}'" not in _PAGER)
+    # CODE, NOT PROSE. This banned the STRING anywhere in the pager, so it
+    # caught the comments explaining why the Pi may not set the field -- and
+    # then caught a legitimate READ, when the welcome started describing the
+    # delivery mode the vault actually chose instead of asserting one. Reading
+    # the vault's decision is the opposite of overriding it. What must not
+    # exist on this box is a way to SET it: an assignment, a dict key, or a
+    # command-line flag.
+    check(f"...and the PI never writes {_f}", not _sets_field(_PAGER, _f))
 check("the two modes are mutually exclusive, refused where the operator is "
       "standing", "delivery_mode_ambiguous" in _AGENT)
 check("the doc states the MONEY cost of plaintext, not only the privacy one",

@@ -78,12 +78,20 @@ pg.integrity_log = lambda *a, **k: None
 CLOCK = [1000.0]
 
 
+#: Fixed rather than random so a label can be written into a check and stay
+#: true from one run to the next.
+PAIR_KEY = {"secret": "11" * 32}
+
+
 class Fake:
     """A Pager with the wake replaced, so nothing below start_job runs."""
 
     def __init__(self, allow=(111, 222)):
         p = pg.Pager.__new__(pg.Pager)
-        p.proxies, p.token, p.key = {}, "x", {}
+        # A REAL PAIRING SECRET: /check takes a confirmation number, which is
+        # a MAC over (chat, handle) keyed from one, and a Pager that cannot
+        # build one is refused at startup.
+        p.proxies, p.token, p.key = {}, "x", dict(PAIR_KEY)
         p.args = types.SimpleNamespace()
         p.allow = set(allow)
         p.allow_users = set()
@@ -91,7 +99,7 @@ class Fake:
         p.handle_job = {}
         p._chain = None
         p._chain_leg = 0
-        p._status_at = None
+        p._status_at = {}
         p.spenders = 1
         p.busy = threading.Lock()
         p.ignored = 0
@@ -820,7 +828,7 @@ check("...and no poke has been charged against the daily budget",
 f8 = Fake()
 f8.say("/depo")
 f8.sent.clear()
-f8.say("/check A3F1")
+f8.say(f"/check {pg.confirmation_number(PAIR_KEY, 111, 'A3F1')}")
 check("a real command mid-conversation is NOT eaten by the wizard",
       f8.pokes == [(111, "swap_status", {"handle": "A3F1"})])
 check("...and the abandoned conversation is dropped rather than left live",
@@ -1321,6 +1329,12 @@ _cs = Fake()
 _cs.p.burn_after = 0
 _COMPOSED = [
     ("welcome_text", pg.welcome_text(0)),
+    # BOTH RENDERINGS. The deposit line follows the keyfile's delivery mode --
+    # "on the machine" with none set, "arrives HERE" with plain_slip -- and
+    # only one of them was ever scanned, so the sentence the phone-only
+    # operator actually reads went unchecked for banned words and for the
+    # currency ceiling below.
+    ("welcome_text_plain", pg.welcome_text(0, {"plain_slip": True})),
     ("_settings_text", pg.Pager._settings_text(_cs.p)),
     ("_amount_question", pg.Pager._amount_question(_cs.p)),
     ("_exit_question", pg.Pager._exit_question(_cs.p)),
@@ -1339,7 +1353,7 @@ check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
 # not authored text and cannot be read from source by anyone.
 _RUNTIME_SENDS = {"slip", "_msg", "memo"}
 _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
-                  | {"welcome_text(self.burn_after)"}
+                  | {"welcome_text(self.burn_after, self.key)"}
                   | {"HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
                      "BUSY_ANSWER"}
                   | _RUNTIME_SENDS)
@@ -1370,7 +1384,13 @@ check("...and no more than twice, so it stays a naming and not a description",
 # likes. The cap is checked after the labels are collected, below.
 # Line -1 marks "composed, not a literal": the ceiling below is per
 # surface and reads that marker to tell the two groups apart.
-_all_sent += [(-1, t) for n, t in _COMPOSED if n != "welcome_text"]
+_all_sent += [(-1, t) for n, t in _COMPOSED
+              if n not in ("welcome_text", "welcome_text_plain")]
+# The two welcomes go in with the currency names scrubbed, like the default
+# one below, because "Monero mixing, from your phone" is the headline and the
+# exemption for it is counted rather than hidden.
+_all_sent += [(-1, _CURRENCY_RE.sub("", t)) for n, t in _COMPOSED
+              if n == "welcome_text_plain"]
 _all_sent += [(-1, _CURRENCY_RE.sub("", pg.WELCOME))]
 
 # AND THE BUTTON LABELS, which were the third surface out of reach.
@@ -1400,16 +1420,15 @@ _LABELS += [l for _row in pg.Pager._handle_buttons(
 # other three rather than writing labels of its own -- which is the point of
 # it -- so appending its output raw would scan the same string twice and count
 # the menu's one currency mention twice against the ceiling below.
+_PHZ = types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS)
+_PHZ._handle_buttons = pg.Pager._handle_buttons.__get__(_PHZ)
+_PHZ._label = pg.Pager._label.__get__(_PHZ)
+_PHZ.key = dict(PAIR_KEY)
 _PHASE_LABELS = [
     l for _w in ("not_yet", "arriving", "landed", "short", "stuck",
                  "more_left", "a-phase-from-a-newer-vault")
-    for _row in (pg.Pager._phase_buttons(
-        types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS,
-                              _handle_buttons=pg.Pager._handle_buttons.__get__(
-                                  types.SimpleNamespace(
-                                      UNWATCHABLE_JOBS=(
-                                          pg.Pager.UNWATCHABLE_JOBS)))),
-        _w, "A3F1", "swap_status") or [])
+    for _row in (pg.Pager._phase_buttons(_PHZ, _w, "A3F1", "swap_status")
+                 or [])
     for l, _d in _row]
 check("the scan reaches the status answer's keyboard, the fourth table and "
       "the one an operator sees most often",
@@ -1432,17 +1451,40 @@ check(f"the currency exemption stays bounded across every surface it covers "
 check("NON-VACUITY -- the surfaces the scrub covers really do name it",
       _exempt_total >= 1)
 # EVERY BUTTON TABLE, not the one the menu happens to use. A `buttons=` that
-# named a fourth table would be a keyboard nothing above reads.
-_BTN_TABLES = {"MENU_BUTTONS", "self._depth_buttons()",
-               "self._handle_buttons(h, job)", "[[('Cancel', 'm:cancel')]]",
-               "self._phase_buttons(phase, h, job)"}
-_btn_seen = {_ast.unparse(_kw.value) for _n in _ast.walk(_pg_tree)
+# named a fifth table would be a keyboard nothing above reads.
+#
+# THE CALLEE, NOT THE WHOLE EXPRESSION. This compared unparsed source text --
+# "self._handle_buttons(h, job)" -- against a set of literal strings, so
+# threading one more argument through a builder failed a check about which
+# TABLES exist. What has to be true is that a keyboard comes from a known
+# builder; how many arguments that builder takes is not this check's business,
+# and pinning it here means every signature change reads as a leak.
+def _btn_source(node):
+    if isinstance(node, _ast.Call):
+        return getattr(node.func, "attr", None) or getattr(
+            node.func, "id", "<call>")
+    if isinstance(node, _ast.Name):
+        return node.id
+    if isinstance(node, (_ast.List, _ast.Tuple)):
+        return "<literal>"
+    if isinstance(node, _ast.Constant) and node.value is None:
+        return "<none>"
+    return _ast.unparse(node)
+
+
+_BTN_TABLES = {"MENU_BUTTONS", "_depth_buttons", "_handle_buttons",
+               "_phase_buttons", "<literal>"}
+_btn_seen = {_btn_source(_kw.value) for _n in _ast.walk(_pg_tree)
              if isinstance(_n, _ast.Call)
              and getattr(_n.func, "attr", "") == "send"
              for _kw in _n.keywords if _kw.arg == "buttons"}
 check(f"...and every keyboard this bot attaches comes from one of them "
       f"({sorted(_btn_seen - _BTN_TABLES)})",
       _btn_seen <= _BTN_TABLES)
+# NON-VACUITY: the scan really did find the builders, so the subset test above
+# is not passing on an empty set.
+check(f"...and it found them all ({sorted(_btn_seen)})",
+      {"MENU_BUTTONS", "_handle_buttons", "_phase_buttons"} <= _btn_seen)
 check("control: the scan reaches the phase lines too, which live in another "
       "file and are sent verbatim",
       any(t in P.PHASE_LINES.values() for _l, t in _all_sent))

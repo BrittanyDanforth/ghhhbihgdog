@@ -2082,6 +2082,80 @@ check("fee: ...and still writes the singular one an older agent reads, as an "
       "address rather than the text of a list",
       '"usage_fee_address": str((list(args.usage_fee_address or []) or [""])[0]),'
       in _kp_src)
+
+# ---- AND SO WAS THE ONE MODE THAT DELIVERS A DEPOSIT ADDRESS -------------
+#
+# EXACTLY THE SAME SHAPE, on the field that decides whether an operator whose
+# only other device is a phone is handed anything to pay at all.
+# gs_wake_agent reads key["plain_slip"] and refuses a keyfile that sets it
+# beside a delivery key; gs_telegram_pager renders it; gs_doorbell validates
+# its shape on the wire; gs_wake_proto defines the field; OPSEC_SETUP.md told
+# the operator to `set "plain_slip": true in the vault's keyfile`. That
+# keyfile is a SEALED CONTAINER written by gs_wake_keys and by nothing else,
+# so the instruction described an edit nobody could make. A reader, a
+# renderer, a wire format, a well-formedness check and a suite -- no writer.
+check("plain_slip: the pairing offers a flag for it",
+      '"--plain-slip"' in _kp_src)
+check("plain_slip: ...and writes it into the keyfile the agent reads",
+      '"plain_slip": bool(args.plain_slip),' in _kp_src)
+# ALWAYS, NOT ONLY WHEN TRUE. An absent field and a false one read the same
+# through .get(), but only one of them says the pairing was asked -- and the
+# agent's loader refuses a value that is not a bool, so writing the bool is
+# what makes that check reachable at all.
+# CODE, NOT PROSE: the comment above the flag quotes the doc sentence this
+# replaced, which itself contains `"plain_slip":`.
+_ps_line = [_l for _l in _kp_src.splitlines()
+            if '"plain_slip":' in _l and not _l.lstrip().startswith("#")]
+check("plain_slip: ...unconditionally, so the agent's bool check is reachable",
+      len(_ps_line) == 1 and "if " not in _ps_line[0])
+# AND THE AGENT REALLY DOES REFUSE THE TWO BAD SHAPES, so the line above is
+# not ceremony: the writer and the reader are checked against each other.
+_ag_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("plain_slip: ...and the agent refuses a value that is not a bool",
+      'plain_slip_malformed' in _ag_src)
+check("plain_slip: ...and refuses a keyfile that also names a delivery key",
+      'delivery_mode_ambiguous' in _ag_src)
+# ONE MODE, NOT TWO, AND THE REFUSAL IS WHERE THE SECOND WOULD BE WRITTEN.
+# load_key raises delivery_mode_ambiguous on a keyfile carrying both -- on
+# EVERY wake, at load, before any job runs. So writing the second field does
+# not create a conflict to resolve later, it stops the vault answering the
+# phone until both boxes are re-paired.
+_dk_src = open(os.path.join(REPO, "gs_delivery_key"), encoding="utf-8").read()
+check("plain_slip: gs_delivery_key refuses to write a delivery key over it, "
+      "rather than leaving the vault to refuse every wake",
+      'if key.get("plain_slip"):' in _dk_src)
+check("plain_slip: ...and does it BEFORE it mints anything, so a refusal "
+      "leaves no orphan key file",
+      _dk_src.index('if key.get("plain_slip"):')
+      < _dk_src.index("dk = nacl.public.PrivateKey.generate()"))
+
+# ---- AND THE CLASS OF BUG, NOT JUST THE TWO INSTANCES OF IT -------------
+#
+# --usage-fee-address and plain_slip were the same defect found twice, a turn
+# apart: a keyfile field the vault READS with no tool that WRITES it, so the
+# branch behind it was unreachable and the documentation described an edit to
+# a sealed container that nobody could make. Both were found by reading; this
+# finds the next one.
+#
+# The rule: every field gs_wake_agent reads out of `key` must be written by
+# something. "Something" is gs_wake_keys (the pairing) or gs_delivery_key (the
+# one tool that patches a keyfile in place) -- there is no third writer, and a
+# field with no writer at all is a feature with no switch.
+_KEY_READS = set(re.findall(r'key\.get\(\s*"([a-z_]+)"', _ag_src))
+_KEY_READS |= set(re.findall(r'key\[\s*"([a-z_]+)"\s*\]', _ag_src))
+_KEY_READS |= set(re.findall(r'\bk\.get\(\s*"([a-z_]+)"', _ag_src))
+_WRITERS = _kp_src + open(os.path.join(REPO, "gs_delivery_key"),
+                          encoding="utf-8").read()
+_unwritable = sorted(f for f in _KEY_READS
+                     if f'"{f}"' not in _WRITERS)
+check(f"keyfile: every field the vault reads has a tool that writes it "
+      f"({len(_KEY_READS)} fields checked)",
+      _unwritable == [])
+# NON-VACUITY: the scan really found the fields, so an empty difference is
+# not an empty scan.
+check(f"keyfile: NON-VACUITY -- the scan found the real ones ({len(_KEY_READS)})",
+      {"plain_slip", "delivery_public", "allow_withdraw", "wallet_file",
+       "usage_fee_address"} <= _KEY_READS)
 # proto.xmr_address, NOT the withdraw schema's exit_to field. This used to
 # borrow that one, which was fine only while the two happened to be the same
 # check -- exit_to takes a LIST of destinations now, so the borrowed gate would

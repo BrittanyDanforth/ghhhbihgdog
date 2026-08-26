@@ -95,13 +95,64 @@ MEMO = f"=:XMR.XMR:{XMR}:0/1/0"
 BTC = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
 
 
+import types as _ty0                                        # noqa: E402
+import threading as _th0                                    # noqa: E402
+
 print("== nothing typed into a chat can name a destination ==")
-# EVERY accepted command, and what it is allowed to produce.
+
+#: A KEY WITH A REAL PAIRING SECRET, because a confirmation number is a MAC
+#: over (chat, handle) keyed from one and a Pager with no usable secret is now
+#: refused at startup. Fixed rather than random so a label can be written out
+#: in a check and stay true.
+_KEY = {"secret": "11" * 32}
+_CID = 111
+
+
+def _to_wire(text, cid=_CID, owner=None, key=None):
+    """(job, params) as they reach start_job -- or ("", {}) if refused.
+
+    THE WIRE IS NOT parse_command's OUTPUT ANY MORE, and this is why the
+    checks below moved. /check and /wait take a CONFIRMATION NUMBER, which
+    only means something in the chat it was issued to -- and parse_command is
+    module-level, with neither the chat nor the key. So it hands over the TEXT
+    and handle() resolves it. Asserting the shape of what parse_command
+    returns would now be asserting the shape of an intermediate; what has to
+    be true is what start_job is handed, so that is what this reads.
+    """
+    p = pg.Pager.__new__(pg.Pager)
+    p.proxies, p.token, p.key = {}, "T", dict(key or _KEY)
+    p.args = _ty0.SimpleNamespace(burn_after=0)
+    p.allow, p.allow_users, p.convos, p.ignored = {cid}, set(), {}, 0
+    p.handle_owner = dict(owner or {})
+    p.handle_job = {}
+    p._chain, p._chain_leg, p._status_at, p._running = None, 0, {}, None
+    p.spenders = 1
+    p.busy = _th0.Lock()
+    p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
+    p.burn, p.burn_after, p.burn_now = [], 0, False
+    p.limits = _ty0.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                    recent=lambda: [], daily_cap=12,
+                                    offset=0, save=lambda: None)
+    got, said = [], []
+    p.send = lambda c, t, buttons=None: (said.append(t), True)[1]
+    p.start_job = lambda c, j, pa, leg=0: got.append((j, dict(pa)))
+    p.handle({"update_id": 1,
+              "message": {"chat": {"id": cid}, "message_id": 1, "text": text}})
+    return (got[0] if got else ("", {})), said
+
+
+_CN = pg.confirmation_number(_KEY, _CID, "A3F1")
 for _text, _job, _params in (
-        ("/watch a3f1", "watch", {"handle": "A3F1"}),
-        ("/check A3F1", "swap_status", {"handle": "A3F1"})):
-    _j, _p, _e = pg.parse_command(_text)
+        (f"/watch {_CN.lower()}", "watch", {"handle": "A3F1"}),
+        (f"/check {_CN}", "swap_status", {"handle": "A3F1"})):
+    (_j, _p), _ = _to_wire(_text)
     check(f"{_text!r} -> {_job}", (_j, _p) == (_job, _params))
+# THE INTERMEDIATE NEVER TRAVELS. `confirmation` is this box's word for a
+# label bound to a chat; the wire has no such field and validate_job would
+# refuse a note carrying one.
+check("the confirmation number is stripped before the wire, never forwarded",
+      all("confirmation" not in _to_wire(f"/check {_CN}")[0][1]
+          for _ in (0,)))
 
 # THE ATTACK THIS SHAPE EXISTS TO STOP.
 for _hostile in (f"/depo 2 --exit-to {XMR}",
@@ -151,8 +202,8 @@ check("every parameter is an int or a 4-char handle, never a longer string",
 # /depo is not in this list any more: it produces NO job directly, only the
 # wizard, which is the point. The wizard's own output is checked below.
 check("the jobs it can ask for are exactly the ones the protocol allows",
-      {pg.parse_command(t)[0] for t in ("/watch A3F1",
-                                        "/check A3F1")} <= set(P.JOBS))
+      {_to_wire(t)[0][0] for t in (f"/watch {_CN}",
+                                   f"/check {_CN}")} <= set(P.JOBS))
 check("...and /depo produces no job of its own at all, in either form",
       pg.parse_command("/depo")[0] == ""
       and pg.parse_command("/depo 2")[0] == "")
@@ -175,7 +226,7 @@ def _wizard_params(answers):
     p.handle_job = {}
     p._chain = None
     p._chain_leg = 0
-    p._status_at = None
+    p._status_at = {}
     p.spenders = 1
     p.busy = _th.Lock()
     p.ignored = 0
@@ -237,8 +288,8 @@ for _j, _pa in _wiz:
                     "challenge": P.new_challenge().hex(), "job": _j, **_pa})
 check("...and every one passes the REAL job schema", True)
 # ...and the protocol itself agrees, rather than this file asserting it alone.
-for _t in ("/watch A3F1", "/check A3F1"):
-    _j, _p, _e = pg.parse_command(_t)
+for _t in (f"/watch {_CN}", f"/check {_CN}"):
+    (_j, _p), _ = _to_wire(_t)
     check(f"gs_wake_proto accepts what {_t!r} composes",
           _j in P.JOBS and set(_p) <= set(P.JOBS[_j]["schema"]))
 check("no job this pager can ask for drives a forbidden tool",
@@ -265,12 +316,14 @@ def _msg(cid, text, uid=1):
     return {"update_id": uid, "message": {"chat": {"id": cid}, "text": text}}
 
 
-_p.handle(_msg(999, "/check A3F1"))
+_ALLOW_CN = pg.confirmation_number(_KEY, 111, "A3F1")
+_p.key = dict(_KEY)
+_p.handle(_msg(999, f"/check {_ALLOW_CN}"))
 check("a chat that is not allowlisted gets NO reply -- a reply would confirm "
       "the bot is alive to whoever found it", _sent == [])
 check("...and it is counted rather than silently dropped", _p.ignored == 1)
 check("...and it never reaches the wake channel", _poked == [])
-_p.handle(_msg(111, "/check A3F1"))
+_p.handle(_msg(111, f"/check {_ALLOW_CN}"))
 check("an allowlisted chat does reach it", len(_poked) == 1)
 
 
@@ -758,7 +811,7 @@ def _wedge_pager(fail_on):
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
     p._chain = None
     p._chain_leg = 0
-    p._status_at = None
+    p._status_at = {}
     p.spenders = 1
     p.busy = _th2.Lock()
     p.clock, p.rng = (lambda: 0.0), __import__("random").SystemRandom()
@@ -950,14 +1003,19 @@ check("polls: ...and it stops on the next poll once the wake finishes, so "
 # which publish_commands' own docstring calls "indistinguishable from a bot
 # that does not work". A four-command blind spot survived a green suite.
 _HANDLED_ERRS = {"depo_wizard", "withdraw_wizard", "settings", "fee", "speed",
-                 "exit", "cancel", "help", "welcome", "status"}
+                 "exit", "cancel", "help", "welcome", "status",
+                 "whats_running"}
 _unresolved = []
 for _c, _desc in pg.BOT_COMMANDS:
     _job, _params, _err = pg.parse_command(f"/{_c}")
     # A command "resolves" if it starts a job, opens a wizard, or is one of
     # the answers handle() dispatches on. "handle must be 4 hex characters" is
     # a resolved command asking for its argument, not an unknown one.
-    if not (_job or _err in _HANDLED_ERRS or "handle" in _err):
+    # "whats_running" is /check and /wait with no argument: a RESOLVED
+    # command answering the question it was almost certainly asked, rather
+    # than the old "handle must be 4 hex characters", which used a word this
+    # chat says nowhere else about a thing it never showed anyone how to find.
+    if not (_job or _err in _HANDLED_ERRS or "confirmation number" in _err):
         _unresolved.append(_c)
 check(f"menu: every published command resolves in parse_command "
       f"({len(pg.BOT_COMMANDS)} of them)", _unresolved == [])
@@ -1090,8 +1148,8 @@ for _sup in ("/recv ²", "/recv ³", "/recv ½", "/recv ٩٩٩"):
 # the wizard's own test says legitimately reads as a slot.
 # NON-VACUITY moved to the commands that still take an argument: /recv is
 # gone, so the digit path it used to exercise is /check and /wait's handle.
-check("digits: NON-VACUITY -- a real handle still parses",
-      pg.parse_command("/check A3F1")[1] == {"handle": "A3F1"})
+check("digits: NON-VACUITY -- a real confirmation number still parses",
+      pg.parse_command(f"/check {_CN}")[1] == {"confirmation": _CN})
 # CODE, NOT PROSE. A substring ban punishes the comments that explain the
 # fix -- the same trap the addr_index guard fell into. Every remaining mention
 # of isdigit in this file is a note saying why isdecimal is used instead.
@@ -1125,7 +1183,7 @@ def _plain_pager(busy=False, why="", spenders=1):
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
     p._chain = None
     p._chain_leg = 0
-    p._status_at = None
+    p._status_at = {}
     p.spenders = spenders
     p.busy = _th3.Lock()
     if busy:
@@ -1257,15 +1315,32 @@ check(f"help: ...and the derived one covers the jitter it always waits "
       f"was added for",
       P.result_budget_s("swap_status") > _jit_hi)
 # THE ARGUMENT IS NAMED INSTEAD, which is the thing the list CAN say and the
-# thing an operator cannot guess: both refuse without a 4-hex label, in a word
-# ("handle") the chat uses nowhere else.
+# thing an operator cannot guess.
 _cmds = dict(pg.BOT_COMMANDS)
-check("help: /check and /wait show the argument they refuse without",
-      "/check A3F1" in _cmds["check"] and "/wait A3F1" in _cmds["wait"])
-check("help: NON-VACUITY -- they really do refuse without one, in a word the "
-      "chat never otherwise uses",
-      pg.parse_command("/check")[2] == "handle must be 4 hex characters"
-      and pg.parse_command("/wait")[2] == "handle must be 4 hex characters")
+# THE EXAMPLE HAS TO BE THE SHAPE THE CHAT ACTUALLY HANDS OVER. It showed
+# "/check A3F1" -- four hex characters, which is what the WIRE carries and
+# what a chat is now refused for sending unless this process minted it here.
+check("help: /check and /wait show an argument of the shape the chat issues",
+      all(pg.CONFIRM_RE.match(_cmds[_c].split("/" + _c + " ")[-1].strip())
+          for _c in ("check", "wait")))
+check("help: ...and say both work with no argument, which is what somebody "
+      "asking 'is anything happening' types",
+      all(f"/{_c}," in _cmds[_c] for _c in ("check", "wait")))
+# ...AND WITH NO ARGUMENT THEY ANSWER THE QUESTION RATHER THAN CORRECTING IT.
+# This used to be "handle must be 4 hex characters" -- a word the chat says
+# nowhere else, about a thing it never showed anyone how to find, in reply to
+# somebody who meant "is anything happening?".
+check("help: NON-VACUITY -- with no argument they ask handle() what is "
+      "running instead of naming an internal word",
+      pg.parse_command("/check")[2] == "whats_running"
+      and pg.parse_command("/wait")[2] == "whats_running")
+check("help: ...and a malformed one is refused in words, naming the shape",
+      "confirmation number" in pg.parse_command("/check ZZZZ")[2]
+      and "A3F1-9C2B7E" in pg.parse_command("/check ZZZZ")[2])
+# THE WORD "handle" IS THE MACHINE'S, and it does not belong in a reply.
+for _bad in ("/check", "/wait", "/check ZZZZ", "/wait nope"):
+    check(f"help: {_bad!r} answers without the word 'handle'",
+          "handle" not in pg.parse_command(_bad)[2].lower())
 # NON-VACUITY: the help still lists the commands, so this is not passing on an
 # emptied string.
 # THE ADVERTISED NAMES, which are now words rather than abbreviations: "depo"
@@ -1659,7 +1734,7 @@ class _BurnPager:
         p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
         p._chain = None
         p._chain_leg = 0
-        p._status_at = None
+        p._status_at = {}
         p.spenders = 1
         p.busy = __import__("threading").Lock()
         p.ignored = 0
@@ -1852,7 +1927,8 @@ def _room_pager(allow, users):
     p.allow_users, p.handle_owner, p.handle_job = set(users), {}, {}
     p._chain = None
     p._chain_leg = 0
-    p._status_at = None
+    p._status_at = {}
+    p._running = None
     p.spenders = len(p.allow_users) or len(p.allow)
     p.burn_after = 0
     p.busy = _th4.Lock()
@@ -1998,37 +2074,160 @@ check("whoami: NON-VACUITY -- a PRIVATE chat is told it needs no --user-id, "
 # ===========================================================================
 print("\n== a handle belongs to the chat that made it ==")
 _hp3, _hs3 = _room_pager([111, 222], [])
-_hp3.start_job = lambda cid, job, params: _hs3.append(("JOB", cid, params))
+_hp3.key = dict(_KEY)
+_hp3.start_job = lambda cid, job, params, leg=0: _hs3.append(
+    ("JOB", cid, dict(params)))
+_CN111 = pg.confirmation_number(_KEY, 111, "A3F1")
 
 # chat 111 makes one
 _hp3.handle_owner["A3F1"] = 111
 _hp3.handle({"update_id": 1, "message": {"chat": {"id": 111},
                                          "message_id": 1,
-                                         "text": "/check A3F1"}})
+                                         "text": f"/check {_CN111}"}})
 check("handles: the chat that made a handle can still check it",
       any(x[0] == "JOB" for x in _hs3 if isinstance(x, tuple)))
 
 _hs3.clear()
 _hp3.handle({"update_id": 2, "message": {"chat": {"id": 222},
                                          "message_id": 1,
-                                         "text": "/check A3F1"}})
-check("handles: another allowlisted chat asking for it is REFUSED — no wake, "
-      "so no slip and no deposit address",
+                                         "text": f"/check {_CN111}"}})
+check("handles: another allowlisted chat replaying the label VERBATIM is "
+      "REFUSED — no wake, so no slip and no deposit address",
       not any(isinstance(x, tuple) and x[0] == "JOB" for x in _hs3))
 check("handles: ...and the refusal does not confirm the handle exists",
       _hs3 and all("somebody" not in str(t).lower()
                    and "else" not in str(t).lower() for t in _hs3))
 
-# The honest bound: the map is process memory, so a restart empties it, and
-# refusing an UNKNOWN handle would lock an operator out of their own swap on
-# the one box whose job is to be reachable.
-_hs3.clear()
-_hp3.handle({"update_id": 3, "message": {"chat": {"id": 222},
-                                         "message_id": 1,
+# ---- AND THE BINDING SURVIVES A RESTART, WHICH IT DID NOT ----------------
+#
+# This block used to end with the opposite guarantee: "a handle this process
+# has never seen is still allowed", on the reasoning that handle_owner is
+# process memory and refusing would lock an operator out of their own swap.
+# The reasoning was sound and the conclusion was a hole. gs-telegram-pager
+# .service sets Restart=on-failure, so ONE dropped circuit at the wrong second
+# emptied that map and turned every label in flight back into a bearer token
+# any allowlisted chat could redeem -- for the deposit address, the amount,
+# and a memo naming the destination Monero address in full.
+#
+# The lockout it was avoiding is avoided a different way: the binding is
+# carried BY THE LABEL, as a MAC over (chat, handle), so it does not live in
+# memory at all and there is nothing for a restart to lose.
+_hp4, _hs4 = _room_pager([111, 222], [])
+_hp4.key = dict(_KEY)
+_hp4.start_job = lambda cid, job, params, leg=0: _hs4.append(
+    ("JOB", cid, dict(params)))
+check("handles: a RESTARTED pager -- empty map -- still honours the label it "
+      "issued to this chat",
+      _hp4.handle_owner == {}
+      and (_hp4.handle({"update_id": 1,
+                        "message": {"chat": {"id": 111}, "message_id": 1,
+                                    "text": f"/check {_CN111}"}}) is None)
+      and [x for x in _hs4 if x[0] == "JOB"][0][2] == {"handle": "A3F1"})
+_hs4.clear()
+_hp4.handle({"update_id": 2, "message": {"chat": {"id": 222}, "message_id": 1,
+                                         "text": f"/check {_CN111}"}})
+check("handles: ...and STILL refuses the same label in another chat, which is "
+      "the case a restart used to open",
+      not any(x[0] == "JOB" for x in _hs4))
+# A BARE HANDLE IS NOT A LABEL. It is what the vault's own terminal prints, so
+# it is accepted while this process remembers minting it for this chat -- and
+# refused once it does not, because an unremembered bare handle is precisely
+# the bearer token the confirmation number retired.
+_hs4.clear()
+_hp4.handle({"update_id": 3, "message": {"chat": {"id": 222}, "message_id": 1,
                                          "text": "/check B7C2"}})
-check("handles: a handle this process has never seen is still allowed — the "
-      "map is process memory and a restart must not lock anyone out",
-      any(isinstance(x, tuple) and x[0] == "JOB" for x in _hs3))
+check("handles: a bare handle this process never minted is REFUSED, where it "
+      "used to be forwarded",
+      not any(x[0] == "JOB" for x in _hs4))
+_hs4.clear()
+_hp4.handle_owner["B7C2"] = 222
+_hp4.handle({"update_id": 4, "message": {"chat": {"id": 222}, "message_id": 1,
+                                         "text": "/check B7C2"}})
+check("handles: NON-VACUITY -- a bare handle THIS process minted for THIS "
+      "chat still works, so the vault's terminal is still usable",
+      any(x[0] == "JOB" for x in _hs4))
+_hs4.clear()
+_hp4.handle({"update_id": 5, "message": {"chat": {"id": 111}, "message_id": 1,
+                                         "text": "/check B7C2"}})
+check("handles: ...and the other chat cannot borrow it",
+      not any(x[0] == "JOB" for x in _hs4))
+# ---- "IS ANYTHING HAPPENING?" IS ANSWERED ABOUT THIS CHAT ONLY ----------
+#
+# /check with no argument used to answer "handle must be 4 hex characters" --
+# a word this chat says nowhere else, about a thing it never showed anyone how
+# to find, to somebody who meant "is anything going on?". It is answered from
+# memory now, and the memory is shared: handle_owner holds every chat's
+# labels, so the answer has to be FILTERED or one device is told what another
+# has running.
+_wr, _wrs = _room_pager([111, 222], [])
+_wr.key = dict(_KEY)
+_wr.start_job = lambda cid, job, params, leg=0: None
+_wr.handle_owner["A3F1"] = 111          # chat 111's, and only 111's
+_wr.handle_job["A3F1"] = "receive_and_quote"
+_wrs.clear()
+_wr.handle(_msg(222, 222, "/check"))
+check("running: a chat with nothing of its own is told exactly that",
+      len(_wrs) == 1 and "no mixes are running" in _wrs[0]
+      and "none have been started in this chat" in _wrs[0])
+check("running: ...and is NOT told about the other chat's label",
+      "A3F1" not in _wrs[0])
+_wrs.clear()
+_wr.handle(_msg(111, 111, "/check"))
+check("running: NON-VACUITY -- the chat that owns one IS told about it",
+      len(_wrs) == 1 and pg.confirmation_number(_KEY, 111, "A3F1") in _wrs[0])
+# AND WHILE ONE IS ACTUALLY RUNNING, the answer says so -- to the chat that
+# started it. `busy` is deliberately not consulted: it is process-wide, so
+# reading it here would tell one chat that another one is mid-job.
+_wr._running = 111
+_wrs.clear()
+_wr.handle(_msg(111, 111, "/check"))
+check("running: the chat holding the job is told one is running now",
+      len(_wrs) == 1 and "running now" in _wrs[0])
+_wrs.clear()
+_wr.handle(_msg(222, 222, "/check"))
+check("running: ...and the OTHER chat is not told a job is in progress",
+      len(_wrs) == 1 and "running now" not in _wrs[0])
+_wr._running = None
+
+# ---- AND A PAGER THAT CANNOT BIND ONE DOES NOT START --------------------
+#
+# The two ways to carry on without a usable pairing secret are both worse than
+# refusing: show the bare handle, which reissues the bearer token the whole
+# mechanism retires, or raise mid-reply, which loses the message that names a
+# deposit. Checked once, at startup, where the operator is standing.
+_MAIN = _SRC_PG_EARLY.split("def main(")[1]
+check("handles: main() checks it can build a confirmation number before the "
+      "bot answers anything",
+      "_confirm_key(key)" in _MAIN)
+# ...AND THE TAIL IS READ ONLY IF THE HEAD IS THERE. Splitting on a marker
+# that is gone raises IndexError, and a suite that CRASHES proves nothing
+# about its checks -- the sweep scores it NO-RESULT, which is not a pass.
+_after_ck = _MAIN.split("_confirm_key(key)")[1][:400] if \
+    "_confirm_key(key)" in _MAIN else ""
+check("handles: ...and EXITS rather than starting without one",
+      "no usable pairing secret" in _MAIN and "sys.exit(" in _after_ck)
+# ...and the primitive really does refuse the shapes a broken card gives it,
+# so the startup check is not a no-op.
+for _bad in ({}, {"secret": ""}, {"secret": "zz" * 32}, {"secret": "11" * 16},
+             {"secret": None}):
+    _raised = False
+    try:
+        pg._confirm_key(_bad)
+    except Exception:                                        # noqa: BLE001
+        _raised = True
+    check(f"handles: a card with secret={_bad.get('secret')!r} cannot mint a "
+          f"label", _raised)
+check("handles: NON-VACUITY -- a real 32-byte secret does mint one",
+      pg.CONFIRM_RE.match(pg.confirmation_number(_KEY, 111, "A3F1")))
+
+# EVERY GUESS IS A DIFFERENT LABEL. 24 bits of tag, so a chat that never
+# received one cannot produce one by trying the handles it has seen.
+check("handles: NON-VACUITY -- the label really is chat-specific, not a "
+      "constant dressed up",
+      pg.confirmation_number(_KEY, 111, "A3F1")
+      != pg.confirmation_number(_KEY, 222, "A3F1")
+      and pg.confirmation_number(_KEY, 111, "A3F1")
+      != pg.confirmation_number({"secret": "22" * 32}, 111, "A3F1"))
 
 # ...and the map really is filled in by the code path that mints one, not
 # only by tests writing to it by hand.
@@ -2412,7 +2611,23 @@ for _t0, _lbl in ((0.0, "a Pi that has just booted"),
     _bp.handle(_msg(111, 111, "/status"))
     check(f"status: the first tap answers on {_lbl}", len(_bs) == 1)
 check("status: ...because 'never' is spelled differently from 'at zero'",
-      pg.Pager(_args, "123456:TOKEN", {}, {"https": "x"})._status_at is None)
+      pg.Pager(_args, "123456:TOKEN", {}, {"https": "x"})._status_at == {})
+# ---- AND ONE CHAT'S THUMB DOES NOT SILENCE ANOTHER ----------------------
+#
+# The marker was ONE float for the whole process, so chat A tapping Status
+# swallowed chat B's next fifteen seconds -- with no reply at all, because the
+# whole point of the cooldown is that a "slow down" line is itself a message.
+# One device made another look broken, which is exactly the cross-chat
+# interference this box is supposed not to have.
+_xp, _xs, _, _ = _tapper(allow=(111, 222))
+_xp.clock = lambda: 500.0
+_xp.handle(_msg(111, 111, "/status"))
+check("status: chat A gets its answer", len(_xs) == 1)
+_xp.handle(_msg(222, 222, "/status"))
+check("status: ...and chat B is NOT silenced by it", len(_xs) == 2)
+_xp.handle(_msg(111, 111, "/status"))
+check("status: NON-VACUITY -- A is still inside its own cooldown, so the "
+      "throttle is per chat and not simply gone", len(_xs) == 2)
 # NON-VACUITY: the throttle is /status's alone. It must not swallow the
 # commands that do something.
 _np, _ns, _, _nj = _tapper()
@@ -3133,6 +3348,37 @@ check("welcome: ...and WHY, because otherwise it reads as a limitation "
 # not what this surface hands over. The pair is minted inside the job and the
 # reply says to read it on the machine, so a list promising a payload the
 # reply then withholds reads as the reply having failed.
+# ...AND THE LINE ABOUT WHERE IT TURNS UP FOLLOWS THE ACTUAL MODE.
+#
+# It said ON THE MACHINE always -- true with no delivery mode set, and false
+# with --plain-slip, where the pair arrives in the chat. The welcome is the
+# screen a first-time reader is guaranteed to see, so a fixed sentence there
+# was a fixed claim about a setting, wrong for exactly the operator the
+# setting exists for: the one with a phone and no second machine, told to go
+# and read something at a machine they are not standing at.
+_w_off = pg.welcome_text(0)
+_w_on = pg.welcome_text(0, {"plain_slip": True})
+check("welcome: with no delivery mode it says the address is on the machine",
+      "ON THE MACHINE" in _w_off and "arrive HERE" not in _w_off)
+check("welcome: ...and with plain_slip it says a fresh one arrives HERE, "
+      "every time",
+      "arrive HERE" in _w_on and "every time" in _w_on
+      and "ON THE MACHINE" not in _w_on)
+check("welcome: ...and BOTH still say what stops a phone paying, which is the "
+      "one mechanism word worth the room",
+      "OP_RETURN" in _w_off and "OP_RETURN" in _w_on)
+check("welcome: NON-VACUITY -- one line differs and the rest of the screen "
+      "does not",
+      len(_w_off.splitlines()) == len(_w_on.splitlines())
+      and sum(1 for a, b in zip(_w_off.splitlines(), _w_on.splitlines())
+              if a != b) == 1)
+# AND THE PAGER PASSES ITS KEY, or the branch above is unreachable in the one
+# place it renders -- the "declared in one place, never wired to the thing
+# that runs" shape this repo keeps finding.
+check("welcome: the /start handler passes the keyfile, so the branch is "
+      "reachable from the chat",
+      "welcome_text(self.burn_after, self.key)" in _SRC_PG_EARLY)
+
 check("welcome: the command list does not promise an address the chat never "
       "sends",
       "get an address" not in dict(pg.BOT_COMMANDS)["deposit"]

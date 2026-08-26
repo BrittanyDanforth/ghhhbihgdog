@@ -729,7 +729,7 @@ PHASE_LINES = {
 }
 
 
-def plain_lines(plain: dict) -> list:
+def plain_lines(plain: dict, label: str = "") -> list:
     """The deposit instructions as lines a human reads and copies. No I/O.
 
     Shared so the doorbell's terminal and the pager's chat message cannot
@@ -746,6 +746,18 @@ def plain_lines(plain: dict) -> list:
         f"Send exactly:  {plain.get('b', '')} BTC",
         f"To address:    {plain.get('d', '')}",
         f"Expected out:  ~{plain.get('x', '')} XMR",
+        # THE LABEL THE READER CAN ACTUALLY USE, and the caller decides what
+        # that is because this function does not know who is reading.
+        #
+        # It printed "Slip:" and the bare four-hex handle for both readers.
+        # For the doorbell's terminal that is right -- it is the operator's own
+        # machine and the handle is what it prints everywhere else. For the
+        # CHAT it was wrong twice over: "slip" is a word the chat uses nowhere
+        # else, and the bare handle is no longer something a chat can act on
+        # (see gs_telegram_pager's confirmation number), so the one line
+        # offering the reader a way to follow this up named a string the bot
+        # would refuse from them.
+        f"Confirmation:  {label}" if label else
         f"Slip:          {plain.get('h', '')}",
         "",
         "The memo below MUST go in an OP_RETURN in the same transaction.",
