@@ -89,6 +89,7 @@ class Fake:
         p.allow_users = set()
         p.handle_owner = {}
         p.handle_job = {}
+        p._status_at = None
         p.spenders = 1
         p.busy = threading.Lock()
         p.ignored = 0
@@ -322,9 +323,15 @@ check("wd/spread: the question offers more than one address",
       str(P.MAX_WAKE_EXIT_DESTS) in _ask and "several" in _ask.lower())
 check("wd/spread: ...and states the arrival count that makes it matter",
       str(P.exit_arrivals_floor(min(P.WITHDRAW_DEPTHS))) in _ask)
-check("wd/spread: ...and still calls one address a legitimate choice, because "
-      "an exchange deposit address cannot be split",
-      "exchange" in _ask.lower())
+# "ONE ADDRESS IS FINE" WAS TWO SENTENCES OF REASSURANCE nobody needed: the
+# question already accepts one, so an operator with one address types it. What
+# is worth the room is the reason SEVERAL is better, which is the part they
+# cannot work out for themselves.
+check("wd/spread: ...and says why several is better, which is the part the "
+      "operator cannot work out alone",
+      "group them" in _ask.lower())
+check(f"wd/spread: ...in one short screen ({len(_ask)} chars)",
+      len(_ask) <= 260)
 _m.say(f"{_WA} {_WB} {_WC}")
 _m.say("3")
 _conf = _m.sent[-1][1]
@@ -402,9 +409,12 @@ _q = _a.sent[-1][1]
 check("amount: the question asks for a BTC amount, not a position in a list",
       "btc" in _q.lower() and "slot" not in _q.lower()
       and "position" not in _q.lower())
-check("amount: ...and states the bounds, so a refusal is not a guessing game",
-      P.btc_display(P.DEPOSIT_MIN_SAT) in _q
-      and P.btc_display(P.DEPOSIT_MAX_SAT) in _q)
+# THE BOUNDS MOVED TO THE REFUSAL. Listing them in the QUESTION makes every
+# operator read two numbers that constrain almost nobody; listing them in the
+# refusal reaches exactly the operator who got it wrong.
+check("amount: ...and does not spend the question on bounds that constrain "
+      "almost nobody",
+      P.btc_display(P.DEPOSIT_MAX_SAT) not in _q)
 _a.say("0.05")
 check("amount: the confirm says the figure back, so it is what gets confirmed",
       "0.05" in _a.sent[-1][1])
@@ -480,45 +490,42 @@ _stx = _st.sent[-1][1]
 # ---- A TYPO GUARD PRESENTED AS AN OPERATING RANGE STRANDS MONEY ---------
 #
 # gs_wake_proto says it at the constants: "THESE ARE TYPO GUARDS AND NOT
-# PROTOCOL MINIMUMS ... The real lower bound is whatever ThorChain's outbound
-# fee makes uneconomic that day", and the bounds are "wide enough never to
-# obstruct a real deposit". The chat said "Anything from 0.0001 to 100", which
-# is how an operator reads an operating range.
+# PROTOCOL MINIMUMS". The chat said "Anything from 0.0001 to 100", which is how
+# an operator reads an operating range -- and a careful first-timer testing
+# with the smallest number the bot named strands the money, because every
+# /withdraw at every depth then fails against a mix minimum two orders of
+# magnitude higher.
 #
-# The trap is the first-time path and it catches the CAREFUL operator: /start,
-# the deposit button, a deliberate test with the smallest number the bot named.
-# The BTC swaps, the XMR lands, and every /withdraw at every depth then fails
-# against mix_minimum_xmr -- on the order of a third of an XMR, two orders of
-# magnitude away. The chat's explanation is "It may be too deep for the balance
-# -- the deeper options need more to work with", which cannot be acted on
-# because depth 1 is out of reach as well.
-print("\n-- the deposit floor that is not the deposit floor --")
+# AND THEN THE FIX ITSELF WAS THE NEXT PROBLEM. The first version spent four
+# lines explaining what a typo guard is, what the real floor is, and that this
+# box cannot compute it -- 391 characters, on the first question a newcomer is
+# ever asked. The operator only ever needed the last clause. The bounds are
+# still enforced and still named in the REFUSAL, which is where a number is
+# actually useful; the question keeps the one instruction that changes what
+# they type.
+print("\n-- the deposit floor, in as few words as it takes --")
 _aq = Fake()
 _aq.say("/deposit")
 _aqt = _aq.text()
-check("deposit: the bounds are labelled as what they are",
-      "TYPO GUARD" in _aqt and "not a working range" in _aqt)
-check("deposit: ...and the real floor is named as existing and higher",
-      "real floor" in _aqt and "much higher" in _aqt)
-check("deposit: ...and what happens below it is stated, since that is the "
-      "part that costs money",
-      "cannot run at ANY depth" in _aqt and "unmixable" in _aqt)
-# THIS BOX CANNOT COMPUTE IT: the floor needs a live fee estimate and a swap
-# rate, and /settings refuses to fetch a balance at all. Saying "send more,
-# not less" is the whole of what it honestly knows, and a computed figure here
-# would be a quote the vault never made.
-check("deposit: ...and it does not invent a figure it cannot know",
-      "cannot work out what it is" in _aqt
-      and "send more, not less" in _aqt)
-check("deposit: NON-VACUITY -- the typo bounds are still printed, because a "
-      "refusal that only says 'out of range' makes the operator guess",
-      P.btc_display(P.DEPOSIT_MIN_SAT) in _aqt
-      and P.btc_display(P.DEPOSIT_MAX_SAT) in _aqt)
-_aq_src = open(os.path.join(REPO, "gs_telegram_pager"),
-               encoding="utf-8").read()
-check("deposit: ...and the numbers come from the protocol, not from a literal "
-      "retyped here that can drift",
-      "proto.DEPOSIT_MIN_SAT" in _aq_src and "proto.DEPOSIT_MAX_SAT" in _aq_src)
+check("deposit: the question says which way to err, which is the only part "
+      "the operator can act on",
+      "Too little" in _aqt and "send more" in _aqt)
+check(f"deposit: ...and says it in one short screen ({len(_aqt)} chars)",
+      len(_aqt) <= 180)
+check("deposit: ...and does not lecture about what a typo guard is",
+      "TYPO GUARD" not in _aqt and "real floor" not in _aqt)
+# THE BOUNDS ARE STILL ENFORCED, and still named where a number helps: the
+# refusal. A question that lists them makes every operator read them; a
+# refusal that lists them reaches only the operator who got it wrong.
+_ob = Fake()
+_ob.say("/deposit")
+_ob.say("500")
+check("deposit: an out-of-range amount is still refused",
+      "no:" in _ob.text().lower())
+check("deposit: ...and the refusal names the bound, so it is not a guessing "
+      "game",
+      P.btc_display(P.DEPOSIT_MAX_SAT) in _ob.text()
+      or "100" in _ob.text())
 
 check("settings: it says the operator picks the deposit amount",
       "deposit amount" in _stx.lower())
