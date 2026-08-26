@@ -881,8 +881,22 @@ print("\n-- a half-finished /depo never reaches the SD card --")
 check("Convo has __slots__, so a field cannot be added by accident",
       hasattr(pg.Convo, "__slots__"))
 check("...and holds only the eight fields the two wizards need",
-      set(pg.Convo.__slots__) == {"kind", "amount", "depth", "handle",
+      set(pg.Convo.__slots__) == {"kind", "amount", "depth",
                                   "exit_to", "expect", "deadline", "tries"})
+# "handle" IS NOT AMONG THEM, and it was -- declared, assigned None in
+# __init__, and never set or read anywhere else in the shipped program. It
+# survived because the fixture below used to assign it by hand and the check
+# then counted it among the struct's text fields, so the slot looked used from
+# the one place inventing the usage. A conversation has no handle: the handle
+# is minted by the JOB, after the conversation is gone, and lives in
+# handle_owner.
+# ASKED OF THE OBJECT, not of the source text: "self.handle" also matches
+# self.handle_owner, self.handle_job and the Pager's own handle() method, so
+# a source count here would have been a check that could not fail.
+_c_probe = pg.Convo(lambda: 0.0)
+check("...and the dead 'handle' slot is gone, not merely unassigned",
+      "handle" not in pg.Convo.__slots__
+      and not hasattr(_c_probe, "handle"))
 # THE RULE NARROWED. It used to be "no string field at all" -- a struct that
 # cannot hold an address however the prompts are later edited. /withdraw has to
 # hold one, because the operator types their destination into the chat and it
@@ -897,18 +911,53 @@ check("...and every field starts empty, so a fresh Convo holds nothing",
       all(getattr(_c_fresh, f) in (None, "depo", 0)
           or isinstance(getattr(_c_fresh, f), float)
           for f in pg.Convo.__slots__))
-_c_full = pg.Convo(lambda: 0.0, kind="withdraw")
-_c_full.handle, _c_full.exit_to, _c_full.expect = "A3F1", "4" + "Ad" * 47, 9
-_str_fields = [f for f in pg.Convo.__slots__
-               if isinstance(getattr(_c_full, f), str)]
-check("...and a FULL withdraw conversation holds exactly three strings: its "
-      "kind, the handle this bot issued, and the one address",
-      sorted(_str_fields) == ["exit_to", "handle", "kind"])
+# DRIVEN, NOT HAND-BUILT, AND THE HAND-BUILT ONE WAS THE WRONG SHAPE.
+#
+# This set `_c_full.exit_to = "4" + "Ad" * 47` -- a STRING -- and the shipped
+# code has stored a LIST there since /withdraw started taking several
+# destinations. So the check below ("holds exactly three strings") passed
+# because of the fixture and would have FAILED against the real object: with a
+# list, exit_to is not a str at all. A fixture that disagrees with the code is
+# not a weaker test, it is a test of something that does not exist.
+#
+# Built by running the real conversation to the confirm step, so the shape can
+# never drift from what _step_convo actually produces.
+_cs = Fake()
+_cs.say("/withdraw")
+_cs.say(f"{_WA} {_WB}")
+_c_full = _cs.p.convos[111]
+check("...NON-VACUITY -- the driven conversation really is a withdraw waiting "
+      "to be confirmed, holding the destinations it was given",
+      _c_full.kind == "withdraw" and _c_full.exit_to == [_WA, _WB])
+
+
+def _texty(v):
+    """Does this field hold operator text, directly or in a list?"""
+    return isinstance(v, str) or (
+        isinstance(v, list) and any(isinstance(x, str) for x in v))
+
+
+_str_fields = [f for f in pg.Convo.__slots__ if _texty(getattr(_c_full, f))]
+check("...and a FULL withdraw conversation holds text in exactly two fields: "
+      "its kind, and the destinations",
+      sorted(_str_fields) == ["exit_to", "kind"])
 check("...and no field can hold a memo, a slip or an amount — nothing else is "
-      "text at all",
-      all(not isinstance(getattr(_c_full, f), str)
+      "text at all, at any depth",
+      all(not _texty(getattr(_c_full, f))
           for f in pg.Convo.__slots__
-          if f not in ("kind", "handle", "exit_to")))
+          if f not in ("kind", "exit_to")))
+# AND THE ONE LIST HOLDS ONLY ADDRESSES THE PROTOCOL'S GATE PASSED. "one free
+# text field" is worth nothing if that field can hold arbitrary text: what
+# makes it safe is that every element came back from the same validator the
+# vault applies, not that there is only one of it.
+_gate_ok = True
+try:
+    P.JOBS["withdraw"]["schema"]["exit_to"](_c_full.exit_to)
+except Exception:                                            # noqa: BLE001
+    _gate_ok = False
+check("...and every element of that list re-passes the protocol's own address "
+      "gate, so the field cannot hold free text",
+      _gate_ok)
 # AND THE ADDRESS IS SET IN EXACTLY ONE PLACE, from a value the protocol's own
 # gate has already accepted. A second writer is how a checked field becomes an
 # unchecked one.
@@ -1432,6 +1481,119 @@ check("NON-VACUITY -- /fee DOES carry it, so the checks above are about the "
       "other commands and not about a rate that is never printed",
       pg.USAGE_FEE_LABEL in _fee_reply)
 
+# ---- AND THE CUT IS NOT ALWAYS TAKEN, WHICH ALL THREE LINES ASSERTED ----
+#
+# GhostSpiral.plan_usage_fee WAIVES the cut when it would come to less than
+# the network fee needed to move it: taking it would create a permanent
+# on-chain output nobody could ever spend. Driven against the SHIPPED function
+# at a 0.0024 XMR network fee, every balance from the mixing minimum (0.1784)
+# up to about 0.34 XMR takes NOTHING -- the band immediately above the
+# smallest run this service will do, so the common case, not an edge.
+#
+# The waiver is correct. What was wrong is that the chat said the opposite:
+#
+#   welcome:  "Taken once, out of what you withdraw."
+#   confirm:  "1.1% usage fee comes out of it — this service's cut."
+#
+# The confirm is the message the operator agrees to a SPEND on, and it stated
+# a cost that is frequently not charged. That is the silent zero in reverse:
+# not a fee quietly missing, a fee quietly promised.
+_fw = Fake()
+_fw.say("/withdraw")
+_fw.say(_WA)
+_fw.say("3")
+_wconf = _fw.sent[-1][1]
+check("fee/honesty: the withdraw confirm does not promise the cut is taken",
+      "comes out of it" not in _wconf)
+check("fee/honesty: ...it states a CEILING, which is the only form this box "
+      "can stand behind — it knows neither the balance nor the machine's fee "
+      "configuration",
+      "Up to" in _wconf and "some runs take none" in _wconf)
+# AND IT DOES NOT BLAME THE AMOUNT. The first draft of this fix said the
+# exception is the withdrawal being small -- one of the two causes, and not
+# the commoner one: a machine paired with nowhere off the wallet to put a cut
+# takes none on EVERY withdrawal, which is the default pairing.
+check("fee/honesty: ...without pinning the exception on the amount, which is "
+      "only one of the two causes",
+      "too small" not in _wconf)
+check("fee/honesty: ...while still naming the rate, so the disclosure did not "
+      "become a non-statement",
+      pg.USAGE_FEE_LABEL in _wconf)
+# NO FLOOR FIGURE, ANYWHERE IN THE CHAT. Not secrecy -- it is derived from
+# constants in this repository and anyone holding it recomputes it. It is that
+# this box CANNOT compute it: the floor moves with the live network fee and
+# the pager has never been told one. A number here would be a quote it cannot
+# honour, which is the same rule _amount_question follows for the minimum.
+_wel = pg.welcome_text(0)
+check("fee/honesty: ...and quotes no floor figure it could not stand behind",
+      not re.search(r"0\.\d{3,}", _wconf)
+      and not re.search(r"0\.\d{3,}", _wel))
+# THE RULE LIVES ON THE WELCOME, which is sent once and has room. /fee is
+# capped at 40 characters precisely so a paragraph about the arrangement
+# cannot grow there, so the rule cannot live in the /fee reply.
+check("fee/honesty: the welcome carries the rule, where there is room for it",
+      "not always" in _wel and "a small one takes none" in _wel)
+check("fee/honesty: ...and names the OTHER cause too, which is the one a "
+      "default pairing hits on every single withdrawal",
+      "names nowhere to put a cut" in _wel)
+check("fee/honesty: ...and /fee stays inside its ceiling rather than growing "
+      f"the rule into it ({len(_fee_reply)} chars)",
+      len(_fee_reply) <= _ANSWER_MAX)
+# ---- AND /settings SAID IT THREE DIFFERENT WAYS IN ONE REPLY ------------
+#
+# It read, in this order and in the same message:
+#
+#   "usage fee       taken once from each withdrawal"
+#   "Set on the machine, with physical access: ... whether a usage fee is
+#    taken, and where it goes"
+#   "Fixed in the software, the same for everyone: ... the usage fee"
+#
+# At most one of those can be true of an install and the first is true of
+# none. This is the command whose entire purpose is to answer "what will this
+# do", one tap from the welcome, /help, /status and every job outcome. Three
+# conditions written separately for one state -- AGENTS.md rule 2's "one
+# state, two sentences, decided twice", at three.
+_set = Fake()
+_set.say("/settings")
+_stext = _set.text()
+check("fee/settings: /settings does not assert a cut is taken from every "
+      "withdrawal",
+      "taken once from each withdrawal" not in _stext)
+check("fee/settings: ...it names the two reasons there may be none",
+      "none on a small withdrawal" in _stext
+      and "nowhere to put it" in _stext)
+# ALL THREE SURFACES THAT HAVE ROOM NAME BOTH CAUSES. The confirm does not --
+# it states a ceiling instead, because it is the one message with no room and
+# the ceiling is true whichever cause applies.
+check("fee/honesty: every fee surface with room for the rule names BOTH "
+      "causes, so none of them can send the operator after the wrong one",
+      all(("small" in _t and ("nowhere to put" in _t))
+          for _t in (_wel, _stext)))
+# THE RATE IS WHAT IS UNIVERSAL, NOT THE FEE. "the usage fee" under "the same
+# for everyone" contradicted the line four rows above it saying the machine
+# decides whether one is taken at all.
+check("fee/settings: ...and what it calls fixed for everyone is the RATE, "
+      "not the fee",
+      "the usage fee RATE" in _stext)
+check("fee/settings: ...while still saying the machine is what decides "
+      "whether one is taken, which is the true half it already had",
+      "whether a usage fee is taken" in _stext)
+# NON-VACUITY: /settings really is the reply under test, and it still answers.
+check("fee/settings: NON-VACUITY -- /settings still lists what a run does",
+      "You choose, per job:" in _stext and "mixing depth" in _stext)
+# AND ALL FOUR FEE SURFACES AGREE. The bug was not any one sentence, it was
+# four surfaces written at different times: welcome, /fee, the withdraw
+# confirm and /settings. Checked together so the next edit to one of them has
+# to face the other three.
+_surfaces = {"welcome": _wel, "confirm": _wconf, "settings": _stext}
+check("fee/honesty: no fee surface asserts the cut is unconditional",
+      not any(_p in _t.lower()
+              for _t in _surfaces.values()
+              for _p in ("comes out of it", "taken once from each")))
+check("fee/honesty: NON-VACUITY -- every one of those surfaces really does "
+      "talk about the fee, so the check above is not passing on silence",
+      all("usage fee" in _t.lower() for _t in _surfaces.values()))
+
 # ===========================================================================
 # 8b. EVERY STRING THIS BOT CAN SEND, NOT JUST THE ONES A TEST HAPPENS TO DRIVE.
 # ===========================================================================
@@ -1633,11 +1795,24 @@ _all_sent += [(-1, _CURRENCY_RE.sub("", l)) for l in _LABELS]
 #: and the ceiling below is a TOTAL across every surface the scrub covers --
 #: so this has to be in it before it is checked, or the scrub would let a
 #: whole extra surface name the currency for free.
-_PLAIN_SAMPLE = {"b": "0.05000000", "d": "bc1qexample", "x": "1.23",
-                 "h": "A3F1", "m": "=:XMR.XMR:4example:0/1/0"}
-_plain_authored = [
-    _l for _l in P.plain_lines(_PLAIN_SAMPLE, label="A3F1-9C2B7E")
-    if _l and _l != _PLAIN_SAMPLE["m"]]
+#: BUILT FROM PLAIN_FIELDS, NOT TYPED. This was a hand-written dict that still
+#: carried "m" -- the memo field the wire dropped -- so the filter below
+#: (`_l != _PLAIN_SAMPLE["m"]`) was excluding a line plain_lines has not
+#: produced since, and plain_slip_is_wellformed REFUSES such a record anyway.
+#: A fixture holding a field the protocol does not have makes every check
+#: downstream of it a check about a shape that cannot occur.
+#:
+#: Keyed off the real table, so a field added to or removed from the wire
+#: changes this fixture with it instead of leaving it a turn behind.
+_PLAIN_VALUES = {"b": "0.05000000", "d": "bc1qexample", "x": "1.23",
+                 "h": "A3F1"}
+_PLAIN_SAMPLE = {_k: _PLAIN_VALUES[_k] for _k in P.PLAIN_FIELDS}
+check("the deposit-instruction fixture is exactly the wire's own field set, "
+      "so it cannot test a record shape the protocol refuses",
+      set(_PLAIN_SAMPLE) == set(P.PLAIN_FIELDS)
+      and P.plain_slip_is_wellformed(_PLAIN_SAMPLE))
+_plain_authored = [_l for _l in P.plain_lines(_PLAIN_SAMPLE,
+                                              label="A3F1-9C2B7E") if _l]
 #: AND THE WITHDRAW QUESTION, which is the one place the reader has to know
 #: WHICH KIND of address to paste. "Send a Monero address" plus an example is
 #: the fastest this can be; the alternative is three sentences of reasoning
@@ -1718,8 +1893,7 @@ check("...without naming the service that makes it shared, or the field that "
 # one of them was being looked at.
 _all_sent += [(-1, _CURRENCY_RE.sub("", _l))
               for _l in P.plain_lines(_PLAIN_SAMPLE)
-              if _l and _l != _PLAIN_SAMPLE["m"]
-              and _l not in _plain_authored]
+              if _l and _l not in _plain_authored]
 
 # EVERY BUTTON TABLE, not the one the menu happens to use. A `buttons=` that
 # named a fifth table would be a keyboard nothing above reads.

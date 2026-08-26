@@ -599,6 +599,67 @@ check("...and a clean cycle prints NO event line at all",
       and "did not authenticate" not in _buf3.getvalue())
 
 
+# ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
+#
+# report() branched on the OUTCOME and never on the job, so a completed
+# withdrawal fell through the deposit path: it carries no handle, so the line
+# read "Handle (none)"; it carries no slip, so the next line said "The deposit
+# address, the memo and the slip stayed on the vault. Read them there" --
+# deposit instructions, printed after a run that just spent money and issued
+# none.
+#
+# This terminal is the by-hand path, and gs_wake_proto's own rule for it is
+# that an operator running the doorbell by hand "must see exactly what the
+# chat would have shown, or the by-hand path stops being a way to check the
+# automated one". The chat says a spend was sent and whether more is left.
+print("\n== a finished withdrawal is reported as a spend ==")
+
+
+def _report_text(job, result):
+    _b = Bell(job=job, params=({"exit_to": ["4" + "A" * 94], "depth": 1}
+                               if job == "withdraw"
+                               else {"amount_sat": 5000000}))
+    _b.pending.result = result
+    _b.pending.reported = True
+    _b.close()
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        DB.report(_b.pending)
+    return _buf.getvalue()
+
+
+_wd_more = _report_text("withdraw", {"status": "done", "handle": "",
+                                     "slip": "", "plain": {},
+                                     "phase": "more_left"})
+check("doorbell/withdraw: a finished spend is reported as a SPEND",
+      "It SPENT" in _wd_more)
+check("doorbell/withdraw: ...and never as a deposit whose details are "
+      "waiting on the vault",
+      "deposit address" not in _wd_more.lower()
+      and "SEALED SLIP" not in _wd_more)
+check("doorbell/withdraw: ...and names no handle, because a withdrawal "
+      "registers none",
+      "Handle" not in _wd_more)
+check("doorbell/withdraw: ...and says there is more here, in the protocol's "
+      "own words rather than the raw wire token",
+      P.PHASE_LINES["more_left"] in _wd_more
+      and "more_left" not in _wd_more)
+_wd_last = _report_text("withdraw", {"status": "done", "handle": "",
+                                     "slip": "", "plain": {}, "phase": ""})
+check("doorbell/withdraw: ...and with no phase it says nothing is left, "
+      "rather than falling silent",
+      "Nothing is left on this wallet" in _wd_last)
+# NON-VACUITY: a DEPOSIT still takes the deposit path, so this is a branch and
+# not a rewrite of report().
+_dep = _report_text("receive_and_quote",
+                    {"status": "done", "handle": "A3F1", "slip": "",
+                     "plain": {}, "phase": ""})
+check("doorbell/withdraw: NON-VACUITY -- a deposit still reports its handle "
+      "and points at the vault for the details",
+      "A3F1" in _dep and "stayed on the vault" in _dep
+      and "It SPENT" not in _dep)
+
+
 print("\n== the passphrase floor ==")
 # It was eight characters. Against Argon2id at 256 MiB and somebody holding the
 # SD card, eight characters of anything a person invents is a delay, not a

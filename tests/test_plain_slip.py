@@ -888,17 +888,31 @@ for _j in ("watch", "receive_and_quote", "swap_status"):
 # --chat-id -1001999999999 --user-id 555: the amount, the deposit address and
 # a memo naming the destination XMR address in full, to everyone in it.
 _GROUP = -1001999999999
-_gp = _drive_out(_res("done", "", plain={
-    "b": "0.05000000", "d": "bc1qdeposit0000000000000000000000",
-    "m": "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0",
-    "x": "1.2345", "h": "A3F1"}), "done", job="receive_and_quote",
-    chat_id=_GROUP)
+# THE FIXTURE CARRIED A MEMO FIELD THE WIRE NO LONGER HAS, so the memo
+# assertion below tested nothing: plain_lines does not render "m" whatever is
+# in the dict, and plain_slip_is_wellformed REFUSES a record carrying one, so
+# such a record cannot reach this code path at all. A check that cannot fail
+# would have gone on passing if the memo came back.
+#
+# The fixture is now the real shape, and the memo guarantee is asserted where
+# it is actually enforced -- at the gate -- just below.
+_PL_OK = {"b": "0.05000000", "d": "bc1qdeposit0000000000000000000000",
+          "x": "1.2345", "h": "A3F1"}
+_PL_MEMO = dict(_PL_OK, m="=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0")
+check("plain: the wire REFUSES a deposit record carrying a memo, which is "
+      "what stops one reaching the chat at all",
+      P.plain_slip_is_wellformed(_PL_OK)
+      and not P.plain_slip_is_wellformed(_PL_MEMO))
+check("plain: ...and the renderer would not print one even if a record "
+      "smuggled it past, so the two halves do not rest on each other",
+      not any("=:XMR.XMR:" in _l or "8" + "d" * 94 in _l
+              for _l in P.plain_lines(_PL_MEMO, label="A3F1-1234AB")))
+_gp = _drive_out(_res("done", "", plain=dict(_PL_OK)), "done",
+                 job="receive_and_quote", chat_id=_GROUP)
 _gtext = "\n".join(_gp)
 check("group: the deposit address is NOT posted into a room",
       "bc1qdeposit" not in _gtext)
 check("group: ...nor the amount", "0.05000000" not in _gtext)
-check("group: ...nor the memo, which names the destination XMR address whole",
-      "=:XMR.XMR:" not in _gtext and "8" + "d" * 94 not in _gtext)
 check("group: ...and the operator is told why, rather than left waiting",
       "this is a group" in _gtext and "everyone in it" in _gtext)
 check("group: ...and told where the details are and how to get them properly",

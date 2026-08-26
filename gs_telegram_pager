@@ -122,7 +122,26 @@ POLL_HOLD_S = 10
 #: the bot stays down until Tor is genuinely back.
 #:
 #: Not 1: a single blip on a Tor circuit is ordinary and must not stop a
-#: pager. At 5 s a retry this is about a minute of sustained failure.
+#: pager.
+#:
+#: "ABOUT A MINUTE OF SUSTAINED FAILURE" WAS THE FAST CASE MISTAKEN FOR THE
+#: ANSWER. It counted 12 x the 5 s loop sleep and nothing else -- but each of
+#: those twelve is one call to updates(), and gs_common.safe_get is decorated
+#: `@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4,
+#: max=30))` around a request with `timeout=20`. So ONE failure is up to four
+#: attempts of 20 s plus about 28 s of backoff: 108 s, not 5.
+#:
+#: Both ends are real and which one happens depends on how Tor breaks:
+#:
+#:   Tor refusing the connection outright  ->  ~1 min to exit  (the old figure)
+#:   Tor accepting and timing out          ->  ~22 min to exit
+#:
+#: The second is the one that matters, because it is what a half-dead circuit
+#: looks like, and 22 minutes is 22 minutes in which the operator believes a
+#: poke will work. The number stays at 12: lowering it to make the worst case
+#: shorter would make the ordinary blip stop the pager, which is the failure
+#: this constant exists to avoid. What changes is that the next reader sizing
+#: it knows what they are sizing.
 MAX_POLL_FAILURES = 12
 
 #: Seconds before the ONE retry of a sealed slip that did not send. Long enough
@@ -497,6 +516,37 @@ CONFIRM_NOTE = (
 #: The usage fee is what this service keeps. The network fee is what Monero
 #: charges per transaction, a mix is many transactions, and none of it comes
 #: here. Naming both is the only way either number means anything.
+#:
+#: ...AND IT IS NOT ALWAYS TAKEN, WHICH ALL THREE FEE LINES ASSERTED.
+#:
+#: GhostSpiral.plan_usage_fee WAIVES the cut when it would come to less than
+#: the network fee needed to move it -- an output nobody could ever spend,
+#: created permanently on chain to fail at it. Driven against the shipped
+#: function at a 0.0024 XMR network fee: every withdrawal from the mixing
+#: minimum up to about a third of an XMR takes NOTHING, which is the band
+#: immediately above the smallest run this service will do, i.e. the common
+#: case rather than an edge. The waiver is right; asserting the opposite in
+#: the chat was not.
+#:
+#: NO FLOOR FIGURE HERE, and not for secrecy -- it is derived from constants
+#: in this repository and anyone holding it recomputes it. It is that this box
+#: CANNOT compute it: the floor moves with the live network fee and the pager
+#: has never been told one, the same reason _amount_question states that a
+#: minimum exists and refuses to name it.
+#:
+#: AND NOT REPORTED PER RUN EITHER. The vault knows which way it went and
+#: could say so on the completion message -- but "no fee taken" plus a floor
+#: anyone can recompute is an upper BOUND on what that withdrawal held, put
+#: into a transcript this file assumes a stranger reads. The rule is safe to
+#: state; the outcome is not.
+#: AND THE RULE IS NOT SAID HERE, WHICH IS THE 40-CHARACTER CEILING'S DOING
+#: rather than an omission. tests/test_depo_wizard.py caps this reply because
+#: two earlier drafts grew into paragraphs describing the arrangement, in the
+#: readable surface, permanently. The waiver rule is a sentence; it lives on
+#: the welcome, which is sent once and has a WHAT IT COSTS section for exactly
+#: this. What this line must not do is what it did before -- assert a cut that
+#: is often not taken -- and it does not: it states the RATE, which is true of
+#: the fee whenever there is one.
 FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Not the network fee."
 #: "no: a wake is already running" NAMED THE ARRANGEMENT AND ANSWERED NOTHING.
 #:
@@ -553,17 +603,21 @@ SPEED_ANSWER = "Fewer hops is faster — see /withdraw."
 # WAS "Not settable here." AND THAT IS NO LONGER TRUE. /withdraw sets it, by
 # reply, per withdrawal. An answer that still said "not settable" would be the
 # tool lying about its own capability on the one surface the operator asks.
-# /send, NOT /withdraw. Both spellings work (parse_command accepts either)
-# but only /send is in BOT_COMMANDS, so /withdraw is the one the "/" menu
-# never offers -- pointing the operator at it from inside an answer sent
-# them to a command they cannot see.
+# /withdraw, NOT /send, AND THIS COMMENT SAID THE OPPOSITE. It read "only
+# /send is in BOT_COMMANDS, so /withdraw is the one the '/' menu never
+# offers", and the table has said the reverse since the rename: BOT_COMMANDS
+# carries ("withdraw", ...) and no "send" entry at all. Both spellings still
+# work -- parse_command accepts either -- so the answers above point at the
+# PUBLISHED one, which is the whole rule this paragraph is about. A comment
+# stating the inverse of the table it describes is how the next edit "fixes"
+# an answer into naming the command the menu does not show.
 # STILL ONE SHORT LINE, and the temptation to grow it here was the wrong one.
-# /send now takes up to MAX_WAKE_EXIT_DESTS destinations and explains why that
-# matters -- but this answer is a STANDING one, and everything written into it
+# /withdraw now takes up to MAX_WAKE_EXIT_DESTS destinations and explains why
+# that matters -- but this answer is a STANDING one, and everything written into it
 # sits permanently in a server-side transcript describing the arrangement. The
 # explanation belongs where the operator is about to act on it, which is
-# _exit_question, shown once per withdrawal. Pointing at /send is the whole of
-# what this has to do. tests/test_depo_wizard.py caps these three at 40
+# _exit_question, shown once per withdrawal. Pointing at /withdraw is the whole
+# of what this has to do. tests/test_depo_wizard.py caps these three at 40
 # characters for exactly this reason and caught a 191-character draft.
 EXIT_ANSWER = "Per withdrawal — see /withdraw."
 
@@ -732,9 +786,20 @@ def handle_from_confirmation(key: dict, chat_id: int, text: str) -> str:
 #: wrong for exactly the operator the setting exists for: the one with a phone
 #: and no second machine, being told to go and read something at a machine
 #: they are not standing at.
+#: THE DEFAULT LINE HAS TO BE TRUE ON BOTH INSTALLS, because the box that
+#: draws it cannot tell which one it is on: `deposit_in_chat` is a field of
+#: the VAULT's keyfile and the Pi's sealed card does not carry it. It said
+#: "The details appear ON THE MACHINE", which is a promise that is simply
+#: false where the mode is set -- and false on the one screen a first-time
+#: reader is guaranteed to see, sending them to a machine they may not be
+#: standing at for something that is about to arrive in front of them.
+#:
+#: What is true on every install is the part that matters: the details come
+#: from the machine, they turn up when /deposit is answered, and a phone
+#: wallet cannot pay them.
 _DEPO_ON_MACHINE = (
-    "  /deposit   you pay in Bitcoin. The details appear ON THE MACHINE — pay "
-    "it from there, never from a phone wallet.")
+    "  /deposit   you pay in Bitcoin. The details come back when you ask — "
+    "pay them from the machine, never from a phone wallet.")
 _DEPO_IN_CHAT = (
     "  /deposit   you pay in Bitcoin. A fresh address and the amount arrive "
     "HERE, every time — pay it from the machine, not from a phone wallet.")
@@ -754,8 +819,20 @@ WELCOME_LINES = [
     "WHAT IT COSTS",
     f"  USAGE FEE {USAGE_FEE_LABEL} — that is what this service keeps, and "
     f"the only thing it keeps.",
-    "  Taken once, out of what you withdraw. Nothing is charged for "
-    "depositing, for waiting, or for asking.",
+    # "Taken once, out of what you withdraw" FULL STOP, and it is not always
+    # taken: below a floor the cut is worth less than the network fee to move
+    # it, so it is waived and the withdrawal runs in full. See FEE_ANSWER.
+    # TWO CAUSES, AND THE FIRST DRAFT OF THIS FIX NAMED ONE. It said "not at
+    # all on a small one" and stopped -- so an operator whose fee is zero on
+    # EVERY withdrawal, because the machine was paired without anywhere off
+    # the wallet to put a cut, reads a sentence that tells them the amount was
+    # the problem. That is the default pairing (gs_wake_keys warns about it
+    # once, at pairing, on a machine they may never go back to), so it is the
+    # commoner of the two. /settings names both; so does this.
+    "  Taken once, out of what you withdraw — but not always: a small one "
+    "takes none, and so does any withdrawal where the machine names nowhere "
+    "to put a cut. Nothing is charged for depositing, for waiting, or for "
+    "asking.",
     "",
     "  That is NOT the same as the network fee. The network charges its own "
     "fee on every transaction it carries, a mix is many transactions, and "
@@ -785,6 +862,30 @@ def welcome_text(burn_after: int = 0, key: dict = None) -> str:
     it describes the default -- which is what every source-level check reads
     and what an install with no mode set actually does.
     """
+    # THE BRANCH CANNOT FIRE ON THE PI, WHICH IS THE ONLY BOX THAT CALLS THIS.
+    #
+    # `deposit_in_chat` is a field of the VAULT's keyfile. The Pi's sealed card
+    # carries role, secret, peer_public, pair_fingerprint, listen_host,
+    # listen_port, target_mac, wol_broadcast and wol_port -- and nothing else,
+    # deliberately: gs_doorbell's pairing block argues at length that values
+    # which mean something get removed from a card that is assumed seizable.
+    # So `self.key` never has this field, `.get` is always falsy, and the
+    # conditional has selected _DEPO_ON_MACHINE on every install since it was
+    # written.
+    #
+    # THAT IS NOT MERELY DEAD, IT IS WRONG HALF THE TIME. On an install where
+    # the vault DOES have the mode set, the deposit address really does arrive
+    # in the chat -- and the welcome, the one screen a first-time reader is
+    # guaranteed to see, has just told them to go and read it at a machine.
+    # That is the exact failure the two-line split was introduced to fix,
+    # reintroduced by putting the switch on a box that cannot see the switch.
+    #
+    # KEPT, AND NOT DELETED, because the argument for the split is right and
+    # the vault-side half of it is real. What is removed is the pretence that
+    # this box can decide: `key` is still taken, still consulted, and now the
+    # DEFAULT line says the thing that is true either way, so no reader is
+    # sent to the wrong place. A future card that does carry the field makes
+    # the branch live again with no further change here.
     lines = [_DEPO_IN_CHAT if _l is _DEPO_LINE and (key or {}).get("deposit_in_chat")
              else _l for _l in WELCOME_LINES]
     try:
@@ -792,7 +893,18 @@ def welcome_text(burn_after: int = 0, key: dict = None) -> str:
     except (TypeError, ValueError):
         _b = 0
     if _b > 0:
-        lines.append(_BURN_LINE.format(h=max(1, _b // 3600)))
+        # ROUNDED UP, AND IT WAS FLOORED. `_b // 3600` on --burn-after 5400
+        # (an hour and a half) printed "deleted after 1h" -- the reader
+        # believes a message is gone half an hour before burn_expired touches
+        # it. That is the one direction this sentence must never err in: a
+        # promise of deletion that has not happened yet is the operator
+        # deciding what to type based on a window that is still open.
+        #
+        # Ceiling division makes the printed figure an upper bound on the real
+        # one, so the message is gone by the time stated and usually sooner.
+        # max(1, ...) still covers a sub-hour setting, which now also rounds
+        # up rather than being clamped from below.
+        lines.append(_BURN_LINE.format(h=max(1, -(-_b // 3600))))
     lines += ["", "Tap below, or /help for everything."]
     return "\n".join(lines)
 
@@ -1199,14 +1311,25 @@ class Convo:
     this struct is already an integer or the conversation is already dead.
     """
 
-    __slots__ = ("kind", "amount", "depth", "handle", "exit_to", "expect",
+    # "handle" IS GONE, AND IT WAS NEVER ANYTHING. The slot was declared here
+    # and assigned None in __init__, and that was every appearance of it in
+    # the shipped program: no branch of _step_convo set it, no reply read it,
+    # nothing on the wire carried it. A conversation has no handle -- the
+    # handle is minted by the JOB, long after the conversation is gone, and
+    # lives in handle_owner.
+    #
+    # It survived because a test fixture assigned it by hand and then asserted
+    # the struct "holds exactly three strings: its kind, the handle this bot
+    # issued, and the one address" -- so the field looked used, from the one
+    # place that was inventing the usage. That is the "declared in one place,
+    # never wired" shape with a test standing in front of it.
+    __slots__ = ("kind", "amount", "depth", "exit_to", "expect",
                  "deadline", "tries")
 
     def __init__(self, clock, kind="depo"):
         self.kind = kind
         self.amount = None
         self.depth = None
-        self.handle = None
         self.exit_to = None
         self.expect = None
         #: Unrecognised answers spent at the ONE step that re-asks instead of
@@ -1541,9 +1664,31 @@ class Pager:
         # chooses and what is counted, and said nothing about the one thing a
         # run takes from them -- on the command whose whole purpose is to
         # answer "what will this do".
+        # ...AND IT SAID "taken once from each withdrawal", WHICH IS FALSE,
+        # in a reply that then contradicts itself twice more about the same
+        # thing. Three sentences were written separately for one state:
+        #
+        #   here:                "taken once from each withdrawal"
+        #   further down:        "whether a usage fee is taken ... [is] set on
+        #                         the machine, with physical access"
+        #   further down again:  "the usage fee" under "Fixed in the software,
+        #                         the same for everyone"
+        #
+        # At most one of those can be true of an install, and the first is
+        # true of none: GhostSpiral.plan_usage_fee waives the cut whenever it
+        # would come to less than the network fee needed to move it, which is
+        # every withdrawal in the band just above the mixing minimum, and
+        # gs_wake_agent takes no cut at all when the machine's keyfile names
+        # nowhere off the wallet to put one. This box has neither the balance
+        # nor the keyfile, so it cannot say which happened -- what it can do
+        # is stop asserting one.
+        #
+        # WHAT IS FIXED IS THE RATE, and that is the line further down; it now
+        # says rate rather than fee, so the three agree.
         lines.append("Taken by the service:")
-        lines.append("  usage fee       taken once from each withdrawal "
-                     "— the rate is on /fee")
+        lines.append("  usage fee       the rate is on /fee — none on a small "
+                     "withdrawal, or where the machine names nowhere to put "
+                     "it")
         lines.append("  network fee     the network's own, per transaction "
                      "— not ours, and larger")
         lines.append("")
@@ -1585,7 +1730,12 @@ class Pager:
         lines.append("Fixed in the software, the same for everyone:")
         lines.append("  the delay between hops")
         lines.append("  which depths are on the menu")
-        lines.append("  the usage fee — see /fee")
+        # THE RATE, NOT THE FEE. "the usage fee" under "the same for
+        # everyone" said the cut itself is universal, which contradicted the
+        # line four rows up saying the machine decides whether one is taken.
+        # The RATE is what is fixed and identical on every install; whether it
+        # applies to a given run is not.
+        lines.append("  the usage fee RATE — see /fee")
         lines.append("")
         lines.append("Nothing in the last two groups changes from this chat. "
                      "A message that could turn the mixing down is a message "
@@ -1604,10 +1754,20 @@ class Pager:
         if it happened to be foreseen and written into a keyfile with physical
         access. Every other time, it quoted a number that was not the number.
 
-        The bounds are named because a refusal that only says "out of range"
-        makes the operator guess at the range. They are stated as BTC because
-        that is the unit being sent; the satoshi count is an implementation
-        detail of the wire and never appears in the chat.
+        THE BOUNDS ARE NOT NAMED, AND THIS PARAGRAPH SAID THEY WERE. It read
+        "The bounds are named because a refusal that only says 'out of range'
+        makes the operator guess at the range" -- describing a version of this
+        question that printed "anything from 0.0001 to 100". The two
+        paragraphs directly below are the argument for taking that range OUT,
+        and they won: the question now says a floor exists and which way to
+        err, and prints no figure at all. A reader who stopped at the first
+        paragraph would conclude the range is stated here and go looking for
+        where it broke.
+
+        What survives is the unit rule: anything this ever says about an
+        amount is stated as BTC, because that is what is being sent; the
+        satoshi count is an implementation detail of the wire and never
+        appears in the chat.
 
         "ANYTHING FROM 0.0001 TO 100" READ AS AN OPERATING RANGE AND IS NOT
         ONE. gs_wake_proto says so at the constants themselves: "THESE ARE
@@ -2052,13 +2212,19 @@ class Pager:
             # the address it reveals nothing -- it is a property of the
             # service, not of the money.
             #
-            # AND HOW MANY ARRIVALS LAND ON HOW MANY ADDRESSES, because the
-            # depth is what decides the first number and this is the last
-            # moment either can be changed. A COUNT is not an address: it says
-            # nothing about where the money goes and everything about whether
-            # the operator has just undone the run's whole purpose. The
+            # AND HOW MANY ADDRESSES THEY LAND ON, which is the half of this
+            # that survived. The arrival COUNT used to be the other half --
+            # "At least 12 separate transactions" -- and it is gone from the
+            # message; this comment described it for a turn after it went,
+            # which is exactly the stale-comment hazard the rules file names.
+            #
+            # What is left is the fact that decides something: how many places
+            # the operator pointed at. A count of DESTINATIONS is a count of
+            # values already in this transcript, so it discloses nothing new,
+            # and it is the difference between a run that spread and one that
+            # collected itself back together on arrival. The
             # single-destination case gets a sentence rather than a number,
-            # since that is the case where the count is the bad news.
+            # because that is the case where it is bad news.
             _n = len(c.exit_to)
             _spread = (f"across {_n} addresses" if _n > 1 else
                        "onto the ONE address you gave — anyone watching it "
@@ -2101,9 +2267,27 @@ class Pager:
                       f"just sent, {proto.depth_said_back(_d)} — this "
                       f"SPENDS.\n\n"
                       f"It arrives as many separate payments, {_spread}.\n"
-                      f"{USAGE_FEE_LABEL} usage fee comes out of it — this "
-                      f"service's cut. The network fee is separate, charged "
-                      f"on every transaction, and is not ours."
+                      # "comes out of it" WAS A PROMISE THIS BOX CANNOT
+                      # KEEP. The cut is waived whenever it would come to
+                      # less than the network fee needed to move it, which is
+                      # every withdrawal in the band just above the mixing
+                      # minimum -- and this line asserted the opposite on the
+                      # one message the operator agrees to a spend on. See
+                      # FEE_ANSWER for the measurement and for why neither
+                      # the floor nor this run's outcome may be printed.
+                      # "UP TO", WHICH IS THE ONLY FORM THAT IS ALWAYS TRUE.
+                      # This box knows neither the balance nor the machine's
+                      # fee configuration, so it cannot say whether a cut
+                      # applies to THIS run -- and both of the earlier
+                      # attempts said something it could not know: first that
+                      # the cut "comes out of it", then that the exception is
+                      # the withdrawal being small, which is only one of the
+                      # two causes and not the commoner one. A ceiling needs
+                      # neither fact and cannot be wrong.
+                      f"Up to {USAGE_FEE_LABEL} usage fee — this service's "
+                      f"cut, and some runs take none. The network fee is "
+                      f"separate, charged on every transaction, and is not "
+                      f"ours."
                       f"\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
@@ -3718,10 +3902,6 @@ class Pager:
                       "spend whoever's balance is largest. Refusing every "
                       "job until that is fixed — one person per bot.")
             return
-        # WHICH LEG THIS IS, recorded before the thread starts so poke() reads
-        # it rather than a slot that has already been cleared. A fresh
-        # /withdraw takes the default and resets the count.
-        self._chain_leg = int(leg)
         why = self.limits.why_not()
         if why:
             self.send(cid, f"no: {why}")
@@ -3749,6 +3929,35 @@ class Pager:
         # worker still thinks it holds.
         try:
             self._running = cid
+            # WHICH LEG THIS IS, recorded before the thread starts so the
+            # worker reads it rather than a slot _worker has already cleared.
+            # A fresh /withdraw takes the default and resets the count.
+            #
+            # ...AND IT USED TO BE ASSIGNED ABOVE, BEFORE THE REFUSALS, WHICH
+            # PUT THE CAP BACK IN THE STATE IT WAS ADDED TO FIX.
+            #
+            # Every call to start_job wrote this, including the ones that then
+            # returned without starting anything -- rate limited, or refused
+            # for `busy`. A withdrawal chain holds `busy` for hours, so any
+            # other command during it takes exactly that path: the operator
+            # taps "Has it arrived?" while leg 3 is running, start_job sets
+            # _chain_leg = 0 for the swap_status job, fails to take the lock,
+            # answers "something is already running" and returns -- and the
+            # withdrawal's own leg counter is now 0.
+            #
+            # The completion then computes `_next_leg = _more and 0 + 1 <
+            # MAX_CHAIN_LEGS`, which is true forever, and every message says
+            # "withdraw 1 sent". Driven: with one tap of /check per leg, a
+            # wallet holding 99 arrivals ran 99 mixes against a cap of 6 --
+            # 99 spends, 99 magic packets, 99 boots, from one /withdraw. The
+            # cap whose entire job is to stop an unbounded run of spends did
+            # nothing, which is precisely what the comment two hundred lines
+            # down says was already fixed once.
+            #
+            # ASSIGNED WHERE THE JOB BECOMES REAL: below every refusal, below
+            # the lock, one statement before the thread that reads it. A call
+            # that does not start a job now leaves the counter alone.
+            self._chain_leg = int(leg)
             self.limits.record()
             integrity_log("pager", f"poke:{job}")
             # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
@@ -4008,7 +4217,26 @@ class Pager:
             except Exception:                                # noqa: BLE001
                 pass
             return 1
-        print("  [*] Shutdown requested.")
+        # THE IGNORE COUNT, WHERE SOMEBODY CAN ACTUALLY SEE IT.
+        #
+        # self.ignored is incremented in six places and, until this line, was
+        # read in none: no reply carried it, no log carried its value, nothing
+        # printed it. Two of those six sites justify themselves by it being
+        # visible -- "skipped instead, and counted, so a real change in the
+        # Bot API shows up as a rising counter rather than as a pager that has
+        # quietly become a loop" -- and the counter rose where nobody could
+        # look. A number nobody reads is not a signal.
+        #
+        # HERE AND NOT IN THE CHAT, for the reason /settings gives about the
+        # poke count: a running total read off successive messages is a
+        # timeline of activity in a transcript this design assumes is read.
+        # This is the Pi's own terminal, printed once, when the operator has
+        # stopped the thing on purpose and is standing at it.
+        #
+        # The per-event integrity_log entries remain the durable record; this
+        # is the number that says whether to go and count them.
+        print(f"  [*] Shutdown requested. {self.ignored} message(s) ignored "
+              f"this run.")
         return 0
 
 
