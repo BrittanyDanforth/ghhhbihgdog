@@ -40,6 +40,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import ast as _ast_ps
 import os
 import re
 import sys
@@ -138,8 +139,58 @@ for _spec in P.JOBS.values():
 check("no job schema has a field that could request plaintext",
       not any("plain" in f or "clear" in f for f in _all_params))
 _pgsrc = open(os.path.join(REPO, "gs_telegram_pager"), encoding="utf-8").read()
+
+
+def _writes_field(source, field):
+    """Does this file ever SET `field`? Assignment, dict key or CLI flag.
+
+    CODE, NOT PROSE, and this check learned that the hard way twice over.
+    It banned the STRING anywhere in the file, so it caught the comments
+    explaining why the Pi may not set it -- and then caught a legitimate READ,
+    when the welcome started describing the delivery mode the vault actually
+    chose instead of asserting one. Reading the vault's decision is the
+    opposite of overriding it; what must not exist is a way to SET it here.
+    """
+    tree = _ast_ps.parse(source)
+    for n in _ast_ps.walk(tree):
+        if isinstance(n, _ast_ps.Dict):
+            for k in n.keys:
+                if isinstance(k, _ast_ps.Constant) and k.value == field:
+                    return True
+        if isinstance(n, (_ast_ps.Assign, _ast_ps.AnnAssign)):
+            for t in ([n.target] if isinstance(n, _ast_ps.AnnAssign)
+                      else n.targets):
+                if (isinstance(t, _ast_ps.Subscript)
+                        and isinstance(t.slice, _ast_ps.Constant)
+                        and t.slice.value == field):
+                    return True
+        if isinstance(n, _ast_ps.Call) and getattr(
+                n.func, "attr", "") == "add_argument":
+            for a in n.args:
+                if isinstance(a, _ast_ps.Constant) and isinstance(a.value, str) \
+                        and a.value.strip("-").replace("-", "_") == field:
+                    return True
+    return False
+
+
 check("the pager never writes plain_slip: the switch is not on this box",
-      '"plain_slip"' not in _pgsrc and "'plain_slip'" not in _pgsrc)
+      not _writes_field(_pgsrc, "plain_slip"))
+check("...nor does the doorbell, which is the other thing on that card",
+      not _writes_field(
+          open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read(),
+          "plain_slip"))
+# NON-VACUITY: the detector really does find a writer, so "no writer" is not
+# "no detector". gs_wake_keys is the one tool that has one.
+check("NON-VACUITY -- the same check DOES find the vault-side writer",
+      _writes_field(
+          open(os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read(),
+          "plain_slip"))
+# ...AND THE PAGER MAY STILL READ IT. The welcome's deposit line describes
+# where the address turns up, which is a statement about this exact field: a
+# fixed sentence there was wrong for every install that set it.
+check("...and the pager DOES read it, so the welcome describes the mode the "
+      "vault actually chose rather than asserting one",
+      '.get("plain_slip")' in _pgsrc)
 
 # ===========================================================================
 # 2. EXACTLY THE ALLOWED FIELDS, AND dest_xmr AND ts ARE NOT AMONG THEM.
@@ -484,12 +535,15 @@ _sent = []
 pg.integrity_log = lambda *a, **k: None
 pg.SLIP_RETRY_S = 0
 _p = pg.Pager.__new__(pg.Pager)
-_p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
+#: A REAL PAIRING SECRET. Every label the chat sees is a MAC over (chat,
+#: handle) keyed from one, and a Pager without one is refused at startup.
+_KEY = {"secret": "11" * 32}
+_p.proxies, _p.token, _p.key, _p.args = {}, "x", dict(_KEY), None
 _p.handle_owner = {}
 _p.handle_job = {}
 _p._chain = None
 _p._chain_leg = 0
-_p._status_at = None
+_p._status_at = {}
 _p.spenders = 1
 _ok = [True]
 _p.send = lambda cid, t, buttons=None: (_sent.append(t), _ok[0])[1]
@@ -998,9 +1052,13 @@ _saved_send_pb = _p.send
 _p.send = lambda cid, t, buttons=None: (_sent.append(t),
                                         _btns.append(buttons), _ok[0])[2]
 try:
-    for _w, _want in (("not_yet", "w:A3F1"), ("arriving", "w:A3F1"),
-                      ("landed", "m:send"), ("short", "m:help"),
-                      ("stuck", "m:help")):
+    # THE ASK-AGAIN BUTTONS CARRY THE CONFIRMATION NUMBER, not the handle:
+    # Telegram keyboards never expire, and a button holding a bare handle
+    # stops working the moment this process restarts and forgets who owned it.
+    _WCN = pg.confirmation_number(_p.key, 111, "A3F1")
+    for _w, _want in ((("not_yet", f"w:{_WCN}"), ("arriving", f"w:{_WCN}"),
+                       ("landed", "m:send"), ("short", "m:help"),
+                       ("stuck", "m:help"))):
         _btns.clear()
         _drive({"status": "done", "handle": "A3F1", "slip": "", "plain": {},
                 "phase": _w}, job="swap_status", params={"handle": "A3F1"})

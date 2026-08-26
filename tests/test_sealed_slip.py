@@ -537,7 +537,7 @@ _pager.handle_owner = {}
 _pager.handle_job = {}
 _pager._chain = None
 _pager._chain_leg = 0
-_pager._status_at = None
+_pager._status_at = {}
 _pager.spenders = 1
 _ok_send = [True]
 _pager.send = lambda cid, text, buttons=None: (_sent.append(text),
@@ -561,7 +561,9 @@ pg.Pager.poke.__wrapped__ if False else None
 pg._DOORBELL[0] = type("D", (), {
     "run_wake": staticmethod(
         lambda a, k, j, p, on_event=None: _done)})()
-_pager.key = {}
+# A REAL PAIRING SECRET: the reply carries a confirmation number, which is a
+# MAC over (chat, handle) keyed from one.
+_pager.key = {"secret": "11" * 32}
 _pager.poke(111, "receive_and_quote", {"amount_sat": 5000000})
 
 _chat = "\n".join(_sent)
@@ -609,8 +611,10 @@ check("when both attempts fail, the reply says so rather than pointing at a "
       "did not get through" in _failtext.lower())
 check("...and does not claim the slip is below it",
       "↑ sealed slip" not in _failtext)
-check("...and still gives the handle, so the job is not lost",
-      "A3F1" in _failtext)
+check("...and still gives the confirmation number, so the job is not lost "
+      "AND what it prints is what the chat can type back",
+      "A3F1" in _failtext
+      and pg.confirmation_number(_pager.key, 111, "A3F1") in _failtext)
 # NOT "/watch <handle>". watch waits for a payment to LAND on a bundle, so it
 # cannot hand back a deposit address the operator never received -- it would
 # sit for two hours waiting for money nobody could send.

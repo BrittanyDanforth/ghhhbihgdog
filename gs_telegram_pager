@@ -69,6 +69,8 @@ entry address were moved off command lines elsewhere in this repo.
 """
 from __future__ import annotations
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -258,8 +260,14 @@ BOT_COMMANDS = [
     # doorbell's own two windows and says it on every run. Two numbers for one
     # wait, and the typed pair was the wrong one -- so it is not restated
     # here, where it cannot be derived.
-    ("check", "has my payment arrived yet — /check A3F1"),
-    ("wait", "wait for it to arrive — /wait A3F1"),
+    # THE EXAMPLE IS THE SHAPE OF THE THING THEY WERE GIVEN. "/check A3F1"
+    # showed four hex characters, which is what the WIRE carries and not what
+    # the chat ever handed anyone -- and a bare handle is now refused unless
+    # this process minted it for this chat. Both also work with no argument,
+    # which is what somebody asking "is anything happening" actually types,
+    # and the list says so because otherwise nobody would try it.
+    ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E"),
+    ("wait", "wait for it to arrive — /wait, or /wait A3F1-9C2B7E"),
     ("settings", "what this will do, and where each part is decided"),
     # THE THREE ANSWERS THAT WERE UNREACHABLE IN PRACTICE. /fee, /speed and
     # /exit have always been handled in parse_command and have always had
@@ -400,8 +408,12 @@ def parse_callback(data: str) -> tuple:
     # refusing rather than passing on to a wake.
     if d[:2] in ("c:", "w:"):
         _h = d[2:].upper()
-        if not HANDLE_RE.match(_h):
-            return "", "that is not a label"
+        # EITHER FORM, AND NEITHER IS TRUSTED HERE. This only checks the
+        # SHAPE; whether a confirmation number belongs to the chat that tapped
+        # it is decided in handle(), against that chat's own MAC, exactly as
+        # it is for a typed one. The button is a convenience, never a bypass.
+        if not (CONFIRM_RE.match(_h) or HANDLE_RE.match(_h)):
+            return "", "that is not a confirmation number"
         return f"{'/check' if d[0] == 'c' else '/wait'} {_h}", ""
     return "", "I do not know that button"
 
@@ -565,6 +577,92 @@ DEFAULT_DAILY_CAP = 12
 #: `$` also matches before a trailing newline (see gs_common's validators).
 HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 
+# ---------------------------------------------------------------------------
+#  THE CONFIRMATION NUMBER
+# ---------------------------------------------------------------------------
+#: A HANDLE IS A BEARER TOKEN AND A RESTART USED TO HAND IT OUT.
+#:
+#: The vault answers /check and /wait for ANY handle in its file, because it
+#: has no idea which chat asked -- chat_id appears nowhere in gs_wake_agent,
+#: gs_wake_proto or gs_doorbell, deliberately. So the binding has to live on
+#: this box, and it lived in `handle_owner`: a dict in PROCESS MEMORY.
+#:
+#: gs-telegram-pager.service sets Restart=on-failure. So a crash -- one dropped
+#: Tor circuit at the wrong second, one full SD card -- emptied that dict and
+#: turned every label in flight back into a bearer token that any allowlisted
+#: chat could redeem. The old comment called this "the honest bound: this
+#: closes the live case, not the whole namespace", which was true and is not
+#: good enough now: with plain_slip on, redeeming somebody else's label returns
+#: the deposit address, the amount, and a memo that names the destination
+#: Monero address in full.
+#:
+#: The fix is not to persist the map. A file on the Pi mapping labels to chats
+#: is "a record of who asked for what" on the one card this design is built
+#: around losing. Instead the binding is CARRIED BY THE LABEL: the chat is
+#: shown the handle plus a short MAC over (chat id, handle), and a label only
+#: verifies in the chat it was issued to. No state, survives a restart, and a
+#: different chat cannot construct one.
+#:
+#: THE WIRE IS UNCHANGED. The vault still receives four hex characters; the
+#: tag is stripped here, after it verifies. Nothing on the vault knows this
+#: exists, which is the point -- the Pi holds the chat identity and the vault
+#: holds the money, and neither learns the other's half.
+CONFIRM_TAG_BYTES = 3
+
+#: `A3F1-9C2B7E`, and the dash is optional so a phone keyboard's autocorrect
+#: cannot break it. Case-insensitive on input, upper on output.
+CONFIRM_RE = re.compile(r"([0-9A-Fa-f]{4})-?([0-9A-Fa-f]{6})\Z")
+
+
+def _confirm_key(key: dict) -> bytes:
+    """The MAC key for confirmation numbers. Raises if this box cannot make one.
+
+    DOMAIN-SEPARATED FROM THE PAIRING SECRET IT IS DERIVED FROM. The Pi's
+    X25519 secret opens M2 and seals M3; using its raw bytes as an HMAC key as
+    well would be one secret doing two unrelated jobs, which is how a weakness
+    in one becomes a weakness in the other. Hashed with a purpose string, so
+    what this holds is a key that is only good for labelling.
+
+    RAISES RATHER THAN DEGRADING. A pager with no usable secret cannot bind a
+    label to a chat, and the failure mode of "carry on without the tag" is
+    silently reissuing bearer tokens -- the exact defect this exists for.
+    main() checks at startup so this can never be the first thing an operator
+    hears about it.
+    """
+    sec = (key or {}).get("secret") or ""
+    raw = bytes.fromhex(sec)          # ValueError on anything not hex
+    if len(raw) != 32:
+        raise ValueError("pairing secret is not 32 bytes")
+    return hashlib.sha256(b"gs-pager-confirmation-v1\x00" + raw).digest()
+
+
+def confirmation_number(key: dict, chat_id: int, handle: str) -> str:
+    """The label THIS chat is shown for `handle`. Raises on a bad handle/key."""
+    h = (handle or "").strip().upper()
+    if not HANDLE_RE.match(h):
+        raise ValueError("not a handle")
+    tag = hmac.new(_confirm_key(key), f"{int(chat_id)}:{h}".encode(),
+                   hashlib.sha256).digest()[:CONFIRM_TAG_BYTES]
+    return f"{h}-{tag.hex().upper()}"
+
+
+def handle_from_confirmation(key: dict, chat_id: int, text: str) -> str:
+    """The handle inside a confirmation number, or "". NEVER raises.
+
+    Constant-time on the tag: the comparison is between a value the sender
+    chose and one derived from a secret, which is the textbook shape for a
+    timing oracle even though the rate limit makes exploiting one absurd here.
+    """
+    try:
+        m = CONFIRM_RE.match((text or "").strip().replace(" ", ""))
+        if not m:
+            return ""
+        h = m.group(1).upper()
+        want = confirmation_number(key, chat_id, h).split("-")[1]
+        return h if hmac.compare_digest(m.group(2).upper(), want) else ""
+    except BaseException:                                    # noqa: BLE001
+        return ""
+
 #: WHAT IT DOES, NOT HOW ANY OF IT WORKS.
 #:
 #: This listed the commands and then explained the setup: which keyfile decides
@@ -616,13 +714,30 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 #: chat will and will not do with what they type. It says nothing about how
 #: any of it is arranged, because that is not a thing a customer needs and it
 #: is a thing a reader would want.
+#: THE ONE LINE THAT DEPENDS ON HOW THIS INSTALL DELIVERS.
+#:
+#: It said the address appears ON THE MACHINE, always -- which is true with no
+#: delivery mode set and FALSE with --plain-slip, where the pair arrives in the
+#: chat. The welcome is the screen a first-time reader is guaranteed to see,
+#: so a fixed sentence there is a fixed sentence about a setting, and it was
+#: wrong for exactly the operator the setting exists for: the one with a phone
+#: and no second machine, being told to go and read something at a machine
+#: they are not standing at.
+_DEPO_ON_MACHINE = (
+    "  /deposit   you pay in Bitcoin. The address and memo appear ON THE "
+    "MACHINE — you need a desktop wallet there to send, because the memo goes "
+    "in an OP_RETURN.")
+_DEPO_IN_CHAT = (
+    "  /deposit   you pay in Bitcoin. A fresh address and a memo arrive HERE, "
+    "every time — you need a desktop wallet to send, because the memo goes in "
+    "an OP_RETURN and no phone wallet can do that.")
+_DEPO_LINE = _DEPO_ON_MACHINE
+
 WELCOME_LINES = [
     "Monero mixing, from your phone.",
     "",
     "MONEY IN",
-    "  /deposit   you pay in Bitcoin. The address and memo appear ON THE "
-    "MACHINE — you need a desktop wallet there to send, because the memo goes "
-    "in an OP_RETURN.",
+    _DEPO_LINE,
     "",
     "MONEY OUT",
     "  /withdraw  the one that pays YOU. It sends back everything that is "
@@ -655,9 +770,16 @@ _BURN_LINE = ("  Messages here are deleted after {h}h, both sides, as far as "
               "Telegram allows.")
 
 
-def welcome_text(burn_after: int = 0) -> str:
-    """The welcome, with the lines that are true of THIS install."""
-    lines = list(WELCOME_LINES)
+def welcome_text(burn_after: int = 0, key: dict = None) -> str:
+    """The welcome, with the lines that are true of THIS install.
+
+    `key` because the delivery mode is a KEYFILE decision, and the sentence
+    about where the deposit address turns up is a statement about it. Omitted,
+    it describes the default -- which is what every source-level check reads
+    and what an install with no mode set actually does.
+    """
+    lines = [_DEPO_IN_CHAT if _l is _DEPO_LINE and (key or {}).get("plain_slip")
+             else _l for _l in WELCOME_LINES]
     try:
         _b = int(burn_after or 0)
     except (TypeError, ValueError):
@@ -967,14 +1089,28 @@ def parse_command(text: str) -> tuple:
         return "", {}, "speed"
     if cmd == "/exit":
         return "", {}, "exit"
-    if cmd in ("/wait", "/watch"):
-        if not HANDLE_RE.match(arg):
-            return "", {}, "handle must be 4 hex characters"
-        return "watch", {"handle": arg.upper()}, ""
-    if cmd == "/check":
-        if not HANDLE_RE.match(arg):
-            return "", {}, "handle must be 4 hex characters"
-        return "swap_status", {"handle": arg.upper()}, ""
+    if cmd in ("/wait", "/watch", "/check"):
+        _job = "swap_status" if cmd == "/check" else "watch"
+        # NO ARGUMENT IS A QUESTION, NOT A MISTAKE.
+        #
+        # This answered "handle must be 4 hex characters" -- which uses a word
+        # the chat says nowhere else, about a thing it never showed them how
+        # to find, in reply to somebody who almost certainly meant "is
+        # anything happening?". handle() answers that from what this process
+        # knows, and says plainly when the answer is nothing.
+        if not arg:
+            return "", {}, "whats_running"
+        # THE TEXT, NOT A HANDLE. Which four hex characters this names cannot
+        # be decided here: a confirmation number only means something in the
+        # chat it was issued to, and parse_command is module-level and has
+        # neither the chat nor the key. handle() resolves it and puts the bare
+        # handle on the wire.
+        if not (CONFIRM_RE.match(arg) or HANDLE_RE.match(arg)):
+            return "", {}, ("that is not a confirmation number. It looks like "
+                            "A3F1-9C2B7E and it is in the message that "
+                            "started the deposit — or just /check on its own "
+                            "and I will say what is running.")
+        return _job, {"confirmation": arg.strip()}, ""
     # A BARE MESSAGE IS NOT A COMMAND THIS BOT DOES NOT KNOW -- it is an
     # ANSWER WITH NO QUESTION, and telling somebody their answer is an unknown
     # command is how this reads as broken.
@@ -1124,7 +1260,17 @@ class Pager:
         #: When /status last answered, or None for never. Process memory,
         #: like everything else here: a restart clears it, which costs one
         #: extra reply and nothing else.
-        self._status_at = None
+        #: WHEN EACH CHAT WAS LAST ANSWERED, or absent. A dict rather than
+        #: one float: see the /status branch. Absent is NOT the same as zero --
+        #: self.clock is time.monotonic, which counts from an arbitrary point,
+        #: so on a freshly booted Pi a zero default puts the FIRST /status
+        #: inside its own cooldown and swallows it.
+        self._status_at = {}
+        #: WHICH CHAT HOLDS THE JOB, or None. Not a second copy of `busy`:
+        #: busy is a lock and answers "is anything running", which is not a
+        #: question one chat may ask about another. This answers "is MINE
+        #: running", and is compared against a cid before anything is said.
+        self._running = None
         #: (chat_id, params, leg) for the next leg of a chained withdrawal, or
         #: None. Set by poke() when the vault says another arrival is here;
         #: acted on by _worker AFTER it releases `busy`, because start_job
@@ -1483,7 +1629,18 @@ class Pager:
     #: command into an unbounded run of spends.
     MAX_CHAIN_LEGS = 6
 
-    def _handle_buttons(self, h: str, job: str = "") -> list:
+    def _label(self, chat_id: int, h: str) -> str:
+        """The confirmation number THIS chat sees for handle `h`.
+
+        STRICT ON PURPOSE. If this cannot build a label the pager cannot bind
+        one to a chat, and the tempting fallback -- show the bare handle --
+        reissues exactly the bearer token the confirmation number retired.
+        main() refuses to start without a usable pairing secret, so the only
+        way to reach the raise is a Pager built some other way.
+        """
+        return confirmation_number(self.key, chat_id, h)
+
+    def _handle_buttons(self, h: str, job: str = "", chat_id: int = 0) -> list:
         """Check / wait, bound to the label this reply is about, or None.
 
         NONE FOR A LABEL NOTHING CAN WATCH, and this used to offer both
@@ -1512,9 +1669,19 @@ class Pager:
             return None
         if job in self.UNWATCHABLE_JOBS:
             return MENU_BUTTONS
-        return [[("Has it arrived?", f"c:{h}"), ("Wait for it", f"w:{h}")]]
+        # THE BUTTON CARRIES THE CONFIRMATION NUMBER, not the bare handle, so
+        # a tap still works after this process has restarted and forgotten who
+        # owned what. Telegram keyboards do not expire; a button that stops
+        # working the moment the unit restarts is a button that mostly does
+        # not work.
+        try:
+            _c = self._label(chat_id, h) if chat_id else h
+        except BaseException:                                # noqa: BLE001
+            return MENU_BUTTONS
+        return [[("Has it arrived?", f"c:{_c}"), ("Wait for it", f"w:{_c}")]]
 
-    def _phase_buttons(self, phase: str, h: str, job: str = "") -> list:
+    def _phase_buttons(self, phase: str, h: str, job: str = "",
+                       chat_id: int = 0) -> list:
         """What to offer under a status answer. Never raises.
 
         THE ONE REPLY THAT OFFERED NOTHING. Every other message this bot sends
@@ -1534,7 +1701,7 @@ class Pager:
         try:
             if phase in ("not_yet", "arriving"):
                 # Still waiting: the two commands that ask again.
-                return self._handle_buttons(h, job)
+                return self._handle_buttons(h, job, chat_id)
             if phase == "landed":
                 # The money is there. There is exactly one thing to do next
                 # and it is the reason any of this ran.
@@ -2293,9 +2460,17 @@ class Pager:
         # a compromised vault is exactly the case that reaches here.
         _early = (pending.result or {}).get("phase") or ""
         if _early and out != "done" and job in ("watch", "swap_status"):
+            # THE LABEL, NOT THE HANDLE. This one branch still printed the
+            # raw four hex characters, so the one reply an operator gets while
+            # a probe is still in flight named a string the bot would then
+            # refuse from them.
+            _eh = (pending.result or {}).get("handle") or ""
+            try:
+                _ecn = self._label(chat_id, _eh) if _eh else "----"
+            except BaseException:                            # noqa: BLE001
+                _ecn = "----"
             self.send(chat_id,
-                      f"{(pending.result or {}).get('handle') or '----'}: "
-                      f"{proto.PHASE_LINES.get(_early, _early)}")
+                      f"{_ecn}: {proto.PHASE_LINES.get(_early, _early)}")
             return
         if out == "done":
             res = pending.result or {}
@@ -2322,6 +2497,14 @@ class Pager:
             if proto.HANDLE_RE.match(h):
                 self.handle_owner[h] = chat_id
                 self.handle_job[h] = job
+            # THE LABEL THIS CHAT SEES. Built once, here, so every branch
+            # below prints the same string the buttons carry and the operator
+            # can type back. "----" is what a reply with no usable handle got
+            # before this existed and it still does; there is nothing to bind.
+            try:
+                _cn = self._label(chat_id, h)
+            except BaseException:                            # noqa: BLE001
+                _cn = h
             slip = res.get("slip") or ""
             plain = res.get("plain") or {}
             phase = res.get("phase") or ""
@@ -2340,8 +2523,9 @@ class Pager:
                 # cannot invent a reassurance, and the word it renders was
                 # checked against a closed set by the doorbell before it got
                 # here.
-                self.send(chat_id, f"{h}: {proto.PHASE_LINES.get(phase, phase)}",
-                          buttons=self._phase_buttons(phase, h, job))
+                self.send(chat_id,
+                          f"{_cn}: {proto.PHASE_LINES.get(phase, phase)}",
+                          buttons=self._phase_buttons(phase, h, job, chat_id))
                 return
             # A FINISHED SPEND IS NOT A READY DEPOSIT, and it used to be
             # reported as one. With no slip and no plain, a completed
@@ -2482,23 +2666,25 @@ class Pager:
                 # for putting one in a chat at all.
                 integrity_log("pager", "plain_slip_withheld_group")
                 self.send(chat_id,
-                          f"{chat_name(job)} ready · slip {h}\n"
+                          f"{chat_name(job)}: quoted. Confirmation number: {_cn}\n"
                           f"The deposit details are NOT posted here — this is "
                           f"a group, and they would go to everyone in it. "
                           f"Read them at the machine, or set up a delivery "
                           f"key and use a one-to-one chat.",
-                          buttons=self._handle_buttons(h, job))
+                          buttons=self._handle_buttons(h, job, chat_id))
                 return
             if plain:
                 # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
                 # own vault keyfile asked for it. gs_wake_proto's "THE PLAINTEXT
                 # SLIP" is where that trade is argued; this branch only renders
                 # it. Two messages: the memo must be copied alone (see below).
-                lines = proto.plain_lines(plain)
+                lines = proto.plain_lines(plain, label=_cn)
                 body, memo = lines[:-1], lines[-1]
-                self.send(chat_id, f"{chat_name(job)} ready · slip {h}\n\n"
-                                   + "\n".join(body).rstrip(),
-                          buttons=self._handle_buttons(h, job))
+                self.send(chat_id,
+                          f"{chat_name(job)}: pay this. Confirmation "
+                          f"number: {_cn}\n\n"
+                          + "\n".join(body).rstrip(),
+                          buttons=self._handle_buttons(h, job, chat_id))
                 # THE MEMO ALONE IN ITS OWN MESSAGE. Tap-and-hold copies a
                 # WHOLE Telegram message, and this string has to reach a wallet
                 # character-for-character or ThorChain cannot route the swap
@@ -2561,13 +2747,15 @@ class Pager:
                 # neither, and read as "your deposit is set up" to somebody who
                 # then had nothing to pay to.
                 self.send(chat_id,
-                          f"{chat_name(job)} {h}: quoted.\n"
+                          f"{chat_name(job)}: quoted. Confirmation number: {_cn}\n"
                           f"The address and memo are ON THE MACHINE — read "
                           f"them there. Paying needs a desktop wallet: the "
                           f"memo goes in an OP_RETURN and no phone wallet can "
                           f"do that.\n"
-                          f"/check {h} once you have paid.",
-                          buttons=self._handle_buttons(h, job))
+                          f"To get them here instead, re-pair with "
+                          f"--plain-slip.\n"
+                          f"/check {_cn} once you have paid.",
+                          buttons=self._handle_buttons(h, job, chat_id))
                 return
             # A SEALED SLIP CAME BACK. This process cannot read it: it is
             # sealed to the delivery key, which exists on neither this box nor
@@ -2604,8 +2792,10 @@ class Pager:
                 # sent alone on purpose -- tap-and-hold copies a whole Telegram
                 # message -- and a keyboard under it would be one more thing
                 # attached to the message the operator is about to long-press.
-                self.send(chat_id, f"{chat_name(job)} ready · slip {h}",
-                          buttons=self._handle_buttons(h, job))
+                self.send(chat_id,
+                          f"{chat_name(job)}: pay the message above. "
+                          f"Confirmation number: {_cn}",
+                          buttons=self._handle_buttons(h, job, chat_id))
             else:
                 integrity_log("pager", "slip_undelivered")
                 # NOT "/watch {h}". That was the first version of this line and
@@ -2616,7 +2806,7 @@ class Pager:
                 # ThorChain quote expires anyway, so the honest instruction is
                 # to ask for a new one.
                 self.send(chat_id,
-                          f"{chat_name(job)} ready · slip {h}\n"
+                          f"{chat_name(job)} {_cn}\n"
                           f"Did not get through, twice — and it expires. "
                           f"/depo again for a fresh one.")
         elif out == "refused":
@@ -2798,6 +2988,7 @@ class Pager:
                 pass
             raise
         finally:
+            self._running = None
             self.busy.release()
             # THE NEXT LEG, AFTER THE LOCK IS FREE. poke() cannot start it: it
             # runs inside this thread, which holds `busy`, and start_job takes
@@ -2977,7 +3168,8 @@ class Pager:
             # what it says and, more importantly, what it deliberately does
             # not. Rendered against THIS pager's --burn-after, so the line
             # about deletion appears only on an install that deletes.
-            self.send(cid, welcome_text(self.burn_after), buttons=MENU_BUTTONS)
+            self.send(cid, welcome_text(self.burn_after, self.key),
+                      buttons=MENU_BUTTONS)
             return
         if err == "help":
             # THE MENU RIDES ON /help TOO, because somebody who typed it is
@@ -2985,6 +3177,40 @@ class Pager:
             # above it, so the list is still the manual and the buttons are
             # just the short way to say the same four things.
             self.send(cid, HELP, buttons=MENU_BUTTONS)
+            return
+        if err == "whats_running":
+            # "IS ANYTHING HAPPENING?" -- ANSWERED, RATHER THAN CORRECTED.
+            #
+            # /check and /wait with no argument used to answer "handle must be
+            # 4 hex characters": a word this chat says nowhere else, about a
+            # thing it never showed anyone how to find. Somebody typing /check
+            # on its own is asking whether anything is going on, and this box
+            # knows -- it holds the job lock and it minted every label in this
+            # chat. Answered from memory: no wake, no boot, no daily slot.
+            #
+            # NOTHING ABOUT ANY OTHER CHAT. handle_owner is filtered by cid
+            # before it is counted, so this cannot leak that somebody else has
+            # something running -- and `busy` is deliberately not consulted for
+            # that reason: it is process-wide, so reporting it here would tell
+            # one chat that another one is mid-job.
+            _mine = [_k for _k, _v in self.handle_owner.items() if _v == cid]
+            if self._running == cid:
+                self.send(cid, "one is running now. Nothing else can start "
+                               "until it reports, and it will report here.",
+                          buttons=MENU_BUTTONS)
+                return
+            if _mine:
+                _last = _mine[-1]
+                self.send(cid,
+                          f"nothing is running. The last one in this chat is "
+                          f"{self._label(cid, _last)} — tap below to ask "
+                          f"about it.",
+                          buttons=self._handle_buttons(
+                              _last, self.handle_job.get(_last, ""), cid))
+                return
+            self.send(cid, "no mixes are running and none have been started "
+                           "in this chat. /deposit is the way in.",
+                      buttons=MENU_BUTTONS)
             return
         if err == "status":
             # WHETHER A COMMAND WILL BE ACCEPTED, and nothing else.
@@ -3020,12 +3246,21 @@ class Pager:
             # FIRST /status after start was inside its own cooldown and was
             # silently swallowed. "Never answered" is a different state from
             # "answered at time zero", and it has to be spelled differently.
+            # PER CHAT, NOT PER PROCESS. One slot meant chat A tapping
+            # Status silenced chat B for the next fifteen seconds -- with NO
+            # reply, because the whole point of the cooldown is that a "slow
+            # down" line is itself a message. So one device's thumb made
+            # another device look broken, which is the cross-chat interference
+            # this box is supposed not to have.
+            #
+            # The dict is bounded by the allowlist, which main() bounds, so
+            # this cannot grow: it is at most one float per allowed chat.
             _now = self.clock()
-            if self._status_at is not None \
-                    and _now - self._status_at < self.STATUS_COOLDOWN_S:
+            _last = self._status_at.get(cid)
+            if _last is not None and _now - _last < self.STATUS_COOLDOWN_S:
                 integrity_log("pager", "status_throttled")
                 return
-            self._status_at = _now
+            self._status_at[cid] = _now
             # THE GATE THIS ANSWER DID NOT KNOW ABOUT.
             #
             # start_job refuses on THREE things and this read two of them. The
@@ -3091,6 +3326,42 @@ class Pager:
         # and refusing there would lock an operator out of their own swap on
         # the one box whose whole job is to be reachable. That is the honest
         # bound -- this closes the live case, not the whole namespace.
+        # THE LABEL BECOMES A HANDLE HERE, OR IT DOES NOT TRAVEL.
+        #
+        # parse_command hands over the TEXT because only this box knows which
+        # chat is asking, and a confirmation number means nothing outside the
+        # chat it was issued to. Two forms are accepted and they are not
+        # equally trusted:
+        #
+        #   * A CONFIRMATION NUMBER verifies against a MAC over (chat, handle),
+        #     so it works after a restart and only here. This is the one the
+        #     chat is shown and the buttons carry.
+        #   * A BARE HANDLE is accepted only while THIS PROCESS still
+        #     remembers minting it FOR THIS CHAT. It is what the vault's own
+        #     terminal prints, so an operator standing at the machine can use
+        #     it; once the process forgets, it is refused rather than sent,
+        #     because an unremembered bare handle is exactly the bearer token
+        #     the confirmation number exists to retire.
+        if isinstance(params, dict) and params.get("confirmation") is not None:
+            _text = str(params.pop("confirmation"))
+            _h = handle_from_confirmation(self.key, cid, _text)
+            if not _h:
+                _bare = _text.strip().upper()
+                if HANDLE_RE.match(_bare) and self.handle_owner.get(_bare) == cid:
+                    _h = _bare
+            if not _h:
+                integrity_log("pager", "handle_not_yours")
+                # NEVER "that is somebody else's", and never "the tag is
+                # wrong": both confirm the handle exists. One answer for
+                # every way of not being entitled to it.
+                self.send(cid,
+                          "no: I have no record of that confirmation number "
+                          "in this chat. It is in the message that started "
+                          "the deposit — or /check on its own and I will say "
+                          "what is running.",
+                          buttons=MENU_BUTTONS)
+                return
+            params["handle"] = _h
         _h = params.get("handle") if isinstance(params, dict) else None
         if _h:
             # REFUSED HERE, NOT AFTER A BOOT. This box recorded which job
@@ -3102,9 +3373,10 @@ class Pager:
             if self.handle_job.get(_h) in self.UNWATCHABLE_JOBS:
                 integrity_log("pager", "unwatchable_handle")
                 self.send(cid,
-                          f"no: {_h} is an address label, and nothing here "
-                          f"can watch one — it has no expected amount to "
-                          f"watch for. Check it at the machine.",
+                          f"no: that one is an address, not a deposit, and "
+                          f"nothing here can watch an address — there is no "
+                          f"expected amount to watch for. Check it at the "
+                          f"machine.",
                           buttons=MENU_BUTTONS)
                 return
             _owner = self.handle_owner.get(_h)
@@ -3112,7 +3384,8 @@ class Pager:
                 integrity_log("pager", "handle_not_yours")
                 # NEVER "that is somebody else's": confirming a handle exists
                 # is the disclosure. Same answer an unknown one gets.
-                self.send(cid, "no: I have no record of that label here.")
+                self.send(cid, "no: I have no record of that confirmation "
+                               "number in this chat.")
                 return
         self.start_job(cid, job, params)
 
@@ -3284,6 +3557,7 @@ class Pager:
         # finally owns the lock, and a release here would free a lock the
         # worker still thinks it holds.
         try:
+            self._running = cid
             self.limits.record()
             integrity_log("pager", f"poke:{job}")
             # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
@@ -3328,6 +3602,7 @@ class Pager:
             threading.Thread(target=self._worker, args=(cid, job, params),
                              daemon=True).start()
         except BaseException as e:                           # noqa: BLE001
+            self._running = None
             self.busy.release()
             integrity_log("pager", "worker_start_failed")
             self.send(cid, f"{chat_name(job)}: could not start — {_redact(e)[:120]}")
@@ -3823,6 +4098,21 @@ def main(argv=None) -> int:
             f"     chat with this bot, whatever it is signed in on. That is "
             f"one --chat-id.)")
     key = doorbell().load_key(Path(args.key))
+    # A PAGER THAT CANNOT BIND A LABEL TO A CHAT MUST NOT START.
+    #
+    # Every confirmation number is a MAC over (chat id, handle) keyed from
+    # this card's pairing secret. Without a usable one there are two ways to
+    # carry on and both are worse than refusing: show the bare handle, which
+    # reissues the bearer token the confirmation number exists to retire, or
+    # raise mid-reply, which loses the message that names a deposit. Checked
+    # once, here, where the operator is standing and the message can be long.
+    try:
+        _confirm_key(key)
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] {args.key} carries no usable pairing secret "
+                 f"({type(e).__name__}), so this cannot issue a confirmation "
+                 f"number that belongs to one chat. Re-pair with "
+                 f"gs_wake_keys.")
 
     st = Path(args.state)
     try:

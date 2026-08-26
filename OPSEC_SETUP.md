@@ -77,7 +77,7 @@ and it is the operator's to make, on the vault, in a 0400 file. Three modes:
 |---|---|---|
 | neither field | a handle | to reach the vault |
 | `delivery_public` | a sealed blob | `gs_delivery.key` on some machine |
-| `plain_slip: true` | the address and memo, in the clear | a phone |
+| `plain_slip: true` (`gs_wake_keys pair --plain-slip`) | the address and memo, in the clear | a phone |
 
 Nothing on the Pi and nothing in a chat can change which mode is in force.
 §8 has what each costs — including the part of the plaintext cost that is
@@ -777,7 +777,9 @@ pocket-dial — and a tap is a pocket-dial.
    decorrelates *boot → ThorChain*. **Nothing** decorrelates *boot →
    a second Tor client appearing in the Mullvad tunnel*. The ThinkPad's
    jitter is the floor because a pwned Pi can zero its own.
-5. Slip stays on the ThinkPad (`0600`). Telegram gets `depo ready · slip A3F1`.
+5. Slip stays on the ThinkPad (`0600`). Telegram gets a **confirmation
+   number** — `A3F1-9C2B7E` — and, with `--plain-slip`, the address and memo
+   with it.
 6. You copy BTC address + memo from the bay (or the file). Not from chat.
 
    **With one laptop, that is the end of it** — the laptop is the vault and
@@ -1416,7 +1418,7 @@ constraint this paragraph has always stated. Do not “just run a Telegram bot�
 that prints the memo: that throws away the only reason to have a Pi.
 
 **By default** the pager names no address, no memo and no slip contents: the
-most it says about a finished deposit is `depo ready · slip A3F1`, which is
+most it says about a finished deposit is a confirmation number, which is
 step 5 below. Three things qualify that, and this paragraph used to state the
 rule without them — which is the sentence most likely to talk the next reader
 out of noticing a new leak:
@@ -1540,21 +1542,48 @@ names one already-spent swap — it is not a wallet, not a seed, and cannot move
 anything. Set no delivery key and none of this happens: no slip is sealed and
 `/depo` answers exactly as it did before.
 
-### If you have only a phone: `plain_slip`
+### If you have only a phone: `--plain-slip`
 
-The sealed slip still assumes a machine that can run `gs_unseal`. With only a
-phone you have none, so there is a third mode — set `"plain_slip": true` in the
-**vault's** keyfile and the deposit address, the amount and the memo arrive in
-the chat as text. The memo comes in its own message so a tap-and-hold copies it
-alone.
+**This is the mode for the ordinary setup** — one laptop, one Pi, one phone —
+because the other two both end with "go and read it on the machine", and the
+whole point of the chat is that you are not standing at the machine.
+
+The sealed slip assumes a *second* machine that can run `gs_unseal`. With only
+a phone you have none, so there is a third mode: pair with `--plain-slip` and
+the deposit address, the amount and the memo arrive in the chat as text. The
+memo comes in its own message so a tap-and-hold copies it alone.
+
+```bash
+python3 gs_wake_keys pair --plain-slip ...        # ON THE VAULT
+```
+
+**The flag is how you set it, and for two turns there was no how.** This
+section used to say `set "plain_slip": true in the vault's keyfile`. That
+keyfile is a sealed container written by `gs_wake_keys` and by nothing else,
+so the instruction described an edit nobody could make. The field had a
+reader, a renderer, a wire format, a well-formedness check on the doorbell and
+a test suite — and no writer, which meant the one mode that hands a
+phone-only operator something to pay could not be turned on at all.
+
+`--plain-slip` and a delivery key are mutually exclusive, and both ends now
+say so before you can get it wrong: the vault refuses a keyfile carrying both
+at load (on *every* wake, so it is not a conflict you resolve later — it stops
+the vault answering until you re-pair), and `gs_delivery_key new` refuses to
+write one into a keyfile paired with `--plain-slip`.
 
 ```
-/depo 2                -> Send exactly:  0.05000000 BTC
+/deposit               -> How much? Reply with the BTC amount…
+0.05                   -> Deposit 0.05 BTC. Confirm and it starts.  7 + 6 = ?
+13                     -> depo: pay this. Confirmation number: A3F1-9C2B7E
+
+                          Send exactly:  0.05000000 BTC
                           To address:    bc1q…
                           Expected out:  ~1.23 XMR
-                          Slip:          A3F1
+                          Confirmation:  A3F1-9C2B7E
                        -> =:XMR.XMR:44AF…:0/1/0      (its own message)
-/check A3F1            -> A3F1: nothing on the address yet. Normal —
+/check                 -> nothing is running. The last one in this chat is
+                          A3F1-9C2B7E — tap below to ask about it.
+/check A3F1-9C2B7E     -> A3F1-9C2B7E: nothing on the address yet. Normal —
                           ask again in a while.
 ```
 

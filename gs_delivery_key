@@ -324,6 +324,29 @@ def cmd_new(args) -> int:
     # The vault is read BEFORE the overwrite refusal, because which refusal is
     # true depends on whether the vault already names a delivery key.
     key = load_vault_key(vault_path)
+    # ONE DELIVERY MODE, REFUSED HERE RATHER THAN AT THE NEXT WAKE.
+    #
+    # gs_wake_agent.load_key raises delivery_mode_ambiguous on a keyfile that
+    # sets BOTH plain_slip and delivery_public -- correctly, because they are
+    # two answers to one question. It raises on EVERY WAKE, at load, before
+    # any job runs: so writing the second field here does not create a
+    # conflict to resolve later, it stops the vault answering the phone at
+    # all, and re-pairing both boxes is the only way back. The phone sees a
+    # refusal with no reason on it, which reads as "try again".
+    #
+    # This check was not needed while nothing could set plain_slip. Now that
+    # `gs_wake_keys pair --plain-slip` can, the trap is one command away.
+    if key.get("plain_slip"):
+        sys.exit(
+            f"[!] {vault_path} is paired with --plain-slip, which already\n"
+            f"    delivers the deposit details -- as text, to the chat.\n"
+            f"    A vault may have ONE delivery mode. Writing a delivery "
+            f"key\n"
+            f"    into this keyfile would make it refuse every wake at "
+            f"load,\n"
+            f"    not just this one, and re-pairing both boxes is the only\n"
+            f"    way back. Re-pair WITHOUT --plain-slip first if you want\n"
+            f"    sealed delivery instead.")
     existing = (key.get("delivery_public") or "").strip()
     # The vault's OWN delivery_public goes in, so the refusal can compare it
     # against the key actually inside the file at --out instead of asserting a

@@ -2622,9 +2622,9 @@ MUTATIONS = [
 
  ("the pager only renders a phase on a finished job", "gs_telegram_pager",
   '        if _early and out != "done" and job in ("watch", "swap_status"):\n'
-  '            self.send(chat_id,',
+  '            # THE LABEL, NOT THE HANDLE. This one branch still printed',
   "        if False:\n"
-  "            self.send(chat_id,",
+  '            # THE LABEL, NOT THE HANDLE. This one branch still printed',
   ["test_plain_slip"]),
 
  # ---- the wizard is the only path, and the card holds no map -------------
@@ -2921,8 +2921,8 @@ MUTATIONS = [
   "gs_telegram_pager",
   # Re-anchored: the help is BUILT from BOT_COMMANDS now, so the figure lives
   # there. It must still include the jitter the operator actually waits.
-  '    ("check", "has my payment arrived yet — /check A3F1"),',
-  '    ("check", "has my payment arrived yet"),',
+  '    ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E"),',
+  '    ("check", "has my payment arrived"),',
   ["test_telegram_pager"]),
 
  # ---- chat text that arrives through a variable --------------------------
@@ -2950,9 +2950,11 @@ MUTATIONS = [
  # after acquire() and outside the release guard. A full card leaves the wake
  # lock held by nobody for the life of the process.
  ("a failed state write wedges the wake lock forever", "gs_telegram_pager",
-  "        try:\n            self.limits.record()\n"
+  "        try:\n            self._running = cid\n"
+  "            self.limits.record()\n"
   '            integrity_log("pager", f"poke:{job}")',
-  '        self.limits.record()\n        integrity_log("pager", f"poke:{job}")\n'
+  "        self._running = cid\n        self.limits.record()\n"
+  '        integrity_log("pager", f"poke:{job}")\n'
   "        try:",
   ["test_telegram_pager"]),
 
@@ -3073,6 +3075,83 @@ MUTATIONS = [
   '        if _early and out != "done":',
   ["test_plain_slip"]),
 
+ # ONE FLOAT FOR THE WHOLE PROCESS meant chat A tapping Status swallowed
+ # chat B's next fifteen seconds -- with no reply at all, because a "slow
+ # down" line is itself a message and the message is what is being rationed.
+ # One device made another look broken.
+ ("the status cooldown goes back to being shared across chats",
+  "gs_telegram_pager",
+  "            _last = self._status_at.get(cid)",
+  "            _last = max(self._status_at.values(), default=None)",
+  ["test_telegram_pager"]),
+
+ # ---- a label belongs to the chat it was issued to ----------------------
+ #
+ # The vault answers /check and /wait for ANY handle in its file -- it has no
+ # notion of a chat, deliberately -- so the binding lives on the Pi. It lived
+ # in a dict in PROCESS MEMORY, and the unit sets Restart=on-failure: one
+ # dropped circuit emptied it and turned every label in flight back into a
+ # bearer token any allowlisted chat could redeem, for the deposit address,
+ # the amount, and a memo naming the destination Monero address in full.
+ ("the label a chat is shown stops being bound to that chat",
+  "gs_telegram_pager",
+  '    tag = hmac.new(_confirm_key(key), f"{int(chat_id)}:{h}".encode(),',
+  '    tag = hmac.new(_confirm_key(key), f"{h}".encode(),',
+  ["test_telegram_pager"]),
+
+ # ...AND THE TAG IS CHECKED, not merely computed. A verifier that returns the
+ # handle whatever the tag says is the same hole with more ceremony.
+ ("the confirmation tag is computed and then not compared",
+  "gs_telegram_pager",
+  '        return h if hmac.compare_digest(m.group(2).upper(), want) else ""',
+  "        return h",
+  ["test_telegram_pager"]),
+
+ # AN UNREMEMBERED BARE HANDLE IS NOT A LABEL. It is what the vault's own
+ # terminal prints, so it is accepted while this process remembers minting it
+ # HERE -- and refused once it does not, which is the case a restart opens.
+ ("a bare handle this process never minted is forwarded again",
+  "gs_telegram_pager",
+  "                if HANDLE_RE.match(_bare) and self.handle_owner.get(_bare) "
+  "== cid:",
+  "                if HANDLE_RE.match(_bare):",
+  ["test_telegram_pager"]),
+
+ # A PAGER THAT CANNOT BIND A LABEL MUST NOT START. The tempting fallback --
+ # carry on and show the bare handle -- reissues the bearer token.
+ ("the pager starts without a secret it can bind a label with",
+  "gs_telegram_pager",
+  "    try:\n        _confirm_key(key)\n    except Exception as e:",
+  "    try:\n        pass\n    except Exception as e:",
+  ["test_telegram_pager"]),
+
+ # "IS ANYTHING HAPPENING?" ANSWERED FROM MEMORY, and filtered by chat: the
+ # unfiltered version would tell one chat that another one is mid-job.
+ ("the what-is-running answer stops filtering by chat",
+  "gs_telegram_pager",
+  "            _mine = [_k for _k, _v in self.handle_owner.items() "
+  "if _v == cid]",
+  "            _mine = list(self.handle_owner)",
+  ["test_telegram_pager"]),
+
+ # THE ONE MODE THAT HANDS A PHONE-ONLY OPERATOR SOMETHING TO PAY. It had a
+ # reader, a renderer, a wire format, a doorbell check and a suite -- and no
+ # writer, so the doc's "set plain_slip: true in the vault's keyfile"
+ # described an edit to a sealed container that nobody could make.
+ ("plain_slip goes back to having no way to switch it on", "gs_wake_keys",
+  '        "plain_slip": bool(args.plain_slip),',
+  "",
+  ["test_wake_agent"]),
+
+ # BOTH MODES AT ONCE STOPS THE VAULT ANSWERING AT ALL -- load_key raises on
+ # every wake, not just the one -- so the refusal has to be where the second
+ # one would be written, not where it is read.
+ ("a delivery key can be written over plain_slip and brick the vault",
+  "gs_delivery_key",
+  '    if key.get("plain_slip"):',
+  "    if False:",
+  ["test_wake_agent"]),
+
  # THE STATUS ANSWER CARRIES THE NEXT STEP. It is the reply an operator sees
  # more often than any other -- waiting is what this tool mostly does -- and
  # it was the one reply in the bot with an empty keyboard. "landed and
@@ -3080,7 +3159,7 @@ MUTATIONS = [
  # with no way to be paid short of knowing the word /withdraw and typing it.
  ("the status answer goes back to offering nothing to do next",
   "gs_telegram_pager",
-  '                          buttons=self._phase_buttons(phase, h, job))',
+  '                          buttons=self._phase_buttons(phase, h, job, chat_id))',
   "                          buttons=None)",
   ["test_plain_slip"]),
 
