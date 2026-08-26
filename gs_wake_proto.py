@@ -292,7 +292,16 @@ PLAIN_FIELDS = {
 #:   landed     at or over the expected amount, unlocked and spendable
 #:   short      money arrived, stopped growing, and is under what was quoted
 #:   stuck      the wallet is not scanning; says NOTHING about the money
-PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck")
+#:   more_left  a withdrawal finished and another arrival is still here
+#:
+#: "more_left" IS ON THE `phase` FIELD RATHER THAN A NEW ONE, deliberately.
+#: The field is already on the wire, already a CLOSED vocabulary the doorbell
+#: validates before the pager can see it, and it is unused by every spending
+#: job -- _phase_of returns "" for anything that is not a watching job. Adding
+#: a key to the M3 record instead would break the doorbell's exact-key-set
+#: check and force both boxes to be updated in the same sitting, which is a
+#: real cost to pay for a fact that fits in a word this record already carries.
+PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left")
 
 CHALLENGE_BYTES = 32
 JOB_ID_BYTES = 16
@@ -711,6 +720,12 @@ PHASE_LINES = {
     "short": "arrived, but UNDER what was quoted, and it has stopped growing. "
              "Check before going further.",
     "stuck": "not scanning, so this says NOTHING about your money. Check.",
+    # NOT RENDERED ON ITS OWN. The pager acts on this one -- it starts the
+    # next leg -- and says so in its own words, because "more left" is not
+    # something the operator has to do anything about. The sentence is here
+    # so that a version which does NOT act on it still says something true.
+    "more_left": "that one is done and there is more here. Run /withdraw "
+                 "again for the next.",
 }
 
 
@@ -1895,6 +1910,32 @@ WITHDRAW_DEPTHS = {
     3: (20, 46560),    # 12.9h
 }
 
+#: HOP COUNT -> the depth key the wire carries. Derived, never written twice.
+#:
+#: THE CHAT TALKS IN HOPS AND THE WIRE TALKS IN KEYS, and for two turns the
+#: chat talked in both at once. The question read:
+#:
+#:     1  3 hops · ~6h · lowest minimum
+#:     2  10 hops · ~9h
+#:     3  20 hops · ~13h · highest minimum
+#:
+#: so "3" was simultaneously the KEY for twenty hops and the HOP COUNT on the
+#: first line. An operator who read "3 hops" and typed 3 got twenty: more than
+#: twice the runtime, the highest minimum balance of the three, and -- if
+#: their balance sat between the two minimums -- a run that fails at stage 0
+#: after they have already confirmed it. Nothing was wrong on screen and
+#: nothing was wrong on the wire; the two vocabularies collided on one
+#: character.
+#:
+#: Hops are what the buttons say, what the note says and what the operator is
+#: actually choosing, so hops are what the chat now accepts. The keys never
+#: leave this file. 10 and 20 were never keys and so were never ambiguous;
+#: 3 now means three hops, which is what it looks like it means. An operator
+#: who had memorised "2" for ten hops is REFUSED rather than silently given
+#: something else, which is the safe direction for the one gate that costs
+#: hours.
+WITHDRAW_HOPS = {v[0]: k for k, v in WITHDRAW_DEPTHS.items()}
+
 #: GhostSpiral.DECOY_MIN, mirrored, because the box that has to state the
 #: consequence cannot import the file that owns it.
 #:
@@ -1951,11 +1992,20 @@ WITHDRAW_DEPTH_NOTE = {
 
 JOBS = {
     # Mint receive subaddresses. Spends nothing.
-    "receive_new": {
-        "schema": {"count": _int_range(1, 4)},
-        "tools": ("create_receive_wallet",),
-        "budget_s": 900,
-    },
+    # "receive_new" WAS HERE AND IS GONE. It minted a Monero subaddress to be
+    # paid into directly -- an entry point for somebody who already holds XMR.
+    #
+    # Nothing in this repository swaps XMR to BTC; every path is BTC to XMR.
+    # So it was half a feature: it could take money in and had no way to say
+    # where. Both slip builders returned empty on it by construction (no quote,
+    # so no thor_pairs file to build one from), which meant the command whose
+    # entire purpose was to hand the operator an address delivered no address,
+    # on any configuration. Both watching jobs refused its handle for the same
+    # reason, so /check and /wait spent a wake to be told no.
+    #
+    # Removing it is a WIRE change: a note naming it is now refused by
+    # validate_job on the vault, which is the loud failure this file's header
+    # promises for a version mismatch. Update both boxes together.
     # Mint ONE receive subaddress and quote a swap TO IT. The destination is
     # minted inside the job; the Pi never supplies one. See above.
     #

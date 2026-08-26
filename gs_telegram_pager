@@ -227,15 +227,21 @@ USAGE_FEE_LABEL = "1.1%"
 #: They are simply not what the menu, the buttons or the help text say.
 BOT_COMMANDS = [
     ("start", "what this is, and what it will not do"),
-    ("deposit", "MONEY IN — send Bitcoin, get an address and a memo"),
-    ("address", "MONEY IN — a Monero address to be paid directly, no swap"),
-    # "MIX WHAT IS HERE" NAMES MORE THAN THE JOB DOES. _funded_entry takes
-    # the LARGEST SINGLE unlocked output and never sums -- summing would spend
-    # inputs from several subaddresses in one transaction, which is permanent
-    # public proof they share an owner. So a withdrawal moves ONE arrival, and
-    # an operator with money in three places reads "what is here", gets a
-    # third of it, and has no reason to look for the rest.
-    ("withdraw", "MONEY OUT — mix ONE arrival and send it to you"),
+    # AND IT DOES NOT PROMISE THE ADDRESS IN THE CHAT. This said "get an
+    # address and a memo", which is what the job produces and not what this
+    # surface hands over: the pair is minted inside the job, on the machine,
+    # and the reply says to read it there. A command list that promises a
+    # payload the reply then withholds reads as the reply having failed.
+    ("deposit", "MONEY IN — quote a swap and get a label to track it"),
+    # ONE RUN MOVES ONE ARRIVAL AND ONE COMMAND STARTS AS MANY AS IT TAKES.
+    # _funded_entry takes the LARGEST SINGLE unlocked output and never sums --
+    # summing would spend inputs from several subaddresses in one transaction,
+    # which is permanent public proof they share an owner. That stays. What
+    # changed is who deals with the remainder: this used to say "mix ONE
+    # arrival", which was true of a run and read, to an operator with money in
+    # three places, as being paid a third of it. The pager now chains the
+    # rest itself, so the promise the command can make is the whole balance.
+    ("withdraw", "MONEY OUT — send it all back, as separate mixes"),
     ("status", "can I start one right now"),
     # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
     # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
@@ -307,7 +313,6 @@ CALLBACK_TEXT = {
     "m:exit": "/exit",
     "m:depo": "/deposit",
     "m:send": "/send",
-    "m:recv": "/receive",
     "m:cancel": "/cancel",
 }
 
@@ -331,13 +336,32 @@ MENU_BUTTONS = [
     # has no object yet. "pays you" gives it one, and it is the sentence the
     # welcome spends a line on.
     [("⬇ Bitcoin in", "m:depo"), ("⬆ Withdraw — pays you", "m:send")],
-    [("⬇ Monero in", "m:recv"), ("Status", "m:status")],
+    [("Status", "m:status"), ("What a run does", "m:settings")],
     # "What this does" PROMISED AN OVERVIEW AND OPENED A SETTINGS TABLE. The
     # overview is the welcome, which is what the newcomer has just read; this
     # button is the one that answers "what will a run actually do to my
     # money", and now says so.
-    [("What a run does", "m:settings"), ("All commands", "m:help")],
+    [("All commands", "m:help")],
 ]
+
+
+def _menu_button(data: str) -> tuple:
+    """One button off the menu, by its callback. Raises on an unknown one.
+
+    SO A LABEL IS SPELT ONCE. Anywhere else that wants to offer "withdraw"
+    used to write the words again, and two spellings of one button is how one
+    of them stops matching what it does -- this bot has already shipped a
+    button reading "What this does" that opened a settings table.
+
+    Deliberately NOT falling back to a made-up label: a KeyError here is a
+    typo in this file, caught by the suite, and a plausible-looking wrong
+    button is not.
+    """
+    for _row in MENU_BUTTONS:
+        for _b in _row:
+            if _b[1] == data:
+                return _b
+    raise KeyError(data)
 
 
 def parse_callback(data: str) -> tuple:
@@ -355,7 +379,19 @@ def parse_callback(data: str) -> tuple:
     # rejection.
     if d.startswith("d:"):
         _n = d[2:]
-        if _n.isdecimal() and int(_n) in proto.WITHDRAW_DEPTHS:
+        # ASCII DIGITS ONLY, THE SAME PREDICATE _depth_from USES.
+        # This gate was written with str.isdecimal(), which is True for all
+        # 455 Unicode decimal digits, and _depth_from -- the step this text is
+        # handed to -- accepts only "0123456789". So "d:１" passed here and
+        # was returned VERBATIM as the text the typed path would have got,
+        # where _depth_from then read it as None: the tap did nothing and the
+        # question came back, with no way for the operator to see why the
+        # button they were offered was not accepted. Two gates on one value
+        # and the outer one looser than the inner is the shape that produced
+        # the fullwidth-BTC-amount bug; this is the same shape, and now the
+        # same predicate. int() below cannot raise on an ASCII-digit string.
+        if _n and all(c in "0123456789" for c in _n) \
+                and int(_n) in proto.WITHDRAW_HOPS:
             return _n, ""
         return "", "that depth is not one this service offers"
     # A HANDLE, and it goes through HANDLE_RE here as well as in
@@ -382,7 +418,6 @@ def parse_callback(data: str) -> tuple:
 #: ever misread, because it is the first four letters of the thing it means.
 CHAT_NAME = {
     "receive_and_quote": "depo",
-    "receive_new": "address",
     "swap_status": "check",
     "watch": "watch",
     "withdraw": "withdraw",
@@ -584,28 +619,15 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 WELCOME_LINES = [
     "Monero mixing, from your phone.",
     "",
-    "MONEY IN — pick whichever describes you",
-    "  /deposit   you are paying IN Bitcoin. You get an address to pay, and "
-    "a memo that must go with it.",
-    # THE WELCOME MUST NOT PROMISE WHAT THIS JOB CANNOT DELIVER, and the
-    # first draft of this line did. "You get a fresh address to hand out"
-    # describes a command that sends you an address; /address sends a LABEL.
-    #
-    # receive_new mints a subaddress and quotes nothing, so there is no
-    # thor_pairs file -- and both slip builders return "" on it BY DESIGN
-    # (seal_slip_for_delivery: "receive_new mints addresses and quotes
-    # nothing. There is no deposit address to deliver and this is not a
-    # fault."). That is true on every configuration: with a delivery key, with
-    # plain slips, with neither. The job's own reply already says so; the
-    # welcome was the one surface still claiming otherwise, and it is the
-    # surface read first.
-    "  /address   mints a fresh address to be paid into. You read the "
-    "address itself at the machine — this chat only gets a label to track "
-    "it with.",
+    "MONEY IN",
+    "  /deposit   you pay in Bitcoin. The address and memo appear ON THE "
+    "MACHINE — you need a desktop wallet there to send, because the memo goes "
+    "in an OP_RETURN.",
     "",
     "MONEY OUT",
-    "  /withdraw  the one that pays YOU. It mixes ONE arrival — the largest "
-    "— and sends it where you say. Money that came in twice is two of these.",
+    "  /withdraw  the one that pays YOU. It sends back everything that is "
+    "here, to the addresses you give — as separate mixes, one per arrival, "
+    "because sending them together would prove they are all yours.",
     "",
     "WHAT IT COSTS",
     f"  USAGE FEE {USAGE_FEE_LABEL} — that is what this service keeps, and "
@@ -660,9 +682,8 @@ HELP = "\n".join(
        "Or use the buttons — they send these same commands.",
        "The memo goes in an OP_RETURN — desktop wallet, not a phone.",
        "",
-       "Old spellings still work: /receive and /recv reach /address, /send "
-       "reaches /withdraw, /depo reaches /deposit. /withdraw is the one that "
-       "pays YOU."]
+       "Old spellings: /send reaches /withdraw, /depo reaches /deposit. "
+       "/withdraw is the one that pays YOU."]
 )
 
 
@@ -879,24 +900,22 @@ def parse_command(text: str) -> tuple:
         return "", {}, "help"
     if cmd == "/status":
         return "", {}, "status"
-    # /address IS THE PUBLISHED SPELLING NOW. /receive and /recv still work --
-    # see BOT_COMMANDS for why the name changed and why the old ones stay.
+    # /address IS GONE, AND THE OLD SPELLINGS WITH IT.
+    #
+    # It minted a Monero subaddress to be paid into directly -- an entry point
+    # for somebody who already holds XMR. Nothing here swaps XMR to BTC, so it
+    # was half a feature: it could take money in and had no way to say where.
+    # Both slip builders returned empty on it by construction, so the command
+    # whose whole purpose was to hand over an address delivered none, on every
+    # configuration; and both watching jobs refused its handle, so /check and
+    # /wait on one spent a wake to be told no.
+    #
+    # ANSWERED, NOT IGNORED. An operator with the word in their fingers gets a
+    # sentence rather than "unknown command", which reads as a broken bot.
     if cmd in ("/address", "/addr", "/receive", "/recv"):
-        n = 1
-        if arg:
-            # isdecimal, NOT isdigit, and the wizard already carries the note
-            # explaining why -- it just never reached here. "²".isdigit() is
-            # True and int("²") RAISES, so this guard let a ValueError escape
-            # parse_command: handle() is inside run()'s per-update try, so the
-            # operator got NO reply at all to a typo and the message was
-            # counted as a dropped update. Driven: parse_command("/recv ²")
-            # raised ValueError before this line changed.
-            if not arg.isdecimal():
-                return "", {}, "count must be a number 1-4"
-            n = int(arg)
-        if not 1 <= n <= 4:
-            return "", {}, "count must be 1-4"
-        return "receive_new", {"count": n}, ""
+        return "", {}, ("/address is gone — nothing here swaps Monero to "
+                        "Bitcoin, so it could take money in and never say "
+                        "where. /deposit is the way in.")
     # ONE COMMAND, SEVERAL SPELLINGS. "depo" was the only name and it is not a
     # word: nobody who had not read the source knew what it did. The long form
     # is what the menu advertises; the short ones keep working because they are
@@ -1106,6 +1125,15 @@ class Pager:
         #: like everything else here: a restart clears it, which costs one
         #: extra reply and nothing else.
         self._status_at = None
+        #: (chat_id, params, leg) for the next leg of a chained withdrawal, or
+        #: None. Set by poke() when the vault says another arrival is here;
+        #: acted on by _worker AFTER it releases `busy`, because start_job
+        #: takes that lock and poke() is still holding it.
+        self._chain = None
+        #: Which leg of a chained withdrawal is running. Set by start_job, so
+        #: it is in place before the worker thread reads it and cannot be
+        #: cleared by the slot handover. A fresh /withdraw passes leg=0.
+        self._chain_leg = 0
         #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
         #: otherwise -- a private chat id is a Telegram ACCOUNT, and Telegram
         #: gives one account one chat with a given bot however many devices it
@@ -1422,8 +1450,11 @@ class Pager:
         fee is doing; printing "0.1784 XMR" would be a quote this box cannot
         stand behind.
         """
-        return ("How deep? Reply with one:\n"
-                + "\n".join(f"  {d}  {proto.WITHDRAW_DEPTH_NOTE[d]}"
+        # NUMBERED BY HOPS, and it used to be numbered by the wire's key with
+        # the hop count printed next to it -- "3  20 hops" -- so the first
+        # line offered "1  3 hops" and the third answered to the same 3.
+        return ("How deep? Reply with the number of hops:\n"
+                + "\n".join(f"  {proto.WITHDRAW_DEPTH_NOTE[d]}"
                             for d in sorted(proto.WITHDRAW_DEPTHS))
                 + "\n\nDeeper mixes better and needs a bigger balance to do "
                   "it — the fees come out of the same pile.\n"
@@ -1433,12 +1464,24 @@ class Pager:
     #: address and quotes nothing, so its handle record carries slip=None and
     #: both watching jobs refuse it with "Only a receive_and_quote handle can
     #: be watched". There is no configuration in which this changes.
-    UNWATCHABLE_JOBS = ("receive_new",)
+    #: Jobs whose labels the vault will never watch. Empty since /address
+    #: was removed -- the only job that minted an unwatchable handle. Kept
+    #: as the seam rather than deleted: the check it feeds is what stops a
+    #: button spending a wake to be refused, and a future job that quotes
+    #: nothing would need it again.
+    UNWATCHABLE_JOBS = ()
 
     #: How often /status will answer. It is a cooldown rather than a budget
     #: because the answer cannot change faster than this: `busy` flips when a
     #: job starts or ends, and the rate limiter's own window is minutes.
     STATUS_COOLDOWN_S = 15
+
+    #: How many legs one /withdraw may chain through before it stops on its
+    #: own. The daily wake budget (12 by default) bounds this anyway; the cap
+    #: is here so that a wallet reporting "more left" forever -- a stuck scan,
+    #: a dust output that never clears the mix minimum -- cannot turn one
+    #: command into an unbounded run of spends.
+    MAX_CHAIN_LEGS = 6
 
     def _handle_buttons(self, h: str, job: str = "") -> list:
         """Check / wait, bound to the label this reply is about, or None.
@@ -1471,6 +1514,37 @@ class Pager:
             return MENU_BUTTONS
         return [[("Has it arrived?", f"c:{h}"), ("Wait for it", f"w:{h}")]]
 
+    def _phase_buttons(self, phase: str, h: str, job: str = "") -> list:
+        """What to offer under a status answer. Never raises.
+
+        THE ONE REPLY THAT OFFERED NOTHING. Every other message this bot sends
+        carries the next step; the status answer -- the message an operator
+        sees more often than any other, because it is what waiting looks like
+        -- ended with a full stop and an empty keyboard. So "landed and
+        spendable" left somebody who had just been told their money was there
+        with no way to be paid except knowing the word /withdraw and typing
+        it, and "nothing on the address yet" left them retyping a
+        four-character hex label off the screen above to ask a second time.
+        Both are the exact defect _handle_buttons was written for, on the
+        surface it did not cover.
+
+        LABELS ARE READ OUT OF THE MENU, not written again here: two spellings
+        of the same button is how one of them stops matching what it does.
+        """
+        try:
+            if phase in ("not_yet", "arriving"):
+                # Still waiting: the two commands that ask again.
+                return self._handle_buttons(h, job)
+            if phase == "landed":
+                # The money is there. There is exactly one thing to do next
+                # and it is the reason any of this ran.
+                return [[_menu_button("m:send")]]
+        except BaseException:                                # noqa: BLE001
+            pass
+        # "short", "stuck", and anything a newer vault invents: something needs
+        # a decision, and the full menu is where /help lives.
+        return MENU_BUTTONS
+
     def _depth_buttons(self) -> list:
         """The same menu as _depth_question, tappable.
 
@@ -1483,9 +1557,15 @@ class Pager:
         Cancel is here because the message it sits under ends with "/cancel to
         stop", and an operator who has just decided not to do this should not
         have to type a word to say so.
+
+        THE CALLBACK CARRIES THE HOP COUNT, not the key, because
+        parse_callback hands back "the text the typed path would have
+        received" and the typed path reads hops. A button carrying the key
+        would tap to a number the step then refuses -- the same two
+        vocabularies that made "3" mean twenty hops, one layer over.
         """
-        _rows = [[(f"{proto.WITHDRAW_DEPTHS[_d][0]} hops", f"d:{_d}")]
-                 for _d in sorted(proto.WITHDRAW_DEPTHS)]
+        _rows = [[(f"{_h} hops", f"d:{_h}")]
+                 for _h in sorted(proto.WITHDRAW_HOPS)]
         return _rows + [[("Cancel", "m:cancel")]]
 
     def _depth_from(self, word: str):
@@ -1495,19 +1575,28 @@ class Pager:
         written with first. isdecimal() is True for all 455 Unicode decimal
         digits and int() converts every one of them, so "１" -- FULLWIDTH
         DIGIT ONE, which a CJK phone keyboard emits without being asked --
-        selected depth 1 through a pattern that was supposed to accept "1".
+        selected a depth through a pattern that was supposed to accept only
+        the ASCII digit it looks like.
         Harmless at this particular gate and not at the one next to it: the
         same shape let a fullwidth digit through as a BTC amount, which is
         driven and recorded at gs_wake_proto._BTC_RE.
 
         The membership test is against the protocol's table rather than a
         range literal, so this cannot accept a depth the vault will refuse.
+
+        HOPS IN, KEY OUT. This took the KEY, and the question listed the key
+        and the hop count side by side -- "3  20 hops" -- so "3" meant twenty
+        hops here and three hops on the line above it. Somebody who read the
+        menu and typed what they wanted got the slowest option of the three,
+        with the highest minimum balance, having confirmed something else.
+        Hops are what the buttons say and what is actually being chosen, so
+        hops are what this reads; WITHDRAW_HOPS is derived from the same table
+        so the two cannot drift.
         """
         w = (word or "").strip()
         if not w or not all(c in "0123456789" for c in w):
             return None
-        n = int(w)
-        return n if n in proto.WITHDRAW_DEPTHS else None
+        return proto.WITHDRAW_HOPS.get(int(w))
 
     def step_convo(self, chat_id: int, text: str) -> bool:
         """Advance a live conversation. True if this message was consumed.
@@ -2177,8 +2266,33 @@ class Pager:
         # doorbell refuses any phase outside the protocol's closed table
         # before this line can see it, which is also what stops the vault
         # gaining a free-text channel into a chat.
+        #
+        # ...AND IT IS SCOPED TO THE JOBS THAT ARGUMENT IS ABOUT, which are
+        # the two that WATCH. For those, "your money has not arrived yet" is
+        # the honest answer and the non-zero return code is the noise. For a
+        # WITHDRAW the same rule inverts and lies about a spend.
+        #
+        # A withdrawal carries a phase now ("more_left"), and every phase word
+        # presupposes a run that FINISHED: unscoped, a failed withdrawal whose
+        # record carried one answered
+        #
+        #     B7C2: that one is done and there is more here. Run /withdraw
+        #           again for the next.
+        #
+        # about a run that moved nothing -- a false success on the one job
+        # that spends, plus an instruction to spend again, after a failure
+        # ("too deep for the balance") that would fail identically. The
+        # failure branch below already says that in the operator's words.
+        #
+        # gs_wake_agent._phase_of will not produce this today: its withdraw
+        # branch returns "" unless the status is "done", and the comment there
+        # says why. That is the first defence and this is the second, which is
+        # the shape this repo uses everywhere the doorbell re-checks what the
+        # vault sends -- the doorbell validates the phase WORD against a
+        # closed table and does not tie it to the status, so a version skew or
+        # a compromised vault is exactly the case that reaches here.
         _early = (pending.result or {}).get("phase") or ""
-        if _early and out != "done":
+        if _early and out != "done" and job in ("watch", "swap_status"):
             self.send(chat_id,
                       f"{(pending.result or {}).get('handle') or '----'}: "
                       f"{proto.PHASE_LINES.get(_early, _early)}")
@@ -2211,13 +2325,23 @@ class Pager:
             slip = res.get("slip") or ""
             plain = res.get("plain") or {}
             phase = res.get("phase") or ""
-            if phase:
+            # SCOPED TO THE WATCHING JOBS, and it used to catch everything.
+            #
+            # This branch renders the phase and RETURNS, which is right for a
+            # status probe: the phase IS the whole answer. A finished
+            # withdrawal now carries one too ("more_left"), and it is not the
+            # answer -- the answer is that the money went, and the phase only
+            # decides whether another leg follows. Unscoped, this swallowed the
+            # completion message for every chained withdrawal and reported a
+            # spend as if it were a probe.
+            if phase and job in ("watch", "swap_status"):
                 # A STATUS PROBE ANSWERS IN ONE SENTENCE and says nothing else.
                 # The sentence comes from the protocol's own table so this box
                 # cannot invent a reassurance, and the word it renders was
                 # checked against a closed set by the doorbell before it got
                 # here.
-                self.send(chat_id, f"{h}: {proto.PHASE_LINES.get(phase, phase)}")
+                self.send(chat_id, f"{h}: {proto.PHASE_LINES.get(phase, phase)}",
+                          buttons=self._phase_buttons(phase, h, job))
                 return
             # A FINISHED SPEND IS NOT A READY DEPOSIT, and it used to be
             # reported as one. With no slip and no plain, a completed
@@ -2263,13 +2387,34 @@ class Pager:
                 # transaction and that is permanent public proof they share an
                 # owner. Both ends are named now, in the words the operator
                 # used for each: what they GAVE, and what money ARRIVED on.
-                _msg = ("withdraw: sent. The mix ran and the funds went to "
-                        "the addresses you gave — all of them.\n\n"
-                        "It emptied ONE of the addresses money had ARRIVED "
-                        "on, not all of those: spending two of them together "
-                        "would prove on-chain that they belong to the same "
-                        "person. If money arrived in more than one place, "
-                        "/withdraw again for the next.")
+                # THE CHAIN, AND WHY IT IS A CHAIN AND NOT ONE BIG SPEND.
+                #
+                # _funded_entry takes the LARGEST SINGLE unlocked output and
+                # never sums: spending inputs from two subaddresses in one
+                # transaction is permanent public proof they share an owner.
+                # So one run empties one arrival, and that is not negotiable.
+                #
+                # What WAS wrong is that the operator was then left to notice,
+                # and to drive the rest by hand, with no idea how many were
+                # left -- so being paid a third of what they put in read as
+                # the tool shortchanging them. The vault answers that question
+                # now (phase "more_left"), and the pager just keeps going.
+                # FROM start_job, NOT FROM THE SLOT. The first version read
+                # the leg out of self._chain -- which _worker has already
+                # cleared by the time this runs, so it was 0 on every leg: the
+                # message said "2 of at most 6" forever and the cap never
+                # fired. Driven with nine arrivals: nine mixes ran.
+                _more = (res.get("phase") or "") == "more_left"
+                _leg = self._chain_leg
+                _msg = ("withdraw: sent — all of it, to the addresses you "
+                        "gave.\n\n"
+                        + ("That was one arrival and there is more here. "
+                           "Starting the next one now — each has to go "
+                           "separately, or spending them together proves "
+                           "they are all yours."
+                           if _more else
+                           "That was the last one here — nothing left to "
+                           "send."))
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
                 # end of a job that ran for up to sixteen hours and moved real
@@ -2287,6 +2432,24 @@ class Pager:
                     time.sleep(SLIP_RETRY_S)
                     if not self.send(chat_id, _msg):
                         integrity_log("pager", "withdraw_result_undelivered")
+                # ARMED AFTER THE REPORT, NOT INSTEAD OF IT. If the send above
+                # failed twice the operator has no idea a leg finished, and
+                # starting another one silently is the worst thing this could
+                # do -- so the chain is set here, below the report, and the
+                # thread that acts on it is the one that just told them.
+                #
+                # NOT STARTED HERE. start_job takes `busy`, and this is
+                # running inside the worker that holds it. _worker acts on
+                # this slot after its finally releases the lock.
+                if _more and _leg + 1 < self.MAX_CHAIN_LEGS:
+                    self._chain = (chat_id, dict(params), _leg + 1)
+                elif _more:
+                    integrity_log("pager", "chain_capped")
+                    self.send(chat_id,
+                              f"Stopping after {self.MAX_CHAIN_LEGS} in a "
+                              f"row. There is still more here — send "
+                              f"/withdraw again when you are ready.",
+                              buttons=MENU_BUTTONS)
                 return
             if plain and chat_id < 0:
                 # A GROUP IS A BROADCAST SURFACE, AND A PAYLOAD IS NOT FOR ONE.
@@ -2377,37 +2540,33 @@ class Pager:
                 # Saying so is worth more than a reassuring word -- an
                 # operator who believes an address is on its way waits for a
                 # message that is never coming.
-                if job == "receive_new":
-                    # "/check WILL SAY WHEN SOMETHING ARRIVES ON IT" IS FALSE,
-                    # and it is the confident kind: it names a command that
-                    # cannot ever work for this label. Both watching jobs
-                    # refuse a handle whose record carries no swap quote --
-                    # "Only a receive_and_quote handle can be watched" -- and
-                    # receive_new records slip=None always, because it mints an
-                    # address and quotes nothing.
-                    #
-                    # So the sentence sent the operator to spend a wake, a
-                    # boot and a 5-20 minute jitter to be refused, with two
-                    # buttons under it doing the same in one tap. The label is
-                    # still worth having -- it is what the operator matches
-                    # against the machine -- and that is all it is.
-                    integrity_log("pager", "address_not_delivered")
-                    self.send(chat_id,
-                              f"address {h}: minted.\n"
-                              f"The address itself is NOT sent to this chat — "
-                              f"only the deposit flow carries one, and this "
-                              f"job has no quote to carry it in. Read it at "
-                              f"the machine.\n"
-                              f"Nothing here can tell you when it is paid "
-                              f"either: watch it from the machine. {h} is the "
-                              f"label to match it by.",
-                              buttons=self._handle_buttons(h, job))
-                    return
-                # NO DELIVERY KEY IS CONFIGURED, so there is nothing to send and
-                # this is still the original vocabulary: §5 step 5, "Telegram
-                # gets `depo ready · slip A3F1`". No address, no memo, no
-                # amount.
-                self.send(chat_id, f"{chat_name(job)} ready · slip {h}",
+                # "READY" WAS THE WORD, AND NOTHING SAID READY FOR WHAT.
+                #
+                # No delivery key is configured, so the address and the memo
+                # are on the machine and nothing here can carry them. That is
+                # the NORMAL case -- and on the topology this is actually
+                # deployed on, one laptop and one Pi, it is the only case:
+                # a delivery key wants a THIRD machine, the one you send the
+                # BTC from, and sealing to a key held on the machine that
+                # sealed it buys nothing.
+                #
+                # It does not need to travel. The memo goes in an OP_RETURN,
+                # which a phone wallet cannot compose, so the operator has to
+                # be at a desktop wallet to pay at all -- and that is the same
+                # machine the address is already sitting on.
+                #
+                # So the reply stops implying a slip arrived and says the two
+                # things the operator does next: where it is, and that paying
+                # needs the desktop wallet. "depo ready · slip A3F1" said
+                # neither, and read as "your deposit is set up" to somebody who
+                # then had nothing to pay to.
+                self.send(chat_id,
+                          f"{chat_name(job)} {h}: quoted.\n"
+                          f"The address and memo are ON THE MACHINE — read "
+                          f"them there. Paying needs a desktop wallet: the "
+                          f"memo goes in an OP_RETURN and no phone wallet can "
+                          f"do that.\n"
+                          f"/check {h} once you have paid.",
                           buttons=self._handle_buttons(h, job))
                 return
             # A SEALED SLIP CAME BACK. This process cannot read it: it is
@@ -2493,12 +2652,10 @@ class Pager:
                       f"{chat_name(job)}: refused before it started"
                       + (" — nothing was spent and nothing moved."
                          if job == "withdraw" else ".")
-                      + " It does not say why, and this end is not told.\n\n"
-                        "Some refusals clear on their own; others need "
-                        "somebody physically at the machine and will refuse "
-                        "the same way every time. If a second try is refused "
-                        "too, stop — each one spends part of the daily "
-                        "allowance for nothing.",
+                      + " It does not say why.\n"
+                        "If a second try is refused the same way, stop — some "
+                        "refusals need somebody at the machine, and each try "
+                        "costs part of the daily allowance.",
                       buttons=MENU_BUTTONS)
         elif out == "failed":
             # A FAILED WITHDRAWAL GETS THE ONE THING THE OPERATOR CAN ACT ON.
@@ -2558,10 +2715,8 @@ class Pager:
             # there because the vault said so. Here nobody said anything.
             self.send(chat_id,
                       f"{chat_name(job)}: never picked up, so nothing ran"
-                      + (" — THIS attempt handed nothing over and spent "
-                         "nothing.\nThat is all I can tell you: I keep no "
-                         "record of an earlier one, so if you have a "
-                         "withdrawal outstanding, check the balance before "
+                      + (" — THIS attempt spent nothing. I keep no record "
+                         "of an earlier one, so check the balance before "
                          "starting another."
                          if job == "withdraw" else ". Try again."),
                       buttons=MENU_BUTTONS)
@@ -2644,6 +2799,33 @@ class Pager:
             raise
         finally:
             self.busy.release()
+            # THE NEXT LEG, AFTER THE LOCK IS FREE. poke() cannot start it: it
+            # runs inside this thread, which holds `busy`, and start_job takes
+            # `busy`. So the slot is set there and acted on here, one line
+            # after the release.
+            #
+            # THROUGH start_job LIKE EVERYTHING ELSE -- not a direct _worker
+            # call. That is where the rate limit is charged, where the
+            # one-spender rule is re-checked and where the busy lock is taken,
+            # and a chain that went round it would be a second path to a wake
+            # with none of those. If the limit refuses, the operator is told
+            # in start_job's own words and the chain simply stops.
+            _next, self._chain = self._chain, None
+            if _next:
+                _cid, _params, _leg = _next
+                try:
+                    self.send(_cid, f"withdraw: starting the next one "
+                                    f"({_leg + 1} of at most "
+                                    f"{self.MAX_CHAIN_LEGS}).")
+
+                    self.start_job(_cid, "withdraw", _params, leg=_leg)
+                except BaseException:                        # noqa: BLE001
+                    # A chain that cannot continue is not a failure of the leg
+                    # that just succeeded, and must never be reported as one.
+                    try:
+                        integrity_log("pager", "chain_start_failed")
+                    except BaseException:                    # noqa: BLE001
+                        pass
 
     # -- loop -----------------------------------------------------------
     def answer_callback(self, cb_id, text: str = "") -> None:
@@ -2844,6 +3026,25 @@ class Pager:
                 integrity_log("pager", "status_throttled")
                 return
             self._status_at = _now
+            # THE GATE THIS ANSWER DID NOT KNOW ABOUT.
+            #
+            # start_job refuses on THREE things and this read two of them. The
+            # third -- more than one person allowlisted against one wallet --
+            # refuses EVERY job unconditionally, so on a bot configured that
+            # way "can I start one right now" answered "ready" and then every
+            # single command came back refused. That is the worst shape a
+            # status answer can have: confidently wrong about the one gate
+            # that never clears on its own.
+            #
+            # Short, because this is a status answer. The reason in full is on
+            # the refusal itself, where somebody has actually tried to do
+            # something.
+            if self.spenders > 1:
+                self.send(cid, "not ready: more than one person is "
+                               "allowlisted and there is one wallet behind "
+                               "this. Nothing will run.",
+                          buttons=MENU_BUTTONS)
+                return
             _why = self.limits.why_not()
             # THE ANSWER IS STILL ONE WORD. The buttons are what the operator
             # asked "can I start one right now" in order to do next, and
@@ -3017,7 +3218,7 @@ class Pager:
                                  "from": cb.get("from") or {},
                                  "text": _text}})
 
-    def start_job(self, cid: int, job: str, params: dict) -> None:
+    def start_job(self, cid: int, job: str, params: dict, leg: int = 0) -> None:
         """Every path to a wake goes through here. THE ONLY ONE.
 
         Factored out so the wizard and `/depo 2` cannot drift: the rate limit,
@@ -3053,6 +3254,10 @@ class Pager:
                       "spend whoever's balance is largest. Refusing every "
                       "job until that is fixed — one person per bot.")
             return
+        # WHICH LEG THIS IS, recorded before the thread starts so poke() reads
+        # it rather than a slot that has already been cleared. A fresh
+        # /withdraw takes the default and resets the count.
+        self._chain_leg = int(leg)
         why = self.limits.why_not()
         if why:
             self.send(cid, f"no: {why}")

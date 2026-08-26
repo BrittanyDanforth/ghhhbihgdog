@@ -487,6 +487,8 @@ _p = pg.Pager.__new__(pg.Pager)
 _p.proxies, _p.token, _p.key, _p.args = {}, "x", {}, None
 _p.handle_owner = {}
 _p.handle_job = {}
+_p._chain = None
+_p._chain_leg = 0
 _p._status_at = None
 _p.spenders = 1
 _ok = [True]
@@ -540,8 +542,23 @@ check("...and it does not name the machine to go and read it on",
       "vault" not in _chat_off.lower())
 # NON-VACUITY: the reply is a real reply, not an empty string that trivially
 # contains no secrets and no machine name.
+#
+# "ready" WAS THE NEEDLE AND IS GONE ON PURPOSE. "depo ready · slip A3F1" said
+# ready for WHAT, to an operator who then had nothing to pay to -- the address
+# and the memo are on the machine and nothing here carries them. On the
+# topology this is deployed on, one laptop and one Pi, that is the only case:
+# a delivery key wants a THIRD machine, the one you send the BTC from, and
+# sealing to a key held on the machine that sealed it buys nothing. It does
+# not need to travel either -- the memo goes in an OP_RETURN, which no phone
+# wallet can compose, so the operator has to be at that desktop wallet to pay
+# at all. The reply says where it is and what paying needs.
 check("NON-VACUITY -- the plaintext-off reply is a real message",
-      _chat_off.strip() and "ready" in _chat_off)
+      _chat_off.strip() and "quoted" in _chat_off)
+check("...and it says where the address actually is",
+      "ON THE MACHINE" in _chat_off)
+check("...and that paying needs a desktop wallet, which is the part that "
+      "stops an operator trying from the phone",
+      "desktop wallet" in _chat_off and "OP_RETURN" in _chat_off)
 
 # ===========================================================================
 #  A PHASE OUTRANKS THE OUTCOME
@@ -593,6 +610,43 @@ for _ph in ("not_yet", "arriving", "short", "stuck"):
           and "failed" not in _m[0].lower())
     check(f"watch/{_ph}: ...and still names the handle, so /check works later",
           "A3F1" in _m[0])
+# ...AND THE RULE IS ABOUT THE JOBS THAT WATCH, NOT ABOUT EVERY JOB.
+#
+# "The phase is the honest answer and the outcome is the return code" holds
+# for a probe, where "your money has not arrived yet" is the answer and the
+# non-zero exit is the noise. It INVERTS on a withdrawal. Every phase word
+# presupposes a run that finished, so a failed withdrawal carrying one
+# answered
+#
+#     B7C2: that one is done and there is more here. Run /withdraw again
+#           for the next.
+#
+# about a run that moved nothing: a false success on the one job that spends,
+# followed by an instruction to spend again after a failure ("too deep for
+# the balance") that would fail identically. The failure branch already says
+# that in the operator's own words.
+#
+# gs_wake_agent._phase_of will not produce this today -- its withdraw branch
+# returns "" unless the status is "done". That is the first defence; this is
+# the second, and the doorbell is why one is not enough: it validates the
+# phase WORD against the closed table and does not tie it to the status, so a
+# version skew or a compromised vault lands exactly here.
+_wf = _drive_out(_res("failed", "more_left"), "failed", job="withdraw")
+check("withdraw: a FAILED run carrying a phase is not reported as a finished "
+      "one", len(_wf) == 1 and "failed" in _wf[0].lower())
+check("withdraw: ...and does not tell the operator to spend again over a "
+      "spend that did not happen",
+      "that one is done" not in _wf[0].lower()
+      and "more here" not in _wf[0].lower())
+check("withdraw: ...and arms no next leg off a run that moved nothing",
+      _p._chain is None)
+# NON-VACUITY: the watching jobs still get the original behaviour, so this
+# scoped the rule rather than deleting it.
+_wn = _drive_out(_res("failed", "not_yet"), "failed", job="swap_status")
+check("withdraw: NON-VACUITY -- a swap_status timeout is still answered with "
+      "its phase and not called a failure",
+      P.PHASE_LINES["not_yet"] in _wn[0] and "failed" not in _wn[0].lower())
+
 # NON-VACUITY 1: a genuine failure with NOTHING seen still says failed. A fix
 # that reported every outcome as a phase would pass every check above.
 _mf = _drive_out(_res("failed", ""), "failed")
@@ -644,7 +698,7 @@ check("withdraw: ...and states no balance, because this box has none",
       not re.search(r"\d+\.\d", _mw[0]))
 # NON-VACUITY: the advice is specific to the job that HAS a depth. Offering it
 # on a deposit would be a confident answer to a question nobody asked.
-for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
+for _j in ("watch", "receive_and_quote", "swap_status"):
     _mo = _drive_out(_res("failed", ""), "failed", job=_j)
     check(f"{_j}: NON-VACUITY -- no depth advice on a job that has no depth",
           "shallower" not in _mo[0])
@@ -718,7 +772,7 @@ check("withdraw: ...and tells the operator NOT to run it again until they "
 # non-spending jobs get neither lecture.
 check("withdraw: NON-VACUITY -- the two silent endings are different text",
       _mu[0] != _mn[0])
-for _j in ("watch", "receive_and_quote", "receive_new", "swap_status"):
+for _j in ("watch", "receive_and_quote", "swap_status"):
     _o1 = _drive_out(_res("expired_uncollected", ""), "expired_uncollected",
                      job=_j)
     _o2 = _drive_out(_res("collected_no_result", ""), "collected_no_result",
@@ -809,57 +863,52 @@ check("withdraw: ...and advertises no slip handle, because none was registered",
 # is at the source end, and the message has to say which end each is.
 check("withdraw: ...and says every destination they gave was paid, since the "
       "job takes several and a doubt here costs a second spend",
-      "all of them" in _mws[0].lower())
-# THE NEEDLE IS THE WORD THAT CARRIES THE COUNT, and the first version of
-# this check missed that a second time. It tested for "arrived", "not all of
-# those" and "/withdraw" -- all three of which survive the mutation that
-# rewrites "It emptied ONE of the addresses" as "It emptied EVERY address".
-# The sweep found it and scored SURVIVED. Same lesson as the comment above,
-# one paragraph later: test the claim, not the vocabulary around it.
-check("withdraw: ...and separately that it emptied ONE of the addresses money "
-      "ARRIVED on, so the rest is not lost track of",
-      "emptied one of the addresses" in _mws[0].lower()
-      and "every address" not in _mws[0].lower()
-      and "not all of those" in _mws[0].lower()
-      and "/withdraw" in _mws[0])
-check("withdraw: ...and gives the reason, which is why it is not a limitation "
-      "to be fixed later",
-      "same person" in _mws[0].lower())
+      "all of it" in _mws[0].lower())
+# THE SCOPE IS NAMED, AND THE CHAIN DECIDES WHICH SENTENCE FOLLOWS.
+#
+# A run empties ONE arrival -- _funded_entry takes the largest single unlocked
+# output and never sums, because summing is permanent public proof the inputs
+# share an owner. That is not negotiable. What was wrong is that the operator
+# was then left to notice and drive the rest by hand with no idea how many
+# were left, so being paid a third of what they put in read as the tool
+# shortchanging them. The vault answers that now (phase "more_left") and the
+# pager keeps going.
+check("withdraw: with nothing left, it says so plainly",
+      "last one here" in _mws[0].lower()
+      and "nothing left" in _mws[0].lower())
+_mwm = _drive_out(_res("done", "more_left"), "done", job="withdraw")
+check("withdraw: with more left, it says another is starting rather than "
+      "leaving the operator to notice",
+      "more here" in _mwm[0].lower()
+      and "starting the next" in _mwm[0].lower())
+check("withdraw: ...and gives the reason they go separately, which is why it "
+      "is not a limitation to be fixed later",
+      "all yours" in _mwm[0].lower())
+check("withdraw: NON-VACUITY -- the two endings really are different text",
+      _mws[0] != _mwm[0])
 check("withdraw: ...and states no balance and no count, because this box has "
       "neither", not re.search(r"\d+\.\d", _mws[0]))
 # NON-VACUITY: a DEPOSIT still takes the ordinary path, so the withdrawal
 # branch is a branch and not a rewrite of every completion message.
 _md2 = _drive_out(_res("done", ""), "done", job="receive_and_quote")
-check("receive_and_quote: NON-VACUITY -- still reports ready with its slip "
-      "handle", len(_md2) == 1 and "ready" in _md2[0] and "A3F1" in _md2[0])
+check("receive_and_quote: NON-VACUITY -- a deposit still takes its own path "
+      "and carries its label",
+      len(_md2) == 1 and "A3F1" in _md2[0] and "quoted" in _md2[0])
 
-# ...AND receive_new IS ITS OWN BRANCH NOW, for a reason worth stating: it
-# was in this list, asserted to say "ready", and it produces NO address and no
-# slip. seal_slip_for_delivery and plain_slip_for_chat both return empty on it
-# by design ("receive_new quotes nothing"), so the reply promised a thing that
-# was never coming -- the same "'ready' is deposit vocabulary for something
-# that has not happened" defect this file fixed once for a finished spend.
-_ma = _drive_out(_res("done", ""), "done", job="receive_new")
-check("receive_new: does NOT say ready, because nothing the operator asked "
-      "for arrived", len(_ma) == 1 and "ready" not in _ma[0].lower())
-check("receive_new: ...says the address is not sent to this chat",
-      "NOT sent to this chat" in _ma[0])
-# "WHICH /check DOES WORK ON" WAS THE PART THAT WAS NOT TRUE, and this check
-# asserted it. Both watching jobs refuse a handle whose record carries no swap
-# quote -- gs_wake_agent: "Only a receive_and_quote handle can be watched" --
-# and receive_new records slip=None ALWAYS, because it mints an address and
-# quotes nothing. So every /address label is permanently unwatchable, and the
-# reply sent the operator to find that out by spending a magic packet, a boot,
-# a 5-20 minute jitter and one of twelve daily wake slots. The refusal carries
-# no reason, so the obvious next move is to try it again.
-check("receive_new: ...and still carries the handle, which is what the "
-      "operator matches against the machine", "A3F1" in _ma[0])
-check("receive_new: ...but does NOT send them to /check, which is refused on "
-      "an address label every time, structurally",
-      "/check A3F1" not in _ma[0])
-check("receive_new: ...and says so, rather than leaving them to discover it "
-      "by spending a wake",
-      "watch it from the machine" in _ma[0].lower())
+# ...AND receive_new IS GONE ENTIRELY. It minted a Monero subaddress to be
+# paid into directly -- an entry point for somebody who already held XMR --
+# and nothing in this repository swaps XMR to BTC, so it could take money in
+# and had no way to say where. Both slip builders returned empty on it by
+# construction, so the command whose whole purpose was to hand over an address
+# delivered none on every configuration; both watching jobs refused its handle,
+# so /check and /wait on one spent a wake to be told no. The job, the command,
+# the button and the welcome line all went with it.
+check("receive_new: the job is not on the wire any more",
+      "receive_new" not in P.JOBS)
+check("receive_new: ...and the pager answers the old spelling with a sentence "
+      "rather than 'unknown command'",
+      "gone" in pg.parse_command("/address")[2].lower()
+      and "/deposit" in pg.parse_command("/address")[2])
 
 # ONE RETRY ON THE COMPLETION NOTICE, and this is the only notification that a
 # spend finished -- at the end of a job that ran up to sixteen hours and moved
@@ -934,6 +983,75 @@ for _w in ("not_yet", "arriving", "landed", "short", "stuck"):
     check(f"a {_w!r} probe answers in one sentence, naming the slip",
           len(_m) == 1 and "A3F1" in _m[0]
           and P.PHASE_LINES[_w] in _m[0])
+# ...AND IT CARRIES THE NEXT STEP, which is the one reply in this bot that
+# used to carry none.
+#
+# A status answer is what waiting LOOKS LIKE -- it is the message an operator
+# sees more often than any other -- and it ended with a full stop and an empty
+# keyboard. "landed and spendable" left somebody who had just been told their
+# money was there with no way to be paid short of knowing the word /withdraw;
+# "nothing on the address yet" left them retyping a four-character hex label
+# off the screen above to ask again. _handle_buttons exists for exactly that
+# defect and did not cover this surface.
+_btns = []
+_saved_send_pb = _p.send
+_p.send = lambda cid, t, buttons=None: (_sent.append(t),
+                                        _btns.append(buttons), _ok[0])[2]
+try:
+    for _w, _want in (("not_yet", "w:A3F1"), ("arriving", "w:A3F1"),
+                      ("landed", "m:send"), ("short", "m:help"),
+                      ("stuck", "m:help")):
+        _btns.clear()
+        _drive({"status": "done", "handle": "A3F1", "slip": "", "plain": {},
+                "phase": _w}, job="swap_status", params={"handle": "A3F1"})
+        _flat = [d for _row in (_btns[-1] or []) for _l, d in _row]
+        check(f"a {_w!r} answer offers the step that follows it ({_want})",
+              _want in _flat)
+    # THE TWO WAITING ANSWERS OFFER THE LABEL, NOT A BARE COMMAND: asking
+    # again has to carry the handle or the wake is spent on unknown_handle.
+    _btns.clear()
+    _drive({"status": "done", "handle": "A3F1", "slip": "", "plain": {},
+            "phase": "not_yet"}, job="swap_status", params={"handle": "A3F1"})
+    check("...and the ask-again buttons carry the label, so nothing has to be "
+          "retyped",
+          all("A3F1" in d for _row in (_btns[-1] or []) for _l, d in _row))
+    # ONE BUTTON, AND IT IS THE MENU'S OWN. Falling through to the full menu
+    # is not a small regression here: the menu LEADS with "Bitcoin in", so the
+    # reply that says the money arrived would point first at putting more in.
+    # And the button is read off the menu rather than spelt again, because two
+    # spellings of one button is how one of them stops matching what it does --
+    # this bot already shipped a "What this does" that opened a settings table.
+    check("...and it is exactly one button, not the whole menu, whose first "
+          "entry would be the way to put MORE money in",
+          _p._phase_buttons("landed", "A3F1", "swap_status")
+          == [[pg._menu_button("m:send")]])
+    check("...and that button is the menu's own row, label and all, so the "
+          "two cannot drift apart",
+          pg._menu_button("m:send") in
+          [_b for _row in pg.MENU_BUTTONS for _b in _row]
+          and "pays you" in pg._menu_button("m:send")[0])
+    # NON-VACUITY: 'landed' does NOT offer ask-again -- the money is there and
+    # a third probe is a wasted wake.
+    _btns.clear()
+    _drive({"status": "done", "handle": "A3F1", "slip": "", "plain": {},
+            "phase": "landed"}, job="swap_status", params={"handle": "A3F1"})
+    check("...and a landed answer does not offer to check again, which would "
+          "spend a wake to be told the same thing",
+          not any(d.startswith(("c:", "w:"))
+                  for _row in (_btns[-1] or []) for _l, d in _row))
+    # EVERY BUTTON IS A REAL ONE. A status reply is built from a word the
+    # vault chose, so a phase this version has never heard of must still
+    # produce a keyboard that works rather than a dead tap.
+    for _w in ("not_yet", "arriving", "landed", "short", "stuck", "more_left",
+               "a-phase-from-a-newer-vault", ""):
+        _bs = _p._phase_buttons(_w, "A3F1", "swap_status")
+        check(f"phase {_w!r}: every button it offers maps to a real command",
+              bool(_bs) and all(pg.parse_callback(d)[1] == ""
+                                for _row in _bs for _l, d in _row))
+finally:
+    _p.send = _saved_send_pb
+    _sent.clear()
+
 check("a 'not yet' answer never uses the word FAILED -- that sentence, for "
       "money still in flight, is the defect this whole feature exists for",
       "FAIL" not in _drive(

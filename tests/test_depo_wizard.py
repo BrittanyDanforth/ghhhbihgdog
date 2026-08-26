@@ -89,6 +89,8 @@ class Fake:
         p.allow_users = set()
         p.handle_owner = {}
         p.handle_job = {}
+        p._chain = None
+        p._chain_leg = 0
         p._status_at = None
         p.spenders = 1
         p.busy = threading.Lock()
@@ -228,10 +230,14 @@ w.say(_WA)
 # this job refuse most real deposits: GhostSpiral's mix floor rises with the
 # hop count (0.1784 XMR at 3 wallets, 0.2972 at 10), so the single pinned
 # WITHDRAW_WALLETS = 10 was a floor on what could be withdrawn AT ALL.
+# HOPS, NOT THE WIRE'S KEY. The question used to print both -- "1  3 hops",
+# "3  20 hops" -- so 3 was the key for twenty hops AND the hop count on the
+# first line, and somebody who read the menu and typed what they wanted got
+# the slowest option with the highest minimum balance.
 check("wd: ...then asks how deep, offering every depth the protocol has",
-      all(str(_d) in w.sent[-1][1] for _d in P.WITHDRAW_DEPTHS)
+      all(f"{_h} hops" in w.sent[-1][1] for _h in P.WITHDRAW_HOPS)
       and "SPENDS" not in w.sent[-1][1])
-w.say("2")
+w.say("10")
 check("wd: ...then confirms, saying plainly that this one SPENDS",
       "SPENDS" in w.sent[-1][1] and "= ?" in w.sent[-1][1])
 # NEITHER THE ADDRESS NOR AN AMOUNT in the confirm: the address is already in
@@ -267,10 +273,20 @@ for _msgs, _label, _want in (
          "bad address"),
         (["/withdraw", _WA[:94]], "an address one character short",
          "bad address"),
-        (["/withdraw", _WA, "2", "999"], "a wrong confirm", "wrong answer"),
+        (["/withdraw", _WA, "10", "999"], "a wrong confirm", "wrong answer"),
         (["/withdraw", _WA, "0"], "a depth below the table",
          "did not recognise"),
         (["/withdraw", _WA, "4"], "a depth above the table",
+         "did not recognise"),
+        # THE WIRE'S OWN KEYS, WHICH THE CHAT NO LONGER SPEAKS. "1" and "2"
+        # used to mean three and ten hops; the menu printed them beside the
+        # hop counts, so "3" meant twenty hops on one line and three hops on
+        # another. Refusing them is the safe half of that fix -- an operator
+        # who had memorised "2" asks again rather than being handed a
+        # different depth without being told.
+        (["/withdraw", _WA, "1"], "the old wire key for three hops",
+         "did not recognise"),
+        (["/withdraw", _WA, "2"], "the old wire key for ten hops",
          "did not recognise"),
         # FULLWIDTH DIGIT ONE. str.isdecimal() is True for it and int()
         # converts it, which is how the first version of _depth_from accepted
@@ -333,7 +349,7 @@ check("wd/spread: ...and says why several is better, which is the part the "
 check(f"wd/spread: ...in one short screen ({len(_ask)} chars)",
       len(_ask) <= 260)
 _m.say(f"{_WA} {_WB} {_WC}")
-_m.say("3")
+_m.say("20")
 _conf = _m.sent[-1][1]
 check("wd/spread: three addresses are accepted in one message",
       "= ?" in _conf)
@@ -352,10 +368,52 @@ check("wd/spread: all three reach the job, in order",
 check("wd/spread: ...and the wire accepts that note",
       _wjob_ok(_m.pokes[0][2]))
 
+# ...AND "3" MEANS THREE HOPS, WHICH IS WHAT IT LOOKS LIKE IT MEANS.
+#
+# The one character both vocabularies claimed. Under the old numbering it
+# selected the THIRD row -- twenty hops, ~13h instead of ~6h, the highest
+# minimum balance of the three -- for somebody who had read "3 hops" off the
+# first line and typed it. Driven end to end, because a mapping test would
+# not have caught the question printing one thing and the step reading
+# another.
+_h3 = Fake()
+_h3.say("/withdraw"); _h3.say(_WA); _h3.say("3")
+_h3conf = _h3.sent[-1][1]
+_h3.answer_confirm()
+check("wd/hops: typing 3 runs THREE hops, not the third row",
+      len(_h3.pokes) == 1
+      and P.WITHDRAW_DEPTHS[_h3.pokes[0][2]["depth"]][0] == 3)
+check("wd/hops: ...and the confirm it agreed to said three hops too, so the "
+      "screen and the job match",
+      "3 hops" in _h3conf and "20 hops" not in _h3conf)
+# EVERY NUMBER THE MENU PRINTS IS A NUMBER THE STEP READS, and this is the
+# check that would have caught the collision on its own. The question used to
+# print two number columns -- the wire's key and the hop count -- so half the
+# numbers on screen meant one thing to the reader and another to the step.
+_dq = Fake()
+_dq.say("/withdraw"); _dq.say(_WA)
+_dqtext = _dq.sent[-1][1]
+_dqnums = [int(n) for n in re.findall(r"^\s+(\d+)", _dqtext, re.M)]
+check(f"wd/hops: the question prints one number per row ({_dqnums})",
+      len(_dqnums) == len(P.WITHDRAW_DEPTHS))
+check("wd/hops: ...and every one of them is a hop count the step accepts, so "
+      "nothing on screen means something else to the code",
+      _dqnums and all(_dq.p._depth_from(str(_n)) is not None
+                      for _n in _dqnums)
+      and sorted(_dqnums) == sorted(P.WITHDRAW_HOPS))
+
+# NON-VACUITY: the deepest option is still reachable, by the number the menu
+# prints for it.
+_h20 = Fake()
+_h20.say("/withdraw"); _h20.say(_WA); _h20.say("20")
+_h20.answer_confirm()
+check("wd/hops: NON-VACUITY -- 20 still runs twenty hops",
+      P.WITHDRAW_DEPTHS[_h20.pokes[0][2]["depth"]][0] == 20)
+
 # ONE DESTINATION GETS THE SENTENCE, because that is the case where the count
 # is the bad news. NON-VACUITY for the branch above: the two differ.
 _o = Fake()
-_o.say("/withdraw"); _o.say(_WA); _o.say("3")
+_o.say("/withdraw"); _o.say(_WA); _o.say("20")
 _oc = _o.sent[-1][1]
 check("wd/spread: one address is told what it costs, at the confirm",
       "ONE address" in _oc and "group" in _oc)
@@ -383,7 +441,7 @@ _f = Fake()
 _f.say("/withdraw")
 _f.say(" ".join("4" + "Ad" * 46 + "A" + c
                 for c in "bcdefghijklmnop"[:P.MAX_WAKE_EXIT_DESTS]))
-_f.say("1")
+_f.say("3")
 check("wd/spread: NON-VACUITY -- exactly the cap is accepted",
       "= ?" in _f.sent[-1][1])
 _f.answer_confirm()
@@ -701,7 +759,7 @@ check("a live conversation holds an int amount in satoshis, not the text",
       isinstance(_c.amount, int) and not isinstance(_c.amount, bool)
       and _c.amount == 3_000_000)
 _c3 = Fake()
-_c3.say("/withdraw"); _c3.say(_WA); _c3.say("3")
+_c3.say("/withdraw"); _c3.say(_WA); _c3.say("20")
 check("...and a withdraw conversation holds an int depth the same way",
       isinstance(_c3.p.convos[111].depth, int)
       and _c3.p.convos[111].depth == 3)
@@ -1331,24 +1389,53 @@ _LABELS += [l for _row in pg.Pager._handle_buttons(
     types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS),
     "A3F1", "receive_and_quote") for l, _d in _row]
 _LABELS += [l for _row in pg.Pager._handle_buttons(
-    types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS),
-    "A3F1", "receive_new") for l, _d in _row]
+    types.SimpleNamespace(UNWATCHABLE_JOBS=("some_future_job",)),
+    "A3F1", "some_future_job") for l, _d in _row]
+# ...AND THE STATUS ANSWER'S KEYBOARD, which is the fourth table and the one
+# an operator sees most, because waiting is what this tool mostly does. Every
+# phase, including one a newer vault might invent: the fallback is a real
+# keyboard, so it is a real surface.
+#
+# DE-DUPLICATED against what is already here. _phase_buttons composes the
+# other three rather than writing labels of its own -- which is the point of
+# it -- so appending its output raw would scan the same string twice and count
+# the menu's one currency mention twice against the ceiling below.
+_PHASE_LABELS = [
+    l for _w in ("not_yet", "arriving", "landed", "short", "stuck",
+                 "more_left", "a-phase-from-a-newer-vault")
+    for _row in (pg.Pager._phase_buttons(
+        types.SimpleNamespace(UNWATCHABLE_JOBS=pg.Pager.UNWATCHABLE_JOBS,
+                              _handle_buttons=pg.Pager._handle_buttons.__get__(
+                                  types.SimpleNamespace(
+                                      UNWATCHABLE_JOBS=(
+                                          pg.Pager.UNWATCHABLE_JOBS)))),
+        _w, "A3F1", "swap_status") or [])
+    for l, _d in _row]
+check("the scan reaches the status answer's keyboard, the fourth table and "
+      "the one an operator sees most often",
+      len(_PHASE_LABELS) >= 6)
+_LABELS += [l for l in dict.fromkeys(_PHASE_LABELS) if l not in _LABELS]
 check(f"the scan reaches the button labels too ({len(_LABELS)} of them), "
       f"which land in the chat and stay under the message",
       len(_LABELS) >= 8)
 _all_sent += [(-1, _CURRENCY_RE.sub("", l)) for l in _LABELS]
 _exempt_total = _wc + sum(len(_CURRENCY_RE.findall(l)) for l in _LABELS)
+# THE EXEMPTION SHRANK WHEN /address WENT. "⬇ Monero in" was the second
+# mention; with the command gone the welcome's headline is the only one left,
+# which is the smallest the exemption can be while the service still says what
+# it deals in.
 check(f"the currency exemption stays bounded across every surface it covers "
       f"({_exempt_total} mentions in the welcome and the labels together)",
-      _exempt_total <= 3)
+      _exempt_total <= 2)
 # NON-VACUITY on the scrub: it is what lets those surfaces through, so it has
 # to actually be doing something, or the cap above is guarding nothing.
 check("NON-VACUITY -- the surfaces the scrub covers really do name it",
-      _exempt_total >= 2)
+      _exempt_total >= 1)
 # EVERY BUTTON TABLE, not the one the menu happens to use. A `buttons=` that
 # named a fourth table would be a keyboard nothing above reads.
 _BTN_TABLES = {"MENU_BUTTONS", "self._depth_buttons()",
-               "self._handle_buttons(h, job)", "[[('Cancel', 'm:cancel')]]"}
+               "self._handle_buttons(h, job)", "[[('Cancel', 'm:cancel')]]",
+               "self._phase_buttons(phase, h, job)"}
 _btn_seen = {_ast.unparse(_kw.value) for _n in _ast.walk(_pg_tree)
              if isinstance(_n, _ast.Call)
              and getattr(_n.func, "attr", "") == "send"

@@ -76,8 +76,7 @@ PI = NP.PrivateKey.generate()      # doorbell, static
 EPH = NP.PrivateKey.generate()     # vault, per boot
 
 _SAMPLE_XMR = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
-SAMPLE = {"receive_new": {"count": 4},
-          "receive_and_quote": {"amount_sat": 5_000_000},
+SAMPLE = {"receive_and_quote": {"amount_sat": 5_000_000},
           "watch": {"handle": "A3F1"},
           "swap_status": {"handle": "A3F1"},
           "withdraw": {"exit_to": _SAMPLE_XMR, "depth": 1}}
@@ -162,7 +161,7 @@ check("the wrong-kind refusal does not echo the received tag",
 
 
 print("\n== forward secrecy: M2 is sealed to the per-boot ephemeral ==")
-rec, _ = m2_for("receive_new")
+rec, _ = m2_for("receive_and_quote")
 for name, sk in (("the Pi's long-term secret", PI),
                  ("the vault's long-term secret", TP)):
     try:
@@ -172,11 +171,12 @@ for name, sk in (("the Pi's long-term secret", PI),
         check(f"a captured M2 stays sealed against {name} — a door kick does "
               f"not decrypt months of recorded notes", True)
 check("...while the boot that made it can open it",
-      P.open_record(EPH, PI.public_key, rec, P.TAG_M2)["job"] == "receive_new")
+      P.open_record(EPH, PI.public_key, rec, P.TAG_M2)["job"]
+      == "receive_and_quote")
 
 
 print("\n== integrity ==")
-ok, _ = m2_for("receive_new")
+ok, _ = m2_for("receive_and_quote")
 flipped = 0
 for i in (0, 30, 150, 295):
     bad = bytearray(ok)

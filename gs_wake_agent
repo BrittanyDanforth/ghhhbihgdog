@@ -785,7 +785,7 @@ def somebody_is_here(artifact_dir=None, rpc=None) -> str:
 
       * The inhibit file was read in preflight and again inside _dispatch's
         `for i, argv in enumerate(steps)` loop -- which iterates ONCE for
-        withdraw, receive_new, watch and swap_status. So for four of the five
+        withdraw, watch and swap_status. So for three of the four
         jobs the "somebody sat down" check ran immediately after the jitter
         and never again, while the job ran for up to 58200 s. An operator who
         touched the file during a withdrawal was ignored and the box powered
@@ -867,11 +867,6 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
     """
     proxy = key["tor_proxy"]
     rpc = key["rpc_primary"]
-    if job == "receive_new":
-        return [[sys.executable, _tool("create_receive_wallet"),
-                 "--tor-proxy", proxy, "--rpc", rpc,
-                 "--count", str(int(params["count"])),
-                 "--output-dir", str(artifact_dir)]]
     if job == "receive_and_quote":
         # RE-CHECKED HERE, and the bounds come from the protocol rather than
         # from a literal typed in this file. The predecessor of this branch
@@ -1632,7 +1627,7 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                       f"{len(recent)} wakes in the last 24 h, which is the "
                       f"budget. Refusing.")
 
-    if job in ("receive_new", "receive_and_quote"):
+    if job == "receive_and_quote":
         ceiling = int(key.get("account_ceiling", 45))
         n = _account_count(key, _accounts)
         if n is None:
@@ -1721,14 +1716,14 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                                      handle, _child, job_id)
     # A STATUS PROBE REPORTS THE HANDLE IT WAS ASKED ABOUT, not the fresh one
     # _run_validated drew. See _dispatch: handles[] is written only for
-    # receive_and_quote and receive_new, and the collision loop guarantees the
+    # receive_and_quote, and the collision loop guarantees the
     # drawn handle is absent from the file -- so a watch used to answer
     # "ready · slip 7C3D" for a label the operator could not look up.
     if job in ("watch", "swap_status"):
         handle = params["handle"]
     slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
     plain = plain_slip_for_chat(key, artifact_dir, status, handle)
-    phase = _phase_of(job, artifact_dir)
+    phase = _phase_of(job, artifact_dir, key=key, status=status)
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
                 plain=plain, phase=phase, poster=d.get("post_record"))
     return code, status, handle
@@ -1749,7 +1744,8 @@ _PHASE_OF_STATE = {
 }
 
 
-def _phase_of(job: str, artifact_dir: Path, reader=None) -> str:
+def _phase_of(job: str, artifact_dir: Path, reader=None,
+              key: dict = None, status: str = "") -> str:
     """The one word a status probe earned, or "". NEVER raises.
 
     BOTH WATCHING JOBS, not just the short one. `watch` used to be excluded
@@ -1759,6 +1755,30 @@ def _phase_of(job: str, artifact_dir: Path, reader=None) -> str:
     swap_status exists to stop saying. Both now write the same status file and
     both are read the same way.
     """
+    # A FINISHED WITHDRAWAL ANSWERS A DIFFERENT QUESTION: is there another
+    # arrival still sitting here?
+    #
+    # _funded_entry takes the LARGEST SINGLE unlocked output and never sums,
+    # because summing spends inputs from several subaddresses in one
+    # transaction and that is permanent public proof they share an owner. So a
+    # withdrawal moves ONE arrival -- correct, and it left the operator with no
+    # idea whether anything remained, which reads as having been paid a
+    # fraction. Asked here, on the machine that has the wallet, at the one
+    # moment the answer is both cheap and true.
+    #
+    # ONLY ON SUCCESS. A failed or refused run has not moved the entry it
+    # chose, so "there is more" would be trivially true and would chain the
+    # pager into repeating a run that just failed.
+    if job == "withdraw":
+        if status != "done":
+            return ""
+        try:
+            return "more_left" if _funded_entry(key) else ""
+        except Exception:                                    # noqa: BLE001
+            # The wallet could not be asked. "" is honest: the operator is
+            # told the withdrawal finished and nothing more, which is where
+            # they were before this existed.
+            return ""
     if job not in ("swap_status", "watch"):
         return ""
     try:
@@ -1961,9 +1981,9 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                           f"no bundle on this machine for handle "
                           f"{params['handle']}.")
         bundle, slip = rec.get("bundle"), rec.get("slip")
-        # ONE HANDLE, ONE ADDRESS. `receive_new --count 4` writes four
-        # wallet_<random>.json files and the handle cannot name one of them
-        # without picking arbitrarily, so it names none and this refuses.
+        # ONE HANDLE, ONE ADDRESS. A job that wrote several bundles could
+        # not have its handle name one of them without picking arbitrarily,
+        # so it names none and this refuses.
         if not bundle:
             raise Refused(
                 "handle_not_watchable",
@@ -1972,7 +1992,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 f"not name ONE address to watch. Watch the address you mean "
                 f"from this machine, or quote it with receive_and_quote.")
         # A WATCH WITH NO QUOTE IS NOT A WATCH. The first version passed
-        # str(slip) here, so a handle minted by receive_new -- which never
+        # str(slip) here, so a handle with no quote behind it -- which never
         # writes a slip -- reached receive_watch as the literal path "None".
         # load_pairs then exited on a missing file and the doorbell was told
         # "failed", which is true and useless: a wake and a boot spent to
@@ -2267,15 +2287,6 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             _save_handles(artifact_dir, handles)
             return "job_failed", "failed", handle
 
-    if job == "receive_new":
-        new = sorted(set(glob.glob(str(artifact_dir / "wallet_*.json"))) - before)
-        if new:
-            # `bundle` only when there is exactly ONE, because --count N writes
-            # N files named wallet_<random>.json and new[0] is whichever of
-            # them sorts first -- an address the operator could not have
-            # predicted. `minted` is what the refusal above quotes back.
-            handles[handle] = {"bundle": new[0] if len(new) == 1 else None,
-                               "minted": len(new), "slip": None}
     _save_handles(artifact_dir, handles)
     integrity_log("wake", f"job_done:{job}")
     return "done", "done", handle
@@ -2367,8 +2378,8 @@ def seal_slip_for_delivery(key: dict, artifact_dir: Path, status: str,
         rec = (_load_handles(artifact_dir) or {}).get(handle) or {}
         path = rec.get("slip")
         if not path:
-            # receive_new mints addresses and quotes nothing. There is no
-            # deposit address to deliver and this is not a fault.
+            # A handle with no quote behind it has no deposit address to
+            # deliver, and that is not a fault.
             return ""
         pairs = (reader or _read_json)(Path(path))
         if not isinstance(pairs, list) or len(pairs) != 1:
@@ -2459,7 +2470,7 @@ def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
         rec = (_load_handles(artifact_dir) or {}).get(handle) or {}
         path = rec.get("slip")
         if not path:
-            return {}                       # receive_new quotes nothing
+            return {}                       # nothing was quoted
         pairs = (reader or _read_json)(Path(path))
         if not isinstance(pairs, list) or len(pairs) != 1:
             # The same refusal the sealed path makes. N slips in one transcript

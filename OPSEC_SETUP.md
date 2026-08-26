@@ -705,21 +705,26 @@ Steps 1–2 are `gs_telegram_pager`. Step 3 onward is `gs_doorbell` and
 `gs_wake_agent`. You can still do steps 1–2 by hand — the pager only pokes the
 doorbell, so anything it does you can do from a terminal.
 
-**Most of it is buttons.** `/help` and `/status` carry a keyboard —
-Deposit, Withdraw, Status, Fresh address — and the depth menu, cancel,
-and the "has it arrived / wait for it" step after a deposit are all
-tappable. Every button sends a command from the list `/help` prints, so
-nothing is reachable only by tapping and an old client still works by
-typing.
+**Most of it is buttons.** The menu carries a keyboard — Bitcoin in,
+Withdraw, Status, What a run does, All commands — and the depth menu, cancel,
+and the "has it arrived / wait for it" step after a deposit are all tappable.
+A status answer carries one too: still-waiting offers the two ask-again
+buttons *with the label already in them*, and "landed and spendable" offers
+the way to be paid, because that is the only thing left to do. Every button
+sends a command from the list `/help` prints, so nothing is reachable only by
+tapping and an old client still works by typing.
 
 **Two things stay typed, on purpose.** The withdrawal *address*, because no
 button can carry one and a button that could would be the bot choosing where
 your money goes. And the **confirm**, because that gate exists to stop a
 pocket-dial — and a tap is a pocket-dial.
 
-1. Phone: `/recv` then `/deposit` to the throwaway account. **It asks for the
-   amount you are about to send**, in BTC, and puts it on the wire as an exact
-   satoshi count.
+1. Phone: `/deposit`. **It asks for the amount you are about to send**, in
+   BTC, and puts it on the wire as an exact satoshi count. There is no
+   `/recv` step before it any more and no separate address command: the
+   deposit address is minted inside the job, on the vault, for that quote
+   alone. Two people running `/deposit` at the same moment get two different
+   addresses because each is minted by its own run — they cannot collide.
 
    This used to be a SLOT — an index into a ladder of amounts held in the
    ThinkPad's keyfile — specifically so the Pi could never turn "0.05" into
@@ -775,18 +780,19 @@ pocket-dial — and a tap is a pocket-dial.
 5. Slip stays on the ThinkPad (`0600`). Telegram gets `depo ready · slip A3F1`.
 6. You copy BTC address + memo from the bay (or the file). Not from chat.
 
-   **Unless you cannot get to the bay**, which is the case this design
-   assumes and then never handled. A vault that is far away and hard to
-   reach is the point of having one, and "read it on the vault" is not an
-   OPSEC property when you cannot — it is a quote you are told about and
-   cannot pay, which expires. So set up a **delivery key** (§4a below) and
-   the slip travels **sealed**: Telegram carries 568 characters of base64,
-   the Pi holds no key for it, and you open it with `gs_unseal` on the
-   machine you send the BTC from — the one that already runs Electrum or
-   Sparrow for the OP_RETURN.
+   **With one laptop, that is the end of it** — the laptop is the vault and
+   it is also the only thing you own that can put a memo in an OP_RETURN, so
+   you read the pair there and pay there. The chat tells you so and hands you
+   nothing to copy. Set no delivery key.
 
-   Set up no delivery key and nothing changes: no slip is sealed, none
-   travels, and step 6 is exactly what it was.
+   **Unless you cannot get to the bay**, which is a real setup and needs a
+   *second* machine to be one: the one that runs Electrum or Sparrow. Then set
+   up a **delivery key** (§4a below) and the slip travels **sealed**: Telegram
+   carries 568 characters of base64, the Pi holds no key for it, and you open
+   it with `gs_unseal` on that machine.
+
+   Set up no delivery key and nothing is sealed, nothing travels, and step 6
+   is exactly what it was.
 7. ThinkPad `receive_watch` until landed **or 2 h** (`--timeout-min 110`,
    inside a 7200 s budget — the doc and the code say the same number),
    then **power off**. Power-off is three independent root-owned paths:
@@ -838,7 +844,26 @@ pocket-dial — and a tap is a pocket-dial.
    button on both. Nothing else — no handle, no account, no
    amount. The vault looks at its own wallet, takes the largest unlocked
    output, mixes it and sends it there. It needs nothing from you that you
-   would have to look up.
+   would have to look up. One `/withdraw` drains the wallet: the pager starts
+   the next run itself once the vault reports another arrival, up to six in a
+   row, each its own mix.
+
+   **The depth is a number of HOPS**, and that is worth stating because it was
+   not always. The question used to be numbered by the protocol's own key with
+   the hop count printed beside it —
+
+   ```
+     1  3 hops · ~6h · lowest minimum
+     2  10 hops · ~9h
+     3  20 hops · ~13h · highest minimum
+   ```
+
+   — so `3` was the key for twenty hops *and* the hop count on the first line.
+   Somebody who read the menu and typed what they wanted got the third row:
+   roughly twice the runtime, the highest minimum balance of the three, and a
+   run that dies at stage 0 if their balance sits between the two minimums,
+   after they have already confirmed something else. It now answers to `3`,
+   `10` and `20` only; the old keys are refused rather than reinterpreted.
 
    **Give it more than one address.** The exit sends **one transaction per
    mixed output** — at least 5, 12 or 22 of them at the three depths — and a
@@ -863,6 +888,26 @@ approval step and there is not meant to be: you pair once with the flags
 below, and after that `/withdraw` runs from the phone with the vault
 untouched. What the one-time setup costs is three things, and all three have
 to be right or the job fails **after the money has moved**:
+
+**One `/withdraw` drains everything, as several runs in a row.** A single run
+moves exactly ONE arrival: `_funded_entry` takes the largest single unlocked
+output and never sums, because spending outputs from several subaddresses in
+one transaction is permanent public proof on-chain that they share an owner.
+That is not negotiable and it is not going to change. What used to be wrong is
+what happened next — nothing. The operator was paid one pile out of three,
+told in the abstract that there might be more, and left to work out how many
+runs to start; being paid a third of what went in reads as the tool
+shortchanging you.
+
+So the vault now answers the question at the one moment it is cheap and true
+(it has the wallet open): when a withdrawal finishes, it reports whether
+another arrival is still sitting there. The pager starts the next run itself
+and says so. Each leg is a **separate mix to the same destinations you gave**
+— nothing is merged, so the on-chain property above is untouched — and the
+chain stops at **six legs in a row**, after which it hands back to you rather
+than looping. Every leg goes through the same `start_job` as a typed command:
+the same rate limit, the same one-spender check, the same busy lock. There is
+no second path to a wake.
 
 ```bash
 # 1. Pair with the two flags. --wallet-file is REQUIRED with --allow-withdraw
@@ -1078,7 +1123,7 @@ missing on a box where it is the only tamper-evidence there is.
 | Door kick, Pi only | **Depends entirely on whether you encrypted the Pi (§3).** The wake keyfile is sealed with your passphrase, so the card alone no longer yields the wake key, your ThinkPad's MAC or your LAN layout — it yields Argon2id parameters and a salt. But an unencrypted card still hands over `/etc/wireguard/wg0.conf`, which is your **Mullvad private key**, and `/var/lib/tor`, which is your **guard set**. Those are your network identity and no work on the wake channel touches them. Wake traffic recorded off the switch stays sealed either way: each job note is boxed to a key the vault minted for that boot and then powered off with. Recovery is a two-box re-key (two commands, §8), plus a new Mullvad account |
 | Door kick, they take the ThinkPad | **Partly** — view-only if auto-unlock; spend USB elsewhere |
 | Spend USB left in the laptop | **No** — you blew the split |
-| Stolen Telegram / bot token | **Partly, and it depends on `allow_withdraw`.** Without it they can wake and spam quotes, **not spend**, and the spam is bounded on the ThinkPad rather than on the stolen thing: a 24 h wake budget (12 by default) and an account ceiling (45) that refuses **minting** jobs once the wallet holds more subaddress accounts than the offline signer derives. Both live in the keyfile, so changing them needs physical access. **With `allow_withdraw` on, they can spend — to an address they type** (§4b), and the ceiling does not apply: it is checked for `receive_new` and `receive_and_quote` only, and a mix mints ~25 accounts of its own. That exemption is deliberate — refusing a withdrawal at 45 accounts would strand the money, and `airgap_tx_signer` already creates the accounts the offline wallet needs — but it means the ceiling bounds the cheap job and not the expensive one. What bounds a withdrawal is `allow_withdraw`, the wake budget, and the fact that one holds the pager for most of a day. They also get your vault powering on when they say |
+| Stolen Telegram / bot token | **Partly, and it depends on `allow_withdraw`.** Without it they can wake and spam quotes, **not spend**, and the spam is bounded on the ThinkPad rather than on the stolen thing: a 24 h wake budget (12 by default) and an account ceiling (45) that refuses **minting** jobs once the wallet holds more subaddress accounts than the offline signer derives. Both live in the keyfile, so changing them needs physical access. **With `allow_withdraw` on, they can spend — to an address they type** (§4b), and the ceiling does not apply: it is checked for `receive_and_quote` only — the one remaining minting job — and a mix mints ~25 accounts of its own. That exemption is deliberate — refusing a withdrawal at 45 accounts would strand the money, and `airgap_tx_signer` already creates the accounts the offline wallet needs — but it means the ceiling bounds the cheap job and not the expensive one. What bounds a withdrawal is `allow_withdraw`, the wake budget, and the fact that one holds the pager for most of a day. They also get your vault powering on when they say |
 | Somebody on the switch during PAIRING | **Only if you compare the code.** The two boxes have never met, so nothing but you can tell the real peer from an impostor. Each commits to its key before seeing the other's, which is what stops an attacker grinding keys until the two codes agree — so the 8 characters you compare are worth 2^40 and a man in the middle has to guess once, in public, with you looking at it. If you do not actually compare them, this is unauthenticated key agreement and the software cannot tell |
 | Roommate sends WOL | **Yes** for job execution — no authenticated note, no job, boot-sit-shutdown. **No** for the side effects: they still chose when your vault powers on and auto-unlocks, and a no-job boot dwells a random 1–3 min before powering off, so it does not die the instant it learns there is nothing to do. That removes the boot-and-die tell; it does **not** make a no-job boot look like a job boot, which waits 5–20 min of jitter before it starts anything |
 | WOL from the internet | **Yes** if UDP 9 is not forwarded |
@@ -1437,11 +1482,22 @@ device that account is signed in to.
 
 ### The slip travels sealed, or it does not travel
 
-“Read it on the vault” is the right rule and it has one assumption: that you
-can get to the vault. If you cannot, the rule delivers nothing — you are told a
-swap is quoted and handed no way to pay it, and quotes expire. And you cannot
-work around it by having the Pi read the slip, because that is exactly the
-Telegram bot this section forbids.
+**Count your machines before reading this section.** All of it is about
+getting a deposit address off the vault and onto a *different* machine. If you
+run the ordinary setup — one laptop and one Pi — then the machine that would
+unseal the slip is the machine that sealed it, and there is nothing to
+deliver: you read the address and memo on the laptop and you pay from the
+laptop, because the laptop is also the only thing you own that can put a memo
+in an OP_RETURN. **Set no delivery key.** The pager then tells you, in those
+words, that the address is on the machine and that paying needs a desktop
+wallet, and that is the whole flow.
+
+Everything below applies when the vault is somewhere you cannot walk to and
+you send the BTC from a *second* machine. “Read it on the vault” is the right
+rule and it has one assumption: that you can get to the vault. If you cannot,
+the rule delivers nothing — you are told a swap is quoted and handed no way to
+pay it, and quotes expire. And you cannot work around it by having the Pi read
+the slip, because that is exactly the Telegram bot this section forbids.
 
 So the payload travels as **ciphertext neither carrier can open**:
 
@@ -1555,8 +1611,19 @@ The one real cost, stated plainly: to run unattended it needs
 SD card as the sealed keyfile and effectively unseals it. A pager you start by
 hand, typing the passphrase, does not. That is the trade; make it knowingly.
 
-The wake channel can ask for five jobs and no others — `receive_new`,
+The wake channel can ask for four jobs and no others —
 `receive_and_quote`, `watch`, `swap_status`, `withdraw`.
+
+**`receive_new` was the fifth and is gone.** It minted a Monero subaddress to
+be paid into directly — an entry point for somebody who already held XMR — and
+nothing in this repository swaps XMR to BTC, so it could take money in and had
+no way to say where it would come out. Both slip builders returned empty on
+it by construction, so the one command whose entire purpose was to hand over
+an address delivered none on every configuration; both watching jobs refused
+its handle, so `/check` or `/wait` on one spent a wake to be told no. The job,
+the `/address` command, the button and the welcome line went with it. The
+pager answers the old spellings with a sentence saying why rather than
+`unknown command`.
 
 **Exactly one of them takes an XMR destination, and this paragraph used to say
 none did.** The old rule was absolute: a doorbell that can name a destination
@@ -1582,13 +1649,12 @@ a bounded satoshi count and the mixing depth is a key of a three-row table;
 neither can be a flag, a path or a proxy. The ThinkPad composes every
 argument itself.
 
-`watch` takes only a handle that came from `receive_and_quote`. A handle
-from `receive_new` is refused, for two reasons: `--count N` mints N
-bundles and the handle cannot name one of them without picking
-arbitrarily, and a receive bundle carries no quoted amount, so the only
-way to watch it would be `--any` — which stops on **any** balance, so a
-piconero of dust from anyone holding the address would page you that
-your money had landed.
+`watch` takes only a handle that came from `receive_and_quote`, which is now
+the only job that mints one. The rule `receive_new` used to be refused under
+still binds the job that replaced it, one layer down: a mint step whose
+directory diff is not exactly one new bundle is **refused**, not resolved by
+picking one. Picking arbitrarily is how a watch ends up following an address
+the operator could not have predicted, and quoting one is worse.
 
 Pi-side artifacts are **not** covered by `paranoia_mode` by default, and
 there is more on the Pi than this used to say. Two things from this repo run

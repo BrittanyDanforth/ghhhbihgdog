@@ -827,13 +827,17 @@ MUTATIONS = [
   '                "no_quote",',
   ["test_wake_agent"]),
 
- # One handle, one address. --count 4 writes four bundles and new[0] is
- # whichever sorts first.
- ("a multi-bundle handle resolves to an arbitrary one of them",
+ # One handle, one address. receive_new's --count 4 wrote four bundles and
+ # new[0] was whichever sorted first, so a later watch followed an address the
+ # operator could not have predicted. That job is gone and the rule moved one
+ # layer down, to a hard refusal: a mint step whose directory diff is not
+ # exactly one file does not get resolved by picking one of them.
+ ("a multi-bundle mint is resolved by hex sort order instead of refused",
   "gs_wake_agent",
-  '            handles[handle] = {"bundle": new[0] if len(new) == 1 else None,\n'
-  '                               "minted": len(new), "slip": None}',
-  '            handles[handle] = {"bundle": new[0], "slip": None}',
+  "            if len(new) != 1:\n"
+  '                raise Refused("bundle_ambiguous",',
+  "            if not new:\n"
+  '                raise Refused("bundle_ambiguous",',
   ["test_wake_agent"]),
 
  # "did not authenticate" and "authenticated, then refused" are different facts
@@ -1242,10 +1246,18 @@ MUTATIONS = [
 
  # ...and the same rule on the side that WRITES it, because the doorbell's
  # copy is the second defence, not the first.
+ #
+ # ANCHORED WITH THE LINE BELOW IT. `if status != "done": return ""` is now
+ # written twice in this file -- the second copy is _phase_of's withdraw
+ # branch, which refuses to answer "is there more left" about a run that did
+ # not move anything. A two-match anchor mutates a place the author did not
+ # choose, so the seal's own next line pins which one this is.
  ("the vault seals a slip for a job that failed or was refused",
   "gs_wake_agent",
-  "        if status != \"done\":\n            return \"\"\n",
-  "",
+  "        if status != \"done\":\n"
+  "            return \"\"\n"
+  '        dpub = (key.get("delivery_public") or "").strip()',
+  '        dpub = (key.get("delivery_public") or "").strip()',
   ["test_sealed_slip"]),
 
  # One ladder slot goes in, so one quoted pair comes out. Picking one of
@@ -2307,10 +2319,36 @@ MUTATIONS = [
  # Re-anchored: the labels are gone with the ladder, and the same property
  # now lives at the depth menu -- an option the menu does not offer is refused
  # HERE, before a wake is spent finding out at the vault.
+ # ONE CHARACTER, TWO VOCABULARIES. The question printed the wire's key beside
+ # the hop count -- "1  3 hops", "3  20 hops" -- so 3 was the key for twenty
+ # hops AND the hop count on the first line. Somebody who read the menu and
+ # typed what they wanted got the third row: ~13h instead of ~6h, the highest
+ # minimum balance of the three, and a run that dies at stage 0 if their
+ # balance sits between the two minimums -- after confirming something else.
+ # Nothing on screen was wrong and nothing on the wire was wrong.
+ ("the depth question goes back to numbering rows instead of hops",
+  "gs_telegram_pager",
+  '        return ("How deep? Reply with the number of hops:\\n"\n'
+  '                + "\\n".join(f"  {proto.WITHDRAW_DEPTH_NOTE[d]}"',
+  '        return ("How deep? Reply with one:\\n"\n'
+  '                + "\\n".join(f"  {d}  {proto.WITHDRAW_DEPTH_NOTE[d]}"',
+  ["test_depo_wizard"]),
+
+ # ...AND THE BUTTON CARRIES WHAT THE STEP READS. parse_callback hands back
+ # "the text the typed path would have received", so a button carrying the key
+ # taps to a number the step refuses -- the same collision, one layer over.
+ ("the depth buttons carry the wire's key instead of the hop count",
+  "gs_telegram_pager",
+  '        _rows = [[(f"{_h} hops", f"d:{_h}")]\n'
+  "                 for _h in sorted(proto.WITHDRAW_HOPS)]",
+  '        _rows = [[(f"{proto.WITHDRAW_DEPTHS[_d][0]} hops", f"d:{_d}")]\n'
+  "                 for _d in sorted(proto.WITHDRAW_DEPTHS)]",
+  ["test_telegram_pager"]),
+
  ("a depth the menu does not offer is accepted and spends a wake to be "
   "refused", "gs_telegram_pager",
-  "        return n if n in proto.WITHDRAW_DEPTHS else None",
-  "        return n",
+  "        return proto.WITHDRAW_HOPS.get(int(w))",
+  "        return int(w)",
   ["test_depo_wizard"]),
 
  # DELETED, NOT RE-ANCHORED. This mutated the doorbell's refusal of a numeric
@@ -2583,8 +2621,10 @@ MUTATIONS = [
   ["test_plain_slip"]),
 
  ("the pager only renders a phase on a finished job", "gs_telegram_pager",
-  "        if _early and out != \"done\":",
-  "        if False:",
+  '        if _early and out != "done" and job in ("watch", "swap_status"):\n'
+  '            self.send(chat_id,',
+  "        if False:\n"
+  "            self.send(chat_id,",
   ["test_plain_slip"]),
 
  # ---- the wizard is the only path, and the card holds no map -------------
@@ -2663,11 +2703,15 @@ MUTATIONS = [
 
  # And the sentence that stops two thirds of the money being forgotten:
  # _funded_entry takes the LARGEST SINGLE output on purpose, so a withdrawal
- # moves one pile and the operator has to be told there may be more.
- ("the withdrawal message stops saying it moved only ONE address",
+ # moves one pile. The operator used to be told that in the abstract and left
+ # to drive the rest by hand; now the vault answers it (phase "more_left") and
+ # the pager chains. Blind the pager to that phase and it says "that was the
+ # last one here" over a wallet with money still in it -- which reads as the
+ # tool having paid out a third of what went in.
+ ("the withdrawal message stops telling the operator more is left",
   "gs_telegram_pager",
-  '                        "It emptied ONE of the addresses money had ARRIVED "',
-  '                        "It emptied EVERY address money had ARRIVED "',
+  '                _more = (res.get("phase") or "") == "more_left"',
+  "                _more = False",
   ["test_plain_slip"]),
 
  # "working. This takes a while." for a job that holds every command for the
@@ -2929,15 +2973,18 @@ MUTATIONS = [
   "                if True:",
   ["test_telegram_pager"]),
 
- # "²".isdigit() is True and int("²") RAISES. The wizard documents this fix;
- # parse_command never got it, so a typo escaped as a ValueError and the
- # operator got no reply at all.
- ("parse_command goes back to isdigit, which int() does not accept",
+ # THE SAME PREDICATE ON BOTH SIDES OF ONE VALUE. parse_command's `count`
+ # argument went with /address, but the trap did not: str.isdecimal() is True
+ # for all 455 Unicode decimal digits and _depth_from -- the step this gate
+ # hands its text to -- takes "0123456789" only. Loosen the gate and "d:１"
+ # comes back verbatim as the text, reads as None one layer down, and the tap
+ # silently does nothing.
+ ("the depth button gate goes back to isdecimal, which the step it feeds "
+  "does not accept",
   "gs_telegram_pager",
-  "            if not arg.isdecimal():\n"
-  '                return "", {}, "count must be a number 1-4"',
-  "            if not arg.isdigit():\n"
-  '                return "", {}, "count must be a number 1-4"',
+  '        if _n and all(c in "0123456789" for c in _n) \\\n'
+  "                and int(_n) in proto.WITHDRAW_HOPS:",
+  "        if _n.isdecimal() and int(_n) in proto.WITHDRAW_HOPS:",
   ["test_telegram_pager"]),
 
  # receive_watch exits non-zero on timeout, so a watch that ran out of time was
@@ -3000,6 +3047,63 @@ MUTATIONS = [
   '    "stuck": "the vault\'s wallet is not scanning, so this says NOTHING "\n'
   '             "about your money. Check the vault.",',
   ["test_depo_wizard"]),
+
+ # "READY" ABOUT THE ONE GATE THAT NEVER CLEARS. start_job refuses on three
+ # things; this answer read two. A bot allowlisted for two people against one
+ # wallet refuses EVERY job unconditionally, and said "ready" to the command
+ # that exists to answer "can I start one right now".
+ ("the status answer stops reading the gate a person has to fix",
+  "gs_telegram_pager",
+  "            if self.spenders > 1:\n"
+  '                self.send(cid, "not ready: more than one person is "',
+  "            if False:\n"
+  '                self.send(cid, "not ready: more than one person is "',
+  ["test_telegram_pager"]),
+
+ # A PHASE OUTRANKS THE OUTCOME ONLY FOR THE JOBS THAT WATCH. For a probe,
+ # "your money has not arrived" is the answer and the non-zero exit is the
+ # noise. On a withdrawal it inverts: every phase word presupposes a run that
+ # finished, so a FAILED withdrawal carrying one said "that one is done and
+ # there is more here. Run /withdraw again" about a run that moved nothing --
+ # a false success on the one job that spends, plus an instruction to repeat
+ # a failure that would repeat identically.
+ ("a failed spend carrying a phase is reported as a finished one",
+  "gs_telegram_pager",
+  '        if _early and out != "done" and job in ("watch", "swap_status"):',
+  '        if _early and out != "done":',
+  ["test_plain_slip"]),
+
+ # THE STATUS ANSWER CARRIES THE NEXT STEP. It is the reply an operator sees
+ # more often than any other -- waiting is what this tool mostly does -- and
+ # it was the one reply in the bot with an empty keyboard. "landed and
+ # spendable" then left somebody who had just been told their money was there
+ # with no way to be paid short of knowing the word /withdraw and typing it.
+ ("the status answer goes back to offering nothing to do next",
+  "gs_telegram_pager",
+  '                          buttons=self._phase_buttons(phase, h, job))',
+  "                          buttons=None)",
+  ["test_plain_slip"]),
+
+ # ...AND 'landed' OFFERS THE ONE THING WORTH DOING. Falling through to the
+ # full menu is not a small regression here: the menu leads with "Bitcoin in",
+ # so the reply that says the money arrived would point at putting more in.
+ ("a landed answer stops leading with the way to be paid", "gs_telegram_pager",
+  '                return [[_menu_button("m:send")]]',
+  "                return MENU_BUTTONS",
+  ["test_plain_slip"]),
+
+ # A LABEL IS SPELT ONCE. _menu_button reads the menu so a second copy of a
+ # button's words cannot drift from what it does -- this bot already shipped
+ # one reading "What this does" that opened a settings table.
+ ("a button label is written a second time instead of read off the menu",
+  "gs_telegram_pager",
+  "    for _row in MENU_BUTTONS:\n"
+  "        for _b in _row:\n"
+  "            if _b[1] == data:\n"
+  "                return _b\n"
+  "    raise KeyError(data)",
+  '    return ("Withdraw", data)',
+  ["test_plain_slip"]),
 
  # "Done." is about the SWAP, and shortening it to "Done" changed which noun.
  # The mix has not run; the money is sitting un-mixed; the operator is reading
@@ -3390,9 +3494,21 @@ MUTATIONS = [
   '    _spread = (f"across {_n} addresses" if True else',
   ["test_depo_wizard"]),
 
+ #
+ # THE WHOLE OFFER, not the first line of it. Cutting only the "or several"
+ # clause left the ceiling and the reason standing two lines below, so the
+ # suite still read the word and the mutation SURVIVED -- an anchor that
+ # names a fragment of a message tests the fragment, not the guarantee.
  ("the question stops offering more than one destination", "gs_telegram_pager",
-  '        return (f"Send where? Reply with the address — or several.\\n\\n"',
-  '        return (f"Send where? Reply with the address.\\n\\n"',
+  '        return (f"Send where? Reply with the address — or several, "\n'
+  '                f"separated by spaces (up to '
+  '{proto.MAX_WAKE_EXIT_DESTS}).\\n"\n'
+  '                f"Several is better: this sends at least {_lo} separate "\n'
+  '                f"transactions, and one address collects them all where "\n'
+  '                f"anyone can group them.\\n"\n'
+  '                f"/cancel to stop.")',
+  '        return (f"Send where? Reply with the address.\\n"\n'
+  '                f"/cancel to stop.")',
   ["test_depo_wizard"]),
 
  # The mirrored decoy floor is what makes the arrival count true.

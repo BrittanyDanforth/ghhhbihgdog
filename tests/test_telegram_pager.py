@@ -98,8 +98,6 @@ BTC = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
 print("== nothing typed into a chat can name a destination ==")
 # EVERY accepted command, and what it is allowed to produce.
 for _text, _job, _params in (
-        ("/recv", "receive_new", {"count": 1}),
-        ("/recv 4", "receive_new", {"count": 4}),
         ("/watch a3f1", "watch", {"handle": "A3F1"}),
         ("/check A3F1", "swap_status", {"handle": "A3F1"})):
     _j, _p, _e = pg.parse_command(_text)
@@ -153,7 +151,7 @@ check("every parameter is an int or a 4-char handle, never a longer string",
 # /depo is not in this list any more: it produces NO job directly, only the
 # wizard, which is the point. The wizard's own output is checked below.
 check("the jobs it can ask for are exactly the ones the protocol allows",
-      {pg.parse_command(t)[0] for t in ("/recv", "/watch A3F1",
+      {pg.parse_command(t)[0] for t in ("/watch A3F1",
                                         "/check A3F1")} <= set(P.JOBS))
 check("...and /depo produces no job of its own at all, in either form",
       pg.parse_command("/depo")[0] == ""
@@ -175,6 +173,8 @@ def _wizard_params(answers):
     p.allow_users = set()
     p.handle_owner = {}
     p.handle_job = {}
+    p._chain = None
+    p._chain_leg = 0
     p._status_at = None
     p.spenders = 1
     p.busy = _th.Lock()
@@ -237,13 +237,13 @@ for _j, _pa in _wiz:
                     "challenge": P.new_challenge().hex(), "job": _j, **_pa})
 check("...and every one passes the REAL job schema", True)
 # ...and the protocol itself agrees, rather than this file asserting it alone.
-for _t in ("/recv 2", "/watch A3F1", "/check A3F1"):
+for _t in ("/watch A3F1", "/check A3F1"):
     _j, _p, _e = pg.parse_command(_t)
     check(f"gs_wake_proto accepts what {_t!r} composes",
           _j in P.JOBS and set(_p) <= set(P.JOBS[_j]["schema"]))
 check("no job this pager can ask for drives a forbidden tool",
       all(t not in P.FORBIDDEN_TOOLS
-          for j in ("receive_new", "receive_and_quote", "watch")
+          for j in ("receive_and_quote", "watch")
           for t in P.JOBS[j]["tools"]))
 
 
@@ -265,12 +265,12 @@ def _msg(cid, text, uid=1):
     return {"update_id": uid, "message": {"chat": {"id": cid}, "text": text}}
 
 
-_p.handle(_msg(999, "/recv"))
+_p.handle(_msg(999, "/check A3F1"))
 check("a chat that is not allowlisted gets NO reply -- a reply would confirm "
       "the bot is alive to whoever found it", _sent == [])
 check("...and it is counted rather than silently dropped", _p.ignored == 1)
 check("...and it never reaches the wake channel", _poked == [])
-_p.handle(_msg(111, "/recv"))
+_p.handle(_msg(111, "/check A3F1"))
 check("an allowlisted chat does reach it", len(_poked) == 1)
 
 
@@ -325,13 +325,13 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
         # each identical refusal.
         check("refused: it no longer tells the operator to just try again",
               "then again" not in _text)
-        check("refused: ...it says a repeat may be the same refusal forever, "
-              "which is true of both kinds and needs no reason from the wire",
-              "refuse the same way every time" in _text)
-        check("refused: ...and gives the rule that is right either way",
+        check("refused: ...it gives the rule that is right for both kinds, "
+              "and needs no reason from the wire",
               "a second try is refused" in _text and "stop" in _text)
+        check("refused: ...and says some refusals need somebody at the machine",
+              "somebody at the machine" in _text)
         check("refused: ...and says retrying is not free",
-              "spends part of the daily allowance" in _text)
+              "daily allowance" in _text)
         check("refused: ...while still naming no machine and no reason",
               "vault" not in _text.lower() and "ceiling" not in _text.lower()
               and "budget" not in _text.lower())
@@ -673,7 +673,7 @@ check("...and it names no machine to go and read it on",
       "vault" not in _chat.lower())
 check("NON-VACUITY -- the reply is a real one, so the absences above are "
       "absences from a message that was actually sent",
-      "ready" in _chat and "A3F1" in _chat)
+      "quoted" in _chat and "A3F1" in _chat)
 
 
 # ===========================================================================
@@ -756,6 +756,8 @@ def _wedge_pager(fail_on):
     p.args = types.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 0, {}
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
+    p._chain = None
+    p._chain_leg = 0
     p._status_at = None
     p.spenders = 1
     p.busy = _th2.Lock()
@@ -784,7 +786,7 @@ _saved_il = pg.integrity_log
 _wp_raised = ""
 try:
     pg.integrity_log = lambda *a, **k: None
-    _wp.start_job(111, "receive_new", {"count": 1})
+    _wp.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
 except BaseException as _e:                                  # noqa: BLE001
     _wp_raised = f"{type(_e).__name__}: {_e}"
 finally:
@@ -805,7 +807,7 @@ try:
     pg.integrity_log = lambda *a, **k: None
     pg.threading.Thread = lambda **k: types.SimpleNamespace(
         start=lambda: _started.append(1))
-    _wp2.start_job(111, "receive_new", {"count": 1})
+    _wp2.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
 finally:
     pg.threading.Thread = _saved_thread
     pg.integrity_log = _saved_il
@@ -968,7 +970,12 @@ check(f"menu: every published command resolves in parse_command "
 # operator was /send, which does not say a direction at all. The menu now
 # offers /address and /withdraw; /receive, /recv and /send are accepted
 # forever, for the reason this file gives about /depo.
-_ALIASES = {"depo", "dep", "recv", "receive", "addr", "send", "stop", "watch"}
+# "recv", "receive", "addr" and "address" are ANSWERED, not handled: the
+# command is gone and parse_command returns a sentence saying so, rather than
+# "unknown command", because an operator with the word in their fingers should
+# be told it moved and not that the bot is broken.
+_ALIASES = {"depo", "dep", "recv", "receive", "addr", "address", "send",
+            "stop", "watch"}
 _pub = {c for c, _ in pg.BOT_COMMANDS}
 _handled = set(re.findall(r'cmd (?:==|in) \(?"/([a-z]+)"', _SRC_PG_EARLY))
 _handled |= set(re.findall(r'"/([a-z]+)"[,)]',
@@ -1050,7 +1057,7 @@ check(f"working: the withdrawal figure is derived from result_budget_s "
       f"({_want_h}h)", f"up to {_want_h}h" in _durations["withdraw"])
 # THE SHORT JOBS ARE WHERE IT SHOWED, so they are what pins it: no rounding to
 # absorb the missing ten minutes.
-for _sj in ("swap_status", "receive_new"):
+for _sj in ("swap_status", "receive_and_quote"):
     _want_s = (P.result_budget_s(_sj) + DB.FETCH_WINDOW_S + DB.PRE_WOL_MAX_S)
     _txt = (f"up to {_want_s // 3600 + 1}h" if _want_s >= 3600
             else f"up to {max(1, _want_s // 60)} min")
@@ -1081,11 +1088,10 @@ for _sup in ("/recv ²", "/recv ³", "/recv ½", "/recv ٩٩٩"):
           not _raised and _j == "" and _e)
 # NON-VACUITY: ordinary digits still work, and so does the Arabic-Indic form
 # the wizard's own test says legitimately reads as a slot.
-check("digits: NON-VACUITY -- plain digits still parse",
-      pg.parse_command("/recv 4")[1] == {"count": 4})
-check("digits: NON-VACUITY -- Arabic-Indic digits still parse, as the wizard "
-      "already decided they legitimately do",
-      pg.parse_command("/recv ٢")[1] == {"count": 2})
+# NON-VACUITY moved to the commands that still take an argument: /recv is
+# gone, so the digit path it used to exercise is /check and /wait's handle.
+check("digits: NON-VACUITY -- a real handle still parses",
+      pg.parse_command("/check A3F1")[1] == {"handle": "A3F1"})
 # CODE, NOT PROSE. A substring ban punishes the comments that explain the
 # fix -- the same trap the addr_index guard fell into. Every remaining mention
 # of isdigit in this file is a note saying why isdecimal is used instead.
@@ -1111,14 +1117,16 @@ import types as _ty3
 import threading as _th3
 
 
-def _plain_pager(busy=False, why=""):
+def _plain_pager(busy=False, why="", spenders=1):
     p = pg.Pager.__new__(pg.Pager)
     p.proxies, p.token, p.key = {"http": "x"}, "T", {}
     p.args = _ty3.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 4, {}
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
+    p._chain = None
+    p._chain_leg = 0
     p._status_at = None
-    p.spenders = 1
+    p.spenders = spenders
     p.busy = _th3.Lock()
     if busy:
         p.busy.acquire()
@@ -1158,6 +1166,38 @@ _sp3, _ss3 = _plain_pager(why="wait 42s")
 _sp3.handle({"update_id": 1, "message": {"chat": {"id": 111},
                                          "message_id": 1, "text": "/status"}})
 check("status: a rate limit is reported over 'ready'", _ss3 == ["wait 42s"])
+# ...AND SO DOES THE GATE THAT NEVER CLEARS ON ITS OWN.
+#
+# start_job refuses on THREE things and this answer read two of them. The
+# third -- more than one person allowlisted against one wallet -- refuses
+# EVERY job unconditionally and cannot time out, so a bot configured that way
+# answered "ready" to "can I start one right now" and then refused every
+# single command that followed. Confidently wrong about the one gate nobody
+# can wait out.
+_sp4, _ss4 = _plain_pager(spenders=2)
+_sp4.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                         "message_id": 1, "text": "/status"}})
+check("status: a bot allowlisted for two people does not answer 'ready' to "
+      "'can I start one'",
+      len(_ss4) == 1 and _ss4[0] != "ready"
+      and _ss4[0].startswith("not ready"))
+check("status: ...and says which of the three gates it is, since this is the "
+      "one that needs a person to fix it",
+      "one wallet" in _ss4[0] and "allowlisted" in _ss4[0])
+# THE SAME PAGER REALLY DOES REFUSE THE WORK, so this is not a warning about
+# a condition that would have been fine.
+_sp4.send = lambda c, t, buttons=None: (_ss4.append(t), True)[1]
+_sp4.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
+check("status: NON-VACUITY -- and start_job on that same pager refuses too, "
+      "so the answer matched what would actually have happened",
+      "one wallet" in _ss4[-1] and len(_ss4) == 2)
+# NON-VACUITY: one spender and everything else equal still answers ready, so
+# this reads the count and not something else.
+_sp5, _ss5 = _plain_pager(spenders=1)
+_sp5.handle({"update_id": 1, "message": {"chat": {"id": 111},
+                                         "message_id": 1, "text": "/status"}})
+check("status: NON-VACUITY -- one spender still answers 'ready'",
+      _ss5 == ["ready"])
 
 # 2. THE WHOLE MANUAL ON EVERY TYPO. f"no: {err}\n\n{HELP}" put the full
 #    command list -- including the memo line -- back into the chat on each
@@ -1234,14 +1274,17 @@ check("help: NON-VACUITY -- they really do refuse without one, in a word the "
 # offer the ones a stranger could guess.
 check("help: NON-VACUITY -- every advertised command is listed",
       all(c in pg.HELP for c in ("/deposit", "/check", "/wait", "/withdraw",
-                                 "/address", "/settings", "/cancel",
-                                 "/status")))
+                                 "/settings", "/cancel", "/status")))
 # AND THE DIRECTION IS ON THE LINE, not left to the verb. This is the whole
 # of the rename: an operator waiting to be paid must not be able to read the
 # list and pick the wrong one.
-check("help: the two money-in commands say MONEY IN and the money-out one "
-      "says MONEY OUT",
-      pg.HELP.count("MONEY IN") == 2 and pg.HELP.count("MONEY OUT") == 1)
+# ONE WAY IN AND ONE WAY OUT, since /address went. The direction still has to
+# be on the line rather than left to the verb: that is the whole of the rename,
+# and an operator waiting to be paid must not read the list and pick the wrong
+# one.
+check("help: the money-in command says MONEY IN and the money-out one says "
+      "MONEY OUT",
+      pg.HELP.count("MONEY IN") == 1 and pg.HELP.count("MONEY OUT") == 1)
 for _c, _d in pg.BOT_COMMANDS:
     if _c in ("deposit", "address"):
         check(f"help: /{_c} is marked MONEY IN", _d.startswith("MONEY IN"))
@@ -1254,10 +1297,16 @@ check("help: the help is BUILT from the command list, not kept beside it",
 # ...and the old spellings still answer, so an operator's muscle memory is not
 # met with "unknown command" by a bot that looks broken.
 for _old, _want in (("/depo", "depo_wizard"), ("/withdraw", "withdraw_wizard"),
-                    ("/recv", "receive_new"), ("/watch A3F1", "watch")):
+                    ("/watch A3F1", "watch")):
     _j, _p2, _e = pg.parse_command(_old)
     check(f"help: the old spelling {_old!r} still works",
           _j == _want or _e == _want)
+# /recv and /address are ANSWERED rather than routed: the job is gone, and a
+# sentence saying so beats "unknown command", which reads as a broken bot.
+for _gone in ("/recv", "/receive", "/address", "/addr"):
+    check(f"help: {_gone!r} is answered with a reason rather than routed",
+          pg.parse_command(_gone)[0] == ""
+          and "gone" in pg.parse_command(_gone)[2].lower())
 
 
 # ===========================================================================
@@ -1608,6 +1657,8 @@ class _BurnPager:
         p.args = _ty2.SimpleNamespace()
         p.allow = {111}
         p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
+        p._chain = None
+        p._chain_leg = 0
         p._status_at = None
         p.spenders = 1
         p.busy = __import__("threading").Lock()
@@ -1799,6 +1850,8 @@ def _room_pager(allow, users):
     p.args = _ty4.SimpleNamespace()
     p.allow, p.ignored, p.convos = set(allow), 0, {}
     p.allow_users, p.handle_owner, p.handle_job = set(users), {}, {}
+    p._chain = None
+    p._chain_leg = 0
     p._status_at = None
     p.spenders = len(p.allow_users) or len(p.allow)
     p.burn_after = 0
@@ -2023,7 +2076,7 @@ def _tapper(allow=(111,), users=()):
 for _data, _text in (("m:status", "/status"), ("m:help", "/help"),
                      ("m:fee", "/fee"), ("m:speed", "/speed"),
                      ("m:exit", "/exit"), ("m:settings", "/settings"),
-                     ("m:recv", "/receive"), ("m:depo", "/deposit"),
+                     ("m:depo", "/deposit"),
                      ("m:send", "/send"), ("m:cancel", "/cancel")):
     _a, _sa, _, _ja = _tapper()
     _tap(_a, _data)
@@ -2056,10 +2109,9 @@ check("tap: /help carries the menu",
 # THE LABELS SAY WHICH WAY THE MONEY GOES. "Fresh address" sat next to
 # "Withdraw" and gave no clue which of them pays the operator -- the same
 # confusion as the command name it was drawn from.
-check("tap: the money-in buttons and the money-out button are marked with "
+check("tap: the money-in button and the money-out button are marked with "
       "different arrows, so the direction is readable without the words",
       any("\u2b07" in l and "Bitcoin in" in l for l in _labels)
-      and any("\u2b07" in l and "Monero in" in l for l in _labels)
       and any("\u2b06" in l and "Withdraw" in l for l in _labels))
 # AND THE DIRECTION IS IN THE WORDS TOO, not only in the arrow. An arrow is a
 # glyph a client may render as a box, and a label that then reads "Monero
@@ -2069,7 +2121,7 @@ check("tap: the money-in buttons and the money-out button are marked with "
 _lbl = [l for _row in pg.MENU_BUTTONS for l, _d in _row]
 check("tap: ...and each money button says its direction in words, so it "
       "survives a client that does not render the arrow",
-      sum(l.endswith(" in") for l in _lbl) == 2
+      sum(l.endswith(" in") for l in _lbl) == 1
       and any(l.startswith("\u2b06") and "pays you" in l for l in _lbl))
 # "WITHDRAW" ALONE HAS NO OBJECT for somebody who has deposited nothing yet,
 # which is precisely who is looking at this menu under the welcome.
@@ -2083,6 +2135,60 @@ check("tap: ...and no button promises an overview it does not open",
 check("tap: ...and every button on it maps to a real command",
       all(pg.parse_callback(_d)[1] == ""
           for _row in (_ms[0][1] or []) for _l, _d in _row))
+
+# ---- THE DEPTH GATE AND THE DEPTH STEP AGREE ON WHAT A DIGIT IS ----------
+#
+# parse_callback returned "the text the typed path would have received" -- and
+# for a depth that is a bare digit, which _depth_from then re-reads. The two
+# used DIFFERENT predicates: parse_callback took str.isdecimal(), True for all
+# 455 Unicode decimal digits, and _depth_from takes "0123456789" only. So
+# "d:１" -- FULLWIDTH DIGIT ONE, which a CJK keyboard emits unasked, and which
+# a modified client can put in callback data directly -- passed the gate, came
+# back verbatim as the text, and was read as None one layer down: the tap did
+# nothing, the question repeated, and nothing told the operator why the button
+# they had just been handed was not accepted.
+for _d, _want in (("d:3", "3"), ("d:20", "20")):
+    check(f"depth tap: {_d!r} still selects a depth",
+          pg.parse_callback(_d) == (_want, ""))
+# ...AND THE BUTTON CARRIES HOPS, NOT THE WIRE'S KEY. parse_callback returns
+# "the text the typed path would have received" and the typed path reads hops
+# now, so a button carrying the key taps to a number the step then refuses.
+for _bad in ("d:１", "d:٣", "d:²", "d:½", "d:٣٣", "d:", "d:99", "d:-1",
+             "d:3.0", "d: 3", "d:0x3", "d:1", "d:2"):
+    _t, _e = pg.parse_callback(_bad)
+    check(f"depth tap: {_bad!r} is refused at the gate, not passed on as text",
+          _t == "" and _e != "")
+# ...AND THE PREDICATE IS THE ONE THE STEP USES, not a paraphrase of it: every
+# string this gate accepts must survive _depth_from, or the tap is a no-op.
+_dpz = pg.Pager.__new__(pg.Pager)
+check("depth tap: NON-VACUITY -- everything the gate accepts, the step reads",
+      all(_dpz._depth_from(pg.parse_callback(f"d:{_h}")[0]) == _d
+          for _h, _d in P.WITHDRAW_HOPS.items()))
+# ---- "3" MEANS THREE HOPS, WHICH IS WHAT IT LOOKS LIKE IT MEANS ----------
+#
+# The question listed the wire's KEY beside the hop count -- "1  3 hops",
+# "3  20 hops" -- so one character carried both vocabularies at once and 3 was
+# in both. Somebody who read the first line and typed 3 got the THIRD option:
+# twenty hops, more than twice the runtime, the highest minimum balance of the
+# three, and a run that dies at stage 0 if their balance sits between the two
+# minimums -- after they have confirmed something else. Nothing on screen was
+# wrong and nothing on the wire was wrong.
+check("depth: typing 3 selects THREE hops, not the third row",
+      _dpz._depth_from("3") == P.WITHDRAW_HOPS[3]
+      and P.WITHDRAW_DEPTHS[_dpz._depth_from("3")][0] == 3)
+check("depth: ...and every hop count the menu prints is accepted",
+      all(P.WITHDRAW_DEPTHS[_dpz._depth_from(str(_h))][0] == _h
+          for _h in P.WITHDRAW_HOPS))
+# THE OLD KEYS ARE REFUSED, NOT REINTERPRETED. An operator who had memorised
+# "2" for ten hops gets a refusal and asks again; the alternative is being
+# handed a different depth without being told, which is the defect itself.
+check("depth: ...and a bare wire key is refused rather than silently meaning "
+      "something else",
+      _dpz._depth_from("1") is None and _dpz._depth_from("2") is None)
+check("depth: NON-VACUITY -- the question prints hop counts and no key column",
+      all(f"  {_h} hops" in _dpz._depth_question()
+          for _h in P.WITHDRAW_HOPS)
+      and "  1  " not in _dpz._depth_question())
 
 # ---- A DEPTH BUTTON IS ONLY A DEPTH WHILE SOMETHING IS ASKING FOR ONE ----
 #
@@ -2167,6 +2273,120 @@ check("shutdown: ...and send() needs neither the busy lock nor the worker "
 # so a repeat inside the window would return the same word anyway. Silent,
 # because a "slow down" line is itself a message, which is the thing being
 # rationed.
+# ---- ONE /withdraw DRAINS EVERYTHING, AS N SEPARATE MIXES ---------------
+#
+# _funded_entry takes the LARGEST SINGLE unlocked output and never sums:
+# spending inputs from two subaddresses in one transaction is permanent public
+# proof they share an owner. So a run empties ONE arrival, and that is not
+# negotiable.
+#
+# What WAS wrong is that the operator was left to notice and drive the rest by
+# hand, with no idea how many remained -- so being paid a third of what they
+# put in read as the tool shortchanging them. The vault answers that question
+# now (phase "more_left", set only on a run that actually finished) and the
+# pager keeps going.
+print("\n== a withdrawal that drains everything ==")
+
+
+def _chain_run(arrivals):
+    """A vault holding `arrivals` separate arrivals. Returns (legs, messages)."""
+    _cp, _cs, _, _ = _tapper()
+    _cp.start_job = pg.Pager.start_job.__get__(_cp, pg.Pager)
+    _left = [arrivals]
+    _legs = [0]
+
+    class _Leg:
+        def __init__(self):
+            _legs[0] += 1
+            _left[0] -= 1
+            self.result = {"status": "done", "handle": "", "slip": "",
+                           "plain": {},
+                           "phase": "more_left" if _left[0] > 0 else ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(
+            run_wake=lambda *a, **k: _Leg())
+        _cp.start_job(111, "withdraw",
+                      {"exit_to": ["4" + "8" * 94], "depth": 2})
+        for _ in range(600):
+            if not _cp.busy.locked() and _cp._chain is None:
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _legs[0], [t for t, _b in _cs]
+
+
+_n1, _m1 = _chain_run(1)
+check("chain: one arrival runs one mix", _n1 == 1)
+check("chain: ...and says there is nothing left, so the operator is not left "
+      "wondering whether they were paid in full",
+      any("last one here" in t and "nothing left" in t for t in _m1))
+check("chain: ...and does not announce a next leg that is not coming",
+      not any("starting the next" in t for t in _m1))
+
+_n3, _m3 = _chain_run(3)
+check("chain: three arrivals run three mixes off ONE /withdraw", _n3 == 3)
+check("chain: ...each announced before it starts, so the operator is never "
+      "left watching silence",
+      sum("starting the next" in t for t in _m3) == 2)
+check("chain: ...numbered, so a long chain is followable",
+      any("(2 of at most" in t for t in _m3)
+      and any("(3 of at most" in t for t in _m3))
+check("chain: ...and the reason they go separately is given once they matter",
+      any("all yours" in t for t in _m3))
+check("chain: ...and the last leg still says nothing is left",
+      any("last one here" in t for t in _m3))
+
+# THE CAP. The daily wake budget bounds this anyway; the cap is what stops a
+# wallet reporting "more left" forever -- a stuck scan, or dust that can never
+# clear the mix minimum -- turning one command into an unbounded run of spends.
+_n9, _m9 = _chain_run(9)
+check(f"chain: a wallet with nine arrivals stops at the cap "
+      f"({_n9} of {pg.Pager.MAX_CHAIN_LEGS})",
+      _n9 == pg.Pager.MAX_CHAIN_LEGS)
+check("chain: ...and says so, rather than stopping silently mid-drain",
+      any("Stopping after" in t and "still more here" in t for t in _m9))
+check("chain: ...and hands it back to the operator rather than to a retry loop",
+      any("send /withdraw again" in t for t in _m9))
+
+# THROUGH start_job, WHICH IS WHERE EVERY BOUND LIVES. A chain that called
+# _worker directly would be a second path to a wake with no rate limit, no
+# one-spender check and no busy lock.
+_CH_END = 'integrity_log("pager", "chain_start_failed")'
+_ch_src = _SRC_PG_EARLY.split("_next, self._chain = self._chain, None")[1]
+# Window it to the handover block itself. Slicing to end-of-file would drag in
+# every later mention of _worker and fail for reasons that have nothing to do
+# with the chain.
+check("chain: the handover block ends where the test thinks it does",
+      _CH_END in _ch_src)
+_ch_src = _ch_src.split(_CH_END)[0]
+check("chain: the next leg goes through start_job like everything else",
+      "self.start_job(_cid" in _ch_src and "_worker" not in _ch_src)
+# THE LEG COUNT SURVIVES THE HANDOVER. The first version read it out of the
+# slot, which _worker clears before the next poke runs -- so it was 0 on every
+# leg, the message said "2 of at most 6" forever, and the cap never fired.
+# Driven with nine arrivals: nine mixes ran.
+check("chain: the leg number is carried by start_job, not by the slot the "
+      "handover clears",
+      "def start_job(self, cid: int, job: str, params: dict, leg: int = 0)"
+      in _SRC_PG_EARLY
+      and "self._chain_leg = int(leg)" in _SRC_PG_EARLY)
+# AND IT IS ARMED ONLY AFTER THE REPORT LANDS. If the completion could not be
+# delivered, the operator does not know a leg finished -- and starting another
+# one silently is the worst thing this could do.
+_arm = _SRC_PG_EARLY.split('integrity_log("pager", "withdraw_result_undelivered")')[1]
+check("chain: the next leg is armed below the report, not instead of it",
+      _arm.index("self._chain = (chat_id") > 0)
+
+
 print("\n== /status cannot be leaned on ==")
 _stp, _sts, _, _ = _tapper()
 _stclock = [500.0]
@@ -2213,7 +2433,7 @@ _dp.handle(_msg(111, 111, "/deposit"))
 _ds.clear()
 _dt.clear()
 _dj.clear()
-_tap(_dp, "d:3")
+_tap(_dp, "d:20")
 check("stale tap: it starts nothing", _dj == [])
 check("stale tap: ...and writes nothing to the transcript", _ds == [])
 check("stale tap: ...and says so on the tapper's own screen instead",
@@ -2229,7 +2449,7 @@ _dp2, _ds2, _dt2, _dj2 = _tapper()
 _dp2.handle(_msg(111, 111, "/withdraw"))
 _dp2.handle(_msg(111, 111, "4" + "1" * 94))
 _ds2.clear()
-_tap(_dp2, "d:3")
+_tap(_dp2, "d:20")
 check("stale tap: NON-VACUITY -- the same tap while a depth IS being asked "
       "for still answers it",
       _dp2.convos.get(111) is not None and _dp2.convos[111].depth == 3)
@@ -2237,7 +2457,7 @@ check("stale tap: NON-VACUITY -- the same tap while a depth IS being asked "
 # the wizard timed out, or was answered hours ago, and the keyboard is still
 # on screen.
 _dp3, _ds3, _dt3, _dj3 = _tapper()
-_tap(_dp3, "d:3")
+_tap(_dp3, "d:20")
 check("stale tap: ...and a depth tapped with nothing running at all is "
       "refused the same way", _dj3 == [] and _ds3 == [] and len(_dt3) == 1)
 
@@ -2361,21 +2581,21 @@ _dp.handle(_msg(111, 111, "4" + "1" * 94))
 _depth_rows = _ds[-1][1] or []
 _depth_data = [_d for _row in _depth_rows for _l, _d in _row]
 check("tap: the depth question is tappable",
-      all(f"d:{_n}" in _depth_data for _n in P.WITHDRAW_DEPTHS))
+      all(f"d:{_h}" in _depth_data for _h in P.WITHDRAW_HOPS))
 check("tap: ...with exactly the depths the protocol offers and no others",
       sorted(_d for _d in _depth_data if _d.startswith("d:"))
-      == sorted(f"d:{_n}" for _n in P.WITHDRAW_DEPTHS))
+      == sorted(f"d:{_h}" for _h in P.WITHDRAW_HOPS))
 check("tap: ...and a way out, since the message says '/cancel to stop'",
       "m:cancel" in _depth_data)
 check("tap: ...and every depth line in the TEXT has a button",
-      all(str(_n) in _ds[-1][0] for _n in P.WITHDRAW_DEPTHS))
+      all(f"{_h} hops" in _ds[-1][0] for _h in P.WITHDRAW_HOPS))
 
 # AND THE CONFIRM DOES NOT GET ONE. CONFIRM_NOTE: this gate "stops a
 # pocket-dial and a message pasted into the wrong chat" -- and a tap IS a
 # pocket-dial. A Yes button would put a spend one accidental touch away and
 # leave that sentence claiming a protection that no longer existed.
 _dp.handle({"update_id": 1, "message": {"chat": {"id": 111}, "message_id": 1,
-                                        "from": {"id": 111}, "text": "2"}})
+                                        "from": {"id": 111}, "text": "10"}})
 check("tap: the CONFIRM question carries NO buttons — a tap is exactly the "
       "pocket-dial that gate exists to stop",
       _ds[-1][1] is None and "SPENDS" in _ds[-1][0])
@@ -2555,7 +2775,7 @@ _fp, _fs = _room_pager([111], [])
 _fp.start_job = lambda *a: None
 _fp.handle(_msg(111, 111, "/withdraw"))
 _fp.handle(_msg(111, 111, "4" + "1" * 94))
-_fp.handle(_msg(111, 111, "2"))
+_fp.handle(_msg(111, 111, "10"))
 check("fee: the withdraw CONFIRM names the usage fee, where the money moves",
       pg.USAGE_FEE_LABEL in _fs[-1] and "usage fee" in _fs[-1])
 check("fee: ...and names the network fee beside it, so the operator is not "
@@ -2802,148 +3022,50 @@ check("pot: NON-VACUITY -- one person gets past that gate and is refused by "
 #  "address ready · slip B7C2". The command whose whole purpose is to hand
 #  over an address handed over none, and called it ready.
 # ===========================================================================
-print("\n== /address says what actually happened ==")
-
-
-class _AddrFin:
-    result = {"status": "done", "handle": "B7C2", "slip": "", "plain": {},
-              "phase": ""}
-
-    def outcome(self):
-        return "done"
-
-
-_ap, _as_, _, _ = _tapper()
-_saved_db = pg._DOORBELL[0]
-pg._DOORBELL[0] = types.SimpleNamespace(
-    run_wake=lambda a, k, j, p, on_event=None: _AddrFin())
-try:
-    _ap.poke(111, "receive_new", {"count": 1})
-    _atext = _as_[0][0]
-    check("address: it does NOT say 'ready', which is deposit vocabulary for "
-          "a thing that has not happened", "ready" not in _atext.lower())
-    check("address: ...it says the address is not sent to this chat",
-          "NOT sent to this chat" in _atext)
-    check("address: ...and where it is instead",
-          "at the machine" in _atext)
-    # THE LABEL IS FOR MATCHING, NOT FOR /check. This asserted the reply sent
-    # the operator to "/check B7C2" -- a command the vault refuses on an
-    # address label every time, because receive_new records slip=None and both
-    # watching jobs refuse a record with no swap quote. The sentence spent a
-    # wake, a boot and a 5-20 minute jitter to be told so, and the two buttons
-    # under it did the same in one tap.
-    check("address: ...and the label is still there, since it is what the "
-          "operator matches against the machine", "B7C2" in _atext)
-    check("address: ...but nothing points them at a command that is refused "
-          "on it every time", "/check B7C2" not in _atext)
-    check("address: ...and it says where the answer actually is",
-          "watch it from the machine" in _atext.lower())
-    # NOR DO THE BUTTONS, which did the same thing in one tap. The reply keeps
-    # a keyboard -- an operator who has just been told to go to the machine
-    # still needs a way to do the next thing -- and it is the menu.
-    _abtn = [_l for _row in (_as_[0][1] or []) for _l, _d in _row]
-    check(f"address: ...and no button offers a watch either ({_abtn})",
-          not any(_d.startswith(("c:", "w:"))
-                  for _row in (_as_[0][1] or []) for _l, _d in _row))
-    check("address: ...while still leaving somewhere to go next",
-          (_as_[0][1] or []) == pg.MENU_BUTTONS)
-    # NON-VACUITY: a DEPOSIT label really does get the two watching buttons, so
-    # this is a branch and not the buttons being removed everywhere.
-    _wb, _wbs, _, _ = _tapper()
-    pg._DOORBELL[0] = types.SimpleNamespace(
-        run_wake=lambda a, k, j, p, on_event=None: _AddrFin())
-    _wb.poke(111, "receive_and_quote", {"amount_sat": 5000000})
-    check("address: NON-VACUITY -- a DEPOSIT label still gets both watching "
-          "buttons, because the vault really can answer for one",
-          any(_d.startswith("c:")
-              for _row in (_wbs[0][1] or []) for _l, _d in _row))
-    check("address: ...and the label is still bound to this chat",
-          _ap.handle_owner.get("B7C2") == 111)
-    # ...AND THE WELCOME MUST AGREE WITH IT, which is the half that was wrong.
-    #
-    # The reply above has been honest since it was written. The WELCOME said
-    # "/address ... You get a fresh address to hand out" -- a promise that the
-    # chat hands over an address, on the surface a first-time reader meets
-    # before they ever run the command. Two surfaces describing one command in
-    # opposite terms is worse than either alone: the operator reads the
-    # welcome, runs /address, gets a label, and concludes the tool broke.
-    #
-    # AND IT IS TRUE ON EVERY CONFIGURATION, not just this fixture's. Both
-    # slip builders return "" for receive_new by construction -- there is no
-    # quote, so there is no thor_pairs file to build one from -- so no
-    # delivery key and no plain_slip setting can make the chat carry it.
-    _wel_addr = [l for l in pg.WELCOME.splitlines() if "/address" in l]
-    check("address: the welcome describes this command at all",
-          len(_wel_addr) == 1)
-    check("address: ...and does not promise the chat will hand over an "
-          "address, which no configuration can make true",
-          "you get a fresh address" not in _wel_addr[0].lower())
-    check("address: ...and says where the address really is read",
-          "at the machine" in pg.WELCOME)
-    # THE STRUCTURAL REASON, read from the source rather than from this
-    # fixture's empty slip: seal_slip_for_delivery returns "" when the handle
-    # record carries no slip path, and receive_new never writes one.
-    _ag = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
-    check("address: ...and the reason is structural — the sealer returns "
-          "nothing when there is no quote to seal",
-          "receive_new mints addresses and quotes nothing" in _ag)
-    # NON-VACUITY: a DEPOSIT with no slip still uses the original vocabulary,
-    # so this is a branch and not a rewrite of every finished job.
-    _dp2, _ds2, _, _ = _tapper()
-    _dp2.poke(111, "receive_and_quote", {"amount_sat": 5000000})
-    # ...AND A TYPED /check ON ONE IS REFUSED HERE, NOT BY A BOOT.
-    #
-    # The buttons are gone, but the operator can still type it -- and the
-    # answer is structural: receive_new records slip=None and both watching
-    # jobs refuse a record with no swap quote. Sending the wake anyway costs a
-    # magic packet, a boot, a 5-20 minute jitter and one of twelve daily
-    # slots, and comes back as a refusal with no reason on it, which reads as
-    # "try again". parse_callback's own comment states the rule: "a button
-    # offering a depth the vault refuses would spend a wake on a rejection."
-    _up2, _us2, _, _uj2 = _tapper()
-    _up2.handle_job["B7C2"] = "receive_new"
-    _up2.handle_owner["B7C2"] = 111
-    _up2.handle(_msg(111, 111, "/check B7C2"))
-    check("address: a typed /check on an address label wakes nothing",
-          _uj2 == [])
-    check("address: ...and says why, in words that do not send them back to "
-          "try it again",
-          _us2 and "address label" in _us2[0][0]
-          and "at the machine" in _us2[0][0])
-    # NON-VACUITY: a DEPOSIT label still reaches the vault, so this refusal is
-    # about the label's kind and not about /check.
-    _up3, _us3, _, _uj3 = _tapper()
-    _up3.handle_job["B7C2"] = "receive_and_quote"
-    _up3.handle_owner["B7C2"] = 111
-    _up3.handle(_msg(111, 111, "/check B7C2"))
-    check("address: NON-VACUITY -- a deposit label still goes to the vault",
-          _uj3 and _uj3[0][1] == "swap_status")
-    # ...AND AN UNKNOWN LABEL STILL GOES THROUGH. The map is process memory, so
-    # a restart empties it; refusing there would lock an operator out of their
-    # own swap on the one box whose whole job is to be reachable. Same honest
-    # bound handle_owner already documents.
-    _up4, _us4, _, _uj4 = _tapper()
-    _up4.handle(_msg(111, 111, "/check B7C2"))
-    check("address: ...and a label this process never saw is still allowed, "
-          "because the map does not survive a restart",
-          _uj4 and _uj4[0][1] == "swap_status")
-
-    check("address: NON-VACUITY -- a deposit with no delivery key still says "
-          "'depo ready · slip B7C2'",
-          _ds2[0][0] == "depo ready · slip B7C2")
-finally:
-    pg._DOORBELL[0] = _saved_db
-
-
-# ===========================================================================
-#  /start IS THE ONE MESSAGE EVERY USER SENDS, AND IT WAS A LIST OF COMMANDS
+print("\n== /address is gone, and says so ==")
 #
-#  It is what the blue Start button sends and the first thing anybody ever
-#  sends a bot -- answered, until now, with eleven slash-commands and no
-#  sentence saying what the thing IS. And the names themselves were the
-#  problem the welcome now fixes in its first six lines: /receive read as
-#  "receive my money" and meant "mint me an address".
-# ===========================================================================
+# It minted a Monero subaddress to be paid into directly -- an entry point for
+# somebody who already holds XMR. Nothing in this repository swaps XMR to BTC;
+# every path is BTC to XMR. So it was half a feature: it could take money in
+# and had no way to say where.
+#
+# Both slip builders returned empty on it BY CONSTRUCTION -- no quote, so no
+# thor_pairs file to build one from -- which meant the command whose entire
+# purpose was to hand the operator an address delivered no address, on every
+# configuration. Both watching jobs refused its handle for the same reason, so
+# /check and /wait on one spent a magic packet, a boot and a 5-20 minute
+# jitter to be told no.
+check("address: the job is off the wire", "receive_new" not in P.JOBS)
+check("address: ...and the pager cannot compose it either",
+      "receive_new" not in pg.CHAT_NAME)
+# ANSWERED, NOT IGNORED. An operator with the word in their fingers gets a
+# sentence; "unknown command" reads as a broken bot.
+for _old in ("/address", "/addr", "/receive", "/recv"):
+    _j, _p, _e = pg.parse_command(_old)
+    check(f"address: {_old} is answered with a reason, not a job",
+          _j == "" and _p == {} and "gone" in _e.lower())
+    check(f"address: ...and points at the way in that exists",
+          "/deposit" in _e)
+check("address: ...and says WHY, since 'gone' alone invites asking for it back",
+      "swaps Monero to Bitcoin" in pg.parse_command("/address")[2])
+# NOTHING OFFERS IT ANY MORE.
+check("address: it is off the published command list",
+      "address" not in dict(pg.BOT_COMMANDS))
+check("address: ...off the keyboard",
+      not any("Monero in" in _l for _row in pg.MENU_BUTTONS for _l, _d in _row))
+check("address: ...and out of the welcome",
+      "/address" not in pg.WELCOME)
+check("address: ...and no callback maps to it",
+      not any(_v in ("/address", "/receive", "/recv")
+              for _v in pg.CALLBACK_TEXT.values()))
+# NON-VACUITY: the way in that remains is still there and still advertised.
+check("address: NON-VACUITY -- /deposit is still the way in, on the list and "
+      "on the keyboard",
+      "deposit" in dict(pg.BOT_COMMANDS)
+      and any("Bitcoin in" in _l
+              for _row in pg.MENU_BUTTONS for _l, _d in _row))
+
+
 print("\n== the welcome ==")
 check("welcome: /start is its own answer, not an alias of /help",
       pg.parse_command("/start")[2] == "welcome"
@@ -2978,24 +3100,52 @@ check("welcome: a chat that is not allowlisted gets NO welcome — a reply is "
 # WHAT IT SAYS. Three things, in the order somebody needs them.
 check("welcome: it says which way each command moves money",
       "MONEY IN" in pg.WELCOME and "MONEY OUT" in pg.WELCOME)
-check("welcome: ...and names both money-in commands and the money-out one",
-      "/address" in pg.WELCOME and "/withdraw" in pg.WELCOME
-      and "/deposit" in pg.WELCOME)
+check("welcome: ...and names the way in and the way out",
+      "/withdraw" in pg.WELCOME and "/deposit" in pg.WELCOME)
 check("welcome: ...and says outright which one pays them, since that is the "
       "question the old names got wrong",
       "the one that pays YOU" in pg.WELCOME)
-# ...AND WHAT IT WILL AND WILL NOT SWEEP UP. _funded_entry takes the LARGEST
-# SINGLE unlocked output and never sums, because summing would spend inputs
-# from several subaddresses in one transaction -- permanent public proof they
-# share an owner. So a withdrawal moves ONE arrival, and "mixes what is here"
-# told an operator with money in three places that all three were going.
-check("welcome: ...and that a withdrawal moves ONE arrival, not everything",
-      "ONE arrival" in pg.WELCOME
-      and "mixes what is here" not in pg.WELCOME)
-check("welcome: ...and what to do about the rest, which is the actionable half",
-      "came in twice is two of these" in pg.WELCOME)
+# ...AND WHAT IT SWEEPS UP, WHICH IS ALL OF IT.
+#
+# _funded_entry takes the LARGEST SINGLE unlocked output and never sums,
+# because summing would spend inputs from several subaddresses in one
+# transaction -- permanent public proof they share an owner. That is a
+# property of a RUN and it is not changing. It was also, for two turns, the
+# promise the welcome made about the COMMAND: "it mixes ONE arrival", leaving
+# an operator with money in three places to notice and drive the other two by
+# hand. Being paid a third of what went in does not read as an OPSEC property.
+# The pager chains the legs itself now, so the command promises the balance
+# and the sentence explains why it arrives in pieces.
+check("welcome: ...and that a withdrawal sends back everything that is here, "
+      "which is what the operator actually wants to know",
+      "everything that is here" in pg.WELCOME)
+check("welcome: ...and that it arrives as separate sends, so several "
+      "transactions are not a malfunction",
+      "separate mixes" in pg.WELCOME and "one per arrival" in pg.WELCOME)
+check("welcome: ...and WHY, because otherwise it reads as a limitation "
+      "somebody should have fixed",
+      "prove they are all yours" in pg.WELCOME)
+# ...AND THE OLD PROMISE IS GONE FROM BOTH SURFACES. A published command list
+# that still says "ONE arrival" is the same wrong answer in the place a
+# newcomer reads first.
+# ...AND THE DEPOSIT ENTRY DOES NOT PROMISE THE ADDRESS IN THE CHAT EITHER.
+# It said "send Bitcoin, get an address and a memo" -- what the JOB produces,
+# not what this surface hands over. The pair is minted inside the job and the
+# reply says to read it on the machine, so a list promising a payload the
+# reply then withholds reads as the reply having failed.
+check("welcome: the command list does not promise an address the chat never "
+      "sends",
+      "get an address" not in dict(pg.BOT_COMMANDS)["deposit"]
+      and "label" in dict(pg.BOT_COMMANDS)["deposit"])
+check("welcome: ...and the deposit reply is the surface that says where it "
+      "actually is",
+      "ON THE MACHINE" in pg.WELCOME)
 check("welcome: ...and the published command list says the same thing",
-      "ONE arrival" in dict(pg.BOT_COMMANDS)["withdraw"])
+      "send it all back" in dict(pg.BOT_COMMANDS)["withdraw"]
+      and "ONE arrival" not in dict(pg.BOT_COMMANDS)["withdraw"])
+check("welcome: ...and neither surface still promises only one",
+      "mixes what is here" not in pg.WELCOME
+      and "ONE arrival" not in pg.WELCOME)
 # THE RENAME NOTE IS IN /help, NOT HERE, and that is the point of this pair.
 #
 # The welcome is read by somebody who has never used this bot. A sentence
@@ -3003,21 +3153,20 @@ check("welcome: ...and the published command list says the same thing",
 # about a thing they have never seen -- it makes the shortest surface longer
 # and answers a question they cannot have. The reader it IS for is the one
 # with the old word already in their fingers, and that reader types /help.
-check("welcome: the rename is NOT explained to a first-time reader",
-      "receive" not in pg.WELCOME.lower())
+check("welcome: the removed command is not explained to a first-time reader",
+      "receive" not in pg.WELCOME.lower() and "/address" not in pg.WELCOME)
+# ...BUT AN OPERATOR WITH THE OLD WORD IS STILL ANSWERED, in parse_command
+# rather than in the welcome: the welcome is read by somebody who has never
+# used this bot, and a sentence about a command that no longer exists is a
+# fact about a thing they have never seen.
 check("welcome: ...but the old spellings are still answered somewhere, so an "
       "operator who learned them is not left guessing",
-      "/receive" in pg.HELP and "/send" in pg.HELP
-      and "still work" in pg.HELP)
-check("welcome: ...and every alias named there really is accepted",
+      all("gone" in pg.parse_command(_c)[2].lower()
+          for _c in ("/address", "/addr", "/receive", "/recv")))
+check("welcome: ...and the aliases /help DOES name really are accepted",
       all(pg.parse_command(_c)[0] == _j or pg.parse_command(_c)[2] == _j
-          for _c, _j in (("/receive", "receive_new"),
-                         ("/recv", "receive_new"),
-                         ("/send", "withdraw_wizard"),
+          for _c, _j in (("/send", "withdraw_wizard"),
                          ("/depo", "depo_wizard"))))
-check("welcome: ...and the two things that change how the operator should "
-      "behave in this chat",
-      "written down" in pg.WELCOME and "until you confirm" in pg.WELCOME)
 check("welcome: ...and that this chat should be assumed readable",
       "read by somebody who is not you" in pg.WELCOME)
 # AND IT SAYS SO WITHOUT THE WORD "TRANSCRIPT", which is on the banned list in
@@ -3068,9 +3217,16 @@ check("welcome: ...reading the real setting rather than a literal",
 check("welcome: ...and a malformed value is treated as off, not as a crash",
       "deleted" not in pg.welcome_text(None)
       and "deleted" not in pg.welcome_text("x"))
+# OP_RETURN IS IN IT NOW, DELIBERATELY. It is not an address, a memo or an
+# amount -- it is the reason a phone cannot complete the payment, and an
+# operator who does not know that tries from the phone and fails. What must
+# stay out is anything that names a destination or a figure.
 check("welcome: no address, amount or memo is in it",
       not re.search(r"[48][0-9A-Za-z]{50,}", pg.WELCOME)
-      and "OP_RETURN" not in pg.WELCOME)
+      and not re.search(r"\d+\.\d{4,}", pg.WELCOME))
+check("welcome: ...and it does say what stops a phone paying, which is the "
+      "one mechanism word worth the room",
+      "OP_RETURN" in pg.WELCOME and "desktop wallet" in pg.WELCOME)
 # ...and it is short enough to read on a phone without scrolling past the
 # buttons. Telegram's own limit is 4096; the constraint here is a thumb.
 check(f"welcome: it fits on a screen ({len(pg.WELCOME)} chars, "
