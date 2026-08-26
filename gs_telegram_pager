@@ -1200,7 +1200,7 @@ class Convo:
     """
 
     __slots__ = ("kind", "amount", "depth", "handle", "exit_to", "expect",
-                 "deadline")
+                 "deadline", "tries")
 
     def __init__(self, clock, kind="depo"):
         self.kind = kind
@@ -1209,6 +1209,12 @@ class Convo:
         self.handle = None
         self.exit_to = None
         self.expect = None
+        #: Unrecognised answers spent at the ONE step that re-asks instead of
+        #: cancelling. Counted rather than unbounded because every re-ask
+        #: writes another line into a transcript this tool cannot delete, so
+        #: "how many lines can one confused minute add" should be a number
+        #: somebody chose rather than a function of how fast the phone types.
+        self.tries = 0
         #: ABSOLUTE, from creation, and never refreshed by an answer. A
         #: per-step refresh puts no upper bound on total lifetime -- a chat
         #: answering every 179 s keeps an entry alive for ever, which is
@@ -1452,7 +1458,10 @@ class Pager:
         server-side transcript this tool cannot delete, and asking N times
         would write N of them.
         """
-        _lo = proto.exit_arrivals_floor(min(proto.WITHDRAW_DEPTHS))
+        # NO ARRIVAL COUNT IS COMPUTED HERE ANY MORE, and the line that did
+        # was left behind by the edit that stopped printing it -- a value
+        # derived, held, and used by nothing, which is the shape a reader
+        # mistakes for a fact the message still states.
         # SHOW THE SHAPE, THEN SAY THE ONE THING THEY CANNOT WORK OUT.
         #
         # This was three sentences of reasoning and no example. The reader has
@@ -1462,9 +1471,9 @@ class Pager:
         return (f"Where do you want it? Send a Monero address:\n"
                 f"  4AdX...9kPq\n\n"
                 f"Several is better — up to {proto.MAX_WAKE_EXIT_DESTS}, "
-                f"separated by spaces. This arrives as {_lo}+ separate "
-                f"payments, and one address collects them all where anyone "
-                f"can group them.\n"
+                f"separated by spaces. It arrives as many separate payments, "
+                f"and one address collects them all where anyone can group "
+                f"them.\n"
                 f"/cancel to stop.")
 
     def _settings_text(self) -> str:
@@ -1500,10 +1509,21 @@ class Pager:
         # DRAWN FROM THE TABLE, not listed here. A second hand-written copy of
         # the depth menu is a second thing to forget to update, and this one
         # would be wrong in the direction that reads as authoritative.
+        #
+        # HOPS, AND IT SAID KEYS. This printed "1 (...), 2 (...), 3 (...)" --
+        # the wire's keys -- while the step that reads the answer takes hop
+        # counts, so /settings told the operator the depths were 1, 2 and 3
+        # and /withdraw refused all three. The 3 was the bad one: it is a
+        # valid answer meaning TWENTY hops, so the reader most likely to be
+        # helped by this line was the one most likely to pick the slowest
+        # option believing it was the shallowest. proto.WITHDRAW_HOPS' own
+        # comment records that collision being taken out of the menu; this
+        # copy of it survived one file away, which is the reason the wire's
+        # keys are not supposed to reach a chat at all.
         lines.append("  mixing depth    "
-                     + ", ".join(f"{d} ({proto.WITHDRAW_DEPTH_NOTE[d]})"
-                                 for d in sorted(proto.WITHDRAW_DEPTHS))
-                     + ", asked at /withdraw")
+                     + ", ".join(str(_h)
+                                 for _h in sorted(proto.WITHDRAW_HOPS))
+                     + " hops, asked at /withdraw")
         lines.append("  destination     the address you reply with at /withdraw")
         lines.append("")
         # THE COURTESY BOUND, SAID TO BE THE COURTESY BOUND. This box's
@@ -1630,11 +1650,13 @@ class Pager:
         fee is doing; printing "0.1784 XMR" would be a quote this box cannot
         stand behind.
         """
-        # NUMBERED BY HOPS, and it used to be numbered by the wire's key with
-        # the hop count printed next to it -- "3  20 hops" -- so the first
-        # line offered "1  3 hops" and the third answered to the same 3.
+        # EVERY ROW LEADS WITH THE NUMBER THAT IS TYPED, and the row is built
+        # by proto.depth_choice rather than here, so that rule holds in one
+        # place for every box that draws this menu. It has been broken twice
+        # -- once with the wire's key first, once with the runtime first --
+        # and depth_choice carries both post-mortems.
         return ("How deep? Reply with the number of hops:\n"
-                + "\n".join(f"  {proto.WITHDRAW_DEPTH_NOTE[d]}"
+                + "\n".join(f"  {proto.depth_choice(d)}"
                             for d in sorted(proto.WITHDRAW_DEPTHS))
                 + "\n\nDeeper mixes better and needs a bigger balance to do "
                   "it — the fees come out of the same pile.\n"
@@ -1663,6 +1685,17 @@ class Pager:
     #: command into an unbounded run of spends.
     MAX_CHAIN_LEGS = 6
 
+    #: How many unrecognised answers the depth step absorbs before it gives
+    #: up. Two, because the second re-ask has already shown the menu twice and
+    #: a third is no longer somebody misreading a row.
+    #:
+    #: THIS IS NOT THE ONLY BOUND ON THAT LOOP and it is not the important
+    #: one. Convo.deadline is absolute from creation and never refreshed by an
+    #: answer, so the conversation dies CONVO_TTL_S after it started whatever
+    #: is typed into it. This bounds the TRANSCRIPT -- how many copies of the
+    #: menu one confused minute can leave behind on a surface with no eraser.
+    DEPTH_RETRIES = 2
+
     def _label(self, chat_id: int, h: str) -> str:
         """The confirmation number THIS chat sees for handle `h`.
 
@@ -1675,7 +1708,10 @@ class Pager:
         return confirmation_number(self.key, chat_id, h)
 
     def _handle_buttons(self, h: str, job: str = "", chat_id: int = 0) -> list:
-        """Check / wait, bound to the label this reply is about, or None.
+        """Ask-again, bound to the label this reply is about, or None.
+
+        ONE BUTTON. It offered check AND wait, side by side; the argument for
+        dropping the second is at the return.
 
         NONE FOR A LABEL NOTHING CAN WATCH, and this used to offer both
         buttons unconditionally. An /address label is refused by the vault
@@ -1688,10 +1724,10 @@ class Pager:
         parse_callback's own comment states the rule this broke: "a button
         offering a depth the vault refuses would spend a wake on a rejection."
 
-        THE TWO COMMANDS AN OPERATOR RUNS NEXT, and both used to require
-        retyping a four-character hex label off the screen above -- on a phone,
-        into a chat, correctly, or the wake was spent on unknown_handle. The
-        label is right there; the button carries it.
+        THE COMMAND AN OPERATOR RUNS NEXT, and it used to require retyping a
+        four-character hex label off the screen above -- on a phone, into a
+        chat, correctly, or the wake was spent on unknown_handle. The label is
+        right there; the button carries it.
 
         Built ONLY from a handle this process just minted and recorded in
         handle_owner, so a button can never carry somebody else's label into
@@ -1712,7 +1748,18 @@ class Pager:
             _c = self._label(chat_id, h) if chat_id else h
         except BaseException:                                # noqa: BLE001
             return MENU_BUTTONS
-        return [[("Has it arrived?", f"c:{_c}"), ("Wait for it", f"w:{_c}")]]
+        # ONE BUTTON. "Wait for it" sat beside "Has it arrived?" and asked
+        # the reader to choose between them, which is a choice nobody holding
+        # a phone can make: waiting is what you do either way, and the label
+        # said nothing about the only thing that actually differs -- how long
+        # the machine stays up looking (three minutes against a hundred and
+        # ten, and the long one holds every other command for the duration).
+        #
+        # /wait still exists and is on the published command list, so an
+        # operator who knows they want the long look can ask for it. What is
+        # gone is a keyboard offering a decision without the information to
+        # make it.
+        return [[("Has it arrived?", f"c:{_c}")]]
 
     def _phase_buttons(self, phase: str, h: str, job: str = "",
                        chat_id: int = 0) -> list:
@@ -1721,20 +1768,22 @@ class Pager:
         THE ONE REPLY THAT OFFERED NOTHING. Every other message this bot sends
         carries the next step; the status answer -- the message an operator
         sees more often than any other, because it is what waiting looks like
-        -- ended with a full stop and an empty keyboard. So "landed and
-        spendable" left somebody who had just been told their money was there
-        with no way to be paid except knowing the word /withdraw and typing
-        it, and "nothing on the address yet" left them retyping a
-        four-character hex label off the screen above to ask a second time.
-        Both are the exact defect _handle_buttons was written for, on the
-        surface it did not cover.
+        -- ended with a full stop and an empty keyboard. The "landed" line (it
+        read "landed and spendable" then) left somebody who had just been told
+        their money was there with no way to be paid except knowing the word
+        /withdraw and typing it, and "nothing on the address yet" left them
+        retyping a four-character hex label off the screen above to ask a
+        second time. Both are the exact defect _handle_buttons was written
+        for, on the surface it did not cover.
 
         LABELS ARE READ OUT OF THE MENU, not written again here: two spellings
         of the same button is how one of them stops matching what it does.
         """
         try:
             if phase in ("not_yet", "arriving"):
-                # Still waiting: the two commands that ask again.
+                # Still waiting: the command that asks again. ONE of them --
+                # _handle_buttons dropped "Wait for it", and this comment said
+                # "the two commands" for a turn after it did.
                 return self._handle_buttons(h, job, chat_id)
             if phase == "landed":
                 # The money is there. There is exactly one thing to do next
@@ -1752,8 +1801,9 @@ class Pager:
         ONE ROW PER DEPTH, from proto.WITHDRAW_DEPTHS -- the same table the
         text is built from, so a depth can never appear as a button and not as
         a line, or the reverse. The label carries the hop count because that is
-        the thing being chosen; the NOTE stays in the message above, where
-        there is room for a sentence.
+        the thing being chosen and because it is the answer the typed path
+        reads; the runtime and what the depth buys stay on the line above,
+        where proto.depth_choice has room for them.
 
         Cancel is here because the message it sits under ends with "/cancel to
         stop", and an operator who has just decided not to do this should not
@@ -1942,9 +1992,52 @@ class Pager:
         if c.awaiting_depth():
             _d = self._depth_from(word)
             if _d is None:
-                del self.convos[chat_id]
-                self.send(chat_id, "no: I did not recognise that. Cancelled — "
-                                   "start again with /withdraw.")
+                # RE-ASKS, AND EVERY OTHER STEP HERE CANCELS. That is not an
+                # inconsistency to tidy up later; it is the one step where a
+                # cancel throws away work, and the work it throws away is the
+                # worst kind to make somebody redo.
+                #
+                # The destinations are already in. They were typed into a
+                # transcript this tool cannot delete, and cancelling means
+                # typing them again -- so the SAME addresses appear twice in
+                # the readable surface, and the second copy buys nothing.
+                # /deposit's amount step and /withdraw's address step have no
+                # such asymmetry: what a cancel costs there is exactly the one
+                # value that was just refused.
+                #
+                # AND THE MENU IS WHY THIS IS REACHED AT ALL. It prints 6, 9
+                # and 13 as runtimes beside the answers 3, 10 and 20; those
+                # are numbers a reader can plausibly type. Refusing them is
+                # right -- guessing which one was meant is how "3" came to
+                # mean twenty hops -- but refusing them by discarding the
+                # addresses turns a misread into a re-disclosure.
+                #
+                # NOTHING HAS BEEN SPENT AT THIS POINT. The confirm sum is
+                # still ahead, and it is where a wrong answer still cancels
+                # outright: that gate exists to stop a pocket-dial, and a gate
+                # you may retry is not one.
+                c.tries += 1
+                if c.tries > self.DEPTH_RETRIES:
+                    del self.convos[chat_id]
+                    integrity_log("pager", "convo_depth_exhausted")
+                    self.send(chat_id, "no: cancelled — start again with "
+                                       "/withdraw.")
+                    return True
+                # THE MENU AGAIN, NOT A HAND-WRITTEN LIST OF THE ANSWERS. A
+                # second copy of the valid numbers written here is a second
+                # thing to forget, and it would be wrong in the direction that
+                # reads as authoritative -- see the same argument at
+                # _depth_question. Re-sending the question also re-sends the
+                # buttons, so the way out of a misread is one tap.
+                #
+                # WHAT THEY TYPED IS NOT ECHOED, for the reason every other
+                # refusal here gives: the reply is about the mistake, and a
+                # transcript line quoting the operator's own near-miss is a
+                # line somebody else can read later.
+                self.send(chat_id,
+                          "no: reply with one of the numbers below.\n\n"
+                          + self._depth_question(),
+                          buttons=self._depth_buttons())
                 return True
             c.depth = _d
             q, c.expect = _confirm_question(self.rng)
@@ -1967,7 +2060,6 @@ class Pager:
             # single-destination case gets a sentence rather than a number,
             # since that is the case where the count is the bad news.
             _n = len(c.exit_to)
-            _lo = proto.exit_arrivals_floor(_d)
             _spread = (f"across {_n} addresses" if _n > 1 else
                        "onto the ONE address you gave — anyone watching it "
                        "sees them all and can group them")
@@ -1989,11 +2081,26 @@ class Pager:
             # balance -- see /settings, which refuses to fetch one -- so it can
             # state the RATE and must not state a figure. A number invented
             # here would be a quote the vault never made.
+            # THE ARRIVAL COUNT IS NOT NAMED, and it used to be: "At least 12
+            # separate transactions".
+            #
+            # STATED HONESTLY, because this is not a Kerckhoffs defence and
+            # must not be written as one: exit_arrivals_floor is a public
+            # function of a depth this same message names, so anyone holding
+            # this repository recomputes the figure in one line. What removing
+            # it changes is the READABLE surface -- a transcript that states
+            # "at least 12" hands a directly usable count to somebody who has
+            # the chat and has never seen the source, which is exactly the
+            # reader this design assumes. It lowers what a casual reader gets
+            # and does not pretend to lower what an informed one gets.
+            #
+            # The FACT survives, because it is the one that decides whether
+            # giving a single address throws the run away.
             self.send(chat_id,
                       f"Send to the {'addresses' if _n > 1 else 'address'} you "
-                      f"just sent, {proto.WITHDRAW_DEPTH_NOTE[_d]} — this "
+                      f"just sent, {proto.depth_said_back(_d)} — this "
                       f"SPENDS.\n\n"
-                      f"At least {_lo} separate transactions, {_spread}.\n"
+                      f"It arrives as many separate payments, {_spread}.\n"
                       f"{USAGE_FEE_LABEL} usage fee comes out of it — this "
                       f"service's cut. The network fee is separate, charged "
                       f"on every transaction, and is not ours."
@@ -2632,12 +2739,44 @@ class Pager:
                 # after the confirm, on a phone, possibly after a reboot, and
                 # "the addresses you gave" then reads as the bot assuming a
                 # context the reader has to scroll for. It says what happened.
-                _msg = ("withdraw: done. The money has been sent.\n\n"
-                        + ("There is more on this wallet. Starting the next "
-                           "one now — they have to go separately, or spending "
-                           "them together proves they are all yours."
+                # SHORT, AND THE REASON IS ONE CLAUSE.
+                #
+                # This was three lines of explanation on the message that
+                # lands after a spend. What the reader needs is where they are
+                # in the run and that more is coming; WHY it is split is one
+                # clause, not a paragraph, and it is the clause that stops
+                # "send it all at once" sounding like an improvement.
+                # AND THE DENOMINATOR CAME BACK OUT. This read
+                # "withdraw 1/6: sent", and 6 is MAX_CHAIN_LEGS -- a CAP, not
+                # a total. Nothing knows the total: the run ends when the
+                # wallet has no funded entry left, which is usually two or
+                # three legs, so "1/6" promised six spends to somebody who was
+                # going to get three and then read the third as the run having
+                # stopped early. The cap has its own message when it actually
+                # fires. A leg number alone is true at every leg.
+                # THREE ENDINGS, AND THERE USED TO BE TWO FOR THREE STATES.
+                #
+                # The second condition was `_more` alone, so on the LAST leg
+                # the cap allows -- more money on the wallet, no leg left to
+                # spend it -- the operator was told "Starting the next one
+                # now" and then, from the branch below, "Stopping after 6 in
+                # a row". Two messages, seconds apart, contradicting each
+                # other, at the end of a run that had moved real money six
+                # times. Whether a next leg RUNS is `_more AND under the cap`,
+                # which is exactly what the branch below already computed and
+                # this line did not, so the two could disagree.
+                #
+                # Computed ONCE, here, and read by both.
+                _next_leg = _more and _leg + 1 < self.MAX_CHAIN_LEGS
+                _msg = (f"withdraw {_leg + 1} sent.\n"
+                        + ("Next one starting — sending them together would "
+                           "prove they are all yours."
+                           if _next_leg else
+                           f"More is here, but {self.MAX_CHAIN_LEGS} in a row "
+                           f"is enough for one run — /withdraw again when you "
+                           f"are ready."
                            if _more else
-                           "Nothing is left on this wallet."))
+                           "That was the last. Wallet empty."))
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
                 # end of a job that ran for up to sixteen hours and moved real
@@ -2664,15 +2803,14 @@ class Pager:
                 # NOT STARTED HERE. start_job takes `busy`, and this is
                 # running inside the worker that holds it. _worker acts on
                 # this slot after its finally releases the lock.
-                if _more and _leg + 1 < self.MAX_CHAIN_LEGS:
+                if _next_leg:
                     self._chain = (chat_id, dict(params), _leg + 1)
                 elif _more:
+                    # THE CAP IS LOGGED HERE AND SAID ABOVE. A second send
+                    # was what contradicted the first one; the sentence it
+                    # carried now lives in _msg, chosen by the same _next_leg
+                    # that decides whether a leg is actually armed.
                     integrity_log("pager", "chain_capped")
-                    self.send(chat_id,
-                              f"Stopping after {self.MAX_CHAIN_LEGS} in a "
-                              f"row. There is still more here — send "
-                              f"/withdraw again when you are ready.",
-                              buttons=MENU_BUTTONS)
                 return
             if plain and chat_id < 0:
                 # A GROUP IS A BROADCAST SURFACE, AND A PAYLOAD IS NOT FOR ONE.
@@ -3031,17 +3169,36 @@ class Pager:
             _next, self._chain = self._chain, None
             if _next:
                 _cid, _params, _leg = _next
+                # NO ANNOUNCEMENT HERE ANY MORE, AND IT IS NOT A LOST
+                # MESSAGE. This sent "withdraw: starting the next one (2 of
+                # at most 6)" moments after the completion message had
+                # already said "Next one starting" -- two messages for one
+                # event, on the surface this design spends its effort keeping
+                # short, and the parenthesis named the CAP as though it were
+                # a total. The completion message is the one with the retry
+                # and the one that says a spend finished, so it is the one
+                # that keeps the job.
                 try:
-                    self.send(_cid, f"withdraw: starting the next one "
-                                    f"({_leg + 1} of at most "
-                                    f"{self.MAX_CHAIN_LEGS}).")
-
                     self.start_job(_cid, "withdraw", _params, leg=_leg)
                 except BaseException:                        # noqa: BLE001
                     # A chain that cannot continue is not a failure of the leg
                     # that just succeeded, and must never be reported as one.
+                    #
+                    # BUT IT IS SAID. The operator has just been told "Next
+                    # one starting"; a chain that then dies in here used to
+                    # leave that sentence as the last thing they ever heard,
+                    # with money still on the wallet and nothing running --
+                    # the silent zero, on the one surface they can see. A
+                    # refusal from start_job's own rate limit is NOT this
+                    # path: that is spoken there and returns normally.
                     try:
                         integrity_log("pager", "chain_start_failed")
+                    except BaseException:                    # noqa: BLE001
+                        pass
+                    try:
+                        self.send(_cid, "the next one did not start. Nothing "
+                                        "else was sent — /withdraw again "
+                                        "when you are ready.")
                     except BaseException:                    # noqa: BLE001
                         pass
 
@@ -3628,11 +3785,38 @@ class Pager:
                      + getattr(doorbell(), "FETCH_WINDOW_S", 0))
             if not getattr(self.args, "no_jitter", False):
                 _hold += getattr(doorbell(), "PRE_WOL_MAX_S", 0)
-            _how = (f"up to {_hold // 3600 + 1}h" if _hold >= 3600
-                    else f"up to {max(1, _hold // 60)} min")
-            self.send(cid,
-                      f"{chat_name(job)}: working — {_how}. Nothing else can "
-                      f"run until it finishes.")
+            _how = (f"{_hold // 3600 + 1}h" if _hold >= 3600
+                    else f"{max(1, _hold // 60)} min")
+            # THE NUMBER IS A LOCK WINDOW, AND IT READ AS AN ESTIMATE.
+            #
+            # "working — up to 17h" landed minutes after the depth menu had
+            # said "about 6h" for the depth the operator picked, and the two
+            # are different quantities: the menu's figure is how long THAT
+            # depth runs, and this one is how long this pager may refuse every
+            # other command. They are both right and they looked like the same
+            # number disagreeing with itself by a factor of three, on
+            # consecutive screens, which is the shape that makes a tool read
+            # as broken.
+            #
+            # THE FIGURE ITSELF STAYS THE WORST CASE, and that is deliberate.
+            # It comes from result_budget_s, which is the wire's ONE budget for
+            # a withdrawal at any depth -- the vault will let a three-hop run
+            # take the full window if the network is slow -- so a depth-derived
+            # bound here would be a bound this box cannot keep. An "up to" that
+            # is sometimes exceeded is worse than one that is loose: the whole
+            # point of the sentence is that the operator is not surprised by
+            # "no: something is already running".
+            #
+            # NOT ON A CHAINED LEG. The completion message that just landed
+            # already says "Next one starting", and this arrived seconds later
+            # saying the same thing with a number attached -- two messages per
+            # leg, six times over, on the surface this design spends its whole
+            # effort keeping short. The window has not changed since leg one
+            # and the operator has already been told it.
+            if not self._chain_leg:
+                self.send(cid,
+                          f"{chat_name(job)}: working. Nothing else can run "
+                          f"for up to {_how}.")
             threading.Thread(target=self._worker, args=(cid, job, params),
                              daemon=True).start()
         except BaseException as e:                           # noqa: BLE001

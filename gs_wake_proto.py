@@ -738,7 +738,13 @@ PHASE_LINES = {
     # point. An operator reading "Done" on the surface they check most is
     # being told the job finished when the money is sitting un-mixed. It
     # says which step ended, without naming the one that has not.
-    "landed": "landed and spendable. The swap is done.",
+    # CONFIRMED IS THE WORD SOMEBODY WAITING FOR MONEY IS LOOKING FOR, and
+    # "landed and spendable" was not it. The second sentence stays for the
+    # reason it was added: shortening it to "Done." once changed which noun it
+    # was about -- the SWAP has finished, the MIX has not, and the mix is the
+    # entire point.
+    "landed": "CONFIRMED — the money is here and spendable. That was the "
+              "swap; the mix has not run yet.",
     "short": "arrived, but UNDER what was quoted, and it has stopped growing. "
              "Check before going further.",
     "stuck": "not scanning, so this says NOTHING about your money. Check.",
@@ -794,6 +800,27 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # it. Said once, without naming what that part is.
         "Pay it from the machine that quoted it. A phone wallet "
         "CANNOT complete this and the money would be lost.",
+        # THE ADDRESS IS NOT THE READER'S, AND NOTHING SAID SO.
+        #
+        # "To address: bc1q..." reads as "this is my deposit address" to
+        # anybody who has ever used an exchange, and the reader's next
+        # reasonable act is to send to it a second time, or to keep it for
+        # next week. Both lose the money: what binds a payment to this
+        # operator is issued per quote and is not part of the address, so a
+        # second payment to the same line arrives belonging to nobody. It is
+        # also not unique to them in the first place -- the same line is
+        # quoted to everyone -- which is exactly why the binding has to be
+        # per payment.
+        #
+        # WHY IT IS SHARED IS NOT IN THE SENTENCE, and that is rule 6, not
+        # Kerckhoffs: the design is public and this line hides nothing an
+        # adversary could not read here. What it avoids is naming the
+        # routing service in a transcript somebody else may read, which is
+        # the same reason the line above says "the part that routes it"
+        # nowhere. What a reader can ACT on is the whole of what they are
+        # told: once, now, and never again.
+        "One payment, once. This line is not yours to keep — sending to it "
+        "again, or later, loses the money.",
     ]
 
 
@@ -2100,11 +2127,97 @@ def exit_arrivals_floor(depth: int) -> int:
 #: which is the part that is true regardless of the fee, and the vault -- the
 #: box that CAN ask -- is what refuses a deposit too small for the depth it
 #: was given.
+#: WHAT EACH DEPTH BUYS, AND NOTHING ELSE. No number appears in these
+#: strings, and that is now a rule rather than an accident -- see depth_choice
+#: for the whole of the argument. The hop count and the runtime are both
+#: DERIVED from WITHDRAW_DEPTHS, so a phrase here can never disagree with the
+#: table the vault budgets from.
+#:
+#: THIS CARRIED THE RUNTIME AND AN "answer N" TAIL FOR ONE TURN, and both had
+#: to come out. The runtime read "~6h", which put a 6 at the START of the row
+#: -- the most prominent number in a menu whose accepted answers are 3, 10 and
+#: 20 -- and the tail was the patch for that, which is the shape of a fix that
+#: is really a symptom. The row now leads with the number that is typed. The
+#: tail also leaked: this string is inlined into the /withdraw confirm
+#: sentence, where it read "... you just sent, ~6h · lightest cover, smallest
+#: balance · answer 3 -- this SPENDS", i.e. it told the operator to answer
+#: something at the moment they were being asked to confirm.
 WITHDRAW_DEPTH_NOTE = {
-    1: "3 hops · ~6h · lowest minimum",
-    2: "10 hops · ~9h",
-    3: "20 hops · ~13h · highest minimum",
+    1: "lightest cover, smallest balance",
+    2: "middle",
+    3: "strongest cover, biggest balance",
 }
+
+
+def depth_hops(depth: int) -> int:
+    """How many hops `depth` runs. The number the chat asks for and reads.
+
+    THE ONLY WAY TO GET FROM A KEY TO A HOP COUNT. WITHDRAW_HOPS goes the
+    other way and is what the typed answer is looked up in; this is its
+    inverse, and it exists so that no caller outside this file has to know
+    that a depth is a tuple whose first element happens to be the hop count.
+    """
+    return WITHDRAW_DEPTHS[depth][0]
+
+
+def depth_hours(depth: int) -> int:
+    """Worst-case runtime for `depth`, in whole hours.
+
+    DERIVED FROM THE SAME TABLE THE BUDGET COMES FROM, and it used to be three
+    hand-written strings sitting next to it. A hand-written "~6h" beside a
+    22080-second budget is a mirror with nothing checking it: change the
+    delays and the menu goes on promising the old figure, in the one place the
+    operator decides how long to be exposed for.
+
+    WORST CASE, NOT TYPICAL, and the chat says "about" over it rather than
+    "up to" for one reason: WITHDRAW_DEPTHS' seconds come from the SLOW end of
+    the hop delay on every one of about thirty draws, which is a tail nobody
+    actually sits through. Rounding is to NEAREST, so 6.13 h prints as 6 --
+    understating by eight minutes on a figure that is already pessimistic by
+    hours. Neither error is the one that matters here; what matters is that
+    three hops reads as most of a working day, which is the thing an operator
+    picking a depth was surprised by.
+    """
+    return int(round(WITHDRAW_DEPTHS[depth][1] / 3600.0))
+
+
+def depth_choice(depth: int) -> str:
+    """One menu row: what is typed, how long it takes, what it buys.
+
+    THE TYPED NUMBER LEADS. That is the entire ordering rule, and it is worth
+    a paragraph because getting it wrong has now caused the same class of bug
+    twice. The chat's answer vocabulary is HOP COUNTS -- 3, 10, 20 -- and any
+    other number printed at the head of a row is read as the answer:
+
+      * "3  20 hops" put the KEY first, so typing 3 got twenty hops;
+      * "~6h · lightest cover" put the RUNTIME first, so 6, 9 and 13 became
+        the salient numbers and none of them is an accepted answer.
+
+    The second one was mine, made while fixing a complaint that three hops did
+    not sound like six hours. It is the more dangerous of the two: 6, 9 and 13
+    are not hop counts, so they cannot silently select the wrong depth -- they
+    are REFUSED, and until this turn a refusal at that step deleted the
+    conversation along with the destination addresses the operator had already
+    pasted into the transcript. The fix is both halves: the row leads with the
+    answer, and gs_telegram_pager re-asks instead of cancelling.
+
+    The runtime still appears, because it is the thing the operator is really
+    trading away and the reason the complaint existed. It just is not first.
+    """
+    return (f"{depth_hops(depth)} hops · about {depth_hours(depth)}h · "
+            f"{WITHDRAW_DEPTH_NOTE[depth]}")
+
+
+def depth_said_back(depth: int) -> str:
+    """The depth, for a sentence that is confirming a spend.
+
+    SHORTER THAN THE MENU ROW ON PURPOSE. The confirm is not a menu: what it
+    has to do is let an operator who typed 10 when they meant 20 notice before
+    they answer the sum. So it says the two facts a mistype changes -- the
+    number they typed and the hours it costs -- and drops the "what it buys"
+    phrase, which is a reason to choose rather than a thing to check.
+    """
+    return f"{depth_hops(depth)} hops, about {depth_hours(depth)}h"
 
 
 JOBS = {
