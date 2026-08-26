@@ -1653,9 +1653,63 @@ check("minout: taking a cut really does raise the floor, so the two figures "
       "are not one value written twice",
       _GS.Decimal(P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)
       > _GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR))
-check("minout: deposit_min_out_xmr picks by whether a cut will be taken",
-      P.deposit_min_out_xmr(False) == P.MIX_MINIMUM_XMR_MIRROR
-      and P.deposit_min_out_xmr(True) == P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)
+# ---- A SILENT ZERO IS A HIDDEN BROKEN FEE -------------------------------
+#
+# There are THREE ways to take no cut and they used to be one empty list. A
+# keyfile that names a destination still takes nothing when that destination
+# is also an --exit-to (GhostSpiral refuses the whole run when they overlap,
+# so it is dropped here first) and when it turns out to be an address of the
+# wallet being mixed. Both are correct; both were indistinguishable from "the
+# operator never asked for a fee". Over many runs that is an operator earning
+# nothing with no way to find out why.
+_FEE_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+check("fee: the three ways of taking none are told apart in the chain",
+      "fee_none_configured" in _FEE_SRC and "fee_all_excluded" in _FEE_SRC)
+check("fee: ...and NOT in the chat, because a fee configuration is the number "
+      "an analyst divides by to read the deposit",
+      "fee_none_configured" not in open(
+          os.path.join(REPO, "gs_telegram_pager"), encoding="utf-8").read())
+_XF, _XE = "4" + "7" * 94, "4" + "Ad" * 46 + "Aa"
+# NAMES THAT CANNOT CLOBBER THE MODULE-LEVEL FIXTURES. `_k` is the shared
+# keyfile every other check in this file builds on, and using it as a loop
+# variable here rebound it to {} -- which crashed a check four hundred lines
+# later in build_argv, on a key with no tor_proxy.
+for _fee_lbl, _fee_k, _fee_d, _fee_o, _fee_want in (
+        ("nothing paired", {}, [_XE], [], []),
+        ("paired, but it IS the exit", {"usage_fee_addresses": [_XF]},
+         [_XF], [], []),
+        ("paired, but this wallet owns it", {"usage_fee_addresses": [_XF]},
+         [_XE], [_XF], []),
+        ("paired and usable", {"usage_fee_addresses": [_XF]},
+         [_XE], [], ["--usage-fee"])):
+    check(f"fee: {_fee_lbl} -> {_fee_want or 'no cut'}",
+          A._withdraw_fee_argv(_fee_k, _fee_d, _fee_o) == _fee_want)
+
+# ---- AND THE WITH-CUT FIGURE IS NOT A FLOOR, WHICH IS MY OWN BUG ---------
+#
+# deposit_min_out_xmr first took a `with_cut` argument and returned the higher
+# figure when the keyfile named a fee destination, on the assumption that a
+# run taking a cut needs more. It does not. plan_usage_fee WAIVES a cut worth
+# less than it costs to spend -- "NO USAGE FEE TAKEN ... The mix is going
+# ahead in full" -- because that branch runs after the swap has settled and
+# aborting there would strand a settled deposit to protect one run's fee.
+#
+# So the with-cut number answers "can a FEE be taken", not "can this be
+# MIXED", and using it as a floor was wrong twice: the deposit gate refused
+# quotes that would have mixed fine, and the withdraw chain ABANDONED
+# arrivals between the two figures while telling the operator there was
+# nothing left -- a false statement about their balance.
+check("minout: the floor is what can be MIXED, and takes no argument at all",
+      P.deposit_min_out_xmr() == P.MIX_MINIMUM_XMR_MIRROR)
+check("minout: ...and the with-cut figure is published but never gates",
+      _GS.Decimal(P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)
+      > _GS.Decimal(P.deposit_min_out_xmr()))
+# THE WAIVER IS WHAT MAKES THAT SAFE, so it is asserted rather than assumed.
+_GS_SRC = open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read()
+check("minout: ...because a cut below its spend cost is WAIVED and the mix "
+      "goes ahead, rather than the run being refused",
+      "waived_below_spend_cost" in _GS_SRC
+      and "going ahead in full" in _GS_SRC)
 # ...AND THE AGENT PASSES IT, by the SAME predicate _withdraw_fee_argv uses.
 # A floor computed and never put on the argv is the "declared in one place,
 # never wired to the thing that runs" shape this repo keeps finding.
@@ -1667,7 +1721,7 @@ for _lbl, _mok, _want in (
         ("no fee destination", _mo_base, P.MIX_MINIMUM_XMR_MIRROR),
         ("a fee destination", dict(_mo_base,
                                    usage_fee_addresses=["4" + "7" * 94]),
-         P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)):
+         P.MIX_MINIMUM_XMR_MIRROR)):
     _steps = A.build_argv("receive_and_quote", {"amount_sat": 5000000}, _mok,
                           Path("/var/lib/ghostspiral"),
                           bundle="/x/wallet_a.json", slip="", handle="A3F1",
@@ -1731,19 +1785,21 @@ try:
                         * _GS.Decimal(10 ** 12)) - 1)
     check("chain: one piconero under it does not", 
           A._phase_of("withdraw", None, key=_ml_key, status="done") == "")
-    # AND A KEYFILE THAT TAKES A CUT USES THE HIGHER FLOOR, because the cut's
-    # own spend cost is what binds at three wallets.
+    # AND A KEYFILE THAT TAKES A CUT USES THE SAME FLOOR, which is the fix to
+    # my own first version: it used the higher with-cut figure there and so
+    # ABANDONED anything between the two, while telling the operator nothing
+    # was left. plan_usage_fee waives a cut it cannot spend and mixes anyway.
     _ml_fee = dict(_ml_key, usage_fee_addresses=["4" + "7" * 94])
-    A._funded_entry = lambda k, injected=None: (
-        7, 1, "4x", int(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
-                        * _GS.Decimal(10 ** 12)))
-    check("chain: an amount over the no-cut floor but under the with-cut one "
-          "is 'more' without a fee destination...",
-          A._phase_of("withdraw", None, key=_ml_key, status="done")
-          == "more_left")
-    check("chain: ...and NOT with one, since that run would take a cut it "
-          "could never spend",
-          A._phase_of("withdraw", None, key=_ml_fee, status="done") == "")
+    _between = int((_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
+                    + _GS.Decimal(P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR))
+                   / 2 * _GS.Decimal(10 ** 12))
+    A._funded_entry = lambda k, injected=None: (7, 1, "4x", _between)
+    for _lbl2, _k2 in (("without a fee destination", _ml_key),
+                       ("WITH one", _ml_fee)):
+        check(f"chain: an arrival between the two figures is 'more' "
+              f"{_lbl2} -- it mixes, with the cut waived",
+              A._phase_of("withdraw", None, key=_k2, status="done")
+              == "more_left")
 finally:
     A._funded_entry = _ml_saved
 

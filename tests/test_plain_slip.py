@@ -975,10 +975,17 @@ check("receive_and_quote: NON-VACUITY -- a deposit still takes its own path "
 # the button and the welcome line all went with it.
 check("receive_new: the job is not on the wire any more",
       "receive_new" not in P.JOBS)
-check("receive_new: ...and the pager answers the old spelling with a sentence "
-      "rather than 'unknown command'",
-      "gone" in pg.parse_command("/address")[2].lower()
-      and "/deposit" in pg.parse_command("/address")[2])
+# ...AND THE OLD SPELLING IS ANSWERED WITH SILENCE. It used to explain itself
+# -- "nothing here swaps Monero to Bitcoin, so it could take money in and
+# never say where" -- which is a description of the toolchain's SHAPE in the
+# one surface every other reply is scrubbed of, and a POST from the Pi for a
+# command that does not exist.
+check("receive_new: ...and the pager says nothing at all to the old spelling",
+      all(pg.parse_command(_c)[2] == pg.IGNORE
+          for _c in ("/address", "/addr", "/receive", "/recv")))
+check("receive_new: ...and what it does not say is the toolchain's shape",
+      not any("swaps" in str(pg.parse_command(_c)[2]).lower()
+              for _c in ("/address", "/addr", "/receive", "/recv")))
 
 # ONE RETRY ON THE COMPLETION NOTICE, and this is the only notification that a
 # spend finished -- at the end of a job that ran up to sixteen hours and moved

@@ -2682,9 +2682,10 @@ MUTATIONS = [
  # channel exists for -- took no cut at all while gs_console's did.
  ("the wake path goes back to taking no usage fee at all",
   "gs_wake_agent",
-  '    return ["--usage-fee"] if fee_addresses(\n'
-  "        key, exclude=list(dests) + list(owned)) else []",
-  "    return []",
+  "    if _usable:\n"
+  '        return ["--usage-fee"]',
+  "    if _usable:\n"
+  "        return []",
   ["test_wake_agent"]),
 
  # A completed spend reported "withdraw ready · slip A3F1": deposit vocabulary
@@ -3110,8 +3111,7 @@ MUTATIONS = [
  # shape this repo keeps finding.
  ("the vault stops telling the quote step what the mix needs",
   "gs_wake_agent",
-  '             "--min-out-xmr",\n'
-  "             proto.deposit_min_out_xmr(bool(fee_addresses(key))),",
+  '             "--min-out-xmr", proto.deposit_min_out_xmr(),',
   '             "--outfile-unused-marker", "0",',
   ["test_wake_agent"]),
 
@@ -3123,6 +3123,17 @@ MUTATIONS = [
   '    if "plain_slip" in k:',
   "    if False:",
   ["test_plain_slip"]),
+
+ # THE WITH-CUT FIGURE IS NOT A FLOOR, and using it as one abandoned money.
+ # plan_usage_fee WAIVES a cut worth less than it costs to spend and the mix
+ # goes ahead in full -- so an arrival between the two figures mixes, and
+ # gating on the higher one told the operator "nothing left to send" about
+ # money still sitting there.
+ ("the chain goes back to abandoning what a fee could not be taken from",
+  "gs_wake_agent",
+  "            _floor = Decimal(proto.deposit_min_out_xmr())",
+  '            _floor = Decimal(proto.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)',
+  ["test_wake_agent"]),
 
  # ---- a label belongs to the chat it was issued to ----------------------
  #
