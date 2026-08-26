@@ -316,6 +316,27 @@ def main():
                          "XMR destination address. ONLY for a genuine aggregator "
                          "format change -- normally this means the swap would "
                          "deliver to someone else's address.")
+    # THE SMALLEST QUOTE WORTH ACCEPTING, in XMR, from the caller.
+    #
+    # NOT COMPUTED HERE, and not defaulted to a number typed in this file.
+    # The figure is GhostSpiral's -- it moves with the network fee, the wallet
+    # count and whether a usage fee is taken -- and this tool has no wallet,
+    # no daemon and no business guessing it. The caller that knows which mix
+    # will run is the caller that supplies it: gs_wake_agent passes the
+    # protocol's mirrored floor, and gs_console passes what its own panel
+    # already shows the operator.
+    #
+    # ABSENT MEANS NO GATE, which is what every existing caller gets. That is
+    # the same behaviour as before this existed rather than a silent new
+    # refusal on a path nobody has updated -- and the gate only ever refuses
+    # BEFORE money moves, so an absent one costs nothing that was not already
+    # being paid.
+    ap.add_argument("--min-out-xmr", default="", metavar="XMR",
+                    help="refuse a quote that would deliver less than this "
+                         "many XMR. Nothing is sent when it fires. Use the "
+                         "mixing minimum for the shallowest depth you would "
+                         "accept; without it a deposit too small to mix is "
+                         "quoted, paid, and then stuck.")
     ap.add_argument("--outfile", default="thor_pairs_batch.json")
     args = ap.parse_args()
 
@@ -430,6 +451,17 @@ def main():
     # error string. The old unconditional "oracle_fetched" line above claimed
     # success right after a failure -- misleading in the very log meant to be
     # audited later.
+
+    # PARSED ONCE, BEFORE THE FIRST QUOTE, so a malformed value fails here
+    # rather than after a network round trip -- and REFUSED rather than
+    # ignored: a gate the caller asked for and this tool silently dropped is
+    # the worst of the three outcomes.
+    _min_out = None
+    if str(getattr(args, "min_out_xmr", "") or "").strip():
+        _min_out = finite_decimal(str(args.min_out_xmr).strip(), None)
+        if _min_out is None or _min_out <= 0:
+            sys.exit(f"[!] --min-out-xmr {args.min_out_xmr!r} is not a "
+                     f"positive decimal amount of XMR.")
 
     pairs: List[dict] = []
 
@@ -590,8 +622,56 @@ def main():
             "memo": memo,
             "dest_xmr": dest,
             "expected_xmr": str(expected_xmr),
+            # WHAT THE MIX WILL NEED, recorded beside what the swap will
+            # deliver, so a later reader can see the comparison this tool made
+            # rather than take its word for the verdict.
+            "min_out_xmr": str(_min_out) if _min_out else "",
             "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         }
+        # ---- A DEPOSIT THE MIX CANNOT PROCESS IS REFUSED HERE ------------
+        #
+        # THIS IS THE LAST MOMENT REFUSING IS FREE, and until now nothing
+        # asked the question at all. The wire accepts any deposit from
+        # DEPOSIT_MIN_SAT = 0.0001 BTC upward; GhostSpiral needs a WALLET
+        # BALANCE of ~0.1388 XMR to complete a mix at three wallets, and
+        # ~0.3364 XMR when a usage fee is taken. At any real rate those are
+        # different by an order of magnitude, so a perfectly ordinary small
+        # deposit was accepted, quoted, and paid --
+        #
+        #   1. the chat takes 0.0005 BTC and issues deposit instructions;
+        #   2. the operator sends the BTC and ThorChain settles it;
+        #   3. the XMR lands on the entry address -- which the swap memo
+        #      names IN PLAINTEXT in a Bitcoin OP_RETURN;
+        #   4. /withdraw refuses at stage 0: below the mixing minimum;
+        #   5. the money is stranded on a publicly-named address and the
+        #      chat says "withdraw: failed", which is true and useless.
+        #
+        # Every stage before 4 succeeded, so the refusal arrives after the
+        # money has moved -- the exact shape plan_usage_fee's own comments
+        # argue against ("the gate that CAN refuse safely is the one before
+        # the deposit instructions are printed, where 'nothing has been
+        # spent' is true of the deposit too"). This is that gate.
+        #
+        # BEFORE THE PAIR IS RECORDED AND BEFORE ANY INSTRUCTION IS PRINTED,
+        # for the same reason the memo checks above sit where they do.
+        #
+        # AGAINST THE SMALLEST MINIMUM OF ANY DEPTH, not the one that will be
+        # used -- the depth is chosen at withdrawal time, hours later and on
+        # another surface. Below the smallest, NO depth can mix it and the
+        # refusal is unambiguous. Above it, some depths work and some do not,
+        # and the withdrawal confirm already names the depth it is about to
+        # use. Refusing only what is definitely unusable is the half this can
+        # be certain of.
+        if _min_out and expected_xmr < _min_out:
+            integrity_log("thor", "quote_below_mix_minimum")
+            sys.exit(
+                f"[!] Pair {i}: this swap would deliver about "
+                f"{expected_xmr} XMR, and the smallest amount that can be\n"
+                f"    MIXED is {_min_out} XMR. Nothing has been sent:\n"
+                f"    refusing to issue deposit instructions for a payment\n"
+                f"    that would settle and then be stuck, on an address\n"
+                f"    this swap's own memo names in public.\n"
+                f"    Send more, or mix this elsewhere.")
         pairs.append(pair)
         integrity_log_once("thor", "pair_ready")
         print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "

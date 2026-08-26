@@ -778,7 +778,7 @@ def welcome_text(burn_after: int = 0, key: dict = None) -> str:
     it describes the default -- which is what every source-level check reads
     and what an install with no mode set actually does.
     """
-    lines = [_DEPO_IN_CHAT if _l is _DEPO_LINE and (key or {}).get("plain_slip")
+    lines = [_DEPO_IN_CHAT if _l is _DEPO_LINE and (key or {}).get("deposit_in_chat")
              else _l for _l in WELCOME_LINES]
     try:
         _b = int(burn_after or 0)
@@ -2752,8 +2752,6 @@ class Pager:
                           f"them there. Paying needs a desktop wallet: the "
                           f"memo goes in an OP_RETURN and no phone wallet can "
                           f"do that.\n"
-                          f"To get them here instead, re-pair with "
-                          f"--plain-slip.\n"
                           f"/check {_cn} once you have paid.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return

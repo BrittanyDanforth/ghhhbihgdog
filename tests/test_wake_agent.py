@@ -1611,6 +1611,142 @@ check("decoys: NON-VACUITY -- the floor really exceeds the wallet count, so "
       all(P.exit_arrivals_floor(_d) > P.WITHDRAW_DEPTHS[_d][0]
           for _d in P.WITHDRAW_DEPTHS))
 
+# ---- AND SO IS THE FLOOR THAT STOPS A DEPOSIT BEING STRANDED ------------
+#
+# THE DEFECT THIS MIRROR EXISTS FOR. The wire took any deposit from
+# DEPOSIT_MIN_SAT = 0.0001 BTC upward and NOTHING asked whether the XMR that
+# arrives could be mixed at all. At any real rate those differ by an order of
+# magnitude, so an ordinary small deposit was quoted, paid, settled through
+# ThorChain -- and only then met the mixing minimum, at /withdraw, with the
+# money already on an address the swap memo names in a public OP_RETURN.
+# Every stage before the refusal succeeded, so the refusal arrived after the
+# money moved. thor_swap_preparer --min-out-xmr moves it to the quote, where
+# nothing has been sent.
+_MIXMIN_ARGS = dict(dag_mixing=True, exit_set=True, chunks=1)
+_shallow = min(P.WITHDRAW_DEPTHS[_d][0] for _d in P.WITHDRAW_DEPTHS)
+_gs_nocut = _GS.mix_minimum_xmr(_GS.Decimal(str(_GS.FALLBACK_FEE_XMR)),
+                                _shallow, usage_pct=None, **_MIXMIN_ARGS)
+_gs_cut = _GS.mix_minimum_xmr(_GS.Decimal(str(_GS.FALLBACK_FEE_XMR)),
+                              _shallow,
+                              usage_pct=_GS.Decimal("0.011"), **_MIXMIN_ARGS)
+check(f"minout: the mirrored floor ({P.MIX_MINIMUM_XMR_MIRROR}) is "
+      f"GhostSpiral's own minimum at {_shallow} wallets ({_gs_nocut})",
+      _GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR) == _gs_nocut)
+check(f"minout: ...and the with-a-cut one "
+      f"({P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR}) is its with-cut minimum "
+      f"({_gs_cut})",
+      _GS.Decimal(P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR) == _gs_cut)
+# THE SHALLOWEST DEPTH, because the depth is chosen hours later at the
+# withdrawal and this figure is needed at the deposit. A floor taken from a
+# DEEPER row would refuse deposits the operator could have mixed by choosing
+# three hops.
+check("minout: the floor is the SHALLOWEST depth's, so it refuses only what "
+      "no depth could mix",
+      all(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
+          <= _GS.mix_minimum_xmr(_GS.Decimal(str(_GS.FALLBACK_FEE_XMR)),
+                                 P.WITHDRAW_DEPTHS[_d][0], usage_pct=None,
+                                 **_MIXMIN_ARGS)
+          for _d in P.WITHDRAW_DEPTHS))
+# AND THE CUT IS WHAT BINDS AT THREE WALLETS -- so a keyfile that names a fee
+# destination has a strictly higher floor, and the agent picks by that.
+check("minout: taking a cut really does raise the floor, so the two figures "
+      "are not one value written twice",
+      _GS.Decimal(P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)
+      > _GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR))
+check("minout: deposit_min_out_xmr picks by whether a cut will be taken",
+      P.deposit_min_out_xmr(False) == P.MIX_MINIMUM_XMR_MIRROR
+      and P.deposit_min_out_xmr(True) == P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)
+# ...AND THE AGENT PASSES IT, by the SAME predicate _withdraw_fee_argv uses.
+# A floor computed and never put on the argv is the "declared in one place,
+# never wired to the thing that runs" shape this repo keeps finding.
+_mo_base = {"tor_proxy": "socks5h://127.0.0.1:9050",
+            "rpc_primary": "http://127.0.0.1:18083",
+            "rpc_daemon": "http://127.0.0.1:18081",
+            "artifact_dir": "/var/lib/ghostspiral"}
+for _lbl, _mok, _want in (
+        ("no fee destination", _mo_base, P.MIX_MINIMUM_XMR_MIRROR),
+        ("a fee destination", dict(_mo_base,
+                                   usage_fee_addresses=["4" + "7" * 94]),
+         P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)):
+    _steps = A.build_argv("receive_and_quote", {"amount_sat": 5000000}, _mok,
+                          Path("/var/lib/ghostspiral"),
+                          bundle="/x/wallet_a.json", slip="", handle="A3F1",
+                          owned_fee=[])
+    _q = [str(x) for x in _steps[1]]
+    check(f"minout: with {_lbl} the quote step carries --min-out-xmr {_want}",
+          "--min-out-xmr" in _q
+          and _q[_q.index("--min-out-xmr") + 1] == _want)
+# AND thor_swap_preparer ACTS ON IT, before it records the pair or prints an
+# instruction. A flag the receiving tool ignores is the same defect wearing
+# the other end's clothes.
+_TH_SRC = open(os.path.join(REPO, "thor_swap_preparer"), encoding="utf-8").read()
+check("minout: thor_swap_preparer offers the flag",
+      '"--min-out-xmr"' in _TH_SRC)
+check("minout: ...and refuses on it rather than only recording it",
+      "if _min_out and expected_xmr < _min_out:" in _TH_SRC
+      and "quote_below_mix_minimum" in _TH_SRC)
+check("minout: ...BEFORE the pair is appended, so nothing downstream sees a "
+      "quote the mix cannot use",
+      _TH_SRC.index("if _min_out and expected_xmr < _min_out:")
+      < _TH_SRC.index("pairs.append(pair)"))
+check("minout: ...and a malformed value is refused rather than dropped, "
+      "because a gate the caller asked for and this tool ignored is worse "
+      "than either",
+      "positive decimal amount of XMR" in _TH_SRC
+      and "_min_out is None or _min_out <= 0" in _TH_SRC)
+
+# ---- "THERE IS MORE HERE" MEANS MORE THAT CAN ACTUALLY BE MIXED ---------
+#
+# The chain asked _funded_entry whether ANY unlocked output remained, so it
+# chased leftovers it could not process. Two kinds turn up in practice: dust,
+# and a usage fee a run started at the DESK minted onto this wallet -- which
+# _funded_entry genuinely cannot tell from a deposit (there is no marker; see
+# _withdraw_fee_argv for why one was rejected) and which is about a hundredth
+# of a deposit. Each such leg costs a magic packet, a boot, a 5-20 minute
+# jitter and one of twelve daily slots, and comes back "withdraw: failed"
+# with a hint about mixing depth that is not the reason.
+_ml_key = {"rpc_primary": "x", "tor_proxy": ""}
+_ml_saved = A._funded_entry
+try:
+    for _lbl, _atomic, _want in (
+            ("a second deposit well over the floor", 500_000_000_000,
+             "more_left"),
+            ("a desk-minted 1.1% cut on a small deposit", 40_000_000_000, ""),
+            ("dust", 100_000_000, "")):
+        A._funded_entry = (lambda _a: (lambda k, injected=None:
+                                       (7, 1, "4x", _a)))(_atomic)
+        _got = A._phase_of("withdraw", None, key=_ml_key, status="done")
+        check(f"chain: {_lbl} -> {_want!r}", _got == _want)
+    # THE FLOOR IS THE ONE THE DEPOSIT GATE USES, by the same predicate, so a
+    # deposit this tool agreed to take is a deposit the chain will follow.
+    A._funded_entry = lambda k, injected=None: (
+        7, 1, "4x", int(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
+                        * _GS.Decimal(10 ** 12)))
+    check("chain: exactly the floor still counts as more, so the gate is >= "
+          "and not >",
+          A._phase_of("withdraw", None, key=_ml_key, status="done")
+          == "more_left")
+    A._funded_entry = lambda k, injected=None: (
+        7, 1, "4x", int(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
+                        * _GS.Decimal(10 ** 12)) - 1)
+    check("chain: one piconero under it does not", 
+          A._phase_of("withdraw", None, key=_ml_key, status="done") == "")
+    # AND A KEYFILE THAT TAKES A CUT USES THE HIGHER FLOOR, because the cut's
+    # own spend cost is what binds at three wallets.
+    _ml_fee = dict(_ml_key, usage_fee_addresses=["4" + "7" * 94])
+    A._funded_entry = lambda k, injected=None: (
+        7, 1, "4x", int(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
+                        * _GS.Decimal(10 ** 12)))
+    check("chain: an amount over the no-cut floor but under the with-cut one "
+          "is 'more' without a fee destination...",
+          A._phase_of("withdraw", None, key=_ml_key, status="done")
+          == "more_left")
+    check("chain: ...and NOT with one, since that run would take a cut it "
+          "could never spend",
+          A._phase_of("withdraw", None, key=_ml_fee, status="done") == "")
+finally:
+    A._funded_entry = _ml_saved
+
 # THE BUDGET IS SIZED FROM THE DEEPEST ROW, so adding a fourth depth without
 # raising the budget goes red here rather than in production at hour thirteen.
 _deepest = max(_t for _w, _t in P.WITHDRAW_DEPTHS.values())
@@ -2087,32 +2223,32 @@ check("fee: ...and still writes the singular one an older agent reads, as an "
 #
 # EXACTLY THE SAME SHAPE, on the field that decides whether an operator whose
 # only other device is a phone is handed anything to pay at all.
-# gs_wake_agent reads key["plain_slip"] and refuses a keyfile that sets it
+# gs_wake_agent reads key["deposit_in_chat"] and refuses a keyfile that sets it
 # beside a delivery key; gs_telegram_pager renders it; gs_doorbell validates
 # its shape on the wire; gs_wake_proto defines the field; OPSEC_SETUP.md told
-# the operator to `set "plain_slip": true in the vault's keyfile`. That
+# the operator to `set "deposit_in_chat": true in the vault's keyfile`. That
 # keyfile is a SEALED CONTAINER written by gs_wake_keys and by nothing else,
 # so the instruction described an edit nobody could make. A reader, a
 # renderer, a wire format, a well-formedness check and a suite -- no writer.
 check("plain_slip: the pairing offers a flag for it",
-      '"--plain-slip"' in _kp_src)
+      '"--deposit-in-chat"' in _kp_src)
 check("plain_slip: ...and writes it into the keyfile the agent reads",
-      '"plain_slip": bool(args.plain_slip),' in _kp_src)
+      '"deposit_in_chat": bool(args.deposit_in_chat),' in _kp_src)
 # ALWAYS, NOT ONLY WHEN TRUE. An absent field and a false one read the same
 # through .get(), but only one of them says the pairing was asked -- and the
 # agent's loader refuses a value that is not a bool, so writing the bool is
 # what makes that check reachable at all.
 # CODE, NOT PROSE: the comment above the flag quotes the doc sentence this
-# replaced, which itself contains `"plain_slip":`.
+# replaced, which itself contains `"deposit_in_chat":`.
 _ps_line = [_l for _l in _kp_src.splitlines()
-            if '"plain_slip":' in _l and not _l.lstrip().startswith("#")]
+            if '"deposit_in_chat":' in _l and not _l.lstrip().startswith("#")]
 check("plain_slip: ...unconditionally, so the agent's bool check is reachable",
       len(_ps_line) == 1 and "if " not in _ps_line[0])
 # AND THE AGENT REALLY DOES REFUSE THE TWO BAD SHAPES, so the line above is
 # not ceremony: the writer and the reader are checked against each other.
 _ag_src = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 check("plain_slip: ...and the agent refuses a value that is not a bool",
-      'plain_slip_malformed' in _ag_src)
+      'deposit_in_chat_malformed' in _ag_src)
 check("plain_slip: ...and refuses a keyfile that also names a delivery key",
       'delivery_mode_ambiguous' in _ag_src)
 # ONE MODE, NOT TWO, AND THE REFUSAL IS WHERE THE SECOND WOULD BE WRITTEN.
@@ -2123,10 +2259,10 @@ check("plain_slip: ...and refuses a keyfile that also names a delivery key",
 _dk_src = open(os.path.join(REPO, "gs_delivery_key"), encoding="utf-8").read()
 check("plain_slip: gs_delivery_key refuses to write a delivery key over it, "
       "rather than leaving the vault to refuse every wake",
-      'if key.get("plain_slip"):' in _dk_src)
+      'if key.get("deposit_in_chat"):' in _dk_src)
 check("plain_slip: ...and does it BEFORE it mints anything, so a refusal "
       "leaves no orphan key file",
-      _dk_src.index('if key.get("plain_slip"):')
+      _dk_src.index('if key.get("deposit_in_chat"):')
       < _dk_src.index("dk = nacl.public.PrivateKey.generate()"))
 
 # ---- AND THE CLASS OF BUG, NOT JUST THE TWO INSTANCES OF IT -------------
@@ -2154,7 +2290,7 @@ check(f"keyfile: every field the vault reads has a tool that writes it "
 # NON-VACUITY: the scan really found the fields, so an empty difference is
 # not an empty scan.
 check(f"keyfile: NON-VACUITY -- the scan found the real ones ({len(_KEY_READS)})",
-      {"plain_slip", "delivery_public", "allow_withdraw", "wallet_file",
+      {"deposit_in_chat", "delivery_public", "allow_withdraw", "wallet_file",
        "usage_fee_address"} <= _KEY_READS)
 # proto.xmr_address, NOT the withdraw schema's exit_to field. This used to
 # borrow that one, which was fine only while the two happened to be the same

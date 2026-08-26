@@ -3351,13 +3351,13 @@ check("welcome: ...and WHY, because otherwise it reads as a limitation "
 # ...AND THE LINE ABOUT WHERE IT TURNS UP FOLLOWS THE ACTUAL MODE.
 #
 # It said ON THE MACHINE always -- true with no delivery mode set, and false
-# with --plain-slip, where the pair arrives in the chat. The welcome is the
+# with --deposit-in-chat, where the pair arrives in the chat. The welcome is the
 # screen a first-time reader is guaranteed to see, so a fixed sentence there
 # was a fixed claim about a setting, wrong for exactly the operator the
 # setting exists for: the one with a phone and no second machine, told to go
 # and read something at a machine they are not standing at.
 _w_off = pg.welcome_text(0)
-_w_on = pg.welcome_text(0, {"plain_slip": True})
+_w_on = pg.welcome_text(0, {"deposit_in_chat": True})
 check("welcome: with no delivery mode it says the address is on the machine",
       "ON THE MACHINE" in _w_off and "arrive HERE" not in _w_off)
 check("welcome: ...and with plain_slip it says a fresh one arrives HERE, "

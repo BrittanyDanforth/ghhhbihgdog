@@ -1948,6 +1948,58 @@ WITHDRAW_DEPTHS = {
 #: hours.
 WITHDRAW_HOPS = {v[0]: k for k, v in WITHDRAW_DEPTHS.items()}
 
+#: THE SMALLEST XMR A MIX CAN ACTUALLY PROCESS. Mirrored from
+#: GhostSpiral.mix_minimum_xmr, and pinned by tests/test_wake_protocol.py
+#: against GhostSpiral's own arithmetic so the two cannot drift.
+#:
+#: WHY THIS HAS TO EXIST AT ALL. The wire accepts any deposit from
+#: DEPOSIT_MIN_SAT = 0.0001 BTC upward, and nothing anywhere asked whether the
+#: XMR that arrives could be mixed. At any real rate those two numbers differ
+#: by an order of magnitude, so an ordinary small deposit went:
+#:
+#:   1. the chat takes it and quotes a swap;
+#:   2. the operator sends the BTC and ThorChain settles it;
+#:   3. the XMR lands on the entry address, which the swap memo names IN
+#:      PLAINTEXT in a Bitcoin OP_RETURN;
+#:   4. /withdraw refuses at stage 0 -- below the mixing minimum;
+#:   5. the money is stranded on a publicly-named address, and the chat says
+#:      "withdraw: failed", which is true and useless.
+#:
+#: Every stage before 4 succeeded, so the refusal landed after the money had
+#: moved. thor_swap_preparer --min-out-xmr moves it to step 1, where nothing
+#: has been sent yet and refusing is free.
+#:
+#: THE SHALLOWEST DEPTH, because the depth is chosen hours later at the
+#: withdrawal and this figure is needed at the deposit. Below the shallowest
+#: minimum NO depth can mix it and the refusal is unambiguous; above it, the
+#: withdrawal confirm already names the depth it is about to use.
+#:
+#: TWO FIGURES, because the usage fee changes it. A cut has to be worth more
+#: than it costs to spend, and that floor is well above the mixing one at
+#: three wallets -- so on a keyfile that names a fee destination it is the
+#: CUT, not the mix, that sets how small a deposit may be.
+#:
+#: BOTH ARE UNDERSTATEMENTS, deliberately and unavoidably. They are computed
+#: at GhostSpiral's FALLBACK network fee; the real fee comes from the daemon
+#: at run time and is usually higher, which moves the true minimum UP. So the
+#: gate refuses less than it ideally would and never more -- it cannot turn
+#: away a deposit that would have worked, and it still catches the deposits
+#: that are wrong by an order of magnitude, which is the case that strands
+#: money.
+#: STRINGS, NOT Decimal, and that is this module's rule rather than laziness:
+#: see btc_to_sat, which is integer string arithmetic "with no float and no
+#: Decimal" on purpose. These travel to an argv and are parsed by the tool
+#: that owns the arithmetic, so a string is also the shape they are used in.
+MIX_MINIMUM_XMR_MIRROR = "0.1784"
+MIX_MINIMUM_XMR_WITH_CUT_MIRROR = "0.3364"
+
+
+def deposit_min_out_xmr(with_cut: bool) -> str:
+    """The floor a quote must clear for the mix to be able to run at all."""
+    return (MIX_MINIMUM_XMR_WITH_CUT_MIRROR if with_cut
+            else MIX_MINIMUM_XMR_MIRROR)
+
+
 #: GhostSpiral.DECOY_MIN, mirrored, because the box that has to state the
 #: consequence cannot import the file that owns it.
 #:

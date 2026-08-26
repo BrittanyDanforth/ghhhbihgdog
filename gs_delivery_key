@@ -336,7 +336,7 @@ def cmd_new(args) -> int:
     #
     # This check was not needed while nothing could set plain_slip. Now that
     # `gs_wake_keys pair --plain-slip` can, the trap is one command away.
-    if key.get("plain_slip"):
+    if key.get("deposit_in_chat"):
         sys.exit(
             f"[!] {vault_path} is paired with --plain-slip, which already\n"
             f"    delivers the deposit details -- as text, to the chat.\n"
