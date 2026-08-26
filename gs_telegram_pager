@@ -733,13 +733,11 @@ def handle_from_confirmation(key: dict, chat_id: int, text: str) -> str:
 #: and no second machine, being told to go and read something at a machine
 #: they are not standing at.
 _DEPO_ON_MACHINE = (
-    "  /deposit   you pay in Bitcoin. The address and memo appear ON THE "
-    "MACHINE — you need a desktop wallet there to send, because the memo goes "
-    "in an OP_RETURN.")
+    "  /deposit   you pay in Bitcoin. The details appear ON THE MACHINE — pay "
+    "it from there, never from a phone wallet.")
 _DEPO_IN_CHAT = (
-    "  /deposit   you pay in Bitcoin. A fresh address and a memo arrive HERE, "
-    "every time — you need a desktop wallet to send, because the memo goes in "
-    "an OP_RETURN and no phone wallet can do that.")
+    "  /deposit   you pay in Bitcoin. A fresh address and the amount arrive "
+    "HERE, every time — pay it from the machine, not from a phone wallet.")
 _DEPO_LINE = _DEPO_ON_MACHINE
 
 WELCOME_LINES = [
@@ -811,7 +809,7 @@ HELP = "\n".join(
        # command from the list above, so this list stays the whole vocabulary
        # and the keyboard is only the short way to reach four of it.
        "Or use the buttons — they send these same commands.",
-       "The memo goes in an OP_RETURN — desktop wallet, not a phone.",
+       "Deposits are paid from the machine, never from a phone wallet.",
        "",
        "Old spellings: /send reaches /withdraw, /depo reaches /deposit. "
        "/withdraw is the one that pays YOU."]
@@ -1455,11 +1453,18 @@ class Pager:
         would write N of them.
         """
         _lo = proto.exit_arrivals_floor(min(proto.WITHDRAW_DEPTHS))
-        return (f"Send where? Reply with the address — or several, "
-                f"separated by spaces (up to {proto.MAX_WAKE_EXIT_DESTS}).\n"
-                f"Several is better: this sends at least {_lo} separate "
-                f"transactions, and one address collects them all where "
-                f"anyone can group them.\n"
+        # SHOW THE SHAPE, THEN SAY THE ONE THING THEY CANNOT WORK OUT.
+        #
+        # This was three sentences of reasoning and no example. The reader has
+        # to produce a Monero address -- so the fastest thing this can do is
+        # show one, name it, and stop. WHY several is better is a real fact
+        # they cannot guess and it stays, in one clause instead of a sentence.
+        return (f"Where do you want it? Send a Monero address:\n"
+                f"  4AdX...9kPq\n\n"
+                f"Several is better — up to {proto.MAX_WAKE_EXIT_DESTS}, "
+                f"separated by spaces. This arrives as {_lo}+ separate "
+                f"payments, and one address collects them all where anyone "
+                f"can group them.\n"
                 f"/cancel to stop.")
 
     def _settings_text(self) -> str:
@@ -2619,15 +2624,20 @@ class Pager:
                 # fired. Driven with nine arrivals: nine mixes ran.
                 _more = (res.get("phase") or "") == "more_left"
                 _leg = self._chain_leg
-                _msg = ("withdraw: sent — all of it, to the addresses you "
-                        "gave.\n\n"
-                        + ("That was one arrival and there is more here. "
-                           "Starting the next one now — each has to go "
-                           "separately, or spending them together proves "
-                           "they are all yours."
+                # SAID FROM NOWHERE, so it cannot lean on a conversation the
+                # reader may not have in front of them.
+                #
+                # "sent -- all of it, to the addresses you gave" was written
+                # as a reply to a question. This lands up to sixteen hours
+                # after the confirm, on a phone, possibly after a reboot, and
+                # "the addresses you gave" then reads as the bot assuming a
+                # context the reader has to scroll for. It says what happened.
+                _msg = ("withdraw: done. The money has been sent.\n\n"
+                        + ("There is more on this wallet. Starting the next "
+                           "one now — they have to go separately, or spending "
+                           "them together proves they are all yours."
                            if _more else
-                           "That was the last one here — nothing left to "
-                           "send."))
+                           "Nothing is left on this wallet."))
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
                 # end of a job that ran for up to sixteen hours and moved real
@@ -2707,31 +2717,21 @@ class Pager:
                 # own vault keyfile asked for it. gs_wake_proto's "THE PLAINTEXT
                 # SLIP" is where that trade is argued; this branch only renders
                 # it. Two messages: the memo must be copied alone (see below).
-                lines = proto.plain_lines(plain, label=_cn)
-                body, memo = lines[:-1], lines[-1]
+                # ONE MESSAGE, BECAUSE THERE IS NO LONGER A SECOND.
+                #
+                # This used to send the body and then the MEMO on its own,
+                # with a retry and a "do NOT send without it" fallback,
+                # because the memo had to reach a wallet character for
+                # character. The memo does not travel any more -- see
+                # gs_wake_proto.PLAIN_FIELDS -- so all of that goes with it:
+                # the second send, the retry, the failure warning, and the one
+                # field in this record that named the operator's destination.
                 self.send(chat_id,
                           f"{chat_name(job)}: pay this. Confirmation "
                           f"number: {_cn}\n\n"
-                          + "\n".join(body).rstrip(),
+                          + "\n".join(proto.plain_lines(
+                              plain, label=_cn)).rstrip(),
                           buttons=self._handle_buttons(h, job, chat_id))
-                # THE MEMO ALONE IN ITS OWN MESSAGE. Tap-and-hold copies a
-                # WHOLE Telegram message, and this string has to reach a wallet
-                # character-for-character or ThorChain cannot route the swap
-                # and the money is stranded. Anything sharing the message would
-                # be pasted with it.
-                if not self.send(chat_id, memo):
-                    time.sleep(SLIP_RETRY_S)
-                    if not self.send(chat_id, memo):
-                        integrity_log("pager", "memo_undelivered")
-                        self.send(chat_id,
-                                  # SHORT, BUT NOT VAGUE. This is the one
-                                  # message where cutting a word costs
-                                  # money rather than privacy: sent
-                                  # without the memo the transfer does
-                                  # not arrive and does not come back.
-                                  f"MEMO did not get through, twice. Do "
-                                  f"NOT send without it — unroutable. "
-                                  f"/depo again.")
                 return
             if not slip:
                 # A MINTED ADDRESS IS NOT A READY DEPOSIT, AND THIS SAID IT

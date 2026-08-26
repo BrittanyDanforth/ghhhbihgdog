@@ -1528,8 +1528,15 @@ from gs_common import instruction_field_safe as _IFS            # noqa: E402
 
 
 def _slip_gate(v):
-    return P.plain_slip_is_wellformed(
-        {"b": v, "d": "x" * 10, "m": "y" * 10, "x": "z" * 10, "h": "abcd"})
+    # BUILT FROM PLAIN_FIELDS, not from a literal key set. This listed the
+    # fields by hand and carried "m" -- the memo -- long after the memo stopped
+    # travelling, so the record had an EXTRA field and the gate refused every
+    # value on every codepoint. 703 "disagreements" that were one stale
+    # fixture, and the NON-VACUITY check beside it is what said so.
+    _rec = {k: "x" * 8 for k in P.PLAIN_FIELDS}
+    _rec["h"] = "abcd"
+    _rec["b"] = v
+    return P.plain_slip_is_wellformed(_rec)
 
 
 _dis10 = [cp for cp in range(0, 0x300)

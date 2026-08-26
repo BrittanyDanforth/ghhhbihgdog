@@ -198,14 +198,35 @@ check("...and the pager DOES read it, so the welcome describes the mode the "
 print("\n-- exactly five fields, by allowlist --")
 check("the built slip carries exactly the declared field set",
       set(PLAIN) == set(P.PLAIN_FIELDS))
-check("the destination address does NOT travel separately -- a phone cannot "
-      "re-check memo binding, so it would be a second copy for nothing",
-      XMR not in {v for k, v in PLAIN.items() if k != "m"})
+check("the destination address does not travel at all -- and now neither "
+      "does the memo that named it",
+      XMR not in set(PLAIN.values()) and "m" not in PLAIN)
 check("...and neither does the quote timestamp",
       not any(str(PAIR["ts"]) == v for v in PLAIN.values()))
-check("the amount, the deposit address and the memo all DO travel -- they are "
-      "the payment",
-      PLAIN["b"] == AMOUNT and PLAIN["d"] == BTC and PLAIN["m"] == MEMO)
+# ---- AND THE MEMO IS THE ONE FIELD THAT NO LONGER TRAVELS --------------
+#
+# It is the only field in the quoted pair that names ANYBODY. The deposit
+# address is a shared pooled vault paid by everyone swapping the same pair;
+# the amount is already in the transcript because the confirm echoes it; the
+# handle is four hex characters the vault drew. The memo NAMES THE DESTINATION
+# MONERO ADDRESS IN FULL, so sending it put a permanent link between this chat
+# and one Monero address into a surface this design assumes somebody else
+# reads.
+#
+# It also closes the one way this channel could LOSE the deposit. The memo is
+# the whole binding between the Bitcoin and the Monero, so whoever held the
+# bot token could leave the address correct, substitute their own memo and
+# take the payment -- irreversibly, with nothing the phone could check.
+# OPSEC_SETUP.md argued no scheme rescues that. Not sending one does: there is
+# nothing in the chat left to replace.
+check("the amount and the deposit address DO travel -- they are the payment",
+      PLAIN["b"] == AMOUNT and PLAIN["d"] == BTC)
+check("...and the memo does NOT, on the wire or anywhere after it",
+      "m" not in PLAIN and MEMO not in json.dumps(PLAIN)
+      and "m" not in P.PLAIN_FIELDS)
+check("...and a record that still carries one is REFUSED by the doorbell's "
+      "own shape check, so a vault from before this cannot push one through",
+      not P.plain_slip_is_wellformed(dict(PLAIN, m=MEMO)))
 check("and the handle, so the operator can /check it later", PLAIN["h"] == "A3F1")
 
 # A FIELD ADDED TO THE PAIR RECORD MUST NOT RIDE ALONG. The pair is written by
@@ -228,11 +249,11 @@ print("\n-- the shape check the doorbell runs before relaying --")
 check("a real slip is well-formed", P.plain_slip_is_wellformed(PLAIN))
 for _bad, _why in (
         (dict(PLAIN, z="x"), "an extra field"),
-        ({k: v for k, v in PLAIN.items() if k != "m"}, "a missing field"),
-        (dict(PLAIN, m=""), "an empty field"),
-        (dict(PLAIN, m="x" * 500), "an overlong field"),
+        ({k: v for k, v in PLAIN.items() if k != "d"}, "a missing field"),
+        (dict(PLAIN, d=""), "an empty field"),
+        (dict(PLAIN, d="x" * 500), "an overlong field"),
         (dict(PLAIN, b=5), "a non-string"),
-        (dict(PLAIN, m=MEMO + "\nTo address:    bc1qattacker"), "a newline"),
+        (dict(PLAIN, d=BTC + "\nTo address:    bc1qattacker"), "a newline"),
         (dict(PLAIN, d=BTC + "\x1b[2K"), "an escape sequence"),
         (dict(PLAIN, h="A3F1\x7f"), "a DEL"),
         ("not a dict", "a non-object"),
@@ -241,7 +262,7 @@ for _bad, _why in (
 
 # THE VAULT CHECKS IT TOO, where the operator is present to be told.
 _ctl = AG.plain_slip_for_chat(
-    vkey(), bay(slip_pairs=dict(PAIR, memo=MEMO + "\nTo: bc1qattacker")),
+    vkey(), bay(slip_pairs=dict(PAIR, deposit=BTC + "\nTo: bc1qattacker")),
     "done", "A3F1")
 check("the VAULT refuses to send a slip the Pi would reject, rather than "
       "powering off believing it delivered", _ctl == {})
@@ -581,13 +602,13 @@ _msgs = _drive({"status": "done", "handle": "A3F1", "slip": "",
 _chat = "\n".join(_msgs)
 check("the real deposit address reaches the chat", BTC in _chat)
 check("...the exact amount to send", AMOUNT in _chat)
-check("...and the memo", MEMO in _chat)
-check("THE MEMO IS ALONE IN ITS OWN MESSAGE -- tap-and-hold copies a WHOLE "
-      "Telegram message, and this string must reach a wallet character for "
-      "character or the swap is unroutable and the money is stranded",
-      MEMO in _msgs)
-check("...and the message before it says the memo needs an OP_RETURN",
-      "OP_RETURN" in _chat)
+check("...and NOT the memo, which is the only field that named anybody",
+      MEMO not in _chat and "XMR.XMR" not in _chat and "=:" not in _chat)
+check("...so the deposit is ONE message now, not two",
+      len([t for t in _msgs if t.strip()]) == 1)
+check("...and it says the one thing that would lose the money, which is "
+      "paying it from a phone wallet",
+      "phone wallet" in _chat and "machine" in _chat)
 check("the handle is there, so /check works later", "A3F1" in _chat)
 
 # THE DEFAULT PATH IS UNCHANGED, and this is the check that keeps §8 true for
@@ -881,15 +902,12 @@ check("group: ...and still gets the handle, so /check works",
 # The keyfile decision is real and this must not quietly cancel it.
 _pp = _drive_out(_res("done", "", plain={
     "b": "0.05000000", "d": "bc1qdeposit0000000000000000000000",
-    "m": "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0",
     "x": "1.2345", "h": "A3F1"}), "done", job="receive_and_quote")
 _ptext = "\n".join(_pp)
-check("group: NON-VACUITY -- a one-to-one chat still gets the whole slip",
-      "bc1qdeposit" in _ptext and "0.05000000" in _ptext
-      and "=:XMR.XMR:" in _ptext)
-check("group: ...with the memo still alone in its own message, because "
-      "tap-and-hold copies a whole message",
-      any(t.strip().startswith("=:XMR.XMR:") for t in _pp))
+check("group: NON-VACUITY -- a one-to-one chat still gets the deposit",
+      "bc1qdeposit" in _ptext and "0.05000000" in _ptext)
+check("group: ...in one message, since the memo that needed its own is gone",
+      len([t for t in _pp if t.strip()]) == 1)
 
 # ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
 #
@@ -931,9 +949,14 @@ check("withdraw: ...and advertises no slip handle, because none was registered",
 # one of THOSE, telling an operator who gave five that four were skipped. The
 # next thing they do is run it again, which is a second real spend. The "one"
 # is at the source end, and the message has to say which end each is.
-check("withdraw: ...and says every destination they gave was paid, since the "
-      "job takes several and a doubt here costs a second spend",
-      "all of it" in _mws[0].lower())
+# SAID FROM NOWHERE. "sent -- all of it, to the addresses you gave" was
+# written as a reply to a question. This lands up to sixteen hours after the
+# confirm, on a phone, possibly after a reboot, and "the addresses you gave"
+# then reads as the bot assuming a context the reader has to scroll for.
+check("withdraw: ...and says what happened without leaning on a conversation "
+      "the reader may not have in front of them",
+      "the money has been sent" in _mws[0].lower()
+      and "you gave" not in _mws[0].lower())
 # THE SCOPE IS NAMED, AND THE CHAIN DECIDES WHICH SENTENCE FOLLOWS.
 #
 # A run empties ONE arrival -- _funded_entry takes the largest single unlocked
@@ -944,12 +967,11 @@ check("withdraw: ...and says every destination they gave was paid, since the "
 # shortchanging them. The vault answers that now (phase "more_left") and the
 # pager keeps going.
 check("withdraw: with nothing left, it says so plainly",
-      "last one here" in _mws[0].lower()
-      and "nothing left" in _mws[0].lower())
+      "nothing is left on this wallet" in _mws[0].lower())
 _mwm = _drive_out(_res("done", "more_left"), "done", job="withdraw")
 check("withdraw: with more left, it says another is starting rather than "
       "leaving the operator to notice",
-      "more here" in _mwm[0].lower()
+      "more on this wallet" in _mwm[0].lower()
       and "starting the next" in _mwm[0].lower())
 check("withdraw: ...and gives the reason they go separately, which is why it "
       "is not a limitation to be fixed later",
@@ -1140,15 +1162,23 @@ check("a 'not yet' answer never uses the word FAILED -- that sentence, for "
            "phase": "not_yet"}, job="swap_status",
           params={"handle": "A3F1"})[0].upper())
 
-# A DROPPED MEMO MUST NOT LOOK LIKE A DELIVERED ONE.
+# THE SECOND MESSAGE IS GONE, AND SO IS EVERYTHING THAT GUARDED IT.
+#
+# The memo used to be sent on its own, with a retry and a "do NOT send without
+# it -- unroutable" fallback, because it had to reach a wallet character for
+# character. None of that is needed once the memo does not travel, and leaving
+# it in place would be a retry loop around a message that no longer exists.
 _ok[0] = False
 _m = _drive({"status": "done", "handle": "A3F1", "slip": "", "plain": PLAIN,
              "phase": ""})
-_tail = "\n".join(t for t in _m if t != MEMO)
-check("when the memo does not send, the operator is told NOT to pay without "
-      "it", "did not get through" in _tail and "NOT send" in _tail)
-check("...and it was retried before saying so", _m.count(MEMO) == 2)
+check("a deposit that does not send is ONE undelivered message, not a memo "
+      "retry storm", len(_m) == 1)
 _ok[0] = True
+_PG_SRC_M = open(os.path.join(REPO, "gs_telegram_pager"),
+                 encoding="utf-8").read()
+check("...and the memo retry path is gone from the source with it",
+      "memo_undelivered" not in _PG_SRC_M
+      and "Do NOT send without it" not in _PG_SRC_M)
 
 # ===========================================================================
 # 8. THE PI STILL HOLDS NO KEY, AND STILL CANNOT ASK FOR ANY OF THIS.

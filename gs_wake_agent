@@ -2534,8 +2534,23 @@ def _read_json(path: Path):
 #: neither, so both fields would be extra copies of sensitive values in a
 #: transcript, bought for nothing. What is left is exactly what a human needs
 #: to make the payment.
-PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"), ("memo", "m"),
-             ("expected_xmr", "x"))
+#: THE MEMO IS NOT IN THIS MAP, so it never reaches the wire.
+#:
+#: ("memo", "m") was here. It is the only field in the quoted pair that names
+#: anybody: the deposit address is a shared pooled vault, the amount is
+#: already in the transcript because the confirm echoes it, and the handle is
+#: four hex characters this machine drew. The memo NAMES THE DESTINATION
+#: MONERO ADDRESS IN FULL.
+#:
+#: Dropping it here rather than at the pager is the point. The Pi never
+#: receives it, so a stolen bot token, a seized SD card and a compromised
+#: doorbell all hold a record that identifies nothing -- and the substitution
+#: attack OPSEC_SETUP.md says no scheme rescues (hold the token, leave the
+#: address, swap the memo, take the deposit) has nothing left to substitute.
+#:
+#: The operator loses nothing: composing the OP_RETURN needs a desktop wallet,
+#: which is THIS machine, and the memo is on its disk in the quoted pair.
+PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"), ("expected_xmr", "x"))
 
 
 def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,

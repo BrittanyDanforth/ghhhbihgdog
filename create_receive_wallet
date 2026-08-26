@@ -435,7 +435,27 @@ def print_next_steps(bundles: list) -> None:
     # ValueError that shape mismatch already caused once.
     print(f"         --dest-from-receive-wallet "
           f"{' '.join(str(b[1]) for b in bundles)} \\")
+    print("         --min-out-xmr <SEE BELOW> \\")
     print("         --tor-proxy <SOCKS5H_PROXY>")
+    # THE GATE THIS TOOL'S OWN GUIDANCE USED TO WALK PAST.
+    #
+    # --min-out-xmr refuses a quote that would deliver less XMR than a mix can
+    # process, at the one moment refusing is free: before any deposit
+    # instruction exists. Without it the payment settles and only THEN meets
+    # the minimum, at the mix, with the money on an address the swap memo
+    # names publicly. This function's own docstring records the rule --
+    # "a fix that the guidance walks the operator around is not a fix" -- and
+    # it was walking past this one.
+    #
+    # The figure is not printed as a constant because it is not one: it moves
+    # with the network fee and the wallet count, and GhostSpiral is the only
+    # thing that can compute it. --print-limits reads no wallet, opens no
+    # socket and spends nothing, so asking it is free too.
+    print("     The minimum comes from the mix, not from here — it moves with")
+    print("     the network fee. Ask for it (this spends nothing and opens no")
+    print("     socket) and use min_xmr for the shallowest depth you would")
+    print("     accept:")
+    print("       python3 GhostSpiral --print-limits --dag-mixing --wallets 3")
     if n == 1:
         print("     (Splitting into several swaps? Each one needs its OWN address —")
         print("      re-run this tool with --count N and pass all N bundles.)")

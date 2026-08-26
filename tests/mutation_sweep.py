@@ -3095,6 +3095,28 @@ MUTATIONS = [
   '            return "more_left"',
   ["test_wake_agent"]),
 
+ # A "NOT SCANNING" VERDICT FROM A THREE-MINUTE WINDOW. Monero targets a TWO
+ # MINUTE block, so P(no block in 180 s) on a healthy wallet is about 22% --
+ # and /check runs exactly that probe. Better than one in five answered "not
+ # scanning, so this says NOTHING about your money. Check.", about a wallet
+ # doing exactly what it should, at the cost of a boot and a wake slot.
+ ("a stuck-wallet verdict is reached from a window too short to mean it",
+  "receive_watch",
+  "                and stall_s >= LIVENESS_DOUBT_S\n",
+  "",
+  ["test_receive_watch"]),
+
+ # THE GUIDANCE WALKED THE OPERATOR PAST THE GATE. create_receive_wallet's own
+ # next-steps text prints the thor_swap_preparer command to run, and omitted
+ # --min-out-xmr -- so following it produced a quote with no minimum, which is
+ # the deposit-stranding case. Its own docstring names the rule: "a fix that
+ # the guidance walks the operator around is not a fix."
+ ("the next-steps guidance stops naming the minimum gate",
+  "create_receive_wallet",
+  '    print("         --min-out-xmr <SEE BELOW> \\\\")',
+  '    print("")',
+  ["test_receive_wallet_cli"]),
+
  # A DEPOSIT TOO SMALL TO MIX WAS QUOTED, PAID, AND THEN STUCK. The wire took
  # anything from 0.0001 BTC upward and nothing asked whether the XMR that
  # arrives could be mixed -- so the refusal landed at /withdraw, after the
@@ -3258,7 +3280,7 @@ MUTATIONS = [
  ("the help text goes back to describing the setup", "gs_telegram_pager",
   # Re-anchored: HELP is generated, so the prose that could grow back is the
   # tail line rather than the block.
-  '       "The memo goes in an OP_RETURN — desktop wallet, not a phone.",',
+  '       "Deposits are paid from the machine, never from a phone wallet.",',
 
   '    "Memo goes in an OP_RETURN — desktop wallet, not a phone.\\n"\n'
   '    "What comes back depends on the VAULT\'s keyfile: a handle, a sealed "\n'
@@ -3629,15 +3651,13 @@ MUTATIONS = [
  # suite still read the word and the mutation SURVIVED -- an anchor that
  # names a fragment of a message tests the fragment, not the guarantee.
  ("the question stops offering more than one destination", "gs_telegram_pager",
-  '        return (f"Send where? Reply with the address — or several, "\n'
-  '                f"separated by spaces (up to '
-  '{proto.MAX_WAKE_EXIT_DESTS}).\\n"\n'
-  '                f"Several is better: this sends at least {_lo} separate "\n'
-  '                f"transactions, and one address collects them all where "\n'
-  '                f"anyone can group them.\\n"\n'
-  '                f"/cancel to stop.")',
-  '        return (f"Send where? Reply with the address.\\n"\n'
-  '                f"/cancel to stop.")',
+  '        return (f"Where do you want it? Send a Monero address:\\n"\n'
+  '                f"  4AdX...9kPq\\n\\n"\n'
+  '                f"Several is better — up to '
+  '{proto.MAX_WAKE_EXIT_DESTS}, "',
+  '        return (f"Where do you want it? Send a Monero address:\\n"\n'
+  '                f"  4AdX...9kPq\\n\\n"\n'
+  '                f"Send one. "',
   ["test_depo_wizard"]),
 
  # The mirrored decoy floor is what makes the arrival count true.

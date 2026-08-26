@@ -1117,6 +1117,52 @@ check("handoff: main() passes the target, the chunk count, the tolerance "
       "pairs=(args.pairs or \"\")" in _norm_rw)
 
 print()
+# ===========================================================================
+#  A "NOT SCANNING" VERDICT NEEDS A WINDOW THAT SUPPORTS IT
+#
+#  Monero targets a TWO MINUTE block, and this verdict fired on stall_s alone.
+#  gs_wake_agent's swap_status probe -- what /check runs -- passes
+#  --stall-min 3, because the whole probe is three minutes and stall_min may
+#  not exceed timeout_min. P(no block in 180 s) on a HEALTHY wallet is e^-1.5,
+#  about 22%: better than one /check in five answered "not scanning, so this
+#  says NOTHING about your money. Check." -- an alarm about the operator's own
+#  hardware, whose remedy is to go to the machine, produced by a wallet doing
+#  exactly what it should, at the cost of a boot and a daily wake slot.
+# ===========================================================================
+print("\n== a stuck-wallet verdict needs a window long enough to mean it ==")
+
+
+class _FrozenRPC:
+    """Answers balance forever and never advances its height."""
+
+    def get_subaddress_balance(self, account_index, address_index):
+        return (0, 0)
+
+    def raw_request(self, m, p=None):
+        return {"height": 100}
+
+
+def _frozen(stall_min):
+    _t = [0.0]
+    return rw.watch(_FrozenRPC(), 0, 1, Decimal("1"),
+                    timeout_s=stall_min * 60 * 3, stall_s=stall_min * 60,
+                    sleep_fn=lambda s: _t.__setitem__(0, _t[0] + s),
+                    clock=lambda: _t[0], echo=lambda *a, **k: None)
+
+
+check("liveness: the 3-minute /check probe does NOT call a healthy-looking "
+      "wallet stuck -- 180s happens 22% of the time on a two-minute block",
+      _frozen(3)["state"] == "timeout")
+check("liveness: NON-VACUITY -- the long watch's 30-minute window still "
+      "reaches the verdict on the SAME frozen wallet",
+      _frozen(30)["state"] == "not_syncing")
+check("liveness: ...and the floor is the constant this file already chose "
+      "for 'long enough to doubt', not a second one meaning the same thing",
+      rw.LIVENESS_DOUBT_S >= 600
+      and _frozen(rw.LIVENESS_DOUBT_S // 60)["state"] == "not_syncing")
+check("liveness: ...and one minute under it does not",
+      _frozen(max(1, rw.LIVENESS_DOUBT_S // 60 - 1))["state"] == "timeout")
+
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     for f in FAILURES:

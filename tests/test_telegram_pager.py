@@ -2572,7 +2572,7 @@ _n1, _m1 = _chain_run(1)
 check("chain: one arrival runs one mix", _n1 == 1)
 check("chain: ...and says there is nothing left, so the operator is not left "
       "wondering whether they were paid in full",
-      any("last one here" in t and "nothing left" in t for t in _m1))
+      any("nothing is left on this wallet" in t.lower() for t in _m1))
 check("chain: ...and does not announce a next leg that is not coming",
       not any("starting the next" in t for t in _m1))
 
@@ -2587,7 +2587,7 @@ check("chain: ...numbered, so a long chain is followable",
 check("chain: ...and the reason they go separately is given once they matter",
       any("all yours" in t for t in _m3))
 check("chain: ...and the last leg still says nothing is left",
-      any("last one here" in t for t in _m3))
+      any("nothing is left on this wallet" in t.lower() for t in _m3))
 
 # THE CAP. The daily wake budget bounds this anyway; the cap is what stops a
 # wallet reporting "more left" forever -- a stuck scan, or dust that can never
@@ -3111,7 +3111,7 @@ check("chain: a chain write that fails does NOT cost the completion message "
       "— the message IS what happened, as far as the operator is concerned",
       _cs != [])
 check("chain: ...and the message that lands is the real completion one",
-      any("withdraw: sent" in t for t in _cs))
+      any("withdraw: done" in t for t in _cs))
 check("chain: ...and busy is still released, so the pager is not wedged",
       not _cp.busy.locked())
 
@@ -3417,9 +3417,14 @@ check("welcome: ...and with plain_slip it says a fresh one arrives HERE, "
       "every time",
       "arrive HERE" in _w_on and "every time" in _w_on
       and "ON THE MACHINE" not in _w_on)
-check("welcome: ...and BOTH still say what stops a phone paying, which is the "
-      "one mechanism word worth the room",
-      "OP_RETURN" in _w_off and "OP_RETURN" in _w_on)
+# THE MECHANISM WORD IS GONE FROM BOTH, along with the memo it was about.
+# What survives is the instruction that matters -- pay from the machine -- in
+# words that name nothing: OP_RETURN told a reader which chain field carries
+# the routing, which is the operator's business and nobody else's.
+check("welcome: ...and BOTH still say what stops a phone paying, without "
+      "naming the field it turns on",
+      "phone" in _w_off.lower() and "phone" in _w_on.lower()
+      and "OP_RETURN" not in _w_off and "OP_RETURN" not in _w_on)
 check("welcome: NON-VACUITY -- one line differs and the rest of the screen "
       "does not",
       len(_w_off.splitlines()) == len(_w_on.splitlines())
@@ -3517,16 +3522,18 @@ check("welcome: ...reading the real setting rather than a literal",
 check("welcome: ...and a malformed value is treated as off, not as a crash",
       "deleted" not in pg.welcome_text(None)
       and "deleted" not in pg.welcome_text("x"))
-# OP_RETURN IS IN IT NOW, DELIBERATELY. It is not an address, a memo or an
-# amount -- it is the reason a phone cannot complete the payment, and an
-# operator who does not know that tries from the phone and fails. What must
-# stay out is anything that names a destination or a figure.
+# OP_RETURN IS OUT AGAIN, and this check used to insist on it. It was
+# defensible while the memo travelled: a reader who did not know why a phone
+# cannot finish the payment tries from the phone and fails. The memo does not
+# travel now, so the field name buys nothing and tells a reader which chain
+# field carries the routing -- which is the operator's business and nobody
+# else's. The INSTRUCTION survives; the mechanism does not.
 check("welcome: no address, amount or memo is in it",
       not re.search(r"[48][0-9A-Za-z]{50,}", pg.WELCOME)
       and not re.search(r"\d+\.\d{4,}", pg.WELCOME))
-check("welcome: ...and it does say what stops a phone paying, which is the "
-      "one mechanism word worth the room",
-      "OP_RETURN" in pg.WELCOME and "desktop wallet" in pg.WELCOME)
+check("welcome: ...and it does say what stops a phone paying, without naming "
+      "the field that stops it",
+      "phone wallet" in pg.WELCOME and "OP_RETURN" not in pg.WELCOME)
 # ...and it is short enough to read on a phone without scrolling past the
 # buttons. Telegram's own limit is 4096; the constraint here is a thumb.
 check(f"welcome: it fits on a screen ({len(pg.WELCOME)} chars, "
