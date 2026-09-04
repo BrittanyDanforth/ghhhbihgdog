@@ -838,7 +838,7 @@ for _n, _s in (("GhostSpiral", _gs_src), ("receive_watch", _rw_src),
 _cd = ["A", "B", "C", "D"]
 _ca = [Decimal("1.0"), Decimal("0.6"), Decimal("2.1"), Decimal("0.9")]
 _ccar = [(f"CarrierAddr{i}", 200 + i) for i in range(len(_cd) - 1)]
-_cpeels = ghost.build_peel_plan(9, 0, _cd, _ca, carriers=_ccar)
+_cpeels = ghost.build_peel_plan(9, _cd, _ca, carriers=_ccar)
 _cfd, _chop = ghost.select_fanout_targets(_cd, set(), wallets=4, num_decoys=0)
 check("peel+dag: the peeled destinations ARE the DAG hop sources (same outputs)",
       sorted(p["dst"] for p in _cpeels) == sorted(_chop))
@@ -1522,16 +1522,18 @@ except SystemExit:
 check("changesweep: the entry it builds passes the shipped signer's validator",
       _cs_ok)
 
-# BOTH distribution modes must sweep. The peel chain forwards its remainder at
-# every hop, which removed the spend hub -- but each peel still leaves
-# (carrier reserve - real fee) as change, so an N-peel chain makes N deposits.
-# Rotation stopped an address being spent, not being a sink.
+# ONLY THE FAN-OUT SWEEPS. A peel consumes its carrier exactly and the last
+# one sweeps (build_peel_plan), so a peel chain leaves no change at all and
+# _stage5_run's peel branch has no sweep step. It used to have one, guarded on
+# a job list a real run never fills, and this check pinned that dead code by
+# counting its call site as if it were a second sweeping path.
 _s5 = _gs_code[_gs_code.index("def _stage5_run("):]
 _s5 = _s5[:_s5.index("\ndef ")] if "\ndef " in _s5[10:] else _s5
 check("changesweep: the FAN-OUT path sweeps its change",
       _s5.count("_run_change_sweeps(") >= 1)
-check("changesweep: the PEEL path sweeps its change too",
-      _s5.count("_run_change_sweeps(") == 2)
+check("changesweep: the PEEL path does NOT sweep -- a peel leaves no change, "
+      "and the dead sweep step is gone",
+      _s5.count("_run_change_sweeps(") == 1)
 check("changesweep: a failed sweep is reported in the run's incomplete list",
       _s5.count("incomplete.append") >= 3 and "unmixed" in _s5)
 check("changesweep: stage 5 takes the sweep jobs as a parameter",
@@ -1862,7 +1864,7 @@ check("mix account: an operator forced into account 0 is warned",
 _pdests = ["Ma", "Mb", "Mc", "Md"]
 _pamts = [Decimal("1.1"), Decimal("0.7"), Decimal("2.3"), Decimal("0.4")]
 _pcar = [(f"Carrier{i}", 300 + i) for i in range(3)]
-_peel = ghost.build_peel_plan(entry_index=9, change_index=0, dests=_pdests,
+_peel = ghost.build_peel_plan(entry_index=9, dests=_pdests,
                               amounts=_pamts, carriers=_pcar)
 check("peel: one peel per destination", len(_peel) == 4)
 check("peel: peel 0 spends ENTRY (entry_index)", _peel[0]["src_index"] == 9)
@@ -1911,18 +1913,18 @@ check("peel: each peel but the last carries its own (unequal) amount",
       [p["amt"] for p in _peel[:-1]] == [str(a) for a in _pamts[:-1]])
 check("peel: peel_num is sequential 0..N-1",
       [p["peel_num"] for p in _peel] == [0, 1, 2, 3])
-check("peel: empty dests -> empty plan", ghost.build_peel_plan(9, 0, [], []) == [])
+check("peel: empty dests -> empty plan", ghost.build_peel_plan(9, [], []) == [])
 
 # A single-destination chain needs no carrier at all.
 check("peel: a 1-peel chain needs no carrier and spends only ENTRY",
-      ghost.build_peel_plan(9, 0, ["X"], [Decimal("1")])[0]["src_index"] == 9)
+      ghost.build_peel_plan(9, ["X"], [Decimal("1")])[0]["src_index"] == 9)
 
 # THE REGRESSION GUARD. Falling back to subaddress 0 when carriers run out
 # would silently rebuild the exact hub this design removes, and it would look
 # like a working plan. It must raise instead.
 def _no_carrier_raises(nc):
     try:
-        ghost.build_peel_plan(9, 0, ["a", "b", "c"], [Decimal("1")] * 3,
+        ghost.build_peel_plan(9, ["a", "b", "c"], [Decimal("1")] * 3,
                               carriers=[(f"C{i}", 400 + i) for i in range(nc)])
         return False
     except ValueError as e:
@@ -1937,12 +1939,12 @@ check("peel: exactly enough carriers is accepted", not _no_carrier_raises(2))
 
 # Ragged inputs never index out of range: zips to the shorter.
 check("peel: mismatched dests/amounts zips to the shorter length",
-      len(ghost.build_peel_plan(9, 0, ["a", "b", "c"], [Decimal("1")])) == 1)
+      len(ghost.build_peel_plan(9, ["a", "b", "c"], [Decimal("1")])) == 1)
 
 # The whole-chain property, at the size the presets actually use.
 _bigd = [f"d{i}" for i in range(10)]
 _bigc = [(f"c{i}", 500 + i) for i in range(9)]
-_big = ghost.build_peel_plan(7, 0, _bigd, [Decimal("1")] * 10,
+_big = ghost.build_peel_plan(7, _bigd, [Decimal("1")] * 10,
                              carriers=_bigc)
 _bs = _Ctr(p["src_index"] for p in _big)
 check("peel: a 10-peel chain still spends MAIN zero times", _bs.get(0, 0) == 0)
@@ -2314,30 +2316,103 @@ check("money: the reserve the message reports IS the reserve the hop used",
           Decimal("0.0001"), rounding=_RD))
 
 # FAN-OUT must also be able to pay its own fee -- the same question the hop
-# failed. It passes because the stage-4 budget already subtracts total_fees AND
-# only FANOUT_SPEND_FRACTION of what remains is distributed. Driven through the
-# REAL function so a regression in it is caught here.
+# failed. Driven through the REAL, SHIPPED function, compute_fanout_amounts.
+# The singular compute_fanout_amount this used to drive had NO CALLER anywhere
+# in the pipeline, so three "money" checks were pinning a formula the run never
+# executed -- a test in front of dead code. The budget comes from the shipped
+# compute_fee_budget as well, not from a hand-copied wallets*2*deep reserve
+# the signature no longer has.
+import random as _random
 _fo_bad = []
+_fo_seen = 0
+_fo_rng = _random.Random(7)
 for _bal_s in ["0.05", "0.06", "0.1", "0.3", "1", "10"]:
     for _w in [3, 5, 10, 25]:
-        for _d in [1, 2]:
+        for _dag in (False, True):
             _bal = Decimal(_bal_s)
-            _usable = _bal - (_REAL_FEE * ghost.FEE_SAFETY_MARGIN * (_w * 2 * _d))
-            if _usable <= Decimal("0.0001"):
+            _usable, _fees, _txs = ghost.compute_fee_budget(
+                _bal, _REAL_FEE, _w, peel=False, dag_mixing=_dag,
+                exit_set=False)
+            if _usable <= 0:
                 continue
-            _fa = ghost.compute_fanout_amount(_usable, _w)
-            if _fa <= Decimal("0.0001"):
-                continue
-            if (_bal - _fa * _w) < _REAL_FEE:      # nothing left to pay the fee
-                _fo_bad.append((_bal_s, _w, _d))
-check(f"money: fan-out always leaves enough for its own fee "
-      f"(unfundable combos: {_fo_bad})", not _fo_bad)
+            _amts = ghost.compute_fanout_amounts(_usable, _w, _REAL_FEE, _dag,
+                                                 rng=_fo_rng)
+            if not _amts:
+                continue            # [] is the documented "cannot fund N"
+            _fo_seen += 1
+            _floor = ghost.min_exit_fundable(_REAL_FEE, _dag)
+            _cap = _usable * ghost.FANOUT_SPEND_FRACTION
+            if (len(_amts) != _w or sum(_amts) > _cap
+                    or any(_a < _floor for _a in _amts)
+                    or (_bal - sum(_amts)) < _REAL_FEE):
+                _fo_bad.append((_bal_s, _w, _dag))
+check("money: fan-out is exercised on real budgets (non-vacuous)",
+      _fo_seen > 0)
+check(f"money: every fan-out plan has N outputs, each >= the exit floor, "
+      f"summing within the spend fraction, with the fee still payable "
+      f"(bad: {_fo_bad})", not _fo_bad)
 check("money: fan-out total never exceeds the spend fraction it derives from",
-      ghost.compute_fanout_amount(Decimal("1.0"), 7) * 7 <=
-      Decimal("1.0") * ghost.FANOUT_SPEND_FRACTION)
-check("money: compute_fanout_amount rounds DOWN (never up past the budget)",
-      ghost.compute_fanout_amount(Decimal("0.9999999"), 3) * 3 <=
-      Decimal("0.9999999") * ghost.FANOUT_SPEND_FRACTION)
+      sum(ghost.compute_fanout_amounts(Decimal("1.0"), 7, _REAL_FEE, True,
+                                       rng=_random.Random(1)))
+      <= Decimal("1.0") * ghost.FANOUT_SPEND_FRACTION)
+check("money: fan-out shares round DOWN (an awkward budget never overshoots)",
+      sum(ghost.compute_fanout_amounts(Decimal("0.9999999"), 3, _REAL_FEE,
+                                       True, rng=_random.Random(2)))
+      <= Decimal("0.9999999") * ghost.FANOUT_SPEND_FRACTION)
+check("money: fan-out amounts are deliberately unequal",
+      len(set(ghost.compute_fanout_amounts(Decimal("1.0"), 7, _REAL_FEE, True,
+                                           rng=_random.Random(3)))) == 7)
+check("money: a budget that cannot fund N viable outputs returns [] rather "
+      "than a plan that dies mid-flight",
+      ghost.compute_fanout_amounts(Decimal("0.001"), 25, _REAL_FEE, True,
+                                   rng=_random.Random(4)) == [])
+
+# ---------------------------------------------------------------------------
+# STAGE 0 SYNC GATE. The default path was `if h1 > 0: break` -- "the wallet
+# answered", not "the wallet is synced" -- while the docstring promised
+# "synced, so balances are real". A wallet still scanning passed it, stage 4
+# then waited its whole window on a stale balance and called the swap NOT
+# arrived with the money on chain. The verdict is a pure function now, driven
+# here on every shape: behind, at tip, ahead of a stale snapshot, tip unknown,
+# alt disagreeing, alt dead.
+# ---------------------------------------------------------------------------
+check("sync gate: a wallet BEHIND the daemon is not ready (the old gate "
+      "passed this)",
+      any("behind" in r for r in ghost.wallet_sync_reasons(2870000, 2870115)))
+check("sync gate: ...and says by how much",
+      "115 block" in ghost.wallet_sync_reasons(2870000, 2870115)[0])
+check("sync gate: at the tip is ready",
+      ghost.wallet_sync_reasons(2870115, 2870115) == [])
+check("sync gate: within two blocks of the tip is ready",
+      ghost.wallet_sync_reasons(2870113, 2870115) == [])
+check("sync gate: three blocks behind is NOT ready",
+      ghost.wallet_sync_reasons(2870112, 2870115) != [])
+check("sync gate: AHEAD of a stale tip snapshot is ready (the loop can run "
+      "five minutes)",
+      ghost.wallet_sync_reasons(2870120, 2870115) == [])
+check("sync gate: tip unknown degrades to 'answers' -- a positive height "
+      "passes",
+      ghost.wallet_sync_reasons(2870115, 0) == [])
+check("sync gate: tip unknown and height 0 is NOT ready",
+      ghost.wallet_sync_reasons(0, 0) != [])
+check("sync gate: --rpc-alt disagreeing is named as a disagreement",
+      any("disagree" in r for r in
+          ghost.wallet_sync_reasons(2870115, 2870115, h2=2870100)))
+check("sync gate: --rpc-alt agreeing within two blocks is fine",
+      ghost.wallet_sync_reasons(2870115, 2870115, h2=2870114) == [])
+check("sync gate: a dead --rpc-alt is named as never answering, not as "
+      "'out of sync'",
+      any("never answered" in r and "ConnectionError" in r for r in
+          ghost.wallet_sync_reasons(2870115, 2870115,
+                                    alt_err="ConnectionError")))
+check("sync gate: behind AND alt dead reports BOTH",
+      len(ghost.wallet_sync_reasons(2870000, 2870115,
+                                    alt_err="ConnectionError")) == 2)
+# Comment-blanked source, because the loop's own comment quotes the old line.
+_s0_src = code_only(os.path.join(REPO, "GhostSpiral"))
+check("sync gate: stage0 no longer breaks on a merely positive height",
+      "if h1 > 0:" not in _s0_src
+      and "wallet_sync_reasons(h1, _tip, h2, _alt_err)" in _s0_src)
 
 # ---------------------------------------------------------------------------
 # ITEM 5: --btc-entry checksum. bech32_checksum_ok used across the codebase;
@@ -2644,7 +2719,35 @@ for _per, _why in [
     except RuntimeError:
         _raised = True
     check(f"a reply describing {_why} is REFUSED, not reported as ours", _raised)
-check("an empty per_subaddress is still a clean zero", _bal([]) == (0, 0))
+# AN EMPTY/ABSENT per_subaddress IS REFUSED, NOT A CLEAN ZERO. This asserted
+# `== (0, 0)`, which was the bug: monero-wallet-rpc 0.18.3.1 synthesises a
+# zero entry even for an index it does not have, so a reply with NO entry is
+# malformed, not a real empty wallet -- and reporting it as zero made
+# _change_residue print "emptied" and receive_watch read "nothing arrived"
+# about an address the wallet never described. It now fails closed, exactly
+# like the index-mismatch cases above.
+class _BkAbsent:                     # a reply with NO per_subaddress key at all
+    def raw_request(self, m, p): return {}
+
+
+def _bal_absent(acct=0, idx=7):
+    r = gs.MoneroRPC.__new__(gs.MoneroRPC)
+    r._backend = _BkAbsent()
+    return r.get_subaddress_balance(account_index=acct, address_index=idx)
+
+
+# Three DISTINCT shapes, each passed through as itself: an empty list, an
+# explicit null, and a reply that omits the key. A loop that mapped None back
+# to [] before calling would have run the same case twice and called it two.
+for _shape, _call in [("an empty per_subaddress list", lambda: _bal([])),
+                      ("a null per_subaddress", lambda: _bal(None)),
+                      ("a reply with no per_subaddress key", _bal_absent)]:
+    _raised = False
+    try:
+        _call()
+    except RuntimeError:
+        _raised = True
+    check(f"{_shape} is REFUSED, not reported as a zero balance", _raised)
 
 
 # ---------------------------------------------------------------------------
@@ -3274,8 +3377,13 @@ for _bad, _why in (("abc", "not a number"), ("5-x", "half a number"),
 
 import secrets as _sec
 _dv = [ghost.hop_delay((100, 200)) for _ in range(300)]
-check("hop delay: every draw is inside the window",
-      all(100 <= v < 200 for v in _dv))
+# INCLUSIVE at the top. This asserted `< 200`, which pinned the off-by-one it
+# should have caught: randbelow(hi - lo) never returns hi, so the default
+# window's 720 s never occurred and a (0, 1) window was always 0.
+check("hop delay: every draw is inside the window, top included",
+      all(100 <= v <= 200 for v in _dv))
+check("hop delay: the top of the window is reachable ((0, 1) used to be "
+      "always 0)", 1 in [ghost.hop_delay((0, 1)) for _ in range(64)])
 check("hop delay: the window is actually sampled, not pinned to one value",
       len(set(_dv)) > 20)
 check("hop delay: a degenerate window returns that value, not a ZeroDivision "
@@ -3296,7 +3404,7 @@ try:
 finally:
     ghost.create_fresh_account = _real_cfa3
 check("hop delay: the window reaches every peel in the plan",
-      all(p["delay"] == 9000 for p in _p3))
+      all(p["delay"] in (9000, 9001) for p in _p3))
 
 
 # ---------------------------------------------------------------------------
@@ -3676,7 +3784,7 @@ try:
         json.dump({"meta": {}, "txs": []}, _fh)
     with _ctx.redirect_stdout(_io.StringIO()):
         ghost._stage5_run(_StgArgs(dag_mixing=False), _pf_stage, None, [],
-                          str(_stg_live), None, Decimal("9"),
+                          str(_stg_live), None,
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[])
 finally:
@@ -3725,7 +3833,7 @@ try:
     with _ctx.redirect_stdout(_to_out):
         _to_res = ghost._stage5_run(
             _StgArgs(dag_mixing=False), _pf_to, None, [], str(_stg_to), None,
-            Decimal("9"), distribution_mode="fanout", change_target=(4, 0),
+            distribution_mode="fanout", change_target=(4, 0),
             change_sweep_jobs=[], veil_file=_veil_to,
             veil_target=[(11, 1), (22, 1), (33, 1)],
             veil_need=[Decimal("1"), Decimal("1"), Decimal("1")],
@@ -3771,7 +3879,7 @@ try:
         json.dump({"meta": {}, "txs": []}, _fh)
     with _ctx.redirect_stdout(_io.StringIO()):
         ghost._stage5_run(_StgArgs(dag_mixing=False), _pf_d, None, [],
-                          str(_stg_dirty), None, Decimal("9"),
+                          str(_stg_dirty), None,
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[])
 finally:
@@ -4265,7 +4373,7 @@ check("veil: the carrier is a FRESH account, not ENTRY's",
 check("veil: it pays that carrier", _vplan[0]["dst"] == _vaddr)
 check("veil: it honours --hop-delay, which matters most here -- it is the one "
       "hop where an analyst knows both endpoints of the wait",
-      _vplan[0]["delay"] == 100)
+      _vplan[0]["delay"] in (100, 101))     # inclusive window now
 check("veil: the entry it builds passes the shipped signer's validator",
       (lambda: (airgap._validate_plan(_vplan), True)[1])())
 
@@ -4365,8 +4473,10 @@ try:
           _tx.get("account_index") == 5)
     check("changesweep: it pays the destination it was given",
           _tx.get("dst") == "DEST_ADDR")
+    # (600, 601) is INCLUSIVE now that hop_delay reaches the top of its window,
+    # so either value proves the delay came from the run's window.
     check("changesweep: the delay comes from the run's window",
-          _tx.get("delay") == 600)
+          _tx.get("delay") in (600, 601))
     check("changesweep: the entry passes the shipped signer's validator",
           (lambda: (airgap._validate_plan([_tx]), True)[1])())
 finally:
@@ -4453,7 +4563,7 @@ try:
     _vf.write_text(json.dumps({"meta": {}, "txs": [{}]}))
     with _ctx.redirect_stdout(_io.StringIO()):
         ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg", None,
-                          Decimal("9"), distribution_mode="peel",
+                          distribution_mode="peel",
                           change_target=(4, 0), change_sweep_jobs=[],
                           veil_file=_vf, veil_target=(7, 2),
                           veil_need=Decimal("8.5"))
@@ -4486,7 +4596,7 @@ try:
         # _stage5_run returns (incomplete, withheld): a deliberately withheld
         # output is not a failed run -- see report_completion.
         _inc, _wh = ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg",
-                                 None, Decimal("9"), distribution_mode="peel",
+                                 None, distribution_mode="peel",
                                  change_target=(4, 0), change_sweep_jobs=[],
                                  veil_file=_vf, veil_target=(7, 2),
                                  veil_need=Decimal("8.5"))
@@ -4510,7 +4620,7 @@ try:
     ghost.tor_recheck = lambda *a, **k: None
     with _ctx.redirect_stdout(_io.StringIO()):
         ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg", None,
-                          Decimal("9"), distribution_mode="peel",
+                          distribution_mode="peel",
                           change_target=(4, 0), change_sweep_jobs=[],
                           veil_file=None)
 finally:
@@ -4595,7 +4705,7 @@ finally:
 #    carriers exist to remove, silently and on-chain.
 _amts3 = [Decimal("1"), Decimal("1"), Decimal("1")]
 try:
-    ghost.build_peel_plan(entry_index=7, change_index=0,
+    ghost.build_peel_plan(entry_index=7,
                           dests=["A", "B", "C"], amounts=_amts3,
                           carriers=[("CAR1", 11)])            # one short
     check("build_peel_plan: a hop with no carrier RAISES, never falls back to 0",
@@ -4603,7 +4713,7 @@ try:
 except (ValueError, SystemExit):
     check("build_peel_plan: a hop with no carrier RAISES, never falls back to 0",
           True)
-_full3 = ghost.build_peel_plan(entry_index=7, change_index=0,
+_full3 = ghost.build_peel_plan(entry_index=7,
                                dests=["A", "B", "C"], amounts=_amts3,
                                carriers=[("CAR1", 11), ("CAR2", 12)])
 check("build_peel_plan: a complete carrier list still plans",

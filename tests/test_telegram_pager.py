@@ -675,14 +675,19 @@ def _vault(handle):
     if pend is None:
         return
     eph = NP.PrivateKey.generate()
+    # THE CHALLENGE THE VAULT SENT IS THE ONE IT ECHOES. The real vault reports
+    # back the challenge from the M2 it collected, and the doorbell compares
+    # it now -- so a stub posting "" is refused as a result for a boot this
+    # box never answered, which is exactly what it would be.
+    _chal = os.urandom(P.CHALLENGE_BYTES).hex()
     post("/wake", P.seal(_TP, _PI.public_key, P.TAG_M1,
                          {"eph_pk": eph.public_key.encode().hex(),
-                          "challenge": os.urandom(P.CHALLENGE_BYTES).hex(),
+                          "challenge": _chal,
                           "window": pend.window.hex()}))
     time.sleep(0.2)
     post("/result", P.seal(_TP, _PI.public_key, P.TAG_M3,
                            {"job_id": pend.job_id, "status": "done",
-                            "handle": handle, "challenge": "",
+                            "handle": handle, "challenge": _chal,
                             # THE DEFAULT VAULT: no delivery key, no
                             # plain_slip. Empty is the configuration §8
                             # describes, and it is what this end-to-end case
@@ -2576,9 +2581,14 @@ def _chain_run(arrivals):
 # keeping short, with the CAP in the parenthesis dressed as a total.
 _n1, _m1 = _chain_run(1)
 check("chain: one arrival runs one mix", _n1 == 1)
-check("chain: ...and says there is nothing left, so the operator is not left "
-      "wondering whether they were paid in full",
-      any("wallet empty" in t.lower() for t in _m1))
+# NOT "wallet empty". An empty phase also covers an arrival below the mix floor
+# and a wallet that could not be asked -- money possibly still there -- so the
+# line says what was found and no more, in the one sentence the doorbell uses.
+check("chain: ...and says nothing more was FOUND (not that the wallet is "
+      "empty), so the operator is not left wondering whether they were paid "
+      "in full",
+      any(pg.proto.WITHDRAW_NO_MORE_LINE in t for t in _m1)
+      and not any("wallet empty" in t.lower() for t in _m1))
 check("chain: ...and does not announce a next leg that is not coming",
       not any("next one starting" in t.lower() for t in _m1))
 check("chain: ...in ONE message, not a completion and an announcement",
@@ -2612,8 +2622,9 @@ check("chain: ...without inventing a total nothing knows",
               for t in _m3))
 check("chain: ...and the reason they go separately is given once they matter",
       any("all yours" in t for t in _m3))
-check("chain: ...and the last leg still says nothing is left",
-      any("wallet empty" in t.lower() for t in _m3))
+check("chain: ...and the last leg still says nothing more was found",
+      any(pg.proto.WITHDRAW_NO_MORE_LINE in t for t in _m3)
+      and not any("wallet empty" in t.lower() for t in _m3))
 
 # THE CAP. The daily wake budget bounds this anyway; the cap is what stops a
 # wallet reporting "more left" forever -- a stuck scan, or dust that can never
@@ -3001,7 +3012,7 @@ check("tap: ...and a way out, since the message says '/cancel to stop'",
 check("tap: ...and every depth line in the TEXT has a button",
       all(f"{_h} hops" in _ds[-1][0] for _h in P.WITHDRAW_HOPS))
 
-# AND THE CONFIRM DOES NOT GET ONE. CONFIRM_NOTE: this gate "stops a
+# AND THE CONFIRM DOES NOT GET ONE. The gate's note says it "stops a
 # pocket-dial and a message pasted into the wrong chat" -- and a tap IS a
 # pocket-dial. A Yes button would put a spend one accidental touch away and
 # leave that sentence claiming a protection that no longer existed.

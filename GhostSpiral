@@ -136,9 +136,10 @@ FEE_SAFETY_MARGIN = Decimal("1.5")
 # single-source-of-truth problem FEE_SAFETY_MARGIN was pulled out for.
 DEFAULT_HOP_DELAY = (180, 720)
 
-#: Refuse a delay range longer than this. broadcast_signed_xmr caps a
-#: manifest-supplied delay at 7 days, so anything past that would be silently
-#: clamped there instead of doing what the operator asked.
+#: Refuse a delay range longer than this. broadcast_signed_xmr REFUSES a
+#: manifest-supplied delay above MAX_PLANNED_DELAY (the same 7 days) with a
+#: sys.exit -- it does not clamp -- and by then the plans are written. So the
+#: refusal belongs here, before anything is planned.
 HOP_DELAY_MAX = 7 * 24 * 3600
 
 
@@ -166,7 +167,8 @@ def parse_hop_delay(spec, default=DEFAULT_HOP_DELAY) -> tuple:
         raise ValueError(f"--hop-delay MIN-MAX is backwards: {lo} > {hi}")
     if hi > HOP_DELAY_MAX:
         raise ValueError(f"--hop-delay above {HOP_DELAY_MAX}s (7 days) would be "
-                         f"clamped by the broadcaster anyway; got {hi}s")
+                         f"refused by the broadcaster after the plans are "
+                         f"written; got {hi}s")
     return (lo, hi)
 
 
@@ -205,7 +207,9 @@ def hop_delay(window=None) -> int:
     # every caller wants the same CSPRNG, and offering the choice is what let
     # `secrets.SystemRandom().randbelow(540)` sit in the change sweep from the
     # commit that introduced it, raising on every sweep it ever built.
-    return lo if hi <= lo else lo + secrets.randbelow(hi - lo)
+    # INCLUSIVE OF hi. randbelow(n) is [0, n), so `hi - lo` alone never returned
+    # hi: a (0, 1) window was always 0 and the default's 720 s never occurred.
+    return lo if hi <= lo else lo + secrets.randbelow(hi - lo + 1)
 
 
 # Fraction of the post-fee balance the fan-out distributes. The remainder stays
@@ -865,22 +869,6 @@ def min_exit_fundable(fee_xmr: Decimal, dag_enabled: bool) -> Decimal:
             return amt
         amt += DUST_XMR
     return amt
-
-
-def compute_fanout_amount(usable: Decimal, fanout_count: int) -> Decimal:
-    """Per-destination fan-out amount.
-
-    Extracted alongside compute_hop_amount so BOTH money formulas are driven by
-    tests against the real function instead of a reimplementation.
-
-    ROUND_DOWN matters: quantising up would make fanout_count * result exceed
-    the FANOUT_SPEND_FRACTION budget it was derived from. The caller guards
-    fanout_count > 0 (mix_targets excludes ENTRY, so a degenerate subaddress
-    set would otherwise divide by zero) and compares the result against
-    DUST_XMR.
-    """
-    return (usable * FANOUT_SPEND_FRACTION / Decimal(fanout_count)).quantize(
-        DUST_XMR, rounding=ROUND_DOWN)
 
 
 def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
@@ -2223,7 +2211,7 @@ def build_peel_stage_plan(rpc, addr_index: dict, entry_account: int,
             f"    transaction proving those peels share an owner. Nothing has been\n"
             f"    spent. Check the wallet RPC.")
     core = build_peel_plan(
-        entry_index=entry_index, change_index=0, dests=dests, amounts=amounts,
+        entry_index=entry_index, dests=dests, amounts=amounts,
         carriers=carriers)
     plan = []
     for p in core:
@@ -2262,8 +2250,7 @@ def build_peel_stage_plan(rpc, addr_index: dict, entry_account: int,
     return plan, []
 
 
-def build_peel_plan(entry_index: int, change_index: int,
-                    dests: list, amounts: list,
+def build_peel_plan(entry_index: int, dests: list, amounts: list,
                     carriers: list = None) -> list:
     """A PEELING CHAIN: N single-destination transactions instead of one
     N-output fan-out.
@@ -2378,7 +2365,7 @@ def build_peel_plan(entry_index: int, change_index: int,
     `carriers` is a list of (address, subaddress_index) for the fresh carriers,
     one per peel; the last peel needs none and any extra is ignored. Pure and
     deterministic; returns core entries the caller decorates with the src
-    address, a per-peel delay and tx 'extra'. Returns [] for no dests.
+    address, a per-peel delay; no tx_extra is ever written (see build_entry_veils). Returns [] for no dests.
 
     There is no `remainders` argument any more. It used to carry what each peel
     forwarded, computed from the reserve schedule at PLANNING time -- hours
@@ -2398,8 +2385,10 @@ def build_peel_plan(entry_index: int, change_index: int,
             src_idx = carriers[i - 1][1]
         else:
             # No carrier was provisioned for this hop. Falling back to
-            # change_index would silently rebuild the exact hub this function
-            # exists to remove, so refuse instead.
+            # subaddress 0 would silently rebuild the exact hub this function
+            # exists to remove, so refuse instead. (A change_index parameter
+            # sat in the signature for exactly that fallback and was never
+            # read -- the refusal is the whole design.)
             raise ValueError(
                 f"peel {i} has no carrier to spend: {len(carriers)} carrier(s) "
                 f"provided for {n} peels (need at least {n - 1}). Refusing to "
@@ -4208,8 +4197,9 @@ def build_cli() -> argparse.ArgumentParser:
                           f"together and no transaction ever spends two "
                           f"chunks. Not supported with --peel.")
     cli.add_argument("--btc-amount", type=decimal_arg,
-                     help="Total BTC amount for ThorChain swap "
-                          "(required when --split > 0 in sender mode)")
+                     help="Total BTC amount for ThorChain swap (sender mode). "
+                          "Leave it out for MANUAL mode, where you send the "
+                          "XMR to the entry address yourself.")
     # The three flags below all size ONE decision: when has all of the swapped
     # XMR arrived on ENTRY? Under --split N that is a real question with a
     # wrong answer available (see wait_for_swap_arrival).
@@ -4259,7 +4249,9 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
                      help="Primary monero-wallet-rpc endpoint")
     cli.add_argument("--rpc-alt",
-                     help="Fallback monero-wallet-rpc endpoint")
+                     help="Second monero-wallet-rpc whose height must agree "
+                          "with --rpc-primary at start-up. A cross-check "
+                          "only: nothing fails over to it.")
     cli.add_argument("--output", default="./unsigned",
                      help="Output directory for unsigned TX plans")
     cli.add_argument("--joinmarket-wallet",
@@ -4448,7 +4440,11 @@ def resolve_sensitive_inputs(args) -> None:
         # max_value, because positive=True alone leaves 1e30 through -- finite,
         # positive, and 39 digits against a 28-digit context, so the first
         # fmt_btc() on it raises InvalidOperation. See BTC_ABSURD_TOTAL.
-        args.btc_amount = decimal_env("GS_BTC_AMOUNT", _amt, positive=True,
+        # BOTH NAMES: the value may have come from either, and a refusal that
+        # cites only the variable told an operator who typed --btc-amount 0
+        # that GS_BTC_AMOUNT was wrong.
+        args.btc_amount = decimal_env("--btc-amount / GS_BTC_AMOUNT", _amt,
+                                      positive=True,
                                       max_value=BTC_ABSURD_TOTAL)
 
     # Exactly one entry mode. argparse enforced this while --btc-entry was a
@@ -4646,6 +4642,33 @@ def refuse_hot_wallet(rpc) -> None:
         "    through it — the air gap is the point, not an inconvenience.")
 
 
+def wallet_sync_reasons(h1: int, tip: int, h2=None, alt_err: str = "") -> list:
+    """Why the wallet is NOT ready to plan against, or [] when it is.
+
+    PURE, so the gate that decides whether stage 4 waits on real balances can
+    be driven directly instead of only through a live daemon. `tip` is the
+    daemon's height from the egress probe (0 = unknown), `h2` the --rpc-alt
+    height when one was read, `alt_err` the error name when it could not be.
+
+    `h1 < tip - 2`, not `abs(h1 - tip) > 2`: the tip is a snapshot taken
+    before a loop that can run five minutes, so a live wallet legitimately
+    overtakes it. AHEAD of a stale snapshot is fine; BEHIND is the defect.
+    """
+    why = []
+    if tip > 0:
+        if h1 < tip - 2:
+            why.append(f"wallet is {tip - h1} block(s) behind the daemon "
+                       f"(still scanning)")
+    elif h1 <= 0:
+        why.append("wallet-rpc reports height 0")
+    if alt_err:
+        why.append(f"--rpc-alt never answered get_height ({alt_err})")
+    elif h2 is not None and abs(h1 - h2) > 2:
+        why.append(f"--rpc-primary and --rpc-alt disagree by "
+                   f"{abs(h1 - h2)} block(s)")
+    return why
+
+
 def stage0_preflight(args, proxy) -> tuple:
     """Every gate that must hold BEFORE this run is allowed to touch money.
 
@@ -4663,7 +4686,9 @@ def stage0_preflight(args, proxy) -> tuple:
         daemon still broadcasts from the operator's IP. Checked at startup,
         not at broadcast time, because by then the plan exists and the
         temptation is to send it anyway;
-      * wallet-rpc reachable AND synced, so balances are real;
+      * wallet-rpc reachable AND at the daemon's chain tip, so balances are
+        real (when the daemon height is unknown the check degrades to
+        "answers", and prints that it did);
       * a live fee estimate, which refuses an implausible one rather than
         sizing a spend off a fresh/offline chain's numbers.
 
@@ -4780,32 +4805,68 @@ def stage0_preflight(args, proxy) -> tuple:
     # costs a confusing failure with the plans already written to disk.
     refuse_hot_wallet(rpc_primary)
 
-    # Sync guard: wait for nodes to agree on height
+    # Sync guard: THE WALLET MUST BE AT THE CHAIN TIP, not merely answering.
+    #
+    # The default path was `if h1 > 0: break`, which proves only that
+    # wallet-rpc is up and has scanned at least one block. A wallet still
+    # catching up passes it with balances that are hours stale, and the
+    # docstring above then promises "synced, so balances are real": stage 4
+    # sits out its whole arrival window on a balance the wallet has not
+    # scanned yet and reports the swap as NOT arrived while the money is on
+    # chain. The daemon's own height was already fetched by the egress probe
+    # (get_info) and thrown away; it is the reference the wallet has to reach.
+    #
+    # `>= tip - 2`, not `abs(...) <= 2`: the tip is a snapshot from before
+    # this loop, which can run five minutes, so the wallet legitimately
+    # overtakes it. AHEAD of a stale snapshot is fine; BEHIND is the defect.
+    # When the daemon height is unknown (probe failed, remote daemon with no
+    # proxy) the old answering-check is all that is left, and that is SAID
+    # rather than silently accepted as sync.
+    _tip = int(egress.get("height") or 0)
+    if _tip <= 0:
+        print("  [!] Daemon height unknown (egress probe: "
+              f"{egress.get('detail') or 'no detail'}), so wallet sync can "
+              "only be checked as 'wallet-rpc answers'. Balances may be "
+              "stale: confirm the wallet is at the chain tip yourself.")
+        integrity_log("stage0", "daemon_height_unknown")
+    _why = ["wallet-rpc never answered get_height"]
     for attempt in range(30):
         if shutdown_requested():
             sys.exit("[!] Shutdown requested during sync wait.")
         try:
-            h1 = rpc_primary.raw_request("get_height", {})["height"]
+            h1 = int(rpc_primary.raw_request("get_height", {})["height"])
+            h2, _alt_err = None, ""
             if rpc_alt:
-                h2 = rpc_alt.raw_request("get_height", {})["height"]
-                if abs(h1 - h2) <= 2:
-                    break
-            else:
-                if h1 > 0:
-                    break
+                # A CROSS-CHECK, NOT A FAILOVER: nothing ever switches to it.
+                # Its own failure is named as its own, not folded into
+                # "nodes out of sync" -- a node that never answered was never
+                # compared with anything.
+                try:
+                    h2 = int(rpc_alt.raw_request("get_height", {})["height"])
+                except Exception as e:                       # noqa: BLE001
+                    _alt_err = type(e).__name__
+                    integrity_log("stage0", f"rpc_alt_height_err:{_alt_err}")
+            _why = wallet_sync_reasons(h1, _tip, h2, _alt_err)
+            if not _why:
+                break
         except Exception as e:
+            _why = [f"wallet-rpc get_height failed ({type(e).__name__})"]
             integrity_log("stage0", f"rpc_height_err:{type(e).__name__}")
         time.sleep(10)
     else:
-        sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
-    # Height coarsened to the SAME granularity integrity_log coarsens its own
-    # timestamp to. That function buckets time to 600s specifically "to reduce
-    # the correlation window between the log and blockchain timestamps" -- and
-    # then this line wrote an exact block height, which pins the run to a
-    # single ~2-minute block and defeats the bucketing by a factor of five.
-    # Five blocks is the same ~10 minutes, so the diagnostic value survives and
-    # the precision does not.
-    integrity_log("stage0", f"rpc_sync_ok:height~{int(h1) // 5 * 5}")
+        # WHICH ONE, so the operator does not restart the wrong box. This
+        # said "RPC nodes out of sync" for every case, including the one
+        # where a node never answered and nothing was ever compared.
+        sys.exit(f"[!] Wallet not ready after 5 min: {'; '.join(_why)}. "
+                 f"Abort.")
+    # NO HEIGHT ON THE CHAIN. This wrote `height~{h1 // 5 * 5}` under a note
+    # that "the diagnostic value survives" the coarsening -- but chain_safe
+    # strips every digit before the line is written, so the file held
+    # `rpc_sync_ok:height~#` and the arithmetic was dead. The height goes to
+    # the terminal, where it is a diagnosis; the chain records that the gate
+    # passed.
+    print(f"  [+] Wallet at height {h1}" + (f" (daemon {_tip})" if _tip > 0 else ""))
+    integrity_log("stage0", "rpc_sync_ok")
 
     # allow_fallback forwarded, and "fee_fetched" no longer claims more than
     # happened: it read as success whether the daemon answered or the run
@@ -4858,34 +4919,18 @@ def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
     DECOY_MAX decoys are assumed, because the real count is drawn at random
     later and this is a reserve. FEE_SAFETY_MARGIN stays on top, via
     hop_fee_reserve: the estimate is taken once at startup and the mempool can
-    move under a multi-day run. On the measured run that lands at 0.1296 XMR
-    against 0.0727 actually spent -- 1.8x, where the old formula was 0.79x.
+    move under a multi-day run. On the measured run's shape (4 wallets,
+    --peel --dag-mixing, an exit set) that lands at 0.1224 XMR over 34
+    counted transactions against 0.0727 actually spent -- 1.68x, where the
+    old formula was 0.79x. (Driven through this function; an earlier note
+    here said 0.1296 / 1.8x, figures it no longer produces.)
     """
-    # `deep` INFLATES THIS RESERVE WITHOUT ADDING A SINGLE TRANSACTION, and
-    # that is stated rather than quietly corrected.
-    #
-    # The formula reads as "one transaction per round", and `deep` sits in it
-    # as though depth meant more hop ROUNDS. It does not: --deep is a
-    # multiplier on the DAG adjacency's out-degree (build_dag_adjacency),
-    # assign_hop_destinations still gives every source exactly ONE
-    # destination, and _stage5_run runs exactly one DAG round. So a wider
-    # `deep` widens the candidate pool for a choice made once, and changes the
-    # transaction count not at all.
-    #
-    # Measured on a 10 XMR run, 12 wallets, 0.0024 XMR fee: --deep 1 holds
-    # back 0.0864 XMR and --deep 6 holds back 0.5184 XMR, for the same ~35
-    # transactions. The 0.432 XMR difference does not vanish -- it is not
-    # distributed, so it stays as change, is swept once to a fresh address,
-    # and is reported UNMIXED. Turning the knob up moves the operator's money
-    # OUT of the mix.
-    #
-    # NOT SILENTLY CHANGED HERE. Under-reserving is the expensive failure --
-    # the docstring above says it "fails on the LAST hop with 'not enough
-    # money', after the funds have already been split across subaddresses" --
-    # and a live chain's real per-transaction fee cannot be measured from
-    # here. Dropping `deep` would be a 2-to-6x cut in the safety margin
-    # justified by arithmetic alone. The cost is made visible to the operator
-    # instead (see --deep's help), and the reserve stays conservative.
+    # NO `deep` TERM. The reserve is one fee per transaction the run will make
+    # (counted by _runtime_terms), and --deep adds none: it widens the DAG
+    # adjacency's out-degree for a choice assign_hop_destinations makes once.
+    # The old `wallets * 2 * deep` formula, and the long note that stood here
+    # defending its `deep` factor as a safety margin, described a parameter
+    # this signature no longer has.
     class _Shape:
         pass
     _Shape.peel = bool(peel)
@@ -5782,7 +5827,10 @@ def resolve_exit_destinations(args) -> None:
     # "roughly 4 separate output(s)" while the run measurably withdrew 8 and 9
     # in two real end-to-end runs. Understating is the wrong direction for a
     # warning whose whole force is HOW MANY arrivals land on one address.
-    _w = max(int(getattr(args, "wallets", 0) or 0), 1)
+    # MIN_WALLETS, not 1: main() clamps --wallets UP to MIN_WALLETS after this
+    # runs (`args.wallets = max(args.wallets, MIN_WALLETS)`), so --wallets 1
+    # warned "AT LEAST 3" about a run that withdraws at least 5.
+    _w = max(int(getattr(args, "wallets", 0) or 0), MIN_WALLETS)
     # A FLOOR, not a range, and not --wallets.
     #
     # Four measured end-to-end runs, all --wallets 4:
@@ -6092,8 +6140,10 @@ def resolve_usage_fee(args) -> None:
         paid a transaction to move money to itself. Refused rather than
         warned, because the fan-out has already been planned around it by the
         time anything would notice.
-      * THE CUT ADDRESS IS THE BTC ENTRY. A Monero validator would not catch
-        it, and it is the shape a copy-paste slip takes.
+      * THE CUT ADDRESS IS THE BTC ENTRY. The Monero validator DOES catch it,
+        with a generic "not a Monero address" that names no cause -- so this
+        check runs BEFORE the validator and says what happened: it is the
+        shape a copy-paste slip takes.
 
     THERE IS NO BTC-SIDE CUT AND THERE WILL NOT BE ONE. Bitcoin amounts are
     public and exact, and the ThorChain memo publishes ENTRY in a plaintext
@@ -6137,7 +6187,7 @@ def resolve_usage_fee(args) -> None:
     # Bounding it here closes the traceback, NaN/Infinity, and the
     # denormal-to-zero case in one place, on the value both branches read.
     if _pct_given is not None:
-        _pct_given = decimal_env("GS_USAGE_FEE_PCT", _pct_given,
+        _pct_given = decimal_env("--usage-fee-pct / GS_USAGE_FEE_PCT", _pct_given,
                                  positive=True,
                                  max_value=USAGE_FEE_PCT_MAX)
     _addr = env_or_argv("GS_USAGE_FEE_ADDRESS",
@@ -6164,6 +6214,14 @@ def resolve_usage_fee(args) -> None:
     args.usage_fee_pct = (Decimal(str(_pct_given)) if _pct_given is not None
                         else USAGE_FEE_PCT)
     _check_fee_pct(args)
+    # BEFORE THE MONERO VALIDATOR, or this never fires: a bc1 address fails
+    # validate_xmr_address first with a generic message, and the operator is
+    # not told the one thing that explains it -- they pasted the BTC entry.
+    # The docstring's claim that the validator "would not catch it" had it
+    # backwards: it catches it and says the less useful thing.
+    if args.usage_fee_address == (getattr(args, "btc_entry", None) or object()):
+        sys.exit("[!] --usage-fee-address is the BTC entry address. That is a "
+                 "copy-paste slip, not a destination.")
     validate_xmr_address(args.usage_fee_address, "--usage-fee-address")
     _refuse_fee_combinations(args)
     for _d in (getattr(args, "exit_to", None) or []):
@@ -6176,9 +6234,6 @@ def resolve_usage_fee(args) -> None:
                 f"    having paid a transaction to move your money to itself. "
                 f"Give the usage fee its own\n"
                 f"    address, or drop --usage-fee.")
-    if args.usage_fee_address == (getattr(args, "btc_entry", None) or object()):
-        sys.exit("[!] --usage-fee-address is the BTC entry address. That is a "
-                 "copy-paste slip, not a destination.")
     integrity_log("usagefee", "address_validated")
 
 
@@ -6399,7 +6454,7 @@ def resolve_swap_arrival(args) -> None:
         "The expected total XMR")
     if _exp is not None:
         args.expect_total_xmr = decimal_env(
-            "GS_EXPECT_TOTAL_XMR", _exp, positive=True,
+            "--expect-total-xmr / GS_EXPECT_TOTAL_XMR", _exp, positive=True,
             max_value=XMR_ABSURD_TOTAL)
 
     tol = getattr(args, "swap_tolerance", SWAP_TOLERANCE_DEFAULT)
@@ -6622,7 +6677,7 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
         if not chunk_amounts:
             print(f"      That assumes your {n_chunks} swaps were EQUAL. If "
                   f"they were not, the smallest one may be smaller than this "
-                  f"gate allows for — pass --pairs, or check the arrival "
+                  f"gate allows for — pass --swap-pairs (receiver mode), or check the arrival "
                   f"yourself before the run plans.")
         elif len(chunk_amounts) != n_chunks:
             print(f"      {n_chunks - len(chunk_amounts)} of your {n_chunks} "
@@ -7161,7 +7216,9 @@ def limits_report(args) -> dict:
     THE MINIMUM IS NOT ONE NUMBER, and pretending otherwise is how a UI lies.
     It moves with --wallets (each mix output reserves its own fees), with
     --dag-mixing (an output that never hops reserves one transaction fewer),
-    and with the cut (which binds harder than the mix below about 15 wallets).
+    and with the cut (whose flat floor is the binding term below about 13
+    wallets at the fallback fee -- driven: 0.3364 flat until the per-wallet
+    mix term passes it at 13).
     So this returns the whole curve and lets the page look up the row the
     operator has actually selected.
 
@@ -8023,8 +8080,11 @@ def establish_entry_set(args, rpc_primary, addr_index, jm_utxos,
             #
             #     n_chunks = len(swap_deposits) or max(args.split, 1)
             #
-            # and receiver mode has no swap_deposits, so --split IS n_chunks
-            # here, and n_chunks feeds swap_arrival_floor. Measured: with
+            # so --split IS n_chunks ONLY WHEN swap_deposits is empty -- receiver
+            # mode WITHOUT a --swap-pairs bundle that matches this address. When
+            # a bundle does match, len(swap_deposits) wins and --split is
+            # discarded (the printed warning below says so). In the no-bundle
+            # case handled here, n_chunks feeds swap_arrival_floor. Measured: with
             # --expect-total-xmr 4 and the default 10% tolerance, --split 1
             # gives a floor of 3.6 and --split 12 gives 3.666..., because once
             # the implied per-chunk size falls below the tolerance the gate
@@ -8057,11 +8117,27 @@ def establish_entry_set(args, rpc_primary, addr_index, jm_utxos,
                   f"address, and there is no --btc-amount to divide. For N "
                   f"genuinely separate entries, mint N bundles "
                   f"(create_receive_wallet --count N) and run once per bundle.")
-            print(f"      It DOES tell the arrival gate to expect "
-                  f"{args.split} separate payments to this one address, which "
-                  f"tightens the gate so one missing payment cannot hide "
-                  f"inside the tolerance. That is the right value if "
-                  f"{args.split} swaps are routed here.")
+            # --split ONLY reaches the gate when nothing else counts the swaps.
+            # stage4 computes `n_chunks = len(swap_deposits) or max(args.split,
+            # 1)`, so a --swap-pairs bundle that routes swaps to THIS address
+            # supplies swap_deposits and WINS: the gate then expects one payment
+            # per matched pair and --split is silently discarded. Claiming
+            # --split sets the count regardless is the trap -- an operator who
+            # sent three swaps, has a one-pair bundle, and passes --split 3
+            # believes the gate waits for three when it waits for one, funds
+            # after the first, and strands the other two on the entry address.
+            if getattr(args, "swap_pairs", None):
+                print(f"      A --swap-pairs bundle is set. If it routes swaps "
+                      f"to THIS address, the gate counts the matched pairs "
+                      f"(one payment each) and --split {args.split} is IGNORED. "
+                      f"Make the bundle name every swap that lands here -- do "
+                      f"not lean on --split to widen a gate the bundle sets.")
+            else:
+                print(f"      With no matching bundle, --split {args.split} IS "
+                      f"the gate count: it makes the gate expect {args.split} "
+                      f"separate payments to this one address, so one missing "
+                      f"payment cannot hide inside the tolerance. That is the "
+                      f"right value if {args.split} swaps are routed here.")
         integrity_log("stage3", "entry_reused_from_receive_wallet")
         print(f"  [+] ENTRY (from receive wallet): "
               f"{scrub_address(receive_entry_addr)}")
@@ -8292,15 +8368,20 @@ def _runtime_terms(args, n_chunks: int, mix_outputs: int, mean: Decimal,
         resolve_exit_destinations' arrival warning had before it was corrected
         to a floor.
 
-    Measured against a full --peel --dag-mixing run with one chunk and seven
-    mix outputs: veil 1 + peels 7 + hops 7 + change sweeps 7 + exits 14 = 36
-    transactions on chain. The old terms summed to 22 -- a 39% undercount, on
-    the number whose own docstring says an operator who believes it and then
+    The 36 measured on a --peel --dag-mixing run with one chunk and seven mix
+    outputs (veil 1 + peels 7 + hops 7 + change sweeps 7 + exits 14) was the
+    PREVIOUS peel design, which left change on every carrier. A peel now
+    consumes its carrier exactly (build_peel_plan), so that shape counts
+    veil 1 + peels 7 + hops 7 + exits 7 = 22 -- driven through this function
+    -- and 22 is the right number for it, not the undercount it once was. The
+    number matters because an operator who believes an estimate and then
     waits longer "concludes the run has hung and interrupts it", which is the
     one failure this pipeline cannot recover from automatically.
 
-    Returned as a pair so the count can be shown alongside the time: "~14h" is
-    a number to doubt, "36 transactions, ~14h" is a number to check.
+    Returned as a pair because BOTH halves are consumed: compute_fee_budget
+    reserves one fee per counted transaction (`_, rounds = _runtime_terms(`)
+    and estimate_runtime keeps the seconds (`secs, _ = ...`). Nothing prints
+    the count beside the time.
     """
     _peel = bool(getattr(args, "peel", False))
     # ZERO under --peel. Every peel consumes its carrier exactly and the last
@@ -8429,13 +8510,10 @@ def resolve_swap_deposits(args, proxy, jm_utxos, receive_mode, entry_addr,
 
         if jm_utxos:
             btc_chunks = jm_utxos
-        elif args.btc_amount is not None and args.btc_amount <= 0:
-            # Falling through the `> 0` test below landed in the manual-mode
-            # branch, which told the operator "No --btc-amount specified"
-            # for an amount they had plainly specified.
-            sys.exit(f"[!] --btc-amount must be positive (got "
-                     f"{args.btc_amount}).")
         elif args.btc_amount and args.btc_amount > 0:
+            # No `<= 0` branch: resolve_entry_mode already routed the value
+            # through decimal_env(positive=True), so a non-None amount here is
+            # positive and the re-check this replaced could never fire.
             num_splits = max(args.split, 1)
             btc_chunks = split_btc_amount(args.btc_amount, num_splits,
                                           secrets.SystemRandom())
@@ -8479,6 +8557,11 @@ def resolve_swap_deposits(args, proxy, jm_utxos, receive_mode, entry_addr,
             total_expected, _unreadable_quotes, _ = swap_expected_total(swap_deposits)
             print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
             print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+            if _unreadable_quotes:
+                print(f"  [!] {_unreadable_quotes} of {len(swap_deposits)} "
+                      f"chunk(s) carry no readable quote, so that total "
+                      f"UNDERSTATES what should arrive. Stage 4 sizes the "
+                      f"gate for them separately.")
             print_sender_instructions(swap_deposits)
         else:
             integrity_log("stage2", "manual_mode")
@@ -8568,7 +8651,11 @@ def main():
 
     proxy = validate_proxy(args.tor_proxy)
 
-    rpc_primary, rpc_alt, fee_xmr = stage0_preflight(args, proxy)
+    # The alt endpoint's whole job is the height cross-check inside
+    # stage0_preflight; nothing after this line reads it and nothing fails
+    # over to it (see --rpc-alt's help). Binding it by name here implied
+    # otherwise.
+    rpc_primary, _, fee_xmr = stage0_preflight(args, proxy)
 
     ###########################################################################
     # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
@@ -8959,7 +9046,7 @@ def main():
         # All four veil/delay kwargs below are required -- see _stage5_run.
         incomplete, withheld = _stage5_run(args, fanout_file, dag_file,
                                  fanout_targets_indexed,
-                                 staging_dir, proxy, usable,
+                                 staging_dir, proxy,
                                  distribution_mode=distribution_mode,
                                  change_target=(bal_account, 0),
                                  change_sweep_jobs=change_sweep_jobs,
@@ -9240,11 +9327,15 @@ def _child_env(wallet_password: str = None) -> dict:
     third-party program. That is not a fix, it is a change of address.
 
     Default-deny is free here: nothing GhostSpiral spawns reads a GS_ variable
-    except the SIGN phase, which reads GS_WALLET_PASSWORD. Checked by grepping
-    every child -- airgap_tx_signer reads only GS_WALLET_PASSWORD,
-    broadcast_signed_xmr reads none.
+    except the SIGN phase (GS_WALLET_PASSWORD) and, through gs_common's import,
+    the GS_DEBUG_RPC_LOG switch -- which the strip below used to remove, so the
+    operator's debug opt-in never reached the signer or the broadcaster. It is
+    a switch, not a secret, and is passed through by name. Checked by grepping
+    every child.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("GS_")}
+    if os.environ.get("GS_DEBUG_RPC_LOG"):
+        env["GS_DEBUG_RPC_LOG"] = os.environ["GS_DEBUG_RPC_LOG"]
     if wallet_password is not None:
         env[GS_PW_ENV] = wallet_password
     # THE ONE GS_ VARIABLE A CHILD IS GIVEN BACK, and it carries no value of
@@ -9317,14 +9408,26 @@ def _stage5_cleanup(outdir_path: Path, *current_files):
                               f"cleaned_old_plan:{old_plan.name}:{'ok' if ok else 'FAILED'}")
                 if not ok:
                     print(f"  [!] Could not securely erase {old_plan}; remove it manually.")
+        # THE PREVIOUS RUN'S CHAIN-ONCE MARKER, which open_chain_once_marker's
+        # docstring said this function "already covers" and it did not: only
+        # unsigned_*.json was globbed. The marker is deleted at a clean exit,
+        # so one still here belongs to a run that crashed -- and this run's
+        # own is created AFTER this cleanup, so nothing current can match.
+        for old_marker in list(outdir_path.glob(".chain_once_*")):
+            ok = secure_delete_file(old_marker)
+            integrity_log("stage5",
+                          f"cleaned_old_chain_marker:{'ok' if ok else 'FAILED'}")
+            if not ok:
+                print(f"  [!] Could not securely erase {old_marker}; remove it manually.")
 
 
 def _run_round(args, plan_file, staging_dir, label, wipe: bool = True):
     """Create -> sign -> broadcast one plan file. Aborts on any failure.
 
     Each round gets its own staging subdir so its unsigned/signed blobs and
-    manifest never collide with another round's. Returns the number of TXs
-    broadcast for this round.
+    manifest never collide with another round's. Returns _run_round_body's
+    count of TXs broadcast; every caller discards it and relies on the
+    abort-on-failure contract instead.
 
     THE STAGING IS WIPED HERE, for every round, because three of the five
     rounds were not wiping it. _run_peel_chain wipes its own per-peel staging
@@ -9633,7 +9736,7 @@ def _wait_for_fanout_confirm(args, targets, proxy, what="fan-out"):
         rpc = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
     except Exception as e:
         integrity_log("stage5", f"confirm_rpc_connect_fail:{type(e).__name__}")
-        print(f"  [!] Could not connect wallet-rpc to await fan-out confirmation: {e}")
+        print(f"  [!] Could not connect wallet-rpc to await {what} confirmation: {e}")
         return False
 
     print(f"  [*] Waiting for {len(targets)} {what} output(s) to confirm+unlock "
@@ -10898,6 +11001,10 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                   f"re-read after the withdrawals "
                   f"({', '.join(str(a) for a in _new_unreadable)}), so this "
                   f"exit cannot be called complete. Check them yourself.")
+            # COUNTED ONCE. This filtered against the INITIAL list only, so
+            # an account unreadable in pass 1 was "new" again in pass 2 and
+            # `failed` grew twice for one account.
+            _unreadable = list(_unreadable) + _new_unreadable
         # A HELD ADDRESS THAT BECAME FUNDED DURING THE EXIT STILL HAS TO BE
         # NAMED. This is not a corner case -- it is the case _exit_hold_list is
         # written for: "a swap chunk that settled late". If it settles while
@@ -10961,7 +11068,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
 
 
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
-                proxy, spendable_amount, distribution_mode="fanout",
+                proxy, distribution_mode="fanout",
                 change_target=(0, 0), change_sweep_jobs=None,
                 change_accounts=None,
                 delay_window=None, veil_file=None, veil_target=None,
@@ -10971,7 +11078,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
-    then the exit-strategy simulation.
+    then the exit withdrawals (_run_exit_withdrawals), which move real value
+    out. The exit-strategy simulator is a separate tool and is not run here.
 
     veil_file/veil_target/veil_need and delay_window are REQUIRED for a real
     run even though they default to None. The entry veil (Round 0 below) and
@@ -11146,57 +11254,14 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         _landed += _dist_landed
         if _total_peels and _relayed < _total_peels:
             incomplete.append(f"peeling chain relayed only {_relayed}/{_total_peels} peels")
-        # Every peel left (carrier reserve - real fee) as change on its OWN
-        # account's subaddress 0. Rotating carriers stopped any address being
-        # spent twice; running each hop in its own account is what lets each
-        # of those change outputs be swept SEPARATELY.
-        #
-        # They must not be collected in one transaction. N inputs in one tx is
-        # public, permanent proof that those N outputs share an owner, and
-        # they are the change of the N peels -- so a single tidy sweep would
-        # announce that the whole chain was one entity. One sweep each.
-        if change_sweep_jobs and _relayed:
-            try:
-                with open(fanout_file) as _mf:
-                    _cs_meta = json.load(_mf).get("meta", {})
-            except Exception:                                # noqa: BLE001
-                _cs_meta = {}
-            # ONLY THE PEELS THAT ACTUALLY RAN LEFT CHANGE.
-            #
-            # change_sweep_jobs is provisioned for EVERY hop in the plan, in
-            # hop order, before the chain runs. A chain that stops early leaves
-            # the rest of those accounts never funded -- and _wait_for_change_settled
-            # cannot distinguish "nothing arrived yet" from "nothing is ever
-            # coming", so it waited out FANOUT_CONFIRM_TIMEOUT on each one.
-            # That is one hour per unrun peel: a 7-peel chain that stopped at
-            # the first peel spent ~6 hours polling accounts that could not
-            # hold anything, and then reported them as "NOT swept — UNMIXED",
-            # which is true of an empty address and tells the operator to go
-            # looking for money that was never there.
-            #
-            # _relayed is the count the chain actually relayed, and the jobs are
-            # in the same hop order, so everything past it is provably empty.
-            _runnable = change_sweep_jobs[:_relayed]
-            _skipped_jobs = change_sweep_jobs[_relayed:]
-            if _skipped_jobs:
-                integrity_log("stage5", "change_sweeps_skipped_unrun_peels")
-                print(f"  [*] {len(_skipped_jobs)} change location(s) belong to "
-                      f"peels that never ran, so they hold nothing. Skipping "
-                      f"them rather than waiting "
-                      f"{FANOUT_CONFIRM_TIMEOUT // 60} minutes each to watch an "
-                      f"empty address.")
-            _missed = _run_change_sweeps(args, _runnable, staging_dir,
-                                         proxy, _cs_meta, delay_window)
-            # Only when every sweep relayed. A sweep that failed left its fresh
-            # destination unfunded, and the landing gate would poll it for the
-            # full hour before giving up on money that was never sent.
-            if not _missed:
-                _landed += list(sweep_targets or ())[:len(_runnable)]
-            if _missed:
-                incomplete.append(
-                    f"{_missed} of {len(_runnable)} peel change output(s) "
-                    f"were NOT swept to a fresh address — they are unmixed on their "
-                    f"hop's change address")
+        # NO CHANGE SWEEPS UNDER --peel, AND NO CODE FOR THEM EITHER. A peel
+        # consumes its carrier exactly and the last one sweeps, so nothing
+        # lands on any subaddress 0 (build_peel_plan); build_peel_stage_plan
+        # returns no change accounts, main() builds no sweep jobs from them,
+        # and change_sweep_jobs is always empty on this branch. The forty-line
+        # sweep step that stood here was guarded on it and could not run --
+        # dead code describing the previous peel design, which DID leave
+        # change, kept alive by a test that handed it jobs a real run cannot.
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
         # THE ONE TRANSACTION THAT CREATES EVERY MIX OUTPUT, and it was the

@@ -283,9 +283,11 @@ def mint_one_receive(wallet_rpc, args, seen_addrs=None, seen_accts=None,
     # printed, and the operator had no reason to go and delete anything.
     #
     # Here, between verify and write, is the only place the claim is true.
-    # main() still calls it as well: that is the caller's own bookkeeping over
-    # the WHOLE run, and a guard asserted in one place and enforced in another
-    # is how this repo's own comments describe half its defects.
+    # main() does NOT call it (it used to): the seen-sets it updates are
+    # main()'s bookkeeping over the WHOLE run, threaded in here so the guard is
+    # asserted and enforced in the one place the claim is true -- a guard
+    # asserted in one place and enforced in another is how this repo's own
+    # comments describe half its defects.
     if seen_addrs is not None and seen_accts is not None:
         refuse_duplicate_receive(addr_str, acct_idx, seen_addrs, seen_accts,
                                  n, count)

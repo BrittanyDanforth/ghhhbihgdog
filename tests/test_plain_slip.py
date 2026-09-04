@@ -328,6 +328,10 @@ def pending(job="receive_and_quote", params=None):
 
 
 def m3(pend, **over):
+    # A RESULT FOLLOWS A HANDOVER. The doorbell refuses an M3 whose challenge
+    # it never issued in an M2, so the harness records the one it is about to
+    # echo -- what on_m2 does when a real vault collects the job.
+    pend._issued.setdefault((b"\0" * 32, bytes.fromhex("a" * 64)), b"")
     body = {"job_id": pend.job_id, "challenge": "a" * 64, "status": "done",
             "handle": "A3F1", "slip": "", "plain": {}, "phase": ""}
     body.update(over)
@@ -995,8 +999,12 @@ check("withdraw: ...and numbers the leg without inventing a total",
 # were left, so being paid a third of what they put in read as the tool
 # shortchanging them. The vault answers that now (phase "more_left") and the
 # pager keeps going.
-check("withdraw: with nothing left, it says so plainly",
-      "wallet empty" in _mws[0].lower())
+# NOT "wallet empty": an empty phase also covers an arrival below the mix
+# floor and a wallet that could not be asked, so the line says what was found,
+# in the one sentence the doorbell uses too.
+check("withdraw: with nothing more found, it says so plainly -- and does not "
+      "call the wallet empty",
+      P.WITHDRAW_NO_MORE_LINE in _mws[0] and "wallet empty" not in _mws[0].lower())
 _mwm = _drive_out(_res("done", "more_left"), "done", job="withdraw")
 check("withdraw: with more left, it says another is starting rather than "
       "leaving the operator to notice",

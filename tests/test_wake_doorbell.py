@@ -646,9 +646,15 @@ check("doorbell/withdraw: ...and says there is more here, in the protocol's "
       and "more_left" not in _wd_more)
 _wd_last = _report_text("withdraw", {"status": "done", "handle": "",
                                      "slip": "", "plain": {}, "phase": ""})
-check("doorbell/withdraw: ...and with no phase it says nothing is left, "
-      "rather than falling silent",
-      "Nothing is left on this wallet" in _wd_last)
+# NOT "nothing is left": an empty phase also covers an arrival below the mix
+# floor and a wallet that could not be asked, so the line may only say what
+# was observed -- and it must be the chat's sentence, word for word, or the
+# by-hand path stops being a way to check the automated one.
+check("doorbell/withdraw: ...and with no phase it says nothing more was "
+      "FOUND (not that the wallet is empty), rather than falling silent",
+      P.WITHDRAW_NO_MORE_LINE in _wd_last
+      and "Nothing is left" not in _wd_last
+      and "empty" not in _wd_last.lower())
 # NON-VACUITY: a DEPOSIT still takes the deposit path, so this is a branch and
 # not a rewrite of report().
 _dep = _report_text("receive_and_quote",

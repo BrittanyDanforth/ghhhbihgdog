@@ -446,7 +446,7 @@ class Pending:
         #: nothing to parallelise; the same lock serialises on_m3, whose
         #: "already reported a result" test has the identical shape.
         self._lock = threading.Lock()
-        #: THIS WINDOW, AND ONLY THIS ONE. 32 fresh bytes the vault must echo
+        #: THIS WINDOW, AND ONLY THIS ONE. WINDOW_BYTES (16) fresh bytes the vault must echo
         #: in M1, fetched from /window before it seals anything.
         #:
         #: WITHOUT IT ONE CAPTURE BECOMES A PERMANENT REMOTE DoS. The response
@@ -554,14 +554,19 @@ class Pending:
             if cached is not None:
                 self.events.append("m1_retry")
                 return cached
-            if not self.fetch_open():
-                raise Doorbell("fetch window closed")
             if self._issued:
                 # A DIFFERENT authenticated ephemeral after one was already
                 # served. Queue depth is one: the second boot gets nothing
                 # rather than a second copy of the job.
+                #
+                # BEFORE THE WINDOW TEST, or a second boot arriving after the
+                # window closed was refused as "fetch window closed" and never
+                # recorded -- and it is the one event _report_events exists
+                # to surface.
                 self.events.append("m1_second_ephemeral")
                 raise Doorbell("job already handed over to a different boot")
+            if not self.fetch_open():
+                raise Doorbell("fetch window closed")
             m2 = proto.seal(
                 pi_sk, nacl.public.PublicKey(eph), proto.TAG_M2,
                 {"job_id": self.job_id, "challenge": chal.hex(),
@@ -617,6 +622,15 @@ class Pending:
                     f"(missing {missing}, unexpected {extra}). The vault and this "
                     f"Pi are running different versions of gs_wake_proto: update "
                     f"both, in the same sitting.")
+            # THE CHALLENGE, COMPARED. It sat in the required key set and its
+            # VALUE was never read: a result naming any hex passed. The job id
+            # is 16 random bytes so nothing hung on it, but a field that is
+            # carried, required and unread is wire weight dressed as a check.
+            # It has to be one this box actually issued in an M2.
+            _ch = body.get("challenge")
+            if not isinstance(_ch, str) or not any(
+                    hmac.compare_digest(_ch, c.hex()) for (_e, c) in self._issued):
+                raise Doorbell("result echoes a challenge this box never issued")
             status = body.get("status")
             if status not in ("done", "refused", "failed"):
                 raise Doorbell("result carries no usable status")
@@ -1120,6 +1134,8 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
         "role": "pi",
         "secret": sk.encode().hex(),
         "peer_public": agreed["peer_public"],
+        # Read by nothing on this box; gs_wake_agent --dry-run prints the
+        # vault's copy so the two boxes' codes can be compared after the fact.
         "pair_fingerprint": agreed["sas"],
         "listen_host": my_host,
         "listen_port": int(port),
@@ -1359,17 +1375,23 @@ def _report_events(pending: Pending) -> None:
               f"cannot read it, and nothing ran.")
         print(f"      The vault refuses a repeated job id on its own ledger, "
               f"so this cannot have run the job twice. CHECK THE VAULT.")
+    retry = pending.events.count("m1_retry")
+    if retry:
+        print(f"  [*] {retry} wake note(s) repeated a boot this box had already "
+              f"answered and were served the same job record again -- a retry, "
+              f"or a note replayed on the LAN. Nothing ran twice.")
     bad = pending.events.count("result_bad")
     if bad:
-        # Deliberately NOT called hostile. Any host on the LAN can post 296
-        # bytes of noise here and land in this count.
+        # Deliberately NOT called hostile. Any host on the LAN can post one
+        # 1064-byte record of noise here and land in this count (anything of
+        # another length is refused before it reaches it).
         print(f"  [*] {bad} record(s) posted to /result did not authenticate "
               f"and were discarded.")
     # THE TWO WIRE-BREAK EVENTS, WHICH WERE RECORDED AND NEVER PRINTED.
     #
     # This function exists because "`events` was collected and never read by
-    # anything" -- and it still read only three of the five words the code
-    # writes. The two it missed are the two that say a HALF-UPGRADED PAIR is
+    # anything" -- and it still read only three of the event words the code
+    # writes (five then, eleven now). The two it missed said a HALF-UPGRADED PAIR is
     # on the switch, and the comment at the site that writes the first of them
     # says in as many words that the wire break "has to name itself".
     #
@@ -1427,13 +1449,23 @@ def report(pending: Pending) -> int:
             if _ph:
                 print(f"      {proto.PHASE_LINES.get(_ph, _ph)}")
             else:
-                print(f"      Nothing is left on this wallet.")
+                # NOT "nothing is left" -- see WITHDRAW_NO_MORE_LINE for the
+                # three things an empty phase means. Same words as the chat.
+                print(f"      {proto.WITHDRAW_NO_MORE_LINE}")
             return 0
         h = pending.result.get("handle") or "(none)"
         print(f"  [+] Vault finished job {pending.job}. Handle {h}.")
         phase = pending.result.get("phase") or ""
         if phase:
             print(f"      Swap status: {proto.PHASE_LINES.get(phase, phase)}")
+        if pending.job in ("swap_status", "watch"):
+            # A PROBE IS ANSWERED BY ITS PHASE LINE. It carries no slip and no
+            # deposit instructions, and falling through printed "The deposit
+            # address, the memo and the slip stayed on the vault" about a
+            # /check -- a deposit's closing line, on a job that issued none.
+            if not phase:
+                print(f"      No status was reported.")
+            return 0
         plain = pending.result.get("plain") or {}
         if plain:
             # Printed here for the same reason the sealed blob is: this is the

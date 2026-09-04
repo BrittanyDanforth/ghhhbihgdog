@@ -641,7 +641,7 @@ def _drive_stage5(args_ns, recorder):
         os.makedirs(stg, exist_ok=True)
         with contextlib.redirect_stdout(io.StringIO()):
             return ghost._stage5_run(
-                args_ns, _plan, None, [], stg, None, 1,
+                args_ns, _plan, None, [], stg, None,
                 distribution_mode="fanout", change_target=(4, 0),
                 change_sweep_jobs=None, delay_window=(0, 0),
                 exit_accounts=ghost._exit_account_list(_addr_index, [], 3),
@@ -814,7 +814,7 @@ def _drive_stage5_exit(residue, hold=(), entry_pairs=(), fee_hold=()):
             # not stdout -- report_completion prints it back in main() -- so a
             # stdout-only driver cannot see whether the run named what it kept.
             _S5_RET["ret"] = ghost._stage5_run(
-                              _a, _plan, None, [], _st, None, 1,
+                              _a, _plan, None, [], _st, None,
                               distribution_mode="fanout",
                               change_target=None, change_sweep_jobs=None,
                               delay_window=(0, 0),
@@ -917,7 +917,7 @@ try:
     os.makedirs(_cstg, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()) as _cout:
         ghost._stage5_run(
-            _cargs, _plan, None, [], _cstg, None, 1,
+            _cargs, _plan, None, [], _cstg, None,
             distribution_mode="fanout", change_target=(3, 0),
             change_sweep_jobs=[(3, 0, "DST", 9)], delay_window=(0, 0),
             exit_accounts=ghost._exit_account_list(_cai, [], 3),
@@ -979,28 +979,26 @@ check("CHANGE HOLD: ...but does say it is unmixed either way",
 
 
 # ==========================================================================
-# G8: A PARTIAL PEEL CHAIN WAITED AN HOUR PER PEEL THAT NEVER RAN
+# G8: A PEEL CHAIN HAS NO CHANGE SWEEPS, AND NOW NO CODE FOR THEM
 # ==========================================================================
-print("\n=== change sweeps skip peels that never ran ===")
+print("\n=== a peel chain runs no change sweeps ===")
 #
-# change_sweep_jobs is provisioned for EVERY hop in the plan, in hop order,
-# before the chain runs. A chain that stops early leaves the rest of those
-# accounts never funded — and _wait_for_change_settled cannot tell "nothing
-# arrived yet" from "nothing is ever coming", so it waited out
-# FANOUT_CONFIRM_TIMEOUT (3600s) on each. A 7-peel chain stopping at the first
-# peel spent ~6 hours polling addresses that could not hold anything, then
-# reported them "NOT swept — UNMIXED", sending the operator to look for money
-# that was never there.
+# This section used to drive _stage5_run's peel branch with change_sweep_jobs
+# a real run cannot produce. A peel consumes its carrier exactly
+# (build_peel_plan), build_peel_stage_plan returns no change accounts, and
+# main() builds no sweep jobs from them -- so the "skip the sweeps of peels
+# that never ran" step it exercised was guarded on a list that is always
+# empty, and lived on only because this harness handed it jobs. The step is
+# gone. What is left to hold is that the peel branch never sweeps, never
+# claims to, and that the dead step did not quietly come back.
 _g8_seen = []
 _g8_saved = (ghost._run_peel_chain, ghost._run_change_sweeps,
              ghost._run_round, ghost._wait_for_fanout_confirm,
              ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
              ghost.secure_delay, ghost._wait_for_carrier,
              ghost._run_exit_withdrawals)
-
-
 def _g8_run(total_peels, relayed):
-    """Drive _stage5_run's peel branch; return the jobs the sweeps were given."""
+    """Drive _stage5_run's peel branch as main() does (no sweep jobs)."""
     _g8_seen.clear()
     d = _tf.mkdtemp(prefix="g8_")
     plan = os.path.join(d, "peel.json")
@@ -1008,7 +1006,6 @@ def _g8_run(total_peels, relayed):
         json.dump({"meta": {}, "txs": [{"i": i} for i in range(total_peels)]}, fh)
     stg = os.path.join(d, "tx_staging")
     os.makedirs(stg, exist_ok=True)
-    jobs = [(10 + i, 0, f"DST{i}", 1) for i in range(total_peels)]
     try:
         ghost._run_peel_chain = lambda *a, **k: relayed
         ghost._run_change_sweeps = lambda a, j, *rest, **k: (
@@ -1020,50 +1017,30 @@ def _g8_run(total_peels, relayed):
         ghost.newnym = lambda *a, **k: None
         ghost.tor_recheck = lambda *a, **k: None
         ghost.secure_delay = lambda *a, **k: None
-        # the exit is a separate concern; this drive is about the sweeps
         ghost._run_exit_withdrawals = lambda *a, **k: (0, 0, 0, 0, 0)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             ghost._stage5_run(
                 types.SimpleNamespace(**{**vars(_wargs), "peel": True}),
-                plan, None, [], stg, None, 1,
+                plan, None, [], stg, None,
                 distribution_mode="peel", change_target=(4, 0),
-                change_sweep_jobs=jobs, delay_window=(0, 0))
+                change_sweep_jobs=[], delay_window=(0, 0))
         return list(_g8_seen), buf.getvalue()
     finally:
         (ghost._run_peel_chain, ghost._run_change_sweeps, ghost._run_round,
          ghost._wait_for_fanout_confirm, ghost.integrity_log, ghost.newnym,
          ghost.tor_recheck, ghost.secure_delay, ghost._wait_for_carrier,
          ghost._run_exit_withdrawals) = _g8_saved
-
-
 _g8_jobs, _g8_out = _g8_run(total_peels=7, relayed=1)
-check("G8: a chain that relayed 1 of 7 peels sweeps only 1 change location",
-      len(_g8_jobs) == 1)
-check("G8: ...and it is the FIRST one, matching hop order",
-      _g8_jobs and _g8_jobs[0][0] == 10)
-check("G8: ...and the operator is told why the rest were skipped",
-      "never ran" in _g8_out and "hold nothing" in _g8_out)
-
-# The saving, stated in the units that matter.
-check(f"G8: that is {6 * ghost.FANOUT_CONFIRM_TIMEOUT // 3600} hours of "
-      f"polling empty addresses avoided",
-      ghost.FANOUT_CONFIRM_TIMEOUT >= 3600)
-
-# A COMPLETE chain must be unaffected — the fix must not skip real change.
+check("G8: a partial peel chain runs NO change sweeps -- a peel leaves none",
+      _g8_jobs == [])
+check("G8: ...and says nothing about skipping the sweeps of unrun peels",
+      "never ran" not in _g8_out and "hold nothing" not in _g8_out)
 _g8_full, _g8_fout = _g8_run(total_peels=7, relayed=7)
-check("G8: a chain that relayed ALL 7 peels still sweeps all 7",
-      len(_g8_full) == 7)
-check("G8: ...and says nothing about skipping", "never ran" not in _g8_fout)
-
-# Partial in the middle, to show it is the count and not a special case.
-_g8_mid, _ = _g8_run(total_peels=12, relayed=5)
-check("G8: 5 of 12 relayed -> exactly 5 change locations swept",
-      len(_g8_mid) == 5)
-check("G8: ...in hop order, not an arbitrary subset",
-      [j[0] for j in _g8_mid] == [10, 11, 12, 13, 14])
-
-
+check("G8: a complete peel chain runs no change sweeps either", _g8_full == [])
+_g8_src = open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read()
+check("G8: the unrun-peel sweep step is gone from the source, not merely "
+      "unreached", "change_sweeps_skipped_unrun_peels" not in _g8_src)
 # The hold itself: drive _stage5_run with jobs EMPTY but change_accounts set,
 # and confirm the exit refuses to withdraw those accounts.
 _saved_h = (ghost._run_round, ghost._wait_for_change_settled,
@@ -1090,7 +1067,7 @@ try:
     _hs = os.path.join(_tf.mkdtemp(prefix="chgacct_"), "tx_staging")
     os.makedirs(_hs, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()):
-        ghost._stage5_run(_ha2, _plan, None, [], _hs, None, 1,
+        ghost._stage5_run(_ha2, _plan, None, [], _hs, None,
                           distribution_mode="fanout",
                           change_target=None,
                           change_sweep_jobs=[],        # every job failed
@@ -1645,7 +1622,7 @@ try:
     with contextlib.redirect_stdout(_s5out):
         _s5inc, _s5wh = ghost._stage5_run(
             _s5args, _s5plan, None, [(90, 1), (91, 1), (92, 1)], str(_s5stg),
-            None, Decimal("9"), distribution_mode="peel",
+            None, distribution_mode="peel",
             change_target=(7, 0), change_sweep_jobs=[], change_accounts=[],
             delay_window=(0, 0), exit_accounts=[90, 91, 92], exit_hold=[])
 finally:
@@ -1682,7 +1659,7 @@ try:
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(
             _s5args, _s5plan, None, [(90, 1), (91, 1), (92, 1)], str(_s5stg2),
-            None, Decimal("9"), distribution_mode="peel",
+            None, distribution_mode="peel",
             change_target=(7, 0), change_sweep_jobs=[], change_accounts=[],
             delay_window=(0, 0), exit_accounts=[90, 91, 92], exit_hold=[])
 finally:

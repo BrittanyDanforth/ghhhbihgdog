@@ -805,8 +805,12 @@ check("isolation: ...and neither does the chunk index",
 _own = "socks5h://mine:secret@127.0.0.1:9050"
 check("isolation: operator-supplied credentials are not overwritten",
       gs.isolated_proxy(_own, "quote:0")["http"] == _own)
-check("isolation: an empty proxy stays empty (no invented credentials)",
-      gs.isolated_proxy("", "quote:0")["http"] == "")
+# {} AND NOT {"http": ""}: an empty-string proxy dict is TRUTHY, so it sailed
+# past safe_get's `if not proxies` refusal and requests read "" as "no proxy"
+# -- a direct connection out of the helper whose name promises isolation.
+check("isolation: an empty proxy is {} -- falsy, so a `not proxies` guard "
+      "refuses instead of connecting direct",
+      gs.isolated_proxy("", "quote:0") == {})
 
 # THE DNS-LEAK GUARD MUST SURVIVE THE WIDENED REGEX. This is the check that
 # matters most here: relaxing SOCKS_RE to admit userinfo must not accidentally

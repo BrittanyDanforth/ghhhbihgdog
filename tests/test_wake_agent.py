@@ -1841,13 +1841,21 @@ for _lbl, _mok, _want in (
 _TH_SRC = open(os.path.join(REPO, "thor_swap_preparer"), encoding="utf-8").read()
 check("minout: thor_swap_preparer offers the flag",
       '"--min-out-xmr"' in _TH_SRC)
+# ON THE WORST-CASE ARRIVAL, not the headline quote. Gating on `expected_xmr
+# < _min_out` left a band -- [min_out, min_out/(1 - tolerance)) -- where the
+# quote passed, receive_watch then called a routine-slippage arrival "funded",
+# and /withdraw refused it: money stranded on the memo'd address. The gate
+# tests what the watcher will accept, which is expected * (1 - tolerance).
+_TH_GATE = "if _min_out and _worst_arrival < _min_out:"
 check("minout: ...and refuses on it rather than only recording it",
-      "if _min_out and expected_xmr < _min_out:" in _TH_SRC
-      and "quote_below_mix_minimum" in _TH_SRC)
+      _TH_GATE in _TH_SRC and "quote_below_mix_minimum" in _TH_SRC)
+check("minout: ...on the arrival the watcher will accept, not the quote -- "
+      "the slippage band no longer strands money",
+      "_worst_arrival = (expected_xmr * (1 - ARRIVAL_TOLERANCE))" in _TH_SRC
+      and "if _min_out and expected_xmr < _min_out:" not in _TH_SRC)
 check("minout: ...BEFORE the pair is appended, so nothing downstream sees a "
       "quote the mix cannot use",
-      _TH_SRC.index("if _min_out and expected_xmr < _min_out:")
-      < _TH_SRC.index("pairs.append(pair)"))
+      _TH_SRC.index(_TH_GATE) < _TH_SRC.index("pairs.append(pair)"))
 check("minout: ...and a malformed value is refused rather than dropped, "
       "because a gate the caller asked for and this tool ignored is worse "
       "than either",

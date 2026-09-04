@@ -147,7 +147,7 @@ try:
     _hop = (Decimal("0.05") * ghost.PEEL_CARRIER_RESERVE_MULT
             / Decimal("1.5") * ghost.FEE_SAFETY_MARGIN)
     remainders = [sum(amounts[i + 1:]) + _hop * (N - i - 1) for i in range(N - 1)]
-    plan = ghost.build_peel_plan(E, 0, [m["address"] for m in mix], amounts,
+    plan = ghost.build_peel_plan(E, [m["address"] for m in mix], amounts,
                                  carriers=carrier_pairs, remainders=remainders)
     check("cold: no peel spends subaddr 0 (MAIN)",
           all(p["src_index"] != 0 for p in plan))

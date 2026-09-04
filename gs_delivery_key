@@ -433,11 +433,18 @@ def _rewrite_vault_key(path: Path, payload: dict) -> None:
         # mid-rewrite reads either the old file or the new one.
         atomic_write_json(container, path, perms=0o400)
     except OSError as e:
+        # NOT "run `new --replace` again": the key file now EXISTS, so the
+        # next `new` stops in _refuse_existing before --replace means anything
+        # -- the recovery this text named was the one path it refuses.
         sys.exit(f"[!] could not rewrite {path} ({e.strerror}).\n"
-                 f"    The delivery key WAS written, but the vault does not "
-                 f"know about it yet,\n"
-                 f"    so slips will not be sealed. Fix the permissions and "
-                 f"run `new --replace` again.")
+                 f"    The delivery key WAS written to {out}, but the vault "
+                 f"does not know about it,\n"
+                 f"    so slips will not be sealed. Fix the permissions, move "
+                 f"that file aside (the vault\n"
+                 f"    never learned of it, so `new` refuses to overwrite it), "
+                 f"and run `new` again --\n"
+                 f"    with --replace only if the vault already named an older "
+                 f"key.")
 
 
 def cmd_show(args) -> int:

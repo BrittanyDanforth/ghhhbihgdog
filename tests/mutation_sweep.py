@@ -673,8 +673,8 @@ MUTATIONS = [
  # for kill -9, and SIGKILL runs no finally -- leaving .gs_pw_* on disk.
  ("a signal handler takes the integrity-chain lock and deadlocks",
   "gs_common.py",
-  '    _PENDING_CHAIN.append(("signal", f"shutdown_requested_sig={signum}"))',
-  '    integrity_log("signal", f"shutdown_requested_sig={signum}")',
+  '    _PENDING_CHAIN.append(("signal", f"shutdown_requested_sig={_signame}"))',
+  '    integrity_log("signal", f"shutdown_requested_sig={_signame}")',
   ["test_concurrency"]),
 
  # The arrival gate decides the money has landed. With chunks=1 the floor is
@@ -1951,9 +1951,11 @@ MUTATIONS = [
  # fmt_btc() on it raises InvalidOperation. Same omission, same crash, as the
  # GS_EXIT_AMOUNT one already anchored above.
  ("GS_BTC_AMOUNT loses its ceiling again", "GhostSpiral",
-  "        args.btc_amount = decimal_env(\"GS_BTC_AMOUNT\", _amt, positive=True,\n"
+  "        args.btc_amount = decimal_env(\"--btc-amount / GS_BTC_AMOUNT\", _amt,\n"
+  "                                      positive=True,\n"
   "                                      max_value=BTC_ABSURD_TOTAL)",
-  "        args.btc_amount = decimal_env(\"GS_BTC_AMOUNT\", _amt, positive=True)",
+  "        args.btc_amount = decimal_env(\"--btc-amount / GS_BTC_AMOUNT\", _amt,\n"
+  "                                      positive=True)",
   ["test_listed_bugs"]),
 
  ("GS_SWAP_AMOUNTS loses its ceiling again", "thor_swap_preparer",
@@ -3201,7 +3203,7 @@ MUTATIONS = [
  # OP_RETURN. This gate moves it to the quote, where nothing has been sent.
  ("a quote too small to mix is issued as deposit instructions anyway",
   "thor_swap_preparer",
-  "        if _min_out and expected_xmr < _min_out:",
+  "        if _min_out and _worst_arrival < _min_out:",
   "        if False:",
   ["test_wake_agent"]),
 

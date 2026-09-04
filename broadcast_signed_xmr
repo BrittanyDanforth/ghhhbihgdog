@@ -38,8 +38,6 @@ from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
 
-import requests
-
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json, check_daemon_relay_egress,
@@ -48,6 +46,10 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, redact_addresses,
     _LOCALHOST_NAMES,
 )
+# AFTER gs_common, deliberately. gs_common lowers RLIMIT_CORE at import so no
+# later import can dump a core holding key material, and this was the one tool
+# that imported requests ahead of it.
+import requests
 
 #: DERIVED FROM THE SHARED SET, plus ONE deliberate addition -- it used to be a
 #: private literal under a docstring saying it "mirrors gs_common.MoneroRPC".

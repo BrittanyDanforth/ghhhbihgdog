@@ -188,9 +188,11 @@ TAG_SL = b"GSWAKE-v3-SL".ljust(TAG_LEN, b"\0")   # ThinkPad -> delivery machine
 #: One 1024-byte block. See the header for why every record is the same size.
 #:
 #: WAS 256, AND THE REASON IT MOVED IS THE SLIP. An M3 carrying a sealed slip
-#: measures 750 bytes of inner (tag + JSON), against 148 for the M3 that
-#: carries only a status and a handle. 256 cannot hold it and neither can 512;
-#: 1024 holds it with 273 bytes to spare, which is the same headroom argument
+#: measures 772 bytes of inner (tag + JSON: 16-byte tag, 16-byte job id and
+#: 32-byte challenge as hex, a 4-character handle, the 568-character slip),
+#: against 204 for the M3 that carries only a status and a handle. 256 cannot
+#: hold it and neither can 512; 1024 holds it with 252 bytes to spare, which
+#: is the same headroom argument
 #: WINDOW_BYTES makes one screen down.
 #:
 #: THE SECURITY PROPERTY IS UNIFORMITY, NOT SMALLNESS. Every record on the
@@ -290,15 +292,18 @@ if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
 #: they were "generous enough" for one. The only field that ever held 106+
 #: characters was the memo ("m", capped at 220), which named the destination
 #: address in full and went with the memo. Nothing here carries a Monero
-#: address any more: "d" is the BITCOIN deposit address, and 100 is generous
-#: for a taproot one and short of a Monero address on purpose.
+#: address any more: "d" is the BITCOIN deposit address, and 90 is generous
+#: for a taproot one (62 characters at most) and short of a Monero address on
+#: purpose -- a STANDARD one is 95. The cap was 100, which is short only of
+#: the 106-character integrated form, so the shape check this paragraph
+#: claimed let an ordinary destination through.
 #:
-#: So the bound is now also a shape check. A value that could hold 106
+#: So the bound is now also a shape check. A value that could hold 95
 #: characters here would be a field able to carry the destination back into a
 #: chat window, which is the exact leak removing the memo closed.
 PLAIN_FIELDS = {
     "b": 24,      # btc_in, as a decimal string
-    "d": 100,     # the pooled inbound deposit address
+    "d": 90,      # the pooled inbound deposit address (bech32/bech32m <= 62)
     "x": 32,      # expected_xmr
     "h": 4,       # the handle
 }
@@ -765,6 +770,17 @@ def phase_is_known(word) -> bool:
 #:
 #: The information survives without the noun. "Check before mixing" is the same
 #: instruction; the operator knows which machine is theirs.
+#: A finished withdrawal with no phase. _phase_of answers "" for three
+#: different things -- no unlocked output left, an output below the mix floor,
+#: and a wallet that could not be asked -- and two of those are money still
+#: sitting there. The chat said "That was the last. Wallet empty." and the
+#: doorbell said "Nothing is left on this wallet.": one state, two sentences,
+#: both asserting an emptiness the probe never established, on the surface
+#: (rule 6) a non-operator reads. Declared ONCE so the by-hand path and the
+#: chat cannot drift, and it says only what was observed.
+WITHDRAW_NO_MORE_LINE = ("Nothing more was found to send: none is here, too "
+                         "little to mix, or it could not be checked.")
+
 PHASE_LINES = {
     "not_yet": "nothing on the address yet. Normal — ask again in a while.",
     "arriving": "something arrived and is still confirming. Ask again shortly.",
@@ -1316,6 +1332,18 @@ def _pair_recv(sock, budget_s: float = PAIR_MSG_S) -> dict:
         try:
             sock.settimeout(min(left, 5.0))
             b = sock.recv(1)
+        except TimeoutError:
+            # A PER-READ 5s CAP EXPIRED WITH BUDGET STILL LEFT, which is the
+            # NORMAL case, not a failure: the peer is a human comparing two
+            # screens and has not typed yes yet. Loop -- the `left <= 0` check
+            # at the top of the while is the real deadline (budget_s).
+            #
+            # THIS USED TO FALL THROUGH TO THE OSError BRANCH BELOW AND RAISE,
+            # so the "long for the human" budget was really five seconds: the
+            # ceremony died the instant the two operators were more than 5 s
+            # apart, blaming a cable that was fine. Driven: 300 s budget, an
+            # 8 s pause -> "connection failed while reading (TimeoutError)".
+            continue
         except OSError as e:
             # WHICH IT WAS MATTERS. A read that timed out because the whole
             # message ran out of time is a peer dribbling bytes; a read that
@@ -1484,6 +1512,42 @@ def _pair_finish(sock, my_pub: bytes, peer_pub: bytes, ask, out) -> dict:
     return {"peer_public": peer_pub.hex(), "sas": sas}
 
 
+def _pair_abort_in(raw: bytes) -> str:
+    """The peer's abort reason if `raw` is exactly one abort frame, else ""."""
+    line, sep, rest = raw.partition(b"\n")
+    if not sep or rest:
+        return ""
+    try:
+        body = parse_body(line)
+    except Exception:                                        # noqa: BLE001
+        return ""
+    if not isinstance(body, dict) or body.get("t") != "abort":
+        return ""
+    code = body.get("code")
+    return PAIR_ABORT.get(code if isinstance(code, str) else "",
+                          "the other box gave up without saying why.")
+
+
+def _pair_send_record(sock, rec: bytes) -> None:
+    """sendall for a sealed record, with _pair_send's failure handling.
+
+    A bare sendall here turned a peer that had refused and gone into
+    "[Errno 32] Broken pipe" -- and left the abort it sent unread.
+    """
+    try:
+        sock.sendall(rec)
+    except OSError as e:
+        try:
+            _pair_step(sock, "__none__")          # raises on a pending abort
+        except WakeError:
+            raise
+        except Exception:                                    # noqa: BLE001
+            pass
+        raise WakeError("the other box closed the connection before taking "
+                        "this box's configuration. Nothing was written "
+                        "here.") from e
+
+
 def _pair_read_record(sock) -> bytes:
     """Exactly RECORD_LEN bytes, under the same whole-message deadline."""
     deadline = time.monotonic() + PAIR_MSG_S
@@ -1496,14 +1560,25 @@ def _pair_read_record(sock) -> bytes:
         try:
             sock.settimeout(min(left, 5.0))
             chunk = sock.recv(RECORD_LEN - len(buf))
+        except TimeoutError:
+            # SAME BUG AS _pair_recv (see there): a per-read 5 s cap with
+            # budget left is the peer still sending, not a broken link. Loop;
+            # the top-of-while deadline is the real bound. This branch used to
+            # raise "connection failed" the moment a config record took longer
+            # than 5 s to arrive.
+            continue
         except OSError as e:
-            if time.monotonic() >= deadline:
-                raise WakeError("the other box did not finish sending its "
-                                "configuration. Nothing was written "
-                                "here.") from e
             raise WakeError(f"the pairing connection failed while reading the "
                             f"configuration ({type(e).__name__}).") from e
         if not chunk:
+            # THE PEER MAY HAVE SAID WHY. A box that refuses the record it was
+            # sent aborts (one JSON line) and closes, so what sits in buf when
+            # the FIN arrives is its reason, not the start of a record.
+            # "closed the connection" hid every refusal behind one sentence.
+            _abort = _pair_abort_in(bytes(buf))
+            if _abort:
+                raise WakeError(f"pairing abandoned: {_abort} Nothing was "
+                                f"written here.")
             raise WakeError("the other box closed the connection before "
                             "sending its configuration")
         buf += chunk
@@ -1556,20 +1631,40 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
             f"this box's own network configuration is not usable for pairing "
             f"({e}). Nothing was written on either box.") from e
     rec = seal(my_sk, peer_pub, send_tag, {"info": my_info})
+
+    def _accept(got: bytes) -> dict:
+        try:
+            return _pair_info(open_record(my_sk, peer_pub, got, recv_tag))
+        except WakeError:
+            # Best-effort: revives PAIR_ABORT["info"], which this exchange
+            # had otherwise left as dead code. After local pre-validation
+            # above, a peer can only get here by sending something no honest
+            # build would send.
+            _pair_abort(sock, "info")
+            raise
+
     if first:
-        sock.sendall(rec)
-        got = _pair_read_record(sock)
-    else:
-        got = _pair_read_record(sock)
-        sock.sendall(rec)
-    try:
-        return _pair_info(open_record(my_sk, peer_pub, got, recv_tag))
-    except WakeError:
-        # Best-effort: revives PAIR_ABORT["info"], which this exchange had
-        # otherwise left as dead code. After local pre-validation above, a peer
-        # can only get here by sending something no honest build would send.
-        _pair_abort(sock, "info")
-        raise
+        # The initiator has to speak first or both sides read forever.
+        _pair_send_record(sock, rec)
+        return _accept(_pair_read_record(sock))
+    # THE RESPONDER VALIDATES BEFORE IT ANSWERS. This read the peer's record,
+    # sent its own, and only THEN opened what it had been given -- so on a
+    # record it was about to refuse, its own configuration had already left:
+    # the initiator opened that fine, returned success and wrote its keyfile
+    # while this side raised. Half a pairing, from the function whose own
+    # docstring says the reveal was moved here to prevent exactly that. Now
+    # nothing is sent until the peer's record is accepted; a refusal aborts
+    # with the initiator still waiting in _pair_read_record, which reads the
+    # abort (_pair_abort_in) and raises too, and neither box writes.
+    #
+    # The mirror window -- the initiator refusing a record this side sealed
+    # validly -- cannot arise from anything this function checks (both boxes
+    # validate their own info before sealing, and PAIR_PROTO was matched at
+    # the commit step); only a wire fault after the code comparison reaches
+    # it, and closing that would take a final acknowledgement round.
+    peer = _accept(_pair_read_record(sock))
+    _pair_send_record(sock, rec)
+    return peer
 
 
 def pair_initiator(sock, my_sk, my_pub: bytes, my_info: dict, ask,

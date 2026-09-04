@@ -404,7 +404,8 @@ def main():
                          "the DIGITS, not the digit COUNT -- a 3-digit holding "
                          "still shows as ###.#### -- so it hides the exact figure, "
                          "not the order of magnitude. NOTE: the plan file records "
-                         "the fiat value computed from the WHOLE-UNIT rate, not "
+                         "the fiat value computed from a rate coarsened to THREE "
+                         "significant figures, not "
                          "the exact one, so under --redact the exact fiat figure "
                          "is not on the screen and not in the file either -- "
                          "re-run without --redact if you need to read it.")
