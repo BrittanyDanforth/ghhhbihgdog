@@ -138,3 +138,7 @@ gs_wake_job.log
 .chain_once_*
 pager_state.json
 pager.log
+# Isolated worktrees that Claude Code's subagents check out INSIDE the repo
+# while auditing it. Each one is a full copy of the tree; committing them
+# would put ten copies of the repository on the branch.
+.claude/worktrees/
