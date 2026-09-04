@@ -64,6 +64,16 @@ BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}\Z", re.I)
 # already the first line of the shared checker, XMR_ADDR_RE.)
 
 
+# receive_watch reports "funded" once the arrival clears expected*(1 - tolerance)
+# -- its --tolerance defaults to 0.10, so it will call a payment complete at 90%
+# of this quote. GhostSpiral's SWAP_TOLERANCE_DEFAULT is the same 0.10. If the
+# quote only just clears --min-out-xmr, a routine slippage arrival lands BELOW
+# the mix floor: receive_watch says "funded", /withdraw then refuses, and the
+# money is stranded on the memo'd address. So the quote is gated on the SAME
+# worst case the watcher will accept, not on the quote's headline number.
+ARRIVAL_TOLERANCE = Decimal("0.10")
+
+
 def _btc_per_xmr(proxy):
     """Shared oracle (gs_common.btc_per_xmr_oracle), with this tool's warning.
 
@@ -662,14 +672,28 @@ def main():
         # and the withdrawal confirm already names the depth it is about to
         # use. Refusing only what is definitely unusable is the half this can
         # be certain of.
-        if _min_out and expected_xmr < _min_out:
+        # THE QUOTE MUST CLEAR THE FLOOR EVEN AFTER SLIPPAGE. Testing the
+        # headline quote leaves a band -- [min_out, min_out/(1-tol)) -- where
+        # the quote passes here but a normal slippage arrival lands under
+        # min_out, and that arrival is exactly what the watcher will call
+        # "funded". Gate on the worst case the watcher accepts, and name the
+        # quote the operator actually needs so "send more" is a number.
+        _worst_arrival = (expected_xmr * (1 - ARRIVAL_TOLERANCE)).quantize(
+            Decimal("0.000001"))
+        if _min_out and _worst_arrival < _min_out:
+            _needed_quote = (_min_out / (1 - ARRIVAL_TOLERANCE)).quantize(
+                Decimal("0.000001"))
+            # f-string, so a single % is literal here; %% would PRINT two.
+            _tol_pct = f"{ARRIVAL_TOLERANCE * 100:.0f}%"
             integrity_log("thor", "quote_below_mix_minimum")
             sys.exit(
                 f"[!] Pair {i}: this swap would deliver about "
                 f"{expected_xmr} XMR, and the smallest amount that can be\n"
-                f"    MIXED is {_min_out} XMR. Nothing has been sent:\n"
-                f"    refusing to issue deposit instructions for a payment\n"
-                f"    that would settle and then be stuck, on an address\n"
+                f"    MIXED is {_min_out} XMR. After the {_tol_pct} slippage the\n"
+                f"    watcher will still accept, as little as {_worst_arrival} XMR would land --\n"
+                f"    below the floor -- so a quote of at least {_needed_quote} XMR is needed.\n"
+                f"    Nothing has been sent: refusing to issue deposit instructions\n"
+                f"    for a payment that could settle and then be stuck, on an address\n"
                 f"    this swap's own memo names in public.\n"
                 f"    Send more, or mix this elsewhere.")
         pairs.append(pair)

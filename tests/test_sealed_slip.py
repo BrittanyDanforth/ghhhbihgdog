@@ -456,6 +456,10 @@ def pending(job="receive_and_quote", params=None):
 
 
 def m3(pend, **over):
+    # A RESULT FOLLOWS A HANDOVER. The doorbell refuses an M3 whose challenge
+    # it never issued in an M2, so the harness records the one it is about to
+    # echo -- what on_m2 does when a real vault collects the job.
+    pend._issued.setdefault((b"\0" * 32, bytes.fromhex("a" * 64)), b"")
     body = {"job_id": pend.job_id, "challenge": "a" * 64, "status": "done",
             "handle": "A3F1", "slip": BLOB, "plain": {}, "phase": ""}
     body.update(over)

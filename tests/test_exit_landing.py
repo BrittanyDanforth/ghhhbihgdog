@@ -554,7 +554,7 @@ try:
     _DAGIX = {"D3": (3, 1), "D4": (4, 1)}
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(Args(), str(_fan), str(_dag), [(1, 1), (2, 1)],
-                          str(_tmp / "stg"), None, Decimal("9"),
+                          str(_tmp / "stg"), None,
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1, 2],
                           dag_dst_index=_DAGIX, sweep_targets=[])
@@ -578,7 +578,7 @@ try:
     _peel_targets = [(20 + i, 1) for i in range(8)]
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(Args(), str(_fan), None, _peel_targets,
-                          str(_tmp / "stg2"), None, Decimal("9"),
+                          str(_tmp / "stg2"), None,
                           distribution_mode="peel", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1],
                           dag_dst_index={}, sweep_targets=[])
@@ -604,7 +604,7 @@ try:
     _ix8 = {f"D{i}": (20 + i, 1) for i in range(8)}
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(Args(), str(_fan), str(_dag8), _peel8,
-                          str(_tmp / "stg2b"), None, Decimal("9"),
+                          str(_tmp / "stg2b"), None,
                           distribution_mode="peel", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1],
                           dag_dst_index=_ix8, sweep_targets=[])
@@ -646,7 +646,7 @@ try:
     with contextlib.redirect_stdout(io.StringIO()):
         _inc0, _wh0 = ghost._stage5_run(
             Args(), str(_fan), str(_dag0), _peel8, str(_tmp / "stg2c"), None,
-            Decimal("9"), distribution_mode="peel", change_target=(4, 0),
+            distribution_mode="peel", change_target=(4, 0),
             change_sweep_jobs=[], exit_accounts=[1],
             dag_dst_index=_ix8, sweep_targets=[])
     check("a peel chain that relayed nothing does not run a DAG round",
@@ -665,7 +665,7 @@ try:
     ghost._run_change_sweeps = lambda *a, **k: 1        # one sweep missed
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(Args(), str(_fan), None, [(1, 1)],
-                          str(_tmp / "stg3"), None, Decimal("9"),
+                          str(_tmp / "stg3"), None,
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[(4, 0, "addr", 1)],
                           exit_accounts=[1], dag_dst_index={},
@@ -684,7 +684,7 @@ try:
 
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(_NoExit(), str(_fan), None, [(1, 1)],
-                          str(_tmp / "stg4"), None, Decimal("9"),
+                          str(_tmp / "stg4"), None,
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1],
                           dag_dst_index={}, sweep_targets=[])

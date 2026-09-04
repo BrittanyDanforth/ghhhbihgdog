@@ -1280,19 +1280,28 @@ def _run_totals(per_tx_xmr, wallets, deep, shape=None):
     or --deep changed -- and it did not, which is exactly what an operator
     reported: "the fee doesn't change even if I up the wallets or depth".
 
-    It is not a small difference. At the real priority-1 fee of 0.0024 XMR/tx:
+    It is not a small difference. At the real priority-1 fee of 0.0024 XMR/tx,
+    driven through the SHIPPED compute_fee_budget -- which has no depth term:
+    the reserve is one fee per transaction the run will make, and the SHAPE
+    is what sets that count:
 
-        3 wallets  · depth 1     6 rounds     0.0216 XMR reserved
-        20 wallets · depth 2    80 rounds     0.288  XMR
-        60 wallets · depth 6   720 rounds     2.592  XMR
+        3 wallets   fan-out   3 tx  0.0108 XMR    DAG  13 tx  0.0468 XMR
+        20 wallets  fan-out   3 tx  0.0108 XMR    DAG  30 tx  0.1080 XMR
+        60 wallets  fan-out   3 tx  0.0108 XMR    DAG  70 tx  0.2520 XMR
+        (peel: 11 / 28 / 68 tx = 0.0396 / 0.1008 / 0.2448 XMR)
 
-    a 120x span, on settings the operator picks by clicking a preset. At
-    60/6 that is a quarter of a 10 XMR balance held back, with the panel
-    still reading 0.0024.
+    a 23x span between the cheapest and dearest of those, on settings the
+    operator picks by clicking a preset -- and a plain fan-out does not move
+    with --wallets at all, which the panel has to show as it is rather than
+    invent a slope for. The table this replaced (6 / 80 / 720 rounds,
+    0.0216 / 0.288 / 2.592 XMR) came from a wallets*2*deep formula the
+    function no longer has; the panel's numbers were already right because
+    they come from the function, only this note was not.
 
     Returns (rounds, [total per priority]) or (None, None) when wallets/deep
     are not both usable -- in which case the panel keeps saying per-tx, rather
-    than inventing a total.
+    than inventing a total. `deep` is validated so the panel never totals a
+    run the form will refuse; it is not a fee term.
     """
     try:
         w, d = int(wallets), int(deep)

@@ -38,9 +38,9 @@ from __future__ import annotations
 # nothing for it.
 #
 # Every tool in this chain imports gs_common immediately after its stdlib
-# imports (GhostSpiral line 41, airgap_tx_signer 37, receive_watch 57), so
-# doing it here covers all of them from the earliest point a shared module can
-# reach. gs_console and gs_doorbell cannot import this file at all -- see
+# imports (broadcast_signed_xmr imported `requests` ahead of it until that was
+# moved, leaving one import outside the cover), so doing it here covers all of
+# them from the earliest point a shared module can reach. gs_console and gs_doorbell cannot import this file at all -- see
 # install_signal_handlers -- and carry their own module-scope copy for the same
 # reason and with the same placement.
 #
@@ -218,9 +218,17 @@ def isolated_proxy(proxy_url: str, tag: str) -> Dict[str, str]:
     of the SOCKS port how many chunks this run has.
 
     Falls back to the bare proxy when `proxy_url` already carries credentials,
-    rather than silently replacing what the operator configured.
+    rather than silently replacing what the operator configured. Returns {}
+    for an EMPTY proxy_url, so a caller's `not proxies` test fails closed.
     """
-    if not proxy_url or "@" in proxy_url:
+    if not proxy_url:
+        # {} and not {"http": ""}: an empty-string proxy dict is TRUTHY, so it
+        # sailed past safe_get's `if not proxies` refusal, and requests then
+        # reads "" as "no proxy" -- a direct connection, out of a helper whose
+        # name promises isolation. Every caller guards first today; this is
+        # the guard on this side.
+        return {}
+    if "@" in proxy_url:
         return {"http": proxy_url, "https": proxy_url}
     user = hashlib.sha256(
         f"{_SOCKS_ISOLATION_SALT}:{tag}".encode()).hexdigest()[:16]
@@ -385,6 +393,10 @@ _CHAIN_B58_RUN_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{10,}")
 #: resolved after its user is one import-order change away from a NameError
 #: inside the logger.
 _CHAIN_PATH_RE = re.compile(r"[^/\s|:]*(?:/[^/\s|]+){2,}")
+#: A home directory named on its own. _CHAIN_PATH_RE keeps the basename so a
+#: plan file stays diagnosable ("<path>/unsigned_3.json"), but for /home/alice
+#: the basename IS the account name, and "<path>/alice" redacted nothing.
+_CHAIN_HOME_RE = re.compile(r"^/(?:home|Users|root)/[^/\s|]+\Z")
 
 
 #: Below this length a digitless base58 run is treated as a word, not an
@@ -579,7 +591,8 @@ def chain_safe(msg: str, keep_digits: bool = False) -> str:
         # it, a payload carrying two pipes would look like a path and lose its
         # leading fields.
         out = _CHAIN_PATH_RE.sub(
-            lambda m: "<path>/" + m.group(0).rsplit("/", 1)[1], out)
+            lambda m: ("<path>" if _CHAIN_HOME_RE.match(m.group(0))
+                       else "<path>/" + m.group(0).rsplit("/", 1)[1]), out)
         out = out.replace("\t", " ").replace("|", "/")
         # A FULL address next, matched exactly rather than statistically: a
         # run of 90+ base58 characters is an address and nothing else, so this
@@ -616,6 +629,13 @@ def chain_safe(msg: str, keep_digits: bool = False) -> str:
         out = _CHAIN_BECH32_RE.sub("<addr>", out)
         out = re.sub(r"[1-9A-HJ-NP-Za-km-z]{90,}", "<addr>", out)
         out = _CHAIN_ADDR_RE.sub("<addr>", out)
+        # EACH HALF ON ITS OWN. The rule above needs four alphanumerics on
+        # BOTH sides of the "...", so a scrubbed memo -- "=:XMR.XM...<tail>",
+        # two characters on the left -- kept its eight-character base58 tail.
+        # A run of four or more against an ellipsis is a fragment of something
+        # scrubbed, whichever side of it survived.
+        out = re.sub(r"[0-9A-Za-z]{4,}(?=\.\.\.)", "<addr>", out)
+        out = re.sub(r"(?<=\.\.\.)[0-9A-Za-z]{4,}", "<addr>", out)
         out = _CHAIN_B58_RUN_RE.sub(
             lambda m: "<addr>" if _b58_run_is_addressy(m.group(0)) else m.group(0),
             out)
@@ -1003,11 +1023,19 @@ MAX_SPLIT = 8
 #: Named ONCE, here, because three places now need to agree about them: the
 #: wipe itself, and the two tools that write operator-chosen paths which the
 #: wipe may therefore never reach.
-def paranoia_search_roots() -> list:
-    """The directories paranoia_mode searches for artifacts."""
-    return [Path.cwd().resolve(), Path.home().resolve(),
-            (Path.home() / "ghostspiral").resolve(),
-            (Path.home() / "GhostSpiral").resolve()]
+def paranoia_search_roots(resolve: bool = True) -> list:
+    """The directories paranoia_mode searches for artifacts.
+
+    resolve=False hands back the raw paths, for paranoia_mode itself, which
+    resolves each one under its own OSError handling (a deleted cwd, an
+    unreadable home) rather than letting one bad root abort the wipe. It used
+    to keep a private copy of this list instead, so "named ONCE" was not true.
+    """
+    roots = [Path("."), Path.home(),
+             Path.home() / "ghostspiral", Path.home() / "GhostSpiral"]
+    if not resolve:
+        return roots
+    return [r.resolve() for r in roots]
 
 
 GS_ARTIFACT_FILE_PATTERNS = [
@@ -1599,7 +1627,11 @@ def integrity_log_once(stage: str, kind: str, log_path: Path = INTEGRITY_LOG) ->
     appears on round seven is still new, so it is still chained -- which is
     what keeps failures visible.
     """
-    key = (stage, kind)
+    # THE SAME KEY THE MARKER FILE USES. In-process this keyed on the raw kind
+    # while the run-scoped file below keys on chain_safe(kind), so two kinds
+    # differing only in digits -- one line on the file -- were two entries
+    # here. One key, redacted, on both sides.
+    key = (chain_safe(stage), chain_safe(kind))
     if key in _CARDINAL_EVENTS_LOGGED:
         return ""
     _shared = os.environ.get("GS_CHAIN_RUN_ONCE") or ""
@@ -1758,11 +1790,12 @@ def check_daemon_relay_egress(daemon_url: str,
     tell" is a distinct and honest outcome from "clearnet":
       verdict: "tor" | "clearnet" | "offline" | "unknown"
       onion/clear: peer counts;  detail: human-readable reason
+      height: the daemon's chain height from get_info, 0 when unknown
     Never raises: a failed probe reports "unknown" rather than blocking a
     broadcast on a diagnostic.
     """
     out = {"verdict": "unknown", "onion": 0, "clear": 0, "local": 0,
-           "detail": "", "nettype": "unknown"}
+           "detail": "", "nettype": "unknown", "height": 0}
     parsed = urlparse(daemon_url)
     host = (parsed.hostname or "127.0.0.1").lower()
     use_proxies = None
@@ -1791,6 +1824,15 @@ def check_daemon_relay_egress(daemon_url: str,
         # "which chain" is exactly the question an operator needs answered when
         # something looks wrong.
         out["nettype"] = str(info.get("nettype") or "unknown")
+        # THE CHAIN TIP, so stage 0 can tell "the wallet answered" from "the
+        # wallet is synced". get_info carries it and, exactly like nettype
+        # above, it was parsed here and thrown away while GhostSpiral's sync
+        # gate accepted any positive wallet height. 0 means unknown. Carried
+        # on every path below, same as nettype.
+        try:
+            out["height"] = int(info.get("height") or 0)
+        except (TypeError, ValueError):
+            out["height"] = 0
         if info.get("offline"):
             out["verdict"] = "offline"
             out["detail"] = "daemon is running --offline; it cannot relay at all"
@@ -2563,7 +2605,21 @@ class MoneroRPC:
         })
         per_sub = res.get("per_subaddress", [])
         if not per_sub:
-            return 0, 0
+            # FAIL CLOSED, LIKE THE INDEX-MISMATCH PATH BELOW, and this used to
+            # return (0, 0). An empty/absent per_subaddress is not a real zero:
+            # monero-wallet-rpc 0.18.3.1 answers get_balance for an index it
+            # does not have with a SYNTHESISED zero entry that names the index,
+            # so a reply with no entry at all is a malformed or error response
+            # -- and returning 0 for it makes _change_residue print
+            # "account N / subaddr M emptied", xmr_balance read "empty", and
+            # receive_watch read "nothing arrived", each about an address the
+            # wallet never actually described. A raise routes to the callers'
+            # own "could not be re-read -- check yourself" handling instead.
+            raise RuntimeError(
+                "get_balance returned no per_subaddress entry for "
+                f"account {int(account_index)} index {int(address_index)} "
+                f"-- a malformed reply, not a real zero. Refusing to report "
+                f"it as an empty balance.")
         # VERIFY the entry describes the subaddress we asked about.
         #
         # This took per_sub[0] positionally and read its balance, without ever
@@ -2617,7 +2673,17 @@ def rpc_lock_scope(url: str) -> str:
     if host in _LOCALHOST_NAMES or host == "::1":
         host = "127.0.0.1"
     if port is None:
-        port = 443 if (u.scheme or "").lower() == "https" else 80
+        # 18083, THE PORT MoneroRPC ACTUALLY OPENS, not the scheme default.
+        #
+        # This filled a missing port with 80/443 while MoneroRPC (see its own
+        # `port = parsed.port or 18083`) connects to 18083 for the same
+        # port-less URL. So `http://127.0.0.1` locked "127.0.0.1:80" while the
+        # wallet was spent on :18083 -- and a second run naming the port
+        # explicitly locked "127.0.0.1:18083", a DIFFERENT scope. Two processes
+        # then both held a lock and both spent the one wallet, defeating the
+        # one-wallet/one-spender guard run_lock exists to enforce. The scope
+        # key must name the port the client will use, which is 18083.
+        port = 18083
     return f"{host}:{port}"
 
 
@@ -3008,7 +3074,13 @@ def _shutdown_handler(signum, frame):
     _SHUTDOWN_REQUESTED = True
     # list.append is a single bytecode under the GIL, so it is safe from a
     # handler; open()/flock() are not.
-    _PENDING_CHAIN.append(("signal", f"shutdown_requested_sig={signum}"))
+    # THE NAME, NOT THE NUMBER: chain_safe strips digits, so `sig=15` reached
+    # the file as `sig=#` and the chain could not say which signal it was.
+    try:
+        _signame = signal.Signals(signum).name
+    except ValueError:
+        _signame = "unknown"
+    _PENDING_CHAIN.append(("signal", f"shutdown_requested_sig={_signame}"))
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
 

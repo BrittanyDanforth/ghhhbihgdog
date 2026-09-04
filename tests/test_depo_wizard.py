@@ -1131,10 +1131,15 @@ for _ in range(5):
     fb.say("99")
 check("repeated guessing cannot reach the wake", fb.pokes == [])
 
-check("the code labels the gate as NOT a security control",
-      "NOT a security control" in pg.CONFIRM_NOTE)
-check("...and names what the real bound is",
-      "wake budget" in pg.CONFIRM_NOTE and "physical access" in pg.CONFIRM_NOTE)
+# The gate's rationale ("NOT a security control ... needs physical access") is
+# a COMMENT now, not a constant. It was CONFIRM_NOTE, pinned by two checks
+# here, and nothing sent it -- nor could anything: it names the vault, its
+# budget and its keyfile. Keep it out of the module namespace so it cannot
+# quietly become a message again, and keep the words beside the gate.
+check("the confirm-gate rationale is not a message-shaped constant",
+      not hasattr(pg, "CONFIRM_NOTE"))
+check("...but the rationale itself is still recorded beside the gate",
+      "NOT a security control" in _SRC and "physical access" in _SRC)
 check("the confirm value comes from SystemRandom, not the predictable stream",
       "SystemRandom" in _SRC)
 
@@ -1634,8 +1639,10 @@ def _sent_strings(tree):
                 for x in _ast.walk(arg):
                     if isinstance(x, _ast.Constant) and isinstance(x.value, str):
                         out.append((n.lineno, x.value))
+    # EVENT_LINES too: its values reach the wire through "\n".join(...), which
+    # has no string constant for the send-argument walk above to find.
     for name in ("HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
-                 "BUSY_ANSWER"):
+                 "BUSY_ANSWER", "EVENT_LINES"):
         for n in tree.body:
             if isinstance(n, _ast.Assign) and getattr(
                     n.targets[0], "id", "") == name:
@@ -1654,6 +1661,9 @@ def _sent_strings(tree):
 # reply vocabulary and covers the part of it that happens to be local.
 _all_sent = _sent_strings(_pg_tree)
 _all_sent += [(0, v) for v in P.PHASE_LINES.values()]
+# ...and the one-sentence withdraw closer, which lives beside them for the
+# same reason and is sent verbatim by the pager and the doorbell.
+_all_sent.append((0, P.WITHDRAW_NO_MORE_LINE))
 
 # AND THE REPLIES THAT ARE BUILT, NOT WRITTEN -- the same lesson as PHASE_LINES
 # above, learned a second time and this time closed properly.

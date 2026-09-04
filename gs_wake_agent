@@ -1514,6 +1514,13 @@ def run_once(args, deps: dict = None) -> tuple:
     if args.dry_run:
         agent_say("  [+] Dry run: keyfile, preflight, Tor and the doorbell "
                   "all check out.")
+        # THE PAIRING CODE, READ BACK. Both keyfiles record it and nothing
+        # read either copy; printing the vault's here gives the operator a
+        # way to confirm which ceremony this keyfile came from.
+        _pf = (key.get("pair_fingerprint") or "").strip()
+        if _pf:
+            agent_say(f"      Pairing code {_pf} -- the Pi's keyfile carries "
+                      f"the same one if these two boxes were paired together.")
         agent_say(f"      The doorbell answered at {key['doorbell_url']} with "
                   f"a {len(window)}-byte wake window.")
         # WHERE A SLIP WILL GO, said here because this is the command the
@@ -1660,7 +1667,7 @@ def run_once(args, deps: dict = None) -> tuple:
     # "the defect this repo names most often, wearing a network timeout as a
     # disguise": the Pi waits out the ENTIRE result budget and then reports
     # "collected but never reported back ... CHECK THE VAULT" for a job that
-    # crashed in its first second. For a withdrawal that budget is 59400s, so
+    # crashed in its first second. For a withdrawal that budget is 59700s, so
     # a one-line bug on the vault holds the pager's one-job lock -- and every
     # other command with it -- for sixteen and a half hours.
     #

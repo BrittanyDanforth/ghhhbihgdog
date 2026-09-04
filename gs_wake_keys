@@ -694,6 +694,9 @@ def do_pair(args) -> int:
         "role": "thinkpad",
         "secret": sk.encode().hex(),
         "peer_public": agreed["peer_public"],
+        # Written for the operator: gs_wake_agent --dry-run prints it, so the
+        # two boxes' codes can be compared after the ceremony. Nothing else
+        # reads it.
         "pair_fingerprint": agreed["sas"],
         "doorbell_url": f"http://{info['host']}:{info['port']}",
         "tor_proxy": args.tor_proxy,

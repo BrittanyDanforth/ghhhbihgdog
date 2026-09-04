@@ -1130,13 +1130,17 @@ def test_fee_panel_answers_the_setting_the_operator_is_changing():
     operator reported exactly that: "the fee doesn't change even if I up the
     wallets or depth".
 
-    It is not a rounding difference. At the real priority-1 fee of 0.0024:
+    It is not a rounding difference. At the real priority-1 fee of 0.0024,
+    through the shipped compute_fee_budget (no depth term; the SHAPE sets the
+    transaction count):
 
-        3 wallets  · depth 1     6 rounds     0.0216 XMR
-        20 wallets · depth 2    80 rounds     0.288  XMR
-        60 wallets · depth 6   720 rounds     2.592  XMR
+        3 wallets   DAG  13 tx  0.0468 XMR     peel 11 tx  0.0396 XMR
+        20 wallets  DAG  30 tx  0.1080 XMR     peel 28 tx  0.1008 XMR
+        60 wallets  DAG  70 tx  0.2520 XMR     peel 68 tx  0.2448 XMR
 
-    a 120x span on settings picked by clicking a preset.
+    a 23x span against a bare fan-out's flat 0.0108, on settings picked by
+    clicking a preset. (The 6/80/720-round table this replaced came from a
+    wallets*2*deep formula the function no longer has.)
 
     compute_fee_budget is IMPORTED from GhostSpiral, not reimplemented -- the
     console has drifted from the orchestrator twice already (the --split

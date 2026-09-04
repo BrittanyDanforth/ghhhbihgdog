@@ -1252,12 +1252,33 @@ check("stage2: ...and the deposit instructions are printed",
 # A NON-POSITIVE --btc-amount is refused rather than falling through to the
 # manual-mode branch, which used to tell the operator "No --btc-amount
 # specified" for an amount they had plainly specified.
-_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("0")))
-check("stage2: --btc-amount 0 is REFUSED, not read as 'no amount given'",
-      _x is not None and "must be positive" in _x)
-_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("-1")))
+# THE GATE IS resolve_sensitive_inputs, NOT STAGE 2. main() runs it before
+# resolve_entry_mode and long before resolve_swap_deposits, and it routes the
+# amount through decimal_env(positive=True) -- so a zero or negative amount
+# never reaches stage 2, and the `<= 0` branch stage 2 used to carry was
+# unreachable: one decision, made twice. These checks drove that dead branch
+# in isolation from the caller that made it dead. They drive the real gate
+# now, and hold that stage 2 has no second copy to drift from it.
+def _sens(**k):
+    _a = types.SimpleNamespace(**{**dict(btc_entry=None, btc_amount=None,
+                                         receive_wallet=None,
+                                         wallet_password=None), **k})
+    try:
+        ghost.resolve_sensitive_inputs(_a)
+        return None
+    except SystemExit as _e:
+        return str(_e)
+_x0 = _sens(btc_amount=Decimal("0"))
+check("stage2: --btc-amount 0 is REFUSED at the input gate, not read as 'no "
+      "amount given'",
+      _x0 is not None and "must be positive" in _x0 and "--btc-amount" in _x0)
+_xn = _sens(btc_amount=Decimal("-1"))
 check("stage2: ...and so is a negative one",
-      _x is not None and "must be positive" in _x)
+      _xn is not None and "must be positive" in _xn)
+_s2_src = _help[_help.index("def resolve_swap_deposits("):]
+_s2_src = _s2_src[:_s2_src.index("\ndef ")]
+check("stage2: ...and stage 2 carries no second copy of that gate",
+      "must be positive" not in _s2_src)
 
 # Manual mode names EVERY entry address on the thor_swap_preparer line.
 # Printing only the first would be the merge the entry set exists to stop,

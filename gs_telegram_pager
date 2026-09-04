@@ -133,7 +133,9 @@ POLL_HOLD_S = 10
 #:
 #: Both ends are real and which one happens depends on how Tor breaks:
 #:
-#:   Tor refusing the connection outright  ->  ~1 min to exit  (the old figure)
+#:   Tor refusing the connection outright  ->  ~7 min to exit  (driven: each
+#:       refused poll still pays ~29 s of tenacity backoff; the old figure of
+#:       ~1 min was wrong for this case as well)
 #:   Tor accepting and timing out          ->  ~22 min to exit
 #:
 #: The second is the one that matters, because it is what a half-dead circuit
@@ -473,13 +475,20 @@ def chat_name(job: str) -> str:
 #: of typing -- and it is the last thing between a conversation and money
 #: moving. See the note on `/depo 2`: "a second door beside it that skips the
 #: confirm makes the confirm optional, which is the same as not having one."
-CONFIRM_NOTE = (
-    "This gate stops a pocket-dial and a message pasted into the wrong "
-    "chat. It is NOT a security control: anyone holding this phone can read "
-    "the question and answer it. The bounds that matter are the vault's 24h "
-    "wake budget and account ceiling, which live in a keyfile and need "
-    "physical access to change."
-)
+#:
+#: WHAT THE GATE IS, AND WHY THIS IS A COMMENT AND NOT A MESSAGE. It stops a
+#: pocket-dial and a message pasted into the wrong chat. It is
+#: NOT a security control: anyone holding this phone can read the question and
+#: answer it. The bounds that matter are the vault's 24h wake budget and
+#: account ceiling, which live in a keyfile and need physical access to change.
+#:
+#: That paragraph used to be CONFIRM_NOTE, a string constant with two tests
+#: asserting its wording -- and nothing ever sent it. Nothing COULD have: it
+#: names the vault, its budget and its keyfile, on the one surface (rule 6)
+#: that a non-operator reads. A constant shaped like a message that no send
+#: path reaches is the "declared in one place, never wired" shape, with a test
+#: in front of it saying otherwise. It is documentation, so now it looks like
+#: documentation.
 
 #: What the wizard says when asked about the two knobs it does not have. These
 #: are ANSWERS, not apologies: each names where the thing is really decided.
@@ -2294,7 +2303,8 @@ class Pager:
         # that is all it is: a wrong answer cancels, and nothing stops the
         # operator -- or whoever holds the phone -- typing /depo again for a
         # fresh sum. Questions are unlimited and free. The number bounds a
-        # pocket-dial, which is what CONFIRM_NOTE claims and all it claims.
+        # pocket-dial, which is what the gate's note above claims and all it
+        # claims.
         # Logged so a burst of failures is at least visible in the chain.
         kind, amount, expect = c.kind, c.amount, c.expect
         exit_to, depth = c.exit_to, c.depth
@@ -2960,7 +2970,7 @@ class Pager:
                            f"is enough for one run — /withdraw again when you "
                            f"are ready."
                            if _more else
-                           "That was the last. Wallet empty."))
+                           proto.WITHDRAW_NO_MORE_LINE))
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
                 # end of a job that ran for up to sixteen hours and moved real

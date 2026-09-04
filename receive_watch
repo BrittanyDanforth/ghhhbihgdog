@@ -104,6 +104,14 @@ STALL_MINUTES_DEFAULT = 30
 #: Between this and a full window the honest answer is that the cause is
 #: undetermined, so the verdict is "stale" and the caller names neither cause.
 LIVENESS_DOUBT_S = 600
+#: THE LIVENESS VERDICT'S OWN FLOOR. "not_syncing" says the WALLET is broken,
+#: and it fired after `stall_s` alone -- so a hand-run --stall-min 10 called a
+#: healthy wallet stuck on a ten-minute block gap, which a two-minute block
+#: target produces routinely (P ~ e^-5 per window, over a rolling multi-hour
+#: watch). Thirty minutes is a gap a healthy wallet does not produce (e^-15),
+#: so the verdict waits at least that long however short the stall window is.
+#: The agent's probes pass --stall-min 30 already; this covers the by-hand run.
+LIVENESS_MIN_S = 1800
 
 # ── what counts as MONEY ARRIVING, as opposed to noise ─────────────────────
 #
@@ -667,7 +675,7 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
         # still reaches it.
         if (last_height is not None
                 and stall_s >= LIVENESS_DOUBT_S
-                and (clock() - last_height_move) >= stall_s):
+                and (clock() - last_height_move) >= max(stall_s, LIVENESS_MIN_S)):
             integrity_log("recv", "wallet_not_scanning")
             return {"state": "not_syncing", "sync": "stuck",
                     "unlocked": last_unlocked,
@@ -810,7 +818,19 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
             integrity_log("recv", "timeout")
             return {"state": "timeout",
                     "unlocked": last_unlocked if seen_any else to_xmr(0),
-                    "total": last_total if last_total >= 0 else to_xmr(0),
+                    # GATED ON seen_any, LIKE `unlocked` ABOVE, and this used to
+                    # be `last_total if last_total >= 0`. last_total tracks the
+                    # RAW balance including sub-threshold dust, so a 0.0001 XMR
+                    # drip -- which the dust branch explicitly says is "NOT
+                    # being treated as the payment" -- came back here as a
+                    # positive total. gs_wake_agent._phase_of reads total > 0
+                    # and answers "arriving" on every /check, one wake each,
+                    # for as long as the dust sits there. seen_any is only set
+                    # by a MEANINGFUL arrival (>= min_arrival), so gating on it
+                    # keeps the drip out of the machine-readable file the same
+                    # way it is kept out of the "seen" bookkeeping.
+                    "total": last_total if (seen_any and last_total >= 0)
+                             else to_xmr(0),
                     "ticks": ticks}
         sleep_fn(poll_seconds(rng))
 
@@ -892,9 +912,13 @@ def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> Non
                 f"the XMR,\n"
                 f"    so handing these to a sender could pay someone else and the "
                 f"payment is\n"
-                f"    irreversible. The pairs file has changed since "
-                f"thor_swap_preparer wrote it.\n"
-                f"    Re-run thor_swap_preparer rather than trusting this file.")
+                f"    irreversible. Either the pairs file changed since "
+                f"thor_swap_preparer wrote it,\n"
+                f"    or it was written with --allow-unbound-memo, whose memos this "
+                f"check cannot\n"
+                f"    vouch for. Re-run thor_swap_preparer without that flag rather "
+                f"than trusting\n"
+                f"    this file, or watch without a bundle by passing --expect-xmr.")
     echo("")
     echo("  ============================================================")
     echo("  GIVE THIS TO THE BTC SENDER (this is the receive address):")
@@ -1437,6 +1461,22 @@ def main():
         return 1
 
     print(f"\n  [+] PAID: {fmt(r['unlocked'])} XMR unlocked on the receive subaddress.")
+    # WHAT THE MIX WILL NEED, which thor_swap_preparer writes into every pair
+    # (min_out_xmr) and nothing read back. PAID is true and not sufficient:
+    # below this figure a withdrawal refuses at stage 0, and the operator found
+    # that out hours later, on another surface.
+    _mo = []
+    for _p in (matched or []):
+        try:
+            _v = Decimal(str(_p.get("min_out_xmr") or ""))
+            if _v.is_finite() and _v > 0:
+                _mo.append(_v)
+        except Exception:                                    # noqa: BLE001
+            pass
+    if _mo and r["unlocked"] < min(_mo):
+        print(f"  [!] ...but that is BELOW the {fmt(min(_mo))} XMR the mix needs "
+              f"(thor_swap_preparer recorded it in the pairs file). A withdrawal "
+              f"will refuse this amount; send more before mixing.")
     # Say what was QUOTED, not just what arrived.
     #
     # The floor sits --tolerance (default 10%) below the quote, so anything in

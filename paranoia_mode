@@ -24,7 +24,7 @@ from pathlib import Path
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
     shutdown_requested, secure_hex, secure_delete_file, secure_write_bytes,
-    verify_integrity_chain,
+    verify_integrity_chain, paranoia_search_roots,
 )
 
 # Paths to wipe
@@ -665,8 +665,10 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
     # Resolving also folds an --search-dir that names a root by another
     # spelling (a symlink, a trailing "/.", a relative path) onto the same
     # entry, and makes the dry-run listing print absolute paths.
-    _roots = [Path("."), Path.home(),
-              Path.home() / "ghostspiral", Path.home() / "GhostSpiral"]
+    # ONE LIST, gs_common's. This kept a private copy of the four roots while
+    # the comment on paranoia_search_roots said three places must agree about
+    # them -- and this, the wipe itself, was the one not reading it.
+    _roots = list(paranoia_search_roots(resolve=False))
     _roots += [Path(d) for d in (extra_dirs or [])]
     _seen, search_roots = set(), []
     for _r in _roots:
