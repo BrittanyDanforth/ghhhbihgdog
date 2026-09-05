@@ -1061,6 +1061,11 @@ class Limits:
         self.offset = 0            # Telegram update_id cursor
         self.last_poke = 0.0
         self.pokes = []            # wall-clock stamps, pruned to 24 h
+        #: True from the moment a wake is started until its result has been
+        #: handled -- ONE BIT, persisted, so a restart in between can say
+        #: that a result was lost rather than answering "ready" as if nothing
+        #: had happened. Not the job, not the chat: the bit.
+        self.in_flight = False
         self._load()
 
     def _load(self) -> None:
@@ -1090,6 +1095,7 @@ class Limits:
         self.pokes = [float(x) for x in (_pk if isinstance(_pk, list) else [])
                       if isinstance(x, (int, float))
                       and not isinstance(x, bool)]
+        self.in_flight = d.get("in_flight") is True
 
     #: Stamps are rounded to this before they touch the card.
     #:
@@ -1111,7 +1117,8 @@ class Limits:
             {"offset": self.offset,
              "last_poke": _bucket(self.last_poke, self.STAMP_BUCKET_S),
              "pokes": [_bucket(t, self.STAMP_BUCKET_S)
-                       for t in self.pokes[-200:]]},
+                       for t in self.pokes[-200:]],
+             "in_flight": bool(getattr(self, "in_flight", False))},
             self.path, perms=0o600)
 
     def recent(self) -> list:
@@ -3491,6 +3498,7 @@ class Pager:
             raise
         finally:
             self._running = None
+            self._set_in_flight(False)
             self.busy.release()
             # THE NEXT LEG, AFTER THE LOCK IS FREE. poke() cannot start it: it
             # runs inside this thread, which holds `busy`, and start_job takes
@@ -4112,6 +4120,7 @@ class Pager:
             # that does not start a job now leaves the counter alone.
             self._chain_leg = int(leg)
             self.limits.record()
+            self._set_in_flight(True)
             integrity_log("pager", f"poke:{job}")
             # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
             # OUT. This said "working. This takes a while." for every job, and
@@ -4223,8 +4232,43 @@ class Pager:
                   "      first poll — it is retried on the next start.")
         return ok
 
+    def _set_in_flight(self, on: bool) -> None:
+        """Persist the one bit that says a wake is between start and result."""
+        try:
+            if hasattr(self.limits, "in_flight"):
+                self.limits.in_flight = bool(on)
+                self.limits.save()
+        except Exception as e:                               # noqa: BLE001
+            print(f"  [!] could not persist the in-flight bit "
+                  f"({_redact(e)[:80]}).")
+
+    def announce_restart(self) -> bool:
+        """If the last process died with a wake in flight, say so, once.
+
+        THE RESULT OF THAT WAKE IS GONE. The doorbell is in this process and
+        the vault's result record comes back to it; a crash between start
+        and result (an SD card full at the wrong moment, a power cut, a
+        kill) leaves the vault finishing its job with nobody to tell. The
+        next process answered /status with "ready" as if nothing had run,
+        and a withdrawal's "sent" was simply never said. One persisted bit
+        turns that silence into a sentence -- no job name, no amount.
+        """
+        if not getattr(self.limits, "in_flight", False):
+            return False
+        integrity_log("pager", "restarted_with_wake_in_flight")
+        for _cid in sorted(self.allow):
+            self.send(_cid,
+                      "Restarted while something was running. That job "
+                      "finished or failed on its own and this end was not "
+                      "told, so its result is lost: CHECK before starting "
+                      "another.",
+                      buttons=MENU_BUTTONS)
+        self._set_in_flight(False)
+        return True
+
     def run(self) -> int:
         self.publish_commands()
+        self.announce_restart()
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
               + (f", {len(self.allow_users)} allowlisted sender(s)"
                  if self.allow_users else "")

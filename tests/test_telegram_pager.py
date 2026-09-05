@@ -3997,6 +3997,53 @@ _lc4 = pg.Limits(_stp, 300, 2)
 check("state: NON-VACUITY -- a good file is still read in full",
       _lc4.offset == 41 and _lc4.last_poke == 12.5 and _lc4.pokes == [1.0, 2.0])
 
+
+# ===========================================================================
+# A RESTART WITH A WAKE IN FLIGHT SAYS SO
+# ===========================================================================
+#
+# The doorbell is in this process and the vault's result comes back to it. A
+# crash between start and result (a full SD card, a power cut, a kill) left
+# the next process answering "ready" as if nothing had run; a withdrawal's
+# "sent" was simply never said. One persisted bit turns that into a sentence.
+print("\n== a restart with a wake in flight ==")
+_ifp = __import__("pathlib").Path(_tf_st.mkdtemp(prefix="pgif_")) / "state.json"
+_lf = pg.Limits(_ifp, 300, 2)
+check("in-flight: a fresh state starts with nothing in flight",
+      _lf.in_flight is False)
+_lf.in_flight = True
+_lf.save()
+check("in-flight: the bit is persisted and read back",
+      pg.Limits(_ifp, 300, 2).in_flight is True
+      and __import__("json").loads(_ifp.read_text())["in_flight"] is True)
+_ifp.write_text('{"offset": 1, "in_flight": "yes"}')
+check("in-flight: only a real true counts -- a string does not",
+      pg.Limits(_ifp, 300, 2).in_flight is False)
+_rp, _rs = _room_pager([111, 222], [])
+_rp.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                   recent=lambda: [], daily_cap=12, offset=0,
+                                   in_flight=True, save=lambda: None)
+_said = _rp.announce_restart()
+check("in-flight: on start, a set bit is announced to every allowlisted chat, "
+      "once, without naming the job or an amount",
+      _said is True and len(_rs) == 2
+      and all("Restarted while something was running" in t for t in _rs)
+      and not any(re.search(r"\d", t) for t in _rs)
+      and not any("withdraw" in t.lower() or "deposit" in t.lower()
+                  for t in _rs))
+check("in-flight: ...and the bit is cleared, so the next start says nothing",
+      _rp.limits.in_flight is False and _rp.announce_restart() is False
+      and len(_rs) == 2)
+check("in-flight: start_job sets the bit right after the poke is recorded, "
+      "the worker clears it before releasing the lock, and run() announces "
+      "before the first poll",
+      _SRC_PG_EARLY.index("self.limits.record()")
+      < _SRC_PG_EARLY.index("self._set_in_flight(True)")
+      and _SRC_PG_EARLY.index("self._set_in_flight(False)")
+      < _SRC_PG_EARLY.index("self.busy.release()")
+      and _SRC_PG_EARLY.index("self.announce_restart()")
+      < _SRC_PG_EARLY.index("while not shutdown_requested():"))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

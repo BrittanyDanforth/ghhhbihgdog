@@ -1134,12 +1134,22 @@ One address for every cut is deliberate: outputs to one Monero address are
 unlinkable on-chain, the address is never published (the swap memo publishes
 *receive* addresses), and one address is what the sweep can find all of.
 
-**The sweep.** `gs_wake_agent --fee-sweep` reads the fee address's unlocked
-balance and, if it clears *both* `--fee-sweep-min` and the live mix floor for
-`--fee-sweep-depth`, runs GhostSpiral exactly as a withdrawal runs — view-only
-rpc, offline signing, DAG mixing — from the fee address to `--fee-sweep-to`.
-No usage fee is taken on it (a fee on the fee would go straight back to the
-fee address). What lands on your cold addresses is therefore *mixed*,
+**The sweep.** `gs_wake_agent --fee-sweep` asks the fee wallet the same
+question a client's withdrawal asks the mixing wallet — the largest unlocked
+output, anywhere on it — and, if that clears *both* `--fee-sweep-min` and
+the live mix floor for `--fee-sweep-depth`, runs GhostSpiral exactly as a
+withdrawal runs — view-only rpc, offline signing, DAG mixing — from that
+output to `--fee-sweep-to`. Then it asks again: a mix leaves change and held
+remainders on other subaddresses of the wallet it ran from, and those are
+the next leg's entry, needing only the floor (the threshold was the
+trigger). Up to three legs per boot, and a leg starts only if its whole
+budget fits before the unit's 17-hour limit — at depths 2 and 3 that is one
+leg per boot, and the rest is the next boot's, which asks the same question
+again. That is what makes "the fees always get mixed out eventually" true of
+*all* of them: nothing a sweep leaves behind is money no sweep will look at.
+What stays is dust under the floor, until more gathers beside it. No usage
+fee is taken on a sweep (a fee on the fee would go straight back to the fee
+wallet). What lands on your cold addresses is therefore *mixed*,
 *aggregated* amounts: the sum of many cuts, fanned out and hopped, not 1.1%
 of anybody's deposit. `--fee-sweep --dry-run` says whether a sweep would run
 and spends nothing.
@@ -1184,6 +1194,22 @@ with the mixing wallet's fan-outs — the business structure. That is the
 status quo for a vault holding a spend wallet at all, and the fee wallet
 adds one more file of the same kind. Keep the fee wallet small: the
 threshold is there so it is swept, not hoarded.
+
+### 4d. A restart with a wake in flight
+
+The doorbell runs inside the pager process, and the vault's result record
+comes back to it. If the pager dies between starting a wake and receiving
+its result — a full SD card at the wrong moment, a power cut, a kill — the
+vault finishes its job with nobody to tell. The next pager process used to
+answer `/status` with "ready" as if nothing had run, and a withdrawal's
+"sent" was simply never said. The pager now persists **one bit** in its
+state file, set when a wake starts and cleared when its result has been
+handled; on start, a set bit is announced to every allowlisted chat —
+"Restarted while something was running … its result is lost: CHECK before
+starting another" — and cleared. No job name, no amount: the bit. A
+withdrawal chain interrupted this way does not double-spend: each leg spends
+one entry, the interrupted leg's entry is already gone, and the next
+`/withdraw` picks up from the largest remaining one.
 
 ### The pager's unit needs a `WorkingDirectory`, and the reason is not obvious
 

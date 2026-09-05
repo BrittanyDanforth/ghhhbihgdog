@@ -3026,8 +3026,46 @@ MUTATIONS = [
  # the try whose finally releases the lock -- so the mutation still lifts them
  # all out of it.
  ("a failed state write wedges the wake lock forever", "gs_telegram_pager",
-  '        try:\n            self._running = cid\n            # WHICH LEG THIS IS, recorded before the thread starts so the\n            # worker reads it rather than a slot _worker has already cleared.\n            # A fresh /withdraw takes the default and resets the count.\n            #\n            # ...AND IT USED TO BE ASSIGNED ABOVE, BEFORE THE REFUSALS, WHICH\n            # PUT THE CAP BACK IN THE STATE IT WAS ADDED TO FIX.\n            #\n            # Every call to start_job wrote this, including the ones that then\n            # returned without starting anything -- rate limited, or refused\n            # for `busy`. A withdrawal chain holds `busy` for hours, so any\n            # other command during it takes exactly that path: the operator\n            # taps "Has it arrived?" while leg 3 is running, start_job sets\n            # _chain_leg = 0 for the swap_status job, fails to take the lock,\n            # answers "something is already running" and returns -- and the\n            # withdrawal\'s own leg counter is now 0.\n            #\n            # The completion then computes `_next_leg = _more and 0 + 1 <\n            # MAX_CHAIN_LEGS`, which is true forever, and every message says\n            # "withdraw 1 sent". Driven: with one tap of /check per leg, a\n            # wallet holding 99 arrivals ran 99 mixes against a cap of 6 --\n            # 99 spends, 99 magic packets, 99 boots, from one /withdraw. The\n            # cap whose entire job is to stop an unbounded run of spends did\n            # nothing, which is precisely what the comment two hundred lines\n            # down says was already fixed once.\n            #\n            # ASSIGNED WHERE THE JOB BECOMES REAL: below every refusal, below\n            # the lock, one statement before the thread that reads it. A call\n            # that does not start a job now leaves the counter alone.\n            self._chain_leg = int(leg)\n            self.limits.record()\n            integrity_log("pager", f"poke:{job}")',
-  '        self._running = cid\n        self._chain_leg = int(leg)\n        self.limits.record()\n        integrity_log("pager", f"poke:{job}")\n        try:',
+  '        try:\n'
+  '            self._running = cid\n'
+  '            # WHICH LEG THIS IS, recorded before the thread starts so the\n'
+  '            # worker reads it rather than a slot _worker has already cleared.\n'
+  '            # A fresh /withdraw takes the default and resets the count.\n'
+  '            #\n'
+  '            # ...AND IT USED TO BE ASSIGNED ABOVE, BEFORE THE REFUSALS, WHICH\n'
+  '            # PUT THE CAP BACK IN THE STATE IT WAS ADDED TO FIX.\n'
+  '            #\n'
+  '            # Every call to start_job wrote this, including the ones that then\n'
+  '            # returned without starting anything -- rate limited, or refused\n'
+  '            # for `busy`. A withdrawal chain holds `busy` for hours, so any\n'
+  '            # other command during it takes exactly that path: the operator\n'
+  '            # taps "Has it arrived?" while leg 3 is running, start_job sets\n'
+  '            # _chain_leg = 0 for the swap_status job, fails to take the lock,\n'
+  '            # answers "something is already running" and returns -- and the\n'
+  "            # withdrawal's own leg counter is now 0.\n"
+  '            #\n'
+  '            # The completion then computes `_next_leg = _more and 0 + 1 <\n'
+  '            # MAX_CHAIN_LEGS`, which is true forever, and every message says\n'
+  '            # "withdraw 1 sent". Driven: with one tap of /check per leg, a\n'
+  '            # wallet holding 99 arrivals ran 99 mixes against a cap of 6 --\n'
+  '            # 99 spends, 99 magic packets, 99 boots, from one /withdraw. The\n'
+  '            # cap whose entire job is to stop an unbounded run of spends did\n'
+  '            # nothing, which is precisely what the comment two hundred lines\n'
+  '            # down says was already fixed once.\n'
+  '            #\n'
+  '            # ASSIGNED WHERE THE JOB BECOMES REAL: below every refusal, below\n'
+  '            # the lock, one statement before the thread that reads it. A call\n'
+  '            # that does not start a job now leaves the counter alone.\n'
+  '            self._chain_leg = int(leg)\n'
+  '            self.limits.record()\n'
+  '            self._set_in_flight(True)\n'
+  '            integrity_log("pager", f"poke:{job}")',
+  '        self._running = cid\n'
+  '        self._chain_leg = int(leg)\n'
+  '        self.limits.record()\n'
+  '        self._set_in_flight(True)\n'
+  '        integrity_log("pager", f"poke:{job}")\n'
+  '        try:',
   ["test_telegram_pager"]),
 
  # ...AND THE LEG NUMBER IS ASSIGNED BELOW THE REFUSALS, WHICH IS THE FIX.
