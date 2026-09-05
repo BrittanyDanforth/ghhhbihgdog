@@ -2388,9 +2388,11 @@ check("deadman: an extension whose disarm FAILED does not claim to be armed",
 # never wired to the thing that runs" shape as the missing fee itself.
 check("fee: the pairing offers a flag for the fee destination",
       '"--usage-fee-address"' in _kp_src)
-check("fee: ...and actually writes it into the keyfile the agent reads",
-      '"usage_fee_addresses": [str(a) for a in (args.usage_fee_address or [])],'
-      in _kp_src)
+check("fee: ...and actually writes it into the keyfile the agent reads "
+      "(or the fee wallet's one address, when one is paired)",
+      '"usage_fee_addresses": ([fee_address] if fee_address else' in _kp_src
+      and "[str(a) for a in\n                                 "
+          "(args.usage_fee_address or [])])," in _kp_src)
 # THE SINGULAR FIELD IS STILL WRITTEN, and it is not vestigial: an agent from
 # before the list existed reads only that name. Writing the list and dropping
 # the singular would leave such an agent taking no fee at all -- the exact
@@ -2398,8 +2400,9 @@ check("fee: ...and actually writes it into the keyfile the agent reads",
 # hand it a destination made of the text of a Python list.
 check("fee: ...and still writes the singular one an older agent reads, as an "
       "address rather than the text of a list",
-      '"usage_fee_address": str((list(args.usage_fee_address or []) or [""])[0]),'
-      in _kp_src)
+      '"usage_fee_address": (fee_address if fee_address else' in _kp_src
+      and 'str((list(args.usage_fee_address or [])' in _kp_src
+      and 'or [""])[0])),' in _kp_src)
 
 # ---- AND SO WAS THE ONE MODE THAT DELIVERS A DEPOSIT ADDRESS -------------
 #
@@ -3711,6 +3714,319 @@ check("report: every call site hands the sleep dependency through, so the "
       "tests that inject a failing poster do not wait real minutes",
       _AGENT_SRC.count("sleeper=d.get(\"sleep\")") == 3
       and _AGENT_SRC.count("report_back(") >= 4)
+
+
+# ===========================================================================
+# THE FEE WALLET AND ITS SWEEP
+# ===========================================================================
+#
+# Every cut lands on ONE address of a second wallet on the vault, and the
+# sweep mixes what has gathered there to the operator's own addresses once
+# it clears the threshold and the live floor. Nothing about it reaches the
+# phone; the mixing wallet never holds a fee.
+print("\n== the fee wallet and its sweep ==")
+_FS_ADDR = "8" + "a" * 94
+_FS_TO = ["4" + "b" * 94, "4" + "c" * 94]
+_FS_KEY = {"rpc_primary": "http://127.0.0.1:18083",
+           "rpc_daemon": "http://127.0.0.1:18081",
+           "tor_proxy": "socks5h://127.0.0.1:9050",
+           "fee_rpc": "http://127.0.0.1:18085", "fee_wallet_file": "/w/fee",
+           "fee_address": _FS_ADDR, "fee_sweep_to": list(_FS_TO),
+           "fee_sweep_min_xmr": "0.5", "fee_sweep_depth": 2}
+_cfg = A.fee_sweep_config(_FS_KEY)
+check("sweep/config: a complete fee wallet reads back as one setting",
+      _cfg and _cfg["rpc"] == "http://127.0.0.1:18085"
+      and _cfg["wallet_file"] == "/w/fee" and _cfg["dests"] == _FS_TO
+      and _cfg["min_xmr"] == _dec.Decimal("0.5") and _cfg["depth"] == 2
+      and _cfg["address"] == _FS_ADDR and _cfg["on_idle_boot"] is False)
+check("sweep/config: no fee wallet paired is None, not an error",
+      A.fee_sweep_config({"rpc_primary": "x"}) is None)
+
+
+def _cfg_refused(**over):
+    try:
+        A.fee_sweep_config(dict(_FS_KEY, **over))
+        return None
+    except A.Refused as e:
+        return e.code
+
+
+check("sweep/config: PART of a fee wallet is refused, not guessed at -- a "
+      "sweep on it would relay a fan-out and fail at signing",
+      _cfg_refused(fee_wallet_file="") == "fee_sweep_misconfigured"
+      and _cfg_refused(fee_sweep_to=[]) == "fee_sweep_misconfigured"
+      and _cfg_refused(fee_rpc="") == "fee_sweep_misconfigured")
+check("sweep/config: a depth the protocol does not have, a non-positive "
+      "threshold and a missing fee address are each refused",
+      _cfg_refused(fee_sweep_depth=9) == "fee_sweep_misconfigured"
+      and _cfg_refused(fee_sweep_min_xmr="0") == "fee_sweep_misconfigured"
+      and _cfg_refused(fee_sweep_min_xmr="lots") == "fee_sweep_misconfigured"
+      and _cfg_refused(fee_address="") == "fee_sweep_misconfigured")
+check("sweep/config: a sweep aimed at the fee address itself is refused -- "
+      "it would go round in a circle",
+      _cfg_refused(fee_sweep_to=[_FS_ADDR, _FS_TO[0]])
+      == "fee_sweep_misconfigured")
+check("pairing/fee: the sweep destinations are checked against BOTH "
+      "wallet-rpcs at pairing, so a sweep can land in neither",
+      "OUTSIDE both" in _kp_src
+      and '("the fee wallet", args.fee_rpc)' in _kp_src
+      and '("the mixing wallet", args.rpc)' in _kp_src)
+check("sweep/config: an absent threshold takes the default, which is positive",
+      A.fee_sweep_config(dict(_FS_KEY, fee_sweep_min_xmr=""))["min_xmr"]
+      == A.FEE_SWEEP_MIN_XMR_DEFAULT > 0)
+
+# THE DECISION: both the operator's figure and the live floor must clear.
+_D = _dec.Decimal
+check("sweep/decision: clears both -> go",
+      A.fee_sweep_decision(_D("0.6"), _D("0.5"), _D("0.027")) == (True, "ok"))
+check("sweep/decision: under the operator's figure -> wait, and it says which",
+      A.fee_sweep_decision(_D("0.4"), _D("0.5"), _D("0.027"))
+      == (False, "below_threshold"))
+check("sweep/decision: over the figure but under the live floor -> wait, "
+      "because the mix could not plan",
+      A.fee_sweep_decision(_D("0.6"), _D("0.5"), _D("0.7"))
+      == (False, "below_floor"))
+check("sweep/decision: exactly the larger of the two still goes (>=, not >)",
+      A.fee_sweep_decision(_D("0.7"), _D("0.5"), _D("0.7"))[0]
+      and A.fee_sweep_decision(_D("0.5"), _D("0.5"), _D("0.1"))[0])
+
+# THE ARGV: a withdrawal's shape, aimed at the fee wallet, with no fee on it.
+_saved_fpw = os.environ.pop("GS_FEE_WALLET_PASSWORD", None)
+try:
+    try:
+        A.build_fee_sweep_argv(_FS_KEY, _cfg, "/tmp/b.json", Path("/tmp"))
+        _no_pw = None
+    except A.Refused as e:
+        _no_pw = e.code
+    check("sweep/argv: no fee-wallet password configured is refused before "
+          "anything runs, by its own name",
+          _no_pw == "fee_wallet_password_unset")
+    os.environ["GS_FEE_WALLET_PASSWORD"] = "feepw"
+    _argv, _env = A.build_fee_sweep_argv(_FS_KEY, _cfg, "/tmp/b.json",
+                                         Path("/tmp"))
+    check("sweep/argv: GhostSpiral is aimed at the FEE wallet-rpc and signs "
+          "with the FEE wallet file",
+          _argv[2:][_argv[2:].index("--rpc-primary") + 1] == "http://127.0.0.1:18085"
+          and _argv[_argv.index("--wallet-file") + 1] == "/w/fee"
+          and os.path.basename(_argv[1]) == "GhostSpiral")
+    check("sweep/argv: ...mixes at the depth's wallet count, with DAG mixing",
+          _argv[_argv.index("--wallets") + 1] == str(A.withdraw_wallets(2))
+          and "--dag-mixing" in _argv)
+    check("sweep/argv: ...takes NO usage fee on the fee (it would go straight "
+          "back to the fee address)",
+          "--usage-fee" not in _argv
+          and not any("USAGE_FEE" in k for k in _env))
+    check("sweep/argv: ...exits to the operator's own addresses, in the "
+          "environment and not on the argv",
+          _env["GS_EXIT_TO"] == " ".join(_FS_TO)
+          and not any(a in _FS_TO for a in _argv))
+    check("sweep/argv: ...and the fee wallet's password reaches the child "
+          "under the name GhostSpiral reads",
+          _env["GS_WALLET_PASSWORD"] == "feepw"
+          and "GS_FEE_WALLET_PASSWORD" not in _env)
+
+    # THE RUN, with the wallet and the child injected.
+    _sw_dir = Path(tempfile.mkdtemp(prefix="feesweep_"))
+
+    def _sweep(atomic, floor="0.0270", dry_run=False, key=None):
+        ran = []
+        deps = {"fee_entry": (lambda: (0, 3, _FS_ADDR, atomic)
+                              if atomic else None),
+                "live_floor": lambda k, w: floor,
+                "run_child": lambda argv, env, budget: (
+                    ran.append((list(argv), dict(env), budget)), (0, False))[1]}
+        with contextlib.redirect_stdout(io.StringIO()) as _o:
+            code = A.run_fee_sweep(key or _FS_KEY, _sw_dir, deps, dry_run)
+        return code, ran, _o.getvalue()
+
+    _c1, _r1, _o1 = _sweep(600_000_000_000)
+    check("sweep/run: 0.6 XMR unlocked against a 0.5 threshold runs ONE "
+          "GhostSpiral child under the withdraw budget",
+          _c1 == "done" and len(_r1) == 1
+          and _r1[0][2] == P.JOBS["withdraw"]["budget_s"])
+    check("sweep/run: ...whose entry bundle names the fee address on the fee "
+          "wallet, mode 0600",
+          json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())["address"]
+          == _FS_ADDR
+          and json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())
+          ["rpc_endpoint"] == "http://127.0.0.1:18085"
+          and _stat_m.S_IMODE(os.stat(_sw_dir / A.FEE_SWEEP_BUNDLE).st_mode)
+          == 0o600)
+    _c2, _r2, _o2 = _sweep(300_000_000_000)
+    check("sweep/run: 0.3 XMR waits, spends nothing, and says what it needs",
+          _c2 == "below_threshold" and _r2 == [] and "Nothing spent" in _o2)
+    _c3, _r3, _o3 = _sweep(600_000_000_000, floor="0.9")
+    check("sweep/run: the live floor for the depth applies on top of the "
+          "threshold", _c3 == "below_floor" and _r3 == [])
+    _c4, _r4, _o4 = _sweep(600_000_000_000, dry_run=True)
+    check("sweep/run: a dry run decides and spends nothing",
+          _c4 == "dry_run" and _r4 == [] and "dry run" in _o4)
+    _c5, _r5, _o5 = _sweep(0)
+    check("sweep/run: nothing unlocked is nothing, not an error",
+          _c5 == "nothing" and _r5 == [])
+    _c6, _r6, _ = _sweep(600_000_000_000, key={"rpc_primary": "x"})
+    check("sweep/run: a keyfile with no fee wallet does nothing at all",
+          _c6 == "not_configured" and _r6 == [])
+    # THE OUTCOME IS RECORDED WITHOUT A FIGURE OR AN ADDRESS.
+    _fs_log = []
+    _saved_il_fs = A.integrity_log
+    A.integrity_log = lambda st, kind, *a, **k: _fs_log.append(kind)
+    try:
+        _sweep(600_000_000_000)
+        _sweep(300_000_000_000)
+    finally:
+        A.integrity_log = _saved_il_fs
+    check("sweep/run: the chain records start and outcome, and the wait, by "
+          "kind alone",
+          "fee_sweep:start" in _fs_log and "fee_sweep:done" in _fs_log
+          and "fee_sweep:below_threshold" in _fs_log
+          and not any(("0.6" in k or _FS_ADDR[:8] in k) for k in _fs_log))
+
+    # THE IDLE-BOOT HOOK: a boot with no job runs the sweep only when asked.
+    def _idle_boot(on_idle):
+        d, kf, key, bell = new_env()
+        key2 = dict(key, **_FS_KEY, fee_sweep_on_idle_boot=on_idle)
+        key2["artifact_dir"] = str(d)
+        os.chmod(kf, 0o600)
+        kf.write_text(json.dumps(P.lock_keyfile(key2, b"", role="thinkpad")))
+        os.chmod(kf, 0o400)
+        ran = []
+        deps = deps_for(d, bell, post_record=stub_post(bell),
+                        fee_entry=lambda: (0, 3, _FS_ADDR, 600_000_000_000),
+                        live_floor=lambda k, w: "0.0270",
+                        run_child=lambda argv, env, budget: (
+                            ran.append(list(argv)), (0, False))[1])
+        out, err, text = run(kf, deps)
+        return err, ran
+
+    _e_on, _r_on = _idle_boot(True)
+    check("sweep/idle: with fee_sweep_on_idle_boot a no-job boot runs the "
+          "sweep and still ends as 'no job' (and powers off)",
+          _e_on is not None and _e_on.code == "no_job" and len(_r_on) == 1
+          and "--rpc-primary" in _r_on[0]
+          and _r_on[0][_r_on[0].index("--rpc-primary") + 1]
+          == "http://127.0.0.1:18085")
+    _e_off, _r_off = _idle_boot(False)
+    check("sweep/idle: without it -- the default -- a no-job boot is boot, "
+          "sit, shut down, and nothing spends",
+          _e_off is not None and _e_off.code == "no_job" and _r_off == [])
+    check("sweep/idle: the sweep runs AFTER the no-job dwell, so a stranger's "
+          "packet sees the same shape either way",
+          _AGENT_SRC.index("_sleep(_rng.randint(NO_JOB_DWELL_LO_S")
+          < _AGENT_SRC.index("if _fcfg and _fcfg[\"on_idle_boot\"]:")
+          < _AGENT_SRC.index('raise Refused("no_job",'))
+
+    # THE BY-HAND RUN.
+    d7, kf7, key7, bell7 = new_env()
+    key7b = dict(key7, **_FS_KEY)
+    key7b["artifact_dir"] = str(d7)
+    os.chmod(kf7, 0o600)
+    kf7.write_text(json.dumps(P.lock_keyfile(key7b, b"", role="thinkpad")))
+    os.chmod(kf7, 0o400)
+    _ran7 = []
+    _deps7 = deps_for(d7, bell7, fee_entry=lambda: (0, 3, _FS_ADDR,
+                                                     600_000_000_000),
+                      live_floor=lambda k, w: "0.0270",
+                      run_child=lambda argv, env, budget: (
+                          _ran7.append(list(argv)), (0, False))[1])
+    with contextlib.redirect_stdout(io.StringIO()):
+        _code7 = A.run_fee_sweep_cli(
+            types.SimpleNamespace(key=str(kf7), dry_run=False),
+            {k: v for k, v in _deps7.items() if not k.startswith("_")})
+    check("sweep/cli: --fee-sweep runs the sweep with a wake's preflight and "
+          "never asks the doorbell for a job",
+          _code7 == "done" and len(_ran7) == 1
+          and not any(p == "/wake" for p, _r in _deps7["_posted"]))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            A.run_fee_sweep_cli(types.SimpleNamespace(key=str(kf), dry_run=False),
+                                {k: v for k, v in _deps7.items()
+                                 if not k.startswith("_")})
+        _nocfg = None
+    except A.Refused as e:
+        _nocfg = (e.code, e.power)
+    check("sweep/cli: on a keyfile with no fee wallet it refuses by name and "
+          "does NOT power the machine off",
+          _nocfg == ("fee_sweep_not_configured", False))
+    check("sweep/cli: main() routes --fee-sweep before any doorbell exchange",
+          'if getattr(args, "fee_sweep", False):' in _AGENT_SRC
+          and _AGENT_SRC.index('if getattr(args, "fee_sweep", False):')
+          < _AGENT_SRC.index("code, _status, _handle = run_once(args)"))
+finally:
+    if _saved_fpw is None:
+        os.environ.pop("GS_FEE_WALLET_PASSWORD", None)
+    else:
+        os.environ["GS_FEE_WALLET_PASSWORD"] = _saved_fpw
+
+# THE PAIRING WRITES IT, AND REFUSES THE HALF-CONFIGURED SHAPES.
+_fw_dir2 = tempfile.mkdtemp(prefix="gs_fw_")
+_fw_mix = os.path.join(_fw_dir2, "vault")
+open(_fw_mix, "w").write("x")
+_fw_file = os.path.join(_fw_dir2, "fee")
+open(_fw_file, "w").write("x")
+
+
+def _pairs_fee(extra):
+    _argv = ["pair", "--out", os.path.join(_fw_dir2, "k.key"),
+             "--artifact-dir", _fw_dir2, "--wallet-file", _fw_mix,
+             "--allow-withdraw"] + extra
+    try:
+        _K._validate(_K.build_cli().parse_args(_argv))
+        return None
+    except SystemExit as _e:
+        return str(_e)
+
+
+_FEE_OK = ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
+           _fw_file, "--fee-sweep-to", _FS_TO[0]]
+check("pairing/fee: a complete fee wallet passes validation",
+      _pairs_fee(_FEE_OK) is None)
+check("pairing/fee: any one of the three without the others is refused",
+      "go together" in (_pairs_fee(["--fee-rpc", "http://127.0.0.1:18085"]) or "")
+      and "go together" in (_pairs_fee(["--fee-sweep-to", _FS_TO[0]]) or ""))
+check("pairing/fee: a fee wallet-rpc that is the mixing wallet-rpc is refused",
+      "same wallet-rpc" in (_pairs_fee(
+          ["--fee-rpc", "http://127.0.0.1:18083", "--fee-wallet-file",
+           _fw_file, "--fee-sweep-to", _FS_TO[0]]) or ""))
+check("pairing/fee: a fee wallet file that is the mixing wallet file is refused",
+      "must be a different wallet" in (_pairs_fee(
+          ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
+           _fw_mix, "--fee-sweep-to", _FS_TO[0]]) or ""))
+check("pairing/fee: a non-loopback fee rpc, a relative or missing fee wallet "
+      "file, and a bad sweep address are each refused",
+      "loopback" in (_pairs_fee(["--fee-rpc", "http://10.0.0.5:18085",
+                                 "--fee-wallet-file", _fw_file,
+                                 "--fee-sweep-to", _FS_TO[0]]) or "")
+      and "relative" in (_pairs_fee(["--fee-rpc", "http://127.0.0.1:18085",
+                                     "--fee-wallet-file", "fee",
+                                     "--fee-sweep-to", _FS_TO[0]]) or "")
+      and "does not exist" in (_pairs_fee(
+          ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
+           os.path.join(_fw_dir2, "nope"), "--fee-sweep-to", _FS_TO[0]]) or "")
+      and "not a usable Monero address" in (_pairs_fee(
+          ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
+           _fw_file, "--fee-sweep-to", "notanaddress"]) or ""))
+check("pairing/fee: --usage-fee-address beside a fee wallet is refused -- two "
+      "answers to where the cut goes",
+      "One or the other" in (_pairs_fee(_FEE_OK + ["--usage-fee-address",
+                                                     _FS_TO[1]]) or ""))
+check("pairing/fee: a zero or nonsense threshold is refused",
+      "positive amount" in (_pairs_fee(_FEE_OK + ["--fee-sweep-min", "0"]) or "")
+      and "positive amount" in (_pairs_fee(_FEE_OK + ["--fee-sweep-min", "x"])
+                                or ""))
+check("pairing/fee: --fee-sweep-on-idle-boot without a fee wallet is refused",
+      "needs --fee-rpc" in (_pairs_fee(["--fee-sweep-on-idle-boot"]) or ""))
+check("pairing/fee: the keyfile carries the fee wallet as the ONLY fee "
+      "destination, so every cut lands where the sweep can reach it",
+      '"usage_fee_addresses": ([fee_address] if fee_address else' in _kp_src
+      and '"fee_address": fee_address,' in _kp_src
+      and "_mint_fee_address(args) if args.fee_rpc else" in _kp_src)
+check("pairing/fee: the fee address is minted by the fee wallet-rpc itself, "
+      "before the Pi is involved, and checked foreign to the mixing wallet",
+      '"create_address"' in _kp_src
+      and _kp_src.index("_mint_fee_address(args) if args.fee_rpc")
+      < _kp_src.index("srv = _listen(args)")
+      and "serving the SAME" in _kp_src)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

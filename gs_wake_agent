@@ -892,8 +892,10 @@ def _ghost():
 _MIN_OUT_WALLETS = 3
 
 
-def live_min_out_xmr(key: dict) -> str:
-    """The mix floor at TODAY'S fee, from the daemon this keyfile names.
+def live_floor_xmr(key: dict, wallets: int) -> str:
+    """The mix floor at TODAY'S fee for `wallets` mix outputs, from the
+    daemon this keyfile names. live_min_out_xmr is this at the shallowest
+    depth; the fee sweep asks for its own depth.
 
     THE MIRROR WAS A SNAPSHOT AT A FEE SIXTY TIMES TODAY'S. Every site that
     needed the floor read gs_wake_proto's MIX_MINIMUM_XMR_MIRROR, a string
@@ -919,7 +921,7 @@ def live_min_out_xmr(key: dict) -> str:
         # hundreds of XMR, and that must not become the gate either.
         if fee_xmr is None or not (Decimal(0) < fee_xmr < Decimal("1.0")):
             raise ValueError("no plausible fee estimate")
-        floor = _ghost().mix_minimum_xmr(fee_xmr, _MIN_OUT_WALLETS,
+        floor = _ghost().mix_minimum_xmr(fee_xmr, int(wallets),
                                          dag_mixing=True, exit_set=True, chunks=1)
         if not (Decimal(0) < floor < Decimal(100)):
             raise ValueError("implausible floor")
@@ -927,6 +929,258 @@ def live_min_out_xmr(key: dict) -> str:
     except Exception:                                        # noqa: BLE001
         integrity_log("wake", "min_out:mirror_fallback")
         return proto.deposit_min_out_xmr()
+
+
+def live_min_out_xmr(key: dict) -> str:
+    """The deposit gate's floor: the live floor at the shallowest depth."""
+    return live_floor_xmr(key, _MIN_OUT_WALLETS)
+
+
+
+#: The fee wallet's sweep: how much must have gathered, unlocked, on the fee
+#: address before a sweep runs when the keyfile names no figure, and the
+#: bundle the sweep hands GhostSpiral as its entry.
+FEE_SWEEP_MIN_XMR_DEFAULT = Decimal("0.5")
+FEE_SWEEP_BUNDLE = "wallet_feesweep.json"
+
+
+def fee_sweep_config(key: dict):
+    """The fee wallet's settings from the keyfile: complete, or None.
+
+    ALL OR NOTHING. fee_rpc (the fee wallet's view-only wallet-rpc),
+    fee_wallet_file (the full fee wallet the sweep signs with) and
+    fee_sweep_to (where a sweep lands) are one setting; a keyfile carrying
+    some of them is a pairing that went wrong, and a sweep started on it
+    would relay a fan-out and fail at the signing step. Refused, not guessed.
+    None means no fee wallet was paired, which is the ordinary case.
+    """
+    bits = {k: key.get(k) for k in ("fee_rpc", "fee_wallet_file",
+                                    "fee_sweep_to")}
+    if not any(bits.values()):
+        return None
+    if not all(bits.values()):
+        raise Refused("fee_sweep_misconfigured",
+                      "this keyfile names part of a fee wallet -- some of "
+                      "fee_rpc, fee_wallet_file and fee_sweep_to but not all "
+                      "three. Pair again with all of them, or none.")
+    dests = bits["fee_sweep_to"]
+    if not isinstance(dests, list) or not dests \
+            or not all(isinstance(a, str) and a.strip() for a in dests):
+        raise Refused("fee_sweep_misconfigured",
+                      "fee_sweep_to in this keyfile is not a list of "
+                      "addresses.")
+    depth = key.get("fee_sweep_depth", 2)
+    if depth not in proto.WITHDRAW_DEPTHS:
+        raise Refused("fee_sweep_misconfigured",
+                      f"fee_sweep_depth {depth!r} is not a depth this "
+                      f"protocol has.")
+    try:
+        min_xmr = Decimal(str(key.get("fee_sweep_min_xmr")
+                              or FEE_SWEEP_MIN_XMR_DEFAULT))
+        if not min_xmr.is_finite() or min_xmr <= 0:
+            raise ValueError
+    except (ValueError, ArithmeticError):
+        raise Refused("fee_sweep_misconfigured",
+                      "fee_sweep_min_xmr in this keyfile is not a positive "
+                      "amount.")
+    addr = str(key.get("fee_address") or "").strip()
+    if not addr:
+        raise Refused("fee_sweep_misconfigured",
+                      "this keyfile names a fee wallet but no fee address; "
+                      "pairing mints one, so pair again.")
+    if addr in [a.strip() for a in dests]:
+        raise Refused("fee_sweep_misconfigured",
+                      "fee_sweep_to names the fee address itself, so a sweep "
+                      "would go round in a circle. Pair again.")
+    return {"rpc": str(bits["fee_rpc"]).strip(),
+            "wallet_file": str(bits["fee_wallet_file"]).strip(),
+            "dests": [a.strip() for a in dests],
+            "depth": int(depth), "min_xmr": min_xmr, "address": addr,
+            "on_idle_boot": bool(key.get("fee_sweep_on_idle_boot"))}
+
+
+def fee_wallet_entry(key: dict, cfg: dict, injected=None):
+    """(account, subaddress, address, unlocked_atomic) of the fee address on
+    the fee wallet, or None when nothing unlocked sits there or the wallet
+    could not be asked (recorded as which).
+
+    THE FEE ADDRESS ONLY. Everything else on the fee wallet is not this
+    tool's to spend: the sweep's entry is the one subaddress pairing minted,
+    where every cut lands.
+    """
+    if injected is not None:
+        return injected()
+    try:
+        from gs_common import connect_rpc
+        rpc = connect_rpc(cfg["rpc"], proxy_url=key.get("tor_proxy", ""))
+        try:
+            rpc.raw_request("refresh", {})
+        except Exception:                                    # noqa: BLE001
+            pass
+        ix = (rpc.raw_request("get_address_index",
+                              {"address": cfg["address"]}) or {}).get("index")
+        if not isinstance(ix, dict):
+            integrity_log("wake", "fee_sweep:address_not_ours")
+            agent_say("  [!] Fee sweep: the fee wallet does not recognise the "
+                      "fee address in this keyfile. Nothing spent.")
+            return None
+        major, minor = ix.get("major"), ix.get("minor")
+        for _v in (major, minor):
+            if not isinstance(_v, int) or isinstance(_v, bool) or _v < 0:
+                integrity_log("wake", "fee_sweep:address_not_ours")
+                return None
+        r = rpc.raw_request("get_balance",
+                            {"account_index": major, "address_indices": [minor],
+                             "all_accounts": False}) or {}
+        for sub in (r.get("per_subaddress") or []):
+            if sub.get("address_index") != minor:
+                continue
+            amt = sub.get("unlocked_balance")
+            if isinstance(amt, int) and not isinstance(amt, bool) and amt > 0:
+                return (major, minor, cfg["address"], amt)
+        return None
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("wake", "fee_sweep:rpc_failed")
+        agent_say(f"  [!] Fee sweep: could not read the fee wallet "
+                  f"({terminal_safe(type(e).__name__)}). Nothing spent.")
+        return None
+
+
+def fee_sweep_decision(unlocked_xmr, min_xmr, floor_xmr) -> tuple:
+    """(go, why). A sweep runs when what is unlocked clears BOTH the figure
+    the operator set and the live mix floor for the sweep's depth -- the
+    floor is what the mix needs to plan at all, the figure is how much the
+    operator wants gathered before one runs."""
+    u, m, f = Decimal(unlocked_xmr), Decimal(min_xmr), Decimal(floor_xmr)
+    if u < m:
+        return False, "below_threshold"
+    if u < f:
+        return False, "below_floor"
+    return True, "ok"
+
+
+def build_fee_sweep_argv(key: dict, cfg: dict, bundle: str,
+                         artifact_dir: Path) -> tuple:
+    """(argv, env_extra) for the sweep: GhostSpiral's withdraw shape, aimed at
+    the FEE wallet and the operator's own destinations.
+
+    THE SAME SHAPE AS A WITHDRAWAL, on purpose: view-only rpc, offline
+    signing with the fee wallet's file, DAG mixing at the chosen depth, exit
+    to fee_sweep_to. No --usage-fee -- a fee on the fee would send a slice of
+    it straight back to the fee address. The password reaches the child as
+    GS_WALLET_PASSWORD, because that is the name GhostSpiral reads; it comes
+    from GS_FEE_WALLET_PASSWORD here so the two wallets' passwords are never
+    one setting. run_child scrubs every other GS_* variable from the child.
+    """
+    if "GS_FEE_WALLET_PASSWORD" not in os.environ:
+        integrity_log("wake", "fee_sweep:password_unset")
+        raise Refused(
+            "fee_wallet_password_unset",
+            "the machine has no fee-wallet password configured, so the fee "
+            "wallet cannot be opened to sign. Nothing was spent. Set "
+            "GS_FEE_WALLET_PASSWORD at the machine -- to an empty value if "
+            "the wallet genuinely has none, so that choice is on the record.")
+    argv = [sys.executable, _tool("GhostSpiral"),
+            "--tor-proxy", str(key.get("tor_proxy") or ""),
+            "--rpc-primary", cfg["rpc"],
+            "--rpc-daemon", str(key.get("rpc_daemon")
+                                or "http://127.0.0.1:18081"),
+            "--receive-wallet", str(bundle),
+            "--wallet-file", cfg["wallet_file"],
+            "--dag-mixing",
+            "--wallets", str(withdraw_wallets(cfg["depth"])),
+            "--output", str(artifact_dir)]
+    env = {"GS_EXIT_TO": " ".join(cfg["dests"]),
+           "GS_WALLET_PASSWORD": os.environ["GS_FEE_WALLET_PASSWORD"]}
+    return argv, env
+
+
+def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
+                  dry_run: bool = False) -> str:
+    """Mix what has gathered on the fee address to the operator's own
+    addresses, if it clears the threshold and the floor. Returns a code.
+
+    NOTHING HERE REACHES THE PHONE. The sweep is the operator's own money
+    moving between the operator's own wallets; the chat is the surface a
+    stranger reads, and a "fee sweep" on it would name the arrangement.
+    The outcome is on this machine's terminal or job log, and in the
+    integrity chain as fee_sweep:<code> -- no amount, no address.
+    """
+    d = deps or {}
+    cfg = fee_sweep_config(key)
+    if cfg is None:
+        return "not_configured"
+    found = fee_wallet_entry(key, cfg, injected=d.get("fee_entry"))
+    if not found:
+        integrity_log("wake", "fee_sweep:nothing")
+        agent_say("  [*] Fee sweep: nothing unlocked on the fee address.")
+        return "nothing"
+    acct, sub, addr, atomic = found
+    unlocked = Decimal(str(atomic)) / Decimal(10 ** 12)
+    wallets = withdraw_wallets(cfg["depth"])
+    floor = Decimal(d.get("live_floor", live_floor_xmr)(key, wallets))
+    go, why = fee_sweep_decision(unlocked, cfg["min_xmr"], floor)
+    if not go:
+        integrity_log("wake", f"fee_sweep:{why}")
+        agent_say(f"  [*] Fee sweep: {unlocked} XMR unlocked on the fee "
+                  f"address; a sweep needs {max(cfg['min_xmr'], floor)} "
+                  f"({why.replace('_', ' ')}). Nothing spent.")
+        return why
+    if dry_run:
+        agent_say(f"  [+] Fee sweep (dry run): {unlocked} XMR unlocked on the "
+                  f"fee address clears the threshold; a real run would mix "
+                  f"it at depth {cfg['depth']} to {len(cfg['dests'])} "
+                  f"address(es). Nothing spent.")
+        return "dry_run"
+    bundle = artifact_dir / FEE_SWEEP_BUNDLE
+    atomic_write_json({"schema": "gs_receive_wallet_v1",
+                       "address": addr,
+                       "account_index": int(acct),
+                       "subaddress_index": int(sub),
+                       "rpc_endpoint": cfg["rpc"]},
+                      bundle, perms=0o600)
+    argv, env_extra = build_fee_sweep_argv(key, cfg, str(bundle), artifact_dir)
+    _jl = artifact_dir / JOB_LOG
+    try:
+        _watched = sys.stdout.isatty()
+    except Exception:                                        # noqa: BLE001
+        _watched = False
+    agent_say(f"  [*] Fee sweep: {unlocked} XMR unlocked on the fee address "
+              f"clears the threshold. Mixing it at depth {cfg['depth']} to "
+              f"{len(cfg['dests'])} address(es); output "
+              f"{'follows on this terminal' if _watched else '-> ' + str(_jl)}.")
+    integrity_log("wake", "fee_sweep:start")
+    rc, killed = run_child(argv, env_extra, proto.JOBS["withdraw"]["budget_s"],
+                           runner=d.get("run_child"),
+                           log_path=None if _watched else _jl)
+    code = "done" if rc == 0 else ("killed" if killed else "failed")
+    integrity_log("wake", f"fee_sweep:{code}")
+    if code == "done":
+        agent_say("  [+] Fee sweep finished.")
+    else:
+        agent_say(f"  [!] Fee sweep {code} (exit {rc}). Some of it may "
+                  f"already have moved: check the fee wallet's balances and "
+                  f"the job log before running another.")
+    return code
+
+
+def run_fee_sweep_cli(args, deps: dict = None) -> str:
+    """`gs_wake_agent --fee-sweep`: the sweep by hand, with the same preflight
+    a wake gets and without asking the doorbell for anything."""
+    d = deps or {}
+    key = load_key(Path(args.key))
+    artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
+    secure_mkdir(artifact_dir, narrow_existing=False)
+    _AGENT_LOG[0] = artifact_dir / JOB_LOG
+    preflight(key, artifact_dir, bool(getattr(args, "dry_run", False)),
+              probes=d)
+    if fee_sweep_config(key) is None:
+        raise Refused("fee_sweep_not_configured",
+                      "this keyfile names no fee wallet. Pair with --fee-rpc, "
+                      "--fee-wallet-file and --fee-sweep-to to have one.",
+                      power=False)
+    return run_fee_sweep(key, artifact_dir, d,
+                         bool(getattr(args, "dry_run", False)))
 
 
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
@@ -1663,6 +1917,21 @@ def run_once(args, deps: dict = None) -> tuple:
         # M1 is ever sent. A dead guard is the same defect as a dead constant
         # in the other direction: it reads as a case that is handled.
         _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))
+        # A BOOT WITH NO JOB IS THE FEE SWEEP'S MOMENT, if the keyfile says
+        # so. The doorbell has nothing for this boot, the machine is on and
+        # preflight passed; with fee_sweep_on_idle_boot the operator has
+        # chosen to let a hand power-on (or a stranger's magic packet: the
+        # flag's help says what that costs) run the sweep before the
+        # power-off. Off by default. AFTER the dwell, so the hostile-packet
+        # shape is unchanged when it does not run.
+        try:
+            _fcfg = fee_sweep_config(key)
+        except Refused as _fe:
+            agent_say(f"  [!] {_fe.msg}")
+            integrity_log("wake", "fee_sweep:misconfigured")
+            _fcfg = None
+        if _fcfg and _fcfg["on_idle_boot"]:
+            run_fee_sweep(key, artifact_dir, d, bool(args.dry_run))
         raise Refused("no_job",
                       "the doorbell answered, and it has no job for this boot. "
                       "That is what a magic packet from anyone on the switch "
@@ -2916,6 +3185,11 @@ def build_cli() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Collect one job from the doorbell, run it, power off.")
     ap.add_argument("--key", required=True, help="the ThinkPad keyfile (0400)")
+    ap.add_argument("--fee-sweep", action="store_true",
+                    help="do not ask the doorbell for a job: mix what has "
+                         "gathered on the fee wallet to the addresses the "
+                         "keyfile names, if it clears the threshold, then "
+                         "stop. With --dry-run, say whether it would.")
     ap.add_argument("--dry-run", action="store_true",
                     help="check the keyfile, preflight, Tor and that the "
                          "doorbell answers — then STOP, without asking for a "
@@ -2932,6 +3206,10 @@ def main(argv=None) -> int:
     code = "unknown"
     try:
         try:
+            if getattr(args, "fee_sweep", False):
+                code = run_fee_sweep_cli(args)
+                agent_say(f"  [+] Fee sweep finished: {code}.")
+                return 0
             code, _status, _handle = run_once(args)
             agent_say(f"  [+] Wake finished: {code}.")
             return 0

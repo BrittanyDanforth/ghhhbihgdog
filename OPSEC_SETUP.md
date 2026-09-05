@@ -931,6 +931,8 @@ python3 gs_wake_keys pair \
 # 2. The password, in a root-owned 0400 file. Never a flag, never on an argv:
 #    /proc/<pid>/cmdline is 0444 and every local account can read it.
 printf 'GS_WALLET_PASSWORD=%s\n' 'your-password' > /etc/gs-wake-spend.env
+# and, only with a fee wallet paired (see 4c):
+# printf 'GS_FEE_WALLET_PASSWORD=%s\n' 'fee-wallet-password' >> /etc/gs-wake-spend.env
 chmod 0400 /etc/gs-wake-spend.env
 #    then uncomment the EnvironmentFile line in systemd/gs-wake-agent.service
 
@@ -1100,6 +1102,80 @@ What it still refuses:
 Until the bot exists: skip 1–3. You are at the ThinkPad. Same files,
 same “memo never leaves the machine except to the sender.”
 
+
+### 4c. The fee wallet, and the sweep that empties it
+
+**Where the cut goes, and why it is a second wallet.** A cut minted onto the
+wallet being mixed was spent by the next chat withdrawal as if it were a
+deposit (see 4b). So the cut goes *off* that wallet or it is not taken — and
+the cleanest place off it is a second wallet on the same vault, the **fee
+wallet**, paired once:
+
+```bash
+python3 gs_wake_keys pair \
+    --allow-withdraw --wallet-file /var/lib/gs/spend.wallet \
+    --fee-rpc http://127.0.0.1:18085 \
+    --fee-wallet-file /var/lib/gs/fee.wallet \
+    --fee-sweep-to 4aaa... --fee-sweep-to 4bbb... \
+    --fee-sweep-min 0.5 --fee-sweep-depth 2
+```
+
+`--fee-rpc` is a *second* `monero-wallet-rpc` serving the fee wallet's
+**view-only** copy (GhostSpiral refuses a hot wallet-rpc at stage 0, on the
+fee wallet as on the mixing one); `--fee-wallet-file` is the full fee wallet
+the sweep signs with, its password in `GS_FEE_WALLET_PASSWORD` in the same
+EnvironmentFile as the spend password. Pairing asks the fee wallet-rpc to
+mint **one** subaddress and writes it into the keyfile as the only fee
+destination, so every withdrawal's cut lands there. It also checks that
+address is *foreign* to the mixing wallet-rpc, because two wallet-rpcs
+serving the same wallet is the exact configuration this exists to prevent.
+
+One address for every cut is deliberate: outputs to one Monero address are
+unlinkable on-chain, the address is never published (the swap memo publishes
+*receive* addresses), and one address is what the sweep can find all of.
+
+**The sweep.** `gs_wake_agent --fee-sweep` reads the fee address's unlocked
+balance and, if it clears *both* `--fee-sweep-min` and the live mix floor for
+`--fee-sweep-depth`, runs GhostSpiral exactly as a withdrawal runs — view-only
+rpc, offline signing, DAG mixing — from the fee address to `--fee-sweep-to`.
+No usage fee is taken on it (a fee on the fee would go straight back to the
+fee address). What lands on your cold addresses is therefore *mixed*,
+*aggregated* amounts: the sum of many cuts, fanned out and hopped, not 1.1%
+of anybody's deposit. `--fee-sweep --dry-run` says whether a sweep would run
+and spends nothing.
+
+**When it runs.** The vault is normally off; a magic packet wakes it for one
+job and it powers off. Two ways to get a sweep:
+
+- By hand: power the vault on, run `gs_wake_agent --fee-sweep --key ...`
+  from the desk. The agent's preflight applies (inhibit file, lock, Tor,
+  resources), and a person at the keyboard stops the power-off.
+- On an idle boot: with `--fee-sweep-on-idle-boot` paired, a boot the
+  doorbell has **no job** for — a hand power-on, or a magic packet from
+  anyone on the switch — runs the sweep after the usual no-job dwell, then
+  powers off. It is off by default because a stranger's packet then keeps
+  the vault on, with the fee wallet unlocked, for the hours a mix takes.
+
+**What a sweep costs the client.** While it runs the vault is busy for hours
+and a client's job arriving in that window is not collected: the doorbell's
+fetch window closes and the phone gets its ordinary "did not collect"
+outcome, to try again later. Run sweeps when no client is expected.
+
+**What reaches whom.** Nothing about the fee wallet reaches the chat: no
+command, no phase, no word. The vault's keyfile holds the fee wallet-rpc
+URL, the fee wallet file path, the fee address and your sweep addresses —
+the same class of thing it already holds (the spend wallet path, the fee
+addresses). The integrity chain records `fee_sweep:start / done / failed /
+below_threshold / below_floor / nothing` — kinds, never a figure or an
+address. The job log (0600, wiped with the artifacts) carries GhostSpiral's
+output as it does for a withdrawal.
+
+**What a seized vault tells.** With both wallet files and their passwords
+in hand, an analyst reads the fee wallet's incoming outputs and pairs them
+with the mixing wallet's fan-outs — the business structure. That is the
+status quo for a vault holding a spend wallet at all, and the fee wallet
+adds one more file of the same kind. Keep the fee wallet small: the
+threshold is there so it is swept, not hoarded.
 
 ### The pager's unit needs a `WorkingDirectory`, and the reason is not obvious
 
