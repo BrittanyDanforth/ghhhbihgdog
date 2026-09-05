@@ -83,6 +83,7 @@ from gs_common import (                                      # noqa: E402
     wipe_covers,
 )
 import gs_wake_proto as proto                                # noqa: E402
+from decimal import Decimal                                  # noqa: E402
 
 # \Z, NOT $. In Python `$` also matches just before a trailing newline, so
 # `^...$` accepted "192.168.1.255\n" -- and int("255\n") is 255, so the range
@@ -378,12 +379,138 @@ def build_cli() -> argparse.ArgumentParser:
                         "addresses and each run picks one at random; one "
                         "address collects every run and divides back to every "
                         "deposit.")
+    # ---- THE FEE WALLET -------------------------------------------------
+    #
+    # A second wallet, on this box, that the cut is paid to and that the
+    # agent can spend from: every withdrawal's usage fee lands on ONE address
+    # of it (minted here, once), and `gs_wake_agent --fee-sweep` mixes what
+    # has gathered there to --fee-sweep-to once it clears --fee-sweep-min.
+    # Nothing about it reaches the chat. The mixing wallet never holds a fee,
+    # so a client's withdrawal can never spend one; the sweep is a full mix,
+    # so what lands on your cold addresses is arbitrary mixed amounts, not
+    # 1.1% of somebody's deposit.
+    p.add_argument("--fee-rpc", default="",
+                   help="the FEE wallet's VIEW-ONLY wallet-rpc on this box, "
+                        "e.g. http://127.0.0.1:18085. Pairing mints one "
+                        "subaddress of it as the fee address and writes it "
+                        "into the keyfile. Needs --fee-wallet-file and "
+                        "--fee-sweep-to; excludes --usage-fee-address.")
+    p.add_argument("--fee-wallet-file", default="",
+                   help="ABSOLUTE path to the FULL fee wallet the sweep signs "
+                        "with -- a different wallet from --wallet-file. Its "
+                        "password goes in GS_FEE_WALLET_PASSWORD in the "
+                        "agent unit's EnvironmentFile.")
+    p.add_argument("--fee-sweep-to", default=[], action="append",
+                   help="where a fee sweep lands: an address of a wallet of "
+                        "your own that is neither this wallet's nor the fee "
+                        "wallet's. Repeat for several.")
+    p.add_argument("--fee-sweep-min", default="0.5",
+                   help="XMR that must have gathered, unlocked, on the fee "
+                        "address before a sweep runs (default 0.5). The live "
+                        "mix floor for the depth applies on top of it.")
+    p.add_argument("--fee-sweep-depth", type=int, default=2, choices=(1, 2, 3),
+                   help="depth of the sweep's mix, as /withdraw counts it "
+                        "(default 2).")
+    p.add_argument("--fee-sweep-on-idle-boot", action="store_true",
+                   help="also run the sweep when this box boots with NO job "
+                        "pending -- a hand power-on, or a magic packet from "
+                        "anyone on the switch. Off by default: on, a "
+                        "stranger's packet keeps this box on, with the fee "
+                        "wallet unlocked, for the hours a mix takes.")
     p.add_argument("--account-ceiling", type=int, default=45,
                    help="refuse minting jobs once the wallet holds this many "
                         "accounts (OPSEC_SETUP.md section 4)")
     p.add_argument("--daily-wake-budget", type=int, default=12,
                    help="refuse after this many wakes in 24 h")
     return ap
+
+
+def _is_loopback_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(str(url)).hostname or "").lower()
+    except Exception:                                        # noqa: BLE001
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _mint_fee_address(args) -> str:
+    """One subaddress of the FEE wallet, minted once, and checked foreign.
+
+    ASKED OF THE FEE WALLET-RPC ITSELF, not derived here: subaddress
+    derivation written from memory is a way to pay every cut to an address
+    nobody can spend. A view-only wallet mints subaddresses fine -- it holds
+    the public spend key and the private view key, which is all that takes.
+    ONE address for every cut, on purpose: outputs to one Monero address are
+    unlinkable on-chain, the address is never published (the swap memo
+    publishes RECEIVE addresses, never this one), and one address is what the
+    sweep can find all of.
+    """
+    from gs_common import connect_rpc
+    try:
+        fee = connect_rpc(args.fee_rpc)
+        r = fee.raw_request("create_address",
+                            {"account_index": 0, "label": ""}) or {}
+        addr = str(r.get("address") or "")
+        proto.xmr_address(addr)
+    except SystemExit:
+        raise
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] --fee-rpc {args.fee_rpc}: could not mint the fee "
+                 f"address ({type(e).__name__}: {str(e)[:80]}).\n"
+                 f"    Is the fee wallet-rpc running on this box, with the "
+                 f"fee wallet open? Nothing was written.")
+    # THE MIXING WALLET MUST NOT OWN IT. get_address_index errors on a
+    # foreign address, which is the answer wanted; an index back means the
+    # two wallet-rpcs are serving the same wallet.
+    try:
+        mix = connect_rpc(args.rpc)
+        ix = (mix.raw_request("get_address_index", {"address": addr})
+              or {}).get("index")
+    except Exception:                                        # noqa: BLE001
+        ix = None
+    if isinstance(ix, dict) and isinstance(ix.get("major"), int) \
+            and not isinstance(ix.get("major"), bool):
+        sys.exit("[!] the fee address minted from --fee-rpc belongs to the "
+                 "wallet at --rpc: the two wallet-rpcs are serving the SAME "
+                 "wallet. The fee wallet must be a different wallet, or a "
+                 "client's withdrawal spends your fees. Nothing was written.")
+    # THE SWEEP'S DESTINATIONS MUST BE OUTSIDE BOTH WALLETS. Into the fee
+    # wallet is a loop; into the mixing wallet turns your fees into a
+    # deposit the next client's withdrawal spends. Both wallet-rpcs are on
+    # this box and answer get_address_index, so this is the moment to ask.
+    for _label, _url in (("the fee wallet", args.fee_rpc),
+                         ("the mixing wallet", args.rpc)):
+        try:
+            _w = connect_rpc(_url)
+            for _sa in args.fee_sweep_to:
+                try:
+                    _six = (_w.raw_request("get_address_index",
+                                           {"address": _sa}) or {}).get("index")
+                except Exception:                            # noqa: BLE001
+                    continue                     # foreign: the answer wanted
+                if isinstance(_six, dict) and isinstance(_six.get("major"), int) \
+                        and not isinstance(_six.get("major"), bool):
+                    sys.exit(f"[!] --fee-sweep-to {_sa[:12]}... is an address "
+                             f"of {_label}. A sweep has to land OUTSIDE both "
+                             f"wallets: into the fee wallet it goes round in "
+                             f"a circle, into the mixing wallet it becomes a "
+                             f"deposit the next withdrawal spends. Nothing "
+                             f"was written.")
+        except SystemExit:
+            raise
+        except Exception:                                    # noqa: BLE001
+            pass
+    # IN FULL, ON THIS TERMINAL: the keyfile that carries it is sealed, and a
+    # run started at the desk (gs_console, or GhostSpiral by hand) takes its
+    # cut only to an address it is given -- this one, in GS_USAGE_FEE_ADDRESS.
+    print("  [+] Fee address minted on the fee wallet. Every cut a chat")
+    print("      withdrawal takes lands there, and the sweep moves it on.")
+    print("      For a run started at the desk, put THIS in the console's")
+    print("      fee box or in GS_USAGE_FEE_ADDRESS, so its cut lands there")
+    print("      too:")
+    print(f"          {addr}")
+    return addr
 
 
 def _validate(args) -> None:
@@ -513,6 +640,60 @@ def _validate(args) -> None:
             f"keyfile: correcting\n"
             f"    it means pairing both boxes again.\n"
             f"    Create or move the wallet first, then pair.")
+    _fee_bits = (bool(args.fee_rpc), bool(args.fee_wallet_file),
+                 bool(args.fee_sweep_to))
+    if any(_fee_bits) and not all(_fee_bits):
+        sys.exit("[!] --fee-rpc, --fee-wallet-file and --fee-sweep-to go "
+                 "together: the fee wallet is where the cut lands, the file "
+                 "is what the sweep signs with, and the addresses are where "
+                 "the sweep goes. Give all three, or none.")
+    if args.fee_rpc:
+        if args.usage_fee_address:
+            sys.exit("[!] --usage-fee-address and --fee-rpc are two answers "
+                     "to where the cut goes. With a fee wallet every cut "
+                     "lands on it and the sweep moves it on; a fixed address "
+                     "beside that would take a share out of the sweep's "
+                     "reach. One or the other.")
+        if not _is_loopback_url(args.fee_rpc):
+            sys.exit(f"[!] --fee-rpc {args.fee_rpc!r} is not a loopback URL. "
+                     f"The fee wallet-rpc lives on this box, like --rpc.")
+        if args.fee_rpc.rstrip("/") == str(args.rpc).rstrip("/"):
+            sys.exit("[!] --fee-rpc is the same wallet-rpc as --rpc, so the "
+                     "fee wallet would BE the mixing wallet -- the exact "
+                     "thing the fee wallet exists to avoid.")
+        if not os.path.isabs(args.fee_wallet_file):
+            sys.exit(f"[!] --fee-wallet-file {args.fee_wallet_file!r} is "
+                     f"relative; give an absolute path, like --wallet-file.")
+        if not (os.path.exists(args.fee_wallet_file)
+                or os.path.exists(args.fee_wallet_file + ".keys")):
+            sys.exit(f"[!] --fee-wallet-file {args.fee_wallet_file!r} does "
+                     f"not exist on this box. A sweep would fail at the "
+                     f"SIGNING step with its fan-out already relayed.")
+        if args.wallet_file and os.path.realpath(args.fee_wallet_file) \
+                == os.path.realpath(args.wallet_file):
+            sys.exit("[!] --fee-wallet-file is --wallet-file: the fee wallet "
+                     "must be a different wallet from the one being mixed.")
+        for _sa in args.fee_sweep_to:
+            try:
+                proto.xmr_address(_sa)
+            except proto.WakeError as e:
+                sys.exit(f"[!] --fee-sweep-to is not a usable Monero "
+                         f"address: {e}")
+        if len(set(args.fee_sweep_to)) != len(args.fee_sweep_to):
+            sys.exit("[!] --fee-sweep-to was given the same address twice.")
+        if len(args.fee_sweep_to) > proto.MAX_WAKE_EXIT_DESTS:
+            sys.exit(f"[!] --fee-sweep-to: at most {proto.MAX_WAKE_EXIT_DESTS} "
+                     f"addresses.")
+        try:
+            _fmin = Decimal(str(args.fee_sweep_min))
+            if not _fmin.is_finite() or _fmin <= 0:
+                raise ValueError
+        except (ValueError, ArithmeticError):
+            sys.exit(f"[!] --fee-sweep-min {args.fee_sweep_min!r} is not a "
+                     f"positive amount of XMR.")
+    elif args.fee_sweep_on_idle_boot:
+        sys.exit("[!] --fee-sweep-on-idle-boot needs --fee-rpc: there is no "
+                 "fee wallet to sweep.")
     if args.account_ceiling < 1:
         sys.exit("[!] --account-ceiling must be at least 1.")
     if not 1 <= args.daily_wake_budget <= 1000:
@@ -630,6 +811,11 @@ def do_pair(args) -> int:
     sk = nacl.public.PrivateKey.generate()
     my_pub = sk.public_key.encode()
 
+    # THE FEE ADDRESS IS MINTED BEFORE THE PI IS INVOLVED, so a fee wallet-rpc
+    # that is down, or that is really the mixing wallet, aborts here with
+    # nothing written on either box.
+    fee_address = _mint_fee_address(args) if args.fee_rpc else ""
+
     srv = _listen(args)
     _announce(args)
     deadline = _time.monotonic() + proto.PAIR_TIMEOUT_S
@@ -715,9 +901,24 @@ def do_pair(args) -> int:
         # BOTH FIELDS, and the singular is not vestigial: it is what an agent
         # from before the list existed reads, and it must name a real
         # destination on that agent rather than the text of a Python list.
-        "usage_fee_address": str((list(args.usage_fee_address or []) or [""])[0]),
-        "usage_fee_addresses": [str(a) for a in (args.usage_fee_address or [])],
+        # WITH A FEE WALLET, THE FEE ADDRESS IS THE ONLY FEE DESTINATION:
+        # _withdraw_fee_argv draws from this list, so the cut lands on the
+        # fee wallet and nowhere else, and the sweep reaches all of it.
+        "usage_fee_address": (fee_address if fee_address else
+                              str((list(args.usage_fee_address or [])
+                                   or [""])[0])),
+        "usage_fee_addresses": ([fee_address] if fee_address else
+                                [str(a) for a in
+                                 (args.usage_fee_address or [])]),
         "wallet_file": str(args.wallet_file or ""),
+        "fee_rpc": str(args.fee_rpc or ""),
+        "fee_wallet_file": str(args.fee_wallet_file or ""),
+        "fee_address": fee_address,
+        "fee_sweep_to": [str(a) for a in (args.fee_sweep_to or [])],
+        "fee_sweep_min_xmr": (str(Decimal(str(args.fee_sweep_min)))
+                              if args.fee_rpc else ""),
+        "fee_sweep_depth": int(args.fee_sweep_depth),
+        "fee_sweep_on_idle_boot": bool(args.fee_sweep_on_idle_boot),
     }
     # kdf="none", deliberately and visibly. See the module docstring: a machine
     # that boots unattended cannot keep a passphrase from someone holding it.

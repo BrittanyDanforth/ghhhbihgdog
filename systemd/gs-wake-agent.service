@@ -181,6 +181,7 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 #
 # ROOT-OWNED 0400, holding one line:
 #     GS_WALLET_PASSWORD=...
+#     GS_FEE_WALLET_PASSWORD=...      # only with a fee wallet paired (gs_wake_keys pair --fee-rpc)
 #
 # /proc/<pid>/cmdline is 0444 and /proc/<pid>/environ is 0400, which is why
 # there is no flag for this and never will be.

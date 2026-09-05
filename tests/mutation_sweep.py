@@ -2021,8 +2021,10 @@ MUTATIONS = [
  # listed thor_pairs_*.json, wallet_*.json, the job log and the status file.
  ("the wake agent's artifact directory goes back to a bare mkdir",
   "gs_wake_agent",
-  "    secure_mkdir(artifact_dir, narrow_existing=False)",
-  "    artifact_dir.mkdir(parents=True, exist_ok=True)",
+  '    secure_mkdir(artifact_dir, narrow_existing=False)\n'
+  '    # From here on agent_say() has somewhere durable to write.',
+  '    artifact_dir.mkdir(parents=True, exist_ok=True)\n'
+  '    # From here on agent_say() has somewhere durable to write.',
   ["test_wake_agent", "test_listed_bugs"]),
 
  # `tampered` only examines entries where i.sha is truthy; the summary line
@@ -2894,8 +2896,10 @@ MUTATIONS = [
  # unreachable code.
  ("the usage-fee destination goes back to being unsettable",
   "gs_wake_keys",
-  '        "usage_fee_addresses": [str(a) for a in (args.usage_fee_address or [])],\n',
-  "",
+  '        "usage_fee_addresses": ([fee_address] if fee_address else\n'
+  '                                [str(a) for a in\n'
+  '                                 (args.usage_fee_address or [])]),\n',
+  '',
   ["test_wake_agent"]),
 
  # ONE ADDRESS COLLECTING EVERY RUN. The rate is published in this repo, so an
