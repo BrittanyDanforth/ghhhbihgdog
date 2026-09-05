@@ -65,10 +65,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
+    daemon_fee_estimate, fee_estimate_per_tx, isolated_proxy,
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
     install_signal_handlers, resource_check, rpc_lock_scope,
     scope_lock_taken, secure_mkdir, terminal_safe, wipe_covers,
 )
+import importlib.machinery, importlib.util                 # noqa: E402
 import gs_wake_proto as proto                                # noqa: E402
 
 #: Mandatory, agent-side, and the Pi cannot influence it. OPSEC_SETUP.md §5
@@ -871,6 +873,62 @@ def _tool(name: str) -> str:
     return str(Path(__file__).resolve().parent / name)
 
 
+_GHOST = [None]
+
+
+def _ghost():
+    """GhostSpiral as a module, loaded the way gs_console loads it. Lazy."""
+    if _GHOST[0] is None:
+        _l = importlib.machinery.SourceFileLoader("GhostSpiral", _tool("GhostSpiral"))
+        _s = importlib.util.spec_from_loader("GhostSpiral", _l)
+        _m = importlib.util.module_from_spec(_s)
+        _l.exec_module(_m)
+        _GHOST[0] = _m
+    return _GHOST[0]
+
+
+#: The shallowest depth's wallet count: the floor is "the smallest minimum of
+#: any depth", because the depth is chosen later, on another surface.
+_MIN_OUT_WALLETS = 3
+
+
+def live_min_out_xmr(key: dict) -> str:
+    """The mix floor at TODAY'S fee, from the daemon this keyfile names.
+
+    THE MIRROR WAS A SNAPSHOT AT A FEE SIXTY TIMES TODAY'S. Every site that
+    needed the floor read gs_wake_proto's MIX_MINIMUM_XMR_MIRROR, a string
+    computed once at a fallback fee of 0.0024 XMR per transaction; mainnet
+    charges about 0.00004. So the deposit gate refused every quote under
+    roughly 0.18 XMR, and the withdraw chain answered "" -- nothing more here
+    -- for every leftover under it: money left unmixed on the entry address
+    and reported as absent. The daemon is on this machine and answers in
+    milliseconds. It is asked; the mirror is the answer only when it cannot
+    be, and the chain records that it fell back.
+
+    A string, because that is what travels to an argv and what the callers
+    parse -- the mirror's own rule.
+    """
+    try:
+        daemon = str(key.get("rpc_daemon") or "http://127.0.0.1:18081")
+        proxies = None
+        if key.get("tor_proxy"):
+            proxies = isolated_proxy(str(key["tor_proxy"]), "min_out")
+        fee_xmr, _src = fee_estimate_per_tx(daemon_fee_estimate(daemon, proxies), 1)
+        # The same plausibility bound GhostSpiral's own fee path applies: a
+        # fresh or offline daemon reports a fee that would put the floor at
+        # hundreds of XMR, and that must not become the gate either.
+        if fee_xmr is None or not (Decimal(0) < fee_xmr < Decimal("1.0")):
+            raise ValueError("no plausible fee estimate")
+        floor = _ghost().mix_minimum_xmr(fee_xmr, _MIN_OUT_WALLETS,
+                                         dag_mixing=True, exit_set=True, chunks=1)
+        if not (Decimal(0) < floor < Decimal(100)):
+            raise ValueError("implausible floor")
+        return str(floor)
+    except Exception:                                        # noqa: BLE001
+        integrity_log("wake", "min_out:mirror_fallback")
+        return proto.deposit_min_out_xmr()
+
+
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                bundle: str = None, slip: str = None, handle: str = None,
                owned_fee=()) -> list:
@@ -923,7 +981,7 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
              # destination, which refused quotes that would have mixed
              # perfectly well: plan_usage_fee waives a cut too small to spend
              # and the mix goes ahead in full.
-             "--min-out-xmr", proto.deposit_min_out_xmr(),
+             "--min-out-xmr", live_min_out_xmr(key),
              "--outfile", str(artifact_dir / f"thor_pairs_{handle}.json")],
         ]
     if job == "watch":
@@ -1896,7 +1954,7 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             # units, spelled the same way here so the two cannot disagree
             # about what a piconero is.
             _left_xmr = Decimal(str(_left[3])) / Decimal(10 ** 12)
-            _floor = Decimal(proto.deposit_min_out_xmr())
+            _floor = Decimal(live_min_out_xmr(key))
             return "more_left" if _left_xmr >= _floor else ""
         except Exception:                                    # noqa: BLE001
             # The wallet could not be asked. "" is honest: the operator is
@@ -2014,7 +2072,14 @@ def _funded_entry(key: dict, injected=None):
                 if best is None or _amt > best[3]:
                     best = (_ai, _si, _ad, _amt)
         return best
-    except Exception:                                        # noqa: BLE001
+    except Exception as e:                                   # noqa: BLE001
+        # NOT THE SAME None. A wallet that could not be asked is not a wallet
+        # with nothing in it; the caller cannot tell them apart from the
+        # value, so the difference is recorded here, where it is known.
+        integrity_log("wake", "funded_entry:rpc_failed")
+        agent_say(f"  [!] could not read the wallet's balances "
+                  f"({terminal_safe(type(e).__name__)}); treating as none "
+                  f"found.")
         return None
 
 
@@ -2098,10 +2163,10 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # unlock, the run, and an operator being told the wrong reason.
         #
         # THE SAME FLOOR, SPELLED THE SAME WAY, so the two sides cannot drift:
-        # proto.deposit_min_out_xmr() and Decimal(10 ** 12), which is how
+        # live_min_out_xmr(key) and Decimal(10 ** 12), which is how
         # GhostSpiral itself converts atomic units.
         _fxmr = Decimal(str(_famt)) / Decimal(10 ** 12)
-        if _fxmr < Decimal(proto.deposit_min_out_xmr()):
+        if _fxmr < Decimal(live_min_out_xmr(key)):
             integrity_log("wake", "withdraw_below_mix_minimum")
             raise Refused(
                 "below_mix_minimum",

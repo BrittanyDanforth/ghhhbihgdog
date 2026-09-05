@@ -1275,6 +1275,10 @@ check("stage2: --btc-amount 0 is REFUSED at the input gate, not read as 'no "
 _xn = _sens(btc_amount=Decimal("-1"))
 check("stage2: ...and so is a negative one",
       _xn is not None and "must be positive" in _xn)
+_xbig = _sens(btc_amount=Decimal("1e30"))
+check("stage2: an absurd --btc-amount (1e30) is refused at the input gate as "
+      "implausibly large -- the ceiling the sweep had no test for",
+      _xbig is not None and "implausibly large" in _xbig)
 _s2_src = _help[_help.index("def resolve_swap_deposits("):]
 _s2_src = _s2_src[:_s2_src.index("\ndef ")]
 check("stage2: ...and stage 2 carries no second copy of that gate",
@@ -2598,10 +2602,9 @@ def _quotes(chunks, dests):
         ghost.secure_delay = lambda *a, **k: None
         ghost.integrity_log = lambda *a, **k: None
         ghost.safe_post = lambda url, payload, proxy: {"routes": [{
-            "expectedOutput": "1.0",
-            "transaction": {
-                "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
-                "depositAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]}
+            "expectedBuyAmount": "1.0",
+            "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
+            "targetAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}]}
         _a = types.SimpleNamespace(allow_unbound_memo=False)
         with contextlib.redirect_stdout(io.StringIO()):
             return ghost.stage2_get_swap_quotes(_a, None, chunks, dests), None
@@ -2674,10 +2677,10 @@ def _quotes_memo(dests, memo_for):
         def _post(url, payload, proxy):
             i = _n[0]
             _n[0] += 1
-            return {"routes": [{"expectedOutput": "1.0", "transaction": {
+            return {"routes": [{"expectedBuyAmount": "1.0",
                 "memo": "=:XMR.XMR:" + memo_for(i) + ":0/1/0::0",
-                "depositAddress":
-                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]}
+                "targetAddress":
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}]}
         ghost.safe_post = _post
         _a = types.SimpleNamespace(allow_unbound_memo=False)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -3034,6 +3037,13 @@ check("shape: ...and the DAG-off notice it mirrors is still there",
 # "funds on EVERY draw", and pin the margin it pays for that.
 print("\n-- the minimum a UI is allowed to display --")
 _MFU_FEE = ghost.FALLBACK_FEE_XMR
+#: A HIGH-FEE REGIME FOR THE NON-VACUITY DRIVES. At mainnet's 0.00004 XMR the
+#: veil reserve (0.00006) is smaller than DUST_XMR, the quantum every figure is
+#: rounded up to -- so "one reserve less" is absorbed by the rounding and
+#: proves nothing about whether the reserve is counted. The priority-4
+#: fallback (200x base) is where it is load-bearing. The POSITIVE drives run
+#: at both: the figure has to hold at today's fee and at a congested one.
+_MFU_FEE_HI = ghost.FALLBACK_FEE_BY_PRIORITY[4]
 _mfu_rng = secrets.SystemRandom()
 _MFU_N = (3, 5, 10, 20, 40, 60)          # 3 = MIN_WALLETS, 60 = the CLI's max
 
@@ -3147,7 +3157,7 @@ class _MMArgs:
         self.exit_to = ["x"]
 
 
-def _mm_survives(bal, wallets, cut=None, draws=120, chunks=1):
+def _mm_survives(bal, wallets, cut=None, draws=120, chunks=1, fee=None):
     """Drive THE SHIPPED PATH at `bal` and count the draws that plan.
 
     THIS USED TO RE-DERIVE THE BUDGET INSTEAD OF CALLING IT, and that is why it
@@ -3169,6 +3179,7 @@ def _mm_survives(bal, wallets, cut=None, draws=120, chunks=1):
     """
     _n = wallets + ghost.DECOY_MAX
     _dests = ["d%d" % i for i in range(_n)]
+    _fee = fee if fee is not None else _MFU_FEE
     _ok = 0
     # STDOUT SUPPRESSED, because the non-vacuity draws below are MEANT to fail
     # and each failure prints the operator's chunk-dropped warning. Left on,
@@ -3186,7 +3197,7 @@ def _mm_survives(bal, wallets, cut=None, draws=120, chunks=1):
             try:
                 _r = ghost.size_and_prune_chunks(
                     _MMArgs(wallets), _entries, _unlocked, _dests, _bal,
-                    _MFU_FEE, _mfu_rng)
+                    _fee, _mfu_rng)
             except SystemExit:
                 continue
             # (entries, unlocked, bal, usable, slices, slice_usable, amounts)
@@ -3216,14 +3227,19 @@ for _w in (3, 10, 20, 60):
 # the mixing shortfall behind it.
 for _w in (3, 10, 20, 60):
     for _dag in (True, False):
-        _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, dag_mixing=_dag)
         _MMArgs.dag_mixing = _dag
-        check(f"min: --wallets {_w} dag={_dag} at {_b} XMR plans through the "
-              f"real size_and_prune_chunks on every draw, veil fee included",
-              _mm_survives(_b, _w) == 120)
+        for _fee in (_MFU_FEE, _MFU_FEE_HI):
+            _b = ghost.mix_minimum_xmr(_fee, _w, dag_mixing=_dag)
+            check(f"min: --wallets {_w} dag={_dag} fee={_fee} at {_b} XMR "
+                  f"plans through the real size_and_prune_chunks on every "
+                  f"draw, veil fee included",
+                  _mm_survives(_b, _w, fee=_fee) == 120)
+        _b = ghost.mix_minimum_xmr(_MFU_FEE_HI, _w, dag_mixing=_dag)
         check(f"min: NON-VACUITY -- one hop_fee_reserve less than {_b} does "
-              f"NOT plan on every draw, so the reserve is what carries it",
-              _mm_survives(_b - ghost.hop_fee_reserve(_MFU_FEE), _w) < 120)
+              f"NOT plan on every draw at the high fee, so the reserve is "
+              f"what carries it",
+              _mm_survives(_b - ghost.hop_fee_reserve(_MFU_FEE_HI), _w,
+                           fee=_MFU_FEE_HI) < 120)
 _MMArgs.dag_mixing = True
 
 # EVERY CARRIER, NOT THE SUM OF THEM. With --split N the money lands on N entry
@@ -3249,16 +3265,19 @@ for _c in (2, 4, 6, 8):
         for _w in (4, 6, 10, 20, 60):
             if _c > _w + ghost.DECOY_MIN:
                 continue
-            _b = ghost.mix_minimum_xmr(_MFU_FEE, _w, dag_mixing=_dag,
-                                       chunks=_c)
-            check(f"min: --split {_c} --wallets {_w} dag={_dag} at {_b} XMR "
-                  f"plans on every draw, every carrier funding its own slice",
-                  _mm_survives(_b, _w, chunks=_c) == 120)
+            for _fee in (_MFU_FEE, _MFU_FEE_HI):
+                _b = ghost.mix_minimum_xmr(_fee, _w, dag_mixing=_dag,
+                                           chunks=_c)
+                check(f"min: --split {_c} --wallets {_w} dag={_dag} "
+                      f"fee={_fee} at {_b} XMR plans on every draw, every "
+                      f"carrier funding its own slice",
+                      _mm_survives(_b, _w, chunks=_c, fee=_fee) == 120)
     _MMArgs.dag_mixing = True
     check(f"min: NON-VACUITY -- the single-chunk figure does NOT survive "
-          f"--split {_c}, so wiring the chunk count is doing real work",
-          _mm_survives(ghost.mix_minimum_xmr(_MFU_FEE, 10), 10,
-                       chunks=_c) < 120)
+          f"--split {_c} at the high fee, so wiring the chunk count is doing "
+          f"real work",
+          _mm_survives(ghost.mix_minimum_xmr(_MFU_FEE_HI, 10), 10,
+                       chunks=_c, fee=_MFU_FEE_HI) < 120)
     check(f"min: ...and --split {_c} therefore asks for strictly more than "
           f"one chunk does",
           ghost.mix_minimum_xmr(_MFU_FEE, 10, chunks=_c)
@@ -3280,14 +3299,14 @@ for _c in (2, 4, 6, 8):
 # only fails a few draws in a hundred would make this check flaky, which is
 # its own kind of untrue.
 _MMArgs.dag_mixing = False
-_v_full = ghost.mix_minimum_xmr(_MFU_FEE, 6, dag_mixing=False, chunks=7)
-_v_once = _v_full - 6 * ghost.hop_fee_reserve(_MFU_FEE)
+_v_full = ghost.mix_minimum_xmr(_MFU_FEE_HI, 6, dag_mixing=False, chunks=7)
+_v_once = _v_full - 6 * ghost.hop_fee_reserve(_MFU_FEE_HI)
 check("min: --split 7 --wallets 6 without DAG mixing plans on every draw at "
-      "the published figure",
-      _mm_survives(_v_full, 6, chunks=7) == 120)
+      "the published figure (high fee)",
+      _mm_survives(_v_full, 6, chunks=7, fee=_MFU_FEE_HI) == 120)
 check("min: NON-VACUITY -- the same figure with ONE veil fee instead of seven "
       "does NOT, so the per-chunk reserve is load-bearing and not margin",
-      _mm_survives(_v_once, 6, chunks=7) < 120)
+      _mm_survives(_v_once, 6, chunks=7, fee=_MFU_FEE_HI) < 120)
 _MMArgs.dag_mixing = True
 
 # --print-limits IS THE ONLY WAY A CALLER THAT CANNOT IMPORT THIS FILE GETS A
@@ -3357,9 +3376,10 @@ check("min: ...and is never below it at any chunk count, wallet count or "
 # --split 4 and 0.2666 at --split 5. The dip is in the pipeline, not in the
 # bound, and forcing the published figure to rise would be inventing a rule the
 # code does not have.
-check("min: NON-VACUITY -- the chunk count really moves the figure, so the "
-      "bound above is not constant in it",
-      len({ghost.min_carrier_usable(17, _c, _MFU_FEE, True)
+check("min: NON-VACUITY -- the chunk count really moves the figure (at a fee "
+      "where the moves clear the rounding quantum), so the bound above is not "
+      "constant in it",
+      len({ghost.min_carrier_usable(17, _c, _MFU_FEE_HI, True)
            for _c in range(1, ghost.MAX_SPLIT + 1)}) >= ghost.MAX_SPLIT - 1)
 
 # THE SLICE-COUNT BOUND min_carrier_usable IS DERIVED FROM. An earlier version
@@ -3391,11 +3411,24 @@ check("min: NON-VACUITY -- the loop above really ran over many slices",
 check("min: enabling the cut RAISES the minimum at the default --wallets 10",
       ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=_MM_CUT)
       > ghost.mix_minimum_xmr(_MFU_FEE, 10))
-check("min: ...and at --wallets 10 it is the CUT that binds, not the mix -- "
+# WHICH CONSTRAINT BINDS IS THE FEE'S DECISION. At the mirror's old 60x fee
+# the cut bound at --wallets 10; at today's it binds only at --wallets 3 and
+# the mix binds from 10 up. Pinned at both fees so the max() is shown to be a
+# real choice rather than one side that always wins.
+_cut_floor = ((ghost.hop_fee_reserve(_MFU_FEE) + ghost.DUST_XMR)
+              / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP)
+check("min: ...and at --wallets 3 it is the CUT that binds, not the mix -- "
       "the raised figure is the spendability floor, not the mixing one",
-      ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=_MM_CUT)
-      == ((ghost.hop_fee_reserve(_MFU_FEE) + ghost.DUST_XMR)
-          / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP))
+      ghost.mix_minimum_xmr(_MFU_FEE, 3, usage_pct=_MM_CUT) == _cut_floor)
+check("min: ...while at --wallets 10 the MIX binds at today's fee, above the "
+      "spendability floor",
+      ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=_MM_CUT) > _cut_floor)
+_cut_floor_hi = ((ghost.hop_fee_reserve(_MFU_FEE_HI) + ghost.DUST_XMR)
+                 / _MM_CUT).quantize(ghost.DUST_XMR, rounding=ROUND_UP)
+check("min: ...and at the high fee the cut binds at --wallets 10 again, so "
+      "the winner is the fee's decision and not a constant",
+      ghost.mix_minimum_xmr(_MFU_FEE_HI, 10, usage_pct=_MM_CUT)
+      == _cut_floor_hi)
 # NON-VACUITY: at a LARGE wallet count the mix binds again, so the max() is a
 # real choice between two constraints rather than one that always wins.
 check("min: NON-VACUITY -- at --wallets 60 the MIX binds instead, so the "
@@ -3407,7 +3440,7 @@ check("min: NON-VACUITY -- at --wallets 60 the MIX binds instead, so the "
 # "spendable at the minimum" is a claim about a threshold that never bites.
 check("min: NON-VACUITY -- at a balance below the minimum the cut is worth "
       "less than the fee to move it, which is why the floor exists",
-      (Decimal("0.2") * _MM_CUT).quantize(ghost.DUST_XMR)
+      (_cut_floor / 4 * _MM_CUT).quantize(ghost.DUST_XMR)
       < ghost.hop_fee_reserve(_MFU_FEE))
 check("min: a cut of zero or None leaves the mixing minimum untouched",
       ghost.mix_minimum_xmr(_MFU_FEE, 10, usage_pct=Decimal(0))
@@ -3566,7 +3599,12 @@ check("fee: ...and the operator is TOLD the account and the amount, because "
 # "nothing has been spent" was false of the deposit -- the BTC is through
 # ThorChain and the XMR sits on an address the memo names in a public
 # OP_RETURN. Aborting to protect a fee strands it.
-_addr2, _amt2, _out2, _pair2 = _plan_fee(Decimal("0.30"))
+# BELOW TODAY'S FLOOR. 0.30 XMR was under the floor at the old 60x fee and is
+# a cut worth taking at today's (0.0033 against a 0.00006 spend cost); the
+# fixture follows the floor the shipped fee sets, a third of it.
+_WAIVE_BAL = (((ghost.hop_fee_reserve(ghost.FALLBACK_FEE_XMR) + ghost.DUST_XMR)
+               / ghost.USAGE_FEE_PCT) / 3).quantize(ghost.DUST_XMR)
+_addr2, _amt2, _out2, _pair2 = _plan_fee(_WAIVE_BAL)
 check("fee: below the spendability floor the cut is WAIVED and the mix goes "
       "ahead", _addr2 is None and _amt2 == 0)
 check("fee: ...and the operator is told why, with the figure that would have "
@@ -3578,7 +3616,7 @@ check("fee: ...and it does NOT claim nothing has been spent, which is false "
 # that never runs.
 check("fee: NON-VACUITY -- the waive is a real threshold, not a dead branch",
       _plan_fee(Decimal("1"))[0] is not None
-      and _plan_fee(Decimal("0.30"))[0] is None)
+      and _plan_fee(_WAIVE_BAL)[0] is None)
 check("fee: no cut asked for means no cut and no minting",
       _plan_fee(Decimal("1"), usage_fee=False, usage_fee_pct=Decimal(0))[0] is None)
 

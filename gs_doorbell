@@ -628,7 +628,10 @@ class Pending:
             # carried, required and unread is wire weight dressed as a check.
             # It has to be one this box actually issued in an M2.
             _ch = body.get("challenge")
-            if not isinstance(_ch, str) or not any(
+            # isascii() FIRST: compare_digest raises TypeError on a non-ASCII
+            # str, and a TypeError here is an uncaught exception in the
+            # request handler where a Doorbell is a clean refusal.
+            if not isinstance(_ch, str) or not _ch.isascii() or not any(
                     hmac.compare_digest(_ch, c.hex()) for (_e, c) in self._issued):
                 raise Doorbell("result echoes a challenge this box never issued")
             status = body.get("status")

@@ -1359,18 +1359,29 @@ _at, _seen_at = _dispatch_withdraw("hunter2", _floor_atomic)
 check("dispatch/floor: ...and exactly the minimum still runs, so the bound is "
       "not off by one",
       _at == "" and len(_seen_at) == 1)
-_dust, _ = _dispatch_withdraw("hunter2", 50_000_000_000)
-check("dispatch/floor: ...and a dust arrival above zero is refused rather "
-      "than spending a wake to fail at stage 0",
+# HALF THE MINIMUM, NOT A FIXED FIGURE. This was 0.05 XMR, which was dust at
+# the mirror's old 60x fee and is a mixable arrival at today's; a constant
+# here is a pin on whatever the fee was the day it was typed.
+_dust, _ = _dispatch_withdraw("hunter2", _floor_atomic // 2)
+check("dispatch/floor: ...and an arrival at half the minimum, above zero, is "
+      "refused rather than spending a wake to fail at stage 0",
       _dust == "below_mix_minimum")
 # THE SAME FLOOR ON BOTH SIDES OF THE BOUNDARY. That is the whole guarantee:
 # the question "is this leg worth running?" and the question "is there another
 # one?" must not be able to disagree, or a chain stops on an arrival the first
 # leg would have taken, or starts on one it would have refused.
-check("dispatch/floor: ...and it is the SAME floor _phase_of chains on, so "
-      "the two sides of the boundary cannot drift",
-      'Decimal(proto.deposit_min_out_xmr())' in _AGENT_SRC
-      and _AGENT_SRC.count("proto.deposit_min_out_xmr()") >= 2)
+check("dispatch/floor: ...and it is the SAME floor _phase_of chains on and the "
+      "quote step is told -- the LIVE one, so the three cannot drift",
+      'Decimal(live_min_out_xmr(key))' in _AGENT_SRC
+      and _AGENT_SRC.count("live_min_out_xmr(key)") >= 3)
+# THE MIRROR IS THE FALLBACK, NOT THE FLOOR. It was computed at a fee sixty
+# times today's, so it refused deposits under ~0.18 XMR and abandoned
+# leftovers up to that. The live helper asks the daemon; without one (as
+# here) it returns the mirror and chains that it did.
+check("dispatch/floor: without a daemon the live floor is the mirror, exactly",
+      A.live_min_out_xmr({"rpc_daemon": "http://127.0.0.1:1"}) == P.deposit_min_out_xmr())
+check("dispatch/floor: ...and the helper's only fallback IS the mirror",
+      "return proto.deposit_min_out_xmr()" in _AGENT_SRC)
 _wargv, _wenv = _seen[0] if _seen else ([], {})
 check("dispatch: the destination is in the ENVIRONMENT",
       _wenv.get("GS_EXIT_TO") == _XMR_SAMPLE)
@@ -1878,7 +1889,10 @@ try:
     for _lbl, _atomic, _want in (
             ("a second deposit well over the floor", 500_000_000_000,
              "more_left"),
-            ("a desk-minted 1.1% cut on a small deposit", 40_000_000_000, ""),
+            # 1.1% of half an XMR. It was 0.04 -- the cut on a 3.6 XMR deposit
+            # -- which sat under the mirror's old 60x floor and sits well over
+            # today's 0.0121; the chain chasing 0.04 XMR is now correct.
+            ("a desk-minted 1.1% cut on a 0.5 XMR deposit", 5_500_000_000, ""),
             ("dust", 100_000_000, "")):
         A._funded_entry = (lambda _a: (lambda k, injected=None:
                                        (7, 1, "4x", _a)))(_atomic)
@@ -3556,6 +3570,62 @@ check("watch: NON-VACUITY -- receive_and_quote still earns no phase",
 check("watch: NON-VACUITY -- and swap_status still does",
       _AGW._phase_of("swap_status", _wd) == "landed")
 
+
+
+# ===========================================================================
+# A WALLET THAT COULD NOT BE ASKED IS NOT A WALLET WITH NOTHING IN IT
+# ===========================================================================
+#
+# _funded_entry returns None for both, and the callers cannot tell them
+# apart from the value -- the chat line already hedges ("or it could not be
+# checked"). The difference is recorded where it is known.
+print("\n== _funded_entry: RPC failure vs nothing found ==")
+_gc_mod = sys.modules["gs_common"]
+_saved_connect = _gc_mod.connect_rpc
+_fe_log = []
+_saved_il_fe = A.integrity_log
+
+
+def _down(*a, **k):
+    raise ConnectionError("wallet-rpc down")
+
+
+try:
+    _gc_mod.connect_rpc = _down
+    A.integrity_log = lambda st, kind, *a, **k: _fe_log.append((st, kind))
+    with contextlib.redirect_stdout(io.StringIO()) as _fe_out:
+        _fe = A._funded_entry({"rpc_primary": "http://127.0.0.1:1",
+                               "tor_proxy": ""})
+finally:
+    _gc_mod.connect_rpc = _saved_connect
+    A.integrity_log = _saved_il_fe
+check("funded: an RPC failure still answers None, so no caller spends on a "
+      "guess", _fe is None)
+check("funded: ...and is RECORDED as a failure, distinct from nothing found",
+      ("wake", "funded_entry:rpc_failed") in _fe_log)
+check("funded: ...with the exception's type on the terminal and not its text, "
+      "which could carry a URL",
+      "ConnectionError" in _fe_out.getvalue()
+      and "wallet-rpc down" not in _fe_out.getvalue())
+
+
+class _EmptyRPC:
+    def raw_request(self, method, params):
+        return {"subaddress_accounts": []} if method == "get_accounts" else {}
+
+
+_fe_log2 = []
+try:
+    _gc_mod.connect_rpc = lambda *a, **k: _EmptyRPC()
+    A.integrity_log = lambda st, kind, *a, **k: _fe_log2.append((st, kind))
+    with contextlib.redirect_stdout(io.StringIO()):
+        _fe2 = A._funded_entry({"rpc_primary": "x", "tor_proxy": ""})
+finally:
+    _gc_mod.connect_rpc = _saved_connect
+    A.integrity_log = _saved_il_fe
+check("funded: NON-VACUITY -- a wallet that answers with nothing is None "
+      "WITHOUT the failure record",
+      _fe2 is None and _fe_log2 == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

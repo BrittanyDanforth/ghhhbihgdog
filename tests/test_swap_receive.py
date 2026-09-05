@@ -125,8 +125,8 @@ class ThorRun:
         m._validate_xmr_addr = lambda a: None      # skip the monero dependency
         m.safe_get = lambda url, proxy=None: {"monero": {"btc": rate}}
         m.safe_post = lambda url, payload, proxy=None: {
-            "routes": [{"transaction": {"depositAddress": deposit, "memo": memo},
-                        "expectedOutput": expected}]}
+            "routes": [{"targetAddress": deposit, "memo": memo,
+                        "expectedBuyAmount": expected}]}
 
     def run(self, dest=DEST, amount="0.005", extra=()):
         out = os.path.join(_scratch, "pairs.json")

@@ -2345,11 +2345,102 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     return r.json()
 
 
+# ---------------------------------------------------------------------------
+#  SwapKit (the BTC->XMR quote aggregator): ONE base URL, ONE parser, ONE key
+# ---------------------------------------------------------------------------
+#: Declared here and nowhere else. GhostSpiral and thor_swap_preparer each
+#: carried their own copy of this URL and their own copy of the route parser.
+SWAPKIT_API = "https://api.swapkit.dev"
+#: The API key travels by ENVIRONMENT, never argv (/proc/<pid>/cmdline is
+#: world-readable; environ is not -- the same rule as every other GS_ secret).
+#: Sent only to SWAPKIT_API's host, as x-api-key, and only when set; a request
+#: refused for lack of one says so and names this variable.
+SWAPKIT_API_KEY_ENV = "GS_SWAPKIT_API_KEY"
+
+
+def swapkit_headers() -> Dict[str, str]:
+    key = (os.environ.get(SWAPKIT_API_KEY_ENV) or "").strip()
+    return {"x-api-key": key} if key else {}
+
+
+#: Per-host extra headers, consulted by safe_post. A table rather than a
+#: parameter so the call sites -- and the three-argument stubs the tests put
+#: in their place -- keep their shape.
+_HOST_HEADERS = {(urlparse(SWAPKIT_API).hostname or "").lower(): swapkit_headers}
+
+
+def parse_swap_route(route: dict) -> tuple:
+    """(deposit_addr, memo, expected_output_str) from ONE SwapKit v3 route.
+
+    THE FIELD NAMES ARE THE API'S OWN, from its published route schema
+    (QuoteResponseRouteItem in the SwapKit SDK):
+
+      targetAddress      where the sold asset is sent -- for BTC.BTC the
+                         THORChain inbound vault. inboundAddress is the
+                         address the aggregator watches, the same thing on a
+                         UTXO chain, so it is the fallback;
+      memo               the memo that inbound payment must carry;
+      expectedBuyAmount  a human-unit decimal string ("0.1234"), the same
+                         shape as sellAmount in the request.
+
+    This read route["transaction"]["depositAddress"], ["memo"] and
+    route["expectedOutput"] -- names from an earlier API that the current one
+    does not return at all. Every live quote therefore parsed to no address,
+    no memo and "0", and stage 2 refused it as a bad route: the swap entry
+    path could not have produced one payable instruction, while the tests fed
+    it the old shape and stayed green. Verified against the SDK's schema and
+    the documented response example, not against a comment.
+
+    `or`, not .get(k, default): the API sends these keys PRESENT with null.
+    """
+    if not isinstance(route, dict):
+        return "", "", "0"
+    deposit = route.get("targetAddress") or route.get("inboundAddress") or ""
+    memo = route.get("memo") or ""
+    expected = route.get("expectedBuyAmount") or "0"
+    return str(deposit), str(memo), str(expected)
+
+
+#: What a standard Bitcoin OP_RETURN carries. A Monero address is 95
+#: characters, so "=:XMR.XMR:<address>" on its own is already over it.
+OP_RETURN_STD_BYTES = 80
+
+
+def memo_size_note(memo: str) -> str:
+    """A warning when the memo will not fit a standard OP_RETURN, else "".
+
+    Nothing here can shorten a memo: the aggregator chose it, and the binding
+    check requires it to name the destination. What the sender has to know is
+    that a wallet enforcing the 80-byte default -- most of them, and every
+    node still on the old relay policy -- refuses or truncates it, and a
+    truncated memo pays nobody. Bitcoin Core 30 relaxed the default relay
+    limit; the sending wallet and the miners' policy both have to allow it.
+    """
+    n = len((memo or "").encode("utf-8"))
+    if n <= OP_RETURN_STD_BYTES:
+        return ""
+    return (f"the memo is {n} bytes, over the {OP_RETURN_STD_BYTES}-byte "
+            f"standard OP_RETURN. The sending wallet must allow a larger "
+            f"OP_RETURN, and the network must relay it, or the memo is "
+            f"refused or cut short -- and a cut memo pays nobody. Confirm the "
+            f"wallet can carry it BEFORE sending.")
+
+
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
     if not proxies:      # proxies={} means DIRECT in requests -- see safe_get
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
-    r = requests.post(url, json=payload, timeout=25, proxies=proxies, allow_redirects=False)
+    _mk = _HOST_HEADERS.get((urlparse(url).hostname or "").lower())
+    _hdrs = (_mk() or None) if _mk else None
+    r = requests.post(url, json=payload, timeout=25, proxies=proxies,
+                      allow_redirects=False, headers=_hdrs)
+    if _mk is not None and _hdrs is None and r.status_code in (401, 403):
+        # A keyed service answering an unkeyed request. Named, because
+        # "HTTP 401" at the quote step reads as a network fault.
+        sys.exit(f"[!] {urlparse(url).hostname} refused the request "
+                 f"({r.status_code}): it needs an API key. Put it in "
+                 f"{SWAPKIT_API_KEY_ENV} in the environment (never on argv) "
+                 f"and retry.")
     r.raise_for_status()
     return r.json()
 
@@ -2957,6 +3048,50 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     connection is rejected to prevent clearnet IP leaks.
     """
     return MoneroRPC(url, proxy_url=proxy_url)
+
+
+#: Bytes per transaction used to turn monerod's per-BYTE fee into a per-
+#: transaction one. A 1-in/2-out ring-16 transfer is ~1.5-2.2 kB; 2000 is now
+#: the one figure every reader of get_fee_estimate shares (GhostSpiral's fee
+#: path, the console's panel, the vault's deposit floor). It was written inline
+#: in two of them.
+TX_BYTES_ESTIMATE = 2000
+#: monerod's own fees[] ratios. get_fee_estimate on mainnet returns
+#: [20000, 80000, 320000, 4000000] piconero/byte (20/80/320/4000 nanonero),
+#: i.e. 1 / 4 / 16 / 200. Used only for a daemon that returns a base `fee` and
+#: no fees[] array. The table this replaces said 1/4/20/166 under a comment
+#: stating that the real fourth ratio was ~200 -- a constant shipped with its
+#: own correction.
+PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 16, 4: 200}
+
+
+def per_tx_fee_xmr(per_byte_piconero) -> Decimal:
+    """piconero-per-byte -> XMR per TX_BYTES_ESTIMATE-byte transaction."""
+    return Decimal(int(per_byte_piconero) * TX_BYTES_ESTIMATE) / Decimal(10 ** 12)
+
+
+def fee_estimate_per_tx(est: dict, fee_priority: int) -> tuple:
+    """(fee_xmr, source) from a get_fee_estimate result; (None, "") if unusable.
+
+    Prefers fees[] -- the exact per-priority figure the daemon will charge --
+    and falls back to fee x PRIORITY_FEE_MULTIPLIER for a daemon without the
+    array. Every fee-reading tool calls this, so one daemon reply cannot be
+    turned into three different numbers by three private copies of the sum.
+    """
+    est = est or {}
+    fees = est.get("fees")
+    try:
+        if (isinstance(fees, list) and len(fees) >= fee_priority
+                and int(fees[fee_priority - 1] or 0) > 0):
+            return per_tx_fee_xmr(fees[fee_priority - 1]), "per_priority_array"
+        base = int(est.get("fee") or 0)
+        if base > 0:
+            return (per_tx_fee_xmr(base)
+                    * Decimal(PRIORITY_FEE_MULTIPLIER.get(fee_priority, 1)),
+                    "base_times_multiplier")
+    except (TypeError, ValueError):
+        pass
+    return None, ""
 
 
 def daemon_fee_estimate(daemon_url: str, proxies: Optional[Dict[str, str]] = None) -> dict:

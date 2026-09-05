@@ -234,9 +234,9 @@ def run_stage2(expected_xmr, oracle_btc_per_xmr, max_slippage="0.10"):
              ghost.shutdown_requested, ghost.btc_per_xmr_oracle)
     try:
         ghost.safe_post = lambda url, payload, proxy=None: {
-            "routes": [{"transaction": {"depositAddress": "bc1qdeposit",
-                                        "memo": f"=:XMR.XMR:{SUB}:0/1/0"},
-                        "expectedOutput": str(expected_xmr)}]}
+            "routes": [{"targetAddress": "bc1qdeposit",
+                        "memo": f"=:XMR.XMR:{SUB}:0/1/0",
+                        "expectedBuyAmount": str(expected_xmr)}]}
         ghost.safe_get = lambda url, proxy=None: {}
         ghost.newnym = lambda *a, **k: True
         ghost.tor_recheck = lambda *a, **k: None
@@ -291,7 +291,7 @@ print("\n=== external numbers: quotes and price oracles ===")
 #     if exp <= 0:                     # RAISES InvalidOperation here
 #
 # so the guard meant to reject the value is the line that crashes. Measured: a
-# SwapKit quote of expectedOutput="NaN" took stage 2 out with an uncaught
+# SwapKit quote of expectedBuyAmount="NaN" took stage 2 out with an uncaught
 # traceback, and quote_deviation — whose docstring promises it "returns None
 # when the comparison cannot be made honestly" — raised on the same input.
 
@@ -334,7 +334,7 @@ check("control: a real oracle price is returned", _oracle("0.005") == D("0.005")
 # ...and stage 2 survives every one of them, reporting rather than crashing.
 for _exp in ("NaN", "Infinity", "-5", "abc"):
     _out = run_stage2(_exp, D("0.005"))
-    check(f"ext: stage 2 survives expectedOutput={_exp!r} without a traceback",
+    check(f"ext: stage 2 survives expectedBuyAmount={_exp!r} without a traceback",
           _out is None or "Chunk" in str(_out))
 check("control: a good quote still passes stage 2",
       run_stage2(D("200"), D("0.005")) is None)
@@ -792,15 +792,14 @@ def _drive_split(n_chunks, wallets=6):
                 # Everything this test is about has happened by now; stop
                 # before the arrival wait, which would block for hours.
                 raise _SplitStop()
-            # depositAddress and memo live under `transaction` -- see
-            # parse_swap_route, which reads them from there.
+            # targetAddress, memo and expectedBuyAmount at the route's top
+            # level -- the API's current shape; see gs_common.parse_swap_route.
             return {"routes": [{
-                "expectedOutput": "1.0",
-                "transaction": {
-                    "memo": "=:XMR.XMR:" + payload["destinationAddress"]
-                            + ":0/1/0::0",
-                    "depositAddress":
-                        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]}
+                "expectedBuyAmount": "1.0",
+                "memo": "=:XMR.XMR:" + payload["destinationAddress"]
+                        + ":0/1/0::0",
+                "targetAddress":
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}]}
         ghost.safe_post = _post
 
         sys.argv = ["GhostSpiral", "--btc-entry",

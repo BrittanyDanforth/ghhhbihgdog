@@ -431,11 +431,16 @@ check("no phase line calls an ordinary wait a failure",
 #
 # A mutation sweep found nothing testing it: the shortened line SURVIVED.
 _landed = P.PHASE_LINES["landed"]
-check("the 'landed' line names WHICH step finished, not just that one did",
-      "swap" in _landed.lower())
+# NOT "the swap; the mix has not run yet" -- that named both steps, which is
+# the arrangement's shape on the answer most often asked for. It says the
+# money is here and that the job is not over, and nothing about what the job
+# consists of.
+check("the 'landed' line says the job is NOT over, without naming the step "
+      "that finished or the one that has not run",
+      "not run yet" in _landed.lower()
+      and not re.search(r"\b(swap|mix|mixing)\b", _landed, re.I))
 check("...and does not read as the whole job being over",
-      not _landed.rstrip().lower().endswith("done.")
-      or "swap" in _landed.lower())
+      not _landed.rstrip().lower().endswith("done."))
 # NON-VACUITY: the line is a real sentence that still says the money arrived,
 # so this is not passing on an empty or unrelated string.
 # THE WORD IS "CONFIRMED", NOT "landed". A status line that opens with the
@@ -593,6 +598,11 @@ _p._chain = None
 _p._chain_leg = 0
 _p._status_at = {}
 _p.spenders = 1
+# The chain asks the limits before promising a next leg; a harness without
+# them reads as "refused", which is the safe side and the wrong one here.
+_p.limits = __import__("types").SimpleNamespace(
+    why_not=lambda: "", record=lambda: None, recent=lambda: [],
+    daily_cap=12, offset=0, save=lambda: None)
 _ok = [True]
 _p.send = lambda cid, t, buttons=None: (_sent.append(t), _ok[0])[1]
 
@@ -618,8 +628,10 @@ check("...and NOT the memo, which is the only field that named anybody",
 check("...so the deposit is ONE message now, not two",
       len([t for t in _msgs if t.strip()]) == 1)
 check("...and it says the one thing that would lose the money, which is "
-      "paying it from a phone wallet",
-      "phone wallet" in _chat and "machine" in _chat)
+      "paying it from a phone (without saying 'wallet' -- a word the chat "
+      "uses nowhere)",
+      "phone" in _chat.lower() and "machine" in _chat
+      and "wallet" not in _chat.lower())
 check("the handle is there, so /check works later", "A3F1" in _chat)
 
 # THE DEFAULT PATH IS UNCHANGED, and this is the check that keeps §8 true for
@@ -658,9 +670,13 @@ check("NON-VACUITY -- the plaintext-off reply is a real message",
       _chat_off.strip() and "quoted" in _chat_off)
 check("...and it says where the address actually is",
       "ON THE MACHINE" in _chat_off)
-check("...and that paying needs a desktop wallet, which is the part that "
-      "stops an operator trying from the phone",
-      "desktop wallet" in _chat_off and "OP_RETURN" in _chat_off)
+# NOT "a desktop wallet: the memo goes in an OP_RETURN" -- that named the
+# field that routes the swap, on the reply every deposit gets. What stops the
+# phone is said; what the phone cannot attach is not.
+check("...and that it cannot be paid from a phone, which is the part that "
+      "stops an operator trying from there -- without naming the field",
+      "from a phone" in _chat_off and "OP_RETURN" not in _chat_off
+      and "wallet" not in _chat_off.lower())
 
 # ===========================================================================
 #  A PHASE OUTRANKS THE OUTCOME
@@ -987,8 +1003,11 @@ check("withdraw: ...and says what happened without leaning on a conversation "
 # runaway chain, not a count of what is coming. A run ends when the wallet has
 # no funded entry left, so the operator who got three legs was reading the
 # third as the run stopping halfway.
-check("withdraw: ...and numbers the leg without inventing a total",
-      re.search(r"withdraw 1 sent", _mws[0])
+# ...AND NOW NO LEG NUMBER EITHER: "withdraw 1 sent" told the transcript how
+# many arrivals there had been, which is the shape of the arrangement.
+check("withdraw: ...and neither numbers the leg nor invents a total",
+      "withdraw: sent" in _mws[0]
+      and not re.search(r"withdraw \d", _mws[0])
       and f"/{pg.Pager.MAX_CHAIN_LEGS}" not in _mws[0])
 # THE SCOPE IS NAMED, AND THE CHAIN DECIDES WHICH SENTENCE FOLLOWS.
 #
@@ -1008,10 +1027,15 @@ check("withdraw: with nothing more found, it says so plainly -- and does not "
 _mwm = _drive_out(_res("done", "more_left"), "done", job="withdraw")
 check("withdraw: with more left, it says another is starting rather than "
       "leaving the operator to notice",
-      "next one starting" in _mwm[0].lower())
-check("withdraw: ...and gives the reason they go separately, which is why it "
-      "is not a limitation to be fixed later",
-      "all yours" in _mwm[0].lower())
+      "another is starting" in _mwm[0].lower())
+# NOT "sending them together would prove they are all yours": that sentence
+# explained the mechanism -- several arrivals, kept apart on purpose -- on
+# the transcript. The operator was told once, at setup; the stranger reading
+# the chat is who it informed.
+check("withdraw: ...and gives NO reason, because the reason is the shape of "
+      "the operation",
+      "all yours" not in _mwm[0].lower()
+      and "separate" not in _mwm[0].lower())
 check("withdraw: NON-VACUITY -- the two endings really are different text",
       _mws[0] != _mwm[0])
 check("withdraw: ...and states no balance and no count, because this box has "

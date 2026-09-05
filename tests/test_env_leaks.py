@@ -436,9 +436,9 @@ def _run_thor(outfile):
     m._validate_xmr_addr = lambda a: None
     m.safe_get = lambda url, proxy=None: {"monero": {"btc": "0.005"}}
     m.safe_post = lambda url, payload, proxy=None: {"routes": [{
-        "transaction": {"depositAddress": _F5DEP,
-                        "memo": f"=:XMR.XMR:{_F5D}:0/1/0"},
-        "expectedOutput": "1.0"}]}
+        "targetAddress": _F5DEP,
+        "memo": f"=:XMR.XMR:{_F5D}:0/1/0",
+        "expectedBuyAmount": "1.0"}]}
     _argv = sys.argv
     sys.argv = ["thor", "--amounts", "0.005", "--dests", _F5D,
                 "--outfile", str(outfile),

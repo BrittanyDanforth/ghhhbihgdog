@@ -242,8 +242,12 @@ w.say(_WA)
 # "3  20 hops" -- so 3 was the key for twenty hops AND the hop count on the
 # first line, and somebody who read the menu and typed what they wanted got
 # the slowest option with the highest minimum balance.
-check("wd: ...then asks how deep, offering every depth the protocol has",
-      all(f"{_h} hops" in w.sent[-1][1] for _h in P.WITHDRAW_HOPS)
+# NO "hops" ON THE ROW: the number is the whole answer, and the word named
+# the mechanism on the surface a stranger reads.
+check("wd: ...then asks how deep, offering every depth the protocol has, "
+      "without naming what a depth is made of",
+      all(re.search(rf"\b{_h}\b", w.sent[-1][1]) for _h in P.WITHDRAW_HOPS)
+      and "hop" not in w.sent[-1][1].lower()
       and "SPENDS" not in w.sent[-1][1])
 w.say("10")
 check("wd: ...then confirms, saying plainly that this one SPENDS",
@@ -450,8 +454,12 @@ check("wd/spread: the question offers more than one address",
 # THE FACT SURVIVES, because it is the one that decides whether a single
 # address throws the run away -- so the checks below are that the CONSEQUENCE
 # is still stated, without the arithmetic.
-check("wd/spread: ...and says the payments are many, without counting them",
-      "many separate payments" in _ask
+# NOT "many separate payments" EITHER: that the money arrives in pieces is
+# the operation's shape. What is left is the consequence of one address.
+check("wd/spread: ...and says what one address costs, without saying the "
+      "payments are many or counting them",
+      "collects everything" in _ask
+      and "separate payments" not in _ask.lower()
       and str(P.exit_arrivals_floor(min(P.WITHDRAW_DEPTHS))) not in _ask)
 # "ONE ADDRESS IS FINE" WAS TWO SENTENCES OF REASSURANCE nobody needed: the
 # question already accepts one, so an operator with one address types it. What
@@ -459,7 +467,7 @@ check("wd/spread: ...and says the payments are many, without counting them",
 # cannot work out for themselves.
 check("wd/spread: ...and says why several is better, which is the part the "
       "operator cannot work out alone",
-      "group them" in _ask.lower())
+      "group it" in _ask.lower())
 check(f"wd/spread: ...in one short screen ({len(_ask)} chars)",
       len(_ask) <= 260)
 _m.say(f"{_WA} {_WB} {_WC}")
@@ -467,12 +475,14 @@ _m.say("20")
 _conf = _m.sent[-1][1]
 check("wd/spread: three addresses are accepted in one message",
       "= ?" in _conf)
-check("wd/spread: the confirm says the payments are many, and does not count "
-      "them either",
-      "many separate payments" in _conf
+check("wd/spread: the confirm says everything goes to the addresses given, "
+      "without saying the payments are many or counting them",
+      "everything here" in _conf and "addresses you gave" in _conf
+      and "separate" not in _conf.lower()
       and str(P.exit_arrivals_floor(3)) not in _conf)
-check("wd/spread: ...and how many places they land in",
-      "across 3 addresses" in _conf)
+check("wd/spread: ...and does not count the places they land in either -- a "
+      "count of destinations is a count in the transcript",
+      "across" not in _conf)
 # THE ADDRESSES ARE STILL NOT REPEATED. A count is not a destination: it says
 # nothing about where the money goes, and the transcript has no masker.
 check("wd/spread: the confirm still repeats no address",
@@ -498,9 +508,9 @@ _h3.answer_confirm()
 check("wd/hops: typing 3 runs THREE hops, not the third row",
       len(_h3.pokes) == 1
       and P.WITHDRAW_DEPTHS[_h3.pokes[0][2]["depth"]][0] == 3)
-check("wd/hops: ...and the confirm it agreed to said three hops too, so the "
+check("wd/hops: ...and the confirm it agreed to said depth 3 too, so the "
       "screen and the job match",
-      "3 hops" in _h3conf and "20 hops" not in _h3conf)
+      "at depth 3" in _h3conf and "depth 20" not in _h3conf)
 # EVERY ROW LEADS WITH THE NUMBER THAT IS TYPED, and this is the check that
 # would have caught both collisions on its own.
 #
@@ -524,9 +534,15 @@ check("wd/hops: ...and every one of them is a hop count the step accepts, so "
       and sorted(_dqnums) == sorted(P.WITHDRAW_HOPS))
 # AND THE RUNTIME IS STILL ON THE ROW. Removing it would "fix" the collision
 # by deleting the thing the menu was changed to say.
-check("wd/hops: ...and each row still says how long that depth takes",
+# The three rows are shown together, so the hours reveal only the table every
+# copy of the source carries -- and they are what is being chosen between.
+check("wd/hops: ...and each row still says how long that depth takes, and "
+      "what the trade-off is, without the word for what a depth is made of",
       all(f"about {P.depth_hours(_d)}h" in _dqtext
-          for _d in P.WITHDRAW_DEPTHS))
+          for _d in P.WITHDRAW_DEPTHS)
+      and all(P.WITHDRAW_DEPTH_NOTE[_d] in _dqtext
+              for _d in P.WITHDRAW_DEPTHS)
+      and "hop" not in _dqtext.lower())
 # THE HOURS ARE DERIVED FROM THE BUDGET THEY DESCRIBE, not written beside it.
 # A hand-typed "~6h" next to a 22080-second budget is a mirror with nothing
 # checking it: change the hop delays and the menu goes on promising the old
@@ -580,7 +596,7 @@ _o = Fake()
 _o.say("/withdraw"); _o.say(_WA); _o.say("20")
 _oc = _o.sent[-1][1]
 check("wd/spread: one address is told what it costs, at the confirm",
-      "ONE address" in _oc and "group" in _oc)
+      "ONE address" in _oc and "sees everything" in _oc)
 check("wd/spread: NON-VACUITY -- the three-address confirm says no such thing",
       "ONE address" not in _conf)
 # NO ARRIVAL COUNT IN EITHER CONFIRM, at any depth. Checked across the whole
@@ -613,7 +629,7 @@ check("wd/spread: neither confirm quotes an arrival count, at any depth",
 # ...AND THE CONSEQUENCE IS STILL THERE, which is what the count was for. A
 # check that only asserts an absence passes on an empty string.
 check("wd/spread: ...and the one-address case is still told what it costs",
-      "sees them all" in _oc and "group them" in _oc)
+      "sees everything" in _oc and "Several are safer" in _oc)
 
 # THE CAP AND THE DUPLICATE RULE ARE THE WIRE'S, enforced where the operator
 # is typing rather than after a wake has been spent.
@@ -656,9 +672,12 @@ print("\n-- it asks how much, in the operator's own figures --")
 _a = Fake()
 _a.say("/deposit")
 _q = _a.sent[-1][1]
-check("amount: the question asks for a BTC amount, not a position in a list",
-      "btc" in _q.lower() and "slot" not in _q.lower()
-      and "position" not in _q.lower())
+# THE UNIT IS NOT NAMED. The one operator knows what they pay in; the coin's
+# name on the question told the transcript what goes in.
+check("amount: the question asks for an amount, not a position in a list, "
+      "and does not name the coin",
+      "amount" in _q.lower() and "btc" not in _q.lower()
+      and "slot" not in _q.lower() and "position" not in _q.lower())
 # THE BOUNDS MOVED TO THE REFUSAL. Listing them in the QUESTION makes every
 # operator read two numbers that constrain almost nobody; listing them in the
 # refusal reaches exactly the operator who got it wrong.
@@ -787,8 +806,10 @@ check("settings: ...and offers every mixing depth the protocol has",
 # sends. The test was written for the welcome and the word was left standing
 # in thirteen replies that predate it, /settings among them. What the
 # operator needs from this line is the number and that it is a daily one.
-check("settings: ...and the daily allowance, which is counted on THIS end",
-      "12" in _stx and "allowance" in _stx.lower())
+# NO FIGURE. The cap is the shape of the arrangement; why_not() names it at
+# the one moment it is useful, when it is reached.
+check("settings: ...and the daily allowance, without its figure",
+      "allowance" in _stx.lower() and re.search(r"\b12\b", _stx) is None)
 check("settings: ...and does not name what is being woken to do it",
       not re.search(r"\\bwoken?\\b|\\bwakes?\\b", _stx, re.I))
 # THE MEANING, NOT ONE PHRASE. This tested for the literal "not here", which
@@ -804,9 +825,9 @@ check("settings: ...and does not claim the hop delay is a machine setting, "
       "because there is no keyfile field for it and no --hop-delay composed",
       "delay" in _stx.lower()
       and _stx.lower().index("fixed in the software")
-      < _stx.lower().index("the delay between hops"))
+      < _stx.lower().index("the delay between steps"))
 check("settings: ...and why they are not settable from a chat",
-      "turn the mixing down" in _stx)
+      "turn the depth down" in _stx)
 check("settings: it wakes nothing to answer", _st.pokes == [])
 # NOTHING OPERATIONAL LEAKS. It is a reply on the surface this design assumes
 # is read: no machine names, no amounts, no addresses.
@@ -880,9 +901,10 @@ check("every figure in the chat is either a bound or what the operator typed",
 print("\n-- a half-finished /depo never reaches the SD card --")
 check("Convo has __slots__, so a field cannot be added by accident",
       hasattr(pg.Convo, "__slots__"))
-check("...and holds only the eight fields the two wizards need",
-      set(pg.Convo.__slots__) == {"kind", "amount", "depth",
-                                  "exit_to", "expect", "deadline", "tries"})
+check("...and holds only the fields the two wizards need, plus the message "
+      "ids that are deleted with it",
+      set(pg.Convo.__slots__) == {"kind", "amount", "depth", "exit_to",
+                                  "expect", "deadline", "tries", "mids"})
 # "handle" IS NOT AMONG THEM, and it was -- declared, assigned None in
 # __init__, and never set or read anywhere else in the shipped program. It
 # survived because the fixture below used to assign it by hand and the check
@@ -908,7 +930,7 @@ check("...and the dead 'handle' slot is gone, not merely unassigned",
 # still enforced for every other field.
 _c_fresh = pg.Convo(lambda: 0.0)
 check("...and every field starts empty, so a fresh Convo holds nothing",
-      all(getattr(_c_fresh, f) in (None, "depo", 0)
+      all(getattr(_c_fresh, f) in (None, "depo", 0, [])
           or isinstance(getattr(_c_fresh, f), float)
           for f in pg.Convo.__slots__))
 # DRIVEN, NOT HAND-BUILT, AND THE HAND-BUILT ONE WAS THE WRONG SHAPE.
@@ -1107,8 +1129,9 @@ _q = fa.text()
 # THE CONFIRM NAMES WHAT WAS CHOSEN, and now that is the figure itself. It
 # used to be the operator's word for a ladder rung ("medium"), or "#4" when
 # they had paired no words -- a number nobody could check against anything.
-check("the confirm names what was chosen before waking anything",
-      "Deposit 0.4 BTC" in _q)
+check("the confirm names what was chosen before waking anything -- the "
+      "figure, and not the coin",
+      "Deposit 0.4." in _q and "BTC" not in _q)
 check("...and names no machine while doing it", "vault" not in _q.lower())
 # FREE-FORM, NOT MULTIPLE CHOICE. Three buttons meant a pocket-dial cleared
 # the gate one time in three; typing a sum is no harder for the operator and
@@ -1189,7 +1212,7 @@ for _shape in ("1e9", "two", "0,05"):
     fd.sent.clear()
     fd.say(_shape)
     check(f"...and {_shape!r} is refused for its SHAPE, not its size",
-          "plain BTC amount" in fd.text())
+          "plain amount" in fd.text() and "BTC" not in fd.text())
 
 # A SUPERSCRIPT DIGIT IS THE isdigit/isdecimal TRAP, and it is here because it
 # was a real reproduced bug: "²".isdigit() is True and int("²") raises, so a
@@ -1203,7 +1226,7 @@ for _sup in ("²", "³", "¹"):
     fe2.sent.clear()
     fe2.say(_sup)
     check(f"{_sup!r} is refused as a bad amount, not as an internal error",
-          "plain BTC amount" in fe2.text() and "went wrong" not in fe2.text())
+          "plain amount" in fe2.text() and "went wrong" not in fe2.text())
 
 # THE FULLWIDTH FAMILY, WHICH IS THE SAME TRAP WEARING A DISGUISE THAT WORKS.
 # "²" raises in int() and is caught. "１" does NOT: str.isdecimal() is True,
@@ -1448,8 +1471,10 @@ _agent = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 # /fee's CLAIM ALSO CHANGED. The agent CAN spawn GhostSpiral now, for exactly
 # one keyfile-gated job -- so "its output can never reach this chat" is no
 # longer true by construction and has to be true by what is SENT instead.
-check("/fee's claim holds: the agent spawns the mix only for the spending job",
-      _agent.count('_tool("GhostSpiral")') == 1
+check("/fee's claim holds: the agent spawns the mix only for the spending job "
+      "(the second reference is the in-process loader for the fee floor)",
+      _agent.count('[sys.executable, _tool("GhostSpiral")') == 1
+      and _agent.count('_tool("GhostSpiral")') == 2
       and 'if job == "withdraw":' in _agent)
 check("...and that job is refused unless this machine's own keyfile allows it",
       'if not key.get("allow_withdraw"):' in _agent)
@@ -1510,10 +1535,12 @@ _fw.say("3")
 _wconf = _fw.sent[-1][1]
 check("fee/honesty: the withdraw confirm does not promise the cut is taken",
       "comes out of it" not in _wconf)
-check("fee/honesty: ...it states a CEILING, which is the only form this box "
-      "can stand behind — it knows neither the balance nor the machine's fee "
-      "configuration",
-      "Up to" in _wconf and "some runs take none" in _wconf)
+# NOT "Up to 1.1% ... some runs take none": the rate and the rule sat on the
+# message most likely to be kept. The confirm says a fee MAY come out and
+# points at /fee, which is read on purpose.
+check("fee/honesty: ...it says a fee MAY come out, which is the only form "
+      "this box can stand behind, and points at /fee for the rate",
+      "may come out of it" in _wconf and "/fee" in _wconf)
 # AND IT DOES NOT BLAME THE AMOUNT. The first draft of this fix said the
 # exception is the withdrawal being small -- one of the two causes, and not
 # the commoner one: a machine paired with nowhere off the wallet to put a cut
@@ -1521,9 +1548,9 @@ check("fee/honesty: ...it states a CEILING, which is the only form this box "
 check("fee/honesty: ...without pinning the exception on the amount, which is "
       "only one of the two causes",
       "too small" not in _wconf)
-check("fee/honesty: ...while still naming the rate, so the disclosure did not "
-      "become a non-statement",
-      pg.USAGE_FEE_LABEL in _wconf)
+check("fee/honesty: ...without the rate itself, which is one tap away and "
+      "does not belong on the message most likely to be kept",
+      pg.USAGE_FEE_LABEL not in _wconf)
 # NO FLOOR FIGURE, ANYWHERE IN THE CHAT. Not secrecy -- it is derived from
 # constants in this repository and anyone holding it recomputes it. It is that
 # this box CANNOT compute it: the floor moves with the live network fee and
@@ -1585,7 +1612,7 @@ check("fee/settings: ...while still saying the machine is what decides "
       "whether a usage fee is taken" in _stext)
 # NON-VACUITY: /settings really is the reply under test, and it still answers.
 check("fee/settings: NON-VACUITY -- /settings still lists what a run does",
-      "You choose, per job:" in _stext and "mixing depth" in _stext)
+      "You choose, per job:" in _stext and "depth" in _stext)
 # AND ALL FOUR FEE SURFACES AGREE. The bug was not any one sentence, it was
 # four surfaces written at different times: welcome, /fee, the withdraw
 # confirm and /settings. Checked together so the next edit to one of them has
@@ -1624,7 +1651,17 @@ import ast as _ast
 # unroutable and the funds do not come back.
 _BANNED = ("vault", "thinkpad", "keyfile", "gs_unseal", "thorchain",
            "subpoena", "deliberate", "transcript", "cash-out", "ladder",
-           "ghostspiral", "monero", "xmr", "wallet-rpc", "tor")
+           "ghostspiral", "monero", "xmr", "wallet-rpc", "tor",
+           # THE SHAPE OF THE ARRANGEMENT, AS WORDS. Rule 6: nothing on this
+           # surface may name what goes in, what comes out, or what happens
+           # between -- and "you pay in Bitcoin ... Monero mixing ... as
+           # separate mixes, one per arrival ... the memo goes in an
+           # OP_RETURN" was the whole shape, spread over the welcome, the
+           # questions and the deposit reply. The one operator set the
+           # machine up and knows all of it; a stranger reading the chat is
+           # the only person these words informed.
+           "bitcoin", "btc", "mix", "mixing", "mixes", "mixed", "hop", "hops",
+           "op_return", "memo", "swap", "swaps", "swapped", "wallet")
 _BANNED_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in _BANNED) + r")\b", re.I)
 _pg_tree = _ast.parse(_SRC)
@@ -1634,7 +1671,10 @@ def _sent_strings(tree):
     """Every literal the bot can put on the wire, with its line."""
     out = []
     for n in _ast.walk(tree):
-        if isinstance(n, _ast.Call) and getattr(n.func, "attr", "") == "send":
+        # _ask IS A send: it forwards to send and records the message id so
+        # the wizard's questions burn with the conversation.
+        if isinstance(n, _ast.Call) and getattr(n.func, "attr", "") in (
+                "send", "_ask"):
             for arg in n.args[1:2]:
                 for x in _ast.walk(arg):
                     if isinstance(x, _ast.Constant) and isinstance(x.value, str):
@@ -1707,7 +1747,9 @@ check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
 # a composed reply driven above, one of the module constants already walked, or
 # a RUNTIME value (a slip from the vault, a minted address, a memo) which is
 # not authored text and cannot be read from source by anyone.
-_RUNTIME_SENDS = {"slip", "_msg", "memo"}
+# `text` is _ask forwarding its own argument to send -- every _ask call site
+# is walked above, so the forwarded name is covered by construction.
+_RUNTIME_SENDS = {"slip", "_msg", "memo", "text"}
 _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
                   | {"welcome_text(self.burn_after, self.key)"}
                   | {"HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
@@ -1715,7 +1757,8 @@ _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
                   | _RUNTIME_SENDS)
 _uncovered = sorted(
     {_ast.unparse(a) for n in _ast.walk(_pg_tree)
-     if isinstance(n, _ast.Call) and getattr(n.func, "attr", "") == "send"
+     if isinstance(n, _ast.Call)
+     and getattr(n.func, "attr", "") in ("send", "_ask")
      for a in n.args[1:2]
      if not any(isinstance(x, _ast.Constant) and isinstance(x.value, str)
                 for x in _ast.walk(a))} - _COVERED_SENDS)
@@ -1727,12 +1770,17 @@ check(f"...and no OTHER reply is composed out of the scan's reach "
 # welcome; every other reply still may not say it, and the welcome may not turn
 # it into a running commentary. Two mentions: what this is, and which of the
 # two ways in applies to the reader.
-_CURRENCY_RE = re.compile(r"\b(monero|xmr)\b", re.I)
+# THE EXEMPTION IS CLOSED. This used to let the welcome name the currency
+# ("a service that will not say what it deals in cannot onboard anybody") and
+# counted the mentions across every surface. There is nobody to onboard: one
+# operator, who configured the machine and knows what it deals in (rule 8).
+# The name on the welcome told the reader of the transcript, and nobody else.
+# The scrub below is kept as a no-op so the total can be checked to be zero.
+_CURRENCY_RE = re.compile(r"\b(monero|xmr|bitcoin|btc)\b", re.I)
 _wc = len(_CURRENCY_RE.findall(pg.WELCOME))
-check(f"the welcome names the currency, because a service that will not say "
-      f"what it deals in cannot onboard anybody ({_wc} mentions)", _wc >= 1)
-check("...and no more than twice, so it stays a naming and not a description",
-      _wc <= 2)
+check("the welcome does not name the currency -- in or out -- because the "
+      "one person it is for already knows, and the transcript does not",
+      _wc == 0)
 # THE EXEMPTION IS COUNTED ACROSS EVERY SURFACE IT COVERS, not per surface.
 # Scrubbing the currency out before the banned-word scan is what lets the
 # welcome and the button labels name it at all; without a total, that scrub
@@ -1836,14 +1884,13 @@ _exempt_total = (_wc
 # mention; with the command gone the welcome's headline is the only one left,
 # which is the smallest the exemption can be while the service still says what
 # it deals in.
-check(f"the currency exemption stays bounded across every surface it covers "
-      f"({_exempt_total} mentions across the welcome, the button labels, the "
-      f"deposit instructions and the withdraw question)",
-      _exempt_total <= 4)
-# NON-VACUITY on the scrub: it is what lets those surfaces through, so it has
-# to actually be doing something, or the cap above is guarding nothing.
-check("NON-VACUITY -- the surfaces the scrub covers really do name it",
-      _exempt_total >= 1)
+check(f"no surface names the currency at all -- welcome, button labels, "
+      f"deposit instructions, withdraw question ({_exempt_total} mentions)",
+      _exempt_total == 0)
+# NON-VACUITY on the count: the surfaces really were collected, or zero is
+# the count of an empty list.
+check("NON-VACUITY -- the surfaces counted are real text",
+      len(_LABELS) >= 8 and len(_plain_authored) >= 5 and len(_EXIT_Q) > 40)
 # ---- AND THE DEPOSIT INSTRUCTIONS, WHICH LIVE IN ANOTHER FILE -----------
 #
 # THE DEFECT THIS FOUND. gs_wake_proto.plain_lines builds the message the chat
@@ -1870,7 +1917,7 @@ _all_sent += [(-1, _CURRENCY_RE.sub("", _l)) for _l in _plain_authored]
 # THE MEMO INSTRUCTION IS GONE ENTIRELY, along with the memo. What is left is
 # the one thing a reader can get wrong and lose the payment for.
 check("...including the line that replaced the OP_RETURN instruction",
-      any("phone wallet" in _l for _l in _plain_authored))
+      any("phone" in _l.lower() and "CANNOT" in _l for _l in _plain_authored))
 check("...and nothing there names the service that routes the swap, or the "
       "field it routes on",
       not any(re.search(r"thorchain|OP_RETURN", _l, re.I)
@@ -1927,11 +1974,12 @@ def _btn_source(node):
     return _ast.unparse(node)
 
 
+# "buttons" is _ask forwarding its keyword to send; every _ask site is walked.
 _BTN_TABLES = {"MENU_BUTTONS", "_depth_buttons", "_handle_buttons",
-               "_phase_buttons", "<literal>"}
+               "_phase_buttons", "<literal>", "buttons"}
 _btn_seen = {_btn_source(_kw.value) for _n in _ast.walk(_pg_tree)
              if isinstance(_n, _ast.Call)
-             and getattr(_n.func, "attr", "") == "send"
+             and getattr(_n.func, "attr", "") in ("send", "_ask")
              for _kw in _n.keywords if _kw.arg == "buttons"}
 check(f"...and every keyboard this bot attaches comes from one of them "
       f"({sorted(_btn_seen - _BTN_TABLES)})",
@@ -2034,6 +2082,199 @@ fg.say("/depo", cid=999)
 check("a chat that is not allowlisted starts no conversation", not fg.p.convos)
 check("...and gets no reply at all", fg.sent == [])
 check("...and is counted", fg.p.ignored == 1)
+
+
+
+# ===========================================================================
+# THE WIZARD BURNS WITH THE CONVERSATION.
+# ===========================================================================
+#
+# THE WIZARD IS WHERE THE SECRETS ARE. The amount the operator typed, the
+# destination addresses they replied with, and the bot's own echoes of both
+# sat in the transcript for as long as Telegram kept them -- forever, with
+# --burn-after at its old default of 0. Every question the bot asks and every
+# reply it consumes is recorded on the conversation, and the moment it ends
+# -- confirmed, cancelled, refused, or expired -- all of it is deleted.
+print("\n-- the wizard's questions and replies are deleted when it ends --")
+
+
+class _BurnFake(Fake):
+    """Fake, with message ids on both sides and a delete that records."""
+
+    def __init__(self, allow=(111, 222)):
+        super().__init__(allow)
+        self.deleted = []
+        self._bot_mid = [1000]
+        self._op_mid = [900]
+        self.p.burn, self.p.burn_after, self.p.burn_now = [], 0, False
+        _sent, _kb = self.sent, self.keyboards
+
+        def _send(cid, t, buttons=None):
+            self._bot_mid[0] += 1
+            pg._LAST_MID.mid = self._bot_mid[0]
+            _sent.append((cid, t))
+            _kb.append(buttons)
+            return True
+        self.p.send = _send
+        self.p.delete_message = lambda cid, mid: (
+            self.deleted.append((cid, mid)), True)[1]
+
+    def say(self, text, cid=111):
+        self._op_mid[0] += 1
+        self.p.handle({"update_id": 1,
+                       "message": {"chat": {"id": cid}, "text": text,
+                                   "message_id": self._op_mid[0]}})
+        return self._op_mid[0]
+
+    def gone(self):
+        return sorted(m for _c, m in self.deleted)
+
+
+# /cancel: the question, the reply and the confirm question all go.
+_wb = _BurnFake()
+_cmd = _wb.say("/deposit")
+_q_amount = pg._LAST_MID.mid
+_reply = _wb.say("0.05")
+_q_confirm = pg._LAST_MID.mid
+_cv = _wb.p.convos.get(111)
+check("wizard-burn: the questions and the operator's reply are recorded on "
+      "the conversation, in order",
+      _cv is not None and list(_cv.mids) == [_q_amount, _reply, _q_confirm])
+check("wizard-burn: ...and nothing is deleted while it is live",
+      _wb.deleted == [])
+_cancel = _wb.say("/cancel")
+check("wizard-burn: /cancel deletes both questions and the typed amount, "
+      "at once",
+      _wb.gone() == sorted([_q_amount, _reply, _q_confirm])
+      and 111 not in _wb.p.convos)
+check("wizard-burn: ...and takes them off the timed list, so they are not "
+      "deleted twice",
+      not any(m in (_q_amount, _reply, _q_confirm)
+              for _c, m, _t in _wb.p.burn))
+check("wizard-burn: ...while the commands themselves stay on the timed list",
+      {_cmd, _cancel} <= {m for _c, m, _t in _wb.p.burn})
+
+# CONFIRMED: the answer to the arithmetic is a reply too, and it goes with
+# the rest -- after the job has been handed on.
+_wc2 = _BurnFake()
+_wc2.say("/deposit")
+_qa = pg._LAST_MID.mid
+_ra = _wc2.say("0.05")
+_qc = pg._LAST_MID.mid
+_ans = _wc2.answer_confirm()
+_rc = _wc2._op_mid[0]
+check("wizard-burn: a confirmed deposit still reaches the wire",
+      _ans is not None
+      and _wc2.pokes == [(111, "receive_and_quote", {"amount_sat": 5_000_000})])
+check("wizard-burn: ...and the whole exchange -- two questions, the amount, "
+      "the answer -- is deleted the moment it is confirmed",
+      _wc2.gone() == sorted([_qa, _ra, _qc, _rc]) and 111 not in _wc2.p.convos)
+
+# A REFUSED ADDRESS. The typed destination is the most valuable line in the
+# chat, and a refusal used to leave it there for good.
+_wr = _BurnFake()
+_wr.say("/withdraw")
+_qw = pg._LAST_MID.mid
+_bad = _wr.say("not-an-address")
+check("wizard-burn: a refused destination is deleted with the question that "
+      "asked for it",
+      "bad address" in _wr.text().lower()
+      and _wr.gone() == sorted([_qw, _bad]) and 111 not in _wr.p.convos)
+
+# A GOOD ADDRESS, THEN THE DEPTH, THEN THE CONFIRM -- every step recorded.
+_wg = _BurnFake()
+_wg.say("/withdraw")
+_qx = pg._LAST_MID.mid
+_addr = _wg.say("4" + "8" * 94)
+_qd = pg._LAST_MID.mid
+_dep = _wg.say("10")
+_qcf = pg._LAST_MID.mid
+_cvw = _wg.p.convos.get(111)
+check("wizard-burn: a withdrawal records the address question, the address, "
+      "the depth question, the depth and the confirm",
+      _cvw is not None
+      and list(_cvw.mids) == [_qx, _addr, _qd, _dep, _qcf])
+_wg.answer_confirm()
+check("wizard-burn: ...and deletes all of it on confirm, the address included",
+      _addr in _wg.gone() and len(_wg.gone()) == 6
+      and _wg.pokes and _wg.pokes[0][1] == "withdraw")
+
+# EXPIRY. A conversation nobody finished is reaped by the next message, and
+# reaping is an ending too.
+_we = _BurnFake()
+_we.say("/withdraw")
+_qe = pg._LAST_MID.mid
+_ae = _we.say("4" + "8" * 94)
+_qe2 = pg._LAST_MID.mid
+CLOCK[0] += pg.CONVO_TTL_S + 1
+_we.p._reap()
+check("wizard-burn: an expired conversation is deleted when it is reaped, "
+      "typed address and all",
+      _we.gone() == sorted([_qe, _ae, _qe2]) and 111 not in _we.p.convos)
+CLOCK[0] = 0.0
+
+# A COMMAND TYPED MID-WIZARD drops the wizard (step_convo hands "/" back), and
+# that drop is an ending as well.
+_wd = _BurnFake()
+_wd.say("/deposit")
+_qdd = pg._LAST_MID.mid
+_wd.say("/status")
+check("wizard-burn: a command typed mid-wizard ends it, and the question goes",
+      _qdd in _wd.gone() and 111 not in _wd.p.convos)
+
+# THE SOURCE-LEVEL HALF: every wizard question is sent through _ask, so a
+# question added later is recorded by construction, not by remembering.
+_pg_ask_src = _SRC
+check("wizard-burn: the wizard questions are sent through _ask, which records "
+      "them, and not through send",
+      _pg_ask_src.count("self._ask(chat_id, self._amount_question()") == 1
+      and _pg_ask_src.count("self._ask(chat_id, self._exit_question()") == 1
+      and _pg_ask_src.count("self._ask(chat_id, self._depth_question()") == 1
+      and re.search(r"self\._ask\(chat_id,\s*\"no: reply with one of the "
+                    r"numbers below", _pg_ask_src)
+      and "self.send(chat_id, self._amount_question()" not in _pg_ask_src
+      and "self.send(chat_id, self._exit_question()" not in _pg_ask_src
+      and "self.send(chat_id, self._depth_question()" not in _pg_ask_src)
+check("wizard-burn: ...and every way a conversation ends goes through "
+      "_end_convo, so none of them can leave the exchange standing",
+      "del self.convos[" not in _pg_ask_src
+      and _pg_ask_src.count("self.convos.pop(") == 1
+      and _pg_ask_src.count("self._end_convo(") >= 8)
+
+# A DELETE THAT NEVER COMPLETED IS QUEUED, NOT FORGOTTEN. _end_convo used to
+# count it as "partial" and drop it from every list; one bad Tor circuit at
+# the moment of /cancel left the typed address in the transcript for good.
+_wt = _BurnFake()
+_wt.say("/withdraw")
+_qt = pg._LAST_MID.mid
+_at = _wt.say("4" + "8" * 94)
+_qt2 = pg._LAST_MID.mid
+_dead = [True]
+
+
+def _flaky(cid, mid):
+    if _dead[0]:
+        return None
+    _wt.deleted.append((cid, mid))
+    return True
+
+
+_wt.p.delete_message = _flaky
+_wt.say("/cancel")
+check("wizard-burn: a delete that never completed is queued with the rest, "
+      "not forgotten -- and the round stops at the first one",
+      _wt.deleted == [] and 111 not in _wt.p.convos
+      and sorted(m for _c, m, _t in _wt.p._wizard_retry)
+      == sorted([_qt, _at, _qt2]))
+_dead[0] = False
+_late = _wt.p.retry_wizard_deletes()
+check("wizard-burn: ...and goes on a later tick",
+      _late == 3 and _wt.gone() == sorted([_qt, _at, _qt2])
+      and _wt.p._wizard_retry == [])
+check("wizard-burn: ...which the poll loop drives, beside the timed burn",
+      "self.retry_wizard_deletes()" in _SRC
+      and _SRC.index("self.burn_expired(self.burn_after)")
+      < _SRC.index("self.retry_wizard_deletes()"))
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

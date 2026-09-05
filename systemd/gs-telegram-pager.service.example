@@ -69,9 +69,12 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 # not, and there is deliberately no --token flag to put it there.
 #
 # --burn-after N deletes every message in the chat N seconds after it was sent,
-# this bot's replies and your commands alike. Telegram only permits a bot to
-# delete for 48h. There is no chat command for it: the word would sit in the
-# transcript it was meant to empty. `systemctl kill -s USR1` empties it now.
+# this bot's replies and your commands alike. The default is 900 (fifteen
+# minutes); 0 keeps them. The questions and replies of a /deposit or
+# /withdraw are deleted the moment that exchange ends whatever N is. Telegram
+# only permits a bot to delete for 48h. There is no chat command for it: the
+# word would sit in the transcript it was meant to empty. `systemctl kill -s
+# USR1` empties it now.
 #ExecStart=/usr/bin/python3 /opt/gs/gs_telegram_pager \
 #    --key /etc/gs_wake_pi.key \
 #    --chat-id 123456789 \

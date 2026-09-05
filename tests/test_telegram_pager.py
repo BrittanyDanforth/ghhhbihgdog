@@ -383,8 +383,9 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
               "a second try is refused" in _text and "stop" in _text)
         check("refused: ...and says some refusals need somebody at the machine",
               "somebody at the machine" in _text)
-        check("refused: ...and says retrying is not free",
-              "daily allowance" in _text)
+        check("refused: ...and says retrying is not free, without a figure",
+              "tries are limited" in _text
+              and "allowance" not in _text.lower())
         check("refused: ...while still naming no machine and no reason",
               "vault" not in _text.lower() and "ceiling" not in _text.lower()
               and "budget" not in _text.lower())
@@ -1245,16 +1246,19 @@ check("status: a bot allowlisted for two people does not answer 'ready' to "
       "'can I start one'",
       len(_ss4) == 1 and _ss4[0] != "ready"
       and _ss4[0].startswith("not ready"))
+# NOT "one wallet behind this" -- the answer names the gate without naming
+# what is behind it.
 check("status: ...and says which of the three gates it is, since this is the "
-      "one that needs a person to fix it",
-      "one wallet" in _ss4[0] and "allowlisted" in _ss4[0])
+      "one that needs a person to fix it -- without naming the wallet",
+      "more than one person" in _ss4[0] and "for one" in _ss4[0]
+      and "wallet" not in _ss4[0].lower())
 # THE SAME PAGER REALLY DOES REFUSE THE WORK, so this is not a warning about
 # a condition that would have been fine.
 _sp4.send = lambda c, t, buttons=None: (_ss4.append(t), True)[1]
 _sp4.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
 check("status: NON-VACUITY -- and start_job on that same pager refuses too, "
       "so the answer matched what would actually have happened",
-      "one wallet" in _ss4[-1] and len(_ss4) == 2)
+      "more than one person" in _ss4[-1] and len(_ss4) == 2)
 # NON-VACUITY: one spender and everything else equal still answers ready, so
 # this reads the count and not something else.
 _sp5, _ss5 = _plain_pager(spenders=1)
@@ -1877,6 +1881,100 @@ _b7.p.burn_expired(1)
 check("burn: a refused delete is dropped rather than retried on every tick",
       _b7.p.burn == [] and _b7.deleted == [(111, 8)])
 
+# 4b. THREE ANSWERS, NOT TWO. False is Telegram refusing (permanent); None is
+#     the request never completing -- a Tor circuit, a timeout -- which used
+#     to be treated as a refusal, so a typed address whose delete hit one bad
+#     circuit stayed in the transcript for good. None is kept for next tick.
+_b7b = _BurnPager(burn_after=1)
+_b7b.p.delete_message = lambda cid, mid: (
+    None if mid == 7 else (_b7b.deleted.append((cid, mid)), True)[1])
+_b7b.p.burn = [(111, 8, _now - 99), (111, 7, _now - 99), (111, 9, _now - 99)]
+_gone7b = _b7b.p.burn_expired(1)
+check("burn: a delete that never completed (None) is KEPT for the next tick, "
+      "unlike a refusal (False)",
+      7 in [m for _c, m, _t in _b7b.p.burn] and _gone7b == 1
+      and (111, 8) in _b7b.deleted)
+# ONE TIMEOUT PER TICK. The first request that never completes says the
+# circuit is dead; the ones behind it are not tried this tick (each try is
+# a 25 s timeout on the polling thread) and stay due for the next.
+check("burn: ...and the entries behind it are not tried on a dead circuit, "
+      "but stay due",
+      (111, 9) not in _b7b.deleted
+      and [m for _c, m, _t in _b7b.p.burn] == [7, 9])
+_b7c = _BurnPager(burn_after=1)
+_b7c.p.delete_message = lambda cid, mid: None
+_b7c.p.burn = [(111, 9, _now - pg.TG_DELETE_WINDOW_S - 1)]
+_b7c.p.burn_expired(1)
+check("burn: ...unless the 48h window has closed on it, after which Telegram "
+      "would refuse it anyway",
+      _b7c.p.burn == [])
+_b7e = _BurnPager()
+_b7e.p.delete_message = lambda cid, mid: None if mid == 41 else True
+_b7e.p.burn = [(111, 40, _now), (111, 41, _now), (111, 42, _now)]
+check("burn: burn_all keeps an incomplete delete for a later tick too, and "
+      "stops the round there",
+      _b7e.p.burn_all() == (1, 2)
+      and [m for _c, m, _t in _b7e.p.burn] == [41, 42])
+# THE REAL delete_message, with the post stubbed each way.
+_b7f = _BurnPager()
+_dm = pg.Pager.delete_message
+
+
+class _HttpErr(Exception):
+    def __init__(self, code):
+        super().__init__(f"HTTP {code}")
+        self.response = _ty2.SimpleNamespace(status_code=code)
+
+
+def _raiser(exc):
+    def _f(*a, **k):
+        raise exc
+    return _f
+
+
+_tri = {}
+try:
+    for _name, _stub in (
+            ("ok", lambda *a, **k: {"ok": True, "result": True}),
+            ("refused_json", lambda *a, **k: {"ok": False,
+                                              "description": "gone"}),
+            ("refused_400", _raiser(_HttpErr(400))),
+            ("circuit", _raiser(ConnectionError("tor"))),
+            ("timeout", _raiser(TimeoutError("slow")))):
+        pg.safe_post = _stub
+        _tri[_name] = _dm(_b7f.p, 111, 5)
+finally:
+    pg.safe_post = pg_saved_post
+check("burn: delete_message answers True for done, False for refused (a JSON "
+      "ok:false or a 4xx), and None for a request that never completed",
+      _tri == {"ok": True, "refused_json": False, "refused_400": False,
+               "circuit": None, "timeout": None})
+# 4c. AT MOST max_deletes PER TICK. Each delete is one request on the polling
+#     thread; a backlog against a dead circuit stalled the loop for minutes,
+#     and every button tapped meanwhile died.
+_b7d = _BurnPager(burn_after=1)
+_b7d.p.burn = [(111, 100 + _i, _now - 99) for _i in range(20)]
+_g1 = _b7d.p.burn_expired(1)
+check("burn: a backlog is worked at most eight per tick, so twenty requests "
+      "over Tor cannot stall the poll loop",
+      _g1 == 8 and len(_b7d.p.burn) == 12)
+_g2 = _b7d.p.burn_expired(1)
+check("burn: ...and the rest go on the following ticks",
+      _g2 == 8 and len(_b7d.p.burn) == 4)
+# 4d. THE ACK AND THE DELETE ARE SINGLE ATTEMPTS. safe_post retries four
+#     times with backoff -- about two minutes on a dead circuit -- on the
+#     thread that polls. A button acknowledged two minutes late is a button
+#     that spun and died.
+check("burn: the callback ack and the delete go through _post_once, never "
+      "through the retrying safe_post",
+      _SRC_PG_EARLY.count("self._post_once(\"answerCallbackQuery\"") == 1
+      and _SRC_PG_EARLY.count("self._post_once(\"deleteMessage\"") == 1
+      and "safe_post(self._url(\"answerCallbackQuery\")" not in _SRC_PG_EARLY
+      and "safe_post(self._url(\"deleteMessage\")" not in _SRC_PG_EARLY)
+check("burn: ...and _post_once calls the undecorated function, so a stub in "
+      "safe_post's place is what runs",
+      'getattr(safe_post, "__wrapped__", safe_post)' in _SRC_PG_EARLY)
+
 # 5. THE SIGNAL. It sets a flag and does no I/O -- a handler runs between
 #    bytecodes and can arrive inside safe_post.
 _b8 = _BurnPager()
@@ -2217,8 +2315,8 @@ _wr.handle_job["A3F1"] = "receive_and_quote"
 _wrs.clear()
 _wr.handle(_msg(222, 222, "/check"))
 check("running: a chat with nothing of its own is told exactly that",
-      len(_wrs) == 1 and "no mixes are running" in _wrs[0]
-      and "none have been started in this chat" in _wrs[0])
+      len(_wrs) == 1 and "nothing is running" in _wrs[0]
+      and "nothing has been started in this chat" in _wrs[0])
 check("running: ...and is NOT told about the other chat's label",
       "A3F1" not in _wrs[0])
 _wrs.clear()
@@ -2353,14 +2451,14 @@ _mp, _ms, _, _ = _tapper()
 _mp.handle(_msg(111, 111, "/help"))
 _labels = [l for _row in (_ms[0][1] or []) for l, _d in _row]
 check("tap: /help carries the menu",
-      any("Bitcoin in" in l for l in _labels)
+      any("Pay in" in l for l in _labels)
       and any("Withdraw" in l for l in _labels))
 # THE LABELS SAY WHICH WAY THE MONEY GOES. "Fresh address" sat next to
 # "Withdraw" and gave no clue which of them pays the operator -- the same
 # confusion as the command name it was drawn from.
 check("tap: the money-in button and the money-out button are marked with "
       "different arrows, so the direction is readable without the words",
-      any("\u2b07" in l and "Bitcoin in" in l for l in _labels)
+      any("\u2b07" in l and "Pay in" in l for l in _labels)
       and any("\u2b06" in l and "Withdraw" in l for l in _labels))
 # AND THE DIRECTION IS IN THE WORDS TOO, not only in the arrow. An arrow is a
 # glyph a client may render as a box, and a label that then reads "Monero
@@ -2434,10 +2532,12 @@ check("depth: ...and every hop count the menu prints is accepted",
 check("depth: ...and a bare wire key is refused rather than silently meaning "
       "something else",
       _dpz._depth_from("1") is None and _dpz._depth_from("2") is None)
-check("depth: NON-VACUITY -- the question prints hop counts and no key column",
-      all(f"  {_h} hops" in _dpz._depth_question()
+check("depth: NON-VACUITY -- the question prints the depth numbers, no key "
+      "column, and no word for what a depth is made of",
+      all(f"  {_h} — " in _dpz._depth_question()
           for _h in P.WITHDRAW_HOPS)
-      and "  1  " not in _dpz._depth_question())
+      and "  1  " not in _dpz._depth_question()
+      and "hop" not in _dpz._depth_question().lower())
 
 # ---- A DEPTH BUTTON IS ONLY A DEPTH WHILE SOMETHING IS ASKING FOR ONE ----
 #
@@ -2605,14 +2705,17 @@ _n3, _m3 = _chain_run(3)
 check("chain: three arrivals run three mixes off ONE /withdraw", _n3 == 3)
 check("chain: ...each announced before it starts, so the operator is never "
       "left watching silence",
-      sum("next one starting" in t.lower() for t in _m3) == 2)
+      sum("another is starting" in t.lower() for t in _m3) == 2)
 check("chain: ...still one message per leg, not two",
       sum("sent." in t for t in _m3) == 3
       and sum("Nothing else can run" in t for t in _m3) == 1
       and len(_m3) == 4)
-check("chain: ...numbered, so a long chain is followable",
-      any(t.startswith("withdraw 2 sent") for t in _m3)
-      and any(t.startswith("withdraw 3 sent") for t in _m3))
+# NOT NUMBERED. "withdraw 2 sent" told the transcript how many arrivals
+# there were; the chain is followable because every leg says a next one is
+# starting and the last says none was found.
+check("chain: ...NOT numbered, because a leg count is an arrival count",
+      not any(re.match(r"withdraw \d+ sent", t) for t in _m3)
+      and sum(t.startswith("withdraw: sent") for t in _m3) == 3)
 # NO DENOMINATOR. MAX_CHAIN_LEGS is the cap that stops a runaway chain, not a
 # count of what is coming: a run ends when the wallet has no funded entry
 # left. Printing "1/6" promised six spends to an operator who was going to get
@@ -2620,8 +2723,9 @@ check("chain: ...numbered, so a long chain is followable",
 check("chain: ...without inventing a total nothing knows",
       not any(f"/{pg.Pager.MAX_CHAIN_LEGS}" in t or "of at most" in t
               for t in _m3))
-check("chain: ...and the reason they go separately is given once they matter",
-      any("all yours" in t for t in _m3))
+check("chain: ...and the reason they go separately is NOT given -- it is "
+      "the shape of the operation, and the operator was told at setup",
+      not any("all yours" in t or "separate" in t for t in _m3))
 check("chain: ...and the last leg still says nothing more was found",
       any(pg.proto.WITHDRAW_NO_MORE_LINE in t for t in _m3)
       and not any("wallet empty" in t.lower() for t in _m3))
@@ -2634,7 +2738,7 @@ check(f"chain: a wallet with nine arrivals stops at the cap "
       f"({_n9} of {pg.Pager.MAX_CHAIN_LEGS})",
       _n9 == pg.Pager.MAX_CHAIN_LEGS)
 check("chain: ...and says so, rather than stopping silently mid-drain",
-      any("is enough for one run" in t for t in _m9))
+      any("More remains" in t for t in _m9))
 check("chain: ...and hands it back to the operator rather than to a retry loop",
       any("/withdraw again" in t for t in _m9))
 # AND IT DOES NOT ALSO SAY THE OPPOSITE. On the last leg the cap allows,
@@ -2646,9 +2750,11 @@ check("chain: ...and hands it back to the operator rather than to a retry loop",
 # computed once and read by the sentence and by the arming.
 check("chain: ...and never claims a next leg on the run that hit the cap",
       not any("next one starting" in t.lower() for t in _m9[-1:]))
-check("chain: ...with the cap's own ending on exactly the last message",
-      "is enough for one run" in _m9[-1]
-      and not any("is enough for one run" in t for t in _m9[:-1]))
+check("chain: ...with the cap's own ending on exactly the last message, and "
+      "no figure for the cap in it",
+      "More remains" in _m9[-1]
+      and not any("More remains" in t for t in _m9[:-1])
+      and not re.search(r"\d", _m9[-1]))
 check(f"chain: ...still one message per leg at the cap ({len(_m9)})",
       sum("sent." in t for t in _m9) == pg.Pager.MAX_CHAIN_LEGS
       and sum("Nothing else can run" in t for t in _m9) == 1
@@ -2661,14 +2767,19 @@ check(f"chain: ...still one message per leg at the cap ({len(_m9)})",
 # burn_expired touches it. That is the one direction this sentence must never
 # err in -- a promise of deletion that has not happened yet is the operator
 # deciding what to type against a window that is still open.
-for _bs, _want in ((900, 1), (1800, 1), (3600, 1), (5400, 2), (7200, 2),
-                   (88200, 25)):
+# MINUTES UNDER AN HOUR. The default is now fifteen minutes, and "deleted
+# after 1h" for a 900-second setting was the other direction of the same
+# error: a promise of retention that had already lapsed.
+for _bs, _want, _secs in ((900, "15 min", 900), (1800, "30 min", 1800),
+                          (3599, "60 min", 3600), (3600, "1h", 3600),
+                          (5400, "2h", 7200), (7200, "2h", 7200),
+                          (88200, "25h", 90000)):
     _wl = [l for l in pg.welcome_text(_bs).splitlines() if "deleted after" in l]
-    check(f"burn: --burn-after {_bs}s ({_bs / 3600:.2f}h) is stated as "
-          f"{_want}h, never sooner than it happens",
-          len(_wl) == 1 and f"after {_want}h" in _wl[0])
-    check(f"burn: ...and {_want}h is not EARLIER than the real {_bs}s",
-          _want * 3600 >= _bs or _bs < 3600)
+    check(f"burn: --burn-after {_bs}s is stated as {_want}, never sooner "
+          f"than it happens",
+          len(_wl) == 1 and f"after {_want}," in _wl[0])
+    check(f"burn: ...and {_want} is not EARLIER than the real {_bs}s",
+          _secs >= _bs)
 # NON-VACUITY: --burn-after 0 still prints no deletion promise at all, so the
 # rounding is not being tested on a line that is always absent.
 check("burn: NON-VACUITY -- with deletion off the line is not printed",
@@ -2737,15 +2848,10 @@ check(f"chain/interrupted: a tap during every leg does NOT defeat the cap "
       f"({_ni} legs against a cap of {pg.Pager.MAX_CHAIN_LEGS}, on a wallet "
       f"holding 99 arrivals)",
       _ni == pg.Pager.MAX_CHAIN_LEGS)
-check("chain/interrupted: ...and the leg numbers still count up rather than "
-      "resetting to 1 every time",
-      [t for t in _mi if t.startswith("withdraw ") and " sent" in t][:3]
-      == ["withdraw 1 sent.\nNext one starting — sending them together would "
-          "prove they are all yours.",
-          "withdraw 2 sent.\nNext one starting — sending them together would "
-          "prove they are all yours.",
-          "withdraw 3 sent.\nNext one starting — sending them together would "
-          "prove they are all yours."])
+check("chain/interrupted: ...and every leg reports the same short way, with "
+      "no leg number and no reason",
+      [t for t in _mi if t.startswith("withdraw: sent")][:3]
+      == ["withdraw: sent.\nAnother is starting."] * 3)
 check("chain/interrupted: ...and the taps really were refused, so this is the "
       "refused-start path and not a quiet no-op",
       sum(t == pg.BUSY_ANSWER for t in _mi) >= pg.Pager.MAX_CHAIN_LEGS)
@@ -3010,7 +3116,7 @@ check("tap: ...with exactly the depths the protocol offers and no others",
 check("tap: ...and a way out, since the message says '/cancel to stop'",
       "m:cancel" in _depth_data)
 check("tap: ...and every depth line in the TEXT has a button",
-      all(f"{_h} hops" in _ds[-1][0] for _h in P.WITHDRAW_HOPS))
+      all(f"  {_h} — " in _ds[-1][0] for _h in P.WITHDRAW_HOPS))
 
 # AND THE CONFIRM DOES NOT GET ONE. The gate's note says it "stops a
 # pocket-dial and a message pasted into the wrong chat" -- and a tap IS a
@@ -3132,13 +3238,18 @@ check("tap: ...and no callback maps to anything the typed vocabulary does "
 #  a command called /fee existed.
 # ===========================================================================
 print("\n== the usage fee, and the fee it is not ==")
-check("fee: the RATE is the one pinned to GhostSpiral's own constant, not a "
-      "literal retyped per surface",
-      pg.USAGE_FEE_LABEL in pg.WELCOME and pg.USAGE_FEE_LABEL in pg.FEE_ANSWER)
+# THE RATE IS ON /fee AND NOWHERE ELSE. It sat on the welcome -- the message
+# every reader of the transcript sees first -- and on the withdraw confirm;
+# /fee is one tap away and read on purpose.
+check("fee: the RATE is the one pinned to GhostSpiral's own constant, on /fee "
+      "only -- not on the welcome",
+      pg.USAGE_FEE_LABEL not in pg.WELCOME
+      and pg.USAGE_FEE_LABEL in pg.FEE_ANSWER)
 # THE FIRST SCREEN. This is the whole of the user's request: somebody seeing
 # the bot for the first time must be told the rate without hunting for it.
-check("fee: the WELCOME states the usage fee on first sight",
-      "USAGE FEE" in pg.WELCOME and pg.USAGE_FEE_LABEL in pg.WELCOME)
+check("fee: the WELCOME says there is a usage fee on first sight, and where "
+      "the rate is",
+      "usage fee" in pg.WELCOME.lower() and "/fee" in pg.WELCOME)
 check("fee: ...and says it is what the SERVICE keeps",
       "this service keeps" in pg.WELCOME)
 check("fee: ...and says which amount it comes out of",
@@ -3164,9 +3275,10 @@ check("fee: the welcome distinguishes it from the NETWORK fee",
       "network fee" in pg.WELCOME.lower())
 check("fee: ...and says the network fee is not received here",
       "none of that comes here" in pg.WELCOME.lower())
-check("fee: ...and that a mix is many transactions, which is why the network "
-      "fee is the larger one",
-      "many transactions" in pg.WELCOME.lower())
+# NOT "a run is many transactions": how many transactions a run makes is
+# the shape of the operation, off the welcome.
+check("fee: ...without saying how many transactions a run makes",
+      "many transactions" not in pg.WELCOME.lower())
 check("fee: ...and says outright that the total leaving is more than the "
       "usage fee alone, which is the number an operator will actually check",
       "more than the usage fee" in pg.WELCOME.lower())
@@ -3206,11 +3318,13 @@ _fp.start_job = lambda *a: None
 _fp.handle(_msg(111, 111, "/withdraw"))
 _fp.handle(_msg(111, 111, "4" + "1" * 94))
 _fp.handle(_msg(111, 111, "10"))
-check("fee: the withdraw CONFIRM names the usage fee, where the money moves",
-      pg.USAGE_FEE_LABEL in _fs[-1] and "usage fee" in _fs[-1])
-check("fee: ...and names the network fee beside it, so the operator is not "
-      "surprised by the larger one",
-      "network fee" in _fs[-1].lower())
+check("fee: the withdraw CONFIRM says a usage fee may come out, where the "
+      "money moves -- and points at /fee rather than printing the rate",
+      "usage fee" in _fs[-1] and "/fee" in _fs[-1]
+      and pg.USAGE_FEE_LABEL not in _fs[-1])
+check("fee: ...and does not re-explain the network fee there -- the welcome "
+      "carries that once, and the confirm is the message most likely kept",
+      "network fee" not in _fs[-1].lower())
 # NO ARITHMETIC. This box has never been told a balance -- /settings refuses
 # to fetch one -- so it may state the RATE and must not state a figure.
 check("fee: ...and quotes NO amount, because this box has no balance to "
@@ -3498,7 +3612,7 @@ check("address: ...and no callback maps to it",
 check("address: NON-VACUITY -- /deposit is still the way in, on the list and "
       "on the keyboard",
       "deposit" in dict(pg.BOT_COMMANDS)
-      and any("Bitcoin in" in _l
+      and any("Pay in" in _l
               for _row in pg.MENU_BUTTONS for _l, _d in _row))
 
 
@@ -3555,12 +3669,14 @@ check("welcome: ...and says outright which one pays them, since that is the "
 check("welcome: ...and that a withdrawal sends back everything that is here, "
       "which is what the operator actually wants to know",
       "everything that is here" in pg.WELCOME)
-check("welcome: ...and that it arrives as separate sends, so several "
-      "transactions are not a malfunction",
-      "separate mixes" in pg.WELCOME and "one per arrival" in pg.WELCOME)
-check("welcome: ...and WHY, because otherwise it reads as a limitation "
-      "somebody should have fixed",
-      "prove they are all yours" in pg.WELCOME)
+# NOT "as separate mixes, one per arrival, because sending them together
+# would prove they are all yours". That was the mechanism, on the message
+# every reader of the transcript sees first; it is the shape of the
+# arrangement and rule 6 keeps it off this surface.
+check("welcome: ...and does NOT say how it arrives or why -- the mechanism "
+      "is the shape of the arrangement",
+      "separate" not in pg.WELCOME and "all yours" not in pg.WELCOME
+      and "arrival" not in pg.WELCOME)
 # ...AND THE OLD PROMISE IS GONE FROM BOTH SURFACES. A published command list
 # that still says "ONE arrival" is the same wrong answer in the place a
 # newcomer reads first.
@@ -3643,7 +3759,7 @@ check("welcome: ...and the welcome does not claim a location it cannot know",
       "ON THE MACHINE" not in pg.WELCOME
       and "come back when you ask" in pg.WELCOME)
 check("welcome: ...and the published command list says the same thing",
-      "send it all back" in dict(pg.BOT_COMMANDS)["withdraw"]
+      "all of it" in dict(pg.BOT_COMMANDS)["withdraw"]
       and "ONE arrival" not in dict(pg.BOT_COMMANDS)["withdraw"])
 check("welcome: ...and neither surface still promises only one",
       "mixes what is here" not in pg.WELCOME
@@ -3704,9 +3820,10 @@ for _leak in _ARCH:
           _leak.lower() not in pg.WELCOME.lower())
 # NON-VACUITY on that sweep: the welcome is not empty, and it DOES contain the
 # service words -- so this is a filter that lets the right things through.
-check("welcome: NON-VACUITY -- it still says what the service does",
-      "Monero" in pg.WELCOME and "/deposit" in pg.WELCOME
-      and len(pg.WELCOME) > 300)
+check("welcome: NON-VACUITY -- it still says what the service does, without "
+      "naming a coin",
+      "Money in, money out" in pg.WELCOME and "/deposit" in pg.WELCOME
+      and "/withdraw" in pg.WELCOME and len(pg.WELCOME) > 300)
 
 # THE DELETION PROMISE IS CONDITIONAL, because --burn-after 0 disables it and
 # a welcome promising deletion on an install that does not delete is the class
@@ -3729,9 +3846,10 @@ check("welcome: ...and a malformed value is treated as off, not as a crash",
 check("welcome: no address, amount or memo is in it",
       not re.search(r"[48][0-9A-Za-z]{50,}", pg.WELCOME)
       and not re.search(r"\d+\.\d{4,}", pg.WELCOME))
-check("welcome: ...and it does say what stops a phone paying, without naming "
-      "the field that stops it",
-      "phone wallet" in pg.WELCOME and "OP_RETURN" not in pg.WELCOME)
+check("welcome: ...and it does say not to pay from the phone, without naming "
+      "the field that stops it or the coin",
+      "from your phone" in pg.WELCOME and "OP_RETURN" not in pg.WELCOME
+      and not re.search(r"\b(bitcoin|btc|monero|xmr)\b", pg.WELCOME, re.I))
 # ...and it is short enough to read on a phone without scrolling past the
 # buttons. Telegram's own limit is 4096; the constraint here is a thumb.
 check(f"welcome: it fits on a screen ({len(pg.WELCOME)} chars, "
@@ -3744,6 +3862,140 @@ _bp, _bs, _, _ = _tapper()
 _bp.handle(_msg(111, 111, "/start"))
 check("welcome: the menu is under it",
       _bs and _bs[0][1] == pg.MENU_BUTTONS)
+
+
+# ===========================================================================
+# THE CHAIN ASKS THE LIMITS BEFORE IT PROMISES A NEXT LEG
+# ===========================================================================
+#
+# start_job refuses a leg the daily cap does not allow. The completion message
+# used to be decided from `_more` and the cap alone, so it said "Another is
+# starting" and the poll loop then sent "no: daily limit reached" seconds
+# later -- the bot contradicting itself at the end of a run that had moved
+# money. The limits are asked when the sentence is written.
+print("\n== the chain and the daily limit ==")
+
+
+def _chain_run_limited(arrivals):
+    """Like _chain_run, but the daily limit closes while the first leg runs."""
+    _cp, _cs, _, _ = _tapper()
+    _cp.start_job = pg.Pager.start_job.__get__(_cp, pg.Pager)
+    _why = [""]
+    _cp.limits.why_not = lambda: _why[0]
+    _left = [arrivals]
+    _legs = [0]
+
+    class _Leg:
+        def __init__(self):
+            _legs[0] += 1
+            _left[0] -= 1
+            _why[0] = "daily limit reached"
+            self.result = {"status": "done", "handle": "", "slip": "",
+                           "plain": {},
+                           "phase": "more_left" if _left[0] > 0 else ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(
+            run_wake=lambda *a, **k: _Leg())
+        _cp.start_job(111, "withdraw",
+                      {"exit_to": ["4" + "8" * 94], "depth": 2})
+        for _ in range(600):
+            if not _cp.busy.locked() and _cp._chain is None:
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _legs[0], [t for t, _b in _cs], _cp
+
+
+_nl, _ml, _lp = _chain_run_limited(3)
+check("chain/limit: with the daily limit reached mid-run, exactly one leg ran",
+      _nl == 1 and _lp._chain is None)
+check("chain/limit: ...and the completion message hands the rest back to the "
+      "operator instead of announcing a leg the limits will refuse",
+      any("More remains" in t for t in _ml)
+      and not any("Another is starting" in t for t in _ml))
+check("chain/limit: ...and does not follow it with a refusal of its own",
+      not any(t.startswith("no:") for t in _ml))
+check("chain/limit: NON-VACUITY -- the same wallet with the limit open runs "
+      "all three",
+      _chain_run(3)[0] == 3)
+
+# ===========================================================================
+# THE BURN LIST IS SHARED BETWEEN TWO THREADS
+# ===========================================================================
+#
+# send() appends from _worker (the chain's completion messages) while
+# burn_expired rebuilds the list on the poll thread. `self.burn = keep` after
+# an append it never saw dropped that message, and a message dropped from the
+# list is a message never deleted.
+print("\n== the burn list under two threads ==")
+_bl = _BurnPager(burn_after=1)
+_old_a, _old_b, _old_c = (111, 1, _now - 99), (111, 2, _now - 99), (111, 3, _now)
+_bl.p.burn = [_old_a, _old_b]
+_bl.p._replace_burn([_old_a, _old_b], [_old_b])
+check("burn/threads: _replace_burn swaps in the kept entries",
+      _bl.p.burn == [_old_b])
+_bl.p.burn = [_old_a, _old_b, _old_c]          # _old_c arrived meanwhile
+_bl.p._replace_burn([_old_a, _old_b], [_old_b])
+check("burn/threads: ...and keeps what another thread appended while the "
+      "deletes were on the wire",
+      _bl.p.burn == [_old_b, _old_c])
+# The deletes themselves run OUTSIDE the lock, or a dead circuit would hold
+# it for the length of a retry and block every append behind it.
+_bl2 = _BurnPager(burn_after=1)
+_bl2.p.burn = [(111, 5, _now - 99)]
+_held = []
+_bl2.p.delete_message = lambda cid, mid: (
+    _held.append(pg._BURN_LOCK.locked()), True)[1]
+_bl2.p.burn_expired(1)
+check("burn/threads: the lock is not held while a delete is on the wire",
+      _held == [False])
+check("burn/threads: every mutation of the list is under the one lock, and "
+      "both sweeps rebuild it through _replace_burn",
+      _SRC_PG_EARLY.count("with _BURN_LOCK:") >= 6
+      and _SRC_PG_EARLY.count("self._replace_burn(snapshot, keep)") == 2
+      and "self.burn = keep\n" not in _SRC_PG_EARLY)
+check("burn/threads: whoami subscribes to both update kinds, so Telegram's "
+      "remembered allowed_updates does not drop taps around it",
+      _SRC_PG_EARLY.count("%22callback_query%22") == 2)
+
+# ===========================================================================
+# A CORRUPT STATE FILE IS A STATE FILE TO START OVER FROM
+# ===========================================================================
+print("\n== a corrupt state file ==")
+import tempfile as _tf_st
+_stp = __import__("pathlib").Path(_tf_st.mkdtemp(prefix="pgst_")) / "state.json"
+_stp.write_text('{"offset": "abc", "last_poke": "x", '
+                '"pokes": ["x", 5, true, 7.5]}')
+try:
+    _lc = pg.Limits(_stp, 300, 2)
+    _lc_ok = True
+except Exception:                                            # noqa: BLE001
+    _lc_ok = False
+check("state: one unreadable field no longer stops the pager at boot",
+      _lc_ok and _lc.offset == 0 and _lc.last_poke == 0.0
+      and _lc.pokes == [5.0, 7.5])
+_stp.write_text('{"offset": -3, "last_poke": true, "pokes": "nope"}')
+_lc2 = pg.Limits(_stp, 300, 2)
+check("state: a negative cursor, a bool stamp and a non-list are each "
+      "started over, not trusted",
+      _lc2.offset == 0 and _lc2.last_poke == 0.0 and _lc2.pokes == [])
+_stp.write_text('[1, 2, 3]')
+_lc3 = pg.Limits(_stp, 300, 2)
+check("state: a file that is not an object is ignored whole",
+      _lc3.offset == 0 and _lc3.pokes == [])
+_stp.write_text('{"offset": 41, "last_poke": 12.5, "pokes": [1, 2]}')
+_lc4 = pg.Limits(_stp, 300, 2)
+check("state: NON-VACUITY -- a good file is still read in full",
+      _lc4.offset == 41 and _lc4.last_poke == 12.5 and _lc4.pokes == [1.0, 2.0])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
