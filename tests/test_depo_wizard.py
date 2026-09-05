@@ -630,6 +630,18 @@ check("wd/spread: neither confirm quotes an arrival count, at any depth",
 # check that only asserts an absence passes on an empty string.
 check("wd/spread: ...and the one-address case is still told what it costs",
       "sees everything" in _oc and "Several are safer" in _oc)
+# THE ONLY NUMBER ON A CONFIRM IS THE DEPTH. A count of destinations is a
+# count in the transcript -- "3 addresses you gave" says how many places the
+# money went, to a reader who has the transcript and nothing else. The
+# mutation that prints it survived a check that only looked for "across".
+check("wd/spread: the three-address confirm carries no number but the depth "
+      "-- no destination count, no arrival count",
+      re.findall(r"\d+", _no_sum(_conf)) == ["20"])
+check("wd/spread: ...and neither does the one-address confirm",
+      re.findall(r"\d+", _no_sum(_oc)) == ["20"])
+check("wd/spread: NON-VACUITY -- the depth really is on both, so the check "
+      "above is reading a number and not an empty list",
+      "at depth 20" in _conf and "at depth 20" in _oc)
 
 # THE CAP AND THE DUPLICATE RULE ARE THE WIRE'S, enforced where the operator
 # is typing rather than after a wake has been spent.
