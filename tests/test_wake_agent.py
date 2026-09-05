@@ -3825,64 +3825,122 @@ try:
           _env["GS_WALLET_PASSWORD"] == "feepw"
           and "GS_FEE_WALLET_PASSWORD" not in _env)
 
-    # THE RUN, with the wallet and the child injected.
+    # THE RUN, with the wallet and the child injected. `entries` is what the
+    # fee wallet answers, leg after leg (a list, consumed in order).
     _sw_dir = Path(tempfile.mkdtemp(prefix="feesweep_"))
 
-    def _sweep(atomic, floor="0.0270", dry_run=False, key=None):
+    def _sweep(entries, floor="0.0270", dry_run=False, key=None,
+               clock_step=0, rc=0):
         ran = []
-        deps = {"fee_entry": (lambda: (0, 3, _FS_ADDR, atomic)
-                              if atomic else None),
-                "live_floor": lambda k, w: floor,
+        seq = list(entries)
+        tick = [0]
+
+        def _entry():
+            v = seq.pop(0) if seq else None
+            return (0, 3, _FS_ADDR, v) if v else None
+
+        def _clock():
+            tick[0] += clock_step
+            return float(tick[0])
+        deps = {"fee_entry": _entry, "live_floor": lambda k, w: floor,
+                "clock": _clock,
                 "run_child": lambda argv, env, budget: (
-                    ran.append((list(argv), dict(env), budget)), (0, False))[1]}
+                    ran.append((list(argv), dict(env), budget)), (rc, False))[1]}
         with contextlib.redirect_stdout(io.StringIO()) as _o:
             code = A.run_fee_sweep(key or _FS_KEY, _sw_dir, deps, dry_run)
         return code, ran, _o.getvalue()
 
-    _c1, _r1, _o1 = _sweep(600_000_000_000)
+    _XMR = 10 ** 12
+    _c1, _r1, _o1 = _sweep([int(0.6 * _XMR), None])
     check("sweep/run: 0.6 XMR unlocked against a 0.5 threshold runs ONE "
-          "GhostSpiral child under the withdraw budget",
+          "GhostSpiral child under the depth's own budget",
           _c1 == "done" and len(_r1) == 1
-          and _r1[0][2] == P.JOBS["withdraw"]["budget_s"])
-    check("sweep/run: ...whose entry bundle names the fee address on the fee "
-          "wallet, mode 0600",
+          and _r1[0][2] == P.WITHDRAW_DEPTHS[2][1])
+    check("sweep/run: ...whose entry bundle names the fee wallet's output, "
+          "mode 0600",
           json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())["address"]
           == _FS_ADDR
           and json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())
           ["rpc_endpoint"] == "http://127.0.0.1:18085"
           and _stat_m.S_IMODE(os.stat(_sw_dir / A.FEE_SWEEP_BUNDLE).st_mode)
           == 0o600)
-    _c2, _r2, _o2 = _sweep(300_000_000_000)
+    # IT CHAINS: what a leg leaves behind is the next leg's entry, and a
+    # later leg needs only the floor -- the threshold was the trigger.
+    _c2, _r2, _o2 = _sweep([int(0.6 * _XMR), int(0.2 * _XMR), None])
+    check("sweep/run: a second unlocked output over the floor but under the "
+          "threshold is swept as a second leg in the same boot",
+          _c2 == "done" and len(_r2) == 2 and "2 leg(s)" in _o2)
+    _c3, _r3, _o3 = _sweep([int(0.6 * _XMR), int(0.01 * _XMR)])
+    check("sweep/run: ...while a remainder under the floor is left, and said "
+          "to be left, with the run still counted as done",
+          _c3 == "done" and len(_r3) == 1 and "under the floor" in _o3)
+    _c4, _r4, _o4 = _sweep([int(0.6 * _XMR)] * 10)
+    check(f"sweep/run: at most {A.FEE_SWEEP_MAX_LEGS} legs per boot, then "
+          f"'more remains' -- the next boot asks the same question again",
+          _c4 == "done" and len(_r4) == A.FEE_SWEEP_MAX_LEGS
+          and "more remains" in _o4)
+    _c5, _r5, _o5 = _sweep([int(0.6 * _XMR)] * 5, clock_step=15000)
+    check("sweep/run: a leg starts only if its whole budget fits before the "
+          "unit's wall clock, so a depth-2 boot runs one leg and defers",
+          _c5 == "done" and len(_r5) == 1 and "more remains" in _o5)
+    _c5b, _r5b, _o5b = _sweep([int(0.6 * _XMR)] * 5, clock_step=30000)
+    check("sweep/run: ...and a boot too far gone to fit even one leg spends "
+          "nothing and says so, rather than reporting a sweep that did not run",
+          _c5b == "more_left" and _r5b == [] and "more remains" in _o5b)
+    _c6, _r6, _o6 = _sweep([int(0.3 * _XMR)])
     check("sweep/run: 0.3 XMR waits, spends nothing, and says what it needs",
-          _c2 == "below_threshold" and _r2 == [] and "Nothing spent" in _o2)
-    _c3, _r3, _o3 = _sweep(600_000_000_000, floor="0.9")
+          _c6 == "below_threshold" and _r6 == [] and "Nothing spent" in _o6)
+    _c7, _r7, _o7 = _sweep([int(0.6 * _XMR)], floor="0.9")
     check("sweep/run: the live floor for the depth applies on top of the "
-          "threshold", _c3 == "below_floor" and _r3 == [])
-    _c4, _r4, _o4 = _sweep(600_000_000_000, dry_run=True)
+          "threshold", _c7 == "below_floor" and _r7 == [])
+    _c8, _r8, _o8 = _sweep([int(0.6 * _XMR)], dry_run=True)
     check("sweep/run: a dry run decides and spends nothing",
-          _c4 == "dry_run" and _r4 == [] and "dry run" in _o4)
-    _c5, _r5, _o5 = _sweep(0)
+          _c8 == "dry_run" and _r8 == [] and "dry run" in _o8)
+    _c9, _r9, _o9 = _sweep([])
     check("sweep/run: nothing unlocked is nothing, not an error",
-          _c5 == "nothing" and _r5 == [])
-    _c6, _r6, _ = _sweep(600_000_000_000, key={"rpc_primary": "x"})
+          _c9 == "nothing" and _r9 == [])
+    _c10, _r10, _ = _sweep([int(0.6 * _XMR)], key={"rpc_primary": "x"})
     check("sweep/run: a keyfile with no fee wallet does nothing at all",
-          _c6 == "not_configured" and _r6 == [])
-    # THE OUTCOME IS RECORDED WITHOUT A FIGURE OR AN ADDRESS.
+          _c10 == "not_configured" and _r10 == [])
+    _c11, _r11, _o11 = _sweep([int(0.6 * _XMR), int(0.6 * _XMR)], rc=3)
+    check("sweep/run: a leg that fails stops the chain and says some of it "
+          "may have moved",
+          _c11 == "failed" and len(_r11) == 1 and "may already have moved" in _o11)
+    # THE OUTCOME IS RECORDED WITHOUT A FIGURE OR AN ADDRESS, ONCE PER RUN.
     _fs_log = []
     _saved_il_fs = A.integrity_log
     A.integrity_log = lambda st, kind, *a, **k: _fs_log.append(kind)
     try:
-        _sweep(600_000_000_000)
-        _sweep(300_000_000_000)
+        _sweep([int(0.6 * _XMR), int(0.2 * _XMR), None])
+        _sweep([int(0.3 * _XMR)])
     finally:
         A.integrity_log = _saved_il_fs
-    check("sweep/run: the chain records start and outcome, and the wait, by "
-          "kind alone",
-          "fee_sweep:start" in _fs_log and "fee_sweep:done" in _fs_log
+    check("sweep/run: the chain records start and outcome once per run (not "
+          "per leg), and the wait, by kind alone",
+          _fs_log.count("fee_sweep:start") == 1
+          and _fs_log.count("fee_sweep:done") == 1
           and "fee_sweep:below_threshold" in _fs_log
           and not any(("0.6" in k or _FS_ADDR[:8] in k) for k in _fs_log))
+    # THE ENTRY IS THE WHOLE FEE WALLET, not the fee address alone: what a
+    # sweep leaves on another subaddress is the next sweep's entry.
+    check("sweep/entry: the fee wallet is asked the same question the mixing "
+          "wallet is -- the largest unlocked output anywhere -- aimed at the "
+          "fee wallet-rpc",
+          "return _funded_entry(key, injected=injected, rpc_url=cfg[\"rpc\"])"
+          in _AGENT_SRC
+          and 'rpc = connect_rpc(rpc_url or key["rpc_primary"],' in _AGENT_SRC)
 
     # THE IDLE-BOOT HOOK: a boot with no job runs the sweep only when asked.
+    def _one_shot_entry():
+        _left = [1]
+
+        def _e():
+            if _left[0]:
+                _left[0] -= 1
+                return (0, 3, _FS_ADDR, 600_000_000_000)
+            return None
+        return _e
+
     def _idle_boot(on_idle):
         d, kf, key, bell = new_env()
         key2 = dict(key, **_FS_KEY, fee_sweep_on_idle_boot=on_idle)
@@ -3892,7 +3950,7 @@ try:
         os.chmod(kf, 0o400)
         ran = []
         deps = deps_for(d, bell, post_record=stub_post(bell),
-                        fee_entry=lambda: (0, 3, _FS_ADDR, 600_000_000_000),
+                        fee_entry=_one_shot_entry(),
                         live_floor=lambda k, w: "0.0270",
                         run_child=lambda argv, env, budget: (
                             ran.append(list(argv)), (0, False))[1])
@@ -3924,8 +3982,7 @@ try:
     kf7.write_text(json.dumps(P.lock_keyfile(key7b, b"", role="thinkpad")))
     os.chmod(kf7, 0o400)
     _ran7 = []
-    _deps7 = deps_for(d7, bell7, fee_entry=lambda: (0, 3, _FS_ADDR,
-                                                     600_000_000_000),
+    _deps7 = deps_for(d7, bell7, fee_entry=_one_shot_entry(),
                       live_floor=lambda k, w: "0.0270",
                       run_child=lambda argv, env, budget: (
                           _ran7.append(list(argv)), (0, False))[1])

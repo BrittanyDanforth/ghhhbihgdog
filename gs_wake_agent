@@ -942,6 +942,14 @@ def live_min_out_xmr(key: dict) -> str:
 #: bundle the sweep hands GhostSpiral as its entry.
 FEE_SWEEP_MIN_XMR_DEFAULT = Decimal("0.5")
 FEE_SWEEP_BUNDLE = "wallet_feesweep.json"
+#: A sweep CHAINS like a withdrawal does: leg after leg while the largest
+#: unlocked output still clears the floor, so what one leg leaves behind
+#: (change, a remainder) is picked up by the next. Bounded twice: by legs, and
+#: by the boot's wall clock -- the unit stops the agent at 17 h, and a leg
+#: must have its whole budget left to start. At depths 2 and 3 that is one leg
+#: per boot; the rest is the NEXT boot's, which asks the same question again.
+FEE_SWEEP_MAX_LEGS = 3
+FEE_SWEEP_WALL_S = 57600
 
 
 def fee_sweep_config(key: dict):
@@ -1000,50 +1008,20 @@ def fee_sweep_config(key: dict):
 
 
 def fee_wallet_entry(key: dict, cfg: dict, injected=None):
-    """(account, subaddress, address, unlocked_atomic) of the fee address on
-    the fee wallet, or None when nothing unlocked sits there or the wallet
-    could not be asked (recorded as which).
+    """(account, subaddress, address, unlocked_atomic): the largest unlocked
+    output anywhere on the FEE wallet, or None.
 
-    THE FEE ADDRESS ONLY. Everything else on the fee wallet is not this
-    tool's to spend: the sweep's entry is the one subaddress pairing minted,
-    where every cut lands.
+    ANYTHING ON THE FEE WALLET IS THE HOST'S. The cuts land on the one fee
+    address pairing minted, but a sweep is a mix, and a mix leaves things
+    behind on other subaddresses of the wallet it ran from -- the fan-out's
+    change, a held remainder. The first version read the fee address alone,
+    so everything a sweep left behind was money no sweep would ever look at
+    again. This asks the same question the client's withdrawal asks of the
+    mixing wallet -- the largest unlocked output, anywhere -- so a later
+    sweep picks up what an earlier one left, and "the fees always get mixed
+    out eventually" is true of all of them and not of the first output only.
     """
-    if injected is not None:
-        return injected()
-    try:
-        from gs_common import connect_rpc
-        rpc = connect_rpc(cfg["rpc"], proxy_url=key.get("tor_proxy", ""))
-        try:
-            rpc.raw_request("refresh", {})
-        except Exception:                                    # noqa: BLE001
-            pass
-        ix = (rpc.raw_request("get_address_index",
-                              {"address": cfg["address"]}) or {}).get("index")
-        if not isinstance(ix, dict):
-            integrity_log("wake", "fee_sweep:address_not_ours")
-            agent_say("  [!] Fee sweep: the fee wallet does not recognise the "
-                      "fee address in this keyfile. Nothing spent.")
-            return None
-        major, minor = ix.get("major"), ix.get("minor")
-        for _v in (major, minor):
-            if not isinstance(_v, int) or isinstance(_v, bool) or _v < 0:
-                integrity_log("wake", "fee_sweep:address_not_ours")
-                return None
-        r = rpc.raw_request("get_balance",
-                            {"account_index": major, "address_indices": [minor],
-                             "all_accounts": False}) or {}
-        for sub in (r.get("per_subaddress") or []):
-            if sub.get("address_index") != minor:
-                continue
-            amt = sub.get("unlocked_balance")
-            if isinstance(amt, int) and not isinstance(amt, bool) and amt > 0:
-                return (major, minor, cfg["address"], amt)
-        return None
-    except Exception as e:                                   # noqa: BLE001
-        integrity_log("wake", "fee_sweep:rpc_failed")
-        agent_say(f"  [!] Fee sweep: could not read the fee wallet "
-                  f"({terminal_safe(type(e).__name__)}). Nothing spent.")
-        return None
+    return _funded_entry(key, injected=injected, rpc_url=cfg["rpc"])
 
 
 def fee_sweep_decision(unlocked_xmr, min_xmr, floor_xmr) -> tuple:
@@ -1107,61 +1085,97 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
     integrity chain as fee_sweep:<code> -- no amount, no address.
     """
     d = deps or {}
+    _clock = d.get("clock", time.monotonic)
     cfg = fee_sweep_config(key)
     if cfg is None:
         return "not_configured"
-    found = fee_wallet_entry(key, cfg, injected=d.get("fee_entry"))
-    if not found:
-        integrity_log("wake", "fee_sweep:nothing")
-        agent_say("  [*] Fee sweep: nothing unlocked on the fee address.")
-        return "nothing"
-    acct, sub, addr, atomic = found
-    unlocked = Decimal(str(atomic)) / Decimal(10 ** 12)
     wallets = withdraw_wallets(cfg["depth"])
     floor = Decimal(d.get("live_floor", live_floor_xmr)(key, wallets))
-    go, why = fee_sweep_decision(unlocked, cfg["min_xmr"], floor)
-    if not go:
-        integrity_log("wake", f"fee_sweep:{why}")
-        agent_say(f"  [*] Fee sweep: {unlocked} XMR unlocked on the fee "
-                  f"address; a sweep needs {max(cfg['min_xmr'], floor)} "
-                  f"({why.replace('_', ' ')}). Nothing spent.")
-        return why
-    if dry_run:
-        agent_say(f"  [+] Fee sweep (dry run): {unlocked} XMR unlocked on the "
-                  f"fee address clears the threshold; a real run would mix "
-                  f"it at depth {cfg['depth']} to {len(cfg['dests'])} "
-                  f"address(es). Nothing spent.")
-        return "dry_run"
-    bundle = artifact_dir / FEE_SWEEP_BUNDLE
-    atomic_write_json({"schema": "gs_receive_wallet_v1",
-                       "address": addr,
-                       "account_index": int(acct),
-                       "subaddress_index": int(sub),
-                       "rpc_endpoint": cfg["rpc"]},
-                      bundle, perms=0o600)
-    argv, env_extra = build_fee_sweep_argv(key, cfg, str(bundle), artifact_dir)
+    leg_budget = int(proto.WITHDRAW_DEPTHS[cfg["depth"]][1])
     _jl = artifact_dir / JOB_LOG
     try:
         _watched = sys.stdout.isatty()
     except Exception:                                        # noqa: BLE001
         _watched = False
-    agent_say(f"  [*] Fee sweep: {unlocked} XMR unlocked on the fee address "
-              f"clears the threshold. Mixing it at depth {cfg['depth']} to "
-              f"{len(cfg['dests'])} address(es); output "
-              f"{'follows on this terminal' if _watched else '-> ' + str(_jl)}.")
-    integrity_log("wake", "fee_sweep:start")
-    rc, killed = run_child(argv, env_extra, proto.JOBS["withdraw"]["budget_s"],
-                           runner=d.get("run_child"),
-                           log_path=None if _watched else _jl)
-    code = "done" if rc == 0 else ("killed" if killed else "failed")
-    integrity_log("wake", f"fee_sweep:{code}")
-    if code == "done":
-        agent_say("  [+] Fee sweep finished.")
-    else:
-        agent_say(f"  [!] Fee sweep {code} (exit {rc}). Some of it may "
-                  f"already have moved: check the fee wallet's balances and "
-                  f"the job log before running another.")
-    return code
+    t0 = _clock()
+    legs = 0
+    while True:
+        found = fee_wallet_entry(key, cfg, injected=d.get("fee_entry"))
+        if not found:
+            if legs == 0:
+                integrity_log("wake", "fee_sweep:nothing")
+                agent_say("  [*] Fee sweep: nothing unlocked on the fee "
+                          "wallet.")
+                return "nothing"
+            break
+        acct, sub, addr, atomic = found
+        unlocked = Decimal(str(atomic)) / Decimal(10 ** 12)
+        # THE THRESHOLD IS THE TRIGGER, THE FLOOR IS THE LAW. The operator's
+        # figure decides whether a sweep STARTS; once one has run, every
+        # later leg needs only what the mix needs to plan, so what a leg
+        # leaves behind is taken while the machine is already on and open.
+        go, why = fee_sweep_decision(
+            unlocked, cfg["min_xmr"] if legs == 0 else Decimal(0), floor)
+        if not go:
+            if legs == 0:
+                integrity_log("wake", f"fee_sweep:{why}")
+                agent_say(f"  [*] Fee sweep: {unlocked} XMR is the most on "
+                          f"one output of the fee wallet; a sweep needs "
+                          f"{max(cfg['min_xmr'], floor)} "
+                          f"({why.replace('_', ' ')}). Nothing spent.")
+                return why
+            integrity_log("wake", "fee_sweep:rest_under_floor")
+            agent_say(f"  [*] Fee sweep: what remains ({unlocked} XMR on the "
+                      f"largest output) is under the floor ({floor}); it "
+                      f"stays until more gathers.")
+            break
+        if dry_run:
+            agent_say(f"  [+] Fee sweep (dry run): {unlocked} XMR unlocked on "
+                      f"the fee wallet clears the threshold; a real run would "
+                      f"mix it at depth {cfg['depth']} to "
+                      f"{len(cfg['dests'])} address(es), leg after leg. "
+                      f"Nothing spent.")
+            return "dry_run"
+        if legs >= FEE_SWEEP_MAX_LEGS \
+                or (_clock() - t0) + leg_budget > FEE_SWEEP_WALL_S:
+            integrity_log("wake", "fee_sweep:more_left")
+            agent_say(f"  [*] Fee sweep: more remains ({unlocked} XMR on the "
+                      f"largest output) but this boot cannot fit "
+                      f"{'another' if legs else 'a'} leg. The next sweep "
+                      f"picks it up.")
+            if legs == 0:
+                return "more_left"
+            break
+        bundle = artifact_dir / FEE_SWEEP_BUNDLE
+        atomic_write_json({"schema": "gs_receive_wallet_v1",
+                           "address": addr,
+                           "account_index": int(acct),
+                           "subaddress_index": int(sub),
+                           "rpc_endpoint": cfg["rpc"]},
+                          bundle, perms=0o600)
+        argv, env_extra = build_fee_sweep_argv(key, cfg, str(bundle),
+                                               artifact_dir)
+        agent_say(f"  [*] Fee sweep leg {legs + 1}: {unlocked} XMR unlocked "
+                  f"on the fee wallet. Mixing it at depth {cfg['depth']} to "
+                  f"{len(cfg['dests'])} address(es); output "
+                  f"{'follows on this terminal' if _watched else '-> ' + str(_jl)}.")
+        if legs == 0:
+            integrity_log("wake", "fee_sweep:start")
+        rc, killed = run_child(argv, env_extra, leg_budget,
+                               runner=d.get("run_child"),
+                               log_path=None if _watched else _jl)
+        legs += 1
+        if rc != 0:
+            code = "killed" if killed else "failed"
+            integrity_log("wake", f"fee_sweep:{code}")
+            agent_say(f"  [!] Fee sweep {code} on leg {legs} (exit {rc}). "
+                      f"Some of it may already have moved: check the fee "
+                      f"wallet's balances and the job log before running "
+                      f"another.")
+            return code
+    integrity_log("wake", "fee_sweep:done")
+    agent_say(f"  [+] Fee sweep finished: {legs} leg(s).")
+    return "done"
 
 
 def run_fee_sweep_cli(args, deps: dict = None) -> str:
@@ -2286,7 +2300,7 @@ def _account_count(key: dict, injected=None):
         return None
 
 
-def _funded_entry(key: dict, injected=None):
+def _funded_entry(key: dict, injected=None, rpc_url: str = None):
     """The (account, subaddress, address, atomic) holding this wallet's money.
 
     THE VAULT ANSWERS THIS, NOT THE PHONE. A withdrawal used to name a 4-hex
@@ -2314,7 +2328,8 @@ def _funded_entry(key: dict, injected=None):
         return injected()
     try:
         from gs_common import connect_rpc
-        rpc = connect_rpc(key["rpc_primary"], proxy_url=key.get("tor_proxy", ""))
+        rpc = connect_rpc(rpc_url or key["rpc_primary"],
+                          proxy_url=key.get("tor_proxy", ""))
         try:
             rpc.raw_request("refresh", {})
         except Exception:                                    # noqa: BLE001
