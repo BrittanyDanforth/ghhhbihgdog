@@ -977,6 +977,17 @@ check("ladder: gs_wake_keys no longer writes amount_ladder either",
       '"amount_ladder": list(args.amount_ladder),' not in _keys_src
       and "MAX_LADDER" not in _keys_src)
 
+
+# THE CHALLENGE ECHO IS CHECKED FOR ASCII BEFORE compare_digest, which raises
+# TypeError on a non-ASCII str -- an uncaught exception in the request
+# handler where a Doorbell is a clean refusal.
+_db_src_ch = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
+check("result: a non-ASCII challenge echo is refused as a Doorbell, not "
+      "raised as a TypeError out of compare_digest",
+      "not _ch.isascii() or not any(" in _db_src_ch
+      and _db_src_ch.index("_ch.isascii()")
+      < _db_src_ch.index("hmac.compare_digest(_ch, c.hex())"))
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

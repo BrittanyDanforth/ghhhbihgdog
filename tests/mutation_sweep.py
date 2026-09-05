@@ -1474,9 +1474,9 @@ MUTATIONS = [
   # confirm step reads one field. The property is unchanged -- the
   # conversation is deleted BEFORE the answer is checked, so a wrong answer
   # cannot be retried against the same sum.
-  "        exit_to, depth = c.exit_to, c.depth\n"
-  "        del self.convos[chat_id]\n",
-  "        exit_to, depth = c.exit_to, c.depth\n",
+  '        exit_to, depth = c.exit_to, c.depth\n'
+  '        self._end_convo(chat_id)\n',
+  '        exit_to, depth = c.exit_to, c.depth\n',
   ["test_depo_wizard"]),
 
  # A real command typed mid-flow must not be swallowed as an answer.
@@ -1956,7 +1956,7 @@ MUTATIONS = [
   "                                      max_value=BTC_ABSURD_TOTAL)",
   "        args.btc_amount = decimal_env(\"--btc-amount / GS_BTC_AMOUNT\", _amt,\n"
   "                                      positive=True)",
-  ["test_listed_bugs"]),
+  ["test_dag_entry"]),
 
  ("GS_SWAP_AMOUNTS loses its ceiling again", "thor_swap_preparer",
   "    args.amounts = [decimal_env(\"GS_SWAP_AMOUNTS\", x, positive=True,\n"
@@ -2312,8 +2312,8 @@ MUTATIONS = [
  # could answer, about a number that means nothing on its own.
  ("the deposit wizard goes back to asking for a slot number",
   "gs_telegram_pager",
-  "        self.send(chat_id, self._amount_question(),",
-  '        self.send(chat_id, "Which slot? Reply 0-7. /cancel to stop.",',
+  '        self._ask(chat_id, self._amount_question(),\n',
+  '        self._ask(chat_id, "Which slot? Reply 0-7. /cancel to stop.",\n',
   ["test_depo_wizard"]),
 
  # Offering three rungs and accepting eight offers a choice that is not there;
@@ -2335,7 +2335,7 @@ MUTATIONS = [
  # a hand-built row is what this catches.
  ("the depth question stops leading each row with the number that is typed",
   "gs_telegram_pager",
-  '        return ("How deep? Reply with the number of hops:\\n"\n'
+  '        return ("How deep? Reply with one of these numbers:\\n"\n'
   '                + "\\n".join(f"  {proto.depth_choice(d)}"',
   '        return ("How deep? Reply with one:\\n"\n'
   '                + "\\n".join(f"  {proto.WITHDRAW_DEPTH_NOTE[d]}"',
@@ -2343,12 +2343,11 @@ MUTATIONS = [
 
  # THE ROW ORDER, AT ITS SOURCE. depth_choice is the one place that decides
  # what leads a menu row, so a mutation there moves every box that draws one.
- ("depth_choice puts the runtime first again, so the salient number on each "
-  "row is one the step refuses",
+ ('depth_choice puts the note first again, so the salient token on each row is not the number that is typed',
   "gs_wake_proto.py",
-  '    return (f"{depth_hops(depth)} hops \u00b7 about {depth_hours(depth)}h \u00b7 "\n'
+  '    return (f"{depth_hops(depth)} — about {depth_hours(depth)}h, "\n'
   '            f"{WITHDRAW_DEPTH_NOTE[depth]}")',
-  '    return (f"about {depth_hours(depth)}h \u00b7 {WITHDRAW_DEPTH_NOTE[depth]} \u00b7 "\n'
+  '    return (f"about {depth_hours(depth)}h, {WITHDRAW_DEPTH_NOTE[depth]} — "\n'
   '            f"answer {depth_hops(depth)}")',
   ["test_depo_wizard"]),
 
@@ -2380,10 +2379,10 @@ MUTATIONS = [
  # taps to a number the step refuses -- the same collision, one layer over.
  ("the depth buttons carry the wire's key instead of the hop count",
   "gs_telegram_pager",
-  '        _rows = [[(f"{_h} hops", f"d:{_h}")]\n'
-  "                 for _h in sorted(proto.WITHDRAW_HOPS)]",
-  '        _rows = [[(f"{proto.WITHDRAW_DEPTHS[_d][0]} hops", f"d:{_d}")]\n'
-  "                 for _d in sorted(proto.WITHDRAW_DEPTHS)]",
+  '        _rows = [[(f"depth {_h}", f"d:{_h}")]\n'
+  '                 for _h in sorted(proto.WITHDRAW_HOPS)]',
+  '        _rows = [[(f"depth {proto.WITHDRAW_DEPTHS[_d][0]}", f"d:{_d}")]\n'
+  '                 for _d in sorted(proto.WITHDRAW_DEPTHS)]',
   ["test_telegram_pager"]),
 
  ("a depth the menu does not offer is accepted and spends a wake to be "
@@ -2565,7 +2564,7 @@ MUTATIONS = [
  # could not have reached stage 1.
  ("the first leg of a withdrawal loses its mix-minimum floor",
   "gs_wake_agent",
-  "        if _fxmr < Decimal(proto.deposit_min_out_xmr()):",
+  "        if _fxmr < Decimal(live_min_out_xmr(key)):",
   "        if False:",
   ["test_wake_agent"]),
 
@@ -3087,16 +3086,31 @@ MUTATIONS = [
  # the second. Neither replaces the other.
  ("the operator's own commands are no longer tracked for deletion",
   "gs_telegram_pager",
-  "        _mid = msg.get(\"message_id\")\n"
-  "        if isinstance(_mid, int) and not isinstance(_mid, bool):\n"
-  "            self.burn.append((cid, _mid, time.time()))",
-  "        _mid = msg.get(\"message_id\")",
+  '        _mid = msg.get("message_id")\n'
+  '        if isinstance(_mid, int) and not isinstance(_mid, bool):\n'
+  '            with _BURN_LOCK:\n'
+  '                self.burn.append((cid, _mid, time.time()))',
+  '        _mid = msg.get("message_id")',
   ["test_telegram_pager"]),
 
  ("a refused delete is retried on every tick, forever, over Tor",
   "gs_telegram_pager",
-  "            if self.delete_message(cid, mid):\n                gone += 1\n        self.burn = keep\n        return gone",
-  "            if self.delete_message(cid, mid):\n                gone += 1\n            else:\n                keep.append((cid, mid, sent))\n        self.burn = keep\n        return gone",
+  '            r = self.delete_message(cid, mid)\n'
+  '            if r:\n'
+  '                gone += 1\n'
+  '            elif r is None:\n'
+  '                dead = True\n'
+  '                if now - sent < TG_DELETE_WINDOW_S:\n'
+  '                    keep.append((cid, mid, sent))  # not refused: next tick\n'
+  '        self._replace_burn(snapshot, keep)\n'
+  '        return gone',
+  '            r = self.delete_message(cid, mid)\n'
+  '            if r:\n'
+  '                gone += 1\n'
+  '            else:\n'
+  '                keep.append((cid, mid, sent))\n'
+  '        self._replace_burn(snapshot, keep)\n'
+  '        return gone',
   ["test_telegram_pager"]),
 
  # A --burn-after past Telegram's window never fires, so the chat only LOOKS
@@ -3136,10 +3150,10 @@ MUTATIONS = [
  # that exists to answer "can I start one right now".
  ("the status answer stops reading the gate a person has to fix",
   "gs_telegram_pager",
-  "            if self.spenders > 1:\n"
-  '                self.send(cid, "not ready: more than one person is "',
-  "            if False:\n"
-  '                self.send(cid, "not ready: more than one person is "',
+  '            if self.spenders > 1:\n'
+  '                self.send(cid, "not ready: more than one person is allowed "',
+  '            if False:\n'
+  '                self.send(cid, "not ready: more than one person is allowed "',
   ["test_telegram_pager"]),
 
  # A PHASE OUTRANKS THE OUTCOME ONLY FOR THE JOBS THAT WATCH. For a probe,
@@ -3181,8 +3195,8 @@ MUTATIONS = [
  # doing exactly what it should, at the cost of a boot and a wake slot.
  ("a stuck-wallet verdict is reached from a window too short to mean it",
   "receive_watch",
-  "                and stall_s >= LIVENESS_DOUBT_S\n",
-  "",
+  "                and (clock() - last_height_move) >= max(stall_s, LIVENESS_MIN_S)):",
+  "                and (clock() - last_height_move) >= stall_s):",
   ["test_receive_watch"]),
 
  # THE GUIDANCE WALKED THE OPERATOR PAST THE GATE. create_receive_wallet's own
@@ -3212,7 +3226,7 @@ MUTATIONS = [
  # shape this repo keeps finding.
  ("the vault stops telling the quote step what the mix needs",
   "gs_wake_agent",
-  '             "--min-out-xmr", proto.deposit_min_out_xmr(),',
+  '             "--min-out-xmr", live_min_out_xmr(key),',
   '             "--outfile-unused-marker", "0",',
   ["test_wake_agent"]),
 
@@ -3232,7 +3246,7 @@ MUTATIONS = [
  # money still sitting there.
  ("the chain goes back to abandoning what a fee could not be taken from",
   "gs_wake_agent",
-  "            _floor = Decimal(proto.deposit_min_out_xmr())",
+  "            _floor = Decimal(live_min_out_xmr(key))",
   '            _floor = Decimal(proto.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)',
   ["test_wake_agent"]),
 
@@ -3348,10 +3362,8 @@ MUTATIONS = [
  # operator agrees to a spend on.
  ("the withdraw confirm promises a cut that is often not taken",
   "gs_telegram_pager",
-  '                      f"Up to {USAGE_FEE_LABEL} usage fee \u2014 this service\'s "\n'
-  '                      f"cut, and some runs take none. The network fee is "',
-  '                      f"{USAGE_FEE_LABEL} usage fee comes out of it \u2014 this "\n'
-  '                      f"service\'s cut. The network fee is "',
+  '                      f"be undone. A usage fee may come out of it (/fee)."',
+  '                      f"be undone. The usage fee comes out of it (/fee)."',
   ["test_depo_wizard"]),
 
  # ...AND THE WELCOME IS WHERE THE RULE LIVES, because /fee is capped at 40
@@ -3402,8 +3414,8 @@ MUTATIONS = [
  # 1h" -- a promise of deletion half an hour before it happens.
  ("the welcome rounds the retention DOWN, promising deletion before it happens",
   "gs_telegram_pager",
-  "        lines.append(_BURN_LINE.format(h=max(1, -(-_b // 3600))))",
-  "        lines.append(_BURN_LINE.format(h=max(1, _b // 3600)))",
+  '                 else f"{max(1, -(-_b // 3600))}h")',
+  '                 else f"{max(1, _b // 3600)}h")',
   ["test_telegram_pager"]),
 
  # THE DEPOSIT LINE IS SINGLE-USE AND THE READER IS TOLD SO. "To address:
@@ -3424,9 +3436,9 @@ MUTATIONS = [
  # anchor exists: WHICH step finished has to be in the sentence, because the
  # mix has not run.
  ("the landed line claims the whole job is finished", "gs_wake_proto.py",
-  '    "landed": "CONFIRMED \u2014 the money is here and spendable. That was the "\n'
-  '              "swap; the mix has not run yet.",',
-  '    "landed": "CONFIRMED \u2014 the money is here and spendable. Done.",',
+  '    "landed": "CONFIRMED — the money is here and spendable. The rest has "\n'
+  '              "not run yet.",',
+  '    "landed": "CONFIRMED — the money is here and spendable. Done.",',
   ["test_plain_slip"]),
 
  # ---- the bot says the answer and stops -----------------------------------
@@ -3445,7 +3457,7 @@ MUTATIONS = [
  ("the help text goes back to describing the setup", "gs_telegram_pager",
   # Re-anchored: HELP is generated, so the prose that could grow back is the
   # tail line rather than the block.
-  '       "Deposits are paid from the machine, never from a phone wallet.",',
+  '       "Deposits are paid from the machine, never from a phone.",',
 
   '    "Memo goes in an OP_RETURN — desktop wallet, not a phone.\\n"\n'
   '    "What comes back depends on the VAULT\'s keyfile: a handle, a sealed "\n'
@@ -3805,24 +3817,25 @@ MUTATIONS = [
  # but a real reduction in what the readable surface gives away. What must not
  # be lost is the sentence that decides whether one destination throws the run
  # away, so that is what this anchor now pins.
- ("the confirm no longer says the payments are many, or where they land",
+ ('the confirm no longer says where the money goes',
   "gs_telegram_pager",
-  '                      f"It arrives as many separate payments, {_spread}.\\n"',
-  '                      f""',
+  '                      f"Send everything here to the "\n'
+  '                      f"{\'addresses\' if _n > 1 else \'address\'} you gave, "',
+  '                      f"Send everything here, "',
   ["test_depo_wizard"]),
 
  # AND THE COUNT MUST NOT COME BACK. A mutation that restores it is the
  # regression this pair exists to catch from the other side.
  ("the arrival count is printed into the confirm again",
   "gs_telegram_pager",
-  '                      f"It arrives as many separate payments, {_spread}.\\n"',
-  '                      f"At least {_lo} separate payments, {_spread}.\\n"',
+  '                      f"{\'addresses\' if _n > 1 else \'address\'} you gave, "',
+  '                      f"{_n} {\'addresses\' if _n > 1 else \'address\'} you gave, "',
   ["test_depo_wizard"]),
 
  ("the single-destination case is no longer called out at the confirm",
   "gs_telegram_pager",
-  '    _spread = (f"across {_n} addresses" if _n > 1 else',
-  '    _spread = (f"across {_n} addresses" if True else',
+  '            _one = ("" if _n > 1 else',
+  '            _one = ("" if True else',
   ["test_depo_wizard"]),
 
  #
@@ -3831,12 +3844,9 @@ MUTATIONS = [
  # suite still read the word and the mutation SURVIVED -- an anchor that
  # names a fragment of a message tests the fragment, not the guarantee.
  ("the question stops offering more than one destination", "gs_telegram_pager",
-  '        return (f"Where do you want it? Send a Monero address:\\n"\n'
-  '                f"  4AdX...9kPq\\n\\n"\n'
-  '                f"Several is better — up to '
-  '{proto.MAX_WAKE_EXIT_DESTS}, "',
-  '        return (f"Where do you want it? Send a Monero address:\\n"\n'
-  '                f"  4AdX...9kPq\\n\\n"\n'
+  '        return (f"Where do you want it? Reply with the address.\\n"\n'
+  '                f"Several is better — up to {proto.MAX_WAKE_EXIT_DESTS}, "',
+  '        return (f"Where do you want it? Reply with the address.\\n"\n'
   '                f"Send one. "',
   ["test_depo_wizard"]),
 

@@ -152,8 +152,11 @@ fee = with_estimate({"fee": 1000, "fees": [1000, 4000, 8000, 20000]})
 check("fee: uses per-priority fees[2]", fee == Decimal(8000 * 2000) / Decimal(10**12))
 # base-only path: priority 3 -> base 1000 * multiplier(20) * 2000
 fee = with_estimate({"fee": 1000})
-check("fee: base x multiplier when no fees[]",
-      fee == (Decimal(1000 * 2000) / Decimal(10**12)) * Decimal(20))
+check("fee: base x multiplier when no fees[] -- the multiplier is the shared "
+      "table's, the daemon's own 1/4/16/200, not the 20 this once hard-coded",
+      fee == (Decimal(1000 * 2000) / Decimal(10**12))
+      * Decimal(ghost.PRIORITY_FEE_MULTIPLIER[3])
+      and ghost.PRIORITY_FEE_MULTIPLIER == {1: 1, 2: 4, 3: 16, 4: 200})
 # NO ESTIMATE -> REFUSE, not a silent guess.
 #
 # This asserted `fee == FALLBACK_FEE_XMR * 20`, i.e. it pinned the defect as
@@ -194,11 +197,13 @@ check("fee: --accept-fallback-fee proceeds with the per-priority figure",
       _fallback == ghost.FALLBACK_FEE_BY_PRIORITY[3])
 check("fee: ...and says out loud that it is not the operator's own daemon",
       "not your daemon" in _fb.getvalue().lower())
-# THE FALLBACK MUST OVERSHOOT, NEVER UNDERSHOOT. The old constant claimed to be
-# "safe to overshoot slightly" and was 48x low. Checked against the daemon
-# figures this repo verified: fees = [1200000, 4700000, 19000000, 240000000]
-# piconero/byte over a ~2 kB transaction.
-for _p, _perbyte in ((1, 1200000), (2, 4700000), (3, 19000000), (4, 240000000)):
+# THE FALLBACK MUST NOT UNDERSHOOT TODAY'S MAINNET. The figures this compared
+# against -- fees = [1200000, 4700000, 19000000, 240000000] piconero/byte --
+# were a daemon answering sixty times what mainnet charges, and a fallback
+# pinned to them refused every deposit under ~0.18 XMR through the mirror the
+# vault reads. Mainnet get_fee_estimate: [20000, 80000, 320000, 4000000]
+# (20/80/320/4000 nanonero per byte), over a ~2 kB transaction.
+for _p, _perbyte in ((1, 20000), (2, 80000), (3, 320000), (4, 4000000)):
     _real = Decimal(_perbyte * 2000) / Decimal(10 ** 12)
     check(f"fee: the priority-{_p} fallback is not BELOW a real mainnet fee "
           f"(under-reserving strands funds mid-pipeline)",
@@ -208,7 +213,8 @@ for _p, _perbyte in ((1, 1200000), (2, 4700000), (3, 19000000), (4, 240000000)):
 # fees[] too short for priority -> falls back to base path
 fee = with_estimate({"fee": 1000, "fees": [1000, 4000]})
 check("fee: short fees[] falls through to base",
-      fee == (Decimal(1000 * 2000) / Decimal(10**12)) * Decimal(20))
+      fee == (Decimal(1000 * 2000) / Decimal(10**12))
+      * Decimal(ghost.PRIORITY_FEE_MULTIPLIER[3]))
 
 # Implausible fee (fresh/offline daemon) must ABORT, not size a plan. A fresh
 # monerod returns base=2e9 piconero/byte, which this conversion turns into 4 XMR
@@ -2065,19 +2071,28 @@ def _try_parse(route):
     except Exception as e:
         return ("__RAISED__" + type(e).__name__, "", "")
 
-check("nullsafe (real): null transaction returns empty deposit, no crash",
-      _try_parse({"transaction": None, "expectedOutput": None})[0] == "")
-check("nullsafe (real): null expectedOutput -> '0' fallback",
-      _try_parse({"transaction": {"to": "X"}, "expectedOutput": None})[2] == "0")
-check("nullsafe (real): calldata fallback when transaction is null",
-      _try_parse({"transaction": None, "calldata": {"depositAddress": "Y"},
-                  "expectedOutput": "1.2"})[0] == "Y")
-check("nullsafe (real): memo picked up from tx_info",
-      _try_parse({"transaction": {"depositAddress": "A", "memo": "SWAP:XMR"},
-                  "expectedOutput": "1"})[1] == "SWAP:XMR")
-check("nullsafe (real): calldata.data used as memo fallback",
-      _try_parse({"calldata": {"to": "A", "data": "0xdeadbeef"},
-                  "expectedOutput": "1"})[1] == "0xdeadbeef")
+# THE API'S CURRENT ROUTE SHAPE: targetAddress / inboundAddress, memo and
+# expectedBuyAmount at the top level of the route. The checks this replaced
+# fed transaction.depositAddress and expectedOutput -- an earlier API's names
+# -- and so pinned a parser that read nothing from a live quote.
+check("nullsafe (real): null targetAddress AND inboundAddress -> empty "
+      "deposit, no crash",
+      _try_parse({"targetAddress": None, "inboundAddress": None,
+                  "expectedBuyAmount": None})[0] == "")
+check("nullsafe (real): null expectedBuyAmount -> '0' fallback",
+      _try_parse({"targetAddress": "X", "expectedBuyAmount": None})[2] == "0")
+check("nullsafe (real): inboundAddress is the fallback for a null "
+      "targetAddress",
+      _try_parse({"targetAddress": None, "inboundAddress": "Y",
+                  "expectedBuyAmount": "1.2"})[0] == "Y")
+check("nullsafe (real): the memo is read from the route itself",
+      _try_parse({"targetAddress": "A", "memo": "=:XMR.XMR:Q",
+                  "expectedBuyAmount": "1"})[1] == "=:XMR.XMR:Q")
+check("schema (real): the OLD shape -- transaction.depositAddress / "
+      "expectedOutput -- parses to NOTHING, so a quote in that shape is "
+      "refused rather than half-read",
+      _try_parse({"transaction": {"depositAddress": "A", "memo": "M"},
+                  "expectedOutput": "1"}) == ("", "", "0"))
 
 # ---------------------------------------------------------------------------
 # exit_strategy_simulator Bisq fallback: EUR must NOT be fabricated from the

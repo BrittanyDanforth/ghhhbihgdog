@@ -455,8 +455,10 @@ different subaddress 0 and is swept **alone**, to its **own** destination.
 Measured on a chain running current consensus: six peels swept together
 produced one 6-input transaction; swept separately they produced six
 1-in/2-out transactions — the commonest shape on the network — for about
-0.005 XMR more in fees against a 0.0024 XMR estimate. That fee difference is
-the entire cost of not announcing the link.
+0.005 XMR more in fees against the 0.0024 XMR fallback estimate in use at the
+time (mainnet charges roughly 0.00004 XMR per transaction today, so the
+difference scales down with it). That fee difference is the entire cost of
+not announcing the link.
 `tests/real_peel_testnet.py` asserts the property directly: **no transaction
 in the run may spend more than one input.**
 
@@ -483,7 +485,9 @@ console hands its children the sensitive values through the environment, not
 argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
 `GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination),
 `GS_EXPECT_TOTAL_XMR` (how much XMR this run is waiting for),
-`GS_USAGE_FEE_ADDRESS` and `GS_USAGE_FEE_PCT` (see below), and
+`GS_USAGE_FEE_ADDRESS` and `GS_USAGE_FEE_PCT` (see below),
+`GS_SWAPKIT_API_KEY` (the quote aggregator's key, if your account needs one;
+it is sent only to that host and never appears on argv), and
 `GS_WALLET_PASSWORD` as before. (`GS_EXIT_AMOUNT` was listed here too and never
 was: `exit_strategy_simulator` reads it when you run that tool by hand, but the
 console has never set it. A list of protections is worth nothing if entries can
@@ -705,7 +709,7 @@ Steps 1–2 are `gs_telegram_pager`. Step 3 onward is `gs_doorbell` and
 `gs_wake_agent`. You can still do steps 1–2 by hand — the pager only pokes the
 doorbell, so anything it does you can do from a terminal.
 
-**Most of it is buttons.** The menu carries a keyboard — Bitcoin in,
+**Most of it is buttons.** The menu carries a keyboard — Pay in,
 Withdraw, Status, What a run does, All commands — and the depth menu, cancel,
 and the "has it arrived / wait for it" step after a deposit are all tappable.
 A status answer carries one too: still-waiting offers the two ask-again
@@ -733,19 +737,22 @@ pocket-dial — and a tap is a pocket-dial.
    rung is that amount only if it happened to be foreseen at pairing time.
    Every other time it quoted a number that was not the number. The figure is
    a Bitcoin transaction and is public on two chains before the mix even
-   starts; the pager deletes the operator's own messages **when
-   `--burn-after` is set, which it is not by default**; and the thing the Pi
-   still cannot do — name the destination subaddress, which is minted inside
-   the job on the vault — was always the half that mattered.
+   starts; the pager deletes the operator's own messages after
+   `--burn-after` seconds — **fifteen minutes by default; `0` turns it
+   off** — and deletes every question and reply of a `/deposit` or
+   `/withdraw` the moment that exchange ends, whatever the setting; and the
+   thing the Pi still cannot do — name the destination subaddress, which is
+   minted inside the job on the vault — was always the half that mattered.
 
-   That middle clause used to be stated flatly, and it is the one of the three
-   that is a setting rather than a fact. `--burn-after` defaults to 0, and the
-   unit example's `--burn-after 3600` sits inside a fully commented-out
-   `ExecStart`, so deletion is opt-in twice over. `welcome_text` already
-   handles this correctly in code — it appends the deletion sentence only when
-   the setting is on, because "a welcome that promises deletion on an install
-   that does not delete is the kind of confident false statement this repo
-   keeps removing." The same default silently weakens `/withdraw`, where the
+   That middle clause is a setting rather than a fact, and the default used
+   to be the wrong one: `--burn-after` defaulted to 0, so the typed amount
+   and the typed destination addresses stayed in the transcript for as long
+   as Telegram kept them. Deletion is still bounded by Telegram — a bot can
+   delete only within 48 hours, and nothing reaches a forwarded copy or a
+   screenshot — which is why the reply vocabulary is kept dull FIRST and the
+   burn is defence in depth on top of it. `welcome_text` states the retention
+   that is actually configured, in minutes under an hour. The setting
+   also bears on `/withdraw`, where the
    operator types full Monero destinations into the chat.
 
    `/deposit` asks the amount and then confirms, because the one command that
@@ -850,9 +857,10 @@ pocket-dial — and a tap is a pocket-dial.
    the next run itself once the vault reports another arrival, up to six in a
    row, each its own mix.
 
-   **The depth is a number of HOPS**, and that is worth stating because it was
-   not always. The question used to be numbered by the protocol's own key with
-   the hop count printed beside it —
+   **The depth is a number of HOPS** — a fact for this document, not for the
+   chat, which says "depth" and the number and never the word — and that is
+   worth stating because it was not always. The question used to be numbered
+   by the protocol's own key with the hop count printed beside it —
 
    ```
      1  3 hops · ~6h · lowest minimum

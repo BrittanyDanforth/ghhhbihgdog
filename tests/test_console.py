@@ -221,10 +221,16 @@ def test_no_fabricated_fees():
 def test_real_fee_estimate_is_used_and_flagged():
     c = load_console()
     calls = []
+    import gs_common as _rgs
 
-    class FakeGs:
+    class _GsBase:
+        """The fee arithmetic is the SHARED helper now, so the fake daemon
+        module carries the real one -- the console no longer owns a private
+        multiplier table to be tested against."""
         _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+        fee_estimate_per_tx = staticmethod(_rgs.fee_estimate_per_tx)
 
+    class FakeGs(_GsBase):
         @staticmethod
         def daemon_fee_estimate(url, proxies=None):
             calls.append(url)
@@ -235,24 +241,48 @@ def test_real_fee_estimate_is_used_and_flagged():
     check("fees are converted to XMR per ~2 kB", res["xmr"][0] == round(20000 * 2000 / 1e12, 6))
     check("a plausible fee is not flagged", res["implausible"] is False)
 
-    class HugeGs:
-        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+    class HugeGs(_GsBase):
         @staticmethod
         def daemon_fee_estimate(url, proxies=None):
-            return {"fees": [2 * 10 ** 9]}     # a fresh offline chain's absurd fee
+            # a fresh offline chain's absurd fee, at all four priorities
+            return {"fees": [2 * 10 ** 9] * 4}
     c._GS_MOD = HugeGs
     res2 = c.live_fees("http://127.0.0.1:18081")
     check("an absurd daemon fee IS flagged implausible", res2["implausible"] is True)
     check("the implausible warning explains it", "fresh or offline" in res2["warning"])
 
-    class ZeroGs:
-        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+    class ZeroGs(_GsBase):
         @staticmethod
         def daemon_fee_estimate(url, proxies=None):
-            return {"fees": [0]}
+            return {"fees": [0, 0, 0, 0]}
     c._GS_MOD = ZeroGs
-    check("a zero fee is flagged implausible",
-          c.live_fees("http://127.0.0.1:18081")["implausible"] is True)
+    _zero = c.live_fees("http://127.0.0.1:18081")
+    check("a zero fee is flagged implausible", _zero["implausible"] is True)
+    check("...and is reported as a daemon that ANSWERED unusably, not as one "
+          "that could not be reached",
+          _zero["ok"] is False and "answered" in _zero["source"]
+          and "fresh or offline" in _zero["warning"])
+
+    class ShortGs(_GsBase):
+        @staticmethod
+        def daemon_fee_estimate(url, proxies=None):
+            return {"fees": [20000]}           # one priority, no base fee
+    c._GS_MOD = ShortGs
+    _short = c.live_fees("http://127.0.0.1:18081")
+    check("a fees[] too short for four priorities is unusable, not padded",
+          _short["ok"] is False and _short["implausible"] is True
+          and _short["xmr"] is None)
+
+    class NoneGs(_GsBase):
+        @staticmethod
+        def daemon_fee_estimate(url, proxies=None):
+            return {}
+    c._GS_MOD = NoneGs
+    _none = c.live_fees("http://127.0.0.1:18081")
+    check("NON-VACUITY -- an unreachable daemon is still 'no estimate', not "
+          "implausible",
+          _none["ok"] is False and _none["implausible"] is False
+          and "Could not reach" in _none["warning"])
 
 
 def test_remote_daemon_fee_query_routes_through_tor():

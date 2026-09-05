@@ -779,7 +779,7 @@ def phase_is_known(word) -> bool:
 #: (rule 6) a non-operator reads. Declared ONCE so the by-hand path and the
 #: chat cannot drift, and it says only what was observed.
 WITHDRAW_NO_MORE_LINE = ("Nothing more was found to send: none is here, too "
-                         "little to mix, or it could not be checked.")
+                         "little to send on, or it could not be checked.")
 
 PHASE_LINES = {
     "not_yet": "nothing on the address yet. Normal — ask again in a while.",
@@ -795,8 +795,8 @@ PHASE_LINES = {
     # reason it was added: shortening it to "Done." once changed which noun it
     # was about -- the SWAP has finished, the MIX has not, and the mix is the
     # entire point.
-    "landed": "CONFIRMED — the money is here and spendable. That was the "
-              "swap; the mix has not run yet.",
+    "landed": "CONFIRMED — the money is here and spendable. The rest has "
+              "not run yet.",
     "short": "arrived, but UNDER what was quoted, and it has stopped growing. "
              "Check before going further.",
     "stuck": "not scanning, so this says NOTHING about your money. Check.",
@@ -828,9 +828,9 @@ def plain_lines(plain: dict, label: str = "") -> list:
     "m" whatever the dict holds.
     """
     return [
-        f"Send exactly:  {plain.get('b', '')} BTC",
+        f"Send exactly:  {plain.get('b', '')}",
         f"To address:    {plain.get('d', '')}",
-        f"Expected out:  ~{plain.get('x', '')} XMR",
+        f"Expected out:  ~{plain.get('x', '')}",
         # THE LABEL THE READER CAN ACTUALLY USE, and the caller decides what
         # that is because this function does not know who is reading.
         # (see below: the memo is no longer among these lines at all)
@@ -855,8 +855,8 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # can get wrong and lose the payment for -- paying this from
         # a phone wallet, which cannot attach the part that routes
         # it. Said once, without naming what that part is.
-        "Pay it from the machine that quoted it. A phone wallet "
-        "CANNOT complete this and the money would be lost.",
+        "Pay it from the machine that quoted it. A phone CANNOT "
+        "complete this and the money would be lost.",
         # THE ADDRESS IS NOT THE READER'S, AND NOTHING SAID SO.
         #
         # "To address: bc1q..." reads as "this is my deposit address" to
@@ -1838,13 +1838,15 @@ def btc_to_sat(text) -> int:
     s = text if isinstance(text, str) else ""
     s = s.strip()
     if not _BTC_RE.match(s):
-        raise WakeError("expected a plain BTC amount like 0.05, at most 8 "
+        # NO COIN NAME: this sentence is echoed into the chat by the /deposit
+        # wizard ("no: <error>. Cancelled"), and the transcript is readable.
+        raise WakeError("expected a plain amount like 0.05, at most 8 "
                         "decimal places")
     whole, _dot, frac = s.partition(".")
     sat = int(whole) * SATS_PER_BTC + int(frac.ljust(8, "0") or "0")
     if not DEPOSIT_MIN_SAT <= sat <= DEPOSIT_MAX_SAT:
         raise WakeError(f"expected between {btc_display(DEPOSIT_MIN_SAT)} and "
-                        f"{btc_display(DEPOSIT_MAX_SAT)} BTC")
+                        f"{btc_display(DEPOSIT_MAX_SAT)}")
     return sat
 
 
@@ -2100,7 +2102,7 @@ _xmr_address_list.spec = (f"1-{MAX_WAKE_EXIT_DESTS} xmr addresses "
 #: WHAT DEPTH ACTUALLY BUYS, stated more carefully than the first version of
 #: this comment stated it. That version said a fixed depth is "a FLOOR on what
 #: can be mixed at all", quoting mix_minimum_xmr at 0.1748 XMR for three
-#: wallets and 0.2936 for ten. Those two figures are now 0.1784 and 0.2972 --
+#: wallets and 0.2936 for ten. Those two figures are now 0.0121 and 0.0270 --
 #: mix_minimum_xmr was understating both by one hop_fee_reserve, the entry
 #: veil's own fee, which size_and_prune_chunks takes off the balance before it
 #: budgets anything. Both were measured with NO operator cut -- which was true
@@ -2118,8 +2120,8 @@ _xmr_address_list.spec = (f"1-{MAX_WAKE_EXIT_DESTS} xmr addresses "
 #: one):
 #:
 #:                        no cut     with the shipped 1.1% cut
-#:   depth 1 (3 hops)     0.1784     0.3364   <- the cut sets it
-#:   depth 2 (10 hops)    0.2972     0.3364   <- the cut sets it
+#:   depth 1 (3 hops)     0.0121     0.0146   <- the cut sets it
+#:   depth 2 (10 hops)    0.0270     0.0273   <- the cut sets it
 #:   depth 3 (20 hops)    0.4764     0.4817   <- the HOPS set it again
 #:
 #: At the deepest depth the phone offers, the cut stops being the binding
@@ -2235,19 +2237,19 @@ WITHDRAW_HOPS = {v[0]: k for k, v in WITHDRAW_DEPTHS.items()}
 #: the pair that makes the pin meaningful -- pinning only the no-cut figure
 #: would not notice the cut's floor moving.
 #:
-#: BOTH ARE UNDERSTATEMENTS, deliberately and unavoidably. They are computed
-#: at GhostSpiral's FALLBACK network fee; the real fee comes from the daemon
-#: at run time and is usually higher, which moves the true minimum UP. So the
-#: gate refuses less than it ideally would and never more -- it cannot turn
-#: away a deposit that would have worked, and it still catches the deposits
-#: that are wrong by an order of magnitude, which is the case that strands
-#: money.
+#: A FALLBACK, NOT THE FLOOR. Computed at GhostSpiral's fallback network
+#: fee, which is today's mainnet priority-1 figure -- the vault computes the
+#: live floor from its own daemon (gs_wake_agent.live_min_out_xmr) and reads
+#: these only when the daemon cannot be asked, and says so on the chain. The
+#: previous strings, 0.1784 and 0.3364, were computed at a fallback fee sixty
+#: times today's: every deposit under about 0.18 XMR was refused, and the
+#: withdraw chain called leftovers up to that "nothing more here".
 #: STRINGS, NOT Decimal, and that is this module's rule rather than laziness:
 #: see btc_to_sat, which is integer string arithmetic "with no float and no
 #: Decimal" on purpose. These travel to an argv and are parsed by the tool
 #: that owns the arithmetic, so a string is also the shape they are used in.
-MIX_MINIMUM_XMR_MIRROR = "0.1784"
-MIX_MINIMUM_XMR_WITH_CUT_MIRROR = "0.3364"
+MIX_MINIMUM_XMR_MIRROR = "0.0121"
+MIX_MINIMUM_XMR_WITH_CUT_MIRROR = "0.0146"
 
 
 def deposit_min_out_xmr() -> str:
@@ -2354,10 +2356,14 @@ def exit_arrivals_floor(depth: int) -> int:
 #: sentence, where it read "... you just sent, ~6h · lightest cover, smallest
 #: balance · answer 3 -- this SPENDS", i.e. it told the operator to answer
 #: something at the moment they were being asked to confirm.
+# NO HOP COUNTS, NO HOURS, NO "COVER" IN THE CHAT. The line the operator reads
+# is the answer vocabulary (3 / 10 / 20) and a plain word for the trade-off;
+# what a depth does, how long it runs and how many transactions it makes are
+# the shape of the operation, on the surface a stranger reads.
 WITHDRAW_DEPTH_NOTE = {
-    1: "lightest cover, smallest balance",
+    1: "lightest and quickest, needs the least",
     2: "middle",
-    3: "strongest cover, biggest balance",
+    3: "most thorough and slowest, needs the most",
 }
 
 
@@ -2416,7 +2422,7 @@ def depth_choice(depth: int) -> str:
     The runtime still appears, because it is the thing the operator is really
     trading away and the reason the complaint existed. It just is not first.
     """
-    return (f"{depth_hops(depth)} hops · about {depth_hours(depth)}h · "
+    return (f"{depth_hops(depth)} — about {depth_hours(depth)}h, "
             f"{WITHDRAW_DEPTH_NOTE[depth]}")
 
 
@@ -2429,7 +2435,7 @@ def depth_said_back(depth: int) -> str:
     number they typed and the hours it costs -- and drops the "what it buys"
     phrase, which is a reason to choose rather than a thing to check.
     """
-    return f"{depth_hops(depth)} hops, about {depth_hours(depth)}h"
+    return f"at depth {depth_hops(depth)}"
 
 
 JOBS = {

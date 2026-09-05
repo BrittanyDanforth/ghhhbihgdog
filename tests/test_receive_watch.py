@@ -1156,12 +1156,28 @@ check("liveness: the 3-minute /check probe does NOT call a healthy-looking "
 check("liveness: NON-VACUITY -- the long watch's 30-minute window still "
       "reaches the verdict on the SAME frozen wallet",
       _frozen(30)["state"] == "not_syncing")
-check("liveness: ...and the floor is the constant this file already chose "
-      "for 'long enough to doubt', not a second one meaning the same thing",
-      rw.LIVENESS_DOUBT_S >= 600
-      and _frozen(rw.LIVENESS_DOUBT_S // 60)["state"] == "not_syncing")
-check("liveness: ...and one minute under it does not",
-      _frozen(max(1, rw.LIVENESS_DOUBT_S // 60 - 1))["state"] == "timeout")
+# THE FLOOR IS LIVENESS_MIN_S (30 min), whatever --stall-min says. A hand-run
+# --stall-min 10 used to call a healthy wallet stuck on a ten-minute block gap;
+# the verdict now needs thirty minutes of silence however short the window.
+
+
+def _frozen_for(stall_min, total_min):
+    _t = [0.0]
+    return rw.watch(_FrozenRPC(), 0, 1, Decimal("1"),
+                    timeout_s=total_min * 60, stall_s=stall_min * 60,
+                    sleep_fn=lambda s: _t.__setitem__(0, _t[0] + s),
+                    clock=lambda: _t[0], echo=lambda *a, **k: None)
+
+
+check("liveness: a 10-minute window over a 25-minute freeze reaches NO "
+      "verdict -- the floor, not --stall-min, decides (the old false alarm)",
+      _frozen_for(10, 25)["state"] == "timeout")
+check("liveness: ...and the same 10-minute window over a 40-minute freeze "
+      "does reach it",
+      _frozen_for(10, 40)["state"] == "not_syncing")
+check("liveness: the floor is LIVENESS_MIN_S, thirty minutes, above the "
+      "doubt threshold the stalled verdict uses",
+      rw.LIVENESS_MIN_S == 1800 and rw.LIVENESS_MIN_S > rw.LIVENESS_DOUBT_S)
 
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

@@ -255,7 +255,7 @@ BOT_COMMANDS = [
     # surface hands over: the pair is minted inside the job, on the machine,
     # and the reply says to read it there. A command list that promises a
     # payload the reply then withholds reads as the reply having failed.
-    ("deposit", "MONEY IN — quote a swap and get a label to track it"),
+    ("deposit", "MONEY IN — get a label to track it"),
     # ONE RUN MOVES ONE ARRIVAL AND ONE COMMAND STARTS AS MANY AS IT TAKES.
     # _funded_entry takes the LARGEST SINGLE unlocked output and never sums --
     # summing would spend inputs from several subaddresses in one transaction,
@@ -264,7 +264,7 @@ BOT_COMMANDS = [
     # arrival", which was true of a run and read, to an operator with money in
     # three places, as being paid a third of it. The pager now chains the
     # rest itself, so the promise the command can make is the whole balance.
-    ("withdraw", "MONEY OUT — send it all back, as separate mixes"),
+    ("withdraw", "MONEY OUT — pays you, all of it"),
     ("status", "can I start one right now"),
     # THE TIMES INCLUDE THE WAKE JITTER, because the operator waits it. The
     # probe itself looks for 3 minutes; the machine sleeps a random 5-20 first,
@@ -300,7 +300,7 @@ BOT_COMMANDS = [
     # was in the same state and is above.
     ("fee", "the usage fee this service keeps — not the network fee"),
     ("speed", "can I make it faster"),
-    ("exit", "where the mixed funds go"),
+    ("exit", "where it goes"),
     ("cancel", "drop whatever I was half-way through"),
     ("help", "this list"),
 ]
@@ -364,7 +364,7 @@ MENU_BUTTONS = [
     # operator arriving for the first time has deposited nothing, so the word
     # has no object yet. "pays you" gives it one, and it is the sentence the
     # welcome spends a line on.
-    [("⬇ Bitcoin in", "m:depo"), ("⬆ Withdraw — pays you", "m:send")],
+    [("⬇ Pay in", "m:depo"), ("⬆ Withdraw — pays you", "m:send")],
     [("Status", "m:status"), ("What a run does", "m:settings")],
     # "What this does" PROMISED AN OVERVIEW AND OPENED A SETTINGS TABLE. The
     # overview is the welcome, which is what the newcomer has just read; this
@@ -608,7 +608,7 @@ EVENT_LINES = {
         "as incomplete.",
 }
 
-SPEED_ANSWER = "Fewer hops is faster — see /withdraw."
+SPEED_ANSWER = "Lighter is faster — see /withdraw."
 # WAS "Not settable here." AND THAT IS NO LONGER TRUE. /withdraw sets it, by
 # reply, per withdrawal. An answer that still said "not settable" would be the
 # tool lying about its own capability on the one surface the operator asks.
@@ -807,27 +807,27 @@ def handle_from_confirmation(key: dict, chat_id: int, text: str) -> str:
 #: from the machine, they turn up when /deposit is answered, and a phone
 #: wallet cannot pay them.
 _DEPO_ON_MACHINE = (
-    "  /deposit   you pay in Bitcoin. The details come back when you ask — "
-    "pay them from the machine, never from a phone wallet.")
+    "  /deposit   you pay in. The details come back when you ask — pay "
+    "them from the machine, never from your phone.")
 _DEPO_IN_CHAT = (
-    "  /deposit   you pay in Bitcoin. A fresh address and the amount arrive "
-    "HERE, every time — pay it from the machine, not from a phone wallet.")
+    "  /deposit   you pay in. A fresh address and the amount arrive HERE, "
+    "every time — pay it from the machine, not from your phone.")
 _DEPO_LINE = _DEPO_ON_MACHINE
 
 WELCOME_LINES = [
-    "Monero mixing, from your phone.",
+    "Money in, money out — from your phone.",
     "",
     "MONEY IN",
     _DEPO_LINE,
     "",
     "MONEY OUT",
     "  /withdraw  the one that pays YOU. It sends back everything that is "
-    "here, to the addresses you give — as separate mixes, one per arrival, "
-    "because sending them together would prove they are all yours.",
+    "here, to the addresses you give.",
     "",
     "WHAT IT COSTS",
-    f"  USAGE FEE {USAGE_FEE_LABEL} — that is what this service keeps, and "
-    f"the only thing it keeps.",
+    # THE RATE IS NOT HERE. It is on /fee, one tap away and read on purpose;
+    # the welcome is the message every reader of this chat sees first.
+    "  A usage fee — the only thing this service keeps. The rate is on /fee.",
     # "Taken once, out of what you withdraw" FULL STOP, and it is not always
     # taken: below a floor the cut is worth less than the network fee to move
     # it, so it is waived and the withdrawal runs in full. See FEE_ANSWER.
@@ -844,9 +844,8 @@ WELCOME_LINES = [
     "asking.",
     "",
     "  That is NOT the same as the network fee. The network charges its own "
-    "fee on every transaction it carries, a mix is many transactions, and "
-    "none of that comes here. So the total that leaves is always a little "
-    "more than the usage fee alone.",
+    "fee on everything it carries, and none of that comes here. So the total "
+    "that leaves is always a little more than the usage fee alone.",
     "",
     "HOW THIS CHAT BEHAVES",
     "  Nothing you type is written down on this end.",
@@ -859,8 +858,8 @@ WELCOME_LINES = [
 #: welcome that promises deletion on an install that does not delete is the
 #: kind of confident false statement this repo keeps removing. The number is
 #: the one actually configured, not a literal.
-_BURN_LINE = ("  Messages here are deleted after {h}h, both sides, as far as "
-              "Telegram allows.")
+_BURN_LINE = ("  Messages here are deleted after {when}, both sides, as far "
+              "as Telegram allows.")
 
 
 def welcome_text(burn_after: int = 0, key: dict = None) -> str:
@@ -913,7 +912,9 @@ def welcome_text(burn_after: int = 0, key: dict = None) -> str:
         # one, so the message is gone by the time stated and usually sooner.
         # max(1, ...) still covers a sub-hour setting, which now also rounds
         # up rather than being clamped from below.
-        lines.append(_BURN_LINE.format(h=max(1, -(-_b // 3600))))
+        _when = (f"{max(1, -(-_b // 60))} min" if _b < 3600
+                 else f"{max(1, -(-_b // 3600))}h")
+        lines.append(_BURN_LINE.format(when=_when))
     lines += ["", "Tap below, or /help for everything."]
     return "\n".join(lines)
 
@@ -921,6 +922,20 @@ def welcome_text(burn_after: int = 0, key: dict = None) -> str:
 #: The default rendering, for the source-level checks and for any caller
 #: without a Pager to ask.
 WELCOME = welcome_text(0)
+
+#: THE BURN LIST IS WRITTEN FROM TWO THREADS. send() appends from _worker (the
+#: chain's completion messages) while burn_expired rebuilds the list on the
+#: poll thread; `self.burn = keep` after an append it never saw drops that
+#: message from the list, and a message dropped from the list is a message
+#: never deleted. One lock, module-level so a Pager built without __init__
+#: (every test harness) has it too. Never held across a network call.
+_BURN_LOCK = threading.Lock()
+
+#: THE LAST MESSAGE ID send() POSTED, PER THREAD. _ask reads it straight after
+#: its own send() to record a wizard question on the conversation; an
+#: attribute on the Pager would be clobbered by _worker's send() on the other
+#: thread, and the wrong message would burn with the wizard.
+_LAST_MID = threading.local()
 
 
 HELP = "\n".join(
@@ -930,7 +945,7 @@ HELP = "\n".join(
        # command from the list above, so this list stays the whole vocabulary
        # and the keyboard is only the short way to reach four of it.
        "Or use the buttons — they send these same commands.",
-       "Deposits are paid from the machine, never from a phone wallet.",
+       "Deposits are paid from the machine, never from a phone.",
        "",
        "Old spellings: /send reaches /withdraw, /depo reaches /deposit. "
        "/withdraw is the one that pays YOU."]
@@ -1055,10 +1070,26 @@ class Limits:
             return
         if not isinstance(d, dict):
             return
-        self.offset = int(d.get("offset") or 0)
-        self.last_poke = float(d.get("last_poke") or 0)
-        self.pokes = [float(x) for x in (d.get("pokes") or [])
-                      if isinstance(x, (int, float))]
+        # EACH FIELD ON ITS OWN. A state file with one unreadable field used
+        # to raise out of here and stop the pager at boot; the fields it
+        # could read are taken and the rest start over.
+        try:
+            _off = d.get("offset")
+            self.offset = (int(_off) if isinstance(_off, int)
+                           and not isinstance(_off, bool) and _off >= 0
+                           else 0)
+        except (TypeError, ValueError):
+            self.offset = 0
+        try:
+            _lp = d.get("last_poke")
+            self.last_poke = (float(_lp) if isinstance(_lp, (int, float))
+                              and not isinstance(_lp, bool) else 0.0)
+        except (TypeError, ValueError):
+            self.last_poke = 0.0
+        _pk = d.get("pokes")
+        self.pokes = [float(x) for x in (_pk if isinstance(_pk, list) else [])
+                      if isinstance(x, (int, float))
+                      and not isinstance(x, bool)]
 
     #: Stamps are rounded to this before they touch the card.
     #:
@@ -1333,7 +1364,7 @@ class Convo:
     # place that was inventing the usage. That is the "declared in one place,
     # never wired" shape with a test standing in front of it.
     __slots__ = ("kind", "amount", "depth", "exit_to", "expect",
-                 "deadline", "tries")
+                 "deadline", "tries", "mids")
 
     def __init__(self, clock, kind="depo"):
         self.kind = kind
@@ -1341,6 +1372,9 @@ class Convo:
         self.depth = None
         self.exit_to = None
         self.expect = None
+        #: message ids of this conversation's questions and replies, deleted
+        #: together the moment it ends -- see Pager._end_convo.
+        self.mids = []
         #: Unrecognised answers spent at the ONE step that re-asks instead of
         #: cancelling. Counted rather than unbounded because every re-ask
         #: writes another line into a transcript this tool cannot delete, so
@@ -1481,9 +1515,9 @@ class Pager:
         #: a monotonic reading cannot be compared to it.
         self.burn = []
         #: Seconds a message may stay in the chat before this deletes it.
-        #: 0 disables, which is the default: a bot that silently removes the
-        #: operator's own messages would be a surprise, and the surprise lands
-        #: on the one channel they use when they cannot reach the machine.
+        #: 0 disables. The default is fifteen minutes (main): the transcript
+        #: is the surface a stranger reads, and a message that has served its
+        #: purpose is a message that should not be there to read.
         self.burn_after = int(getattr(args, "burn_after", 0) or 0)
         #: Set by SIGUSR1; cleared by the poll loop when it has acted. See
         #: arm_burn for why the trigger is a signal and not a chat command.
@@ -1498,7 +1532,104 @@ class Pager:
         """
         dead = [c for c, v in self.convos.items() if not v.alive(self.clock)]
         for c in dead:
-            del self.convos[c]
+            self._end_convo(c)
+
+    def _post_once(self, method: str, payload: dict):
+        """One attempt, no retries: for the calls whose value is gone if late.
+
+        safe_post retries four times with backoff -- about two minutes on a
+        dead circuit -- ON THIS THREAD, the one that polls. A button's
+        acknowledgement two minutes late is a button that spun and died, and
+        a delete that fails now can be retried next tick. The undecorated
+        function is called, so a stub the tests put in safe_post's place is
+        what runs here as well.
+        """
+        fn = getattr(safe_post, "__wrapped__", safe_post)
+        return fn(self._url(method), payload, proxies=self.proxies)
+
+    def _ask(self, chat_id: int, text: str, buttons=None) -> bool:
+        """A wizard question: sent, and remembered on the conversation so it
+        is deleted with it."""
+        ok = self.send(chat_id, text, buttons=buttons)
+        c = self.convos.get(chat_id)
+        mid = getattr(_LAST_MID, "mid", None)
+        if ok and c is not None and isinstance(mid, int) \
+                and not isinstance(mid, bool) and mid not in c.mids:
+            c.mids.append(mid)
+        return ok
+
+    def _end_convo(self, chat_id: int) -> None:
+        """Drop a conversation and delete every message it consisted of, NOW.
+
+        THE WIZARD IS WHERE THE SECRETS ARE. The amount the operator typed,
+        the destination addresses they replied with, and this bot's own
+        echoes of both sat in the transcript for as long as Telegram kept
+        them -- forever, with --burn-after at its old default of 0. Every
+        question this bot asks and every reply it consumes is recorded on the
+        conversation, and the moment it ends -- confirmed, cancelled,
+        mistyped, dropped by a command, or expired -- all of it is deleted,
+        both sides, as far as Telegram allows. What stays is the label and
+        the phase words: the vocabulary that says nothing.
+        """
+        c = self.convos.pop(chat_id, None)
+        if c is None:
+            return
+        mids = list(dict.fromkeys(m for m in getattr(c, "mids", ())
+                                  if isinstance(m, int)))
+        if not mids:
+            return
+        with _BURN_LOCK:
+            burn = getattr(self, "burn", None)
+            stamps = ({e[1]: e[2] for e in burn if e[0] == chat_id}
+                      if isinstance(burn, list) else {})
+            if isinstance(burn, list):
+                self.burn = [e for e in burn
+                             if not (e[0] == chat_id and e[1] in mids)]
+        # ONE DEAD CIRCUIT STOPS THE ROUND, NOT THE INTENT. A delete that never
+        # completed (None) means the circuit is dead; the rest are not tried
+        # now -- each try is a 25 s timeout on the polling thread -- but
+        # QUEUED, with their real send times so the 48 h window is honoured,
+        # and retried every tick by retry_wizard_deletes until they go.
+        gone, retry, dead = 0, [], False
+        for m in mids:
+            r = None if dead else self.delete_message(chat_id, m)
+            if r:
+                gone += 1
+            elif r is None:
+                dead = True
+                retry.append((chat_id, m, stamps.get(m, time.time())))
+        if retry:
+            _pending = getattr(self, "_wizard_retry", None)
+            if not isinstance(_pending, list):
+                _pending = self._wizard_retry = []
+            _pending.extend(retry)
+        integrity_log("pager", "wizard_burned" if gone == len(mids)
+                      else "wizard_burn_partial")
+
+    def retry_wizard_deletes(self, max_deletes: int = 8) -> int:
+        """Try again, every tick, on the wizard messages whose delete never
+        completed. Stops at the first one that fails again (dead circuit),
+        drops one Telegram refuses or that is past the 48 h window."""
+        pending = getattr(self, "_wizard_retry", None)
+        if not pending:
+            return 0
+        now = time.time()
+        keep, gone, dead = [], 0, False
+        for i, (cid, mid, sent) in enumerate(pending):
+            if dead or i >= max_deletes:
+                keep.append((cid, mid, sent))
+                continue
+            r = self.delete_message(cid, mid)
+            if r:
+                gone += 1
+            elif r is None:
+                dead = True
+                if now - sent < TG_DELETE_WINDOW_S:
+                    keep.append((cid, mid, sent))
+        self._wizard_retry = keep
+        if gone:
+            integrity_log("pager", "wizard_burned_late")
+        return gone
 
     def begin_convo(self, chat_id: int, kind: str = "depo") -> None:
         self._reap()
@@ -1540,6 +1671,7 @@ class Pager:
             self.send(chat_id, "no: too many conversations in flight. Try "
                                "again in a few minutes.")
             return
+        self._end_convo(chat_id)
         self.convos[chat_id] = Convo(self.clock, kind=kind)
         if kind == "withdraw":
             # STRAIGHT TO THE ADDRESS. This used to ask for a 4-character
@@ -1555,10 +1687,10 @@ class Pager:
             # which is the thing the whole design refuses. So the tappable part
             # is the way OUT, which is the part an operator standing in a
             # street with a half-typed address actually needs.
-            self.send(chat_id, self._exit_question(),
+            self._ask(chat_id, self._exit_question(),
                       buttons=[[("Cancel", "m:cancel")]])
             return
-        self.send(chat_id, self._amount_question(),
+        self._ask(chat_id, self._amount_question(),
                   buttons=[[("Cancel", "m:cancel")]])
 
     def _exit_question(self) -> str:
@@ -1600,12 +1732,13 @@ class Pager:
         # to produce a Monero address -- so the fastest thing this can do is
         # show one, name it, and stop. WHY several is better is a real fact
         # they cannot guess and it stays, in one clause instead of a sentence.
-        return (f"Where do you want it? Send a Monero address:\n"
-                f"  4AdX...9kPq\n\n"
+        # NO COIN NAME, NO SAMPLE ADDRESS, NO "SEPARATE PAYMENTS": each names
+        # the operation on the surface a stranger reads. The address gate says
+        # what is wrong with a bad one; this only asks.
+        return (f"Where do you want it? Reply with the address.\n"
                 f"Several is better — up to {proto.MAX_WAKE_EXIT_DESTS}, "
-                f"separated by spaces. It arrives as many separate payments, "
-                f"and one address collects them all where anyone can group "
-                f"them.\n"
+                f"separated by spaces: one address collects everything, "
+                f"where anyone can group it.\n"
                 f"/cancel to stop.")
 
     def _settings_text(self) -> str:
@@ -1637,7 +1770,7 @@ class Pager:
         # that is not to loosen it: /deposit states the range at the moment it
         # asks, which is when the operator needs it, and /settings is read at
         # times when a number in the transcript buys nothing.
-        lines.append("  deposit amount  in BTC, typed at /deposit")
+        lines.append("  deposit amount  typed at /deposit")
         # DRAWN FROM THE TABLE, not listed here. A second hand-written copy of
         # the depth menu is a second thing to forget to update, and this one
         # would be wrong in the direction that reads as authoritative.
@@ -1652,10 +1785,10 @@ class Pager:
         # comment records that collision being taken out of the menu; this
         # copy of it survived one file away, which is the reason the wire's
         # keys are not supposed to reach a chat at all.
-        lines.append("  mixing depth    "
+        lines.append("  depth           "
                      + ", ".join(str(_h)
                                  for _h in sorted(proto.WITHDRAW_HOPS))
-                     + " hops, asked at /withdraw")
+                     + ", asked at /withdraw")
         lines.append("  destination     the address you reply with at /withdraw")
         lines.append("")
         # THE COURTESY BOUND, SAID TO BE THE COURTESY BOUND. This box's
@@ -1717,7 +1850,9 @@ class Pager:
         #
         # Nothing is lost: why_not() already tells the operator whether they
         # are blocked, at the moment they are blocked, without a total.
-        lines.append(f"  daily allowance {self.limits.daily_cap} a day")
+        # NO NUMBER. The cap is the shape of the arrangement; why_not() says
+        # when it is reached, which is the only moment the figure is useful.
+        lines.append("  a daily allowance — you are told when it is reached")
         lines.append("")
         # ONLY WHAT IS ACTUALLY THERE. This block used to read "Set on the
         # machine, not here: hop delay, and the depth ceiling" and two thirds
@@ -1737,7 +1872,7 @@ class Pager:
         lines.append("  whether a usage fee is taken, and where it goes")
         lines.append("")
         lines.append("Fixed in the software, the same for everyone:")
-        lines.append("  the delay between hops")
+        lines.append("  the delay between steps")
         lines.append("  which depths are on the menu")
         # THE RATE, NOT THE FEE. "the usage fee" under "the same for
         # everyone" said the cut itself is universal, which contradicted the
@@ -1747,7 +1882,7 @@ class Pager:
         lines.append("  the usage fee RATE — see /fee")
         lines.append("")
         lines.append("Nothing in the last two groups changes from this chat. "
-                     "A message that could turn the mixing down is a message "
+                     "A message that could turn the depth down is a message "
                      "worth stealing the phone for.")
         return "\n".join(lines)
 
@@ -1799,8 +1934,8 @@ class Pager:
         floor exists and which way to err, which is the whole of what it
         honestly knows.
         """
-        return (f"How much? Reply with the BTC amount — for example 0.05.\n"
-                f"Too little and the mix cannot run at all. If in doubt, "
+        return (f"How much? Reply with the amount — for example 0.05.\n"
+                f"Too little and it cannot run at all. If in doubt, "
                 f"send more.\n"
                 f"/cancel to stop.")
 
@@ -1824,11 +1959,11 @@ class Pager:
         # place for every box that draws this menu. It has been broken twice
         # -- once with the wire's key first, once with the runtime first --
         # and depth_choice carries both post-mortems.
-        return ("How deep? Reply with the number of hops:\n"
+        return ("How deep? Reply with one of these numbers:\n"
                 + "\n".join(f"  {proto.depth_choice(d)}"
                             for d in sorted(proto.WITHDRAW_DEPTHS))
-                + "\n\nDeeper mixes better and needs a bigger balance to do "
-                  "it — the fees come out of the same pile.\n"
+                + "\n\nDeeper is more thorough and needs a bigger balance "
+                  "— the fees come out of the same pile.\n"
                   "/cancel to stop.")
 
     #: The jobs whose labels the vault will never watch. receive_new mints an
@@ -1984,7 +2119,7 @@ class Pager:
         would tap to a number the step then refuses -- the same two
         vocabularies that made "3" mean twenty hops, one layer over.
         """
-        _rows = [[(f"{_h} hops", f"d:{_h}")]
+        _rows = [[(f"depth {_h}", f"d:{_h}")]
                  for _h in sorted(proto.WITHDRAW_HOPS)]
         return _rows + [[("Cancel", "m:cancel")]]
 
@@ -2018,7 +2153,7 @@ class Pager:
             return None
         return proto.WITHDRAW_HOPS.get(int(w))
 
-    def step_convo(self, chat_id: int, text: str) -> bool:
+    def step_convo(self, chat_id: int, text: str, mid=None) -> bool:
         """Advance a live conversation. True if this message was consumed.
 
         NEVER RAISES, and that is not defensive habit -- it is the fix for a
@@ -2029,15 +2164,15 @@ class Pager:
         here has that shape, so the conversation is dropped on any of them.
         """
         try:
-            return self._step_convo(chat_id, text)
+            return self._step_convo(chat_id, text, mid)
         except Exception as e:                               # noqa: BLE001
-            self.convos.pop(chat_id, None)
+            self._end_convo(chat_id)
             integrity_log("pager", "convo_error")
             self.send(chat_id, f"no: that went wrong — cancelled, nothing was "
                                f"started ({_redact(e)[:60]}).")
             return True
 
-    def _step_convo(self, chat_id: int, text: str) -> bool:
+    def _step_convo(self, chat_id: int, text: str, mid=None) -> bool:
         self._reap()
         c = self.convos.get(chat_id)
         if c is None:
@@ -2069,7 +2204,7 @@ class Pager:
             # branch has already been the place a second cancel vocabulary got
             # written and then disagreed with the first one.
             _kind = c.kind
-            del self.convos[chat_id]
+            self._end_convo(chat_id)
             _route = parse_command(text)[2]
             # THE SAME COMMAND AGAIN IS A RESTART, NOT AN INTERRUPTION, and
             # saying "that dropped the /deposit you were part-way through"
@@ -2085,6 +2220,13 @@ class Pager:
                           f"you were part-way through — any command does. "
                           f"Nothing was sent.)")
             return False
+        # THE REPLY IS PART OF THE CONVERSATION and is deleted with it -- it
+        # is the amount, the addresses, or the answer to the confirm. A
+        # command typed mid-wizard is not a reply: it ended the wizard above
+        # and stays on the timed list like any other command.
+        if isinstance(mid, int) and not isinstance(mid, bool) \
+                and mid not in c.mids:
+            c.mids.append(mid)
         if c.awaiting_amount():
             # THE AMOUNT THEY ARE ACTUALLY SENDING, parsed by the PROTOCOL's
             # own function -- the same one the vault's schema bounds against,
@@ -2097,7 +2239,7 @@ class Pager:
             try:
                 _amt = proto.btc_to_sat(text.strip())
             except Exception as _e:                          # noqa: BLE001
-                del self.convos[chat_id]
+                self._end_convo(chat_id)
                 # THE REASON, AND NOT WHAT THEY TYPED. Echoing the figure back
                 # on a failure would put an amount in the transcript for a
                 # deposit that is not going to happen.
@@ -2113,8 +2255,10 @@ class Pager:
             # rather than a rung's nickname. Rendered through btc_display so
             # what they confirm is what the vault will quote -- if those two
             # ever disagreed, this is the line that would show it.
-            self.send(chat_id,
-                      f"Deposit {proto.btc_display(c.amount)} BTC. "
+            # A wizard question: the figure is checked here and the message
+            # is deleted with the conversation (_end_convo).
+            self._ask(chat_id,
+                      f"Deposit {proto.btc_display(c.amount)}. "
                       f"Confirm and it starts.\n\n{q}")
             return True
         if c.awaiting_address():
@@ -2139,7 +2283,7 @@ class Pager:
             try:
                 _a = proto.JOBS["withdraw"]["schema"]["exit_to"](_a)
             except Exception:                                # noqa: BLE001
-                del self.convos[chat_id]
+                self._end_convo(chat_id)
                 # THE REASON, NOT THE VALUE. Echoing what they typed would put
                 # a near-miss of their own destination in the transcript, on
                 # the one surface with no masker.
@@ -2155,7 +2299,7 @@ class Pager:
             # ten hops whether the pile could afford it or not. The mix floor
             # rises with the hop count, so that one constant was a floor on
             # what could be withdrawn AT ALL.
-            self.send(chat_id, self._depth_question(),
+            self._ask(chat_id, self._depth_question(),
                       buttons=self._depth_buttons())
             return True
         if c.awaiting_depth():
@@ -2166,10 +2310,10 @@ class Pager:
                 # cancel throws away work, and the work it throws away is the
                 # worst kind to make somebody redo.
                 #
-                # The destinations are already in. They were typed into a
-                # transcript this tool cannot delete, and cancelling means
-                # typing them again -- so the SAME addresses appear twice in
-                # the readable surface, and the second copy buys nothing.
+                # The destinations are already in. Cancelling means typing
+                # them again -- the wizard's messages are deleted when it
+                # ends (_end_convo), but only as far as Telegram allows, and
+                # a second copy of the same addresses buys nothing.
                 # /deposit's amount step and /withdraw's address step have no
                 # such asymmetry: what a cancel costs there is exactly the one
                 # value that was just refused.
@@ -2187,7 +2331,7 @@ class Pager:
                 # you may retry is not one.
                 c.tries += 1
                 if c.tries > self.DEPTH_RETRIES:
-                    del self.convos[chat_id]
+                    self._end_convo(chat_id)
                     integrity_log("pager", "convo_depth_exhausted")
                     self.send(chat_id, "no: cancelled — start again with "
                                        "/withdraw.")
@@ -2203,7 +2347,7 @@ class Pager:
                 # refusal here gives: the reply is about the mistake, and a
                 # transcript line quoting the operator's own near-miss is a
                 # line somebody else can read later.
-                self.send(chat_id,
+                self._ask(chat_id,
                           "no: reply with one of the numbers below.\n\n"
                           + self._depth_question(),
                           buttons=self._depth_buttons())
@@ -2235,69 +2379,23 @@ class Pager:
             # single-destination case gets a sentence rather than a number,
             # because that is the case where it is bad news.
             _n = len(c.exit_to)
-            _spread = (f"across {_n} addresses" if _n > 1 else
-                       "onto the ONE address you gave — anyone watching it "
-                       "sees them all and can group them")
-            # NO "WHOSE MONEY IS THIS" LINE HERE, AND THAT IS THE POINT.
-            #
-            # An earlier version added one, for the install where more than
-            # one person could spend from one wallet. There is no such install
-            # any more: main() refuses to start, unconditionally, and
-            # start_job refuses the wake. A sentence explaining a risk the
-            # operator is not allowed to be exposed to would be a sentence
-            # about a state that cannot exist -- and worse, it would read as
-            # the warning that MAKES it acceptable.
-            # THE FEE IS NAMED WHERE IT IS CHARGED. /fee and the welcome both
-            # say it, and neither is on the screen at the moment the operator
-            # is about to agree to a spend. A cost disclosed only somewhere
-            # else is a cost the person paying it can miss.
-            #
-            # NO AMOUNT AND NO ARITHMETIC. This box has never been told a
-            # balance -- see /settings, which refuses to fetch one -- so it can
-            # state the RATE and must not state a figure. A number invented
-            # here would be a quote the vault never made.
-            # THE ARRIVAL COUNT IS NOT NAMED, and it used to be: "At least 12
-            # separate transactions".
-            #
-            # STATED HONESTLY, because this is not a Kerckhoffs defence and
-            # must not be written as one: exit_arrivals_floor is a public
-            # function of a depth this same message names, so anyone holding
-            # this repository recomputes the figure in one line. What removing
-            # it changes is the READABLE surface -- a transcript that states
-            # "at least 12" hands a directly usable count to somebody who has
-            # the chat and has never seen the source, which is exactly the
-            # reader this design assumes. It lowers what a casual reader gets
-            # and does not pretend to lower what an informed one gets.
-            #
-            # The FACT survives, because it is the one that decides whether
-            # giving a single address throws the run away.
-            self.send(chat_id,
-                      f"Send to the {'addresses' if _n > 1 else 'address'} you "
-                      f"just sent, {proto.depth_said_back(_d)} — this "
-                      f"SPENDS.\n\n"
-                      f"It arrives as many separate payments, {_spread}.\n"
-                      # "comes out of it" WAS A PROMISE THIS BOX CANNOT
-                      # KEEP. The cut is waived whenever it would come to
-                      # less than the network fee needed to move it, which is
-                      # every withdrawal in the band just above the mixing
-                      # minimum -- and this line asserted the opposite on the
-                      # one message the operator agrees to a spend on. See
-                      # FEE_ANSWER for the measurement and for why neither
-                      # the floor nor this run's outcome may be printed.
-                      # "UP TO", WHICH IS THE ONLY FORM THAT IS ALWAYS TRUE.
-                      # This box knows neither the balance nor the machine's
-                      # fee configuration, so it cannot say whether a cut
-                      # applies to THIS run -- and both of the earlier
-                      # attempts said something it could not know: first that
-                      # the cut "comes out of it", then that the exception is
-                      # the withdrawal being small, which is only one of the
-                      # two causes and not the commoner one. A ceiling needs
-                      # neither fact and cannot be wrong.
-                      f"Up to {USAGE_FEE_LABEL} usage fee — this service's "
-                      f"cut, and some runs take none. The network fee is "
-                      f"separate, charged on every transaction, and is not "
-                      f"ours."
-                      f"\n\n{q}")
+            # ONE ADDRESS COLLECTS EVERYTHING, said without counts: how many
+            # payments arrive is the shape of the operation, not for the
+            # transcript.
+            _one = ("" if _n > 1 else
+                    "\nIt goes to ONE address — anyone watching that address "
+                    "sees everything that lands on it. Several are safer.")
+            # NO FEE FIGURE, NO HOP COUNT, NO HOURS. This named the rate, the
+            # cut and the hop count on the message most likely to be kept;
+            # the rate is on /fee, one tap away, and this says only what the
+            # operator is agreeing to. A wizard question: it burns with the
+            # conversation (see _end_convo).
+            self._ask(chat_id,
+                      f"Send everything here to the "
+                      f"{'addresses' if _n > 1 else 'address'} you gave, "
+                      f"{proto.depth_said_back(_d)} — this SPENDS and cannot "
+                      f"be undone. A usage fee may come out of it (/fee)."
+                      f"{_one}\n\n{q}")
             return True
         # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
         # that is all it is: a wrong answer cancels, and nothing stops the
@@ -2308,7 +2406,7 @@ class Pager:
         # Logged so a burst of failures is at least visible in the chain.
         kind, amount, expect = c.kind, c.amount, c.expect
         exit_to, depth = c.exit_to, c.depth
-        del self.convos[chat_id]
+        self._end_convo(chat_id)
         if not word.isdecimal() or int(word) != expect:
             integrity_log("pager", "convo_confirm_failed")
             self.send(chat_id, "no: wrong answer. Cancelled — nothing was "
@@ -2431,6 +2529,7 @@ class Pager:
         looking at "Sealed slip below" with nothing below it, on a box they
         cannot walk to, for a quote that expires while they wait.
         """
+        _LAST_MID.mid = None
         try:
             _payload = {"chat_id": chat_id, "text": text,
                         "disable_web_page_preview": True}
@@ -2488,7 +2587,9 @@ class Pager:
         try:
             mid = ((res or {}).get("result") or {}).get("message_id")
             if isinstance(mid, int) and not isinstance(mid, bool):
-                self.burn.append((int(chat_id), mid, time.time()))
+                with _BURN_LOCK:
+                    self.burn.append((int(chat_id), mid, time.time()))
+                _LAST_MID.mid = mid
         except Exception:                                    # noqa: BLE001
             pass
 
@@ -2504,42 +2605,73 @@ class Pager:
         That is why the reply vocabulary was made boring FIRST -- a message
         that says nothing is safe whether or not this call succeeds.
         """
+        # THREE ANSWERS, NOT TWO. True: gone. False: Telegram refused (past
+        # its 48 h window, already gone, no right to) -- permanent, drop it.
+        # None: the request never completed -- a Tor circuit, a timeout --
+        # which is NOT a refusal and used to be treated as one, so a slip or
+        # a typed address whose delete hit one bad circuit stayed in the
+        # transcript for good. None is retried on a later tick.
         try:
-            safe_post(self._url("deleteMessage"),
-                      {"chat_id": chat_id, "message_id": int(message_id)},
-                      proxies=self.proxies)
+            r = self._post_once("deleteMessage",
+                                {"chat_id": chat_id,
+                                 "message_id": int(message_id)})
+            if isinstance(r, dict) and r.get("ok") is False:
+                return False
             return True
         except Exception as e:                               # noqa: BLE001
-            # EXPECTED, ROUTINELY. Telegram refuses a delete for reasons that
-            # are not failures of this program: the message is over 48 hours
-            # old, it was already deleted, or the chat no longer exists. Quiet
-            # by default; the caller counts and reports the total.
-            print(f"  [!] delete refused: {_redact(e)[:120]}")
-            return False
+            _code = getattr(getattr(e, "response", None), "status_code", None)
+            if isinstance(_code, int) and 400 <= _code < 500:
+                print(f"  [!] delete refused: {_redact(e)[:120]}")
+                return False
+            print(f"  [!] delete did not go through: {_redact(e)[:120]}")
+            return None
 
-    def burn_expired(self, older_than: float) -> int:
+    def burn_expired(self, older_than: float, max_deletes: int = 8) -> int:
         """Delete every tracked message older than `older_than` seconds.
 
         Called from the poll loop, so a chat left alone still empties itself.
 
-        DROPPED FROM THE LIST WHATEVER TELEGRAM SAYS. A refused delete is
-        almost always permanent -- past the 48-hour window, or already gone --
-        and retrying it every ten seconds for the life of the process would
-        turn one refusal into a permanent stream of requests over Tor. The
-        count is returned so a caller can say what happened.
+        A REFUSAL IS DROPPED, A FAILURE IS KEPT. Telegram refusing a delete is
+        permanent -- past the 48-hour window, or already gone -- and retrying
+        it every ten seconds for the life of the process would turn one
+        refusal into a permanent stream of requests over Tor. A request that
+        never completed (delete_message returns None) is not a refusal: the
+        entry stays for the next tick, until the 48-hour window closes on it.
+        The count is returned so a caller can say what happened.
         """
         if older_than <= 0 or not self.burn:
             return 0
         now = time.time()
-        keep, gone = [], 0
-        for cid, mid, sent in self.burn:
-            if now - sent < older_than:
+        with _BURN_LOCK:
+            snapshot = list(self.burn)
+        keep, gone, tried, dead = [], 0, 0, False
+        for cid, mid, sent in snapshot:
+            # AT MOST max_deletes PER TICK, AND ONE TIMEOUT. Each delete is
+            # one request on the polling thread; a backlog against a dead
+            # circuit stalled the loop for minutes, and every button tapped
+            # meanwhile died. The first request that never completes ends
+            # the tick -- the rest stay due for the next one.
+            if now - sent < older_than or tried >= max_deletes or dead:
                 keep.append((cid, mid, sent))
                 continue
-            if self.delete_message(cid, mid):
+            tried += 1
+            r = self.delete_message(cid, mid)
+            if r:
                 gone += 1
-        self.burn = keep
+            elif r is None:
+                dead = True
+                if now - sent < TG_DELETE_WINDOW_S:
+                    keep.append((cid, mid, sent))  # not refused: next tick
+        self._replace_burn(snapshot, keep)
         return gone
+
+    def _replace_burn(self, snapshot: list, keep: list) -> None:
+        """Swap the burn list for `keep`, WITHOUT losing what another thread
+        appended while the deletes above were on the wire."""
+        with _BURN_LOCK:
+            _seen = set(snapshot)
+            newer = [e for e in self.burn if e not in _seen]
+            self.burn = keep + newer
 
     def burn_all(self, chat_id: int = None) -> tuple:
         """Delete everything tracked (optionally for one chat). (gone, tried).
@@ -2549,18 +2681,21 @@ class Pager:
         deleted by a bot at all, so "3 of 7" is the honest answer and "wiped"
         would not be.
         """
-        keep, gone, tried = [], 0, 0
-        for cid, mid, sent in self.burn:
-            if chat_id is not None and cid != int(chat_id):
+        keep, gone, tried, dead = [], 0, 0, False
+        with _BURN_LOCK:
+            snapshot = list(self.burn)
+        for cid, mid, sent in snapshot:
+            if (chat_id is not None and cid != int(chat_id)) or dead:
                 keep.append((cid, mid, sent))
                 continue
             tried += 1
-            if not self.delete_message(cid, mid):
-                # NOT KEPT. See burn_expired: a refusal here is not transient.
-                pass
-            else:
+            r = self.delete_message(cid, mid)
+            if r:
                 gone += 1
-        self.burn = keep
+            elif r is None:
+                dead = True                        # not refused: next tick
+                keep.append((cid, mid, sent))
+        self._replace_burn(snapshot, keep)
         return gone, tried
 
     def updates(self) -> list:
@@ -2961,14 +3096,24 @@ class Pager:
                 # this line did not, so the two could disagree.
                 #
                 # Computed ONCE, here, and read by both.
-                _next_leg = _more and _leg + 1 < self.MAX_CHAIN_LEGS
-                _msg = (f"withdraw {_leg + 1} sent.\n"
-                        + ("Next one starting — sending them together would "
-                           "prove they are all yours."
+                # AND THE LIMITS ARE ASKED NOW, not when the poll loop tries.
+                # start_job refuses a leg the daily cap does not allow, so
+                # "Another is starting" followed by "no: daily limit reached"
+                # was the bot contradicting itself seconds apart. Refused
+                # here, the sentence is the "more remains" one and the
+                # operator is handed the decision.
+                try:
+                    _allowed = not self.limits.why_not()
+                except Exception:                            # noqa: BLE001
+                    _allowed = False
+                _next_leg = (_more and _leg + 1 < self.MAX_CHAIN_LEGS
+                             and _allowed)
+                # NO LEG NUMBER, NO CAP, NO "SEPARATE": each is the shape of
+                # the withdrawal, on the surface a stranger reads.
+                _msg = ("withdraw: sent.\n"
+                        + ("Another is starting."
                            if _next_leg else
-                           f"More is here, but {self.MAX_CHAIN_LEGS} in a row "
-                           f"is enough for one run — /withdraw again when you "
-                           f"are ready."
+                           "More remains — /withdraw again when you are ready."
                            if _more else
                            proto.WITHDRAW_NO_MORE_LINE))
                 # ONE RETRY, like the slip path, and for a sharper reason.
@@ -3040,8 +3185,8 @@ class Pager:
                           f"{chat_name(job)}: quoted. Confirmation number: {_cn}\n"
                           f"The deposit details are NOT posted here — this is "
                           f"a group, and they would go to everyone in it. "
-                          f"Read them at the machine, or set up a delivery "
-                          f"key and use a one-to-one chat.",
+                          f"Read them at the machine, or set up delivery and "
+                          f"use a one-to-one chat.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
             if plain:
@@ -3109,10 +3254,8 @@ class Pager:
                 # then had nothing to pay to.
                 self.send(chat_id,
                           f"{chat_name(job)}: quoted. Confirmation number: {_cn}\n"
-                          f"The address and memo are ON THE MACHINE — read "
-                          f"them there. Paying needs a desktop wallet: the "
-                          f"memo goes in an OP_RETURN and no phone wallet can "
-                          f"do that.\n"
+                          f"The payment details are ON THE MACHINE — read "
+                          f"them there. They cannot be paid from a phone.\n"
                           f"/check {_cn} once you have paid.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
@@ -3203,8 +3346,8 @@ class Pager:
                          if job == "withdraw" else ".")
                       + " It does not say why.\n"
                         "If a second try is refused the same way, stop — some "
-                        "refusals need somebody at the machine, and each try "
-                        "costs part of the daily allowance.",
+                        "refusals need somebody at the machine, and tries are "
+                        "limited.",
                       buttons=MENU_BUTTONS)
         elif out == "failed":
             # A FAILED WITHDRAWAL GETS THE ONE THING THE OPERATOR CAN ACT ON.
@@ -3413,9 +3556,9 @@ class Pager:
         Used for refusals, which is exactly what should not be permanent.
         """
         try:
-            safe_post(self._url("answerCallbackQuery"),
-                      {"callback_query_id": str(cb_id), "text": text[:190]},
-                      proxies=self.proxies)
+            self._post_once("answerCallbackQuery",
+                            {"callback_query_id": str(cb_id),
+                             "text": text[:190]})
         except Exception as e:                               # noqa: BLE001
             print(f"  [!] callback ack failed: {_redact(e)}")
 
@@ -3476,7 +3619,8 @@ class Pager:
         # allowlisted is an action taken on behalf of somebody who was refused.
         _mid = msg.get("message_id")
         if isinstance(_mid, int) and not isinstance(_mid, bool):
-            self.burn.append((cid, _mid, time.time()))
+            with _BURN_LOCK:
+                self.burn.append((cid, _mid, time.time()))
         # A LIVE CONVERSATION GETS FIRST REFUSAL on the message, because a bare
         # "2" is an answer and not a command. It hands back anything starting
         # with "/" (and drops itself when it does), so a real command is never
@@ -3489,7 +3633,7 @@ class Pager:
         # "/" branch and then answered "nothing to cancel".
         self._reap()
         had_convo = cid in self.convos
-        if self.step_convo(cid, msg["text"]):
+        if self.step_convo(cid, msg["text"], mid=_mid):
             return
         job, params, err = parse_command(msg["text"])
         if err == "depo_wizard":
@@ -3499,7 +3643,7 @@ class Pager:
             self.begin_convo(cid, kind="withdraw")
             return
         if err == "cancel":
-            self.convos.pop(cid, None)
+            self._end_convo(cid)
             # THREE ANSWERS, BECAUSE THERE ARE THREE STATES. This had two, and
             # the missing one is the state an operator is most likely to be in
             # when they type /cancel: a wake already running.
@@ -3586,7 +3730,7 @@ class Pager:
                           buttons=self._handle_buttons(
                               _last, self.handle_job.get(_last, ""), cid))
                 return
-            self.send(cid, "no mixes are running and none have been started "
+            self.send(cid, "nothing is running and nothing has been started "
                            "in this chat. /deposit is the way in.",
                       buttons=MENU_BUTTONS)
             return
@@ -3653,9 +3797,9 @@ class Pager:
             # the refusal itself, where somebody has actually tried to do
             # something.
             if self.spenders > 1:
-                self.send(cid, "not ready: more than one person is "
-                               "allowlisted and there is one wallet behind "
-                               "this. Nothing will run.",
+                self.send(cid, "not ready: more than one person is allowed "
+                               "in here, and this is for one. Nothing will "
+                               "run.",
                           buttons=MENU_BUTTONS)
                 return
             _why = self.limits.why_not()
@@ -3907,10 +4051,9 @@ class Pager:
         if self.spenders > 1:
             integrity_log("pager", "refused_multi_spender")
             self.send(cid,
-                      "no: this bot is allowlisted for more than one person "
-                      "and there is one wallet behind it. A withdrawal would "
-                      "spend whoever's balance is largest. Refusing every "
-                      "job until that is fixed — one person per bot.")
+                      "no: more than one person is allowed in here, and this "
+                      "is for one person per chat. Refusing every job until "
+                      "that is fixed.")
             return
         why = self.limits.why_not()
         if why:
@@ -4172,6 +4315,7 @@ class Pager:
             _burned = self.burn_expired(self.burn_after)
             if _burned:
                 integrity_log("pager", "messages_burned")
+            self.retry_wizard_deletes()
         # SAY WHAT IS BEING ABANDONED. The other way this process can end is a
         # signal -- `systemctl restart`, or an operator with a terminal -- and
         # it reaches here with the same consequence the poll-failure exit was
@@ -4264,8 +4408,12 @@ def whoami(token: str, proxies: dict, waits: int = 30) -> int:
     for _ in range(waits):
         if shutdown_requested():
             break
+        # BOTH KINDS, like the pager's own poll: Telegram REMEMBERS the last
+        # allowed_updates it was given, so a message-only call here dropped
+        # every button tapped until the pager's next poll set it back.
         url = (f"https://api.telegram.org/bot{token}/getUpdates"
-               f"?timeout={POLL_HOLD_S}&allowed_updates=%5B%22message%22%5D")
+               f"?timeout={POLL_HOLD_S}"
+               f"&allowed_updates=%5B%22message%22,%22callback_query%22%5D")
         try:
             d = safe_get(url, proxies=proxies)
         except Exception as e:                               # noqa: BLE001
@@ -4397,11 +4545,15 @@ def build_cli():
     ap.add_argument("--daily-cap", type=int, default=DEFAULT_DAILY_CAP,
                     help="courtesy pokes per 24h. The vault's own keyfile "
                          "budget is the real bound.")
-    ap.add_argument("--burn-after", type=int, default=0, metavar="SECONDS",
+    ap.add_argument("--burn-after", type=int, default=900, metavar="SECONDS",
                     help="Delete every message in an allowlisted chat -- this "
                          "bot's replies AND the operator's commands -- this "
-                         "many seconds after it was sent. 0 (default) keeps "
-                         "them. Telegram only lets a bot delete for 48h, so a "
+                         "many seconds after it was sent. Default 900 (15 "
+                         "minutes); 0 keeps them, which is the wrong default "
+                         "for a transcript somebody else can read. The "
+                         "questions and replies of a /deposit or /withdraw "
+                         "are deleted the moment it ends regardless. "
+                         "Telegram only lets a bot delete for 48h, so a "
                          "value above 172800 cannot work and is refused. This "
                          "does not reach a forward, a screenshot or a cached "
                          "copy: it is defence in depth on a channel already "

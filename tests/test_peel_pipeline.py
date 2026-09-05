@@ -261,10 +261,9 @@ class Run:
             _change_residue=lambda a, ac, sb: self.bal.get((ac, sb), 0),
             report_completion=lambda *a, **k: None,
             safe_post=lambda url, payload, proxy: {"routes": [{
-                "expectedOutput": "12.0",
-                "transaction": {
-                    "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
-                    "depositAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]},
+                "expectedBuyAmount": "12.0",
+                "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
+                "targetAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}]},
             btc_per_xmr_oracle=lambda *a, **k: None,
             wait_for_swap_arrival=lambda fn, floor_, n: dict(
                 zip(("state", "total", "unlocked"), ("funded",) + fn())),

@@ -47,9 +47,11 @@ from gs_common import (
     finite_decimal,
     fmt_btc,
     PAIR_SCHEMA,
+    SWAPKIT_API, parse_swap_route, memo_size_note,
 )
 
-SWAPKIT_API = "https://api.swapkit.dev"
+# SWAPKIT_API is gs_common's now, beside the one route parser both quoting
+# tools read. This file carried its own copies of both.
 # PAIR_SCHEMA is gs_common's now. It was declared here AND in receive_watch --
 # one constant, two copies, held by the writer and the reader, which are exactly
 # the two sides that must agree about it.
@@ -510,6 +512,10 @@ def main():
             "buyAsset": "XMR.XMR",
             "sellAmount": str(amt),
             "destinationAddress": dest,
+            # Pinned to THORCHAIN, and the memo's limit set to what the
+            # watcher accepts -- see GhostSpiral's stage 2 for both reasons.
+            "providers": ["THORCHAIN"],
+            "slippage": int(ARRIVAL_TOLERANCE * 100),
         }
 
         try:
@@ -528,16 +534,15 @@ def main():
             integrity_log("thor", f"no_routes_{i}")
             sys.exit(f"[!] No swap routes for pair {i}: {str(error)[:80]}")
 
-        # `or` fallbacks, not .get() defaults: the API frequently returns these
-        # keys PRESENT but null. .get("k", default) hands back None (not the
-        # default) for a null value, so route.get("transaction", {}) -> None ->
-        # None.get(...) AttributeError, and Decimal(str(None)) -> InvalidOperation.
+        # ONE PARSER, gs_common's, reading the API's current field names
+        # (targetAddress / memo / expectedBuyAmount). The inline copy that
+        # stood here read transaction.depositAddress and expectedOutput --
+        # fields the current API does not return -- so every live quote came
+        # back with no address and "0" and was refused as a bad route.
         route = routes[0]
-        tx_info = route.get("transaction") or route.get("calldata") or {}
-        deposit = tx_info.get("depositAddress") or tx_info.get("to") or ""
-        memo = tx_info.get("memo") or tx_info.get("data") or ""
+        deposit, memo, _expected = parse_swap_route(route)
         try:
-            expected_xmr = finite_decimal(route.get("expectedOutput"), Decimal(0))
+            expected_xmr = finite_decimal(_expected, Decimal(0))
         except Exception:
             expected_xmr = Decimal(0)
         if expected_xmr <= 0:
@@ -596,6 +601,9 @@ def main():
                 )
             print(f"  [!] Pair {i}: memo does not name your destination — continuing "
                   f"because --allow-unbound-memo was given. VERIFY IT BY HAND.")
+        _mnote = memo_size_note(memo)
+        if _mnote:
+            print(f"  [!] Pair {i}: {_mnote}")
 
         # Slippage check
         deviation = quote_deviation(expected_xmr, amt, btc_per_xmr)
@@ -643,10 +651,11 @@ def main():
         # THIS IS THE LAST MOMENT REFUSING IS FREE, and until now nothing
         # asked the question at all. The wire accepts any deposit from
         # DEPOSIT_MIN_SAT = 0.0001 BTC upward; GhostSpiral needs a WALLET
-        # BALANCE of ~0.1388 XMR to complete a mix at three wallets, and
-        # ~0.3364 XMR when a usage fee is taken. At any real rate those are
-        # different by an order of magnitude, so a perfectly ordinary small
-        # deposit was accepted, quoted, and paid --
+        # BALANCE of roughly 0.012 XMR at today's mainnet fee to complete a
+        # mix at three wallets (about 0.015 with a usage fee), and the floor
+        # moves with the fee -- which is why the vault computes it live and
+        # passes it here. Below it, a perfectly ordinary small deposit was
+        # accepted, quoted, and paid --
         #
         #   1. the chat takes 0.0005 BTC and issues deposit instructions;
         #   2. the operator sends the BTC and ThorChain settles it;

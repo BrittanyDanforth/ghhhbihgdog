@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import List
 
 from gs_common import (
+    SWAPKIT_API, parse_swap_route, memo_size_note, fee_estimate_per_tx,
+    PRIORITY_FEE_MULTIPLIER,
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
     safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json,
@@ -249,7 +251,7 @@ FANOUT_SPEND_FRACTION = Decimal("0.9")
 # stopped being true: these are per-run accounts, and _run_change_sweep records
 # the verification that the wallet's real primary address is spent zero times.)
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}\Z", re.I)
-SWAPKIT_API = "https://api.swapkit.dev"
+# SWAPKIT_API is gs_common's now: one URL for the two tools that quote.
 
 #: How far each --split chunk may stray from the equal share, either way.
 #: 0.18 keeps every chunk inside +/-18% -- enough that N deposits are not one
@@ -355,11 +357,21 @@ USAGE_FEE_PCT_MIN = Decimal("0.000001")
 # one invented number. Overshooting slightly is safe (the operator keeps the
 # change); undershooting strands funds mid-pipeline, so where the two conflict
 # this rounds up.
+# TODAY'S MAINNET FIGURES, NOT A STALE MEASUREMENT. These were 0.0024 /
+# 0.0094 / 0.038 / 0.48, derived from a get_fee_estimate that answered
+# fees = [1200000, 4700000, 19000000, 240000000] -- sixty times what mainnet
+# returns ([20000, 80000, 320000, 4000000] piconero/byte, September 2026,
+# consistent with a median transfer fee of a few US cents). The daemon's live
+# answer is always preferred; these matter when it cannot be reached and the
+# operator passes --accept-fallback-fee -- and they also seed the deposit
+# floor the vault mirrors, which at the old figure refused every deposit under
+# about 0.18 XMR and abandoned leftovers up to that as "nothing more here".
+# Re-derive when the network's fee level moves: fees[i] x TX_BYTES_ESTIMATE.
 FALLBACK_FEE_BY_PRIORITY = {
-    1: Decimal("0.0024"),
-    2: Decimal("0.0094"),
-    3: Decimal("0.038"),
-    4: Decimal("0.48"),
+    1: Decimal("0.00004"),
+    2: Decimal("0.00016"),
+    3: Decimal("0.00064"),
+    4: Decimal("0.008"),
 }
 # Kept as the priority-1 figure so the name still means "the fallback per-TX
 # fee"; every priority now comes from the table above.
@@ -379,18 +391,12 @@ FALLBACK_FEE_XMR = FALLBACK_FEE_BY_PRIORITY[1]
 # value, so it catches the pathological case without ever rejecting a real one.
 FEE_IMPLAUSIBLE_XMR = Decimal("1.0")
 
-# FALLBACK per-priority fee multipliers, used ONLY when monerod's
-# get_fee_estimate doesn't return an explicit per-priority 'fees' array (older
-# daemons). Modern monerod DOES return that array and fetch_fee_from_daemon
-# prefers it (the exact per-priority fee the daemon will charge), so this table
-# is a best-effort approximation, not authoritative.
-#
-# Verified against real monerod 0.18.3.1: get_fee_estimate returned
-#   fees = [1200000, 4700000, 19000000, 240000000]  (ratios ~ 1 / 3.9 / 15.8 / 200)
-# i.e. the real priority-4 multiplier is ~200x, NOT the classic 166x below. That
-# is exactly why we prefer the daemon's fees[] and treat this table as a rough
-# fallback for ancient daemons only. At priority 1 it's exact regardless.
-PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
+# The per-priority multipliers and the per-byte -> per-transaction conversion
+# live in gs_common (PRIORITY_FEE_MULTIPLIER, fee_estimate_per_tx), so this
+# tool, the console's panel and the vault's deposit floor derive one fee from
+# one formula. The table that stood here said 1/4/20/166 under a comment
+# stating the real fourth ratio was ~200: a constant shipped with its own
+# correction, and the console carried a second private copy of it.
 
 # Fan-out outputs are spendable only after they confirm and unlock (~10 blocks,
 # roughly 20 min on mainnet). The DAG-mixing round sources FROM those fan-out
@@ -477,22 +483,14 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1,
     then to FALLBACK_FEE_XMR. Scaled by a ~2kB typical TX size throughout."""
     multiplier = Decimal(PRIORITY_FEE_MULTIPLIER.get(fee_priority, 1))
     est = daemon_fee_estimate(daemon_url, proxies)
-    fees = est.get("fees")
-    # Exact path: monerod's per-priority array, indexed by priority (1-based).
-    if isinstance(fees, list) and len(fees) >= fee_priority and fees[fee_priority - 1] > 0:
-        fee_xmr = Decimal(int(fees[fee_priority - 1]) * 2000) / Decimal(10 ** 12)
-        if fee_xmr > 0:
-            _reject_implausible_fee(fee_xmr, daemon_url, "per_priority_array")
-            integrity_log("fee", "daemon_fee:per_priority_array")
-            return fee_xmr
-    # Approximate path: older daemon with only a base 'fee'.
-    base = est.get("fee", 0) or 0
-    if base > 0:
-        fee_xmr = (Decimal(int(base) * 2000) / Decimal(10 ** 12)) * multiplier
-        if fee_xmr > 0:
-            _reject_implausible_fee(fee_xmr, daemon_url, "base_times_multiplier")
-            integrity_log("fee", "daemon_fee:base_times_multiplier")
-            return fee_xmr
+    # ONE CONVERSION, gs_common's: the same per-byte -> per-transaction
+    # arithmetic the console's panel and the vault's deposit floor use, so
+    # three readers of one daemon reply cannot disagree about what it said.
+    fee_xmr, _src = fee_estimate_per_tx(est, fee_priority)
+    if fee_xmr is not None and fee_xmr > 0:
+        _reject_implausible_fee(fee_xmr, daemon_url, _src)
+        integrity_log("fee", f"daemon_fee:{_src}")
+        return fee_xmr
     # NEVER SILENTLY. Reaching here means the daemon gave us nothing usable --
     # unreachable, wrong --rpc-daemon, a non-localhost daemon with no proxies,
     # a timeout, or a reply with neither `fees` nor `fee`. Every one of those
@@ -2437,25 +2435,10 @@ def build_peel_plan(entry_index: int, dests: list, amounts: list,
     return plan
 
 
-def parse_swap_route(route: dict) -> tuple:
-    """Extract (deposit_addr, memo, expected_output_str) from ONE SwapKit route.
-
-    Extracted from the inlined stage2 loop so tests exercise the actual code
-    rather than a copy. The `nullsafe:` block in test_units.py used to assert on
-    a hand-written parse_route(); reverting the real function would not have
-    turned that test red. Same defect appeared in thor_swap_preparer -- both
-    call this now.
-
-    Uses `x or fallback` NOT `dict.get(k, default)` because SwapKit routinely
-    returns these keys PRESENT with a null value: .get("transaction", {}) hands
-    back None (not the default) for a null value, then .get() on None raises
-    AttributeError. `or` collapses missing AND null to the safe fallback.
-    """
-    tx_info = route.get("transaction") or route.get("calldata") or {}
-    deposit = tx_info.get("depositAddress") or tx_info.get("to") or ""
-    memo = tx_info.get("memo") or tx_info.get("data") or ""
-    expected = route.get("expectedOutput") or "0"
-    return deposit, memo, expected
+# parse_swap_route is gs_common's now: ONE parser for the two tools that
+# quote, reading the API's current field names. The copy that stood here read
+# transaction.depositAddress and expectedOutput, which the API no longer
+# returns -- see gs_common.parse_swap_route for what that cost.
 
 
 def validate_swap_route(deposit_addr, memo, xmr_dest: str, idx: int,
@@ -4027,6 +4010,17 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
             # not something to rely on for a payment amount.
             "sellAmount": fmt_btc(amt),
             "destinationAddress": chunk_dest,
+            # THE ROUTE IS PINNED TO THORCHAIN. Unpinned, the aggregator may
+            # answer with another provider's route whose memo grammar the
+            # binding check below does not read, and a good quote is refused
+            # -- or a route with no memo at all is taken for one.
+            "providers": ["THORCHAIN"],
+            # THE MEMO'S LIMIT MATCHES WHAT THE WATCHER ACCEPTS. The
+            # aggregator turns this into the swap's minimum output; below it
+            # the network refunds instead of delivering. Left at the API's
+            # default (3%) a routine move would refund a swap this tool was
+            # prepared to call funded at 90%.
+            "slippage": int(SWAP_TOLERANCE_DEFAULT * 100),
         }
 
         try:
@@ -4067,6 +4061,9 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         # thor_swap_preparer so the two swap paths cannot diverge again.
         validate_swap_route(deposit_addr, memo, chunk_dest, i,
                             allow_unbound_memo=args.allow_unbound_memo)
+        _mnote = memo_size_note(memo)
+        if _mnote:
+            print(f"  [!] Chunk {i}: {_mnote}")
 
         # finite_decimal: `Decimal("NaN")` parses, and then `expected_dec <= 0`
         # RAISES InvalidOperation -- so the guard meant to reject an unreadable

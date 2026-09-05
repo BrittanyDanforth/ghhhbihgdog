@@ -1165,9 +1165,10 @@ def stop(jid):
 #: THIS WAS 0.1 AND IT FLAGGED HEALTHY DAEMONS. _flag_fees compares
 #: max(res["xmr"]) -- which is always the PRIORITY 4 figure -- against this, so
 #: the number being tested is the flash-priority fee while the ceiling was
-#: chosen for priority 1. A real monerod 0.18.3.1 returns
+#: chosen for priority 1. The daemon this was measured against returned
 #: fees = [1200000, 4700000, 19000000, 240000000] piconero/byte, i.e. 0.0024 /
-#: 0.0094 / 0.038 / 0.48 XMR per ~2 kB transaction. 0.48 > 0.1, so the console
+#: 0.0094 / 0.038 / 0.48 XMR per ~2 kB transaction (mainnet today is sixty
+#: times lower: [20000, 80000, 320000, 4000000]). 0.48 > 0.1, so the console
 #: told the operator "far above a real mainnet fee ... the daemon is on a fresh
 #: or offline chain. Do NOT treat these as real costs" about the correct
 #: numbers from a correctly working node. Reproduced against a real local
@@ -1641,21 +1642,41 @@ def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None, shape=None):
         except Exception:                                    # noqa: BLE001
             _net = ""
         est = gs.daemon_fee_estimate(daemon_url, proxies)
-        fees = est.get("fees")
-        if isinstance(fees, list) and fees:
-            _per = [round(int(f) * 2000 / 1e12, 6) for f in fees[:4]]
+        # ONE CONVERSION, gs_common's. This page carried its own `* 2000` and
+        # its own [1, 4, 20, 166] multiplier table -- the one GhostSpiral's
+        # comment already called wrong -- so the panel and the run could
+        # price the same daemon reply differently.
+        _per, _src = [], ""
+        for _p in (1, 2, 3, 4):
+            _f, _s = gs.fee_estimate_per_tx(est, _p)
+            if _f is None:
+                break
+            _per.append(round(float(_f), 6))
+            _src = _src or _s
+        if len(_per) == 4:
             _rounds, _totals = _run_totals(_per, wallets, deep, shape)
-            return _flag_fees({"ok": True, "source": "daemon fees[] per priority",
+            return _flag_fees({"ok": True,
+                               "source": ("daemon fees[] per priority"
+                                          if _src == "per_priority_array"
+                                          else "daemon base fee x multiplier"),
                                "xmr": _per, "rounds": _rounds,
                                "total_xmr": _totals, "nettype": _net})
-        base = est.get("fee")
-        if base:
-            mult = [1, 4, 20, 166]
-            _per = [round(int(base) * 2000 * m / 1e12, 6) for m in mult]
-            _rounds, _totals = _run_totals(_per, wallets, deep, shape)
-            return _flag_fees({"ok": True, "source": "daemon base fee x multiplier",
-                               "xmr": _per, "rounds": _rounds,
-                               "total_xmr": _totals, "nettype": _net})
+        if est:
+            # THE DAEMON ANSWERED, AND THE ANSWER IS UNUSABLE -- zero fees, a
+            # fees[] too short to cover four priorities, no base fee. That is
+            # not "could not reach a daemon": it is a daemon on a fresh or
+            # offline chain, or a build this tool does not know, and the
+            # operator should hear which.
+            return {"ok": False, "xmr": None, "implausible": True,
+                    "source": "the daemon answered, but with no usable fee",
+                    "warning": (f"The daemon at {daemon_url} answered "
+                                f"get_fee_estimate, but the figures are "
+                                f"unusable (zero, malformed, or fewer than "
+                                f"four priorities). This usually means a "
+                                f"fresh or offline chain. No numbers are "
+                                f"shown because inventing them would be "
+                                f"worse than showing none."),
+                    "nettype": _net}
         return {"ok": False, "xmr": None, "implausible": False,
                 "source": "no estimate — the daemon returned no fee data",
                 "warning": ("Could not reach a daemon at "
