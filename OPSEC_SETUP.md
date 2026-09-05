@@ -1020,20 +1020,31 @@ every sweep, which is the worst reuse pattern available — and two withdrawals
 racing it would read the same number. A uniform draw has no state to corrupt,
 survives the wipe, and cannot be raced.
 
-**The desk can still leave a cut behind for the phone to spend.** The gate
-above is on the woken path only. `gs_console`'s fee panel recommends leaving
-its address box empty so a fresh account is minted per run — sound advice
-about address reuse, and it mints onto *this* wallet, where `_funded_entry`
-will select it exactly as readily once the run's exit has swept everything
-else out. Neither tool can see the other: the console holds no keyfile and the
-agent does not know what was run at the desk. So pairing warns about it, and
-the console page names the case where its own advice is wrong. On a wallet a
-phone can spend from, fill that box in.
+**The desk no longer leaves a cut behind for the phone to spend.** The gate
+used to be on the woken path only: `gs_console`'s fee panel recommended
+leaving its address box empty so a fresh account was minted per run, onto
+*this* wallet, where `_funded_entry` selected it exactly as readily once the
+run's exit had swept everything else out. `plan_usage_fee` now waives the cut
+on every path when no destination off the wallet is given, so nothing mints a
+fee onto the mixing wallet any more. What remains is history: a cut an
+*older* desk run minted is still there, and the next chat withdrawal will
+spend it as a deposit. Sweep such accounts off at the desk before pairing;
+`gs_wake_keys pair` says so.
 
-On a small withdrawal the cut is **waived, not charged**: below roughly 0.33
-XMR at a typical fee, 1.1% is worth less than the fee to move it, so
-GhostSpiral skips it and the mix goes ahead in full rather than creating a
-permanent on-chain output nobody can spend.
+**Address reuse is the wrong worry here, and this document used to make it
+the main one.** Outputs to one Monero address are not linkable on-chain —
+each gets a one-time key — and the fee address is never published, unlike a
+swap destination, which the memo puts in a Bitcoin `OP_RETURN` (that is why
+receive addresses are fresh per run). What identifies runs at the fee
+address is the *amount*, a published fraction of each deposit, to whoever
+holds that wallet's keys or reads this vault's own records — the same whether
+the address is fresh or fixed. Pairing several is a nicety, not a defence.
+
+On a small withdrawal the cut is **waived, not charged**: below about 0.015
+XMR at today's mainnet fee (the floor scales with the fee; it was 0.33 XMR
+when the fallback estimate was sixty times higher), 1.1% is worth less than
+the fee to move it, so GhostSpiral skips it and the mix goes ahead in full
+rather than creating a permanent on-chain output nobody can spend.
 
 **The trade is the wallet FILE, not the RPC.** The wallet-rpc stays view-only
 — it has to, or stage 0 refuses the run — so the vault keeps every property
@@ -1447,18 +1458,20 @@ confirms the bot is alive to whoever found it. Run `gs_telegram_pager --whoami`
 once: it needs no `--key` and no `--chat-id`, arms nothing, wakes nothing,
 prints the chat id of the next message it sees and exits.
 
-**The usage fee lands on the wallet the phone can empty, and the vault knows
-not to spend it.** With no `--usage-fee-address`, `plan_usage_fee` mints a
-fresh account per run for the operator's 1.1% and keeps it out of `addr_index`
-so the exit will not sweep it — "it is yours where it lands". That hold is one
-process's in-memory index, and `_funded_entry` on the vault is a *different*
-process re-enumerating the same wallet: it takes the largest unlocked output.
-Driven, after a withdrawal completes the fee **is** the largest output, so the
-next `/withdraw` mixed the operator's own revenue and paid it to the address
-the chat named — compounding, taking a fee of the fee. Any stale fee bigger
-than the user's balance also becomes the target of *every* withdrawal, and if
-it is under the mixing minimum the user's money cannot be withdrawn from the
-phone at all.
+**The usage fee used to land on the wallet the phone can empty.** With no
+`--usage-fee-address`, `plan_usage_fee` minted a fresh account per run for the
+operator's 1.1% and kept it out of `addr_index` so the exit would not sweep
+it — "it is yours where it lands". That hold was one process's in-memory
+index, and `_funded_entry` on the vault is a *different* process
+re-enumerating the same wallet: it takes the largest unlocked output. Driven,
+after a withdrawal completed the fee **was** the largest output, so the next
+`/withdraw` mixed the operator's own revenue and paid it to the address the
+chat named — compounding, taking a fee of the fee. Any stale fee bigger than
+the user's balance also became the target of *every* withdrawal, and if it was
+under the mixing minimum the user's money could not be withdrawn from the
+phone at all. **Nothing mints a fee onto the mixing wallet any more**: with no
+destination off the wallet the cut is waived, loudly, on the desk path as
+well as the woken one.
 
 **That paragraph used to end by claiming a fix that does not exist.** It said
 the fee account carries a wallet label, naming a constant USAGE_FEE_ACCOUNT_LABEL in gs_common,
@@ -1469,28 +1482,21 @@ that believed their revenue was protected by a mechanism that was never built.
 
 What is actually true, and it is a different shape:
 
-- **The woken path cannot create the problem.** `_withdraw_fee_argv` passes
+- **Neither path can create the problem now.** `_withdraw_fee_argv` passes
   `--usage-fee` only when the keyfile names a destination *off* this wallet,
-  so a phone withdrawal either pays the cut somewhere the mix cannot reach or
-  takes no cut at all. Nothing is minted onto the mixing wallet.
-- **The desk path still can.** `gs_console`'s fee panel recommends leaving the
-  address box empty so a fresh account is minted per run — sound advice about
-  address reuse, and it mints onto *this* wallet. A later `/withdraw` picks it
-  up, because `_funded_entry` genuinely cannot tell your cut from a deposit.
-  Since `/withdraw` now chains until the wallet is empty, it will find every
-  such account rather than occasionally one.
-- **Both places that can see the collision say so.** The console panel says
-  "if this wallet is paired for withdrawals, put an address in the box", and
-  `gs_wake_keys pair --allow-withdraw` with no `--usage-fee-address` prints
-  the same warning before you type the confirmation code. Neither is a gate,
-  and the label idea that would have been one was considered and rejected —
+  and `plan_usage_fee` waives the cut whenever no such destination reaches it
+  — from the desk as well. Nothing is minted onto the mixing wallet.
+- **A cut an older desk run left behind still is the problem.** `/withdraw`
+  chains until the wallet is empty, and `_funded_entry` genuinely cannot tell
+  that account from a deposit. Sweep it off at the desk before pairing.
+- **The label that would have marked it was considered and rejected** —
   `_withdraw_fee_argv`'s docstring argues why at length: a label outlives
   every artifact wipe, names which account is the operator's revenue, and
   hands over the deposit size to anyone who divides by the published rate.
 
-**So: pair at least one `--usage-fee-address` if a phone can spend from this
-wallet, and do not tick the desk panel's fee box with an empty address.** That
-is the whole protection. There is no marker doing it for you.
+**So: pair at least one `--usage-fee-address` to take a fee at all, and clear
+any fee account an older desk run minted before a phone can spend from the
+wallet.** There is no marker doing it for you.
 
 **One person per bot, and the pager refuses anything else.** There is a single
 wallet behind this. A withdrawal does not ask who is asking — the vault takes

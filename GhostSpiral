@@ -4279,24 +4279,28 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--usage-fee", action="store_true",
                      help=f"Keep {(USAGE_FEE_PCT * 100).normalize()}%% of the deposit as your "
                           f"USAGE FEE, paid as one more destination on "
-                          f"the fan-out. By default it goes to a FRESH "
-                          f"account and subaddress minted for this run, so no "
-                          f"address collects from two runs. XMR side only -- "
-                          f"there is no BTC-side fee and there will not be "
-                          f"one; see --usage-fee-address.")
+                          f"the fan-out -- to the address in "
+                          f"GS_USAGE_FEE_ADDRESS, which must be OFF this "
+                          f"wallet. With no address the cut is WAIVED: a "
+                          f"cut minted onto the mixing wallet was spent by "
+                          f"the next withdrawal as if it were a deposit. XMR "
+                          f"side only -- there is no BTC-side fee and there "
+                          f"will not be one; see --usage-fee-address.")
     cli.add_argument("--usage-fee-pct", type=decimal_arg, metavar="FRACTION",
                      help=f"Override the usage fee (default {USAGE_FEE_PCT} = "
                           f"{(USAGE_FEE_PCT * 100).normalize()}%%). Ceiling "
                           f"{USAGE_FEE_PCT_MAX}. Implies --usage-fee.")
     cli.add_argument("--usage-fee-address", metavar="XMR_ADDRESS",
-                     help="Send the usage fee to THIS address instead of a freshly "
-                          "minted one. Prefer GS_USAGE_FEE_ADDRESS=... : an "
-                          "argv address is world-readable via ps and "
-                          "/proc/<pid>/cmdline (mode 444). Note what it costs: "
-                          "one address collecting a slice of every run is the "
-                          "reuse this toolchain refuses everywhere else, and "
-                          "it survives the mix. The default mints a fresh one "
-                          "per run for that reason.")
+                     help="Where the usage fee goes: an address of a wallet of "
+                          "your own, never one of this wallet's. Prefer "
+                          "GS_USAGE_FEE_ADDRESS=... : an argv address is "
+                          "world-readable via ps and /proc/<pid>/cmdline "
+                          "(mode 444). Outputs to the same Monero address are "
+                          "not linkable on-chain, so one address is fine; "
+                          "what identifies runs is the AMOUNT -- a published "
+                          "fraction of each deposit -- to whoever holds that "
+                          "wallet's keys or sees the vault's records. Without "
+                          "it, no cut is taken.")
     # NOT WHAT gs_console DOES, and this help said it was. maybe_print_limits'
     # own docstring corrects it in as many words -- "the console does not shell
     # out, it loads this module in-process and calls mix_minimum_xmr directly"
@@ -7594,112 +7598,67 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
         # -- and only once the fee is definitely being taken, so this is never
         # a warning about something that then does not occur.
         integrity_log("usagefee", "to_static_address")
-        print(f"  [!] The usage fee goes to a FIXED address you supplied. It "
-              f"will "
-              f"collect from every run\n"
-              f"      that uses it, which is the address reuse this toolchain "
-              f"refuses everywhere\n"
-              f"      else -- and mixing does not retract it. Drop "
-              f"--usage-fee-address to have a\n"
-              f"      fresh account and subaddress minted per run instead.")
+        # WHAT IDENTIFIES RUNS AT THE FEE ADDRESS IS THE AMOUNT, NOT THE
+        # ADDRESS. This said the fixed address was "the reuse this toolchain
+        # refuses everywhere else" -- a Bitcoin instinct applied to Monero.
+        # Outputs to one Monero address are unlinkable on-chain (each gets a
+        # one-time key); the receive addresses are fresh per run because the
+        # SWAP MEMO publishes them in an OP_RETURN, which never happens to
+        # this one. The leak here is the amount, a published fraction of the
+        # deposit, visible to whoever holds the fee wallet's keys or reads
+        # this vault's own records -- the same whether the address is fresh
+        # or fixed.
+        print(f"  [*] USAGE FEE: {cut} XMR ({(pct * 100).normalize()}% of the "
+              f"deposit) goes to the address\n"
+              f"      you supplied, as one more destination on the fan-out. "
+              f"It is not mixed.\n"
+              f"      Outputs to one Monero address are not linkable on-chain; "
+              f"what identifies\n"
+              f"      runs is the AMOUNT -- a published fraction of each "
+              f"deposit -- to whoever\n"
+              f"      holds that wallet's keys or reads this vault's records.\n"
+              f"      SPEND IT ON ITS OWN: two fees in one transaction prove "
+              f"they share an owner\n"
+              f"      AND divide by the rate into two deposits. Never to the "
+              f"same destination as\n"
+              f"      your mixed output.")
         # No pair: the wallet does not know this address, so it is outside the
         # accounts the exit enumerates and there is nothing to hold.
         return addr, cut, None
-    # WAIVED IF THE MINT FAILS, for the same reason the below-floor branch
-    # waives -- and this door was left open when that one was closed.
+    # NO DESTINATION OFF THIS WALLET MEANS NO CUT. This used to mint a fresh
+    # account on the mixing wallet and pay the cut there -- "it is yours where
+    # it lands" -- and the account was kept out of addr_index so the exit
+    # would not sweep it. That hold lived in ONE process's memory.
+    # gs_wake_agent._funded_entry is a different process re-enumerating the
+    # same wallet, it takes the largest unlocked output, and after the exit
+    # has swept everything else out the fee IS the largest output: the next
+    # phone withdrawal mixed the operator's revenue and paid it to whatever
+    # address the chat named, taking a fee of the fee on the way. A label to
+    # tell the account apart was tried and rejected -- paranoia_mode never
+    # deletes the wallet file, so a label outlives every wipe and names which
+    # account is revenue on a seized card.
     #
-    # create_fresh_account RAISES (it refuses an absent, non-int, or zero
-    # account_index rather than defaulting to the wallet's primary account),
-    # and new_subaddress_indexed validates its answer the same way. Uncaught,
-    # either one takes down main() with a traceback at stage 4 -- AFTER
-    # stage4_await_swap, so the BTC is already through ThorChain and the XMR is
-    # sitting on ENTRY, an address a public OP_RETURN memo names. That is the
-    # exact outcome the "Nothing has been spent" abort was removed for,
-    # reached through the RPC instead of through the arithmetic.
-    #
-    # Nothing is half-done on this path. The account may exist, but it is empty
-    # and unreferenced: the cut is only ever paid as a destination on the
-    # fan-out plan, and that is built later, from the values returned here.
-    # Waiving costs one run's fee; raising costs a settled swap.
-    try:
-        # NOTHING IS LABELLED, and a label was tried here and backed out.
-        #
-        # The problem it was solving is real: gs_wake_agent._funded_entry is a
-        # different process re-enumerating this wallet, and the hold below is
-        # an omission in THIS process's addr_index, so a phone withdrawal took
-        # the fee account as if it were the user's money. Marking the account
-        # would have told it apart.
-        #
-        # It cannot be marked HERE. paranoia_mode deliberately never deletes
-        # the wallet file -- it is the only thing that can still spend the
-        # money -- so anything written INTO it outlives every artifact wipe
-        # this toolchain performs. An account labelled for the fee survives a
-        # seizure that erased the plans, the logs and the staging directory,
-        # and it does the analyst's arithmetic for them: it names which
-        # account is the operator's revenue, and the rate is public, so
-        # dividing by it gives the deposit. That is the exact linkability the
-        # cut is otherwise careful about.
-        #
-        # The fix went to the other end instead: gs_wake_agent takes no fee on
-        # a phone withdrawal unless the keyfile names somewhere OFF this
-        # wallet to put it. See _withdraw_fee_argv.
-        _acct = create_fresh_account(rpc, label="")
-        addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")
-    except Exception as _e:
-        integrity_log("usagefee", "waived_mint_failed")
-        print(f"  [!] NO USAGE FEE TAKEN — the wallet would not mint an "
-              f"account to put it on:\n"
-              f"      {_e}\n"
-              f"      The mix is going ahead in full. The swap has already "
-              f"settled, so stopping\n"
-              f"      here would strand it on an address the swap memo names "
-              f"publicly, and one\n"
-              f"      run's fee is the cheaper loss. If it repeats, the "
-              f"wallet-rpc is the thing to\n"
-              f"      look at — every later stage of this run mints accounts "
-              f"too.")
-        return None, Decimal(0), None
-    integrity_log("usagefee", "subaddress_minted")
-    # SAY IT, AND SAY WHERE. The first version printed nothing at all on this
-    # branch: the cut account was minted, paid, and never mentioned -- not on
-    # the terminal, not in report_holdings, which lists "THIS RUN'S FUNDS ARE
-    # IN N SEPARATE ACCOUNTS" and had no idea this one existed. An operator
-    # cannot check they were paid against a number they were never given, and
-    # the wallet is the only authoritative record; this line is what makes a
-    # discrepancy noticeable at all.
-    print(f"  [*] USAGE FEE: {cut} XMR ({(pct * 100).normalize()}% of the "
-          f"deposit) "
-          f"goes to a freshly minted\n"
-          f"      account {_acct}, subaddress {_idx}, as one more destination "
-          f"on the fan-out.\n"
-          f"      It is not mixed and it is not swept by the exit — it is "
-          f"yours where it lands.")
-    # SPEND HYGIENE, HERE, because nothing else covers these accounts.
-    #
-    # report_holdings prints "SPEND THEM ONE ACCOUNT AT A TIME" over the run's
-    # accounts -- and this account is not one of them. It is deliberately kept
-    # out of addr_index so the exit cannot sweep it, which also keeps it out of
-    # the holdings report, so the accounts that accumulate run after run are
-    # the only ones the warning never reaches. They are also the ones most
-    # exposed to it: a fee is small, small piles invite being collected
-    # together, and the operator collecting them is the same person every time.
-    #
-    # And the merge costs more here than anywhere else in the run. Every mixed
-    # output is an arbitrary amount; each of these is a FIXED FRACTION of one
-    # deposit. Spending two together proves common ownership (any transaction
-    # does that) AND hands over two amounts that divide by a known rate into
-    # two deposit sizes -- so the merge does not just link the fees, it
-    # measures the runs behind them.
-    print(f"      SPEND IT ON ITS OWN. Every run mints another of these, and "
-          f"each one is\n"
-          f"      exactly {(pct * 100).normalize()}% of that run's deposit. A "
-          f"single transaction spending two of\n"
-          f"      them proves they share an owner AND lets anyone divide by "
-          f"the rate to read\n"
-          f"      both deposits off it. One account per transaction, and not "
-          f"into the same\n"
-          f"      destination as your mixed output.")
-    return addr, cut, (int(_acct), int(_idx))
+    # So the desk path now keeps the rule the woken path already had: the fee
+    # goes OFF this wallet or it is not taken. WAIVED, not refused -- the swap
+    # has settled and aborting here would strand it. The message says what to
+    # set, because a silent zero is a hidden broken fee.
+    integrity_log("usagefee", "waived_no_destination")
+    print(f"  [!] NO USAGE FEE TAKEN — no address OFF this wallet was given to "
+          f"put it on.\n"
+          f"      A cut minted onto the wallet being mixed is spent by the next "
+          f"withdrawal\n"
+          f"      as if it were a deposit (gs_wake_agent takes the largest "
+          f"unlocked output\n"
+          f"      and cannot tell your revenue from a deposit), so this tool no "
+          f"longer mints\n"
+          f"      one. Set GS_USAGE_FEE_ADDRESS to an address of a wallet of "
+          f"your own — a\n"
+          f"      subaddress is fine; outputs to the same Monero address are "
+          f"not linkable\n"
+          f"      on-chain — and the {(pct * 100).normalize()}% goes there as "
+          f"one more fan-out output.\n"
+          f"      The mix is going ahead in full.")
+    return None, Decimal(0), None
 
 
 def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,

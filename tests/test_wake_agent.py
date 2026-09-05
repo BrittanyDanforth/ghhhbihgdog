@@ -1977,11 +1977,11 @@ check("budget: the deadman extension outlasts the budget it protects",
 # wake channel exists for -- silently did not, for as long as the job existed.
 # Every suite was green through it, because nothing looked.
 # ...AND IT ASKS ONLY WHEN THE CUT HAS SOMEWHERE TO GO THAT IS NOT HERE.
-# With no --usage-fee-address, plan_usage_fee mints a fresh account on the
-# wallet being emptied and keeps it out of addr_index so the exit will not
-# sweep it. _funded_entry is a different process re-enumerating the same
-# wallet and takes the largest unlocked output -- which, after the exit has
-# swept everything else, is that fee. See _withdraw_fee_argv.
+# With no --usage-fee-address, plan_usage_fee USED TO mint a fresh account on
+# the wallet being emptied; _funded_entry, a different process re-enumerating
+# the same wallet, took the largest unlocked output -- which, after the exit
+# had swept everything else, was that fee. plan_usage_fee now waives with no
+# destination, on every path. See _withdraw_fee_argv.
 _fee_argv = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                          dict(_k, usage_fee_address="4" + "7" * 94),
                          _wdir, bundle="b", slip=None, handle="A3F1")[0]
@@ -1999,14 +1999,13 @@ check("fee: NON-VACUITY -- neither refused combination is composed",
 # the part that identifies the operator.
 check("fee: ...and no address rides on the argv with it",
       "--usage-fee-address" not in _fee_argv)
-# THE DEFAULT MINTS A FRESH ACCOUNT PER RUN. One address collecting a slice of
-# every run is the reuse this toolchain refuses everywhere else, and it
-# survives the mix -- so a fixed destination is opt-in, from THIS machine's
-# keyfile, and never the default.
+# NO ADDRESS IS COMPOSED WHEN THE KEYFILE NAMES NONE, and GhostSpiral then
+# waives the cut rather than minting one onto the wallet being mixed.
 _no_addr_env = A.build_argv("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                             dict(_k), _wdir, bundle="b", slip=None,
                             handle="A3F1")
-check("fee: with no keyfile address the run is left to mint a fresh one",
+check("fee: with no keyfile address no address is composed, so the cut is "
+      "waived rather than minted onto this wallet",
       not any("USAGE_FEE_ADDRESS" in str(x) for x in _no_addr_env))
 
 # ---- THE DAEMON THIS KEYFILE COULD NOT NAME -----------------------------
@@ -2715,11 +2714,12 @@ check("owned: NON-VACUITY -- the wallet is asked only for a withdrawal",
 # ---- ...AND THE DESK RE-OPENS WHAT THE PHONE PATH CLOSED -----------------
 #
 # _withdraw_fee_argv stops the WOKEN path minting a cut onto the mixing
-# wallet. gs_console's fee panel recommends exactly that for a run started at
-# the desk -- "leave the box empty and a new account and subaddress are minted
-# per run" -- and _funded_entry cannot tell the two apart, because it takes the
-# largest unlocked output on the wallet and asks nothing else. So the gate
-# holds on one path and the other walks around it.
+# wallet. gs_console's fee panel USED TO recommend exactly that for a run
+# started at the desk -- "leave the box empty and a new account and subaddress
+# are minted per run" -- and _funded_entry cannot tell the two apart, because
+# it takes the largest unlocked output on the wallet and asks nothing else.
+# plan_usage_fee now waives on the desk path too; the driven case below is a
+# cut an OLDER desk run left behind, which is why pairing says to sweep it.
 #
 # DRIVEN, not reasoned about: a wallet whose deposit the last exit already
 # swept out reports the desktop-minted fee account as the entry for the next
@@ -2785,15 +2785,17 @@ check("fee: ...and it is a warning, not a refusal -- taking no fee is a "
           .split("if args.wallet_file")[0])
 # AND THE PAGE THAT RECOMMENDS THE EMPTY BOX SAYS WHEN NOT TO.
 _cons_src = open(os.path.join(REPO, "gs_console"), encoding="utf-8").read()
-check("fee: the console's fee panel names the case where its own advice is "
-      "wrong", "Unless a phone can spend from this wallet" in _cons_src)
+check("fee: the console's fee panel says why the address must be off this "
+      "wallet, and that an empty box means no fee",
+      "Why it must be off this wallet" in _cons_src
+      and "empty = no fee is taken" in _cons_src)
 # WHITESPACE-NORMALISED, because this is HTML source: the sentence wraps at
 # whatever column the file wraps at, so a raw substring check passes or fails
 # on where a line break happens to fall rather than on what the page says.
 _cons_flat = " ".join(_cons_src.split())
 check("fee: ...and points at the fix rather than only at the hazard",
-      "put an address in the box" in _cons_flat
-      and "one is drawn per run" in _cons_flat)
+      "goes to a wallet of your own or it is not taken" in _cons_flat
+      and "from the desk and from the phone alike" in _cons_flat)
 
 # ---- A KILLED PROBE WAS A COMPLETED DEPOSIT --------------------------
 #
@@ -2844,14 +2846,14 @@ shutil.rmtree(_pk_dir, ignore_errors=True)
 
 # ---- A PHONE WITHDRAWAL TAKES NO FEE ONTO THE WALLET IT IS EMPTYING ---
 #
-# plan_usage_fee, with no fixed destination, mints a FRESH account on the
-# wallet being mixed and keeps it out of addr_index so the exit will not
-# sweep it -- "it is yours where it lands". That hold is one process's
+# plan_usage_fee, with no fixed destination, USED TO mint a FRESH account on
+# the wallet being mixed and keep it out of addr_index so the exit would not
+# sweep it -- "it is yours where it lands". That hold was one process's
 # in-memory index. _funded_entry is a different process re-enumerating the
 # same wallet and takes the largest unlocked output there is. Driven: after a
-# withdrawal completes, the fee account IS the largest output, so the next
-# /withdraw -- which the pager itself suggests -- mixes the operator's
-# revenue and pays it to the address the chat named.
+# withdrawal completed, the fee account WAS the largest output, so the next
+# /withdraw -- which the pager itself suggests -- mixed the operator's
+# revenue and paid it to the address the chat named. It waives now.
 _fee_key = {"rpc_primary": "http://127.0.0.1:18083",
             "rpc_daemon": "http://127.0.0.1:18081",
             "tor_proxy": "socks5h://127.0.0.1:9050",
@@ -2903,11 +2905,19 @@ check("fee: NON-VACUITY -- the address never rides on the argv either way",
 # AND NOTHING IS LABELLED, checked from this side too so the two files cannot
 # drift into disagreeing about it.
 _gs_src = open(os.path.join(REPO, "GhostSpiral"), encoding="utf-8").read()
-check("fee: the fee account is still minted with an EMPTY label, because a "
-      "label outlives every artifact wipe",
-      'create_fresh_account(rpc, label="")' in _gs_src)
-check("fee: ...and so is its subaddress",
-      'new_subaddress_indexed(account_index=_acct, label="")' in _gs_src)
+# NOTHING IS MINTED FOR THE FEE ANY MORE -- no account, labelled or not. The
+# label question is moot because the branch that minted is gone: with no
+# destination off the wallet the cut is waived.
+_pf_src = _gs_src.split("def plan_usage_fee")[1].split("\ndef ")[0]
+check("fee: plan_usage_fee mints no account and no subaddress for the cut -- "
+      "with no destination off the wallet it waives",
+      "create_fresh_account(" not in _pf_src
+      and "new_subaddress_indexed(" not in _pf_src
+      and 'integrity_log("usagefee", "waived_no_destination")' in _pf_src)
+check("fee: ...and the waive is the LAST answer, after the static-address "
+      "branch, so an address off the wallet still pays",
+      _pf_src.index('"to_static_address"')
+      < _pf_src.index('"waived_no_destination"'))
 
 # ---- THE THIRD ADDRESS VALIDATOR AGREED WITH THE OTHER TWO ON ALL BUT ONE
 #
@@ -3626,6 +3636,81 @@ finally:
 check("funded: NON-VACUITY -- a wallet that answers with nothing is None "
       "WITHOUT the failure record",
       _fe2 is None and _fe_log2 == [])
+
+
+# ===========================================================================
+# THE RESULT RECORD IS TRIED MORE THAN ONCE
+# ===========================================================================
+#
+# post_record returns (0, b"") on any transport failure and never raises, so
+# report_back's except could not fire on the failure that happens in practice
+# -- a Tor circuit to the Pi down for the thirty seconds it ran in -- and the
+# one record that tells the phone money moved was lost to it silently.
+print("\n== report_back: retried, refused once, or given up loudly ==")
+import nacl.public as _npub_rb
+_rb_tp, _rb_pi = _npub_rb.PrivateKey.generate(), _npub_rb.PrivateKey.generate()
+_rb_key = {"secret": bytes(_rb_tp).hex(),
+           "peer_public": bytes(_rb_pi.public_key).hex(),
+           "doorbell_url": "http://x"}
+_rb_log = []
+_saved_il_rb = A.integrity_log
+A.integrity_log = lambda st, kind, *a, **k: _rb_log.append(kind)
+
+
+def _rb_drive(statuses):
+    """A poster answering `statuses` in order (repeating the last)."""
+    _calls, _sleeps = [], []
+    _seq = list(statuses)
+
+    def _post(url, path, rec, timeout=30):
+        _calls.append(path)
+        return (_seq.pop(0) if len(_seq) > 1 else _seq[0]), b""
+    del _rb_log[:]
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.report_back(_rb_key, "j", "00" * 32, "done", "A3F1",
+                      poster=_post, sleeper=lambda s: _sleeps.append(s))
+    return _calls, _sleeps, list(_rb_log)
+
+
+try:
+    _c1, _s1, _l1 = _rb_drive([200])
+    check("report: a first-try delivery posts once and sleeps never",
+          _c1 == ["/result"] and _s1 == [] and _l1 == [])
+    _c2, _s2, _l2 = _rb_drive([0, 0, 200])
+    check("report: a dead circuit is retried with backoff, and the delivery "
+          "on retry is recorded",
+          len(_c2) == 3 and _s2 == [15, 30]
+          and _l2 == ["result_delivered_on_retry"])
+    _c3, _s3, _l3 = _rb_drive([0])
+    check("report: ...bounded -- four attempts, three waits, then it is said "
+          "to be undeliverable",
+          len(_c3) == A.RESULT_POST_ATTEMPTS and _s3 == [15, 30, 60]
+          and _l3 == ["result_undeliverable"])
+    _c4, _s4, _l4 = _rb_drive([204])
+    check("report: a doorbell that ANSWERED and refused (204) is not retried "
+          "-- the same record would be refused again -- and is recorded as "
+          "rejected, not undeliverable",
+          _c4 == ["/result"] and _s4 == [] and _l4 == ["result_rejected"])
+    _c5, _s5, _l5 = _rb_drive([503, 200])
+    check("report: a 5xx is transient and retried", len(_c5) == 2
+          and _l5 == ["result_delivered_on_retry"])
+
+    def _raiser(url, path, rec, timeout=30):
+        raise ConnectionError("no circuit")
+    _sl6 = []
+    del _rb_log[:]
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.report_back(_rb_key, "j", "00" * 32, "done", "A3F1",
+                      poster=_raiser, sleeper=lambda s: _sl6.append(s))
+    check("report: a poster that raises is treated as a transport failure, "
+          "retried and then given up on -- never propagated",
+          len(_sl6) == 3 and _rb_log == ["result_undeliverable"])
+finally:
+    A.integrity_log = _saved_il_rb
+check("report: every call site hands the sleep dependency through, so the "
+      "tests that inject a failing poster do not wait real minutes",
+      _AGENT_SRC.count("sleeper=d.get(\"sleep\")") == 3
+      and _AGENT_SRC.count("report_back(") >= 4)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

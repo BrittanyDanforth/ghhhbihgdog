@@ -1249,14 +1249,18 @@ def _withdraw_fee_argv(key: dict, dests=(), owned=()) -> list:
     NEXT withdrawal. The first fix here was to take no fee at all unless the
     keyfile named a fixed --usage-fee-address, i.e. somewhere off this wallet.
 
-    That closed the recapture and opened something else. gs_wake_keys says
-    plainly why omitting the address is the RECOMMENDED setting: with no
-    address a fresh account is minted per run, "so no address collects from
-    two runs". A fixed destination is one address taking a slice of
-    everything, it survives the mix, and the fee is a published fraction --
-    so an analyst who finds that address divides by 0.011 and reads every
-    deposit this operator ever took. Making the fee CONDITIONAL on a fixed
-    address made the linkable configuration the only one that pays.
+    That closed the recapture and seemed to open something else. gs_wake_keys
+    at the time called omitting the address the RECOMMENDED setting: with no
+    address a fresh account was minted per run, "so no address collects from
+    two runs", and a fixed destination looked like one address taking a slice
+    of everything. That was a Bitcoin instinct: outputs to one Monero address
+    are unlinkable on-chain, and the fee address is never published the way a
+    swap destination is (the memo puts THAT one in an OP_RETURN). What
+    identifies runs at the fee address is the AMOUNT, a published fraction of
+    each deposit, to whoever holds that wallet's keys or reads this vault's
+    records -- the same whether the address is fresh or fixed. So the rule
+    below costs nothing it was thought to cost, and plan_usage_fee now keeps
+    it on the desk path as well: no destination off the wallet, no cut.
 
     SO A MARKER WAS PROPOSED AND IS NOT SHIPPED. READ THE NEXT PARAGRAPH
     BEFORE BELIEVING THIS ONE. The proposal was:
@@ -1750,7 +1754,7 @@ def run_once(args, deps: dict = None) -> tuple:
         # CHECK THE BALANCE before running it again."
         report_back(key, job_id, challenge.hex(),
                     "failed" if _CHILD_STARTED[0] else "refused", "",
-                    poster=d.get("post_record"))
+                    poster=d.get("post_record"), sleeper=d.get("sleep"))
         raise e
 
 
@@ -1878,7 +1882,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     plain = plain_slip_for_chat(key, artifact_dir, status, handle)
     phase = _phase_of(job, artifact_dir, key=key, status=status)
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
-                plain=plain, phase=phase, poster=d.get("post_record"))
+                plain=plain, phase=phase, poster=d.get("post_record"),
+                sleeper=d.get("sleep"))
     return code, status, handle
 
 
@@ -1991,7 +1996,7 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
 def _reported(key, d, job_id, challenge, exc):
     """Tell the doorbell 'refused', then hand back the exception to raise."""
     report_back(key, job_id, challenge.hex(), "refused", "",
-                poster=d.get("post_record"))
+                poster=d.get("post_record"), sleeper=d.get("sleep"))
     return exc
 
 
@@ -2393,12 +2398,11 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # from a chat kept 100% and put 0% aside, for as long as the job
             # has existed.
             #
-            # NO ADDRESS BY DEFAULT, and that is the OPSEC-load-bearing half.
-            # With --usage-fee alone GhostSpiral mints a FRESH account and
-            # subaddress per run, so no address collects from two runs. Naming
-            # a fixed one is the address reuse this toolchain refuses
-            # everywhere else, and it survives the mix -- so it is available,
-            # from this machine's own keyfile, and never the default.
+            # NO ADDRESS MEANS NO CUT. With --usage-fee and no address
+            # GhostSpiral WAIVES the fee (it used to mint a fresh account on
+            # the mixing wallet, which the next withdrawal then spent), so the
+            # address is what makes a woken withdrawal take a fee at all. It
+            # comes from this machine's own keyfile.
             #
             # ON THE ARGV, DELIBERATELY, because it is a boolean that carries
             # no value: `ps` learns that this run skims, which is public in
@@ -2794,9 +2798,17 @@ def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
         return {}
 
 
+#: Attempts to deliver the result record, and the waits between them. Four
+#: tries over about 105 s: long enough for a Tor circuit to be rebuilt, short
+#: against every job budget. Bounded so a Pi that is gone for good cannot hold
+#: the vault powered on.
+RESULT_POST_ATTEMPTS = 4
+RESULT_POST_BACKOFF_S = (15, 30, 60)
+
+
 def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
                 handle: str, slip: str = "", plain: dict = None,
-                phase: str = "", poster=None) -> None:
+                phase: str = "", poster=None, sleeper=None) -> None:
     """Tell the doorbell the outcome, a 4-hex label, and at most ONE payload.
 
     Never the reason a job was refused. The payload is either a SEALED slip --
@@ -2860,12 +2872,44 @@ def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
     except Exception:                                        # noqa: BLE001
         integrity_log("wake", "result_undeliverable")
         return
-    try:
-        (poster or post_record)(key["doorbell_url"], "/result", m3)
-    except Exception:                                        # noqa: BLE001
-        # THIS one really is a delivery problem. The job either happened or did
-        # not, and the record of it is here.
-        integrity_log("wake", "result_undeliverable")
+    # DELIVERED, OR SAID TO BE UNDELIVERABLE -- AND TRIED MORE THAN ONCE.
+    # post_record returns (0, b"") on any transport failure and NEVER raises,
+    # so the except below could not fire on the one failure that happens in
+    # practice: a Tor circuit to the Pi that is down for the thirty seconds
+    # this ran in. The result record is the ONLY thing that tells the phone
+    # money moved; losing it to one bad circuit meant "withdraw: failed" for
+    # a withdrawal that succeeded. So: a bounded set of attempts with backoff,
+    # a refusal (the doorbell answered and would not take it: 204/400/404)
+    # stopping at once because the same record would be refused again, and
+    # the chain recording which of the three happened.
+    _post = poster or post_record
+    _sleep = sleeper or time.sleep
+    _status = 0
+    for _i in range(RESULT_POST_ATTEMPTS):
+        try:
+            _status = int((_post(key["doorbell_url"], "/result", m3)
+                           or (0, b""))[0] or 0)
+        except Exception:                                    # noqa: BLE001
+            _status = 0
+        if _status == 200:
+            if _i:
+                integrity_log("wake", "result_delivered_on_retry")
+            return
+        if _status in (204, 400, 404):
+            integrity_log("wake", "result_rejected")
+            agent_say(f"  [!] The doorbell answered {_status} to the result "
+                      f"record and will not take it; not retrying the same "
+                      f"record. The job's artifacts are on this machine.")
+            return
+        if _i < RESULT_POST_ATTEMPTS - 1:
+            _sleep(RESULT_POST_BACKOFF_S[min(_i, len(RESULT_POST_BACKOFF_S) - 1)])
+    # THIS one really is a delivery problem. The job either happened or did
+    # not, and the record of it is here.
+    integrity_log("wake", "result_undeliverable")
+    agent_say(f"  [!] The result record could not be delivered after "
+              f"{RESULT_POST_ATTEMPTS} attempts (last status {_status}). The "
+              f"phone will not be told; the job's artifacts are on this "
+              f"machine.")
 
 
 def build_cli() -> argparse.ArgumentParser:

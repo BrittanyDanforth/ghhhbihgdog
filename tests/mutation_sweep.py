@@ -554,9 +554,9 @@ MUTATIONS = [
  # Pi times out and tells the operator "this job may already be done. CHECK THE
  # VAULT" when nothing ran.
  ("a post-collection refusal never reaches the doorbell", "gs_wake_agent",
-  "        report_back(key, job_id, challenge.hex(),\n"
+  '        report_back(key, job_id, challenge.hex(),\n'
   '                    "failed" if _CHILD_STARTED[0] else "refused", "",\n'
-  '                    poster=d.get("post_record"))',
+  '                    poster=d.get("post_record"), sleeper=d.get("sleep"))',
   "        pass",
   ["test_wake_agent"]),
 
@@ -2168,18 +2168,19 @@ MUTATIONS = [
  # balance is the only authoritative record that the operator was paid.
  ("the cut is taken again without telling the operator where it went",
   "GhostSpiral",
-  '    print(f"  [*] USAGE FEE: {cut} XMR',
-  '    _unused = (f"  [*] USAGE FEE: {cut} XMR',
+  '        print(f"  [*] USAGE FEE: {cut} XMR',
+  '        _unused = (f"  [*] USAGE FEE: {cut} XMR',
   ["test_dag_entry"]),
 
  # A fixed cut address is the reuse this repo refuses by sys.exit in three
  # other places; minting per run is what removes the cross-run join key.
- ("the cut goes back to one account instead of a fresh one per run",
+ ('a run with no fee destination charges the cut anyway, to nowhere',
   "GhostSpiral",
   # Re-anchored: the two mints moved inside a try/except this turn, so a
   # wallet that refuses them waives the fee instead of killing a settled run.
-  '        _acct = create_fresh_account(rpc, label="")',
-  "        _acct = 0",
+  '    integrity_log("usagefee", "waived_no_destination")',
+  '    return addr, cut, None\n'
+  '    integrity_log("usagefee", "waived_no_destination")',
   ["test_dag_entry"]),
 
  # The distinctness staircase needs n(n-1)/2 DUST ticks -- 0.177 XMR at 60
@@ -2261,10 +2262,12 @@ MUTATIONS = [
  # that takes main() down at stage 4 -- after the BTC is through ThorChain and
  # the XMR is on an address a public OP_RETURN names. Same outcome the
  # below-floor branch stopped producing; this was the door beside it.
- ("a wallet that will not mint the fee account kills the run again",
+ ('the no-destination branch goes back to aborting after the swap',
   "GhostSpiral",
-  '        integrity_log("usagefee", "waived_mint_failed")',
-  "        raise",
+  '    integrity_log("usagefee", "waived_no_destination")\n'
+  '    print(f"  [!] NO USAGE FEE TAKEN — no address OFF this wallet was given to "',
+  '    integrity_log("usagefee", "waived_no_destination")\n'
+  '    sys.exit(f"  [!] NO USAGE FEE TAKEN — no address OFF this wallet was given to "',
   ["test_dag_entry"]),
 
  # ---- the accounts no other warning reaches ------------------------------
@@ -2275,8 +2278,8 @@ MUTATIONS = [
  # it measures the runs behind them.
  ("the fee accounts go back to getting no spend-hygiene warning at all",
   "GhostSpiral",
-  '    print(f"      SPEND IT ON ITS OWN. Every run mints another of these, and "',
-  '    _unused = (f"      SPEND IT ON ITS OWN. Every run mints another of these, and "',
+  '              f"      SPEND IT ON ITS OWN: two fees in one transaction prove "',
+  '              f"      Two fees in one transaction prove "',
   ["test_dag_entry"]),
 
  # ---- labels are written INTO the wallet file ----------------------------
@@ -2284,10 +2287,12 @@ MUTATIONS = [
  # paranoia_mode never deletes the wallet file; it is the only thing that can
  # still spend the money. So a label outlives every artifact wipe, and a
  # labelled fee account does the analyst's arithmetic for them.
- ("the fee account is labelled, and the label outlives every wipe",
+ ('the fee is paid onto the mixing wallet again when the address is its own',
   "GhostSpiral",
-  '        _acct = create_fresh_account(rpc, label="")',
-  '        _acct = create_fresh_account(rpc, label="usage fee")',
+  '        if _own is not None:\n'
+  '            integrity_log("usagefee", "waived_address_in_wallet")',
+  '        if False:\n'
+  '            integrity_log("usagefee", "waived_address_in_wallet")',
   ["test_dag_entry"]),
 
  # ---- /fee predates --usage-fee and answers about something else ---------
@@ -3611,11 +3616,10 @@ MUTATIONS = [
   '    if params.get("usage_fee_pct"):',
   ["test_console"]),
 
- ("the fee subaddress is labelled, which the wallet file also keeps",
+ ("the fee address is no longer checked against the wallet's own",
   "GhostSpiral",
-  '        addr, _idx = rpc.new_subaddress_indexed(account_index=_acct, label="")',
-  '        addr, _idx = rpc.new_subaddress_indexed(account_index=_acct,\n'
-  '                                                label="usage fee")',
+  '        _own = _wallet_owns_address(rpc, addr)',
+  '        _own = None',
   ["test_dag_entry"]),
 
  # -- the published deposit minimum ----------------------------------------
