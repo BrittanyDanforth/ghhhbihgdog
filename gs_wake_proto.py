@@ -359,7 +359,8 @@ PLAIN_FIELDS = {
 #: a key to the M3 record instead would break the doorbell's exact-key-set
 #: check and force both boxes to be updated in the same sitting, which is a
 #: real cost to pay for a fact that fits in a word this record already carries.
-PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left")
+PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
+          "more_locked", "moved", "partial")
 
 CHALLENGE_BYTES = 32
 JOB_ID_BYTES = 16
@@ -806,6 +807,20 @@ PHASE_LINES = {
     # so that a version which does NOT act on it still says something true.
     "more_left": "that one is done and there is more here. Run /withdraw "
                  "again for the next.",
+    # LOCKED, NOT ABSENT. A run can end with value still inside the network's
+    # unlock window; "nothing more was found" for it was a false statement
+    # about the balance, on the surface this line exists to stop making one.
+    "more_locked": "that one is done and more is here, still unlocking. Run "
+                   "/withdraw again in a while.",
+    # PAID AND SENT ON. A watcher on an address that was paid and then
+    # emptied sees nothing and calls it "not yet", which is the one thing
+    # it is not. The vault answers this from its own record instead.
+    "moved": "that one arrived and was sent on.",
+    # SHORT SO FAR, NOT SHORT FOR GOOD. A three-minute look sees an
+    # arrival that is all spendable and under the quote; whether more is
+    # coming is a verdict only the long watch can reach ("short").
+    "partial": "some of it is here and spendable, under what was quoted "
+               "so far. Ask again later.",
 }
 
 

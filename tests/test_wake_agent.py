@@ -149,7 +149,10 @@ def deps_for(d, bell, **over):
                 account_count=lambda: 3,
                 unit_is_active=lambda u: True, removable_devices=lambda: [],
                 resource_check=lambda *a: True,
-                tor_bootstrapped=lambda u: True, wipe_covers=lambda p: True)
+                tor_bootstrapped=lambda u: True, wipe_covers=lambda p: True,
+                # The fee sweep arms a backstop before it spends, like a
+                # withdrawal; a scratch vault has no systemd to arm one on.
+                extend_deadman=lambda s: True)
     base.update(over)
     base["_posted"] = posted
     base["_ran"] = ran
@@ -1275,6 +1278,205 @@ finally:
 
 check("dispatch: the spending job ran exactly one child", len(_seen) == 1)
 
+# ---- A DEPOSIT THAT WAS PAID OUT IS "MOVED", NOT "NOT YET" ----------------
+#
+# The withdrawal spent handle A3F1's receive subaddress and nothing marked the
+# record. A later /check ran receive_watch on the emptied address, saw zero,
+# and told the client "nothing on the address yet. Normal -- ask again in a
+# while", with an ask-again button: a wake spent to say their money never came,
+# about money that came and was sent to them. The ledger answers now.
+print("\n== a paid-out deposit answers from the ledger ==")
+
+
+def _ledger_env(prefix, spent_rc=0, acct=9, sub=4):
+    _d = Path(tempfile.mkdtemp(prefix=prefix))
+    _b = _d / "wallet_recv_1.json"
+    _b.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
+                              "address": _XMR_SAMPLE, "account_index": acct,
+                              "subaddress_index": sub,
+                              "rpc_endpoint": "http://127.0.0.1:18083"}))
+    _s = _d / "thor_pairs_A3F1.json"
+    _s.write_text("{}")
+    (_d / A.HANDLES_FILE).write_text(json.dumps(
+        {"A3F1": {"bundle": str(_b), "slip": str(_s), "minted": 1},
+         "B7C2": {"bundle": str(_d / "wallet_recv_2.json"),
+                  "slip": str(_d / "thor_pairs_B7C2.json"), "minted": 1}}))
+    _runs = []
+
+    def _runner(argv, env_extra, budget_s):
+        _runs.append(list(argv))
+        return spent_rc, False
+    return _d, _runs, _runner
+
+
+_ld, _lruns, _lrun = _ledger_env("ledger_")
+_saved_il_ld = A.integrity_log
+_ld_log = []
+try:
+    A.integrity_log = lambda st, kind, *a, **k: _ld_log.append(kind)
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                    _k, _ld, "C4D5", _lrun, "job-w",
+                    funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
+    _ld_h = json.loads((_ld / A.HANDLES_FILE).read_text())
+    check("ledger: a finished withdrawal marks the handle whose receive "
+          "subaddress it spent, and no other",
+          _ld_h["A3F1"].get("spent") is True
+          and "spent" not in _ld_h["B7C2"] and len(_lruns) == 1)
+    _lruns.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ld_out = A._dispatch("swap_status", {"handle": "A3F1"}, _k, _ld,
+                              "D5E6", _lrun, "job-c")
+    check("ledger: /check on that handle is answered 'moved' from the ledger "
+          "-- done, no child run, no watcher on an emptied address",
+          _ld_out[:2] == ("done", "done") and _lruns == []
+          and A._phase_of("swap_status", _ld) == "moved"
+          and "watch_spent_handle" in _ld_log)
+    _lruns.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("swap_status", {"handle": "B7C2"}, _k, _ld,
+                    "E6F7", _lrun, "job-c2")
+    check("ledger: NON-VACUITY -- the other handle still runs its probe",
+          len(_lruns) == 1 and "receive_watch" in " ".join(_lruns[0]))
+finally:
+    A.integrity_log = _saved_il_ld
+
+# ONLY ON A RUN THAT REPORTED DONE. A failed mix may have moved nothing.
+_ldf, _lfruns, _lfrun = _ledger_env("ledgerf_", spent_rc=1)
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ldf_out = A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                               _k, _ldf, "C4D5", _lfrun, "job-wf",
+                               funded=lambda: (9, 4, _XMR_SAMPLE,
+                                               5_000_000_000_000))
+finally:
+    A.integrity_log = _saved_il_ld
+check("ledger: a withdrawal that FAILED marks nothing spent -- the money may "
+      "still be there, and 'moved' about it would be the lie the other way",
+      _ldf_out[1] == "failed"
+      and "spent" not in json.loads((_ldf / A.HANDLES_FILE).read_text())["A3F1"])
+
+# ---- A MINTED-BUT-NEVER-QUOTED ADDRESS IS THE NEXT DEPOSIT'S -------------
+#
+# Step 1 (the quote) failed, the record kept its bundle with no slip, and the
+# next /deposit minted ANOTHER account: every retry burned one of a ceiling
+# nothing on this disk can reset, until every /deposit was refused for good.
+print("\n== a failed quote's address is reused, not abandoned ==")
+
+
+def _reuse_env(prefix, acct=7, sub=2, new_pair=(8, 1)):
+    _d = Path(tempfile.mkdtemp(prefix=prefix))
+    _b = _d / "wallet_old.json"
+    _b.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
+                              "address": _XMR_SAMPLE, "account_index": acct,
+                              "subaddress_index": sub,
+                              "rpc_endpoint": "http://127.0.0.1:18083"}))
+    (_d / A.HANDLES_FILE).write_text(json.dumps(
+        {"OLD1": {"bundle": str(_b), "slip": None, "minted": 1}}))
+    _runs = []
+
+    def _runner(argv, env_extra, budget_s):
+        _runs.append(list(argv))
+        if "create_receive_wallet" in " ".join(argv):
+            (_d / "wallet_new.json").write_text(json.dumps(
+                {"schema": "gs_receive_wallet_v1", "address": _XMR_SAMPLE,
+                 "account_index": new_pair[0],
+                 "subaddress_index": new_pair[1],
+                 "rpc_endpoint": "http://127.0.0.1:18083"}))
+        return 0, False
+    return _d, _b, _runs, _runner
+
+
+_rd, _rb, _rruns, _rrun = _reuse_env("reuse_")
+_r_log = []
+try:
+    A.integrity_log = lambda st, kind, *a, **k: _r_log.append(kind)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _r_out = A._dispatch("receive_and_quote", {"amount_sat": 5000000},
+                             _k, _rd, "NEW1", _rrun, "job-r",
+                             reuse_balance=lambda k, a, s: 0)
+finally:
+    A.integrity_log = _saved_il_ld
+_r_h = json.loads((_rd / A.HANDLES_FILE).read_text())
+check("reuse: a record with a bundle, no slip and a wallet that says the "
+      "subaddress holds nothing is taken by the next deposit -- no mint, one "
+      "child (the quote), aimed at the old bundle",
+      _r_out[:2] == ("done", "done") and len(_rruns) == 1
+      and "thor_swap_preparer" in " ".join(_rruns[0])
+      and str(_rb) in _rruns[0]
+      and _r_h["NEW1"]["bundle"] == str(_rb) and "OLD1" not in _r_h
+      and "receive_bundle_reused" in _r_log)
+_rd2, _rb2, _rruns2, _rrun2 = _reuse_env("reuse2_")
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("receive_and_quote", {"amount_sat": 5000000},
+                    _k, _rd2, "NEW1", _rrun2, "job-r2",
+                    reuse_balance=lambda k, a, s: 1)
+finally:
+    A.integrity_log = _saved_il_ld
+check("reuse: ...but an address the wallet says has been paid -- or cannot "
+      "be asked about -- is left alone and a fresh one is minted",
+      len(_rruns2) == 2 and "create_receive_wallet" in " ".join(_rruns2[0])
+      and json.loads((_rd2 / A.HANDLES_FILE).read_text())["NEW1"]["bundle"]
+      .endswith("wallet_new.json"))
+_rd3, _rb3, _rruns3, _rrun3 = _reuse_env("reuse3_")
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("receive_and_quote", {"amount_sat": 5000000},
+                    _k, _rd3, "NEW1", _rrun3, "job-r3",
+                    reuse_balance=lambda k, a, s: None)
+finally:
+    A.integrity_log = _saved_il_ld
+check("reuse: NON-VACUITY -- 'could not ask' counts as 'holds something'",
+      len(_rruns3) == 2)
+# THE SAME ADDRESS TWICE IS REFUSED BEFORE THE QUOTE. A wallet whose account
+# list rolled back mints the same (account, subaddress) again; two deposits
+# quoting one address confirm on each other's arrival and are spent as one.
+_rd4, _rb4, _rruns4, _rrun4 = _reuse_env("reuse4_", new_pair=(7, 2))
+try:
+    A.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        A._dispatch("receive_and_quote", {"amount_sat": 5000000},
+                    _k, _rd4, "NEW1", _rrun4, "job-r4",
+                    reuse_balance=lambda k, a, s: 1)
+    _r4 = None
+except A.Refused as _e:
+    _r4 = _e.code
+finally:
+    A.integrity_log = _saved_il_ld
+check("reuse: a fresh mint that names an (account, subaddress) an earlier "
+      "handle already names is refused before the quote, by name",
+      _r4 == "bundle_reused" and len(_rruns4) == 1)
+# THE REDRAW LOOP ASKS THE DISK TOO: a handle whose record fell off the
+# ledger's cap may still have a slip file, and a label on a phone.
+_rd5 = Path(tempfile.mkdtemp(prefix="redraw_"))
+(_rd5 / "thor_pairs_A3F1.json").write_text("{}")
+
+
+def _rrun5(argv, env_extra, budget_s):
+    if "create_receive_wallet" in " ".join(argv):
+        (_rd5 / "wallet_new.json").write_text("{}")
+    return 0, False
+
+
+_saved_nh = A.proto.new_handle
+try:
+    A.integrity_log = lambda *a, **k: None
+    A.proto.new_handle = lambda: "C4D5"
+    with contextlib.redirect_stdout(io.StringIO()):
+        _r5 = A._dispatch("receive_and_quote", {"amount_sat": 5000000},
+                          _k, _rd5, "A3F1", _rrun5, "job-r5",
+                          reuse_balance=lambda k, a, s: 1)
+finally:
+    A.proto.new_handle = _saved_nh
+    A.integrity_log = _saved_il_ld
+check("reuse: a handle still named by a slip file on disk is redrawn even "
+      "when the ledger has forgotten it",
+      _r5[2] == "C4D5" and A._handles_on_disk(_rd5) == {"A3F1"})
+
 
 import decimal as _dec                                        # noqa: E402
 _AGENT_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
@@ -1927,6 +2129,58 @@ try:
               f"{_lbl2} -- it mixes, with the cut waived",
               A._phase_of("withdraw", None, key=_k2, status="done")
               == "more_left")
+    # NOTHING UNLOCKED IS NOT NOTHING. A deposit that landed during the leg
+    # is inside the unlock window; "nothing more was found" for it was a false
+    # statement about the balance, and the client, told that, was done with
+    # their second deposit still on the wallet. Its own word, over the same
+    # floor: locked dust is not more, and a wallet that cannot be asked about
+    # its locked value says nothing rather than "more".
+    _ml_locked_saved = A._locked_value
+    try:
+        A._funded_entry = lambda k, injected=None: None
+        for _lbl3, _locked, _want3 in (
+                ("half an XMR still unlocking", _GS.Decimal("0.5"),
+                 "more_locked"),
+                ("locked dust", _GS.Decimal("0.001"), ""),
+                ("a wallet that could not be asked", None, "")):
+            A._locked_value = (lambda _v: (lambda k, injected=None,
+                                           rpc_url=None: _v))(_locked)
+            check(f"chain: nothing unlocked and {_lbl3} -> {_want3!r}",
+                  A._phase_of("withdraw", None, key=_ml_key, status="done")
+                  == _want3)
+        A._locked_value = lambda k, injected=None, rpc_url=None: (
+            _GS.Decimal("0.5"))
+        check("chain: ...and a run that did not finish never says more is "
+              "locked either",
+              A._phase_of("withdraw", None, key=_ml_key, status="failed") == "")
+    finally:
+        A._locked_value = _ml_locked_saved
+    check("chain: 'more_locked' and 'moved' and 'partial' are words the "
+          "protocol has, with a line each, so the doorbell lets them through",
+          all(P.phase_is_known(w) and P.PHASE_LINES[w]
+              for w in ("more_locked", "moved", "partial"))
+          and A._PHASE_OF_STATE["moved"] == "moved")
+    # THE LOCKED FIGURE IS THE WALLET'S OWN TOTAL, asked without spending.
+    _lv_calls = []
+
+    class _LvRpc:
+        def raw_request(self, m, p=None):
+            _lv_calls.append((m, dict(p or {})))
+            return {"balance": 1_500_000_000_000,
+                    "unlocked_balance": 1_000_000_000_000}
+    # _locked_value imports connect_rpc from gs_common at call time, so the
+    # module attribute is what to stand in for.
+    _lv_saved_connect = _gsc_pat.connect_rpc
+    try:
+        _gsc_pat.connect_rpc = lambda *a, **k: _LvRpc()
+        _lv = A._locked_value({"rpc_primary": "x", "tor_proxy": ""})
+    finally:
+        _gsc_pat.connect_rpc = _lv_saved_connect
+    check("chain: the locked figure is balance minus unlocked across every "
+          "account, in XMR",
+          _lv == _GS.Decimal("0.5")
+          and _lv_calls == [("get_balance", {"account_index": 0,
+                                             "all_accounts": True})])
 finally:
     A._funded_entry = _ml_saved
 
@@ -3566,14 +3820,32 @@ check("watch: NON-VACUITY -- the argv is a real one for the real tool",
 
 # AND _phase_of NOW ANSWERS FOR IT.
 _wd = Path(tempfile.mkdtemp(prefix="watchphase_"))
-for _state, _total, _want in (("timeout", "0", "not_yet"),
-                              ("timeout", "0.4", "arriving"),
-                              ("funded", "1.2", "landed"),
-                              ("stalled", "0.4", "short")):
+# A TIMEOUT WITH MONEY ON THE ADDRESS SPLITS ON WHAT IS STILL PENDING: all of
+# it unlocked and under the quote is "partial" (short so far), some of it
+# still confirming is "arriving". "Stopped growing" is the long watch's verdict
+# and the three-minute probe no longer claims it -- see the argv check below.
+for _state, _total, _unl, _want in (("timeout", "0", "0", "not_yet"),
+                                    ("timeout", "0.4", "0.4", "partial"),
+                                    ("timeout", "0.4", "0.1", "arriving"),
+                                    ("timeout", "0.4", "0", "arriving"),
+                                    ("funded", "1.2", "1.2", "landed"),
+                                    ("stalled", "0.4", "0.4", "short"),
+                                    ("moved", "", "", "moved")):
     (_wd / _AGW.STATUS_FILE).write_text(json.dumps(
-        {"state": _state, "total": _total, "unlocked": _total, "ticks": 2}))
-    check(f"watch: a {_state!r} watch reports {_want!r}, not a failure",
+        {"state": _state, "total": _total, "unlocked": _unl, "ticks": 2}))
+    check(f"watch: a {_state!r} watch ({_unl}/{_total}) reports {_want!r}, "
+          f"not a failure",
           _AGW._phase_of("watch", _wd) == _want)
+check("watch: the three-minute probe passes NO stall window -- with one equal "
+      "to its timeout, a fully unlocked partial came back 'stopped growing' "
+      "from three minutes of looking",
+      not any("--stall-min" in a
+              for argv in _AGW.build_argv("swap_status", {"handle": "A3F1"},
+                                          _k, Path("/tmp/bay"),
+                                          bundle="/tmp/bay/wallet_recv_1.json",
+                                          slip="/tmp/bay/thor_pairs_A3F1.json",
+                                          handle="A3F1")
+              for a in argv))
 # NON-VACUITY: a job that is NOT a watching job still gets no phase, so this
 # did not open the door to every job inventing a status.
 (_wd / _AGW.STATUS_FILE).write_text(json.dumps({"state": "funded",
@@ -3829,8 +4101,10 @@ try:
     # fee wallet answers, leg after leg (a list, consumed in order).
     _sw_dir = Path(tempfile.mkdtemp(prefix="feesweep_"))
 
+    _armed_log = []
+
     def _sweep(entries, floor="0.0270", dry_run=False, key=None,
-               clock_step=0, rc=0):
+               clock_step=0, rc=0, deadman=True):
         ran = []
         seq = list(entries)
         tick = [0]
@@ -3842,8 +4116,12 @@ try:
         def _clock():
             tick[0] += clock_step
             return float(tick[0])
+
+        def _arm(seconds):
+            _armed_log.append(int(seconds))
+            return bool(deadman)
         deps = {"fee_entry": _entry, "live_floor": lambda k, w: floor,
-                "clock": _clock,
+                "clock": _clock, "extend_deadman": _arm,
                 "run_child": lambda argv, env, budget: (
                     ran.append((list(argv), dict(env), budget)), (rc, False))[1]}
         with contextlib.redirect_stdout(io.StringIO()) as _o:
@@ -3856,6 +4134,31 @@ try:
           "GhostSpiral child under the depth's own budget",
           _c1 == "done" and len(_r1) == 1
           and _r1[0][2] == P.WITHDRAW_DEPTHS[2][1])
+    # THE BACKSTOP OUTLASTS THE SWEEP. The shipped deadman is 9300 s and a
+    # leg at depth 2 runs past it: an idle-boot sweep was a mix the vault
+    # powered off in the middle of. Armed ONCE, for the whole wall, before
+    # the first leg; refused -- with nothing run -- when it cannot be.
+    check("sweep/run: ...having first armed a backstop for the sweep's whole "
+          "wall plus the same margin a withdrawal gets, exactly once",
+          _armed_log == [A.FEE_SWEEP_WALL_S + 600])
+    _armed_log.clear()
+    _cdm, _rdm, _odm = _sweep([int(0.6 * _XMR), int(0.6 * _XMR)],
+                              deadman=False)
+    check("sweep/run: a backstop that cannot be armed refuses the sweep by "
+          "name before any leg runs -- the short one is still armed",
+          _cdm == "deadman_too_short" and _rdm == []
+          and "backstop" in _odm and _armed_log == [A.FEE_SWEEP_WALL_S + 600])
+    _armed_log.clear()
+    _cdm2, _rdm2, _ = _sweep([int(0.6 * _XMR), int(0.2 * _XMR), None])
+    check("sweep/run: ...and a two-leg boot arms it once, not per leg",
+          _cdm2 == "done" and len(_rdm2) == 2 and len(_armed_log) == 1)
+    _armed_log.clear()
+    _sweep([int(0.6 * _XMR)], dry_run=True)
+    _sweep([int(0.3 * _XMR)])
+    _sweep([])
+    check("sweep/run: a dry run, a wait and an empty wallet arm nothing -- "
+          "nothing was going to spend",
+          _armed_log == [])
     check("sweep/run: ...whose entry bundle names the fee wallet's output, "
           "mode 0600",
           json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())["address"]
@@ -3921,6 +4224,16 @@ try:
           and _fs_log.count("fee_sweep:done") == 1
           and "fee_sweep:below_threshold" in _fs_log
           and not any(("0.6" in k or _FS_ADDR[:8] in k) for k in _fs_log))
+    _fs_log.clear()
+    A.integrity_log = lambda st, kind, *a, **k: _fs_log.append(kind)
+    try:
+        _sweep([int(0.6 * _XMR)], deadman=False)
+    finally:
+        A.integrity_log = _saved_il_fs
+    check("sweep/run: ...and a refused backstop is a kind of its own, with "
+          "no start recorded for a sweep that did not start",
+          "fee_sweep:deadman_too_short" in _fs_log
+          and "fee_sweep:start" not in _fs_log)
     # THE ENTRY IS THE WHOLE FEE WALLET, not the fee address alone: what a
     # sweep leaves on another subaddress is the next sweep's entry.
     check("sweep/entry: the fee wallet is asked the same question the mixing "
@@ -3941,7 +4254,7 @@ try:
             return None
         return _e
 
-    def _idle_boot(on_idle):
+    def _idle_boot(on_idle, unreachable=False, dry_run=False):
         d, kf, key, bell = new_env()
         key2 = dict(key, **_FS_KEY, fee_sweep_on_idle_boot=on_idle)
         key2["artifact_dir"] = str(d)
@@ -3949,30 +4262,57 @@ try:
         kf.write_text(json.dumps(P.lock_keyfile(key2, b"", role="thinkpad")))
         os.chmod(kf, 0o400)
         ran = []
-        deps = deps_for(d, bell, post_record=stub_post(bell),
+        slept = []
+        deps = deps_for(d, bell,
+                        post_record=((lambda u, p, r, timeout=30: (0, b""))
+                                     if unreachable else stub_post(bell)),
+                        sleep=slept.append,
                         fee_entry=_one_shot_entry(),
                         live_floor=lambda k, w: "0.0270",
                         run_child=lambda argv, env, budget: (
                             ran.append(list(argv)), (0, False))[1])
-        out, err, text = run(kf, deps)
-        return err, ran
+        out, err, text = run(kf, deps, dry_run=dry_run)
+        return err, ran, slept
 
-    _e_on, _r_on = _idle_boot(True)
+    _e_on, _r_on, _ = _idle_boot(True)
     check("sweep/idle: with fee_sweep_on_idle_boot a no-job boot runs the "
           "sweep and still ends as 'no job' (and powers off)",
           _e_on is not None and _e_on.code == "no_job" and len(_r_on) == 1
           and "--rpc-primary" in _r_on[0]
           and _r_on[0][_r_on[0].index("--rpc-primary") + 1]
           == "http://127.0.0.1:18085")
-    _e_off, _r_off = _idle_boot(False)
+    _e_off, _r_off, _ = _idle_boot(False)
     check("sweep/idle: without it -- the default -- a no-job boot is boot, "
           "sit, shut down, and nothing spends",
           _e_off is not None and _e_off.code == "no_job" and _r_off == [])
     check("sweep/idle: the sweep runs AFTER the no-job dwell, so a stranger's "
           "packet sees the same shape either way",
           _AGENT_SRC.index("_sleep(_rng.randint(NO_JOB_DWELL_LO_S")
-          < _AGENT_SRC.index("if _fcfg and _fcfg[\"on_idle_boot\"]:")
+          < _AGENT_SRC.index("_idle_boot_sweep(key, artifact_dir, d)",
+                             _AGENT_SRC.index("_sleep(_rng.randint("
+                                              "NO_JOB_DWELL_LO_S"))
           < _AGENT_SRC.index('raise Refused("no_job",'))
+    # THE IDLE BOOT THAT ACTUALLY HAPPENS HAS NO DOORBELL. It listens only
+    # during a pager wake, so a hand power-on -- the host's way of booting
+    # the vault when no client asked for anything -- ends at
+    # doorbell_unreachable, one branch before the no-job hook this sweep was
+    # hung on. It ran on a stranger's packet and never on the boot it was
+    # written for.
+    _e_hand, _r_hand, _s_hand = _idle_boot(True, unreachable=True)
+    check("sweep/idle: a boot that finds NO doorbell -- a hand power-on -- "
+          "runs the sweep too, and still ends as 'doorbell unreachable'",
+          _e_hand is not None and _e_hand.code == "doorbell_unreachable"
+          and len(_r_hand) == 1 and "--rpc-primary" in _r_hand[0])
+    _e_hoff, _r_hoff, _ = _idle_boot(False, unreachable=True)
+    check("sweep/idle: ...and without the flag that boot is unchanged: "
+          "refused, nothing spent",
+          _e_hoff is not None and _e_hoff.code == "doorbell_unreachable"
+          and _r_hoff == [])
+    _e_hdry, _r_hdry, _s_hdry = _idle_boot(True, unreachable=True,
+                                           dry_run=True)
+    check("sweep/idle: ...and never on a dry run, which sleeps nothing and "
+          "spends nothing",
+          _e_hdry is not None and _r_hdry == [] and _s_hdry == [])
 
     # THE BY-HAND RUN.
     d7, kf7, key7, bell7 = new_env()

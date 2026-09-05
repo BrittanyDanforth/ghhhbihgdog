@@ -398,15 +398,20 @@ check("every non-empty phase renders to a sentence, so none can reach a chat "
       all(w in P.PHASE_LINES for w in P.PHASES if w))
 
 _sd = Path(tempfile.mkdtemp(prefix="status_"))
-for _state, _total, _want in (("timeout", "0", "not_yet"),
-                              ("timeout", "0.4", "arriving"),
-                              ("funded", "1.23", "landed"),
-                              ("stalled", "0.4", "short"),
-                              ("not_syncing", "0", "stuck"),
-                              ("interrupted", "0", "")):
+# A timeout with money on the address splits on what is still PENDING: all of
+# it unlocked and under the quote is "partial" (short so far), some of it
+# still confirming is "arriving".
+for _state, _total, _unl, _want in (("timeout", "0", "0", "not_yet"),
+                                    ("timeout", "0.4", "0.4", "partial"),
+                                    ("timeout", "0.4", "0.1", "arriving"),
+                                    ("funded", "1.23", "1.23", "landed"),
+                                    ("stalled", "0.4", "0.4", "short"),
+                                    ("not_syncing", "0", "0", "stuck"),
+                                    ("moved", "", "", "moved"),
+                                    ("interrupted", "0", "0", "")):
     (_sd / AG.STATUS_FILE).write_text(json.dumps(
-        {"state": _state, "total": _total, "unlocked": _total, "ticks": 2}))
-    check(f"receive_watch {_state!r} with total={_total} -> {_want!r}",
+        {"state": _state, "total": _total, "unlocked": _unl, "ticks": 2}))
+    check(f"receive_watch {_state!r} with {_unl}/{_total} -> {_want!r}",
           AG._phase_of("swap_status", _sd) == _want)
 
 # THE SPLIT THAT MATTERS. receive_watch has no "arriving" state -- it is built
