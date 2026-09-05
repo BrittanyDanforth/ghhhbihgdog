@@ -2581,29 +2581,23 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <h3 style="margin-top:18px">Your usage fee</h3>
       <label class="chk"><input type="checkbox" id="usage_fee">
         <span>Keep a usage fee from every deposit<span class="d">paid as one more
-        destination on the fan-out, to a FRESH account and subaddress minted
-        for this run</span></span></label>
+        destination on the fan-out, to an address of a wallet of your own
+        (below) — with no address, no fee is taken</span></span></label>
       <div class="f"><label for="usage_fee_pct">Fraction
         <span class="d">default 0.011 = 1.1%</span></label>
         <input id="usage_fee_pct" autocomplete="off" spellcheck="false" placeholder="0.011"></div>
-      <div class="f"><label for="usage_fee_address">Send the usage fee here instead
-        <span class="d">optional — a fixed address of your own</span></label>
-        <input id="usage_fee_address" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="4… (leave empty to mint a fresh one each run)"></div>
-      <p class="lead mut-s"><b>What a fixed address costs.</b> One address
-      collecting from every run is the address reuse this toolchain refuses
-      everywhere else, and mixing does not retract it. Leave the box empty and
-      a new account and subaddress are minted per run, so no two runs share a
-      collection point.</p>
-      <p class="lead mut-s"><b>Unless a phone can spend from this wallet.</b>
-      A minted fee account lands on the wallet being mixed. The woken path
-      chooses its entry by taking the largest unlocked output on that wallet
-      and has no way to tell your cut from a deposit — so once the run’s
-      exit has swept everything else out, that fee account is what the next
-      withdrawal started from the chat will pick up, and it goes to whatever
-      address the chat named. If this wallet is paired for withdrawals, put an
-      address in the box. Several addresses can be paired on that side and one
-      is drawn per run, which spreads the collection point the way an empty
-      box would.</p>
+      <div class="f"><label for="usage_fee_address">Send the usage fee here
+        <span class="d">required for a fee — an address of a wallet of your own, never one of this wallet’s</span></label>
+        <input id="usage_fee_address" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="4… or 8… (empty = no fee is taken)"></div>
+      <p class="lead mut-s"><b>Why it must be off this wallet.</b> A fee minted
+      onto the wallet being mixed used to be spent by the next withdrawal as
+      if it were a deposit: the woken path takes the largest unlocked output
+      on the wallet and cannot tell your cut from a deposit, and a label that
+      could would outlive every wipe on a seized card. So the cut goes to a
+      wallet of your own or it is not taken, from the desk and from the phone
+      alike. One address is fine — outputs to the same Monero address are not
+      linkable on-chain; a fresh subaddress per run is a nicety, not a
+      defence.</p>
       <p class="lead mut-s"><b>What no setting here can fix.</b> The usage fee is a
       published fraction of the deposit. Wherever you eventually spend it,
       whoever you spend it with sees an amount — and dividing it by the

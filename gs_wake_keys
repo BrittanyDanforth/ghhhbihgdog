@@ -346,8 +346,9 @@ def build_cli() -> argparse.ArgumentParser:
     #
     # THIS HELP USED TO SAY OMITTING IT WAS THE RECOMMENDED SETTING, on the
     # reasoning that GhostSpiral then mints a fresh account per run "so no
-    # address collects from two runs". That is true of a DESKTOP run and has
-    # never been true of a woken one, which is the only kind this file pairs.
+    # address collects from two runs". That was true of a DESKTOP run and
+    # never of a woken one; it is now true of neither -- plan_usage_fee
+    # waives the cut with no destination off the wallet, on both paths.
     #
     # gs_wake_agent's _withdraw_fee_argv passes --usage-fee only when this
     # field is set, because a freshly minted account lands ON THE MIXING
@@ -435,13 +436,14 @@ def _validate(args) -> None:
     # notion of whose it is -- so a cut minted there is paid out to whoever
     # withdraws next. That gate is on the WOKEN path only.
     #
-    # gs_console's fee panel recommends the opposite for a run started at the
-    # desk: "leave the box empty and a new account and subaddress are minted
-    # per run, so no two runs share a collection point". That is sound advice
-    # about address reuse and it mints onto THIS wallet -- and once a phone can
-    # spend from this wallet, _funded_entry will select that account exactly as
-    # readily. Driven: a wallet whose user deposit has been swept out reports
-    # the desktop-minted fee account as the entry for the next /withdraw.
+    # gs_console's fee panel USED TO recommend the opposite for a run started
+    # at the desk: "leave the box empty and a new account and subaddress are
+    # minted per run". That minted onto THIS wallet, and once a phone could
+    # spend from it, _funded_entry selected that account exactly as readily.
+    # Driven: a wallet whose user deposit had been swept out reported the
+    # desktop-minted fee account as the entry for the next /withdraw.
+    # plan_usage_fee no longer mints at all -- no destination, no cut -- so
+    # what remains of the hazard is a cut an OLDER desk run left behind.
     #
     # NEITHER TOOL CAN DETECT THE OTHER. The console has no keyfile and the
     # agent does not know what was run at the desk. This is the one moment both
@@ -461,16 +463,15 @@ def _validate(args) -> None:
         print("      1. A withdrawal started from the chat takes NO usage fee.")
         print("         The cut can only be taken to somewhere off this")
         print("         wallet, and nowhere off it has been named.")
-        print("      2. If you run the mix from the desk with 'Keep a usage")
-        print("         fee' ticked and the address box EMPTY, that cut is")
-        print("         minted onto this wallet -- and the next withdrawal")
-        print("         started from the chat will pick it up and send it to")
-        print("         whatever address the chat names. The console page")
-        print("         recommends leaving that box empty; on a wallet a phone")
-        print("         can spend from, do not.")
+        print("      2. A cut that an OLDER desk run minted onto this wallet")
+        print("         (before the tool stopped doing that) is still there,")
+        print("         and the next withdrawal started from the chat")
+        print("         will pick it up and send it to whatever address the")
+        print("         chat names, as if it were a deposit. Sweep any such")
+        print("         account off this wallet at the desk BEFORE pairing.")
         print()
-        print("      Give --usage-fee-address (repeat it for several) to fix")
-        print("      both, or continue if you meant to take no fee.")
+        print("      Give --usage-fee-address (repeat it for several) to take")
+        print("      a fee, or continue if you meant to take no fee.")
         print()
     if args.wallet_file and not os.path.isabs(args.wallet_file):
         sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "

@@ -3051,10 +3051,21 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
 
 
 #: Bytes per transaction used to turn monerod's per-BYTE fee into a per-
-#: transaction one. A 1-in/2-out ring-16 transfer is ~1.5-2.2 kB; 2000 is now
-#: the one figure every reader of get_fee_estimate shares (GhostSpiral's fee
-#: path, the console's panel, the vault's deposit floor). It was written inline
-#: in two of them.
+#: transaction one. A 1-in/2-out ring-16 RingCT transfer is ~1.5-2.2 kB; 2000
+#: is the one figure every reader of get_fee_estimate shares (GhostSpiral's
+#: fee path, the console's panel, the vault's deposit floor). It was written
+#: inline in two of them.
+#:
+#: A CONSENSUS ASSUMPTION, NOT A CONSTANT OF NATURE. The size of a transaction
+#: is set by the proof system in force: a hard fork that replaces ring
+#: signatures (FCMP++ is the one in flight for Monero) makes transactions
+#: LARGER, and with it every per-transaction figure derived here is too low
+#: by the same factor -- the reserve under-funds a hop, and the run stalls
+#: mid-pipeline with money already moved. FEE_SAFETY_MARGIN (1.5x) absorbs
+#: drift, not a doubling. Re-measure this against a real transaction's
+#: `weight` after any consensus change; GhostSpiral's fee path learns the
+#: real fee by building a transaction once, which is the check that catches
+#: it at run time.
 TX_BYTES_ESTIMATE = 2000
 #: monerod's own fees[] ratios. get_fee_estimate on mainnet returns
 #: [20000, 80000, 320000, 4000000] piconero/byte (20/80/320/4000 nanonero),

@@ -3586,14 +3586,21 @@ def _plan_fee(bal, _mint=None, **kw):
         ghost.integrity_log, ghost.create_fresh_account = _old_log, _old_acct
 
 
+# NO DESTINATION OFF THE WALLET, NO CUT. This used to mint a fresh account on
+# the mixing wallet and pay the cut there, and the next phone withdrawal spent
+# it as if it were a deposit (_funded_entry takes the largest unlocked output
+# and cannot tell revenue from a deposit; a label to tell them apart would
+# outlive every wipe on a seized card). Waived, loudly, with what to set.
 _addr, _amt, _out, _pair = _plan_fee(Decimal("1"))
-check("fee: a 1 XMR deposit yields exactly 1.1%", _amt == Decimal("0.0110"))
-check("fee: ...paid to a FRESHLY MINTED account, not a reused address -- the "
-      "reuse this toolchain refuses in three other places",
-      bool(_addr) and "freshly minted" in _out)
-check("fee: ...and the operator is TOLD the account and the amount, because "
-      "the wallet is the only authoritative record that they were paid",
-      "account 7" in _out and "0.0110" in _out)
+check("fee: with no destination off the wallet the cut is WAIVED, not minted "
+      "onto the wallet being mixed",
+      _addr is None and _amt == 0 and _pair is None
+      and "NO USAGE FEE TAKEN" in _out and "OFF this wallet" in _out)
+check("fee: ...and the operator is told what to set, so a silent zero is not "
+      "a hidden broken fee",
+      "GS_USAGE_FEE_ADDRESS" in _out and "going ahead in full" in _out)
+check("fee: ...and no account was minted for it -- the wallet was never asked",
+      "freshly minted" not in _out and "account 7" not in _out)
 
 # BELOW THE SPENDABILITY FLOOR: WAIVE, NEVER ABORT. This ran after the swap, so
 # "nothing has been spent" was false of the deposit -- the BTC is through
@@ -3615,8 +3622,8 @@ check("fee: ...and it does NOT claim nothing has been spent, which is false "
 # NON-VACUITY: the floor must actually bite somewhere, or "waived" is a branch
 # that never runs.
 check("fee: NON-VACUITY -- the waive is a real threshold, not a dead branch",
-      _plan_fee(Decimal("1"))[0] is not None
-      and _plan_fee(_WAIVE_BAL)[0] is None)
+      _plan_fee(Decimal("1"), usage_fee_address=_FEE_A1)[0] is not None
+      and _plan_fee(_WAIVE_BAL, usage_fee_address=_FEE_A1)[0] is None)
 check("fee: no cut asked for means no cut and no minting",
       _plan_fee(Decimal("1"), usage_fee=False, usage_fee_pct=Decimal(0))[0] is None)
 
@@ -3630,10 +3637,17 @@ check("fee: the cut is rounded DOWN, so it never exceeds the stated fraction",
 _addr4, _amt4, _out4, _pair4 = _plan_fee(Decimal("1"),
                                          usage_fee_address=_FEE_A1)
 check("fee: a static address is used as given", _addr4 == _FEE_A1)
-check("fee: ...and the reuse it causes is stated at the moment it happens",
-      "collect from every run" in _out4)
-check("fee: NON-VACUITY -- the freshly minted path does NOT print that warning",
-      "collect from every run" not in _out)
+check("fee: ...and a 1 XMR deposit yields exactly 1.1% there",
+      _amt4 == Decimal("0.0110") and "0.0110" in _out4)
+# NOT "the reuse this toolchain refuses everywhere else": outputs to one
+# Monero address are unlinkable on-chain, and the fee address is never
+# published the way a swap destination is. What identifies runs is the amount.
+check("fee: ...and what identifies runs there is stated -- the amount, a "
+      "published fraction, and not the address",
+      "published fraction" in _out4 and "not linkable on-chain" in _out4
+      and "reuse this toolchain refuses" not in _out4)
+check("fee: NON-VACUITY -- the waived path does NOT print that disclosure",
+      "published fraction" not in _out)
 
 # ---- A STATIC ADDRESS INSIDE THIS WALLET IS THE ONE THE EXIT SWEEPS -------
 #
@@ -3712,9 +3726,9 @@ _fa, _famt2, _fpair2, _fout2 = _plan_static(_ForeignRPC())
 check("fee/own: NON-VACUITY -- an address the wallet does NOT hold keys to is "
       "used exactly as given, which is the ordinary case",
       _fa == _FEE_A1 and _famt2 > 0 and _fpair2 is None)
-check("fee/own: NON-VACUITY -- ...and gets the reuse warning, not the "
-      "in-wallet one",
-      "collect from every run" in _fout2 and "THIS WALLET" not in _fout2)
+check("fee/own: NON-VACUITY -- ...and gets the fee disclosure, not the "
+      "in-wallet refusal",
+      "published fraction" in _fout2 and "THIS WALLET" not in _fout2)
 # ONE STATEMENT PER RUN. The refusal used to print AFTER the reuse warning, so
 # a waived run said "the usage fee goes to a FIXED address you supplied" and
 # then, four lines later, "NO USAGE FEE TAKEN" -- two claims about the same run
@@ -3852,7 +3866,9 @@ def _fee_and_exit_accounts():
     _old_log, _old_acct = ghost.integrity_log, ghost.create_fresh_account
     ghost.integrity_log = lambda *x, **y: None
     ghost.create_fresh_account = lambda rpc, label="": _FEE_ACCT
-    a = _fee_args()
+    # A DESTINATION OFF THE WALLET, or no fee is taken at all now; the
+    # question below is still whether the exit would sweep what was paid.
+    a = _fee_args(usage_fee_address=_FEE_A1)
     a.usage_fee_pct = ghost.USAGE_FEE_PCT
     # A realistic addr_index: three mix subaddresses on their own accounts.
     _ai = {f"4{'m' * 94}{i}": (i, 1) for i in range(3)}
@@ -3944,10 +3960,9 @@ check("fee/exit: NON-VACUITY -- and the docstring alone does not fool it: "
 # So plan_usage_fee also HANDS BACK the pair, main() passes it to _stage5_run
 # as exit_fee_hold, and _run_exit_withdrawals refuses it by name. Inert while
 # the omission holds. Loud the day it does not.
-check("fee/hold: the minted cut reports the (account, subaddress) it landed on",
-      _pair == (7, 3))
-check("fee/hold: ...and it is the same account the operator was told about",
-      f"account {_pair[0]}" in _out and f"subaddress {_pair[1]}" in _out)
+check("fee/hold: with no destination there is no pair, because nothing was "
+      "minted for the exit to refuse",
+      _pair is None)
 check("fee/hold: a static address reports NO pair — this run did not create "
       "it, so it can name no account, and the exit never enumerates it anyway",
       _pair4 is None and _addr4 == _FEE_A1)
@@ -3991,20 +4006,18 @@ def _boom(rpc, label=""):
 
 
 _maddr, _mamt, _mout, _mpair = _plan_fee(Decimal("1"), _mint=_boom)
-check("fee/mint: a wallet that will not mint the fee account WAIVES the cut",
-      _maddr is None and _mamt == 0 and _mpair is None)
-check("fee/mint: ...and does not raise, because the swap has already settled "
-      "by the time this runs",
-      "NO USAGE FEE TAKEN" in _mout)
-check("fee/mint: ...and says the mix is going ahead, so the operator does not "
-      "kill a run that is still fine",
-      "going ahead in full" in _mout)
-check("fee/mint: ...and reports the wallet's own reason rather than swallowing "
-      "it", "refused create_account" in _mout)
-# NON-VACUITY: the same call with a working wallet DOES take the fee, so the
-# waive is a response to the failure and not the helper's normal answer.
-check("fee/mint: NON-VACUITY -- the same deposit with a working wallet takes "
-      "the cut", _addr is not None and _amt > 0)
+check("fee/mint: the wallet is never asked to mint a fee account -- a wallet "
+      "that would refuse changes nothing",
+      _maddr is None and _mamt == 0 and _mpair is None
+      and "refused create_account" not in _mout)
+check("fee/mint: ...and the run does not raise, because the swap has already "
+      "settled by the time this runs",
+      "NO USAGE FEE TAKEN" in _mout and "going ahead in full" in _mout)
+# NON-VACUITY: the same deposit with a destination OFF the wallet takes the
+# cut, so the waive is the answer to a missing destination and not the
+# helper's only answer.
+check("fee/mint: NON-VACUITY -- the same deposit with a destination off the "
+      "wallet takes the cut", _addr4 is not None and _amt4 > 0)
 
 
 class _BadSubRPC:
@@ -4028,10 +4041,10 @@ try:
     _sout = _sb.getvalue()
 finally:
     ghost.integrity_log, ghost.create_fresh_account = _old_l, _old_a
-check("fee/mint: a wallet that mints the account but refuses the SUBADDRESS "
-      "waives too — the account exists but is empty and unreferenced",
+check("fee/mint: a wallet that would refuse the SUBADDRESS is never asked "
+      "for one either",
       _s_addr is None and _s_amt == 0 and _s_pair is None)
-check("fee/mint: ...and says so rather than raising",
+check("fee/mint: ...and the waive is said rather than anything raised",
       "NO USAGE FEE TAKEN" in _sout)
 
 # ---- SPEND HYGIENE, ON THE ACCOUNTS NOTHING ELSE COVERS -------------------
@@ -4043,13 +4056,13 @@ check("fee/mint: ...and says so rather than raising",
 # is an arbitrary amount, but each of these is a FIXED FRACTION of one deposit,
 # so spending two together does not merely link the fees, it measures the runs
 # behind them.
-check("fee/hygiene: the minted disclosure says to spend the fee on its own",
-      "SPEND IT ON ITS OWN" in _out)
+check("fee/hygiene: the fee disclosure says to spend the fee on its own",
+      "SPEND IT ON ITS OWN" in _out4)
 check("fee/hygiene: ...and gives the reason that is specific to a fee — the "
       "fixed rate divides back to the deposit",
-      "divide by the rate" in _out and "share an owner" in _out)
+      "divide by the rate" in _out4 and "share an owner" in _out4)
 check("fee/hygiene: ...and says not to send it where the mixed output goes",
-      "same" in _out and "destination as your mixed output" in _out)
+      "same destination" in _out4 and "mixed output" in _out4)
 # NON-VACUITY: the waived branch mints nothing, so it must NOT print advice
 # about an account that does not exist.
 check("fee/hygiene: NON-VACUITY -- a waived cut prints no such advice, so the "
@@ -4094,26 +4107,19 @@ try:
                              ghost.FALLBACK_FEE_XMR)
 finally:
     ghost.integrity_log, ghost.create_fresh_account = _old_l2, _old_a2
-check("fee/label: the fee ACCOUNT is minted with an empty label — a label is "
-      "written into the wallet file, which paranoia_mode never deletes",
-      _LABELS["acct"] == "")
-check("fee/label: ...and so is the SUBADDRESS inside it", _LABELS["sub"] == "")
-# NON-VACUITY: the recorder really did see both calls, so an empty string is
-# an observed label and not an un-run stub.
-check("fee/label: NON-VACUITY -- both mints were actually reached, so the "
-      "empty labels are observed and not defaults of a call that never "
-      "happened",
-      _LABELS["acct"] is not None and _LABELS["sub"] is not None)
-# ...and at the source level, so the property is also readable: neither call
-# may pass a label expression at all.
-check("fee/label: neither mint passes anything but a literal empty label",
-      all(isinstance(_k.value, _ast.Constant) and _k.value.value == ""
-          for _n in _ast.walk(_pf_fn) if isinstance(_n, _ast.Call)
-          for _k in _n.keywords if _k.arg == "label"))
-check("fee/label: NON-VACUITY -- there ARE label= keywords in plan_usage_fee "
-      "for that check to have read",
-      len([_k for _n in _ast.walk(_pf_fn) if isinstance(_n, _ast.Call)
-           for _k in _n.keywords if _k.arg == "label"]) == 2)
+# NOTHING IS MINTED FOR THE FEE ANY MORE, so there is nothing to label. The
+# label question -- a label is written into the wallet file, which
+# paranoia_mode never deletes -- is closed by removing the mint, not by
+# keeping the label empty: with no destination off the wallet the cut is
+# waived, and the wallet is never asked for an account or a subaddress.
+check("fee/label: with no destination the wallet is asked for neither an "
+      "account nor a subaddress, so no label can reach the wallet file",
+      _LABELS["acct"] is None and _LABELS["sub"] is None)
+check("fee/label: ...and plan_usage_fee carries no label= keyword at all, so "
+      "there is no mint left for a later edit to label",
+      not any(_k.arg == "label"
+              for _n in _ast.walk(_pf_fn) if isinstance(_n, _ast.Call)
+              for _k in _n.keywords))
 
 # WHAT REACHES THE PERSISTENT CHAIN. The fee is a fixed fraction of the
 # deposit, so an amount on the chain is the deposit on the chain.
