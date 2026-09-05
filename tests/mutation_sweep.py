@@ -575,11 +575,11 @@ MUTATIONS = [
  # and a later watch follows the newer job's address.
  ("a colliding handle overwrites the record it lands on", "gs_wake_agent",
   "    for _ in range(64):\n"
-  "        if handle not in handles:\n"
+  "        if handle not in _taken:\n"
   "            break\n"
   "        handle = proto.new_handle()",
   "    for _ in range(0):\n"
-  "        if handle not in handles:\n"
+  "        if handle not in _taken:\n"
   "            break\n"
   "        handle = proto.new_handle()",
   ["test_wake_agent"]),
@@ -834,10 +834,10 @@ MUTATIONS = [
  # exactly one file does not get resolved by picking one of them.
  ("a multi-bundle mint is resolved by hex sort order instead of refused",
   "gs_wake_agent",
-  "            if len(new) != 1:\n"
-  '                raise Refused("bundle_ambiguous",',
-  "            if not new:\n"
-  '                raise Refused("bundle_ambiguous",',
+  "                if len(new) != 1:\n"
+  '                    raise Refused("bundle_ambiguous",',
+  "                if not new:\n"
+  '                    raise Refused("bundle_ambiguous",',
   ["test_wake_agent"]),
 
  # "did not authenticate" and "authenticated, then refused" are different facts
@@ -2967,7 +2967,8 @@ MUTATIONS = [
  ("/status discloses the wake count and the power state again",
   "gs_telegram_pager",
   "            self.send(cid, _why if _why\n"
-  '                      else ("wait" if self.busy.locked() else "ready"),\n'
+  '                      else ("wait" if (self.busy.locked() or self._hold_why())\n'
+  '                            else "ready"),\n'
   "                      buttons=MENU_BUTTONS)",
   '            self.send(cid, f"pokes in last 24h: {len(self.limits.recent())}/"\n'
   '                           f"{self.limits.daily_cap}\\n"\n'
@@ -3058,12 +3059,10 @@ MUTATIONS = [
   '            # that does not start a job now leaves the counter alone.\n'
   '            self._chain_leg = int(leg)\n'
   '            self.limits.record()\n'
-  '            self._set_in_flight(True)\n'
   '            integrity_log("pager", f"poke:{job}")',
   '        self._running = cid\n'
   '        self._chain_leg = int(leg)\n'
   '        self.limits.record()\n'
-  '        self._set_in_flight(True)\n'
   '        integrity_log("pager", f"poke:{job}")\n'
   '        try:',
   ["test_telegram_pager"]),
@@ -3075,12 +3074,16 @@ MUTATIONS = [
  ("the leg number is written by calls that never start a job, so the chain "
   "cap stops firing",
   "gs_telegram_pager",
-  "        why = self.limits.why_not()\n"
+  "        why = self.limits.why_not() or self._hold_why()\n"
   "        if why:\n"
+  "            if held:\n"
+  "                self._drop_busy()\n"
   '            self.send(cid, f"no: {why}")',
   "        self._chain_leg = int(leg)\n"
-  "        why = self.limits.why_not()\n"
+  "        why = self.limits.why_not() or self._hold_why()\n"
   "        if why:\n"
+  "            if held:\n"
+  "                self._drop_busy()\n"
   '            self.send(cid, f"no: {why}")',
   ["test_telegram_pager"]),
 
@@ -3341,8 +3344,9 @@ MUTATIONS = [
  # unfiltered version would tell one chat that another one is mid-job.
  ("the what-is-running answer stops filtering by chat",
   "gs_telegram_pager",
-  "            _mine = [_k for _k, _v in self.handle_owner.items() "
-  "if _v == cid]",
+  "            _mine = [_k for _k, _v in self.handle_owner.items()\n"
+  "                     if _v == cid\n"
+  "                     and self.handle_job.get(_k) not in self.UNWATCHABLE_JOBS]",
   "            _mine = list(self.handle_owner)",
   ["test_telegram_pager"]),
 

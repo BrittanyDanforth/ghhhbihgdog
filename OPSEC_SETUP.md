@@ -770,7 +770,9 @@ pocket-dial — and a tap is a pocket-dial.
    | `/exit` | `GS_EXIT_TO`, at the vault, at mix time — this channel can never name or select a destination |
 2. Pi checks Tor, allowlisted chat id, rate limit.
 3. `gs_doorbell wake` binds its LAN socket **first**, waits a random
-   0–15 min, then sends the magic packet and holds one job for 10 min.
+   0–15 min, then sends the magic packet and holds one job for 10 min,
+   repeating the packet every minute until the vault collects it (a vault
+   still shutting down from its last job ignores the first one).
    It hands that job over **at most once**, sealed to a public key the
    booting ThinkPad mints for that boot alone.
 4. ThinkPad boots. `gs_wake_agent` checks it can do the job **before**
@@ -1160,11 +1162,30 @@ job and it powers off. Two ways to get a sweep:
 - By hand: power the vault on, run `gs_wake_agent --fee-sweep --key ...`
   from the desk. The agent's preflight applies (inhibit file, lock, Tor,
   resources), and a person at the keyboard stops the power-off.
-- On an idle boot: with `--fee-sweep-on-idle-boot` paired, a boot the
-  doorbell has **no job** for — a hand power-on, or a magic packet from
-  anyone on the switch — runs the sweep after the usual no-job dwell, then
-  powers off. It is off by default because a stranger's packet then keeps
-  the vault on, with the fee wallet unlocked, for the hours a mix takes.
+- On an idle boot: with `--fee-sweep-on-idle-boot` paired, a boot that has
+  **no job** runs the sweep, then powers off. That is *both* idle boots: a
+  hand power-on, which finds no doorbell at all (the doorbell listens only
+  during a pager wake, so this is the one that actually happens when you
+  press the button), and a magic packet from anyone on the switch, which
+  finds a doorbell with nothing for it and dwells the usual 1–3 minutes
+  first. It is off by default because a stranger's packet then keeps the
+  vault on, with the fee wallet unlocked, for the hours a mix takes.
+
+**It arms its own backstop.** The shipped deadman is 9300 s, sized for the
+largest non-spending job; a sweep leg at depth 2 or 3 runs past it. Before
+its first leg the sweep arms the same longer transient timer a withdrawal
+arms (its whole 16-hour wall plus ten minutes) and refuses, spending
+nothing, if it cannot (`fee_sweep:deadman_too_short` in the chain). A
+by-hand run on a desk machine therefore leaves that timer armed when it
+finishes; `--dry-run` arms nothing.
+
+**So "eventually" means:** a cut lands on the fee wallet at every chat
+withdrawal; it is swept the next time the vault is on with nothing else to
+do and the threshold is met — which, with `--fee-sweep-on-idle-boot`, is
+the next time you press the power button, and without it is the next time
+you run `--fee-sweep`. A host who never boots the vault idle never sweeps:
+put a monthly reminder against it, or leave the flag on and accept what a
+stranger's packet costs.
 
 **What a sweep costs the client.** While it runs the vault is busy for hours
 and a client's job arriving in that window is not collected: the doorbell's
@@ -1204,12 +1225,74 @@ vault finishes its job with nobody to tell. The next pager process used to
 answer `/status` with "ready" as if nothing had run, and a withdrawal's
 "sent" was simply never said. The pager now persists **one bit** in its
 state file, set when a wake starts and cleared when its result has been
-handled; on start, a set bit is announced to every allowlisted chat —
+handled, together with the **latest moment that wake can still be running**
+(the same figure the "working — up to Nh" message quotes, rounded up to the
+five-minute bucket everything else in that file is kept at). On start, a
+set bit is announced to every allowlisted chat. If that moment has passed:
 "Restarted while something was running … its result is lost: CHECK before
-starting another" — and cleared. No job name, no amount: the bit. A
+starting another", and the bit is cleared. If it has **not**: "It may still
+be running for up to Nh … nothing else can start until then", every
+command is refused and `/status` answers "wait" until it passes — because
+a wake sent at a vault that is mid-job finds the doorbell's port free (the
+old process is gone) and the vault deaf to it: ten minutes of "never picked
+up" and a daily slot spent, for nothing. The bit stays set through the
+hold, so a second restart inside it holds too. No job name, no amount. A
 withdrawal chain interrupted this way does not double-spend: each leg spends
 one entry, the interrupted leg's entry is already gone, and the next
 `/withdraw` picks up from the largest remaining one.
+
+### 4e. Several deposits, several withdrawals: what the ledger now tracks
+
+One client, one bot, but the client is allowed more than one thing in
+flight, and the vault's handle ledger is what keeps them apart. What it
+records, and what the chat is told:
+
+- **A deposit that was paid out is "moved".** A withdrawal spends one
+  receive subaddress — the largest unlocked output — and the vault marks
+  every handle whose bundle points at it as *spent*, on the run that
+  reported done and no other. A later `/check` on that label is answered
+  from the ledger ("that one arrived and was sent on"), without waking a
+  watcher on an emptied address to be told "nothing on the address yet".
+- **A second deposit that landed during a withdrawal is "still
+  unlocking".** A finished leg that finds nothing *unlocked* asks the
+  wallet for its locked total; over the mix floor, the chat hears "More is
+  here but still unlocking — /withdraw again in a while" rather than
+  "nothing more was found", and no leg is armed that would find nothing
+  spendable.
+- **A withdrawal's label is not a deposit's.** Its result carries a label
+  like every job's, but there is nothing to watch on it; `/check` on it is
+  refused here, without a wake, and "/check" alone no longer offers it.
+- **A failed quote's address is the next deposit's.** Step 0 mints an
+  account and step 1 quotes; when the quote failed, the account sat unused
+  and the next `/deposit` minted another, one of the 45-account ceiling
+  per retry. A record with a bundle, no slip file, not marked spent, whose
+  subaddress the wallet says holds nothing, is taken instead of minting.
+  (If the wallet cannot be asked, it is not taken.)
+- **The same address twice is refused.** A wallet whose account list rolled
+  back (a file restored from a backup) mints the same account again; the
+  vault refuses the quote (`bundle_reused`) if a fresh bundle names an
+  (account, subaddress) an earlier handle already names, and
+  `create_receive_wallet` now asks the wallet-rpc to `store` right after
+  minting, so a power cut minutes later does not forget the account.
+- **The three-minute probe claims less.** It passed `--stall-min 3` and
+  could report a fully-unlocked partial arrival as "stopped growing" after
+  one look; it passes no stall window now and says "some of it is here and
+  spendable, under what was quoted so far. Ask again later" — "stopped
+  growing" is the 110-minute `/wait`'s verdict.
+- **A chained leg is not lost to a tap.** The next leg starts with the job
+  lock still held (a tap on "Has it arrived?" between legs used to take it
+  first and end the chain), and the Pi repeats the magic packet every
+  minute until the vault collects — the first one landed while the vault
+  was still shutting down from the previous leg and was lost.
+
+**What is still true, and worth knowing.** Labels are four hex characters
+plus a tag over (chat, handle). `paranoia_mode` wipes the ledger and the
+slip files but not the pairing, so a label the phone still shows can, with
+probability 1/65536 per new deposit, be drawn again and then name the new
+deposit's status. The vault avoids handles still named by a slip file on
+disk, which covers the ledger's 1000-entry prune; it cannot cover a wipe.
+If you wipe the vault, re-pair — every outstanding label then stops
+verifying, which is the honest state of a machine that has forgotten them.
 
 ### The pager's unit needs a `WorkingDirectory`, and the reason is not obvious
 

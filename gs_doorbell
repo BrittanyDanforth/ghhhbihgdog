@@ -134,6 +134,17 @@ FETCH_WINDOW_S = 600
 #: 5-20 min jitter after it boots; that one is the floor, because a pwned Pi
 #: can zero this one and a pwned Pi must not be able to shorten the vault's.
 PRE_WOL_MAX_S = 900
+#: How often the magic packet is REPEATED while the vault has not collected.
+#: One packet was sent, and a packet that lands while the vault is still
+#: shutting down from its last job is ignored by a machine that is on and
+#: then missed by one that is off. A chained withdrawal's next leg is sent
+#: seconds after the previous leg's result, i.e. exactly then, and the chain
+#: died "never picked up" with money on the wallet -- on the shipped
+#: constants, most of the time. The same 102 bytes to the same broadcast,
+#: repeated at this cadence for as long as the fetch window is open: a
+#: machine already up ignores them, a machine that was mid-shutdown boots
+#: on the next one.
+WOL_RESEND_S = 60
 
 
 class Doorbell(Exception):
@@ -1321,10 +1332,26 @@ def run_wake(args, key: dict, job: str, params: dict,
         # handover it is reporting. Watching the timestamp from this loop
         # costs one comparison a second and cannot touch the handover.
         _said = False
+        _last_wol = clock()
         while not pending.finished():
             if not _said and pending.collected_at is not None:
                 _said = True
                 _fire("collected")
+            # REPEATED UNTIL COLLECTED. See WOL_RESEND_S.
+            if (pending.collected_at is None and pending.fetch_open()
+                    and clock() - _last_wol >= WOL_RESEND_S):
+                try:
+                    send_wol(key["target_mac"],
+                             key.get("wol_broadcast", "255.255.255.255"),
+                             int(key.get("wol_port", 9)),
+                             sock_factory=sock_factory)
+                except Exception:                            # noqa: BLE001
+                    # The first send validated the MAC; what can fail here
+                    # is a socket, and the next tick tries again.
+                    pass
+                _last_wol = clock()
+                if "wake_resent" not in pending.events:
+                    pending.events.append("wake_resent")
             sleep(1)
     finally:
         # THE OVER-CAP REFUSALS, SAID BY THE ONLY FUNCTION THAT CAN SEE THEM.
@@ -1383,6 +1410,10 @@ def _report_events(pending: Pending) -> None:
         print(f"  [*] {retry} wake note(s) repeated a boot this box had already "
               f"answered and were served the same job record again -- a retry, "
               f"or a note replayed on the LAN. Nothing ran twice.")
+    if "wake_resent" in pending.events:
+        print("  [*] The magic packet was repeated while the vault had not "
+              "collected -- a machine still shutting down from its last job "
+              "ignores the first one. Nothing about the job changed.")
     bad = pending.events.count("result_bad")
     if bad:
         # Deliberately NOT called hostile. Any host on the LAN can post one

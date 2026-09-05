@@ -2886,7 +2886,7 @@ check("chain: the handover announces nothing of its own",
 # Driven with nine arrivals: nine mixes ran.
 check("chain: the leg number is carried by start_job, not by the slot the "
       "handover clears",
-      "def start_job(self, cid: int, job: str, params: dict, leg: int = 0)"
+      "def start_job(self, cid: int, job: str, params: dict, leg: int = 0,"
       in _SRC_PG_EARLY
       and "self._chain_leg = int(leg)" in _SRC_PG_EARLY)
 # AND IT IS ARMED ONLY AFTER THE REPORT LANDS. If the completion could not be
@@ -4038,11 +4038,191 @@ check("in-flight: start_job sets the bit right after the poke is recorded, "
       "the worker clears it before releasing the lock, and run() announces "
       "before the first poll",
       _SRC_PG_EARLY.index("self.limits.record()")
-      < _SRC_PG_EARLY.index("self._set_in_flight(True)")
+      < _SRC_PG_EARLY.index("self._set_in_flight(True,")
       and _SRC_PG_EARLY.index("self._set_in_flight(False)")
       < _SRC_PG_EARLY.index("self.busy.release()")
       and _SRC_PG_EARLY.index("self.announce_restart()")
       < _SRC_PG_EARLY.index("while not shutdown_requested():"))
+
+# ---- ...AND HOLDS EVERY COMMAND WHILE THAT WAKE MAY STILL BE RUNNING ------
+#
+# The bit alone said "its result is lost" and then answered "ready": the next
+# command sent a magic packet at a vault that was mid-withdrawal, found the
+# doorbell's port free (the old process is gone) and waited ten minutes for a
+# collection that could not come. The state file carries the latest moment
+# the wake can still be running; until then, everything is "wait".
+print("\n== a restart inside the wake's window holds ==")
+_now = time.time()
+_lh = pg.Limits(_ifp, 300, 2)
+_lh.in_flight, _lh.in_flight_until = True, _now + 4000
+_lh.save()
+_lh2 = pg.Limits(_ifp, 300, 2)
+check("hold: the moment is persisted, rounded UP to the stamp bucket -- a "
+      "hold that ends early is a wake sent at a busy vault",
+      _lh2.in_flight is True
+      and _now + 4000 <= _lh2.in_flight_until < _now + 4000 + pg.Limits.STAMP_BUCKET_S
+      and _lh2.in_flight_until % pg.Limits.STAMP_BUCKET_S == 0)
+_ifp.write_text('{"offset": 1, "in_flight": true, "in_flight_until": "soon"}')
+check("hold: a malformed moment reads as none", pg.Limits(_ifp, 300, 2).in_flight_until == 0.0)
+_hp, _hs = _room_pager([111], [])
+_hp.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                   recent=lambda: [], daily_cap=12, offset=0,
+                                   in_flight=True, in_flight_until=_now + 7200,
+                                   save=lambda: None)
+_h_said = _hp.announce_restart()
+check("hold: on start, a wake whose window has not passed is announced as "
+      "possibly still running, with how long, and the bit is NOT cleared",
+      _h_said is True and len(_hs) == 1
+      and "may still be running" in _hs[0] and "h" in _hs[0]
+      and _hp.limits.in_flight is True and _hp._hold_until == _now + 7200)
+_hs.clear()
+_hp.handle(_msg(111, 111, "/status"))
+check("hold: /status answers 'wait' for the whole window",
+      _hs == ["wait"])
+_hs.clear()
+_hp.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
+check("hold: start_job refuses every job until then, saying why, and "
+      "without taking the lock",
+      len(_hs) == 1 and _hs[0].startswith("no: something from before the "
+                                          "restart may still be running")
+      and not _hp.busy.locked())
+check("hold: ...and the refusal names no job, no amount and no address",
+      not any(w in _hs[0].lower() for w in ("withdraw", "deposit", "xmr"))
+      and not re.search(r"[0-9a-f]{20,}", _hs[0], re.I))
+_hp._hold_until = time.time() - 1
+_hs.clear()
+_hp._status_at = {}
+_hp.handle(_msg(111, 111, "/status"))
+check("hold: once the window has passed, /status is 'ready' again and the "
+      "persisted bit is cleared with it",
+      _hs == ["ready"] and _hp.limits.in_flight is False
+      and _hp._hold_until == 0.0)
+_hpo, _hso = _room_pager([111], [])
+_hpo.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                    recent=lambda: [], daily_cap=12, offset=0,
+                                    in_flight=True, in_flight_until=_now - 5,
+                                    save=lambda: None)
+_hpo.announce_restart()
+check("hold: NON-VACUITY -- a wake whose window HAS passed gets the "
+      "'result is lost' sentence and no hold",
+      len(_hso) == 1 and "result is lost" in _hso[0]
+      and getattr(_hpo, "_hold_until", 0.0) == 0.0
+      and _hpo.limits.in_flight is False)
+check("hold: the deposit wizard's pre-check applies the hold too, so a "
+      "conversation is not walked through its questions to be refused at "
+      "the confirm",
+      _SRC_PG_EARLY.count("self.limits.why_not() or self._hold_why()") == 2)
+check("hold: start_job records the moment from the same figure the working "
+      "message quotes, so the two cannot drift",
+      "self._set_in_flight(True, until=time.time() + _hold)" in _SRC_PG_EARLY
+      and _SRC_PG_EARLY.index("_hold = (proto.result_budget_s(job)")
+      < _SRC_PG_EARLY.index("self._set_in_flight(True, until=time.time() + _hold)"))
+
+# ---- A WITHDRAWAL'S LABEL IS NOT A DEPOSIT'S ------------------------------
+#
+# Its result carries a handle like every other job's, and this box recorded it
+# as a label the chat owns: "/check" alone offered "the last one in this chat"
+# with an ask-again button for a label the vault holds no bundle for. The tap
+# cost a wake and came back "refused before it started".
+print("\n== a withdrawal's label cannot be watched ==")
+check("unwatchable: a withdrawal's handle is one the vault will never watch",
+      "withdraw" in pg.Pager.UNWATCHABLE_JOBS)
+_up, _us, _, _uj = _tapper()
+_up.key = dict(_KEY)
+_up.handle_owner["A3F1"] = 111
+_up.handle_job["A3F1"] = "withdraw"
+_up.handle(_msg(111, 111, f"/check {pg.confirmation_number(_KEY, 111, 'A3F1')}"))
+check("unwatchable: /check on it is refused here -- no wake -- and says what "
+      "it is, not that it does not exist",
+      _uj == [] and len(_us) == 1 and _us[0][0].startswith("no:")
+      and "withdrawal" in _us[0][0] and "deposit" in _us[0][0])
+_us.clear()
+_up.handle(_msg(111, 111, "/check"))
+check("unwatchable: ...and '/check' alone does not offer it as 'the last one "
+      "in this chat'",
+      len(_us) == 1 and "nothing has been started" in _us[0][0]
+      and _uj == [])
+_up.handle_owner["B7C2"] = 111
+_up.handle_job["B7C2"] = "receive_and_quote"
+_us.clear()
+_up.handle(_msg(111, 111, "/check"))
+check("unwatchable: NON-VACUITY -- a deposit's label is still offered",
+      len(_us) == 1 and pg.confirmation_number(_KEY, 111, "B7C2") in _us[0][0])
+
+# ---- MORE, STILL UNLOCKING ------------------------------------------------
+#
+# A deposit that landed during the leg is inside the unlock window. "Nothing
+# more was found" for it was a false statement about the balance; the vault
+# says "more_locked" and this end says "in a while" instead of arming a leg
+# that would find nothing spendable yet.
+print("\n== more is here, still unlocking ==")
+
+
+def _locked_run():
+    _lp, _ls, _, _ = _tapper()
+    _lp.start_job = pg.Pager.start_job.__get__(_lp, pg.Pager)
+    _legs = [0]
+
+    class _Leg:
+        def __init__(self):
+            _legs[0] += 1
+            self.result = {"status": "done", "handle": "", "slip": "",
+                           "plain": {}, "phase": "more_locked"}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(
+            run_wake=lambda *a, **k: _Leg())
+        _lp.start_job(111, "withdraw",
+                      {"exit_to": ["4" + "8" * 94], "depth": 2})
+        for _ in range(600):
+            if not _lp.busy.locked() and _lp._chain is None:
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _legs[0], [t for t, _b in _ls]
+
+
+_nl, _ml = _locked_run()
+check("locked: 'more_locked' runs ONE leg and says the rest is still "
+      "unlocking, in a while -- no next leg, no 'nothing more'",
+      _nl == 1
+      and any("sent." in t and "still unlocking" in t for t in _ml)
+      and not any("another is starting" in t.lower() for t in _ml)
+      and not any(pg.proto.WITHDRAW_NO_MORE_LINE in t for t in _ml))
+
+# ---- THE CHAIN HANDS THE LOCK OVER RATHER THAN DROPPING IT ----------------
+#
+# Between a release and the next leg's acquire, a tap on "Has it arrived?"
+# from the poll thread could take `busy` first, and the chain died with "the
+# next one did not start" -- money still on the wallet, the run over, from a
+# tap the completion message had just invited.
+_hand = _SRC_PG_EARLY.split("_next, self._chain = self._chain, None")[1]
+_hand = _hand.split('integrity_log("pager", "chain_start_failed")')[0]
+check("chain: the next leg is started with the lock still held, and the "
+      "lock is released only when there is no next leg",
+      "held=True" in _hand
+      and "if not _next:\n                self.busy.release()" in _hand)
+check("chain: ...and start_job gives a held lock back on every refusal path "
+      "that does not start a thread",
+      _SRC_PG_EARLY.count("if held:\n                self._drop_busy()") == 2
+      and "if not held and not self.busy.acquire(blocking=False):"
+      in _SRC_PG_EARLY)
+_hb, _hbs = _room_pager([111], [])
+_hb.spenders = 2
+_hb.busy.acquire()
+_hb.start_job(111, "withdraw", {"exit_to": ["4" + "8" * 94], "depth": 2},
+              leg=1, held=True)
+check("chain: a held handover that is refused frees the lock (driven: the "
+      "one-spender refusal)",
+      not _hb.busy.locked() and any("more than one person" in t for t in _hbs))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

@@ -501,6 +501,102 @@ check("...and NO magic packet was sent — never wake a machine you have not "
       "proven you can answer", order == ["bind"])
 
 
+print("\n== the magic packet is repeated until the vault collects ==")
+# A packet that lands while the vault is still shutting down from its LAST
+# job is ignored by a machine that is on and then missed by one that is off.
+# A chained withdrawal's next leg is sent seconds after the previous leg's
+# result -- exactly then -- and the chain died "never picked up" with money
+# on the wallet. Repeated every WOL_RESEND_S while the fetch window is open
+# and nothing has collected.
+
+
+class _IdleSrv:
+    refused_connections = 0
+
+    def serve_forever(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+    def server_close(self):
+        pass
+
+
+def _wake_uncollected(collect_at=None):
+    """Drive run_wake on an injected clock; the vault collects at
+    `collect_at` seconds (or never). Returns (packets sent, pending)."""
+    t = [5000.0]
+    sent = []
+
+    class _Sock:
+        def setsockopt(self, *a):
+            pass
+
+        def sendto(self, pkt, addr):
+            sent.append(t[0])
+            return len(pkt)
+
+        def close(self):
+            pass
+
+    holder = {}
+
+    def _factory(addr, handler):
+        holder["pending"] = handler.pending if hasattr(handler, "pending") \
+            else None
+        return _IdleSrv()
+
+    def _sleep(s):
+        t[0] += s
+        p = holder.get("p")
+        if (p is not None and collect_at is not None
+                and p.collected_at is None and t[0] - 5000.0 >= collect_at):
+            p.collected_at = p.clock()
+            p.result = {"status": "done"}
+
+    _real_pending = DB.Pending
+
+    class _Spy(_real_pending):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            holder["p"] = self
+
+    DB.Pending = _Spy
+    try:
+        p = DB.run_wake(Args(), KEY, "swap_status", {"handle": "A3F1"},
+                        server_factory=_factory,
+                        sock_factory=lambda: _Sock(), sleep=_sleep,
+                        clock=lambda: t[0])
+    finally:
+        DB.Pending = _real_pending
+    return sent, p
+
+
+_sent_never, _p_never = _wake_uncollected()
+_expect = 1 + (DB.FETCH_WINDOW_S - 1) // DB.WOL_RESEND_S
+check(f"resend: a vault that never collects is sent the packet once, then "
+      f"every {DB.WOL_RESEND_S} s until the fetch window closes "
+      f"({_expect} in all)",
+      len(_sent_never) == _expect
+      and all(b - a == DB.WOL_RESEND_S
+              for a, b in zip(_sent_never, _sent_never[1:])))
+check("resend: ...recorded once as an event, and the outcome is still "
+      "'expired uncollected' -- the repeat changes nothing about the job",
+      _p_never.events.count("wake_resent") == 1
+      and _p_never.outcome() == "expired_uncollected")
+_sent_soon, _p_soon = _wake_uncollected(collect_at=30)
+check("resend: a vault that collects inside the first interval is sent "
+      "exactly ONE packet -- nothing is repeated at a machine that answered",
+      len(_sent_soon) == 1 and "wake_resent" not in _p_soon.events)
+_sent_late, _p_late = _wake_uncollected(collect_at=150)
+check("resend: ...and one that collects after two intervals was sent three "
+      "and no more",
+      len(_sent_late) == 3 and _p_late.events.count("wake_resent") == 1)
+check("resend: the cadence is a named constant the docs can quote",
+      isinstance(DB.WOL_RESEND_S, int) and 0 < DB.WOL_RESEND_S < DB.FETCH_WINDOW_S)
+
+
 print("\n== the doorbell persists nothing ==")
 scratch = Path(tempfile.mkdtemp())
 cwd = os.getcwd()

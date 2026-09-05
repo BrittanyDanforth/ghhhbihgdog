@@ -110,7 +110,10 @@ LIVENESS_DOUBT_S = 600
 #: target produces routinely (P ~ e^-5 per window, over a rolling multi-hour
 #: watch). Thirty minutes is a gap a healthy wallet does not produce (e^-15),
 #: so the verdict waits at least that long however short the stall window is.
-#: The agent's probes pass --stall-min 30 already; this covers the by-hand run.
+#: The agent's long watch takes the 30-minute default and its three-minute
+#: probe passes no stall window at all (the default is longer than the
+#: probe, so neither stall verdict can fire in it); this covers the by-hand
+#: run.
 LIVENESS_MIN_S = 1800
 
 # ── what counts as MONEY ARRIVING, as opposed to noise ─────────────────────
@@ -655,10 +658,12 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
         #
         # Monero targets a TWO MINUTE block. This verdict fired on `stall_s`
         # alone, and gs_wake_agent's swap_status probe -- which is what
-        # /check runs -- passes --stall-min 3, because the whole probe is only
-        # three minutes and stall_min may not exceed timeout_min. So the
-        # window was 180 s, and P(no block in 180 s) on a PERFECTLY HEALTHY
-        # wallet is e^-1.5, about 22%.
+        # /check runs -- passed --stall-min 3 then, to match its three-minute
+        # timeout. So the window was 180 s, and P(no block in 180 s) on a
+        # PERFECTLY HEALTHY wallet is e^-1.5, about 22%. (The probe passes
+        # no stall window at all now, for the balance-stall verdict's
+        # version of the same mistake; the floor here stays, for the
+        # by-hand run.)
         #
         # Better than one /check in five returned "not scanning, so this says
         # NOTHING about your money. Check." -- an alarm, about the operator's

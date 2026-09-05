@@ -232,6 +232,20 @@ def mint_one_receive(wallet_rpc, args, seen_addrs=None, seen_accts=None,
             f"    Nothing was published, so no payment can have been sent "
             f"anywhere by this run.")
 
+    # WRITTEN TO DISK NOW, NOT AT SHUTDOWN. monero-wallet-rpc keeps a new
+    # account and subaddress in memory until it stores, which it does on an
+    # orderly stop and on its own schedule. This tool runs on a machine that
+    # is powered off minutes later by a timer, sometimes by a cut: an
+    # address published here and then forgotten by the wallet is minted
+    # AGAIN for the next deposit -- two deposits, one address, and the wake
+    # agent's ledger check (bundle_reused) is the only thing left to catch
+    # it. A store that fails is not a mint that failed: the address is real
+    # and owned; it is logged and the run goes on.
+    try:
+        wallet_rpc.raw_request("store", {})
+    except Exception:                                        # noqa: BLE001
+        integrity_log("wallet", "store_failed")
+
     # The label's CONTENT never reaches the integrity chain -- only whether one
     # was set. This logged `label={args.label}` verbatim. The entire reason
     # this tool defaults to no label is that a label describes an address's

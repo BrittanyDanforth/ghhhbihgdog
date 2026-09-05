@@ -1099,6 +1099,7 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
         _watched = False
     t0 = _clock()
     legs = 0
+    _armed = False
     while True:
         found = fee_wallet_entry(key, cfg, injected=d.get("fee_entry"))
         if not found:
@@ -1146,6 +1147,26 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
             if legs == 0:
                 return "more_left"
             break
+        # THE BACKSTOP MUST OUTLAST THE SWEEP, AND NOTHING HERE ARMED ONE.
+        # The shipped deadman is 9300 s, sized for the largest non-spending
+        # job; a leg at depth 2 or 3 runs far past it. So an idle-boot
+        # sweep was a mix the vault powers off in the middle of -- the one
+        # failure GhostSpiral cannot recover from on its own -- with the
+        # fee wallet's money half-moved, on the path built so that money is
+        # never left half-moved. A withdrawal arms a longer one at
+        # _run_validated; the sweep spends the same way and gets the same
+        # rule, applied once for the whole wall the loop is allowed, before
+        # anything spends. A refusal here has spent nothing.
+        if not _armed:
+            if not d.get("extend_deadman", extend_deadman)(
+                    int(FEE_SWEEP_WALL_S) + 600):
+                integrity_log("wake", "fee_sweep:deadman_too_short")
+                agent_say("  [!] Fee sweep: could not arm a backstop long "
+                          "enough for a mix, so nothing was started. The "
+                          "short one is still armed and this machine will "
+                          "still power itself off.")
+                return "deadman_too_short"
+            _armed = True
         bundle = artifact_dir / FEE_SWEEP_BUNDLE
         atomic_write_json({"schema": "gs_receive_wallet_v1",
                            "address": addr,
@@ -1195,6 +1216,35 @@ def run_fee_sweep_cli(args, deps: dict = None) -> str:
                       power=False)
     return run_fee_sweep(key, artifact_dir, d,
                          bool(getattr(args, "dry_run", False)))
+
+
+def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
+    """A boot with no job is the fee sweep's moment, if the keyfile says so.
+
+    Returns whether the keyfile asked for it. A misconfigured keyfile is said
+    and logged, and counts as "no": the boot goes on to power off as it would
+    have.
+
+    CALLED FROM TWO PLACES, AND THE SECOND IS THE ONE THAT HAPPENS. This hook
+    was hung on the doorbell's "no job for you" answer alone -- which needs a
+    doorbell that answers. The doorbell listens only during a pager wake, so
+    a HAND POWER-ON, the way the host actually boots this machine when no
+    client has asked for anything, finds no doorbell at all and ends at
+    doorbell_unreachable, one branch earlier. The sweep "on an idle boot" ran
+    on a stranger's magic packet and never on the boot it was written for.
+    Both boots have no job, the machine is on and preflight passed; both get
+    the hook.
+    """
+    try:
+        _fcfg = fee_sweep_config(key)
+    except Refused as _fe:
+        agent_say(f"  [!] {_fe.msg}")
+        integrity_log("wake", "fee_sweep:misconfigured")
+        return False
+    if not (_fcfg and _fcfg["on_idle_boot"]):
+        return False
+    run_fee_sweep(key, artifact_dir, d, False)
+    return True
 
 
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
@@ -1293,9 +1343,21 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  "--receive-wallet", str(bundle),
                  "--pairs", str(slip),
                  "--timeout-min", "3",
-                 # stall_min must not exceed timeout_min or the tool warns and
-                 # the stall check can never fire inside the window anyway.
-                 "--stall-min", "3",
+                 # NO --stall-min, AND THE ABSENCE IS THE FIX. This passed
+                 # --stall-min 3 to match the timeout, so the tool would
+                 # not warn -- and receive_watch checks the balance stall
+                 # BEFORE the timeout on the same tick. A partial arrival
+                 # that had fully unlocked (the first of two transactions,
+                 # a refund leg still to come) therefore came back "stalled"
+                 # from three minutes of looking: "it has stopped growing.
+                 # Check before going further", with the full menu under
+                 # it, one tap from a withdrawal that strands the second
+                 # leg on a burned address. The tool's own liveness check
+                 # says in as many words that a three-minute probe is too
+                 # short to reach a verdict and should time out; the
+                 # default stall window (30 min) is longer than the probe,
+                 # so that branch cannot fire, the tool prints its warning
+                 # into the job log, and _phase_of reads what was SEEN.
                  "--result-json", str(artifact_dir / STATUS_FILE)]]
     if job == "withdraw":
         # THE ADDRESS IS NOT HERE, and that is the whole point of this branch.
@@ -1811,6 +1873,16 @@ def run_once(args, deps: dict = None) -> tuple:
     # Echoing the window binds the note to the wake it was written for.
     wstat, window = _post(key["doorbell_url"], "/window", b"")
     if wstat != 200 or len(window) != proto.WINDOW_BYTES:
+        # NO DOORBELL AT ALL IS THE IDLE BOOT THAT ACTUALLY HAPPENS. See
+        # _idle_boot_sweep: the doorbell listens only during a pager wake,
+        # so a hand power-on lands here, not at the no-job branch below.
+        # Status 0 only -- a doorbell that answered something else is a
+        # doorbell that is up, and a wake may be in progress around this
+        # boot. Never on a dry run, which stops short of everything that
+        # spends. No dwell: the sweep is hours, and a boot that does not
+        # run one is left exactly as it was.
+        if wstat == 0 and not args.dry_run:
+            _idle_boot_sweep(key, artifact_dir, d)
         raise Refused("doorbell_unreachable",
                       "the doorbell did not hand over a wake window, so there "
                       "is nothing to bind this note to. Nothing was handed "
@@ -1934,18 +2006,12 @@ def run_once(args, deps: dict = None) -> tuple:
         # A BOOT WITH NO JOB IS THE FEE SWEEP'S MOMENT, if the keyfile says
         # so. The doorbell has nothing for this boot, the machine is on and
         # preflight passed; with fee_sweep_on_idle_boot the operator has
-        # chosen to let a hand power-on (or a stranger's magic packet: the
-        # flag's help says what that costs) run the sweep before the
-        # power-off. Off by default. AFTER the dwell, so the hostile-packet
-        # shape is unchanged when it does not run.
-        try:
-            _fcfg = fee_sweep_config(key)
-        except Refused as _fe:
-            agent_say(f"  [!] {_fe.msg}")
-            integrity_log("wake", "fee_sweep:misconfigured")
-            _fcfg = None
-        if _fcfg and _fcfg["on_idle_boot"]:
-            run_fee_sweep(key, artifact_dir, d, bool(args.dry_run))
+        # chosen to let a boot nobody asked for -- a stranger's magic
+        # packet here, a hand power-on at the /window fetch above -- run
+        # the sweep before the power-off. Off by default: the flag's help
+        # says what a stranger's packet then costs. AFTER the dwell, so
+        # the hostile-packet shape is unchanged when it does not run.
+        _idle_boot_sweep(key, artifact_dir, d)
         raise Refused("no_job",
                       "the doorbell answered, and it has no job for this boot. "
                       "That is what a magic packet from anyone on the switch "
@@ -2182,6 +2248,10 @@ _PHASE_OF_STATE = {
     "not_syncing": "stuck",
     "timeout": "not_yet",
     "interrupted": "",
+    # WRITTEN BY _dispatch ITSELF, not by receive_watch: a handle whose
+    # arrival a withdrawal has already spent is answered from the ledger,
+    # without waking the watcher on an emptied address to hear "nothing".
+    "moved": "moved",
 }
 
 
@@ -2216,6 +2286,19 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
         try:
             _left = _funded_entry(key)
             if not _left:
+                # NOTHING UNLOCKED IS NOT NOTHING. A deposit that landed
+                # while this leg ran is inside the network's unlock window
+                # for twenty minutes, and _funded_entry cannot see it by
+                # design (a mix planned around it fails partway). "Nothing
+                # more was found" for it was a false statement about the
+                # balance, on the surface this chain was added to stop
+                # making one -- and the client, told that, was done, with
+                # their second deposit still on the wallet. The same floor
+                # as below: locked dust is not more.
+                _locked = _locked_value(key)
+                if (_locked is not None
+                        and _locked >= Decimal(live_min_out_xmr(key))):
+                    return "more_locked"
                 return ""
             # ...AND IT HAS TO BE BIG ENOUGH TO MIX, or the next leg is a wake
             # spent to fail at stage 0.
@@ -2262,10 +2345,20 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
         # and telling an operator "nothing yet" when their money is two
         # confirmations away is the same class of wrong answer as telling them
         # the vault failed.
+        # ...AND "ARRIVING" SPLITS AGAIN. "Still confirming" is what a
+        # balance with something pending is; a balance that has ALL
+        # unlocked and is still under the quote is not confirming anything,
+        # it is short SO FAR -- a swap delivered in two transactions, or a
+        # refund leg still to come. The probe cannot tell "so far" from
+        # "for good" in three minutes (see the argv: it passes no stall
+        # window for exactly that reason), so it says what it saw and asks
+        # for another look, and leaves "stopped growing" to the long watch.
         if word == "not_yet":
             try:
-                if Decimal(str(out.get("total") or "0")) > 0:
-                    word = "arriving"
+                _tot = Decimal(str(out.get("total") or "0"))
+                _unl = Decimal(str(out.get("unlocked") or "0"))
+                if _tot > 0:
+                    word = "partial" if _unl >= _tot else "arriving"
             except (InvalidOperation, ValueError):
                 pass                      # unreadable total: stay with not_yet
         return word if proto.phase_is_known(word) else ""
@@ -2372,8 +2465,128 @@ def _funded_entry(key: dict, injected=None, rpc_url: str = None):
         return None
 
 
+def _locked_value(key: dict, injected=None, rpc_url: str = None):
+    """XMR on this wallet that has arrived and not yet unlocked, or None.
+
+    ONE NUMBER, NOT AN ENTRY. Nothing is spent from this; it decides whether
+    a finished withdrawal says "more is here, still unlocking" or "nothing
+    more was found", and for that the wallet's own total is the honest figure
+    -- the arrival is on SOME subaddress, and which one is the next leg's
+    question, asked when it can be answered. None when the wallet could not
+    be asked, which the caller treats as "" (say nothing), never as "more".
+    """
+    if injected is not None:
+        return injected()
+    try:
+        from gs_common import connect_rpc
+        rpc = connect_rpc(rpc_url or key["rpc_primary"],
+                          proxy_url=key.get("tor_proxy", ""))
+        r = rpc.raw_request("get_balance",
+                            {"account_index": 0, "all_accounts": True}) or {}
+        _bal, _unl = r.get("balance"), r.get("unlocked_balance")
+        for _v in (_bal, _unl):
+            if not isinstance(_v, int) or isinstance(_v, bool):
+                return None
+        return Decimal(str(max(_bal - _unl, 0))) / Decimal(10 ** 12)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _bundle_pair(rec: dict):
+    """(account, subaddress) a handle record's bundle points at, or None.
+
+    Read from the bundle FILE through the one strict loader, never from the
+    record: the record holds a path and the file holds the address, and a
+    record whose file is gone (wiped, or never written) names nothing.
+    """
+    try:
+        from gs_common import load_receive_bundle
+        _b = load_receive_bundle(rec.get("bundle"))
+        return (int(_b["account_index"]), int(_b["subaddress_index"]))
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _subaddress_total(key: dict, acct: int, sub: int, injected=None):
+    """Atomic units on ONE subaddress, locked and unlocked together, or None.
+
+    None is "could not be asked", and the caller treats it as "not zero":
+    a bundle is reused only when the wallet has SAID nothing ever reached it.
+    """
+    if injected is not None:
+        return injected(key, acct, sub)
+    try:
+        from gs_common import connect_rpc
+        rpc = connect_rpc(key["rpc_primary"], proxy_url=key.get("tor_proxy", ""))
+        r = rpc.raw_request("get_balance",
+                            {"account_index": int(acct),
+                             "address_indices": [int(sub)],
+                             "all_accounts": False}) or {}
+        for _s in (r.get("per_subaddress") or []):
+            if _s.get("address_index") == int(sub):
+                _amt = _s.get("balance")
+                if isinstance(_amt, int) and not isinstance(_amt, bool):
+                    return _amt
+                return None
+        # A subaddress the wallet does not list has never been paid.
+        return 0
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _reusable_receive(key: dict, handles: dict, balance=None):
+    """(handle, bundle) of a receive address minted and never quoted, or None.
+
+    A DEPOSIT WHOSE QUOTE FAILED LEFT AN ACCOUNT BEHIND, FOREVER. Step 0
+    mints a fresh wallet account and step 1 quotes the swap; when step 1
+    fails -- the quote under the mix floor, Tor down, the provider gone --
+    the record is saved with no slip, the phone hears "failed" with no
+    label, and the NEXT /deposit mints ANOTHER account. Every retry burned
+    one of a ceiling (45) that nothing on this disk can reset, and once it
+    was reached every /deposit was refused "before it started", forever,
+    with the reason kept on this machine.
+
+    The address is unused: the quote is what publishes it, and the quote
+    never ran. So it is the right address for the next deposit, and it is
+    taken instead of minting. THREE THINGS MAKE IT SAFE: the record has no
+    slip file (nothing was ever published for it), it is not marked spent,
+    and the wallet says the subaddress holds nothing -- and "could not ask"
+    counts as "holds something".
+    """
+    _ask = (lambda k, a, s: balance(k, a, s)) if balance else _subaddress_total
+    for _h, _rec in handles.items():
+        if _rec.get("spent") is True or not _rec.get("bundle"):
+            continue
+        _slip = _rec.get("slip")
+        if _slip and Path(_slip).exists():
+            continue
+        if not Path(_rec["bundle"]).is_file():
+            continue
+        _pair = _bundle_pair(_rec)
+        if _pair is None:
+            continue
+        if _ask(key, _pair[0], _pair[1]) == 0:
+            return _h, _rec["bundle"]
+    return None
+
+
+def _handles_on_disk(d: Path) -> set:
+    """Handles still named by a slip file in the artifact directory.
+
+    The redraw loop below avoids the LEDGER's handles; the ledger keeps the
+    newest MAX_HANDLES and drops the rest, while their slip files may still
+    be on disk and their labels still on a phone. A handle drawn again after
+    its record fell off names two deposits to one chat. The files are the
+    other place the machine remembers, so they are asked too.
+    """
+    out = set()
+    for _f in glob.glob(str(d / "thor_pairs_*.json")):
+        out.add(Path(_f).name[len("thor_pairs_"):-len(".json")])
+    return out
+
+
 def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
-              funded=None) -> tuple:
+              funded=None, reuse_balance=None) -> tuple:
     """Run the job's tools in order. Returns (code, status, handle)."""
     budget = proto.JOBS[job]["budget_s"]
     handles = _load_handles(artifact_dir)
@@ -2387,8 +2600,9 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # Four characters stays. The operator reads it aloud off a terminal;
     # widening it to fix a bookkeeping problem would be paying in the wrong
     # currency, and the fix costs nothing here.
+    _taken = set(handles) | _handles_on_disk(artifact_dir)
     for _ in range(64):
-        if handle not in handles:
+        if handle not in _taken:
             break
         handle = proto.new_handle()
     else:
@@ -2399,6 +2613,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                       "things it wipes.")
 
     bundle = slip = None
+    _spent_pair = None
     # EVERY JOB THAT NAMES A HANDLE RESOLVES IT HERE, and `withdraw` was
     # missing from this tuple while its argv template already interpolated
     # `bundle`. Driven: the composed command was
@@ -2491,12 +2706,30 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                            "subaddress_index": int(_fs),
                            "rpc_endpoint": key.get("rpc_primary", "")},
                           Path(bundle), perms=0o600)
+        # REMEMBERED FOR THE LEDGER, written there only if the run reports
+        # done -- see the end of this function. A failed run has moved
+        # nothing it can be sure of, and a handle marked spent about money
+        # still sitting there is the lie in the other direction.
+        _spent_pair = (int(_fa), int(_fs))
     elif job in ("watch", "swap_status"):
         rec = handles.get(params["handle"])
         if not rec:
             raise Refused("unknown_handle",
                           f"no bundle on this machine for handle "
                           f"{params['handle']}.")
+        # PAID AND SENT ON, ANSWERED FROM THE LEDGER. A watcher on an
+        # address that was paid and then emptied by a withdrawal sees a
+        # zero balance and times out into "nothing on the address yet.
+        # Normal -- ask again in a while", with an ask-again button under
+        # it: a wake spent to tell the client their money never came,
+        # about money that came and was sent to them, and an invitation
+        # to spend the next wake hearing it again. The handle had no state
+        # after "landed". It has one now, and the answer costs no child.
+        if rec.get("spent") is True:
+            atomic_write_json({"state": "moved"},
+                              artifact_dir / STATUS_FILE, perms=0o600)
+            integrity_log("wake", "watch_spent_handle")
+            return "done", "done", handle
         bundle, slip = rec.get("bundle"), rec.get("slip")
         # ONE HANDLE, ONE ADDRESS. A job that wrote several bundles could
         # not have its handle name one of them without picking arbitrarily,
@@ -2570,20 +2803,61 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
                        slip=slip, handle=handle, owned_fee=_owned_fee)
 
+    # AN ADDRESS MINTED FOR A DEPOSIT THAT NEVER GOT ITS QUOTE IS THE NEXT
+    # DEPOSIT'S ADDRESS. See _reusable_receive; decided before the loop so
+    # step 0 (the mint) can be skipped whole.
+    _reuse = (_reusable_receive(key, handles, balance=reuse_balance)
+              if job == "receive_and_quote" else None)
     before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
     for i, argv in enumerate(steps):
         env_extra = {}
+        if job == "receive_and_quote" and i == 0 and _reuse:
+            continue
         if job == "receive_and_quote" and i == 1:
-            # Identify the new bundle by a DIRECTORY DIFF, not by parsing
-            # stdout: a tool's human-facing output is not an interface, and a
-            # wrong bundle here would quote a swap to the wrong address.
-            new = sorted(set(glob.glob(str(artifact_dir / "wallet_*.json")))
-                         - before)
-            if len(new) != 1:
-                raise Refused("bundle_ambiguous",
-                              f"expected exactly one new receive bundle, found "
-                              f"{len(new)}. Refusing to quote a swap without "
-                              f"knowing which address it pays.")
+            if _reuse:
+                _old_h, _old_b = _reuse
+                new = [_old_b]
+                # THE OLD RECORD GOES. Its handle was reported to a phone
+                # that dropped it (a failed deposit carries no label), and
+                # two handles naming one address is the collision the
+                # redraw loop exists to prevent.
+                handles.pop(_old_h, None)
+                integrity_log("wake", "receive_bundle_reused")
+            else:
+                # Identify the new bundle by a DIRECTORY DIFF, not by
+                # parsing stdout: a tool's human-facing output is not an
+                # interface, and a wrong bundle here would quote a swap to
+                # the wrong address.
+                new = sorted(set(glob.glob(str(artifact_dir
+                                               / "wallet_*.json")))
+                             - before)
+                if len(new) != 1:
+                    raise Refused("bundle_ambiguous",
+                                  f"expected exactly one new receive "
+                                  f"bundle, found {len(new)}. Refusing "
+                                  f"to quote a swap without knowing "
+                                  f"which address it pays.")
+                # ...AND IT MUST BE AN ADDRESS THIS LEDGER HAS NEVER SEEN.
+                # create_receive_wallet checks for a repeated answer only
+                # within one run. A wallet whose account list rolled back
+                # (a file restored from a backup, a power cut before it
+                # was stored) mints the same account and subaddress again,
+                # and two deposits then quote one address: one client's
+                # watch confirms on the other's arrival, and the two are
+                # later spent as one pile, linked on-chain. Refused before
+                # the quote, so nothing is published for it.
+                _np = _bundle_pair({"bundle": new[0]})
+                if _np is not None and any(
+                        _bundle_pair(_r) == _np for _r in handles.values()
+                        if _r.get("bundle")):
+                    integrity_log("wake", "receive_bundle_duplicate")
+                    raise Refused(
+                        "bundle_reused",
+                        "the wallet handed out an address it had already "
+                        "handed out for an earlier deposit, which means "
+                        "its account list has gone backwards. Nothing was "
+                        "published. Check the wallet at the machine before "
+                        "taking another deposit.")
             argv[argv.index("--dest-from-receive-wallet") + 1] = new[0]
             # THE AMOUNT, AS A DECIMAL BTC STRING, IN THE ENVIRONMENT.
             # thor_swap_preparer reads GS_SWAP_AMOUNTS through env_or_argv and
@@ -2848,6 +3122,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             _save_handles(artifact_dir, handles)
             return "job_failed", "failed", handle
 
+    # THE DEPOSIT THAT JUST LEFT IS MARKED, on the run that reports done and
+    # no other. The withdrawal's entry was one handle's receive address (or
+    # none: money that came in some other way has no handle); every record
+    # pointing at that (account, subaddress) is now a deposit that has been
+    # paid out, and a /check on it is answered from here -- see the
+    # watching branch above -- rather than from an emptied address.
+    if _spent_pair is not None:
+        for _rec in handles.values():
+            if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:
+                _rec["spent"] = True
     _save_handles(artifact_dir, handles)
     integrity_log("wake", f"job_done:{job}")
     return "done", "done", handle

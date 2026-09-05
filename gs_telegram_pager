@@ -102,6 +102,26 @@ def _bucket(t: float, size: int) -> float:
     return float(int(t) // int(size) * int(size))
 
 
+def _bucket_up(t: float, size: int) -> float:
+    """Round a wall-clock stamp UP to a bucket. 0 stays 0.
+
+    For the one stamp that is a HOLD rather than a history: rounding it
+    down would end the hold early, and an early end is a wake sent at a
+    vault that may still be busy.
+    """
+    if not t or size <= 1:
+        return float(t or 0)
+    _b = _bucket(t, size)
+    return _b if _b == float(t) else _b + float(size)
+
+
+def _hold_words(seconds: float) -> str:
+    """'3h' or '20 min': the coarse figure a wait is quoted in, rounded up
+    past an hour like the working message's own."""
+    _s = int(max(0, seconds))
+    return f"{_s // 3600 + 1}h" if _s >= 3600 else f"{max(1, _s // 60)} min"
+
+
 #: The token env var. Never a flag: see the module docstring.
 TOKEN_ENV = "GS_TG_BOT_TOKEN"
 
@@ -1066,6 +1086,11 @@ class Limits:
         #: that a result was lost rather than answering "ready" as if nothing
         #: had happened. Not the job, not the chat: the bit.
         self.in_flight = False
+        #: ...AND THE LATEST WALL-CLOCK MOMENT THAT WAKE CAN STILL BE RUNNING,
+        #: bucketed like the stamps. A restart inside it holds every command
+        #: until it passes: the vault may be mid-job, and a second wake would
+        #: find the doorbell's port free and the vault deaf to it.
+        self.in_flight_until = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -1096,6 +1121,10 @@ class Limits:
                       if isinstance(x, (int, float))
                       and not isinstance(x, bool)]
         self.in_flight = d.get("in_flight") is True
+        _iu = d.get("in_flight_until")
+        self.in_flight_until = (float(_iu) if isinstance(_iu, (int, float))
+                                and not isinstance(_iu, bool) and _iu > 0
+                                else 0.0)
 
     #: Stamps are rounded to this before they touch the card.
     #:
@@ -1118,7 +1147,12 @@ class Limits:
              "last_poke": _bucket(self.last_poke, self.STAMP_BUCKET_S),
              "pokes": [_bucket(t, self.STAMP_BUCKET_S)
                        for t in self.pokes[-200:]],
-             "in_flight": bool(getattr(self, "in_flight", False))},
+             "in_flight": bool(getattr(self, "in_flight", False)),
+             # ROUNDED UP, unlike the stamps: a hold that ends early is a
+             # wake sent at a vault that is still busy.
+             "in_flight_until": _bucket_up(
+                 float(getattr(self, "in_flight_until", 0.0) or 0.0),
+                 self.STAMP_BUCKET_S)},
             self.path, perms=0o600)
 
     def recent(self) -> list:
@@ -1486,6 +1520,10 @@ class Pager:
         #: it is in place before the worker thread reads it and cannot be
         #: cleared by the slot handover. A fresh /withdraw passes leg=0.
         self._chain_leg = 0
+        #: Wall-clock moment until which a wake from BEFORE this process
+        #: started may still be running, or 0. Set by announce_restart from
+        #: the persisted state; read by start_job and /status.
+        self._hold_until = 0.0
         #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
         #: otherwise -- a private chat id is a Telegram ACCOUNT, and Telegram
         #: gives one account one chat with a given bot however many devices it
@@ -1664,7 +1702,9 @@ class Pager:
         if self.busy.locked():
             self.send(chat_id, BUSY_ANSWER)
             return
-        why = self.limits.why_not()
+        # THE RESTART HOLD TOO, so a conversation is not walked through its
+        # questions to be refused at the confirm.
+        why = self.limits.why_not() or self._hold_why()
         if why:
             self.send(chat_id, f"no: {why}")
             return
@@ -1977,12 +2017,20 @@ class Pager:
     #: address and quotes nothing, so its handle record carries slip=None and
     #: both watching jobs refuse it with "Only a receive_and_quote handle can
     #: be watched". There is no configuration in which this changes.
-    #: Jobs whose labels the vault will never watch. Empty since /address
-    #: was removed -- the only job that minted an unwatchable handle. Kept
-    #: as the seam rather than deleted: the check it feeds is what stops a
-    #: button spending a wake to be refused, and a future job that quotes
-    #: nothing would need it again.
-    UNWATCHABLE_JOBS = ()
+    #: Jobs whose labels the vault will never watch. The check this feeds
+    #: is what stops a button spending a wake to be refused: the vault
+    #: refuses a watching job on such a label always, for a structural
+    #: reason, and that refusal used to arrive after the magic packet, the
+    #: boot, the 5-20 minute jitter and one of twelve daily slots, with no
+    #: reason on it -- which reads as "try again".
+    #:
+    #: A WITHDRAWAL'S HANDLE IS ONE. Its result carries a handle like every
+    #: other job's, and this box recorded it as a label this chat owns --
+    #: so "/check" with no argument offered "the last one in this chat" with
+    #: an ask-again button, for a label the vault holds no bundle for
+    #: (handles[] is written for deposits only). The tap cost a wake and
+    #: came back "refused before it started".
+    UNWATCHABLE_JOBS = ("withdraw",)
 
     #: How often /status will answer. It is a cooldown rather than a budget
     #: because the answer cannot change faster than this: `busy` flips when a
@@ -2025,7 +2073,7 @@ class Pager:
         dropping the second is at the return.
 
         NONE FOR A LABEL NOTHING CAN WATCH, and this used to offer both
-        buttons unconditionally. An /address label is refused by the vault
+        buttons unconditionally. A withdrawal's label is refused by the vault
         every time -- see UNWATCHABLE_JOBS -- and the refusal happens after
         the magic packet, the boot and the 5-20 minute jitter, having spent one
         of twelve daily wake slots. The reason is deliberately not on the wire,
@@ -2091,7 +2139,7 @@ class Pager:
         of the same button is how one of them stops matching what it does.
         """
         try:
-            if phase in ("not_yet", "arriving"):
+            if phase in ("not_yet", "arriving", "partial"):
                 # Still waiting: the command that asks again. ONE of them --
                 # _handle_buttons dropped "Wait for it", and this comment said
                 # "the two commands" for a turn after it did.
@@ -3066,6 +3114,11 @@ class Pager:
                 # message said "2 of at most 6" forever and the cap never
                 # fired. Driven with nine arrivals: nine mixes ran.
                 _more = (res.get("phase") or "") == "more_left"
+                # LOCKED IS NOT GONE. A deposit that landed during this leg
+                # is inside the unlock window; the vault says so with its
+                # own word, and this end says "in a while" rather than
+                # arming a leg that would find nothing spendable yet.
+                _locked = (res.get("phase") or "") == "more_locked"
                 _leg = self._chain_leg
                 # SAID FROM NOWHERE, so it cannot lean on a conversation the
                 # reader may not have in front of them.
@@ -3122,6 +3175,9 @@ class Pager:
                            if _next_leg else
                            "More remains — /withdraw again when you are ready."
                            if _more else
+                           "More is here but still unlocking — /withdraw "
+                           "again in a while."
+                           if _locked else
                            proto.WITHDRAW_NO_MORE_LINE))
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
@@ -3499,20 +3555,29 @@ class Pager:
         finally:
             self._running = None
             self._set_in_flight(False)
-            self.busy.release()
-            # THE NEXT LEG, AFTER THE LOCK IS FREE. poke() cannot start it: it
-            # runs inside this thread, which holds `busy`, and start_job takes
-            # `busy`. So the slot is set there and acted on here, one line
-            # after the release.
+            # THE NEXT LEG, WITH THE LOCK STILL HELD. poke() cannot start it:
+            # it runs inside this thread, and start_job is where a job is
+            # admitted. So the slot is set there and acted on here.
             #
-            # THROUGH start_job LIKE EVERYTHING ELSE -- not a direct _worker
-            # call. That is where the rate limit is charged, where the
-            # one-spender rule is re-checked and where the busy lock is taken,
-            # and a chain that went round it would be a second path to a wake
-            # with none of those. If the limit refuses, the operator is told
-            # in start_job's own words and the chain simply stops.
+            # HANDED OVER, NOT RELEASED AND RETAKEN. This released `busy` and
+            # then called start_job, which took it again -- and in between,
+            # a tap on "Has it arrived?" from the poll thread could take it
+            # first. The chain then died with "the next one did not start",
+            # money still on the wallet, from a tap the completion message
+            # had just invited. start_job(held=True) keeps the lock across
+            # the handover and gives it back itself on every path that does
+            # not start a thread.
+            #
+            # THROUGH start_job LIKE EVERYTHING ELSE -- not a direct call to
+            # the worker. That is where the rate limit is charged, where the
+            # one-spender rule is re-checked and where the restart hold is
+            # applied, and a chain that went round it would be a second path
+            # to a wake with none of those. If it refuses, the operator is
+            # told in start_job's own words and the chain simply stops.
             _next, self._chain = self._chain, None
-            if _next:
+            if not _next:
+                self.busy.release()
+            else:
                 _cid, _params, _leg = _next
                 # NO ANNOUNCEMENT HERE ANY MORE, AND IT IS NOT A LOST
                 # MESSAGE. This sent "withdraw: starting the next one (2 of
@@ -3524,7 +3589,8 @@ class Pager:
                 # and the one that says a spend finished, so it is the one
                 # that keeps the job.
                 try:
-                    self.start_job(_cid, "withdraw", _params, leg=_leg)
+                    self.start_job(_cid, "withdraw", _params, leg=_leg,
+                                   held=True)
                 except BaseException:                        # noqa: BLE001
                     # A chain that cannot continue is not a failure of the leg
                     # that just succeeded, and must never be reported as one.
@@ -3723,7 +3789,11 @@ class Pager:
             # something running -- and `busy` is deliberately not consulted for
             # that reason: it is process-wide, so reporting it here would tell
             # one chat that another one is mid-job.
-            _mine = [_k for _k, _v in self.handle_owner.items() if _v == cid]
+            # DEPOSITS ONLY: a withdrawal's label is recorded (so its result
+            # can be addressed) but names nothing the vault can watch.
+            _mine = [_k for _k, _v in self.handle_owner.items()
+                     if _v == cid
+                     and self.handle_job.get(_k) not in self.UNWATCHABLE_JOBS]
             if self._running == cid:
                 self.send(cid, "one is running now. Nothing else can start "
                                "until it reports, and it will report here.",
@@ -3815,8 +3885,10 @@ class Pager:
             # asked "can I start one right now" in order to do next, and
             # attaching them adds nothing to the transcript: a label on a
             # button is not a line in the chat.
+            # ...AND THE RESTART HOLD IS "wait" TOO: the vault may be busy.
             self.send(cid, _why if _why
-                      else ("wait" if self.busy.locked() else "ready"),
+                      else ("wait" if (self.busy.locked() or self._hold_why())
+                            else "ready"),
                       buttons=MENU_BUTTONS)
             return
         if err == IGNORE:
@@ -3910,10 +3982,10 @@ class Pager:
             if self.handle_job.get(_h) in self.UNWATCHABLE_JOBS:
                 integrity_log("pager", "unwatchable_handle")
                 self.send(cid,
-                          f"no: that one is an address, not a deposit, and "
-                          f"nothing here can watch an address — there is no "
-                          f"expected amount to watch for. Check it at the "
-                          f"machine.",
+                          "no: that confirmation number is from a "
+                          "withdrawal, not a deposit, and there is nothing "
+                          "to watch for on it — it reported when it "
+                          "finished. /check on its own says what is running.",
                           buttons=MENU_BUTTONS)
                 return
             _owner = self.handle_owner.get(_h)
@@ -4028,8 +4100,15 @@ class Pager:
                                  "from": cb.get("from") or {},
                                  "text": _text}})
 
-    def start_job(self, cid: int, job: str, params: dict, leg: int = 0) -> None:
+    def start_job(self, cid: int, job: str, params: dict, leg: int = 0,
+                  held: bool = False) -> None:
         """Every path to a wake goes through here. THE ONLY ONE.
+
+        `held`: THE LOCK IS ALREADY THIS CALL'S. A chained leg is started by
+        the worker that holds `busy`, which hands it over rather than
+        releasing it (see the worker's finally). Every path below that does
+        not start a thread gives it back; the thread's own finally owns it
+        from then on, as always.
 
         Factored out so the wizard and `/depo 2` cannot drift: the rate limit,
         the one-job lock and the argument that reaches the wire are the same
@@ -4057,20 +4136,26 @@ class Pager:
         # can notice. So this is checked at the last line before the wake,
         # not only at the first line of the process.
         if self.spenders > 1:
+            if held:
+                self._drop_busy()
             integrity_log("pager", "refused_multi_spender")
             self.send(cid,
                       "no: more than one person is allowed in here, and this "
                       "is for one person per chat. Refusing every job until "
                       "that is fixed.")
             return
-        why = self.limits.why_not()
+        # ...AND THE RESTART HOLD, which is a limit like the others: a wake
+        # from before this process started may still be running.
+        why = self.limits.why_not() or self._hold_why()
         if why:
+            if held:
+                self._drop_busy()
             self.send(cid, f"no: {why}")
             return
         # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the window, so
         # a second concurrent wake cannot bind and would fail confusingly --
         # and two vaults woken at once is not a thing this design has.
-        if not self.busy.acquire(blocking=False):
+        if not held and not self.busy.acquire(blocking=False):
             self.send(cid, BUSY_ANSWER)
             return
         # RELEASE IT IF ANYTHING BETWEEN HERE AND THE THREAD RAISES.
@@ -4120,7 +4205,6 @@ class Pager:
             # that does not start a job now leaves the counter alone.
             self._chain_leg = int(leg)
             self.limits.record()
-            self._set_in_flight(True)
             integrity_log("pager", f"poke:{job}")
             # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
             # OUT. This said "working. This takes a while." for every job, and
@@ -4156,6 +4240,10 @@ class Pager:
                      + getattr(doorbell(), "FETCH_WINDOW_S", 0))
             if not getattr(self.args, "no_jitter", False):
                 _hold += getattr(doorbell(), "PRE_WOL_MAX_S", 0)
+            # THE SAME FIGURE IS THE HOLD A RESTART KEEPS. It is the latest
+            # moment this wake can still be running, and announce_restart
+            # reads it back to refuse every command until then.
+            self._set_in_flight(True, until=time.time() + _hold)
             _how = (f"{_hold // 3600 + 1}h" if _hold >= 3600
                     else f"{max(1, _hold // 60)} min")
             # THE NUMBER IS A LOCK WINDOW, AND IT READ AS AN ESTIMATE.
@@ -4232,15 +4320,42 @@ class Pager:
                   "      first poll — it is retried on the next start.")
         return ok
 
-    def _set_in_flight(self, on: bool) -> None:
-        """Persist the one bit that says a wake is between start and result."""
+    def _set_in_flight(self, on: bool, until: float = 0.0) -> None:
+        """Persist the one bit that says a wake is between start and result,
+        and with it the latest wall-clock moment that wake can still be
+        running (0 when the bit is off)."""
         try:
             if hasattr(self.limits, "in_flight"):
                 self.limits.in_flight = bool(on)
+                self.limits.in_flight_until = (float(until or 0.0)
+                                               if on else 0.0)
                 self.limits.save()
         except Exception as e:                               # noqa: BLE001
             print(f"  [!] could not persist the in-flight bit "
                   f"({_redact(e)[:80]}).")
+
+    def _drop_busy(self) -> None:
+        """Give `busy` back. Never raises: a lock already free stays free."""
+        try:
+            self.busy.release()
+        except RuntimeError:
+            pass
+
+    def _hold_why(self) -> str:
+        """The refusal while a wake from before a restart may still be
+        running, or "". Clears the hold, and the persisted bit with it, once
+        the window it names has passed."""
+        _until = float(getattr(self, "_hold_until", 0.0) or 0.0)
+        if not _until:
+            return ""
+        _left = _until - time.time()
+        if _left <= 0:
+            self._hold_until = 0.0
+            self._set_in_flight(False)
+            return ""
+        return ("something from before the restart may still be running, "
+                f"for up to {_hold_words(_left)}. Nothing can start until "
+                "it is over; /status says when.")
 
     def announce_restart(self) -> bool:
         """If the last process died with a wake in flight, say so, once.
@@ -4256,14 +4371,33 @@ class Pager:
         if not getattr(self.limits, "in_flight", False):
             return False
         integrity_log("pager", "restarted_with_wake_in_flight")
+        # STILL RUNNING, FOR ALL THIS END KNOWS. The bit alone said "its
+        # result is lost" and then answered "ready" -- so the next command
+        # sent a magic packet at a vault that was mid-withdrawal, found the
+        # doorbell's port free (the old process is gone), and waited ten
+        # minutes for a collection that could not come: "never picked up",
+        # a wake slot spent, and the operator told to try again. The state
+        # file also carries the latest moment that wake can still be
+        # running; until then every command is held, and the bit stays set
+        # so a second restart inside the window holds too.
+        _until = float(getattr(self.limits, "in_flight_until", 0.0) or 0.0)
+        _left = _until - time.time()
+        if _left > 0:
+            self._hold_until = _until
+            _msg = ("Restarted while something was running. It may still be "
+                    f"running for up to {_hold_words(_left)}, and its result "
+                    "cannot reach this end: nothing else can start until "
+                    "then, and /status says when. CHECK before starting "
+                    "another.")
+        else:
+            _msg = ("Restarted while something was running. That job "
+                    "finished or failed on its own and this end was not "
+                    "told, so its result is lost: CHECK before starting "
+                    "another.")
         for _cid in sorted(self.allow):
-            self.send(_cid,
-                      "Restarted while something was running. That job "
-                      "finished or failed on its own and this end was not "
-                      "told, so its result is lost: CHECK before starting "
-                      "another.",
-                      buttons=MENU_BUTTONS)
-        self._set_in_flight(False)
+            self.send(_cid, _msg, buttons=MENU_BUTTONS)
+        if _left <= 0:
+            self._set_in_flight(False)
         return True
 
     def run(self) -> int:
