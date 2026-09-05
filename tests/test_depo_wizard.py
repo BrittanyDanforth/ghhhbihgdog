@@ -1483,11 +1483,17 @@ _agent = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 # /fee's CLAIM ALSO CHANGED. The agent CAN spawn GhostSpiral now, for exactly
 # one keyfile-gated job -- so "its output can never reach this chat" is no
 # longer true by construction and has to be true by what is SENT instead.
+# TWO SPAWN SITES: the client's withdrawal, and the fee sweep -- which mixes
+# the operator's OWN fees off the fee wallet and is never a phone job. The
+# third reference is the in-process loader for the fee floor.
 check("/fee's claim holds: the agent spawns the mix only for the spending job "
-      "(the second reference is the in-process loader for the fee floor)",
-      _agent.count('[sys.executable, _tool("GhostSpiral")') == 1
-      and _agent.count('_tool("GhostSpiral")') == 2
-      and 'if job == "withdraw":' in _agent)
+      "and for the operator's own fee sweep, never for a status ask",
+      _agent.count('[sys.executable, _tool("GhostSpiral")') == 2
+      and _agent.count('_tool("GhostSpiral")') == 3
+      and 'if job == "withdraw":' in _agent
+      and _agent.index('def build_fee_sweep_argv')
+      < _agent.index('[sys.executable, _tool("GhostSpiral")')
+      < _agent.index('def run_fee_sweep('))
 check("...and that job is refused unless this machine's own keyfile allows it",
       'if not key.get("allow_withdraw"):' in _agent)
 # AND THE OLD CHECK HERE IS GONE, DELIBERATELY. It asserted the fee RATE never

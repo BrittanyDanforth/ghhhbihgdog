@@ -1170,6 +1170,14 @@ below_threshold / below_floor / nothing` — kinds, never a figure or an
 address. The job log (0600, wiped with the artifacts) carries GhostSpiral's
 output as it does for a withdrawal.
 
+**It grows accounts like the mixing wallet does.** Every sweep is a mix,
+and a mix mints one account per output on the wallet it runs from — so the
+fee wallet gains ten or twenty accounts per sweep, exactly as the mixing
+wallet does per withdrawal. The offline signer creates them as it goes; when
+either wallet has grown past what you want to carry, rotate it: make a fresh
+wallet and pair again. A higher `--fee-sweep-min` means fewer sweeps and
+slower growth, at the price of more sitting on the fee wallet between them.
+
 **What a seized vault tells.** With both wallet files and their passwords
 in hand, an analyst reads the fee wallet's incoming outputs and pairs them
 with the mixing wallet's fan-outs — the business structure. That is the
