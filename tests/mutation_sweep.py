@@ -3507,8 +3507,8 @@ MUTATIONS = [
  # note that routes the payment; a reader not told so pays from one.
  ("the deposit instructions stop warning that a phone cannot attach the note",
   "gs_wake_proto.py",
-  '        "Attach the note above to your payment, exactly as sent \u2014 from a "\n'
-  '        "desktop app. A phone CANNOT, and the money is lost.",',
+  '        "Attach the note above to the payment \u2014 it is what makes the money "\n'
+  '        "arrive. Most phone apps CANNOT attach one; use a desktop app that can.",',
   '        "",',
   ["test_depo_wizard", "test_plain_slip"]),
 

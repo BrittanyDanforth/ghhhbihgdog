@@ -342,7 +342,7 @@ PLAIN_FIELDS = {
 #:   ""         nothing to say (every job that is not a status probe)
 #:   not_yet    the address is empty. Normal. This is NOT a failure, and
 #:              reporting it as one is the defect this vocabulary exists for.
-#:   arriving   something landed and is still confirming
+#:   arriving   received, still confirming, not yet spendable
 #:   landed     at or over the expected amount, unlocked and spendable
 #:   short      money arrived, stopped growing, and is under what was quoted
 #:   stuck      the wallet is not scanning; says NOTHING about the money
@@ -805,7 +805,12 @@ WITHDRAW_NO_MORE_LINE = ("Nothing more was found to send: none is here, too "
 
 PHASE_LINES = {
     "not_yet": "nothing on the address yet. Normal — ask again in a while.",
-    "arriving": "something arrived and is still confirming. Ask again shortly.",
+    # RECEIVED, AND NOT YET SPENDABLE, in those words. "Something arrived and
+    # is still confirming" made a reader ask what "something" was and whether
+    # it was theirs; what they need is that it is in, that it is not usable
+    # yet, and that waiting is the whole of what to do.
+    "arriving": "received — waiting for it to confirm. Not spendable yet; ask "
+                "again shortly.",
     # "Done." WAS TOO SHORT AND SAID SOMETHING FALSE. Shortening this from
     # "The swap is done" to "Done" changed which noun it was about: the
     # swap has landed, the mix has NOT run, and the mix is the entire
@@ -905,8 +910,17 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # thirty-four words that circled the thing rather than naming it,
         # on the surface a stranger reads once with money in hand. "The
         # note above" is the whole of what they need to find.
-        "Attach the note above to your payment, exactly as sent — from a "
-        "desktop app. A phone CANNOT, and the money is lost.",
+        #
+        # AND WHY, or the phone sentence reads as arbitrary. "From a desktop
+        # app. A phone CANNOT" told a reader who thinks of this as an
+        # ordinary payment that the device matters, with no reason -- and
+        # the reason is the one fact that makes them obey it: the note is
+        # what routes the money to them, and an app that cannot attach one
+        # sends money that arrives nowhere. Said without the field or the
+        # service (rule 6); "most" rather than "a phone", because it is the
+        # app's ability to attach a note that decides it, not the device.
+        "Attach the note above to the payment — it is what makes the money "
+        "arrive. Most phone apps CANNOT attach one; use a desktop app that can.",
         # THE ADDRESS IS NOT THE READER'S, AND NOTHING SAID SO.
         #
         # "To address: bc1q..." reads as "this is my deposit address" to
