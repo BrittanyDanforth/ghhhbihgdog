@@ -3535,12 +3535,12 @@ class Pager:
                 # the amount and the address; the number is a line of the
                 # receipt, once, where the sentence below points at it.
                 self.send(chat_id,
-                          f"{chat_name(job)}: pay this.\n\n"
+                          f"{chat_name(job)}: here is how to pay.\n\n"
                           + "\n".join(proto.plain_lines(
                               plain, label=_cn)).rstrip()
-                          + "\n\nOnce it is paid, tap below or /check that "
-                            "number — it says when it has arrived. Then "
-                            "/withdraw sends it on.",
+                          + "\n\nWhen it is paid, tap below or /check that "
+                            "number — it tells you when the money has "
+                            "arrived. Then /withdraw sends it on.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
             if not slip:
@@ -4809,19 +4809,18 @@ class Pager:
         """
         _n = chat_name(job)
         if job == "receive_and_quote":
-            return (f"{_n}: getting your payment details — a few minutes. "
-                    f"They arrive here. Nothing else can run for up to {how}.")
+            return (f"{_n}: getting your payment details now. They come "
+                    f"here. Nothing else can run for up to {how}.")
         if job == "withdraw":
             try:
-                _lead = (f"About {proto.depth_hours(int(params.get('depth')))}h "
-                         f"for what you chose.")
+                _lead = f"About {proto.depth_hours(int(params.get('depth')))}h."
             except Exception:                                # noqa: BLE001
                 _lead = "This takes hours."
-            return (f"{_n}: sending. {_lead} I will say here when it is done "
-                    f"— you can close this. Nothing else can run for up to "
-                    f"{how}.")
-        return (f"{_n}: looking — a few minutes. I will say here. Nothing "
-                f"else can run for up to {how}.")
+            return (f"{_n}: sending now. {_lead} I will tell you here when "
+                    f"it is done — you can close this. Nothing else can run "
+                    f"for up to {how}.")
+        return (f"{_n}: checking now. I will tell you here. Nothing else "
+                f"can run for up to {how}.")
 
     def _busy_answer(self, cid: int) -> str:
         """The "not now" for a chat while a wake holds the lock.

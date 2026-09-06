@@ -877,7 +877,7 @@ def plain_lines(plain: dict, label: str = "") -> list:
     return [
         f"Send exactly:  {plain.get('b', '')}",
         f"To address:    {plain.get('d', '')}",
-        f"Expected out:  ~{plain.get('x', '')}",
+        f"You get back:  ~{plain.get('x', '')}",
         # THE LABEL THE READER CAN ACTUALLY USE, and the caller decides what
         # that is because this function does not know who is reading.
         # (see below: the memo is no longer among these lines at all)
@@ -919,8 +919,9 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # sends money that arrives nowhere. Said without the field or the
         # service (rule 6); "most" rather than "a phone", because it is the
         # app's ability to attach a note that decides it, not the device.
-        "Attach the note above to the payment — it is what makes the money "
-        "arrive. Most phone apps CANNOT attach one; use a desktop app that can.",
+        "The code above is the note for this payment — add it to the "
+        "payment. Most phone apps CANNOT add a note, and without it the "
+        "money never arrives.",
         # THE ADDRESS IS NOT THE READER'S, AND NOTHING SAID SO.
         #
         # "To address: bc1q..." reads as "this is my deposit address" to
@@ -944,8 +945,8 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # "This line is not yours to keep" named a LINE, and a reader with
         # an address in front of them does not know which. It is the
         # address, and the sentence says so and says what to do about it.
-        "Pay it once. Do not send here again — a second payment, now or "
-        "later, loses the money.",
+        "Pay it once. Never send to this address again — a second payment, "
+        "now or later, loses the money.",
     ]
 
 
