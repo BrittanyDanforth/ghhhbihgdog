@@ -1926,23 +1926,22 @@ write one into a keyfile paired with `--deposit-in-chat`.
                           2h at most. They arrive here. Nothing else can run
                           until then.
                        -> =:XMR.XMR:44AF…:0/1/0      (its own message, FIRST)
-                       -> depo: pay this. Confirmation number: A3F1-9C2B7E01
+                       -> depo: pay this.
 
                           Send exactly:  0.05000000
                           To address:    bc1q…
                           Expected out:  ~1.23
                           Confirmation:  A3F1-9C2B7E01
 
-                          Attach the line in the message ABOVE as the
-                          payment's note, exactly as it is, from a desktop
-                          app that can attach one. A phone app CANNOT, and
-                          the money would be lost.
-                          One payment, once. This line is not yours to keep —
-                          sending to it again, or later, loses the money.
+                          Attach the note above to your payment, exactly as
+                          sent — from a desktop app. A phone CANNOT, and the
+                          money is lost.
+                          Pay it once. Do not send here again — a second
+                          payment, now or later, loses the money.
 
-                          Once you have paid, tap below or /check with that
-                          number — it says when it has arrived. Then
-                          /withdraw sends it on.
+                          Once it is paid, tap below or /check that number —
+                          it says when it has arrived. Then /withdraw sends
+                          it on.
 /check A3F1-9C2B7E01     -> A3F1-9C2B7E01: nothing on the address yet. Normal —
                           ask again in a while.
 ```

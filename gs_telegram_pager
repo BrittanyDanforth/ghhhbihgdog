@@ -3526,14 +3526,21 @@ class Pager:
                 # the button that asks whether it has arrived. The lines
                 # come from the protocol's own renderer, shared with the
                 # doorbell's terminal, so the two cannot drift.
+                #
+                # THE NUMBER LEADS NOWHERE. This opened "pay this.
+                # Confirmation number: A3F1-9C2B7E01", so the first thing
+                # a reader with money in hand saw was a reference code
+                # where they expected the thing to pay, and then saw the
+                # same code again four lines down. The receipt leads with
+                # the amount and the address; the number is a line of the
+                # receipt, once, where the sentence below points at it.
                 self.send(chat_id,
-                          f"{chat_name(job)}: pay this. Confirmation "
-                          f"number: {_cn}\n\n"
+                          f"{chat_name(job)}: pay this.\n\n"
                           + "\n".join(proto.plain_lines(
                               plain, label=_cn)).rstrip()
-                          + "\n\nOnce you have paid, tap below or /check "
-                            "with that number — it says when it has "
-                            "arrived. Then /withdraw sends it on.",
+                          + "\n\nOnce it is paid, tap below or /check that "
+                            "number — it says when it has arrived. Then "
+                            "/withdraw sends it on.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
             if not slip:

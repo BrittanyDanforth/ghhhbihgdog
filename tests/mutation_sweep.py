@@ -3082,25 +3082,23 @@ MUTATIONS = [
  ("the leg number is written by calls that never start a job, so the chain "
   "cap stops firing",
   "gs_telegram_pager",
-  "        why = self.limits.why_not() or self._hold_why()\n"
-  "        if why:\n"
-  "            if held:\n"
-  "                self._drop_busy()\n"
-  '            self.send(cid, f"no: {why}")',
-  "        self._chain_leg = int(leg)\n"
-  "        why = self.limits.why_not() or self._hold_why()\n"
-  "        if why:\n"
-  "            if held:\n"
-  "                self._drop_busy()\n"
-  '            self.send(cid, f"no: {why}")',
+  "            why = self.limits.why_not() or self._hold_why()\n"
+  "            if why:\n"
+  "                _give_back()\n"
+  '                self.send(cid, f"no: {why}")',
+  "            self._chain_leg = int(leg)\n"
+  "            why = self.limits.why_not() or self._hold_why()\n"
+  "            if why:\n"
+  "                _give_back()\n"
+  '                self.send(cid, f"no: {why}")',
   ["test_telegram_pager"]),
 
  # run() reads upd.get("update_id") in the FOR HEADER, outside the per-update
  # try, so one bare string in the batch kills the process -- and the offset was
  # never advanced past it, so it crash-loops.
  ("a malformed update element kills the pager", "gs_telegram_pager",
-  "        return [u for u in out if isinstance(u, dict)]",
-  "        return out",
+  "        kept = [u for u in out if isinstance(u, dict)]",
+  "        kept = list(out)",
   ["test_telegram_pager"]),
 
  # The offset is what confirms an update. One that can never advance it is
@@ -3181,8 +3179,12 @@ MUTATIONS = [
 
  # The signal handler must not do network I/O: it runs between bytecodes and
  # can arrive inside safe_post.
+ # ANCHORED ON THE DOCSTRING'S CLOSE: burn_all re-arms the same flag for a
+ # continuation, so the bare assignment is no longer unique in the file.
  ("the burn signal does the work inside the handler", "gs_telegram_pager",
+  '        """\n'
   "        self.burn_now = True",
+  '        """\n'
   "        self.burn_all()",
   ["test_telegram_pager"]),
 
@@ -3364,7 +3366,7 @@ MUTATIONS = [
  # unfiltered version would tell one chat that another one is mid-job.
  ("the what-is-running answer stops filtering by chat",
   "gs_telegram_pager",
-  "            _mine = [_k for _k, _v in self.handle_owner.items()\n"
+  "            _mine = [_k for _k, _v in list(self.handle_owner.items())\n"
   "                     if _v == cid\n"
   "                     and self.handle_job.get(_k) not in self.UNWATCHABLE_JOBS]",
   "            _mine = list(self.handle_owner)",
@@ -3496,10 +3498,19 @@ MUTATIONS = [
  # is not part of the address, which is not unique to them either.
  ("the deposit instructions stop saying the address is for one payment only",
   "gs_wake_proto.py",
-  '        "One payment, once. This line is not yours to keep \u2014 sending to it "\n'
-  '        "again, or later, loses the money.",',
+  '        "Pay it once. Do not send here again \u2014 a second payment, now or "\n'
+  '        "later, loses the money.",',
   '        "",',
   ["test_depo_wizard"]),
+
+ # THE ONE THING THAT LOSES THE MONEY IS SAID. A phone app cannot attach the
+ # note that routes the payment; a reader not told so pays from one.
+ ("the deposit instructions stop warning that a phone cannot attach the note",
+  "gs_wake_proto.py",
+  '        "Attach the note above to your payment, exactly as sent \u2014 from a "\n'
+  '        "desktop app. A phone CANNOT, and the money is lost.",',
+  '        "",',
+  ["test_depo_wizard", "test_plain_slip"]),
 
  # Re-anchored: the line opens "CONFIRMED" now rather than "landed" -- a
  # status that leads with the jargon of the step it describes tells the reader
@@ -4000,14 +4011,12 @@ MUTATIONS = [
 
  ("a one-person bot naming several people runs their jobs anyway",
   "gs_telegram_pager",
-  "        if self.spenders > 1 and self._max_clients() <= 1:\n"
-  "            if held:\n"
-  "                self._drop_busy()\n"
-  '            integrity_log("pager", "refused_many")',
-  "        if False:\n"
-  "            if held:\n"
-  "                self._drop_busy()\n"
-  '            integrity_log("pager", "refused_many")',
+  "            if self.spenders > 1 and self._max_clients() <= 1:\n"
+  "                _give_back()\n"
+  '                integrity_log("pager", "refused_many")',
+  "            if False:\n"
+  "                _give_back()\n"
+  '                integrity_log("pager", "refused_many")',
   ["test_telegram_pager"]),
 
  # THE GHOSTS. An unpaid deposit lets go of its place after the TTL only when
@@ -4030,10 +4039,12 @@ MUTATIONS = [
  ("a guess during the label wait is free again", "gs_telegram_pager",
   "                _fails += 1\n"
   "                _wait = min(LABEL_BACKOFF_MAX_S,\n"
-  "                            60.0 * (2 ** max(0, _fails - LABEL_FAILS_FREE - 1)))",
+  "                            60.0 * (2 ** min(20, max(0, _fails\n"
+  "                                                     - LABEL_FAILS_FREE - 1))))",
   "                _fails += 0\n"
   "                _wait = min(LABEL_BACKOFF_MAX_S,\n"
-  "                            60.0 * (2 ** max(0, _fails - LABEL_FAILS_FREE - 1)))",
+  "                            60.0 * (2 ** min(20, max(0, _fails\n"
+  "                                                     - LABEL_FAILS_FREE - 1))))",
   ["test_multi_client"]),
 
  ("the vault's 'full' reaches the chat as 'it does not say why'",
