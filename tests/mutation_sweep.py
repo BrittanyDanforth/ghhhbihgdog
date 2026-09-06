@@ -4095,6 +4095,120 @@ MUTATIONS = [
   '                    integrity_log("pager", "note_undelivered")',
   ["test_plain_slip"]),
 
+ # AN UNQUOTED BUNDLE IS REUSED ACROSS OWNERS. The mint records the account as
+ # the asker's before the quote; handed to the next owner regardless, one
+ # account sits in two owners' sets and the first can spend the second's
+ # arrival.
+ ("a bundle minted for one owner becomes the next owner's address",
+  "gs_wake_agent",
+  '        if _rec.get("owner") and _rec.get("owner") != owner:\n'
+  '            continue',
+  '        if False:\n'
+  '            continue',
+  ["test_multi_client"]),
+
+ ("a restart with a wake in flight is broadcast to every client",
+  "gs_telegram_pager",
+  "        _to = sorted(self.allow) if self._max_clients() <= 1 else []\n"
+  "        for _cid in _to:\n"
+  "            self.send(_cid, _msg, buttons=MENU_BUTTONS)",
+  "        _to = sorted(self.allow)\n"
+  "        for _cid in _to:\n"
+  "            self.send(_cid, _msg, buttons=MENU_BUTTONS)",
+  ["test_multi_client"]),
+
+
+ # ---- the deep-read pass: hot loops, leaked locks, chain floods ----------
+ ("a stranger's every message is a line on the card", 'gs_telegram_pager',
+  '        if now - last >= self.IGNORED_LOG_EVERY_S or now < last:\n            seen[kind] = now\n            integrity_log("pager", kind)',
+  '        if True:\n            seen[kind] = now\n            integrity_log("pager", kind)',
+  ['test_stability_pass']),
+
+ ('a chained leg whose gate raises keeps the lock for ever', 'gs_telegram_pager',
+  '        except BaseException:                                # noqa: BLE001\n            _give_back()\n            raise',
+  '        except BaseException:                                # noqa: BLE001\n            raise',
+  ['test_stability_pass']),
+
+ ('the lock can be given back twice', 'gs_telegram_pager',
+  '            if _owned[0]:\n                _owned[0] = False\n                self._drop_busy()',
+  '            if _owned[0]:\n                self._drop_busy()',
+  ['test_stability_pass']),
+
+ ('a batch of chaff spins the poll loop', 'gs_telegram_pager',
+  '        if out and not kept:\n',
+  '        if False and out and not kept:\n',
+  ['test_stability_pass']),
+
+ ('an update with no id spins the poll loop', 'gs_telegram_pager',
+  '            if _batch and self.limits.offset == _cursor_before:\n',
+  '            if False:\n',
+  ['test_stability_pass']),
+
+ ("a burn of a session's messages freezes the loop", 'gs_telegram_pager',
+  '        _cap = 32\n',
+  '        _cap = 10 ** 6\n',
+  ['test_stability_pass']),
+
+ ('burn_signal is written once per pass, not once per signal', 'gs_telegram_pager',
+  '                if not _resumed:\n                    integrity_log("pager", "burn_signal")',
+  '                if True:\n                    integrity_log("pager", "burn_signal")',
+  ['test_stability_pass']),
+
+ ("a clock that jumped back answers 'wait' for hours", 'gs_telegram_pager',
+  '        if gap < 0:\n            gap = float(self.min_interval)',
+  '        if False:\n            gap = float(self.min_interval)',
+  ['test_stability_pass']),
+
+ ('the second label-backoff site overflows', 'gs_telegram_pager',
+  '                                60.0 * (2 ** min(20, _fails\n                                                 - LABEL_FAILS_FREE - 1)))',
+  '                                60.0 * (2 ** (_fails\n                                                 - LABEL_FAILS_FREE - 1)))',
+  ['test_stability_pass']),
+
+ ('the state file is saved by two threads with nothing between them', 'gs_telegram_pager',
+  '    def save(self) -> None:\n        with self._lk():',
+  '    def save(self) -> None:\n        with threading.Lock():',
+  ['test_stability_pass']),
+
+ ('the in-flight bit is saved outside the limits lock', 'gs_telegram_pager',
+  '                _lk = getattr(self.limits, "_lk", None)\n',
+  '                _lk = None\n',
+  ['test_stability_pass']),
+
+ ("the chain's prev is the root on every call", 'gs_common.py',
+  '            for ln in reversed(buf.splitlines()):\n                if ln.strip():\n                    return ln.decode("utf-8", "replace").split(" | ")[0].strip()',
+  '            for ln in reversed(buf.splitlines()):\n                if False:\n                    return ln.decode("utf-8", "replace").split(" | ")[0].strip()',
+  ['test_stability_pass']),
+
+ ('two writers of one file share one tmp name', 'gs_common.py',
+  '    _fd, _name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",\n                                  dir=str(path.parent))\n    os.close(_fd)\n    tmp = Path(_name)',
+  '    tmp = path.with_suffix(path.suffix + ".tmp")\n    tmp.touch(mode=0o600)',
+  ['test_stability_pass']),
+
+ ('a refusal that keeps the machine on is re-decided at power-off', 'gs_wake_agent',
+  '        if not _keep_on:\n            _late = somebody_is_here()',
+  '        if True:\n            _late = somebody_is_here()',
+  ['test_stability_pass']),
+
+ ('the accounts a mix minted are asked for once', 'gs_wake_agent',
+  '            for _try in range(3):\n                _accts_after = _account_indices(key, injected=accounts)',
+  '            for _try in range(1):\n                _accts_after = _account_indices(key, injected=accounts)',
+  ['test_stability_pass']),
+
+ ('unreadable accounts after a mix go unsaid', 'gs_wake_agent',
+  '            else:\n                integrity_log("wake", "owner_accounts_unreadable")',
+  '            else:\n                pass',
+  ['test_stability_pass']),
+
+ ('a failed withdrawal leaves its entry bundle on the disk', 'gs_wake_agent',
+  '            if job == "withdraw" and bundle:\n                try:\n                    if Path(bundle).is_file():',
+  '            if False:\n                try:\n                    if Path(bundle).is_file():',
+  ['test_stability_pass']),
+
+ ('a finished fee sweep leaves its entry bundle', 'gs_wake_agent',
+  '    integrity_log("wake", "fee_sweep:done")\n    _retire_fee_bundle(artifact_dir)',
+  '    integrity_log("wake", "fee_sweep:done")',
+  ['test_stability_pass']),
+
 ]
 
 

@@ -678,6 +678,31 @@ def terminal_safe(msg: str) -> str:
     return chain_safe(msg, keep_digits=True)
 
 
+def _last_chain_prev(log_path: Path) -> str:
+    """The hash on the chain's last line, read from the file's TAIL, or the
+    all-zero root when there is no chain yet. Reads back from the end in 4 KiB
+    steps until a whole last line is in hand; never the whole file."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            buf = b""
+            while pos > 0:
+                step = min(4096, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+                # A newline BEFORE the last line means the last line is whole.
+                if b"\n" in buf.rstrip(b"\n"):
+                    break
+            for ln in reversed(buf.splitlines()):
+                if ln.strip():
+                    return ln.decode("utf-8", "replace").split(" | ")[0].strip()
+    except OSError:
+        pass
+    return "0" * 64
+
+
 def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     """Append a SHA-256-chained line to the integrity log. Returns the hash.
 
@@ -714,12 +739,12 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
         lock_fd = None
         stage = f"{stage}!nolock"
     try:
-        prev = "0" * 64
-        if log_path.exists():
-            text = log_path.read_text()
-            lines = text.splitlines()
-            if lines:
-                prev = lines[-1].split(" | ")[0].strip()
+        # THE TAIL, NOT THE FILE. This read the whole chain and split it into
+        # lines to take the LAST hash -- on every call, under the lock, on a
+        # file that only grows (tens of megabytes on a long-lived install),
+        # from a pager whose unknown-chat path logs before any filtering, so
+        # a stranger's messages each cost the Pi a full read of the chain.
+        prev = _last_chain_prev(log_path)
         ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
         # ANYTHING A SIGNAL HANDLER WANTED TO SAY GOES FIRST, inside this same
         # lock. See _shutdown_handler: it may not take the lock itself, so it
@@ -1953,7 +1978,18 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     path, not a theoretical one. BaseException (not Exception) because
     KeyboardInterrupt is exactly the case that leaked.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # A NAME OF ITS OWN PER WRITE. The tmp used to be the fixed
+    # "<name>.tmp", so two writers of one file -- the pager's poll thread and
+    # its worker both save the state file -- could interleave: one truncates
+    # the tmp the other has just filled, and the rename moves an empty file
+    # over the real one. mkstemp gives each writer its own 0600 file in the
+    # same directory (the rename stays atomic) and secure_write_bytes then
+    # fills it; the prefix keeps it beside the file it replaces.
+    import tempfile
+    _fd, _name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                  dir=str(path.parent))
+    os.close(_fd)
+    tmp = Path(_name)
     try:
         # Created 0600 up front, not chmod'ed afterwards: the tmp holds the
         # same plaintext as the final file, so a world-readable window (or a

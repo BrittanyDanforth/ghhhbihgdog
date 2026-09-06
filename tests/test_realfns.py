@@ -316,18 +316,35 @@ check("...and the result is 0600, not the target's mode",
       _planted2.stat().st_mode & 0o777 == 0o600)
 _planted2.unlink()
 
-# The staging file it writes THROUGH is the attackable one, and that is where
-# the O_NOFOLLOW refusal has to bite: a planted '<name>.tmp' link.
+# The staging file it writes THROUGH was the attackable one: a planted
+# '<name>.tmp' link at the fixed staging name, which O_NOFOLLOW refused. The
+# staging name is no longer fixed -- mkstemp makes a fresh 0600 file of its
+# own per write (two writers of one file could otherwise truncate each
+# other's staging file) -- so a planted link at the old name is never opened,
+# never followed and never removed: the write lands, the link stays a link,
+# and its target is untouched.
 _planted3 = _sym_dir / "unsigned_manifest.json"
-os.symlink(str(_victim), str(_sym_dir / "unsigned_manifest.json.tmp"))
-_refused3 = False
+_old_tmp = _sym_dir / "unsigned_manifest.json.tmp"
+os.symlink(str(_victim), str(_old_tmp))
+_raised3 = None
 try:
     gs.atomic_write_json({"a": 1}, _planted3)
 except OSError as e:
-    _refused3 = "symbolic link" in str(e)
-check("atomic_write_json REFUSES a planted '.tmp' symlink", _refused3)
-check("...target still untouched after the atomic path",
-      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+    _raised3 = e
+check("atomic_write_json never touches a planted '<name>.tmp' symlink: the "
+      "write lands beside it, the link stays a link, and its target is "
+      "untouched",
+      _raised3 is None
+      and json.loads(_planted3.read_text()) == {"a": 1}
+      and not _planted3.is_symlink()
+      and _old_tmp.is_symlink()
+      and _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+check("...and no stray mkstemp staging file is left beside it",
+      not [p for p in _sym_dir.iterdir()
+           if p.name.startswith("unsigned_manifest.json.")
+           and p.name != "unsigned_manifest.json.tmp"])
+_old_tmp.unlink()
+_planted3.unlink()
 
 # The legitimate cases must all still work.
 _normal = _sym_dir / "normal.json"

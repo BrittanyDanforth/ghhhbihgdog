@@ -1340,8 +1340,13 @@ first two on the vault where they cannot be talked around from a phone:
   recreate both wallets with a large lookahead (`--subaddress-lookahead
   400:50` and up), pair with `--account-ceiling` ≈ 30 K plus what the wallet
   already holds, and rotate the wallet when it fills.
-- **Wakes.** A deposit, a check or two and a withdrawal is about three wakes
-  per person per cycle against `--daily-wake-budget` (12). Size it at ~3 K.
+- **Wakes.** A deposit, a check or two and a withdrawal is about four wakes
+  per person per cycle against the vault's `--daily-wake-budget` (12). Size
+  it at ~3 K. The Pi's own courtesy limits are shared by every chat too:
+  `--daily-cap` (12 pokes a day for the whole bot) and `--min-interval`
+  (300 s between *any* two pokes). Raise `--daily-cap` with the places — the
+  pager says so at startup when it is too small — and expect "wait Ns" when
+  two people poke within five minutes of each other.
 - **Wall clock, which is what actually binds once the first two are sized.**
   One vault drains one withdrawal at a time; eight people withdrawing at ten
   hops is three days of queue nobody can shorten. Three or four people in

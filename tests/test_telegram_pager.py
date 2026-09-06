@@ -4291,12 +4291,18 @@ check("chain: the next leg is started with the lock still held, and the "
       and "if not _next:\n                self.busy.release()" in _hand)
 # THREE REFUSAL PATHS NOW, not two: the multi-spender check, the rate/restart
 # hold, and the new at-capacity refusal (refused_full, from _full_for) all
-# return before starting a thread, and each hands a held lock back.
+# return before starting a thread, and each hands a held lock back -- through
+# ONE ownership flag (_give_back), so a raise from a gate gives it back too
+# and nothing can give it back twice.
+_sj = _SRC_PG_EARLY.split("    def start_job(")[1].split("    def publish_commands(")[0]
 check("chain: ...and start_job gives a held lock back on every refusal path "
-      "that does not start a thread",
-      _SRC_PG_EARLY.count("if held:\n                self._drop_busy()") == 3
-      and "if not held and not self.busy.acquire(blocking=False):"
-      in _SRC_PG_EARLY)
+      "that does not start a thread, and on a raise from any of them",
+      _sj.count("                _give_back()\n") == 3
+      and "        except BaseException:                                # noqa: BLE001\n"
+          "            _give_back()\n            raise" in _sj
+      and "if not self.busy.acquire(blocking=False):" in _sj
+      and "_owned[0] = True" in _sj
+      and "self._running = None\n            _give_back()" in _sj)
 _hb, _hbs = _room_pager([111], [])
 _hb.spenders = 2
 _hb.busy.acquire()

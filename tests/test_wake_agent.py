@@ -2024,8 +2024,13 @@ check("minout: taking a cut really does raise the floor, so the two figures "
 # operator never asked for a fee". Over many runs that is an operator earning
 # nothing with no way to find out why.
 _FEE_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
+# THE THREE KINDS, AS WRITTEN. This looked for "fee_all_excluded", the merged
+# name the fix REPLACED, and passed because a comment still mentions it.
 check("fee: the three ways of taking none are told apart in the chain",
-      "fee_none_configured" in _FEE_SRC and "fee_all_excluded" in _FEE_SRC)
+      all(f'integrity_log("wake", "{k}")' in _FEE_SRC
+          for k in ("fee_none_configured", "fee_all_on_this_wallet",
+                    "fee_all_are_destinations"))
+      and 'integrity_log("wake", "fee_all_excluded")' not in _FEE_SRC)
 check("fee: ...and NOT in the chat, because a fee configuration is the number "
       "an analyst divides by to read the deposit",
       "fee_none_configured" not in open(
