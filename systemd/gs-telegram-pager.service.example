@@ -1,16 +1,18 @@
 # EXAMPLE, not an install. Read every line, then write your own.
 #
-# WHY THIS FILE IS SHORT.
-#
-# It used to carry ninety lines of design notes: what this is for, what it may
-# and may not say, what an attacker gets, and where each limit really lives.
-# All true, all useful once -- and all of it sat permanently on the card of the
-# box that is supposed to hold nothing, readable by anyone who images it,
-# without running a thing.
+# WHY THIS FILE IS SHORT. It used to carry ninety lines of design notes: what
+# this is for, what it may and may not say, what an attacker gets, and where
+# each limit really lives. All true, all useful once -- and all of it sat
+# permanently on the card of the box that is supposed to hold nothing,
+# readable by anyone who images it, without running a thing.
 #
 # The reasoning now lives in OPSEC_SETUP.md and in gs_telegram_pager's own
-# docstring, on the machine that has the source. Read it THERE before
-# installing this.
+# docstring. Read it THERE before installing this -- and be honest about what
+# this card carries: the pager, gs_common and gs_wake_proto run FROM it,
+# docstrings and all, so anyone who images it identifies the toolchain by
+# construction. What the card must not carry is anything about a person: an
+# address, an amount, a label, a timetable, a passphrase beside the keyfile.
+# Ship a stripped build (python3 -OO, no docstrings) if that matters to you.
 #
 # NAMES ARE YOURS TO CHANGE. Every path and the unit name below are examples.
 # Nothing in the tools depends on them: the pager takes --key, --chat-id and

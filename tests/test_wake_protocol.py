@@ -76,10 +76,11 @@ PI = NP.PrivateKey.generate()      # doorbell, static
 EPH = NP.PrivateKey.generate()     # vault, per boot
 
 _SAMPLE_XMR = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
-SAMPLE = {"receive_and_quote": {"amount_sat": 5_000_000},
-          "watch": {"handle": "A3F1"},
-          "swap_status": {"handle": "A3F1"},
-          "withdraw": {"exit_to": _SAMPLE_XMR, "depth": 1}}
+_OWNER = "0123456789abcdef"
+SAMPLE = {"receive_and_quote": {"amount_sat": 5_000_000, "owner": _OWNER},
+          "watch": {"handle": "A3F1", "owner": _OWNER},
+          "swap_status": {"handle": "A3F1", "owner": _OWNER},
+          "withdraw": {"exit_to": _SAMPLE_XMR, "depth": 1, "owner": _OWNER}}
 # KEYED ON JOBS, AND CHECKED TO BE. This table is what every per-job check
 # below iterates, so a job added to the protocol without a sample here would
 # not be silently skipped -- it would KeyError and crash the suite, which
@@ -275,11 +276,37 @@ check("there is no swap_quote job — a job that takes a destination is how a "
 # reason a wake note reveals nothing about the job it carries.
 _SPECS = [getattr(c, "spec", "")
           for spec in P.JOBS.values() for c in spec["schema"].values()]
-check("no schema field is free-form: every one is a bounded int, a handle, or "
-      "the address gate",
-      all(s.startswith(("int ", "handle ", "xmr address", "1-"))
-          and ("xmr address" in s or s.startswith(("int ", "handle ")))
+check("no schema field is free-form: every one is a bounded int, a handle, an "
+      "owner token, or the address gate",
+      all(s.startswith(("int ", "handle ", "owner ", "xmr address", "1-"))
+          and ("xmr address" in s
+               or s.startswith(("int ", "handle ", "owner ")))
           for s in _SPECS))
+# THE OWNER FIELD IS ON EVERY JOB, mandatory, and shaped like nothing else on
+# the wire: sixteen lowercase hex, never a flag, a path or an address.
+check("every job carries an owner field, so one rule covers all four",
+      all("owner" in P.JOBS[j]["schema"] for j in P.JOBS))
+for _bad, _why in (("0" * 15, "15 hex"), ("0" * 17, "17 hex"),
+                   ("A" * 16, "uppercase"), ("g" * 16, "not hex"),
+                   (0, "not a string"), ("--owner=" + "0" * 8, "a flag"),
+                   ("/" + "0" * 15, "a path")):
+    try:
+        P._owner_field(_bad)
+        check(f"owner: {_why} is refused", False)
+    except P.WakeError:
+        check(f"owner: {_why} is refused", True)
+check("owner: sixteen lowercase hex is accepted, and the host's fixed token "
+      "is one such value",
+      P._owner_field("0123456789abcdef") == "0123456789abcdef"
+      and P._owner_field(P.HOST_OWNER) == P.HOST_OWNER)
+_no_owner = {"job_id": P.new_job_id(), "challenge": P.new_challenge().hex(),
+             "job": "receive_and_quote", "amount_sat": 5_000_000}
+try:
+    P.validate_job(_no_owner)
+    check("owner: a note without one is refused, loudly, by name", False)
+except P.WakeError as _e:
+    check("owner: a note without one is refused, loudly, by name",
+          "owner" in str(_e))
 check("...and the text field is on the spending job and nowhere else",
       [j for j in P.JOBS
        if any("xmr address" in getattr(c, "spec", "")

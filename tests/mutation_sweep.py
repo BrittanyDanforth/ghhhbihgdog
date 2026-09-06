@@ -556,6 +556,9 @@ MUTATIONS = [
  ("a post-collection refusal never reaches the doorbell", "gs_wake_agent",
   '        report_back(key, job_id, challenge.hex(),\n'
   '                    "failed" if _CHILD_STARTED[0] else "refused", "",\n'
+  '                    phase=("full" if isinstance(e, Refused)\n'
+  '                           and e.code == "at_capacity"\n'
+  '                           and not _CHILD_STARTED[0] else ""),\n'
   '                    poster=d.get("post_record"), sleeper=d.get("sleep"))',
   "        pass",
   ["test_wake_agent"]),
@@ -1168,7 +1171,8 @@ MUTATIONS = [
  # the only thing between a stranger who found the bot and a poke.
  ("the pager answers any chat, not just the allowlisted one",
   "gs_telegram_pager",
-  "        if not isinstance(cid, int) or cid not in self.allow:",
+  "        if (not isinstance(cid, int) or isinstance(cid, bool)\n"
+  "                or cid not in self.allow):",
   "        if False:",
   ["test_telegram_pager"]),
 
@@ -2420,10 +2424,12 @@ MUTATIONS = [
  # The machine holding the wallet is the one that can see where the money is.
  ("the withdraw job goes back to demanding a handle", "gs_wake_proto.py",
   '        "schema": {"exit_to": _xmr_address_list,\n'
-  '                   "depth": _int_range(1, 3)},',
+  '                   "depth": _int_range(1, 3),\n'
+  '                   "owner": _owner_field},',
   '        "schema": {"handle": _handle_field,\n'
   '                   "exit_to": _xmr_address_list,\n'
-  '                   "depth": _int_range(1, 3)},',
+  '                   "depth": _int_range(1, 3),\n'
+  '                   "owner": _owner_field},',
   ["test_wake_agent"]),
 
  # Summing subaddresses would mean a first transaction spending inputs from
@@ -2800,7 +2806,7 @@ MUTATIONS = [
   "                if not self.send(chat_id, _msg):\n"
   "                    time.sleep(SLIP_RETRY_S)\n"
   "                    if not self.send(chat_id, _msg):\n"
-  '                        integrity_log("pager", "withdraw_result_undelivered")',
+  '                        integrity_log("pager", "result_undelivered")',
   "                self.send(chat_id, _msg)",
   ["test_plain_slip"]),
 
@@ -2870,7 +2876,7 @@ MUTATIONS = [
  # operator nothing was happening and then refused them because something was.
  ("/cancel goes back to saying nothing is running while a wake runs",
   "gs_telegram_pager",
-  "            elif self.busy.locked():\n",
+  "            elif self.busy.locked() and self._running == cid:\n",
   "            elif False:\n",
   ["test_depo_wizard"]),
 
@@ -2967,7 +2973,9 @@ MUTATIONS = [
  ("/status discloses the wake count and the power state again",
   "gs_telegram_pager",
   "            self.send(cid, _why if _why\n"
-  '                      else ("wait" if (self.busy.locked() or self._hold_why())\n'
+  '                      else ("wait" if (self.busy.locked() or self._hold_why()\n'
+  '                                       or self._full_for(cid,\n'
+  '                                                         "receive_and_quote"))\n'
   '                            else "ready"),\n'
   "                      buttons=MENU_BUTTONS)",
   '            self.send(cid, f"pokes in last 24h: {len(self.limits.recent())}/"\n'
@@ -2993,7 +3001,7 @@ MUTATIONS = [
   "gs_telegram_pager",
   # Re-anchored: the help is BUILT from BOT_COMMANDS now, so the figure lives
   # there. It must still include the jitter the operator actually waits.
-  '    ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E"),',
+  '    ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E01"),',
   '    ("check", "has my payment arrived"),',
   ["test_telegram_pager"]),
 
@@ -3059,11 +3067,11 @@ MUTATIONS = [
   '            # that does not start a job now leaves the counter alone.\n'
   '            self._chain_leg = int(leg)\n'
   '            self.limits.record()\n'
-  '            integrity_log("pager", f"poke:{job}")',
+  '            integrity_log("pager", "poke")',
   '        self._running = cid\n'
   '        self._chain_leg = int(leg)\n'
   '        self.limits.record()\n'
-  '        integrity_log("pager", f"poke:{job}")\n'
+  '        integrity_log("pager", "poke")\n'
   '        try:',
   ["test_telegram_pager"]),
 
@@ -3200,7 +3208,7 @@ MUTATIONS = [
  # that exists to answer "can I start one right now".
  ("the status answer stops reading the gate a person has to fix",
   "gs_telegram_pager",
-  '            if self.spenders > 1:\n'
+  '            if self.spenders > 1 and self._max_clients() <= 1:\n'
   '                self.send(cid, "not ready: more than one person is allowed "',
   '            if False:\n'
   '                self.send(cid, "not ready: more than one person is allowed "',
@@ -3336,8 +3344,20 @@ MUTATIONS = [
  # carry on and show the bare handle -- reissues the bearer token.
  ("the pager starts without a secret it can bind a label with",
   "gs_telegram_pager",
-  "    try:\n        _confirm_key(key)\n    except Exception as e:",
-  "    try:\n        pass\n    except Exception as e:",
+  "    try:\n"
+  "        _confirm_key(key)\n"
+  "        # ...AND AN OWNER TOKEN, for the same reason: a wake without one is\n"
+  "        # refused by the vault, and a pager that found that out on its first\n"
+  "        # poke would have spent a boot to learn it.\n"
+  "        owner_token(key, 0)\n"
+  "    except Exception as e:",
+  "    try:\n"
+  "        pass\n"
+  "        # ...AND AN OWNER TOKEN, for the same reason: a wake without one is\n"
+  "        # refused by the vault, and a pager that found that out on its first\n"
+  "        # poke would have spent a boot to learn it.\n"
+  "        pass\n"
+  "    except Exception as e:",
   ["test_telegram_pager"]),
 
  # "IS ANYTHING HAPPENING?" ANSWERED FROM MEMORY, and filtered by chat: the
@@ -3937,6 +3957,113 @@ MUTATIONS = [
   "        return node.value\n"
   "    if False:",
   ["test_units"]),
+
+ # ---- SEVERAL PEOPLE ON ONE VAULT ----------------------------------------
+ #
+ # Isolation between clients rests on a handful of lines: the owner token is
+ # derived from the asking chat, the vault spends only from the asker's own
+ # accounts, a probe on another owner's handle is refused, and the capacity
+ # gate is what stands between "several people" and "a wallet that cannot
+ # mint". Each of these, deleted, leaves every suite that does not know about
+ # owners green -- which is why test_multi_client exists.
+ ("a withdrawal widens from the owner's accounts to the whole wallet",
+  "gs_wake_agent",
+  "            if owned_accounts is not None and _ai not in owned_accounts:\n"
+  "                continue",
+  "            if False:\n"
+  "                continue",
+  ["test_multi_client"]),
+
+ ("every chat gets the same owner token", "gs_telegram_pager",
+  "    return hmac.new(_owner_key(key), str(int(chat_id)).encode(),",
+  "    return hmac.new(_owner_key(key), str(0).encode(),",
+  ["test_multi_client"]),
+
+ ("the account reserve never refuses", "gs_wake_agent",
+  "        if _need > ceiling:",
+  "        if _need > ceiling * 1000:",
+  ["test_multi_client"]),
+
+ ("a probe on another owner's handle is answered", "gs_wake_agent",
+  '        if _owner and rec.get("owner") and rec.get("owner") != _owner:\n'
+  '            integrity_log("wake", "watch_not_owner")',
+  '        if False:\n'
+  '            integrity_log("wake", "watch_not_owner")',
+  ["test_multi_client"]),
+
+ ("a chain never yields to a waiter", "gs_telegram_pager",
+  "                             and not (self._max_clients() > 1\n"
+  '                                      and getattr(self, "_contended", False)))',
+  "                             and not (self._max_clients() > 1\n"
+  "                                      and False))",
+  ["test_multi_client"]),
+
+ ("a one-person bot naming several people runs their jobs anyway",
+  "gs_telegram_pager",
+  "        if self.spenders > 1 and self._max_clients() <= 1:\n"
+  "            if held:\n"
+  "                self._drop_busy()\n"
+  '            integrity_log("pager", "refused_many")',
+  "        if False:\n"
+  "            if held:\n"
+  "                self._drop_busy()\n"
+  '            integrity_log("pager", "refused_many")',
+  ["test_telegram_pager"]),
+
+ # THE GHOSTS. An unpaid deposit lets go of its place after the TTL only when
+ # the address says it holds nothing; age alone freeing it would drop the
+ # reserve for a funded deposit that is simply old.
+ ("a funded deposit loses its reserve by age alone", "gs_wake_agent",
+  "    _total = (ask or _subaddress_total)(key, _pair[0], _pair[1])\n"
+  "    return _total != 0",
+  "    _total = (ask or _subaddress_total)(key, _pair[0], _pair[1])\n"
+  "    return False",
+  ["test_multi_client"]),
+
+ ("a key that is not a handle is a ledger record again", "gs_wake_agent",
+  "               if isinstance(k, str) and proto.HANDLE_RE.match(k)\n"
+  "               and isinstance(r, dict)}",
+  "               if isinstance(k, str)\n"
+  "               and isinstance(r, dict)}",
+  ["test_multi_client"]),
+
+ ("a guess during the label wait is free again", "gs_telegram_pager",
+  "                _fails += 1\n"
+  "                _wait = min(LABEL_BACKOFF_MAX_S,\n"
+  "                            60.0 * (2 ** max(0, _fails - LABEL_FAILS_FREE - 1)))",
+  "                _fails += 0\n"
+  "                _wait = min(LABEL_BACKOFF_MAX_S,\n"
+  "                            60.0 * (2 ** max(0, _fails - LABEL_FAILS_FREE - 1)))",
+  ["test_multi_client"]),
+
+ ("the vault's 'full' reaches the chat as 'it does not say why'",
+  "gs_telegram_pager",
+  '            if _rphase == "full" and job == "receive_and_quote":',
+  "            if False:",
+  ["test_multi_client"]),
+
+ ("a place with no sign of life is held for good", "gs_telegram_pager",
+  "                   if _now - float(s or 0.0) >= proto.DEPOSIT_PLACE_TTL_S]:",
+  "                   if _now - float(s or 0.0) >= 10 ** 12]:",
+  ["test_multi_client"]),
+
+ ("the capacity refusal carries no word", "gs_wake_agent",
+  '                    phase=("full" if isinstance(e, Refused)\n'
+  '                           and e.code == "at_capacity"',
+  '                    phase=("" if isinstance(e, Refused)\n'
+  '                           and e.code == "at_capacity"',
+  ["test_multi_client"]),
+
+ ("the soft cap never says full", "gs_telegram_pager",
+  "        return (_tok not in _inf and len(_inf) >= self._max_clients())",
+  "        return False",
+  ["test_multi_client"]),
+
+ ("a stop mid-wake with no known chat tells everyone on a bot serving several",
+  "gs_telegram_pager",
+  "                    else sorted(self.allow) if self._max_clients() <= 1 else []",
+  "                    else sorted(self.allow)",
+  ["test_multi_client"]),
 
 ]
 

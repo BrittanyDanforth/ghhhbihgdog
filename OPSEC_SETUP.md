@@ -787,7 +787,7 @@ pocket-dial — and a tap is a pocket-dial.
    a second Tor client appearing in the Mullvad tunnel*. The ThinkPad's
    jitter is the floor because a pwned Pi can zero its own.
 5. Slip stays on the ThinkPad (`0600`). Telegram gets a **confirmation
-   number** — `A3F1-9C2B7E` — and, with `--deposit-in-chat`, the address and memo
+   number** — `A3F1-9C2B7E01` — and, with `--deposit-in-chat`, the address and memo
    with it.
 6. You copy BTC address + memo from the bay (or the file). Not from chat.
 
@@ -931,12 +931,21 @@ python3 gs_wake_keys pair \
     --wallet-file /var/lib/gs/spend.wallet
 
 # 2. The password, in a root-owned 0400 file. Never a flag, never on an argv:
-#    /proc/<pid>/cmdline is 0444 and every local account can read it.
-printf 'GS_WALLET_PASSWORD=%s\n' 'your-password' > /etc/gs-wake-spend.env
+#    /proc/<pid>/cmdline is 0444 and every local account can read it -- and
+#    NEVER TYPED ON A COMMAND LINE EITHER: a `printf '...=%s' 'password' >`
+#    recipe puts the password in the shell's history file on exit and creates
+#    the file at the shell's umask (0644) with the password already inside,
+#    until a later chmod. The file is created closed, the value is read from
+#    the terminal without echo, and history is off for the command.
+install -m 0400 -o root -g root /dev/null /etc/gs-wake-spend.env
+( set +o history; umask 077; read -rs -p 'spend wallet password: ' p; echo
+  printf 'GS_WALLET_PASSWORD=%s\n' "$p" > /etc/gs-wake-spend.env )
 # and, only with a fee wallet paired (see 4c):
-# printf 'GS_FEE_WALLET_PASSWORD=%s\n' 'fee-wallet-password' >> /etc/gs-wake-spend.env
-chmod 0400 /etc/gs-wake-spend.env
-#    then uncomment the EnvironmentFile line in systemd/gs-wake-agent.service
+# ( set +o history; umask 077; read -rs -p 'fee wallet password: ' p; echo
+#   printf 'GS_FEE_WALLET_PASSWORD=%s\n' "$p" >> /etc/gs-wake-spend.env )
+#    then uncomment the EnvironmentFile line in systemd/gs-wake-agent.service.
+#    The same recipe writes /etc/gs-pager.env on the Pi, if you run the pager
+#    unattended at all -- read 4b's "one real cost" first.
 
 # 3. THE WALLET-RPC KEEPS SERVING THE VIEW-ONLY WALLET. Do not point it at
 #    the spend wallet -- this step used to say to, and it was wrong in the
@@ -1285,6 +1294,14 @@ records, and what the chat is told:
   minute until the vault collects — the first one landed while the vault
   was still shutting down from the previous leg and was lost.
 
+- **A paid-out deposit leaves no slip behind.** Its slip (the deposit address,
+  the memo naming the receive address in full, the amounts) and its bundle
+  are shredded the moment its withdrawal reports done; the ledger keeps the
+  record, its spent flag and two small integers. The job log is truncated at
+  every boot, so it holds the run in progress and no more — read it before
+  the next wake if a run needs looking at. The vault's job ledger keeps ids
+  and ten-minute buckets, not job words.
+
 **What is still true, and worth knowing.** Labels are four hex characters
 plus a tag over (chat, handle). `paranoia_mode` wipes the ledger and the
 slip files but not the pairing, so a label the phone still shows can, with
@@ -1293,6 +1310,80 @@ deposit's status. The vault avoids handles still named by a slip file on
 disk, which covers the ledger's 1000-entry prune; it cannot cover a wipe.
 If you wipe the vault, re-pair — every outstanding label then stops
 verifying, which is the honest state of a machine that has forgotten them.
+
+### 4f. How many people one vault can serve, and what it says past that
+
+**The honest number is small, and here is the arithmetic.** One vault runs
+one job per boot, and a withdrawal holds it for one leg of 6, 9 or 13 hours
+at 3, 10 or 20 hops. Nothing here changes that: "several clients" means
+several people holding a place while the vault serves them one at a time,
+and the answer past the limit is a plain "busy" or "full" from the Pi's own
+memory, with no wake spent. Three bounds apply, and the code enforces the
+first two on the vault where they cannot be talked around from a phone:
+
+- **Accounts.** Every deposit mints one wallet account; every withdrawal
+  mints one per mix output plus 2–7 decoys, a veil carrier and a change
+  sweep: up to **12 / 19 / 29** at the three depths. So one deposit paid out
+  at twenty hops costs up to **30** accounts. The vault refuses a new deposit
+  unless the wallet can carry it and every deposit already admitted and not
+  yet paid out, each at the deepest mix the phone can ask for:
+
+      accounts_now + 30 × (deposits_in_flight + 1) ≤ account_ceiling
+
+  (`at_capacity` in the chain; the phone hears the same "full … try again
+  later" it would have heard from the Pi's own soft cap, since this is the
+  one refusal that carries a word — keep the two caps in step anyway). A
+  withdrawal is **never** refused for capacity: you can always get your own
+  money out. At the shipped ceiling of 45 that admits **one** deposit in
+  flight and the wallet is full after one cycle — the ceiling is small
+  because the default wallet lookahead is. To serve K people at twenty hops:
+  recreate both wallets with a large lookahead (`--subaddress-lookahead
+  400:50` and up), pair with `--account-ceiling` ≈ 30 K plus what the wallet
+  already holds, and rotate the wallet when it fills.
+- **Wakes.** A deposit, a check or two and a withdrawal is about three wakes
+  per person per cycle against `--daily-wake-budget` (12). Size it at ~3 K.
+- **Wall clock, which is what actually binds once the first two are sized.**
+  One vault drains one withdrawal at a time; eight people withdrawing at ten
+  hops is three days of queue nobody can shorten. Three or four people in
+  flight is the most one vault serves without waits running to days; more
+  vaults are the only way past that.
+
+**What the Pi does with the number.** `--max-clients N` is the number of
+**places**: how many people may hold a deposit in flight at once. The
+allowlist is who may ask, and it may — usually should — be longer than N;
+the difference is who waits. A newcomer's `/deposit` is refused from memory
+when N people already hold a place (a deposit reported done and not yet
+fully paid out), with "this is full at the moment … try again later" — no
+figure, because the only true figure would be a fact about other people's
+runs. A place is held by a sign of life — the deposit reporting done, a
+`/check` reporting money on the address, a withdrawal leg with more to come —
+and **forgotten after two days without one** (`DEPOSIT_PLACE_TTL_S`), so a
+person who asks for an address and never pays cannot hold a place for good.
+The vault keeps the same rule on its own reserve: an admitted deposit older
+than two days with nothing on its address stops counting there too, while a
+funded one keeps its place at any age (and "could not ask" counts as
+funded). Nothing else is forgotten — a late payment is still its owner's to
+withdraw; only the reserve lets go. While the vault is busy with someone
+else's job every command is refused with "busy … try again in about T",
+where T is the Pi's own persisted ceiling on the running wake (the same one
+the "working" line quoted), never a count and never whose. The chat whose
+job it is hears "yours is still running". `/status` answers "wait" in both
+cases. A withdrawal with several arrivals chains leg to leg only while
+nobody else was refused during it; otherwise it yields after the leg and says
+"more remains — /withdraw again", so the waiter gets a turn. The places are
+process memory: a restart forgets them and may admit one deposit too many,
+which the vault's account gate then refuses — and that refusal is the one
+that carries a word (`full`), so the chat hears the same "full … try again
+later" sentence from the vault that it would have heard from the Pi, not
+"refused, it does not say why".
+
+**What one client can learn about another, stated plainly.** That the shared
+vault is busy, for up to about T, and that the service is full. Not who, not
+how many, not what kind of job, not a position in any queue (there is none).
+The busy window is a fact one shared vault cannot hide; it carries no
+identity. Labels, status words, "more remains" and chained legs are all
+owner-scoped, on the vault. The vault's ledger holds opaque tokens and small
+account numbers; the Pi persists nothing per person.
 
 ### The pager's unit needs a `WorkingDirectory`, and the reason is not obvious
 
@@ -1691,21 +1782,30 @@ What is actually true, and it is a different shape:
 any fee account an older desk run minted before a phone can spend from the
 wallet.** There is no marker doing it for you.
 
-**One person per bot, and the pager refuses anything else.** There is a single
-wallet behind this. A withdrawal does not ask who is asking — the vault takes
-the largest unlocked balance it can see and sends it to whatever addresses that
-person gave, because it is never told which chat the job came from and could
-not act on it if it were. Driven against the shipped code: with 1000 XMR from
-one person and 300 from another on one wallet, the second person's withdrawal
-picks up the first person's 1000.
+**One person per bot unless you say otherwise, and each person's money is
+theirs.** There is a single wallet behind this. A withdrawal used to take the
+largest unlocked balance on it whoever put it there, because the vault was
+never told who asked — driven: with 1000 XMR from one person and 300 from
+another, the second person's withdrawal picked up the first person's 1000. The
+vault is told now, without learning who: every job carries an **owner token**
+the pager derives from the asking chat (HMAC of the chat id under a key
+derived from the pairing secret, sixteen hex characters, one-way), the vault's
+ledger records which wallet **accounts** each owner's deposits and mixes
+created, and a withdrawal for an owner spends only from those — the largest
+single unlocked output among them, never a sum, never anyone else's. An owner
+the ledger has never seen is refused, not handed the wallet. A `/check` on
+another owner's label is refused on the vault as well as on the Pi. What
+that rests on is the pairing secret: forging another chat's token needs it,
+and the vault holds only the Pi's public half.
 
-So `--chat-id` (or `--user-id`, in a group) may name exactly **one** person, and
-the pager exits at startup if it names more. There is deliberately no flag to
-override it: the operator who would pass such a flag is not the person who
-would be robbed, and consent from one party to a loss that falls on a second
-party is not consent. To serve several people, give each their own vault, their
-own wallet and their own bot — then they share nothing and cannot reach each
-other's funds.
+So `--chat-id` may name **one** person by default and the pager exits at
+startup if it names more. To serve several, pass `--max-clients N` — N is how
+many hold a place at once, and the allowlist may be longer than N (the rest
+hear "full" and wait for a place to free) — allowlist each person's
+**private** chat (a group shares a chat id, so every member would get one
+token, and one transcript; it is refused above one client), and size the
+vault for it — section 4f. Nothing automatic grants it: an upgrade without
+the flag behaves exactly as before.
 
 If you were thinking of a second `--chat-id` for your own second device: you do
 not need one. Telegram gives one account one chat with a given bot, on every
@@ -1814,16 +1914,16 @@ write one into a keyfile paired with `--deposit-in-chat`.
 ```
 /deposit               -> How much? Reply with the BTC amount…
 0.05                   -> Deposit 0.05 BTC. Confirm and it starts.  7 + 6 = ?
-13                     -> depo: pay this. Confirmation number: A3F1-9C2B7E
+13                     -> depo: pay this. Confirmation number: A3F1-9C2B7E01
 
                           Send exactly:  0.05000000 BTC
                           To address:    bc1q…
                           Expected out:  ~1.23 XMR
-                          Confirmation:  A3F1-9C2B7E
+                          Confirmation:  A3F1-9C2B7E01
                        -> =:XMR.XMR:44AF…:0/1/0      (its own message)
 /check                 -> nothing is running. The last one in this chat is
-                          A3F1-9C2B7E — tap below to ask about it.
-/check A3F1-9C2B7E     -> A3F1-9C2B7E: nothing on the address yet. Normal —
+                          A3F1-9C2B7E01 — tap below to ask about it.
+/check A3F1-9C2B7E01     -> A3F1-9C2B7E01: nothing on the address yet. Normal —
                           ask again in a while.
 ```
 
@@ -1871,14 +1971,26 @@ still open; the pairing survives.
 service: the pager **long-polls outward** over Tor and listens on nothing at
 all, so there is no inbound port to forward. If Tor is down it does not start
 (§4). A stolen phone or bot token can wake the vault and spam quotes — §7
-already scores that — and cannot spend, cannot name a destination, and cannot
-read a memo. The bound that matters is the vault's 24 h wake budget and
-account ceiling, which live in a keyfile and need physical access to change.
+already scores that — and, on a vault paired with `--allow-withdraw`, can
+**spend what that chat's own deposits put there**, to an address the thief
+types: there is no second factor on `/withdraw` beyond the phone's own lock,
+and the earlier claim here that it "cannot spend, cannot name a destination"
+stopped being true the day the withdraw job existed. It cannot reach anyone
+else's money (the vault spends only that chat's owner's accounts) and cannot
+read a memo. The bounds that matter are the vault's: `allow_withdraw`, the
+24 h wake budget and the account ceiling, in a keyfile that needs physical
+access to change.
 
 The one real cost, stated plainly: to run unattended it needs
 `GS_WAKE_PASSPHRASE` in its environment, which puts the passphrase on the same
-SD card as the sealed keyfile and effectively unseals it. A pager you start by
-hand, typing the passphrase, does not. That is the trade; make it knowingly.
+SD card as the sealed keyfile and effectively unseals it. **With
+`allow_withdraw`, an unsealed Pi card is a spend capability**: whoever images
+it holds the Pi's secret, can forge a wake note for any owner token they can
+compute (every allowlisted chat id is on the same card), and needs only a
+position on the LAN to have the vault mix that owner's money to their own
+address — no phone, no bot token. A pager you start by hand, typing the
+passphrase, does not make that trade. Make it knowingly, and price it at the
+value at rest on the mixing wallet.
 
 The wake channel can ask for four jobs and no others —
 `receive_and_quote`, `watch`, `swap_status`, `withdraw`.
@@ -1933,7 +2045,7 @@ there: `gs_doorbell`, which persists nothing but the keyfile, and
 | file | what it holds |
 |---|---|
 | `pager_state.json` | up to 200 wake timestamps in 5-minute buckets, plus the last one. `gs_common`'s own wipe-list calls this "a dated record of every time you woke the vault from a phone — which is exactly the correlation the jitters exist to break". |
-| `integrity_chain.log` | append-only, never rotated: `poke:<job>`, `collected:<job>`, `outcome:<job>:<out>`, `burn_signal`, `messages_burned`, `start`. |
+| `integrity_chain.log` | append-only, never rotated: `poke`, `collected`, `outcome:<out>`, `burn_signal`, `messages_burned`, `start` and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. |
 | `pager.log` | whatever the unit's `ExecStartPre` writes, plus anything you redirect there. |
 
 `paranoia_mode`'s search roots are the working directory, `$HOME`, and

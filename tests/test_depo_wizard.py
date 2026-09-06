@@ -101,6 +101,11 @@ class Fake:
         p._chain_leg = 0
         p._status_at = {}
         p.spenders = 1
+        # WHOSE WAKE HOLDS THE LOCK, read straight (not via __dict__.get) by
+        # handle()'s /cancel branch and by _busy_answer, so the harness must
+        # carry it. None means "a wake is running but not this chat's"; a test
+        # that needs the owner's-own-wake branch sets it to that chat id.
+        p._running = None
         p.busy = threading.Lock()
         p.ignored = 0
         p.convos = {}
@@ -184,17 +189,22 @@ _job, _params = f.pokes[0][1], f.pokes[0][2]
 check("the emitted job is one the protocol has", _job in P.JOBS)
 # THE REAL SCHEMA, through validate_job, with the job_id and challenge an M2
 # actually carries -- so this is the same gate the vault applies, not a
-# paraphrase of it.
+# paraphrase of it. The owner is the one field the wizard does NOT collect:
+# start_job stamps it from the asking chat (owner_token) at the wire, so an M2
+# always carries one and validate_job now refuses a note without it. The poke
+# recorded here is pre-injection, so the owner start_job would add is supplied
+# to exercise the same gate the vault applies.
 _ok = True
 try:
     P.validate_job({"job_id": P.new_job_id(),
                     "challenge": P.new_challenge().hex(),
-                    "job": _job, **_params})
+                    "job": _job, "owner": P.HOST_OWNER, **_params})
 except P.WakeError:
     _ok = False
 check("...and the emitted params pass the REAL job schema", _ok)
-check("...and carry nothing but the declared keys",
-      set(_params) == set(P.JOBS[_job]["schema"]))
+check("...and carry nothing but the declared keys the wizard collects "
+      "(the owner is stamped at the wire, not by the conversation)",
+      set(_params) == set(P.JOBS[_job]["schema"]) - {"owner"})
 check("nothing in the emitted params is a string",
       all(isinstance(v, int) and not isinstance(v, bool)
           for v in _params.values()))
@@ -212,11 +222,15 @@ _WA = "4" + "Ad" * 47
 
 
 def _wjob_ok(params):
-    """Does the wire really accept this withdraw note? Asked of the real gate."""
+    """Does the wire really accept this withdraw note? Asked of the real gate.
+
+    The owner is added the way start_job would stamp it: the conversation
+    never collects one, so a poke's params carry every field BUT owner, and
+    the gate now refuses a note without it."""
     try:
         P.validate_job({"job_id": P.new_job_id(),
                         "challenge": P.new_challenge().hex(),
-                        "job": "withdraw", **params})
+                        "job": "withdraw", "owner": P.HOST_OWNER, **params})
         return True
     except P.WakeError:
         return False
@@ -272,7 +286,8 @@ _wok = True
 try:
     P.validate_job({"job_id": P.new_job_id(),
                     "challenge": P.new_challenge().hex(),
-                    "job": "withdraw", **w.pokes[0][2]})
+                    "job": "withdraw", "owner": P.HOST_OWNER,
+                    **w.pokes[0][2]})
 except P.WakeError:
     _wok = False
 check("wd: ...and what it emits passes the REAL job schema", _wok)
@@ -873,10 +888,15 @@ check("the pager has no amount ladder to read, and no longer pretends to",
 # THE DEPOSIT JOB CARRIES ONE KEY, and it is not an address.
 _dj = Fake()
 _dj.say("/deposit"); _dj.say("0.05"); _dj.answer_confirm()
-check("a deposit job carries the amount and nothing else",
+check("a deposit job carries the amount and nothing else the wizard chose",
       set(_dj.pokes[0][2]) == {"amount_sat"})
-check("...and the protocol agrees that is the whole schema",
-      set(P.JOBS["receive_and_quote"]["schema"]) == {"amount_sat"})
+# THE WHOLE SCHEMA IS THE AMOUNT PLUS THE OWNER, and the owner is stamped at
+# the wire from the asking chat, not chosen in the conversation -- so neither
+# field is an address the Pi could name. That is the property: no destination
+# in the deposit schema at all.
+check("...and the protocol agrees that is the whole schema (the amount, plus "
+      "the owner the wire stamps -- and no address)",
+      set(P.JOBS["receive_and_quote"]["schema"]) == {"amount_sat", "owner"})
 # NON-VACUITY: the OTHER job really can carry an address, so this is a fact
 # about the deposit path and not about a bot that never sends addresses.
 check("NON-VACUITY -- withdraw really can carry a destination, so the "
@@ -1055,8 +1075,11 @@ for c in range(1, 200):
     f4.say("/depo", cid=c)
 check(f"live conversations are capped at MAX_CONVOS ({pg.MAX_CONVOS})",
       len(f4.p.convos) <= pg.MAX_CONVOS)
+# THE OVERFLOW ANSWER IS FULL_ANSWER NOW, the same "not now" every other
+# capacity refusal uses: a count of other people mid-question is not a thing to
+# say, so the cap no longer gets its own "too many conversations" wording.
 check("...and the chat at the cap is told, not silently ignored",
-      "too many conversations" in f4.text())
+      pg.FULL_ANSWER in f4.text())
 
 f5 = Fake()
 f5.say("/depo")
@@ -1326,17 +1349,23 @@ check("/cancel with nothing running says so rather than lying",
 # it is an honest answer.
 _cb = Fake()
 _cb.p.busy.acquire()                       # a wake is running, no conversation
+# ...AND IT IS THIS CHAT'S. The honest answer is now told ONLY to the chat
+# whose job holds the lock (handle() checks self._running == cid); any other
+# chat hears the plain "busy" instead, so the running wake here is 111's own.
+_cb.p._running = 111
 _cb.say("/cancel")
 _cbt = _cb.text()
 check("/cancel with a WAKE running does not claim there is nothing to cancel",
       "nothing to cancel." not in _cbt)
-check("...and says something is running instead",
-      "something is running" in _cbt.lower()
-      or "something IS running" in _cbt)
+check("...and says the operator's own job is running instead",
+      "yours IS running" in _cbt)
 check("...and says plainly that it cannot be stopped from here, rather than "
       "implying it was", "cannot be stopped" in _cbt.lower())
-check("...and explains why everything else is being refused",
-      "refused" in _cbt.lower())
+# THE REASSURANCE, NOT A LECTURE ON REFUSALS. The message no longer explains
+# that other commands are being refused -- it says the one thing the operator
+# needs, that the running job reports back on its own when it finishes.
+check("...and says it reports back on its own when it finishes",
+      "report back" in _cbt.lower() and "finishes" in _cbt.lower())
 check("...and wakes nothing itself", _cb.pokes == [])
 # A HALF-TYPED CONVERSATION IS STILL CANCELLABLE WHILE A WAKE RUNS -- and
 # building that state took a correction. The obvious construction (hold
@@ -1360,9 +1389,13 @@ check("/cancel still cancels a half-typed wizard while a job runs",
 _ce = Fake()
 _ce.p.busy.acquire()
 _ce.say("/depo")
+# THE WORDING IS THE SHARED "not now" NOW. begin_convo sends _busy_answer,
+# which for a chat that is not the running one is BUSY_ANSWER -- "busy right
+# now with something that cannot be interrupted from here" -- rather than the
+# old "a wake is already running" that named the arrangement.
 check("/cancel: ...and a wizard cannot be started during a wake at all",
       111 not in _ce.p.convos
-      and "already running" in _ce.text())
+      and "busy right now" in _ce.text())
 # NON-VACUITY: with nothing running at all the plain answer is unchanged, so
 # the new branch is about `busy` and not a rewrite of every cancel.
 _cd = Fake()
@@ -1700,7 +1733,8 @@ def _sent_strings(tree):
     # EVENT_LINES too: its values reach the wire through "\n".join(...), which
     # has no string constant for the send-argument walk above to find.
     for name in ("HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
-                 "BUSY_ANSWER", "EVENT_LINES"):
+                 "BUSY_ANSWER", "BUSY_ANSWER_MINE", "FULL_ANSWER",
+                 "EVENT_LINES"):
         for n in tree.body:
             if isinstance(n, _ast.Assign) and getattr(
                     n.targets[0], "id", "") == name:
@@ -1768,10 +1802,15 @@ check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
 # `text` is _ask forwarding its own argument to send -- every _ask call site
 # is walked above, so the forwarded name is covered by construction.
 _RUNTIME_SENDS = {"slip", "_msg", "memo", "text"}
+# _busy_answer(cid) is a composed reply like the questions above: it returns
+# one of two module constants (BUSY_ANSWER_MINE for the chat whose job runs,
+# BUSY_ANSWER for anyone else), both walked by the constant scan. FULL_ANSWER
+# is the new capacity refusal, a constant sent directly like BUSY_ANSWER.
 _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
                   | {"welcome_text(self.burn_after, self.key)"}
                   | {"HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
-                     "BUSY_ANSWER"}
+                     "BUSY_ANSWER", "FULL_ANSWER"}
+                  | {"self._busy_answer(cid)", "self._busy_answer(chat_id)"}
                   | _RUNTIME_SENDS)
 _uncovered = sorted(
     {_ast.unparse(a) for n in _ast.walk(_pg_tree)
@@ -1888,7 +1927,7 @@ check("the deposit-instruction fixture is exactly the wire's own field set, "
       set(_PLAIN_SAMPLE) == set(P.PLAIN_FIELDS)
       and P.plain_slip_is_wellformed(_PLAIN_SAMPLE))
 _plain_authored = [_l for _l in P.plain_lines(_PLAIN_SAMPLE,
-                                              label="A3F1-9C2B7E") if _l]
+                                              label="A3F1-9C2B7E01") if _l]
 #: AND THE WITHDRAW QUESTION, which is the one place the reader has to know
 #: WHICH KIND of address to paste. "Send a Monero address" plus an example is
 #: the fastest this can be; the alternative is three sentences of reasoning

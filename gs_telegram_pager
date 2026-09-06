@@ -54,11 +54,18 @@ pager that accepted an amount would have to either carry the ladder (putting
 it on the SD card) or send a number (breaking the rule). `/depo 2` it is.
 
 WHAT A STOLEN PHONE OR BOT TOKEN GETS, stated plainly because §7 already
-scores it: they can wake the vault and spam quotes. They cannot spend, cannot
-name a destination, and cannot read a memo — the reply vocabulary here has no
-word for one. The real bound is on the ThinkPad and needs physical access to
-change: a 24 h wake budget and an account ceiling in the keyfile. The rate
-limit below is courtesy, not the backstop, and says so.
+scores it: they can wake the vault, spam quotes, and -- on a vault paired
+with --allow-withdraw -- SPEND what that chat's own deposits put there, to an
+address they type. Nothing of anyone else's: the vault spends only the
+accounts the asking chat's arrivals created (see owner_token below). They
+cannot read a memo — the reply vocabulary here has no word for one. The real
+bounds are on the ThinkPad and need physical access to change: the
+allow_withdraw switch, a 24 h wake budget and an account ceiling in the
+keyfile. The rate limit below is courtesy, not the backstop, and says so.
+WHAT A STOLEN PI CARD GETS is worse when the passphrase sits beside the
+keyfile (the unattended unit's EnvironmentFile): the Pi secret forges any
+note, including a withdrawal for any owner it can name. OPSEC_SETUP.md 4b
+prices that trade; a pager started by hand does not make it.
 
 NOT A DAEMON THAT HOLDS SECRETS. The keyfile passphrase is read once at
 startup from GS_WAKE_PASSPHRASE (gs_doorbell.read_passphrase's own documented
@@ -307,8 +314,8 @@ BOT_COMMANDS = [
     # this process minted it for this chat. Both also work with no argument,
     # which is what somebody asking "is anything happening" actually types,
     # and the list says so because otherwise nobody would try it.
-    ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E"),
-    ("wait", "wait for it to arrive — /wait, or /wait A3F1-9C2B7E"),
+    ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E01"),
+    ("wait", "wait for it to arrive — /wait, or /wait A3F1-9C2B7E01"),
     ("settings", "what this will do, and where each part is decided"),
     # THE THREE ANSWERS THAT WERE UNREACHABLE IN PRACTICE. /fee, /speed and
     # /exit have always been handled in parse_command and have always had
@@ -592,8 +599,23 @@ FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Not the network fee."
 #: start_job's own -- and the comment at the first says they "cannot drift into
 #: describing the same refusal differently". Two copies of a literal is exactly
 #: how that drift happens.
-BUSY_ANSWER = ("no: something is already running. One at a time — wait for it "
-               "to report, then try again.")
+#: THREE ANSWERS FOR "NOT NOW", AND NONE OF THEM IS ABOUT ANYBODY ELSE.
+#:
+#: The old one said "wait for it to report" to whoever asked -- and the report
+#: goes to the chat that started the job. Said to a different chat it promised
+#: a message that would never come, and said that somebody else's job was
+#: running. Now: YOURS is running (only to the chat whose job it is), or this
+#: is busy for about so long (a ceiling from this box's own persisted hold,
+#: never a count, never a name), or this is full (no figure at all: the only
+#: true one would be a fact about other people's runs).
+BUSY_ANSWER_MINE = ("no: yours is still running. One at a time — it reports "
+                    "here when it finishes.")
+BUSY_ANSWER = ("no: busy right now with something that cannot be interrupted "
+               "from here. Try again in about {when}.")
+#: ...AND "FULL" IS THE PROTOCOL'S OWN SENTENCE, so the vault's refusal for
+#: capacity (phase "full", when this box's memory of the places was wrong)
+#: and this box's own refusal from memory are the same words.
+FULL_ANSWER = proto.PHASE_LINES["full"]
 #: "Not settable here." IS THE STRING EXIT_ANSWER WAS FIXED FOR, left standing
 #: one line below the fix. That note says an answer naming no alternative
 #: "reads as a refusal to say rather than a fact about the design", and speed
@@ -699,11 +721,23 @@ IGNORE = "\x00ignore"
 #: tag is stripped here, after it verifies. Nothing on the vault knows this
 #: exists, which is the point -- the Pi holds the chat identity and the vault
 #: holds the money, and neither learns the other's half.
-CONFIRM_TAG_BYTES = 3
+#: FOUR BYTES, NOT THREE, AND A WRONG GUESS NOW COSTS SOMETHING. Three bytes
+#: is 2^24; a wrong label was answered for free and never counted, so a
+#: second person in the same chat could grind a tag at the inbound rate with
+#: nothing in this code slowing them down. Four bytes and a per-chat failure
+#: backoff (see handle()) put that past what a chat channel can carry. The
+#: label is shown and tapped, never typed blind, so its length costs nothing.
+CONFIRM_TAG_BYTES = 4
 
-#: `A3F1-9C2B7E`, and the dash is optional so a phone keyboard's autocorrect
+#: `A3F1-9C2B7E01`, and the dash is optional so a phone keyboard's autocorrect
 #: cannot break it. Case-insensitive on input, upper on output.
-CONFIRM_RE = re.compile(r"([0-9A-Fa-f]{4})-?([0-9A-Fa-f]{6})\Z")
+CONFIRM_RE = re.compile(r"([0-9A-Fa-f]{4})-?([0-9A-Fa-f]{8})\Z")
+
+#: How many wrong labels a chat may send before its label lookups slow down,
+#: and the longest the slowdown grows to. The answer never changes -- "no
+#: record" either way -- so nothing is disclosed; what changes is the rate.
+LABEL_FAILS_FREE = 5
+LABEL_BACKOFF_MAX_S = 3600
 
 
 def _confirm_key(key: dict) -> bytes:
@@ -754,6 +788,38 @@ def handle_from_confirmation(key: dict, chat_id: int, text: str) -> str:
         return h if hmac.compare_digest(m.group(2).upper(), want) else ""
     except BaseException:                                    # noqa: BLE001
         return ""
+
+
+def _owner_key(key: dict) -> bytes:
+    """The MAC key for owner tokens. Domain-separated like _confirm_key, and
+    from it: one secret, two purposes, two derived keys."""
+    sec = (key or {}).get("secret") or ""
+    raw = bytes.fromhex(sec)
+    if len(raw) != 32:
+        raise ValueError("pairing secret is not 32 bytes")
+    return hashlib.sha256(b"gs-pager-owner-v1\x00" + raw).digest()
+
+
+def owner_token(key: dict, chat_id: int) -> str:
+    """WHO A JOB IS FOR, in a form the vault can hold and nobody can read.
+
+    Sixteen hex characters of HMAC(owner key, chat id). The vault records
+    every account this token's deposits and mixes create and lets a
+    withdrawal for the token spend those and nothing else -- which is what
+    makes one vault safe for several people. Three properties carry it:
+
+      * DERIVED, NEVER STORED. It is computed from the chat that is asking at
+        the one place a wake starts (start_job), so a chat can only ever
+        emit its own; it survives a restart with no map on the card; and the
+        card holds no token->chat record because there is nothing to hold.
+      * ONE-WAY. The vault sees a token and never a chat id; someone holding
+        the vault's disk cannot turn a token back into a person.
+      * KEYED. Forging another chat's token needs the pairing secret. That is
+        the whole of what isolation rests on -- the secret, not the width
+        and not anybody not knowing this function.
+    """
+    return hmac.new(_owner_key(key), str(int(chat_id)).encode(),
+                    hashlib.sha256).hexdigest()[:16]
 
 #: WHAT IT DOES, NOT HOW ANY OF IT WORKS.
 #:
@@ -1314,7 +1380,7 @@ def parse_command(text: str) -> tuple:
         # handle on the wire.
         if not (CONFIRM_RE.match(arg) or HANDLE_RE.match(arg)):
             return "", {}, ("that is not a confirmation number. It looks like "
-                            "A3F1-9C2B7E and it is in the message that "
+                            "A3F1-9C2B7E01 and it is in the message that "
                             "started the deposit — or just /check on its own "
                             "and I will say what is running.")
         return _job, {"confirmation": arg.strip()}, ""
@@ -1535,6 +1601,30 @@ class Pager:
         #: other way. One wallet, one person -- checked where it is spent as
         #: well as where it is configured.
         self.spenders = len(self.allow_users) or len(self.allow)
+        #: HOW MANY PEOPLE THIS BOT SERVES AT ONCE. One unless the operator
+        #: said otherwise (--max-clients): an upgrade grants nothing. Above
+        #: one, every client is a private chat and the vault keeps their
+        #: money apart by owner token; this number is the soft cap on how
+        #: many may have a deposit in flight, and the vault's own account
+        #: reserve is the hard one behind it (OPSEC_SETUP.md 4f).
+        self.max_clients = max(1, int(getattr(args, "max_clients", 1) or 1))
+        #: Owner tokens holding a place -> when the place was last seen
+        #: alive (monotonic-free wall clock, in memory). Taken when a
+        #: deposit reports done; kept alive by a watching job that reports
+        #: money on the address; given back when a withdrawal reports done
+        #: with nothing left; and FORGOTTEN after DEPOSIT_PLACE_TTL_S with
+        #: no sign of life, so an unpaid deposit cannot hold a place for
+        #: good. IN MEMORY, like every per-person fact on this box: a
+        #: restart empties it and may admit one too many, and the vault's
+        #: own reserve refuses that one with the same "full" words.
+        #: Compared as a LENGTH and nothing else.
+        self.inflight_owners = {}
+        #: Whether another chat was refused during the running withdrawal.
+        #: A chain continues leg to leg only while nobody is waiting; with a
+        #: waiter, the completion says "more remains" and yields the turn.
+        self._contended = False
+        #: chat -> (wrong labels in a row, not-before). See handle().
+        self._label_fails = {}
         self.busy = threading.Lock()
         self.ignored = 0
         self.poll_failures = 0
@@ -1700,7 +1790,7 @@ class Pager:
         # The strings are the same ones `/depo 2` already answers with, so the
         # two paths cannot drift into describing the same refusal differently.
         if self.busy.locked():
-            self.send(chat_id, BUSY_ANSWER)
+            self.send(chat_id, self._busy_answer(chat_id))
             return
         # THE RESTART HOLD TOO, so a conversation is not walked through its
         # questions to be refused at the confirm.
@@ -1708,15 +1798,19 @@ class Pager:
         if why:
             self.send(chat_id, f"no: {why}")
             return
+        # ...AND THE ROOM, for the same reason: a newcomer at capacity is
+        # told now, not after typing an amount.
+        if kind == "depo" and self._full_for(chat_id, "receive_and_quote"):
+            self.send(chat_id, FULL_ANSWER)
+            return
         # BOUNDED. The dict is keyed by chat_id and only an allowlisted chat
         # ever reaches here, so len(convos) <= len(allow) is already
-        # structural. MAX_CONVOS is the second bound, and it is a BUG DETECTOR
-        # rather than a policy: if it ever fires, something is creating
-        # conversations that nothing is clearing.
+        # structural. MAX_CONVOS is the second bound. With several clients it
+        # is reachable, so its answer is the same words as every other "not
+        # now" -- a count of other people mid-question is not a thing to say.
         if (chat_id not in self.convos) and len(self.convos) >= MAX_CONVOS:
             integrity_log("pager", "convo_cap_hit")
-            self.send(chat_id, "no: too many conversations in flight. Try "
-                               "again in a few minutes.")
+            self.send(chat_id, FULL_ANSWER)
             return
         self._end_convo(chat_id)
         self.convos[chat_id] = Convo(self.clock, kind=kind)
@@ -2224,7 +2318,7 @@ class Pager:
             self._end_convo(chat_id)
             integrity_log("pager", "convo_error")
             self.send(chat_id, f"no: that went wrong — cancelled, nothing was "
-                               f"started ({_redact(e)[:60]}).")
+                               f"started.")
             return True
 
     def _step_convo(self, chat_id: int, text: str, mid=None) -> bool:
@@ -2387,7 +2481,7 @@ class Pager:
                 c.tries += 1
                 if c.tries > self.DEPTH_RETRIES:
                     self._end_convo(chat_id)
-                    integrity_log("pager", "convo_depth_exhausted")
+                    integrity_log("pager", "convo_exhausted")
                     self.send(chat_id, "no: cancelled — start again with "
                                        "/withdraw.")
                     return True
@@ -2489,13 +2583,18 @@ class Pager:
         job = "withdraw"
         params = {"exit_to": exit_to, "depth": depth}
         _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
-        if set(params) != set(_schema):
+        # MINUS THE OWNER, on both lines. The token is stamped by start_job,
+        # the one place a wake starts, so it is not in `params` here -- and
+        # a loop over the whole schema raised KeyError on it, which the bare
+        # except turned into "internal check failed" on every /withdraw.
+        if set(params) != set(_schema) - {"owner"}:
             integrity_log("pager", "convo_commit_mismatch")
             self.send(chat_id, "no: internal check failed, nothing was started.")
             return
         try:
             for _k, _check in _schema.items():
-                _check(params[_k])
+                if _k != "owner":
+                    _check(params[_k])
         except Exception:                                    # noqa: BLE001
             integrity_log("pager", "convo_commit_mismatch")
             self.send(chat_id, "no: internal check failed, nothing was started.")
@@ -2536,10 +2635,11 @@ class Pager:
         job, params = "receive_and_quote", {"amount_sat": amount}
         _schema = (proto.JOBS.get(job) or {}).get("schema") or {}
         try:
-            if set(params) != set(_schema):
+            if set(params) != set(_schema) - {"owner"}:
                 raise ValueError("key set")
             for _k, _check in _schema.items():
-                _check(params[_k])
+                if _k != "owner":            # stamped by start_job, not here
+                    _check(params[_k])
         except Exception:                                    # noqa: BLE001
             integrity_log("pager", "convo_commit_mismatch")
             self.send(chat_id, "no: internal check failed, nothing was started.")
@@ -2885,7 +2985,7 @@ class Pager:
         def _say(word):
             if word != "collected":
                 return
-            integrity_log("pager", f"collected:{job}")
+            integrity_log("pager", "collected")
             self.send(chat_id,
                       f"{chat_name(job)}: picked up — it is running now. "
                       f"Nothing else to do; I will say when it is finished.")
@@ -2905,8 +3005,17 @@ class Pager:
             pending = db.run_wake(self.args, self.key, job, params,
                                   on_event=self._milestone(chat_id, job))
         except BaseException as e:                           # noqa: BLE001
-            integrity_log("pager", f"wake_failed:{job}")
-            self.send(chat_id, f"{chat_name(job)}: failed to start — {_redact(e)[:160]}")
+            integrity_log("pager", "wake_failed")
+            # THE REASON STAYS ON THIS BOX. This forwarded the exception's
+            # text, redacted -- and the doorbell's own refusal reads "NOT
+            # sending the magic packet: waking the vault ... wastes a boot ...
+            # until its deadman fires", words the banned-word scan never saw
+            # because they live in another file. A closed sentence to the
+            # chat; the detail to the terminal, where the operator is.
+            print(f"  [!] {chat_name(job)} failed to start: "
+                  f"{_redact(e)[:200]}")
+            self.send(chat_id, f"{chat_name(job)}: failed to start — nothing "
+                               f"ran. Try again later.")
             return
         out = pending.outcome()
         # WHAT HAPPENED ON THE SWITCH, WHICH THIS SURFACE NEVER SAW.
@@ -2941,7 +3050,11 @@ class Pager:
         # the chain records what happened, the message IS what happened as far
         # as the operator is concerned.
         try:
-            integrity_log("pager", f"outcome:{job}:{out}")
+            # THE OUTCOME, NOT THE JOB. The card kept "poke:withdraw" and
+            # "outcome:withdraw:done" for every run, at ten-minute stamps: a
+            # timetable of spends against probes, for the life of the card.
+            # Kinds only, and job-agnostic kinds.
+            integrity_log("pager", f"outcome:{out}")
         except Exception:                                    # noqa: BLE001
             print("  [!] could not write the integrity chain for this "
                   "outcome; reporting it anyway.")
@@ -3022,6 +3135,9 @@ class Pager:
             if proto.HANDLE_RE.match(h):
                 self.handle_owner[h] = chat_id
                 self.handle_job[h] = job
+            # A DEPOSIT IN FLIGHT HOLDS A PLACE. See inflight_owners.
+            if job == "receive_and_quote":
+                self._hold_place(chat_id)
             # THE LABEL THIS CHAT SEES. Built once, here, so every branch
             # below prints the same string the buttons carry and the operator
             # can type back. "----" is what a reply with no usable handle got
@@ -3043,6 +3159,16 @@ class Pager:
             # completion message for every chained withdrawal and reported a
             # spend as if it were a probe.
             if phase and job in ("watch", "swap_status"):
+                # MONEY ON THE ADDRESS KEEPS THE PLACE ALIVE. A deposit that
+                # is arriving, landed, short or partial is one still to be
+                # paid out, whatever its age; "moved" is one that was, and
+                # "not_yet"/"stuck" say nothing about the money either way,
+                # so neither touches the place.
+                if phase in ("arriving", "landed", "short", "partial",
+                             "more_left", "more_locked"):
+                    self._hold_place(chat_id)
+                elif phase == "moved":
+                    self._drop_place(chat_id)
                 # A STATUS PROBE ANSWERS IN ONE SENTENCE and says nothing else.
                 # The sentence comes from the protocol's own table so this box
                 # cannot invent a reassurance, and the word it renders was
@@ -3166,8 +3292,16 @@ class Pager:
                     _allowed = not self.limits.why_not()
                 except Exception:                            # noqa: BLE001
                     _allowed = False
+                # ...AND ONLY WHILE NOBODY IS WAITING. A chain that runs
+                # six legs holds one vault for days; with another client
+                # refused during this leg it yields after this one and the
+                # completion says "more remains", so the waiter gets a turn
+                # and this client runs /withdraw again. Alone on the bot, the
+                # six-leg convenience is unchanged.
                 _next_leg = (_more and _leg + 1 < self.MAX_CHAIN_LEGS
-                             and _allowed)
+                             and _allowed
+                             and not (self._max_clients() > 1
+                                      and getattr(self, "_contended", False)))
                 # NO LEG NUMBER, NO CAP, NO "SEPARATE": each is the shape of
                 # the withdrawal, on the surface a stranger reads.
                 _msg = ("withdraw: sent.\n"
@@ -3195,7 +3329,7 @@ class Pager:
                 if not self.send(chat_id, _msg):
                     time.sleep(SLIP_RETRY_S)
                     if not self.send(chat_id, _msg):
-                        integrity_log("pager", "withdraw_result_undelivered")
+                        integrity_log("pager", "result_undelivered")
                 # ARMED AFTER THE REPORT, NOT INSTEAD OF IT. If the send above
                 # failed twice the operator has no idea a leg finished, and
                 # starting another one silently is the worst thing this could
@@ -3205,6 +3339,13 @@ class Pager:
                 # NOT STARTED HERE. start_job takes `busy`, and this is
                 # running inside the worker that holds it. _worker acts on
                 # this slot after its finally releases the lock.
+                # THE PLACE IS GIVEN BACK when nothing of this owner's is
+                # left -- not while more remains or is unlocking, which is
+                # still a deposit in flight.
+                if not (_more or _locked):
+                    self._drop_place(chat_id)
+                else:
+                    self._hold_place(chat_id)
                 if _next_leg:
                     self._chain = (chat_id, dict(params), _leg + 1)
                 elif _more:
@@ -3212,7 +3353,7 @@ class Pager:
                     # was what contradicted the first one; the sentence it
                     # carried now lives in _msg, chosen by the same _next_leg
                     # that decides whether a leg is actually armed.
-                    integrity_log("pager", "chain_capped")
+                    integrity_log("pager", "run_capped")
                 return
             if plain and chat_id < 0:
                 # A GROUP IS A BROADCAST SURFACE, AND A PAYLOAD IS NOT FOR ONE.
@@ -3243,7 +3384,7 @@ class Pager:
                 # The SEALED slip is still sent to a group: it is sealed to a
                 # key nobody in the room holds, which is the whole argument
                 # for putting one in a chat at all.
-                integrity_log("pager", "plain_slip_withheld_group")
+                integrity_log("pager", "payload_withheld_group")
                 self.send(chat_id,
                           f"{chat_name(job)}: quoted. Confirmation number: {_cn}\n"
                           f"The deposit details are NOT posted here — this is "
@@ -3403,15 +3544,27 @@ class Pager:
             # SO IT SAYS THE SHAPE OF BOTH AND PICKS NEITHER. "Refused twice
             # the same way, stop" is the rule that is right for both kinds,
             # and it needs no reason from the wire to be true.
-            self.send(chat_id,
-                      f"{chat_name(job)}: refused before it started"
-                      + (" — nothing was spent and nothing moved."
-                         if job == "withdraw" else ".")
-                      + " It does not say why.\n"
-                        "If a second try is refused the same way, stop — some "
-                        "refusals need somebody at the machine, and tries are "
-                        "limited.",
-                      buttons=MENU_BUTTONS)
+            # ...EXCEPT "FULL", the one refusal that carries a word, because
+            # "wait, this frees up" is the one a person can act on. It is
+            # the vault's account reserve speaking when this box's memory
+            # of the places was wrong (a restart forgot them), in the same
+            # words this box uses from memory. Only on a deposit: the word
+            # on any other job is a vault this end does not recognise, and
+            # it gets the generic line like any other refusal.
+            _rphase = (pending.result or {}).get("phase") or ""
+            if _rphase == "full" and job == "receive_and_quote":
+                integrity_log("pager", "refused_full")
+                self.send(chat_id, FULL_ANSWER, buttons=MENU_BUTTONS)
+            else:
+                self.send(chat_id,
+                          f"{chat_name(job)}: refused before it started"
+                          + (" — nothing was spent and nothing moved."
+                             if job == "withdraw" else ".")
+                          + " It does not say why.\n"
+                            "If a second try is refused the same way, stop — "
+                            "some refusals clear only when someone looks at "
+                            "the other end, and tries are limited.",
+                          buttons=MENU_BUTTONS)
         elif out == "failed":
             # A FAILED WITHDRAWAL GETS THE ONE THING THE OPERATOR CAN ACT ON.
             #
@@ -3445,8 +3598,8 @@ class Pager:
                      "options need more to work with.\n"
                      "Some of it may already have moved: a run can stop "
                      "before it spends anything or part-way through, and "
-                     "this end cannot tell which. CHECK THE BALANCE before "
-                     "running it again."
+                     "this end cannot tell which. CHECK YOUR DESTINATION "
+                     "before running it again."
                      if job == "withdraw" else "")
             self.send(chat_id, f"{chat_name(job)}: failed.{_tail}",
                       buttons=MENU_BUTTONS)
@@ -3487,7 +3640,7 @@ class Pager:
             # is true and does not say what to check or what the risk of not
             # checking is.
             if job == "withdraw":
-                integrity_log("pager", "withdraw_unresolved")
+                integrity_log("pager", "run_unresolved")
                 self.send(chat_id,
                           "withdraw: it was picked up and never reported "
                           "back.\n"
@@ -3538,10 +3691,11 @@ class Pager:
             # whether it landed), but this is the last line of defence and it
             # must not become the thing that eats the exception silently.
             try:
+                print(f"  [!] worker failed to report cleanly: "
+                      f"{_redact(e)[:200]}")
                 self.send(chat_id,
                           f"{chat_name(job)}: it ran and this end then "
-                          f"failed to report it cleanly "
-                          f"({_redact(e)[:80]}).\n"
+                          f"failed to report it cleanly.\n"
                           f"I cannot tell you whether it finished. Check "
                           f"before starting another one.",
                           buttons=MENU_BUTTONS)
@@ -3646,10 +3800,12 @@ class Pager:
             return
         chat = msg.get("chat") or {}
         cid = chat.get("id")
-        if not isinstance(cid, int) or cid not in self.allow:
+        if (not isinstance(cid, int) or isinstance(cid, bool)
+                or cid not in self.allow):
             # NOT replied to. Answering an unknown chat confirms the bot is
             # alive to whoever found it, and the token is the only thing
-            # standing between a stranger and this loop.
+            # standing between a stranger and this loop. (bool excluded like
+            # the callback path: True == 1, and 1 could be allowlisted.)
             self.ignored += 1
             integrity_log("pager", "chat_not_allowlisted")
             return
@@ -3737,13 +3893,14 @@ class Pager:
             # still worth confirming while a job runs.
             if had_convo:
                 self.send(cid, "cancelled. Nothing was started.")
-            elif self.busy.locked():
+            elif self.busy.locked() and self._running == cid:
+                # ONLY TO THE CHAT WHOSE JOB IT IS. Said to any other chat
+                # this announced somebody else's run and promised them a
+                # report that goes elsewhere.
                 self.send(cid,
-                          "nothing half-typed to cancel — but something IS "
-                          "running, and it cannot be stopped from here. The "
-                          "machine has the job and is working through it; "
-                          "that is also why other commands are being "
-                          "refused. It will report back when it finishes.")
+                          "nothing half-typed to cancel — but yours IS "
+                          "running, and it cannot be stopped from here. "
+                          "It will report back when it finishes.")
             else:
                 self.send(cid, "nothing to cancel.")
             return
@@ -3874,7 +4031,7 @@ class Pager:
             # Short, because this is a status answer. The reason in full is on
             # the refusal itself, where somebody has actually tried to do
             # something.
-            if self.spenders > 1:
+            if self.spenders > 1 and self._max_clients() <= 1:
                 self.send(cid, "not ready: more than one person is allowed "
                                "in here, and this is for one. Nothing will "
                                "run.",
@@ -3886,8 +4043,12 @@ class Pager:
             # attaching them adds nothing to the transcript: a label on a
             # button is not a line in the chat.
             # ...AND THE RESTART HOLD IS "wait" TOO: the vault may be busy.
+            # ...AND A FULL SERVICE, for a chat with no deposit in flight, so
+            # /status never says "ready" and then refuses.
             self.send(cid, _why if _why
-                      else ("wait" if (self.busy.locked() or self._hold_why())
+                      else ("wait" if (self.busy.locked() or self._hold_why()
+                                       or self._full_for(cid,
+                                                         "receive_and_quote"))
                             else "ready"),
                       buttons=MENU_BUTTONS)
             return
@@ -3953,13 +4114,47 @@ class Pager:
         #     the confirmation number exists to retire.
         if isinstance(params, dict) and params.get("confirmation") is not None:
             _text = str(params.pop("confirmation"))
+            # WRONG LABELS ARE COUNTED, PER CHAT, AND SLOW DOWN. A wrong one
+            # was answered for free, as many times as a chat cared to send,
+            # which made the tag something a chat could grind. After a few
+            # in a row the lookup is refused without being tried, for a
+            # doubling interval; the answer is the same words either way,
+            # so nothing is learned from being slowed. A right label resets.
+            _lf = self.__dict__.setdefault("_label_fails", {})
+            _fails, _until = _lf.get(cid, (0, 0.0))
+            if time.time() < _until:
+                # A GUESS DURING THE WAIT COUNTS, AND EXTENDS IT. Refused
+                # without the lookup (no MAC computed for it), but the
+                # streak grows and the not-before moves out with it, so
+                # hammering through the wait makes the wait longer, not
+                # shorter. Capped like the rest.
+                _fails += 1
+                _wait = min(LABEL_BACKOFF_MAX_S,
+                            60.0 * (2 ** max(0, _fails - LABEL_FAILS_FREE - 1)))
+                _lf[cid] = (_fails, max(_until, time.time() + _wait))
+                self.send(cid,
+                          "no: I have no record of that confirmation number "
+                          "in this chat. It is in the message that started "
+                          "the deposit — or /check on its own and I will say "
+                          "what is running.",
+                          buttons=MENU_BUTTONS)
+                return
             _h = handle_from_confirmation(self.key, cid, _text)
             if not _h:
                 _bare = _text.strip().upper()
                 if HANDLE_RE.match(_bare) and self.handle_owner.get(_bare) == cid:
                     _h = _bare
             if not _h:
-                integrity_log("pager", "handle_not_yours")
+                _fails += 1
+                _wait = 0.0
+                if _fails > LABEL_FAILS_FREE:
+                    _wait = min(LABEL_BACKOFF_MAX_S,
+                                60.0 * (2 ** (_fails - LABEL_FAILS_FREE - 1)))
+                _lf[cid] = (_fails, time.time() + _wait)
+                # ONCE PER STREAK ON THE CHAIN, not once per guess: a guess
+                # a second wrote a line a second to the card.
+                if _fails == 1:
+                    integrity_log("pager", "handle_not_yours")
                 # NEVER "that is somebody else's", and never "the tag is
                 # wrong": both confirm the handle exists. One answer for
                 # every way of not being entitled to it.
@@ -3970,6 +4165,7 @@ class Pager:
                           "what is running.",
                           buttons=MENU_BUTTONS)
                 return
+            _lf.pop(cid, None)
             params["handle"] = _h
         _h = params.get("handle") if isinstance(params, dict) else None
         if _h:
@@ -4135,10 +4331,17 @@ class Pager:
         # that succeeds takes the other one's money, and nothing downstream
         # can notice. So this is checked at the last line before the wake,
         # not only at the first line of the process.
-        if self.spenders > 1:
+        #
+        # ABOVE ONE CLIENT THE ALLOWLIST IS NOT THE CAP. --max-clients is
+        # how many may hold a place (a deposit in flight) at once, and the
+        # people allowed to ask may be more than that: the ones past it hear
+        # "full" and wait for a place to free, which is the whole point of a
+        # service with a cap. So this gate is the ONE-PERSON rule and fires
+        # only on a bot configured for one person that names several.
+        if self.spenders > 1 and self._max_clients() <= 1:
             if held:
                 self._drop_busy()
-            integrity_log("pager", "refused_multi_spender")
+            integrity_log("pager", "refused_many")
             self.send(cid,
                       "no: more than one person is allowed in here, and this "
                       "is for one person per chat. Refusing every job until "
@@ -4152,12 +4355,33 @@ class Pager:
                 self._drop_busy()
             self.send(cid, f"no: {why}")
             return
+        # ...AND THE ROOM. A newcomer's deposit at capacity is refused from
+        # memory, with no wake spent; a client with a deposit in flight is
+        # never refused their own /check or /withdraw for this.
+        if self._full_for(cid, job):
+            if held:
+                self._drop_busy()
+            integrity_log("pager", "refused_full")
+            self.send(cid, FULL_ANSWER)
+            return
         # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the window, so
         # a second concurrent wake cannot bind and would fail confusingly --
         # and two vaults woken at once is not a thing this design has.
         if not held and not self.busy.acquire(blocking=False):
-            self.send(cid, BUSY_ANSWER)
+            # SOMEBODY ELSE WAITED. The running chain reads this at its next
+            # completion and yields its turn instead of chaining on.
+            if self._running != cid:
+                self.__dict__["_contended"] = True
+            self.send(cid, self._busy_answer(cid))
             return
+        # WHOSE JOB THIS IS, ON THE WIRE. Derived from the asking chat here,
+        # at the one place a wake starts, and nowhere else: a chat can only
+        # ever emit its own token. A fresh (leg 0) withdrawal also clears the
+        # contention flag, so a chain is judged on ITS run's waiters.
+        params = dict(params)
+        params["owner"] = owner_token(self.key, cid)
+        if not leg:
+            self.__dict__["_contended"] = False
         # RELEASE IT IF ANYTHING BETWEEN HERE AND THE THREAD RAISES.
         #
         # The guard used to start at Thread.start(), on the reasoning that a
@@ -4205,7 +4429,7 @@ class Pager:
             # that does not start a job now leaves the counter alone.
             self._chain_leg = int(leg)
             self.limits.record()
-            integrity_log("pager", f"poke:{job}")
+            integrity_log("pager", "poke")
             # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
             # OUT. This said "working. This takes a while." for every job, and
             # the jobs are not alike: a status probe is minutes and a
@@ -4282,7 +4506,12 @@ class Pager:
             self._running = None
             self.busy.release()
             integrity_log("pager", "worker_start_failed")
-            self.send(cid, f"{chat_name(job)}: could not start — {_redact(e)[:120]}")
+            # THE REASON TO THE TERMINAL, A CLOSED SENTENCE TO THE CHAT: the
+            # redacted text still carried a file's basename ("No space left
+            # on device: <path>/pager_state.json.tmp") into the transcript.
+            print(f"  [!] {chat_name(job)} could not start: {_redact(e)[:200]}")
+            self.send(cid, f"{chat_name(job)}: could not start — nothing ran. "
+                           f"Try again later.")
 
     def publish_commands(self) -> bool:
         """Register the command list with Telegram. Returns whether it landed.
@@ -4300,18 +4529,35 @@ class Pager:
         the wrong trade on the box whose whole job is to be reachable. It says
         so instead, once, on the terminal.
 
-        SCOPE default (every chat this bot is in), because the allowlist is
-        what decides who is answered -- and it is checked on every message, so
-        a menu visible to a stranger buys them nothing but the word "no".
+        SCOPED TO THE ALLOWLISTED CHATS, AND THE DEFAULT SCOPE EMPTIED. This
+        published at the default scope on the reasoning that "a menu visible
+        to a stranger buys them nothing but the word no" -- and it bought them
+        the description: Telegram serves the default menu to ANYONE who opens
+        the bot, allowlisted or not, running or not, and the list says MONEY
+        IN, MONEY OUT, a usage fee, a speed and a payout. The shape of the
+        arrangement, to whoever is forwarded the username, from a bot that
+        otherwise refuses to acknowledge it exists. Per-chat scopes are what
+        Telegram offers for exactly this; the default is set to nothing.
         """
         cmds = [{"command": c, "description": d} for c, d in BOT_COMMANDS]
+        ok = True
         try:
-            r = safe_post(self._url("setMyCommands"),
-                          {"commands": json.dumps(cmds)},
-                          proxies=self.proxies)
-            ok = bool(isinstance(r, dict) and r.get("ok"))
+            # THE DEFAULT SCOPE FIRST, EMPTIED. Not fatal if it fails: the
+            # per-chat scopes below are what the allowlisted chats read.
+            safe_post(self._url("deleteMyCommands"), {},
+                      proxies=self.proxies)
         except Exception:                                    # noqa: BLE001
-            ok = False
+            pass
+        for _cid in sorted(self.allow):
+            try:
+                r = safe_post(self._url("setMyCommands"),
+                              {"commands": json.dumps(cmds),
+                               "scope": json.dumps({"type": "chat",
+                                                    "chat_id": int(_cid)})},
+                              proxies=self.proxies)
+                ok = ok and bool(isinstance(r, dict) and r.get("ok"))
+            except Exception:                                # noqa: BLE001
+                ok = False
         if not ok:
             print("  [!] Could not publish the command menu to Telegram. The "
                   "bot still answers every\n"
@@ -4340,6 +4586,115 @@ class Pager:
             self.busy.release()
         except RuntimeError:
             pass
+
+    def _busy_answer(self, cid: int) -> str:
+        """The "not now" for a chat while a wake holds the lock.
+
+        The chat whose job it is hears that; any other chat hears "busy for
+        about T" where T is this box's own persisted hold on the running wake
+        -- a ceiling, never a count, never whose. When no hold is known (a
+        test harness, a wake older than the state file) the public worst
+        case for any job is quoted instead, which is a constant of the
+        software and a fact about nobody.
+        """
+        if self._running == cid:
+            return BUSY_ANSWER_MINE
+        _until = float(getattr(self.limits, "in_flight_until", 0.0) or 0.0)
+        _left = _until - time.time()
+        if _left <= 0:
+            _left = float(proto.result_budget_s("withdraw"))
+        return BUSY_ANSWER.format(when=_hold_words(_left))
+
+    def _full_for(self, cid: int, job: str) -> bool:
+        """Whether this chat's `job` is refused for capacity. Only a NEW
+        deposit from a chat holding no place, only above one client, and
+        never a check or a withdrawal: you can always get your own out."""
+        if self._max_clients() <= 1 or job != "receive_and_quote":
+            return False
+        try:
+            _tok = owner_token(self.key, cid)
+        except Exception:                                    # noqa: BLE001
+            return False
+        _inf = self._places()
+        return (_tok not in _inf and len(_inf) >= self._max_clients())
+
+    def _places(self) -> dict:
+        """The places held right now: owner token -> last sign of life,
+        with the ghosts dropped. A place with no sign of life (a deposit
+        done, money reported on the address, a leg with more to come) for
+        DEPOSIT_PLACE_TTL_S is an unpaid deposit and stops counting -- the
+        same rule, on the same clock, as the vault's own reserve."""
+        _inf = self.__dict__.get("inflight_owners")
+        if not isinstance(_inf, dict):
+            # A set from an older build or a harness: every entry is alive
+            # as of now, and the dict takes over from here.
+            _inf = {t: time.time() for t in (_inf or ())}
+            self.__dict__["inflight_owners"] = _inf
+        _now = time.time()
+        for _t in [t for t, s in _inf.items()
+                   if _now - float(s or 0.0) >= proto.DEPOSIT_PLACE_TTL_S]:
+            _inf.pop(_t, None)
+        return _inf
+
+    def _hold_place(self, cid: int) -> None:
+        """This chat's place is alive as of now (taken, or kept)."""
+        try:
+            self._places()[owner_token(self.key, cid)] = time.time()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    def _drop_place(self, cid: int) -> None:
+        """This chat's place is given back: nothing of theirs is left."""
+        try:
+            self._places().pop(owner_token(self.key, cid), None)
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    def _max_clients(self) -> int:
+        """The configured cap, 1 for a Pager built without one (a harness)."""
+        return max(1, int(getattr(self, "max_clients", 1) or 1))
+
+    def _check_group_rights(self) -> None:
+        """Say so, loudly, when a group would keep the operator's own lines.
+
+        A bot deletes another member's message in a group only as an admin
+        with "delete messages". Without that, every typed reply to the
+        wizard -- the pasted destination addresses, the amount -- stays in
+        the room for good while the welcome says messages are deleted both
+        sides. Checked once at start, where the operator is standing.
+        """
+        _rooms = sorted(c for c in self.allow if c < 0)
+        if not _rooms:
+            return
+        _bot = None
+        try:
+            _me = safe_post(self._url("getMe"), {}, proxies=self.proxies)
+            _bot = ((_me or {}).get("result") or {}).get("id") \
+                if isinstance(_me, dict) else None
+        except Exception:                                    # noqa: BLE001
+            _bot = None
+        for _cid in _rooms:
+            _ok = False
+            try:
+                if _bot is not None:
+                    _r = safe_post(self._url("getChatMember"),
+                                   {"chat_id": _cid, "user_id": _bot},
+                                   proxies=self.proxies)
+                    _m = ((_r or {}).get("result") or {}) \
+                        if isinstance(_r, dict) else {}
+                    _ok = (bool(_m.get("can_delete_messages"))
+                           or _m.get("status") == "creator")
+            except Exception:                                # noqa: BLE001
+                _ok = False
+            if not _ok:
+                integrity_log("pager", "group_cannot_delete")
+                print("  [!] In a group this bot can delete other people's "
+                      "messages only as an admin with\n"
+                      "      'delete messages'. It is not one there (or could "
+                      "not check), so your own typed\n"
+                      "      replies to a wizard -- addresses, an amount -- "
+                      "would stay in the room. Make it\n"
+                      "      an admin there, or use a private chat.")
 
     def _hold_why(self) -> str:
         """The refusal while a wake from before a restart may still be
@@ -4402,6 +4757,7 @@ class Pager:
 
     def run(self) -> int:
         self.publish_commands()
+        self._check_group_rights()
         self.announce_restart()
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
               + (f", {len(self.allow_users)} allowlisted sender(s)"
@@ -4529,23 +4885,30 @@ class Pager:
             #
             # This process is still alive and Tor is still up: send() needs
             # neither `busy` nor the worker thread, and _worker already uses
-            # it for the analogous case. Every allowlisted chat, because there
-            # is no record here of which one started the job -- normally there
-            # is exactly one, since main() refuses more than one spender.
+            # it for the analogous case. To the chat whose job it is; when
+            # that is somehow unknown, to the one person on a one-person bot,
+            # and to NOBODY on a bot serving several -- "yours is running" to
+            # everyone would tell each of them that somebody's is.
             #
             # A BARE EXCEPT, and it wraps the whole loop: a dead circuit at
             # shutdown must not turn "stopping" into a traceback, and there is
             # nothing useful left to do about a failure here anyway.
+            # TO THE CHAT WHOSE JOB IT IS, which this process does know
+            # (_running is set at start and cleared by the worker's finally).
+            # Sent to every chat, it told other people a run was in flight;
+            # and "at the machine" is a place a client does not have.
             try:
-                for _cid in sorted(self.allow):
+                _to = [self._running] if self._running in self.allow \
+                    else sorted(self.allow) if self._max_clients() <= 1 else []
+                for _cid in _to:
                     self.send(_cid,
-                              "STOPPING while something is still running.\n\n"
+                              "STOPPING while yours is still running.\n\n"
                               "The job itself keeps going — it is not on this "
                               "end and nothing here can stop it — but its "
                               "result comes back to this process, which is "
                               "going away, so you will not be told how it "
                               "ended.\n"
-                              "CHECK AT THE MACHINE before starting another.")
+                              "Check before starting another.")
             except Exception:                                # noqa: BLE001
                 pass
             return 1
@@ -4723,6 +5086,18 @@ def build_cli():
     ap.add_argument("--daily-cap", type=int, default=DEFAULT_DAILY_CAP,
                     help="courtesy pokes per 24h. The vault's own keyfile "
                          "budget is the real bound.")
+    ap.add_argument("--max-clients", type=int, default=1,
+                    help="how many people this bot serves at once. Default 1: "
+                         "several allowlisted people are refused. Above 1, "
+                         "each client needs their own PRIVATE chat (a group is "
+                         "refused), the vault keeps each person's money apart "
+                         "by owner, and this is the soft cap on deposits in "
+                         "flight -- a newcomer past it is told the service is "
+                         "full. The hard caps are the vault's: its account "
+                         "ceiling and daily wake budget, which OPSEC_SETUP.md "
+                         "4f sizes for a given number of clients. Raising "
+                         "this without raising those admits deposits the "
+                         "vault then refuses.")
     ap.add_argument("--burn-after", type=int, default=900, metavar="SECONDS",
                     help="Delete every message in an allowlisted chat -- this "
                          "bot's replies AND the operator's commands -- this "
@@ -4854,31 +5229,49 @@ def main(argv=None) -> int:
     # not exist -- that operator has one account, one chat id, one entry. A
     # second --chat-id is a second ACCOUNT, which is a second person.
     _spenders = len(set(args.user_id or ())) or len(set(args.chat_id))
-    if _spenders > 1:
+    _max_clients = max(1, int(getattr(args, "max_clients", 1) or 1))
+    # SEVERAL PEOPLE, ONLY WHEN ASKED FOR, AND ONLY IN PRIVATE CHATS.
+    #
+    # The vault keeps each person's money apart by an owner token derived
+    # from the CHAT that asks (owner_token). In a group every member's
+    # message carries the group's id, so every member would get one token
+    # and the isolation would collapse to nothing -- and the room shares one
+    # transcript, which rule 6 forbids for several people's deposits. So a
+    # group is refused above one client, whatever --user-id says.
+    if _spenders > 1 and _max_clients > 1:
+        if _rooms:
+            sys.exit(
+                f"[!] --max-clients {_max_clients} with a GROUP chat id. "
+                f"Several people need their own\n"
+                f"    private chats: a group shares one chat id (one owner "
+                f"token for everyone, so\n"
+                f"    nobody's money would be kept apart) and one transcript. "
+                f"Allowlist each\n"
+                f"    person's private --chat-id instead.")
+        # THE ALLOWLIST MAY BE LONGER THAN THE CAP, and usually should be:
+        # the cap is how many hold a place at once, the allowlist is who
+        # may ask, and the difference is who hears "full" and waits. Said
+        # once here, on the terminal, so the operator knows which of the
+        # two numbers they are looking at.
+        if _spenders > _max_clients:
+            # NO COUNTS: this line lands in a journal on the card, and the
+            # operator typed both numbers.
+            print("[i] more people are allowlisted than there are places "
+                  "at once: past the places a /deposit hears \"full\" until "
+                  "one is paid out (OPSEC_SETUP.md 4f).", file=sys.stderr)
+    elif _spenders > 1:
         sys.exit(
-            f"[!] {_spenders} different people would be able to spend from "
-            f"ONE wallet. Refusing.\n"
-            f"    There is a single wallet behind this bot. A withdrawal does "
-            f"not ask who is\n"
-            f"    asking: the vault takes the LARGEST unlocked balance it can "
-            f"see and sends it to\n"
-            f"    whatever addresses that person gave. Driven against the "
-            f"shipped code -- with\n"
-            f"    1000 XMR from one person and 300 from another on one "
-            f"wallet, the second\n"
-            f"    person's withdrawal picks up the first person's 1000.\n"
-            f"\n"
-            f"    THERE IS NO FLAG TO OVERRIDE THIS. An override would be the "
-            f"operator agreeing,\n"
-            f"    on somebody else's behalf, to a loss that falls on somebody "
-            f"else. The person\n"
-            f"    who would be robbed is not the person who would be asked.\n"
-            f"\n"
-            f"    ONE PERSON PER BOT, because it is one wallet per bot. To "
-            f"serve several people,\n"
-            f"    give each of them their own vault, their own wallet and "
-            f"their own bot; they\n"
-            f"    share nothing and cannot reach each other's funds.\n"
+            f"[!] {_spenders} different people are allowlisted and "
+            f"--max-clients is 1. Refusing.\n"
+            f"    Several people on one bot is a choice the operator makes on "
+            f"purpose, because\n"
+            f"    it needs the rest of the setup to agree with it: private "
+            f"chats for each, a\n"
+            f"    vault whose ledger keeps their money apart by owner (this "
+            f"build's does), and\n"
+            f"    an account ceiling and wake budget sized for the number "
+            f"(OPSEC_SETUP.md 4f).\n"
+            f"    Pass --max-clients N when that is so.\n"
             f"    (If you meant one person on several devices: Telegram gives "
             f"one account one\n"
             f"     chat with this bot, whatever it is signed in on. That is "
@@ -4894,6 +5287,10 @@ def main(argv=None) -> int:
     # once, here, where the operator is standing and the message can be long.
     try:
         _confirm_key(key)
+        # ...AND AN OWNER TOKEN, for the same reason: a wake without one is
+        # refused by the vault, and a pager that found that out on its first
+        # poke would have spent a boot to learn it.
+        owner_token(key, 0)
     except Exception as e:                                   # noqa: BLE001
         sys.exit(f"[!] {args.key} carries no usable pairing secret "
                  f"({type(e).__name__}), so this cannot issue a confirmation "
