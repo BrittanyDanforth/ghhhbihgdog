@@ -1933,9 +1933,9 @@ write one into a keyfile paired with `--deposit-in-chat`.
                           Expected out:  ~1.23
                           Confirmation:  A3F1-9C2B7E01
 
-                          Attach the note above to your payment, exactly as
-                          sent — from a desktop app. A phone CANNOT, and the
-                          money is lost.
+                          Attach the note above to the payment — it is what
+                          makes the money arrive. Most phone apps CANNOT
+                          attach one; use a desktop app that can.
                           Pay it once. Do not send here again — a second
                           payment, now or later, loses the money.
 
