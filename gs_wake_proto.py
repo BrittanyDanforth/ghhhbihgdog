@@ -898,9 +898,15 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # service that reads it -- only what a reader does with it and
         # what it costs to get wrong: paying from a phone app, which
         # cannot attach it.
-        "Attach the line in the message ABOVE as the payment's note, "
-        "exactly as it is, from a desktop app that can attach one. A "
-        "phone app CANNOT, and the money would be lost.",
+        #
+        # ONE SENTENCE FOR WHAT TO DO, ONE FOR WHAT IT COSTS. This read
+        # "Attach the line in the message ABOVE as the payment's note,
+        # exactly as it is, from a desktop app that can attach one" --
+        # thirty-four words that circled the thing rather than naming it,
+        # on the surface a stranger reads once with money in hand. "The
+        # note above" is the whole of what they need to find.
+        "Attach the note above to your payment, exactly as sent — from a "
+        "desktop app. A phone CANNOT, and the money is lost.",
         # THE ADDRESS IS NOT THE READER'S, AND NOTHING SAID SO.
         #
         # "To address: bc1q..." reads as "this is my deposit address" to
@@ -920,8 +926,12 @@ def plain_lines(plain: dict, label: str = "") -> list:
         # the same reason the line above says "the part that routes it"
         # nowhere. What a reader can ACT on is the whole of what they are
         # told: once, now, and never again.
-        "One payment, once. This line is not yours to keep — sending to it "
-        "again, or later, loses the money.",
+        #
+        # "This line is not yours to keep" named a LINE, and a reader with
+        # an address in front of them does not know which. It is the
+        # address, and the sentence says so and says what to do about it.
+        "Pay it once. Do not send here again — a second payment, now or "
+        "later, loses the money.",
     ]
 
 
