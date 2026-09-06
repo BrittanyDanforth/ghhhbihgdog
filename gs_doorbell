@@ -1564,6 +1564,13 @@ def report(pending: Pending) -> int:
             print(f"      DEPOSIT INSTRUCTIONS, IN THE CLEAR — the vault's own "
                   f"keyfile asked for this.")
             print("")
+            # THE NOTE FIRST AND ALONE, the way the chat sends it: it is the
+            # only thing that routes the payment, and the lines below tell
+            # the reader to attach "the line above".
+            _note = plain.get("m") or ""
+            if _note:
+                print(f"      {_note}")
+                print("")
             for line in proto.plain_lines(plain):
                 print(f"      {line}")
             print("")

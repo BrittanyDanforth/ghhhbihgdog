@@ -288,53 +288,49 @@ if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
 #: An allowlist with bounds, not "whatever the pair record holds", for the same
 #: reason the sealed slip has one: the pair is written by another tool and the
 #: next field somebody adds there must not ride along into a chat window.
-#: THE BOUNDS NO LONGER ADMIT A 106-CHARACTER MONERO ADDRESS, and this said
-#: they were "generous enough" for one. The only field that ever held 106+
-#: characters was the memo ("m", capped at 220), which named the destination
-#: address in full and went with the memo. Nothing here carries a Monero
-#: address any more: "d" is the BITCOIN deposit address, and 90 is generous
-#: for a taproot one (62 characters at most) and short of a Monero address on
-#: purpose -- a STANDARD one is 95. The cap was 100, which is short only of
-#: the 106-character integrated form, so the shape check this paragraph
-#: claimed let an ordinary destination through.
+#: "d" is the BITCOIN deposit address, and 90 is generous for a taproot one
+#: (62 characters at most). "m" is the memo, and its bound is the memo's own
+#: (a THORChain swap memo naming a standard Monero address runs to ~120
+#: characters; 220 leaves room for the limit/interval/affiliate tail).
 #:
-#: So the bound is now also a shape check. A value that could hold 95
-#: characters here would be a field able to carry the destination back into a
-#: chat window, which is the exact leak removing the memo closed.
-PLAIN_FIELDS = {
-    "b": 24,      # btc_in, as a decimal string
-    "d": 90,      # the pooled inbound deposit address (bech32/bech32m <= 62)
-    "x": 32,      # expected_xmr
-    "h": 4,       # the handle
-}
-#: THE MEMO IS GONE FROM THIS RECORD, and it is the field that mattered.
+#: THE MEMO IS BACK IN THIS RECORD, AND THE REASON IS MONEY, NOT CONVENIENCE.
 #:
-#: It used to travel: "m", 220 characters, rendered into the chat in its own
-#: message. It is the ONLY field here that identifies anybody. The deposit
-#: address is a shared pooled vault paid by everyone swapping the same pair
-#: and identifies nobody; the amount is already in the transcript because the
-#: confirm echoes it back; the handle is four hex characters this box drew.
-#: The memo NAMES THE DESTINATION MONERO ADDRESS IN FULL -- so sending it put
-#: a permanent link between this chat and one Monero address into a surface
-#: this design assumes is read by somebody else.
+#: For one turn it was removed, on two arguments: it is the one field that
+#: names the destination Monero address, and whoever holds the bot token
+#: could substitute it. Both are true. What the removal did was leave the
+#: mode that exists for a person WITH ONLY A PHONE (`deposit_in_chat`, see
+#: "THE PLAINTEXT SLIP" above) handing that person an address, an amount and
+#: no way to pay: the deposit address is a SHARED pooled inbound vault, so
+#: the memo is the entire binding between the Bitcoin and the Monero, and BTC
+#: paid to that address without it is not routed to anyone. OPSEC_SETUP.md's
+#: own section on the mode says so in as many words -- "an address without
+#: its memo is not a partial delivery, it is a trap" -- and every doc, the
+#: pairing flag's help and the doorbell's console went on promising the memo
+#: while the wire had stopped carrying it. A service whose clients pay from
+#: their own desktop app cannot work without it at all.
 #:
-#: AND IT CLOSES THE ONE WAY THIS CHANNEL COULD LOSE THE DEPOSIT. The memo is
-#: the entire binding between the Bitcoin and the Monero, so whoever held the
-#: bot token could leave the address correct, substitute their own memo, and
-#: take the payment -- irreversibly, with nothing the phone could check,
-#: because someone holding the token IS the bot as far as the phone can tell.
-#: OPSEC_SETUP.md argued at length that no scheme rescues that. Not sending a
-#: memo does: there is no longer one in the chat to replace.
+#: So it travels, in this mode only, and the costs are paid where they are
+#: stated: the destination is a one-shot account minted inside the same job
+#: (no long-lived identity), the memo becomes public in the OP_RETURN the
+#: moment the payment is broadcast (the transcript adds attribution, not the
+#: address), the message that carries it is deleted after --burn-after, and
+#: the substitution attack is mitigated by the token and only the token --
+#: which is the same mitigation the address line already rests on. The vault
+#: re-checks memo_binds_destination against its own dest_xmr right before the
+#: record is built, so a memo that names anyone else never reaches the wire.
 #:
-#: NOTHING IS LOST. Composing the OP_RETURN needs a desktop wallet, which is
-#: the machine that ran the job and already holds the memo on disk. The chat's
-#: job is to say a swap is quoted, for how much, and to what address -- and
-#: it still does all three.
 #: dest_xmr is DELIBERATELY ABSENT. The sealed slip carries it so gs_unseal can
 #: re-check memo_binds_destination on a second machine. A phone cannot run that
 #: check, so the field would be a second copy of the destination in the
 #: transcript buying nothing. `ts` is absent for the same reason: the operator
 #: reads the message's own timestamp.
+PLAIN_FIELDS = {
+    "b": 24,      # btc_in, as a decimal string
+    "d": 90,      # the pooled inbound deposit address (bech32/bech32m <= 62)
+    "m": 220,     # the swap memo: the ONLY thing that routes the payment
+    "x": 32,      # expected_xmr
+    "h": 4,       # the handle
+}
 
 #: The one word an M3 may carry about how a swap is going.
 #:
@@ -749,12 +745,12 @@ def plain_slip_is_wellformed(obj) -> bool:
 
     Control characters matter here more than anywhere else in this file: the
     pager pastes these values into a message a human reads and copies into a
-    wallet, and a newline forges a line of it. That sentence used to end "a
-    newline in the MEMO forges a line of it" -- the memo is not a field of
-    this record any more, and the exact-key-set test on the first line is what
-    refuses one outright, before the control-character loop is ever reached.
-    The reasoning survives the field: "d" and "b" are still pasted, and a
-    newline in either still forges a line of the message around them.
+    wallet, and a newline in the memo, the address or the amount forges a
+    line of it. The memo is checked for SHAPE only -- bounds and characters --
+    because this box cannot know the destination it must name; the vault
+    checks that binding before the record is built (plain_slip_for_chat).
+    The exact-key-set test is what refuses a record from the turn the memo
+    did not travel: an address can never arrive here without its note.
     """
     if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):
         return False
@@ -888,17 +884,19 @@ def plain_lines(plain: dict, label: str = "") -> list:
         f"Confirmation:  {label}" if label else
         f"Slip:          {plain.get('h', '')}",
         "",
-        # THE MEMO IS NOT HERE AND NEITHER IS AN INSTRUCTION FOR IT.
+        # THE MEMO IS NOT AMONG THESE LINES, AND THE INSTRUCTION FOR IT IS.
         #
-        # These two lines used to be a sentence about OP_RETURN and
-        # then the memo itself, in its own message so tap-and-hold
-        # would copy it alone. Both are gone with the field: see
-        # PLAIN_FIELDS. What replaces them is the one thing a reader
-        # can get wrong and lose the payment for -- paying this from
-        # a phone wallet, which cannot attach the part that routes
-        # it. Said once, without naming what that part is.
-        "Pay it from the machine that quoted it. A phone CANNOT "
-        "complete this and the money would be lost.",
+        # The memo travels in its own message, sent BEFORE this one, so
+        # tap-and-hold copies it alone and a reader who got this message
+        # without it has nothing to pay (see gs_telegram_pager). These
+        # lines are the authored part, the part a banned word can hide
+        # in, and they name neither the field the note goes in nor the
+        # service that reads it -- only what a reader does with it and
+        # what it costs to get wrong: paying from a phone app, which
+        # cannot attach it.
+        "Attach the line in the message ABOVE as the payment's note, "
+        "exactly as it is, from a desktop app that can attach one. A "
+        "phone app CANNOT, and the money would be lost.",
         # THE ADDRESS IS NOT THE READER'S, AND NOTHING SAID SO.
         #
         # "To address: bc1q..." reads as "this is my deposit address" to

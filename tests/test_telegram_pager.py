@@ -2912,7 +2912,8 @@ check(f"chain/interrupted: a tap during every leg does NOT defeat the cap "
 check("chain/interrupted: ...and every leg reports the same short way, with "
       "no leg number and no reason",
       [t for t in _mi if t.startswith("withdraw: sent")][:3]
-      == ["withdraw: sent.\nAnother is starting."] * 3)
+      == ["withdraw: sent. It is on its way to your addresses.\n"
+          "Another is starting."] * 3)
 # THE MINE ANSWER, because the tap is from the same chat whose withdrawal is
 # running: _busy_answer(cid) returns BUSY_ANSWER_MINE when self._running == cid
 # (and the plain BUSY_ANSWER, a formatted "busy for about T", only to others).

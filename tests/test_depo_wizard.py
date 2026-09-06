@@ -1787,6 +1787,14 @@ _COMPOSED = [
     ("_amount_question", pg.Pager._amount_question(_cs.p)),
     ("_exit_question", pg.Pager._exit_question(_cs.p)),
     ("_depth_question", pg.Pager._depth_question(_cs.p)),
+    # THE THREE WORKING LINES, one per kind of job: what is being done and
+    # where the answer lands, built from the job and the lock window.
+    ("_working_line_deposit",
+     pg.Pager._working_line(_cs.p, "receive_and_quote", {}, "2h")),
+    ("_working_line_withdraw",
+     pg.Pager._working_line(_cs.p, "withdraw", {"depth": 1}, "17h")),
+    ("_working_line_check",
+     pg.Pager._working_line(_cs.p, "swap_status", {}, "30 min")),
 ]
 check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
       f"BUILT rather than written, which it used to miss entirely",
@@ -1811,6 +1819,9 @@ _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
                   | {"HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
                      "BUSY_ANSWER", "FULL_ANSWER"}
                   | {"self._busy_answer(cid)", "self._busy_answer(chat_id)"}
+                  # The working line is composed (scanned via _COMPOSED above);
+                  # the note is a runtime value off the quote, sent alone.
+                  | {"self._working_line(job, params, _how)", "_note"}
                   | _RUNTIME_SENDS)
 _uncovered = sorted(
     {_ast.unparse(a) for n in _ast.walk(_pg_tree)
@@ -1920,7 +1931,7 @@ _all_sent += [(-1, _CURRENCY_RE.sub("", l)) for l in _LABELS]
 #: Keyed off the real table, so a field added to or removed from the wire
 #: changes this fixture with it instead of leaving it a turn behind.
 _PLAIN_VALUES = {"b": "0.05000000", "d": "bc1qexample", "x": "1.23",
-                 "h": "A3F1"}
+                 "m": "=:XMR.XMR:" + "4" + "A" * 94 + ":0/1/0", "h": "A3F1"}
 _PLAIN_SAMPLE = {_k: _PLAIN_VALUES[_k] for _k in P.PLAIN_FIELDS}
 check("the deposit-instruction fixture is exactly the wire's own field set, "
       "so it cannot test a record shape the protocol refuses",

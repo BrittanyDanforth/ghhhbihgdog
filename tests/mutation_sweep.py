@@ -4065,6 +4065,36 @@ MUTATIONS = [
   "                    else sorted(self.allow)",
   ["test_multi_client"]),
 
+ # ---- THE PHONE-DELIVERED DEPOSIT CARRIES ITS NOTE, CHECKED AND FIRST ------
+ #
+ # The deposit address is a shared line paid by everyone; the memo is the only
+ # thing that routes the payment. Three lines hold that up: the memo is in the
+ # record, the vault checks it names its own destination before the record
+ # exists, and the pager sends it first and alone so a note that does not get
+ # through leaves nothing to pay wrongly.
+ ("the memo leaves the phone-delivered record again, and the address is a "
+  "trap", "gs_wake_agent",
+  'PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"), ("memo", "m"),\n'
+  '             ("expected_xmr", "x"))',
+  'PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"),\n'
+  '             ("expected_xmr", "x"))',
+  ["test_plain_slip"]),
+
+ ("a memo naming somebody else's destination is sent anyway", "gs_wake_agent",
+  '        if not _binds(str(pair.get("memo") or ""), str(pair.get("dest_xmr") or "")):\n'
+  '            integrity_log("wake", "plain_memo_unbound")',
+  '        if False:\n'
+  '            integrity_log("wake", "plain_memo_unbound")',
+  ["test_plain_slip"]),
+
+ ("the address is sent even when the note did not get through",
+  "gs_telegram_pager",
+  '                if not _ok:\n'
+  '                    integrity_log("pager", "note_undelivered")',
+  '                if False:\n'
+  '                    integrity_log("pager", "note_undelivered")',
+  ["test_plain_slip"]),
+
 ]
 
 

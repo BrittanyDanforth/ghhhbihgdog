@@ -1891,7 +1891,10 @@ number; you read the pair where it was minted.
 The sealed slip assumes a *second* machine that can run `gs_unseal`. With only
 a phone you have none, so there is a third mode: pair with `--deposit-in-chat` and
 the deposit address, the amount and the memo arrive in the chat as text. The
-memo comes in its own message so a tap-and-hold copies it alone.
+memo comes **first**, in its own message, so a tap-and-hold copies it alone —
+and so that if it does not get through, nothing else is sent (see below).
+The chat never calls it a memo: to the reader it is "the line in the message
+above", the payment's note.
 
 ```bash
 python3 gs_wake_keys pair --deposit-in-chat ...        # ON THE VAULT
@@ -1912,20 +1915,40 @@ the vault answering until you re-pair), and `gs_delivery_key new` refuses to
 write one into a keyfile paired with `--deposit-in-chat`.
 
 ```
-/deposit               -> How much? Reply with the BTC amount…
-0.05                   -> Deposit 0.05 BTC. Confirm and it starts.  7 + 6 = ?
-13                     -> depo: pay this. Confirmation number: A3F1-9C2B7E01
+/deposit               -> How much? Reply with the amount — for example 0.05.
+0.05                   -> Deposit 0.05. Confirm and it starts.  7 + 6 = ?
+13                     -> depo: getting your payment details — a few minutes,
+                          2h at most. They arrive here. Nothing else can run
+                          until then.
+                       -> =:XMR.XMR:44AF…:0/1/0      (its own message, FIRST)
+                       -> depo: pay this. Confirmation number: A3F1-9C2B7E01
 
-                          Send exactly:  0.05000000 BTC
+                          Send exactly:  0.05000000
                           To address:    bc1q…
-                          Expected out:  ~1.23 XMR
+                          Expected out:  ~1.23
                           Confirmation:  A3F1-9C2B7E01
-                       -> =:XMR.XMR:44AF…:0/1/0      (its own message)
-/check                 -> nothing is running. The last one in this chat is
-                          A3F1-9C2B7E01 — tap below to ask about it.
+
+                          Attach the line in the message ABOVE as the
+                          payment's note, exactly as it is, from a desktop
+                          app that can attach one. A phone app CANNOT, and
+                          the money would be lost.
+                          One payment, once. This line is not yours to keep —
+                          sending to it again, or later, loses the money.
+
+                          Once you have paid, tap below or /check with that
+                          number — it says when it has arrived. Then
+                          /withdraw sends it on.
 /check A3F1-9C2B7E01     -> A3F1-9C2B7E01: nothing on the address yet. Normal —
                           ask again in a while.
 ```
+
+The note goes **first and alone**, and that order is the safety: the address
+is a shared line, so the one failure that can strand money is the note not
+getting through. If it does not (after one retry) the chat hears "the payment
+details did not get through, so there is nothing to pay yet" and the address
+is never sent. The vault checks, right before it builds the record, that the
+memo names its own destination (`memo_binds_destination`); a memo naming
+anyone else is refused and nothing is sent.
 
 **Read this before you set it.** Not the privacy cost — the money one.
 
