@@ -890,8 +890,9 @@ def make_handler(pending: Pending):
         def do_POST(self):                                   # noqa: N802
             if self.path == "/window":
                 # Unauthenticated by necessity: the vault must have this
-                # BEFORE it can seal anything. It is 32 random bytes and a
-                # statement that a window is open right now -- which the open
+                # BEFORE it can seal anything. It is WINDOW_BYTES (16) random
+                # bytes and a statement that a window is open right now --
+                # which the open
                 # port already says.
                 return self._reply(200, pending.window)
             if self.path == "/wake":
@@ -1592,6 +1593,13 @@ def report(pending: Pending) -> int:
         print(f"")
         return 0
     if out == "refused":
+        # THE ONE REFUSAL THAT CARRIES A WORD is rendered here the way the
+        # chat renders it, so the by-hand path and the chat do not drift.
+        _rph = (pending.result or {}).get("phase") or ""
+        if _rph == "full":
+            print(f"  [!] Vault refused job {pending.job}: "
+                  f"{proto.PHASE_LINES.get('full', 'full')}")
+            return 1
         print(f"  [!] Vault REFUSED job {pending.job}. It did not say why, "
               f"deliberately — the reason is on the vault's terminal.")
         return 1

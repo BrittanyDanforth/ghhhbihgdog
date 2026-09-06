@@ -347,6 +347,10 @@ PLAIN_FIELDS = {
 #:   short      money arrived, stopped growing, and is under what was quoted
 #:   stuck      the wallet is not scanning; says NOTHING about the money
 #:   more_left  a withdrawal finished and another arrival is still here
+#:   more_locked a withdrawal finished and more is here, still unlocking
+#:   moved      that address was paid and then sent on (answered from the
+#:              vault's own ledger, no probe)
+#:   partial    some of it is here and spendable, under the quote so far
 #:
 #: "more_left" IS ON THE `phase` FIELD RATHER THAN A NEW ONE, deliberately.
 #: The field is already on the wire, already a CLOSED vocabulary the doorbell
@@ -2551,9 +2555,10 @@ JOBS = {
     # LOOK ONCE, ANSWER IN ONE WORD, POWER OFF. The operator's question is
     # "has my money arrived?" and `watch` answers it terribly:
     #
-    #   * it holds the Pi's one-job lock for up to 9900 s -- 900 s pre-WOL
-    #     jitter + a 600 s fetch window + an 8400 s result budget -- so for the
-    #     better part of three hours every other command is refused with
+    #   * it holds the Pi's one-job lock for up to 10200 s -- 900 s pre-WOL
+    #     jitter + a 600 s fetch window + an 8700 s result budget (its row in
+    #     result_budget_s's table) -- so for the better part of three hours
+    #     every other command is refused with
     #     "a wake is already running";
     #   * it keeps the vault powered on, with its disk auto-unlocked, for over
     #     two of those hours, which is the power and network signature the

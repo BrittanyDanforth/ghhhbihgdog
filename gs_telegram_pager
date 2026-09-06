@@ -146,7 +146,9 @@ POLL_HOLD_S = 10
 #: matters: the operator believes a poke will work, and the bot has quietly
 #: been unable to reach anything since. Consecutive failures are counted and
 #: the process exits, so systemd's Restart= re-runs the startup verify_tor and
-#: the bot stays down until Tor is genuinely back.
+#: the bot stays down until Tor is genuinely back -- EXCEPT while a wake is
+#: in flight on the LAN, where the exit waits for the wake instead of killing
+#: the doorbell the vault will report to (see updates()).
 #:
 #: Not 1: a single blip on a Tor circuit is ordinary and must not stop a
 #: pager.
@@ -271,10 +273,11 @@ USAGE_FEE_LABEL = "1.1%"
 #:                 /address    a Monero address, to be paid directly
 #:     MONEY OUT   /withdraw   mixed funds out, to addresses you name
 #:
-#: Every old spelling still works -- /receive, /recv and /send are accepted
-#: forever, for the reason this file already gives about /depo: "a bot that
-#: answers 'unknown command' to its own old name is a bot that looks broken."
-#: They are simply not what the menu, the buttons or the help text say.
+#: /send still works as a spelling of /withdraw, for the reason this file
+#: gives about /depo: "a bot that answers 'unknown command' to its own old
+#: name is a bot that looks broken." /address, /addr, /receive and /recv do
+#: NOT: they named a job that no longer exists, and they are met with the
+#: same silence as any command this bot does not have (see parse_command).
 BOT_COMMANDS = [
     ("start", "what this is, and what it will not do"),
     # AND IT DOES NOT PROMISE THE ADDRESS IN THE CHAT. This said "get an
@@ -372,7 +375,7 @@ CALLBACK_TEXT = {
     "m:cancel": "/cancel",
 }
 
-#: THE MENU, and the reason it is short. Eleven commands are published to
+#: THE MENU, and the reason it is short. Twelve commands are published to
 #: Telegram's "/" list; four of them are what an operator actually does. The
 #: rest are answers to questions, and they hang off /help, which is one tap
 #: away and stays one tap away.
@@ -1151,6 +1154,14 @@ class Limits:
         self.path = path
         self.min_interval = min_interval
         self.daily_cap = daily_cap
+        #: TWO THREADS WRITE THIS. The poll thread records pokes and saves
+        #: the cursor; the worker thread sets the in-flight bit at both ends
+        #: of a wake and starts the chained legs. save() builds its dict
+        #: from the live fields, so two saves in flight could put the OLDER
+        #: picture on the card last -- an in-flight bit already cleared in
+        #: memory, still set on disk, and the next process holding every
+        #: command for the old window. Re-entrant: record() saves.
+        self._lock = threading.RLock()
         self.offset = 0            # Telegram update_id cursor
         self.last_poke = 0.0
         self.pokes = []            # wall-clock stamps, pruned to 24 h
@@ -1199,6 +1210,14 @@ class Limits:
                                 and not isinstance(_iu, bool) and _iu > 0
                                 else 0.0)
 
+    def _lk(self):
+        """The lock, made on first use for a Limits built without __init__
+        (the tests do this) so every path still serialises the same way."""
+        _l = self.__dict__.get("_lock")
+        if _l is None:
+            _l = self.__dict__["_lock"] = threading.RLock()
+        return _l
+
     #: Stamps are rounded to this before they touch the card.
     #:
     #: This file is the ONE thing the pager persists, and it sat on the SD card
@@ -1215,28 +1234,36 @@ class Limits:
     STAMP_BUCKET_S = 300
 
     def save(self) -> None:
-        atomic_write_json(
-            {"offset": self.offset,
-             "last_poke": _bucket(self.last_poke, self.STAMP_BUCKET_S),
-             "pokes": [_bucket(t, self.STAMP_BUCKET_S)
-                       for t in self.pokes[-200:]],
-             "in_flight": bool(getattr(self, "in_flight", False)),
-             # ROUNDED UP, unlike the stamps: a hold that ends early is a
-             # wake sent at a vault that is still busy.
-             "in_flight_until": _bucket_up(
-                 float(getattr(self, "in_flight_until", 0.0) or 0.0),
-                 self.STAMP_BUCKET_S)},
-            self.path, perms=0o600)
+        with self._lk():
+            atomic_write_json(
+                {"offset": self.offset,
+                 "last_poke": _bucket(self.last_poke, self.STAMP_BUCKET_S),
+                 "pokes": [_bucket(t, self.STAMP_BUCKET_S)
+                           for t in self.pokes[-200:]],
+                 "in_flight": bool(getattr(self, "in_flight", False)),
+                 # ROUNDED UP, unlike the stamps: a hold that ends early is
+                 # a wake sent at a vault that is still busy.
+                 "in_flight_until": _bucket_up(
+                     float(getattr(self, "in_flight_until", 0.0) or 0.0),
+                     self.STAMP_BUCKET_S)},
+                self.path, perms=0o600)
 
     def recent(self) -> list:
         now = time.time()
-        self.pokes = [t for t in self.pokes if now - t < 86400]
-        return self.pokes
+        with self._lk():
+            self.pokes = [t for t in self.pokes if now - t < 86400]
+            return self.pokes
 
     def why_not(self) -> str:
         """'' if a poke is allowed, else the reason to send back."""
         now = time.time()
         gap = now - self.last_poke
+        # A CLOCK THAT JUMPED BACKWARDS is not a poke in the future. The Pi
+        # has no battery clock: it boots on the last shutdown's time and
+        # jumps when NTP lands, and a negative gap answered every command
+        # with "wait <hours>s" until the clock caught up. Treated as elapsed.
+        if gap < 0:
+            gap = float(self.min_interval)
         # THESE ARE CHAT TEXT. why_not()'s return value is sent verbatim --
         # `self.send(cid, f"no: {why}")` -- so it belongs to the transcript,
         # and it did not look like it: a source scan for literals at send()
@@ -1254,10 +1281,11 @@ class Limits:
         return ""
 
     def record(self) -> None:
-        now = time.time()
-        self.last_poke = now
-        self.pokes.append(now)
-        self.save()
+        with self._lk():
+            now = time.time()
+            self.last_poke = now
+            self.pokes.append(now)
+            self.save()
 
 
 def parse_command(text: str) -> tuple:
@@ -1305,8 +1333,8 @@ def parse_command(text: str) -> tuple:
     # configuration; and both watching jobs refused its handle, so /check and
     # /wait on one spent a wake to be told no.
     #
-    # ANSWERED, NOT IGNORED. An operator with the word in their fingers gets a
-    # sentence rather than "unknown command", which reads as a broken bot.
+    # IGNORED, NOT ANSWERED -- the paragraph inside says why, and the one
+    # that used to stand here said the opposite.
     if cmd in ("/address", "/addr", "/receive", "/recv"):
         # SILENCE, LIKE ANY OTHER COMMAND THIS BOT DOES NOT HAVE.
         #
@@ -1632,8 +1660,15 @@ class Pager:
         self._contended = False
         #: chat -> (wrong labels in a row, not-before). See handle().
         self._label_fails = {}
+        #: Wizard messages whose delete did not complete, retried each tick
+        #: (retry_wizard_deletes). Initialised HERE: it used to be conjured by
+        #: a getattr fallback in _end_convo, so a fresh process had no queue
+        #: until a delete had already failed.
+        self._wizard_retry = []
         self.busy = threading.Lock()
         self.ignored = 0
+        #: kind -> when that kind last reached the chain. See _log_ignored.
+        self._ignored_logged = {}
         self.poll_failures = 0
         #: chat_id -> Convo. IN MEMORY. Never written to args.state: that file
         #: is Limits and sits on the SD card next to the sealed keyfile.
@@ -1664,6 +1699,9 @@ class Pager:
         #: Set by SIGUSR1; cleared by the poll loop when it has acted. See
         #: arm_burn for why the trigger is a signal and not a chat command.
         self.burn_now = False
+        #: True when burn_all re-armed burn_now itself (cap reached, circuit
+        #: dead): the next pass is the same signal, not a new one.
+        self._burn_resumed = False
 
     # -- the /depo wizard -----------------------------------------------
     def _reap(self) -> None:
@@ -1694,8 +1732,23 @@ class Pager:
         is deleted with it."""
         ok = self.send(chat_id, text, buttons=buttons)
         c = self.convos.get(chat_id)
+        if not ok:
+            # A QUESTION THAT DID NOT LAND IS NOT WAITED ON. Every caller
+            # discarded this value and went on expecting an answer to a
+            # question the reader never saw: the wizard sat silent for its
+            # whole window and the next thing typed was refused as an
+            # answer to nothing. The conversation ends the way /cancel ends
+            # it (its earlier lines deleted), so the next message starts
+            # clean, and the chain records that a question was lost.
+            if c is not None:
+                self._end_convo(chat_id)
+            try:
+                integrity_log("pager", "question_undelivered")
+            except Exception:                                # noqa: BLE001
+                pass
+            return False
         mid = getattr(_LAST_MID, "mid", None)
-        if ok and c is not None and isinstance(mid, int) \
+        if c is not None and isinstance(mid, int) \
                 and not isinstance(mid, bool) and mid not in c.mids:
             c.mids.append(mid)
         return ok
@@ -2114,10 +2167,9 @@ class Pager:
                   "— the fees come out of the same pile.\n"
                   "/cancel to stop.")
 
-    #: The jobs whose labels the vault will never watch. receive_new mints an
-    #: address and quotes nothing, so its handle record carries slip=None and
-    #: both watching jobs refuse it with "Only a receive_and_quote handle can
-    #: be watched". There is no configuration in which this changes.
+    #: The jobs whose labels the vault will never watch. (This paragraph
+    #: used to be about receive_new, a job the wire no longer has; the one
+    #: member left is the withdrawal, argued below.)
     #: Jobs whose labels the vault will never watch. The check this feeds
     #: is what stops a button spending a wake to be refused: the vault
     #: refuses a watching job on such a label always, for a structural
@@ -2678,7 +2730,7 @@ class Pager:
 
         `buttons` is rows of (label, callback_data) and is OPTIONAL EVERYWHERE.
         A tap is a second way to send text this bot already accepts -- see
-        _callback_text -- so a chat with no keyboard support, an old client, or
+        CALLBACK_TEXT -- so a chat with no keyboard support, an old client, or
         a burned message all still work by typing. Nothing is reachable only by
         tapping.
 
@@ -2846,8 +2898,16 @@ class Pager:
         keep, gone, tried, dead = [], 0, 0, False
         with _BURN_LOCK:
             snapshot = list(self.burn)
+        # CAPPED PER TICK, LIKE burn_expired, AND FOR THE SAME REASON: every
+        # delete is a round trip over Tor on the poll thread, and a session's
+        # worth of them in one go froze the loop for as long as it took --
+        # no getUpdates, every button dying -- after the one signal that is
+        # sent when something has gone wrong. What is left re-arms the
+        # signal's flag, so the next tick carries on where this one stopped.
+        _cap = 32
         for cid, mid, sent in snapshot:
-            if (chat_id is not None and cid != int(chat_id)) or dead:
+            if (chat_id is not None and cid != int(chat_id)) or dead \
+                    or tried >= _cap:
                 keep.append((cid, mid, sent))
                 continue
             tried += 1
@@ -2858,6 +2918,16 @@ class Pager:
                 dead = True                        # not refused: next tick
                 keep.append((cid, mid, sent))
         self._replace_burn(snapshot, keep)
+        if len(keep) > sum(1 for c, _m, _s in snapshot
+                           if chat_id is not None and c != int(chat_id)):
+            # Something is still to burn: the cap or a dead circuit stopped
+            # this pass. Ask for another -- AND SAY IT IS A CONTINUATION, so
+            # the loop does not put "burn_signal" on the chain again for it.
+            # A dead circuit re-arms this on every tick for as long as Tor
+            # is down, and each pass was a chain write: one signal became
+            # a line on the card every half minute of an outage.
+            self._burn_resumed = True
+            self.burn_now = True
         return gone, tried
 
     def updates(self) -> list:
@@ -2953,7 +3023,17 @@ class Pager:
         # batch, the same element comes back, and the pager crash-loops until
         # somebody looks. Filtered rather than raised: a batch of ten updates
         # with one malformed element must still deliver the other nine.
-        return [u for u in out if isinstance(u, dict)]
+        kept = [u for u in out if isinstance(u, dict)]
+        if out and not kept:
+            # A BATCH THAT WAS ALL CHAFF cannot advance the offset -- nothing
+            # in it carried an update_id -- so the API hands the same batch
+            # straight back, and long-polling returns at once while there is
+            # something to return. Without a pause that is a request every
+            # circuit round-trip, for as long as the malformed element sits
+            # in Telegram's queue: the crash loop above, rebuilt as a hot
+            # loop. One poll period, then ask again.
+            time.sleep(5)
+        return kept
 
     # -- the poke -------------------------------------------------------
     #: A JOB LONG ENOUGH THAT SILENCE STOPS MEANING "BE PATIENT".
@@ -3047,7 +3127,14 @@ class Pager:
         _ev = getattr(pending, "events", None) or []
         _notes = [EVENT_LINES[_e] for _e in EVENT_VOCAB if _e in _ev]
         if _notes:
-            integrity_log("pager", "event_reported")
+            # GUARDED LIKE THE OUTCOME WRITE BELOW, and it was not: this sits
+            # above every reply branch too, so a full or read-only card threw
+            # out of here before the operator heard what happened.
+            try:
+                integrity_log("pager", "event_reported")
+            except Exception:                                # noqa: BLE001
+                print("  [!] could not write the integrity chain for these "
+                      "events; reporting them anyway.")
             self.send(chat_id, "\n".join(_notes))
         # BOOKKEEPING MUST NOT PRE-EMPT THE REPORT. integrity_log re-raises an
         # OSError, and this line sits above every reply branch -- so a full or
@@ -3841,8 +3928,7 @@ class Pager:
             # alive to whoever found it, and the token is the only thing
             # standing between a stranger and this loop. (bool excluded like
             # the callback path: True == 1, and 1 could be allowlisted.)
-            self.ignored += 1
-            integrity_log("pager", "chat_not_allowlisted")
+            self._log_ignored("chat_not_allowlisted")
             return
         # AND WHO SENT IT, which the chat id does not answer in a group.
         #
@@ -3864,8 +3950,7 @@ class Pager:
             _from = (msg.get("from") or {}).get("id")
             if not isinstance(_from, int) or isinstance(_from, bool) \
                     or _from not in self.allow_users:
-                self.ignored += 1
-                integrity_log("pager", "sender_not_allowlisted")
+                self._log_ignored("sender_not_allowlisted")
                 return
         # A PHOTO IS NOT A COMMAND. Without this, every sticker, image or
         # voice note in an allowlisted chat drew the whole help text back --
@@ -3983,7 +4068,12 @@ class Pager:
             # one chat that another one is mid-job.
             # DEPOSITS ONLY: a withdrawal's label is recorded (so its result
             # can be addressed) but names nothing the vault can watch.
-            _mine = [_k for _k, _v in self.handle_owner.items()
+            # A SNAPSHOT, because the worker inserts into both dicts when a
+            # deposit reports done -- at exactly the moment a chat asks
+            # "is anything happening?" -- and walking a dict another thread
+            # grows raises out of the one answer that would have carried
+            # the new label.
+            _mine = [_k for _k, _v in list(self.handle_owner.items())
                      if _v == cid
                      and self.handle_job.get(_k) not in self.UNWATCHABLE_JOBS]
             if self._running == cid:
@@ -4089,10 +4179,10 @@ class Pager:
             return
         if err == IGNORE:
             # NOTHING GOES BACK. Counted, so a burst of them is visible in the
-            # chain and in /status's own bookkeeping rather than vanishing --
-            # silence is the reply, not the absence of one.
-            self.ignored += 1
-            integrity_log("pager", "unknown_command")
+            # chain and on the shutdown line rather than vanishing (/status
+            # prints no counters, on purpose) -- silence is the reply, not
+            # the absence of one.
+            self._log_ignored("unknown_command")
             return
         if err:
             # A BARE NUMBER WITH NO LIVE CONVERSATION is the commonest way to
@@ -4165,7 +4255,8 @@ class Pager:
                 # shorter. Capped like the rest.
                 _fails += 1
                 _wait = min(LABEL_BACKOFF_MAX_S,
-                            60.0 * (2 ** max(0, _fails - LABEL_FAILS_FREE - 1)))
+                            60.0 * (2 ** min(20, max(0, _fails
+                                                     - LABEL_FAILS_FREE - 1))))
                 _lf[cid] = (_fails, max(_until, time.time() + _wait))
                 self.send(cid,
                           "no: I have no record of that confirmation number "
@@ -4183,8 +4274,14 @@ class Pager:
                 _fails += 1
                 _wait = 0.0
                 if _fails > LABEL_FAILS_FREE:
+                    # THE EXPONENT IS CAPPED, on this site as on the one
+                    # above. min() bounds the RESULT; it does not stop
+                    # 60.0 * 2**1030 from raising OverflowError first, and
+                    # a chat that had guessed a thousand times crashed its
+                    # every later /check as "update dropped".
                     _wait = min(LABEL_BACKOFF_MAX_S,
-                                60.0 * (2 ** (_fails - LABEL_FAILS_FREE - 1)))
+                                60.0 * (2 ** min(20, _fails
+                                                 - LABEL_FAILS_FREE - 1)))
                 _lf[cid] = (_fails, time.time() + _wait)
                 # ONCE PER STREAK ON THE CHAIN, not once per guess: a guess
                 # a second wrote a line a second to the card.
@@ -4252,15 +4349,13 @@ class Pager:
         cid = (_msg.get("chat") or {}).get("id")
         if not isinstance(cid, int) or isinstance(cid, bool) \
                 or cid not in self.allow:
-            self.ignored += 1
-            integrity_log("pager", "chat_not_allowlisted")
+            self._log_ignored("chat_not_allowlisted")
             return
         if self.allow_users:
             _from = (cb.get("from") or {}).get("id")
             if not isinstance(_from, int) or isinstance(_from, bool) \
                     or _from not in self.allow_users:
-                self.ignored += 1
-                integrity_log("pager", "sender_not_allowlisted")
+                self._log_ignored("sender_not_allowlisted")
                 # ANSWERED, unlike the message path, and the difference is
                 # deliberate: this person is already in an allowlisted room and
                 # already knows the bot is there -- they can see the button.
@@ -4373,42 +4468,69 @@ class Pager:
         # "full" and wait for a place to free, which is the whole point of a
         # service with a cap. So this gate is the ONE-PERSON rule and fires
         # only on a bot configured for one person that names several.
-        if self.spenders > 1 and self._max_clients() <= 1:
-            if held:
+        # THE LOCK IS GIVEN BACK EXACTLY ONCE, WHATEVER HAPPENS BELOW.
+        #
+        # A chained leg arrives with `busy` held (see the worker's finally),
+        # and the three gates below each dropped it by hand on their refusal
+        # path -- which covered the refusals and not a RAISE. integrity_log
+        # writes the chain on the SD card and raises when the card is full;
+        # a raise from a gate left the worker's except to say "the next one
+        # did not start" with `busy` held by a thread that had just ended,
+        # and every later command answered "busy" for the life of the
+        # process. Dropping it from that except instead was not safe either:
+        # a raise from INSIDE the guarded region below has already released
+        # the lock, and a second release could free one the poll thread had
+        # taken in between -- two wakes at once, which is the one thing this
+        # lock exists to prevent. So ownership is a flag this call keeps,
+        # and the one release happens where the flag says it is still ours.
+        _owned = [bool(held)]
+
+        def _give_back() -> None:
+            if _owned[0]:
+                _owned[0] = False
                 self._drop_busy()
-            integrity_log("pager", "refused_many")
-            self.send(cid,
-                      "no: more than one person is allowed in here, and this "
-                      "is for one person per chat. Refusing every job until "
-                      "that is fixed.")
-            return
-        # ...AND THE RESTART HOLD, which is a limit like the others: a wake
-        # from before this process started may still be running.
-        why = self.limits.why_not() or self._hold_why()
-        if why:
-            if held:
-                self._drop_busy()
-            self.send(cid, f"no: {why}")
-            return
-        # ...AND THE ROOM. A newcomer's deposit at capacity is refused from
-        # memory, with no wake spent; a client with a deposit in flight is
-        # never refused their own /check or /withdraw for this.
-        if self._full_for(cid, job):
-            if held:
-                self._drop_busy()
-            integrity_log("pager", "refused_full")
-            self.send(cid, FULL_ANSWER)
-            return
-        # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the window, so
-        # a second concurrent wake cannot bind and would fail confusingly --
-        # and two vaults woken at once is not a thing this design has.
-        if not held and not self.busy.acquire(blocking=False):
-            # SOMEBODY ELSE WAITED. The running chain reads this at its next
-            # completion and yields its turn instead of chaining on.
-            if self._running != cid:
-                self.__dict__["_contended"] = True
-            self.send(cid, self._busy_answer(cid))
-            return
+
+        try:
+            if self.spenders > 1 and self._max_clients() <= 1:
+                _give_back()
+                integrity_log("pager", "refused_many")
+                self.send(cid,
+                          "no: more than one person is allowed in here, and "
+                          "this is for one person per chat. Refusing every "
+                          "job until that is fixed.")
+                return
+            # ...AND THE RESTART HOLD, which is a limit like the others: a
+            # wake from before this process started may still be running.
+            why = self.limits.why_not() or self._hold_why()
+            if why:
+                _give_back()
+                self.send(cid, f"no: {why}")
+                return
+            # ...AND THE ROOM. A newcomer's deposit at capacity is refused
+            # from memory, with no wake spent; a client with a deposit in
+            # flight is never refused their own /check or /withdraw for this.
+            if self._full_for(cid, job):
+                _give_back()
+                integrity_log("pager", "refused_full")
+                self.send(cid, FULL_ANSWER)
+                return
+            # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the
+            # window, so a second concurrent wake cannot bind and would fail
+            # confusingly -- and two vaults woken at once is not a thing this
+            # design has.
+            if not held:
+                if not self.busy.acquire(blocking=False):
+                    # SOMEBODY ELSE WAITED. The running chain reads this at
+                    # its next completion and yields its turn instead of
+                    # chaining on.
+                    if self._running != cid:
+                        self.__dict__["_contended"] = True
+                    self.send(cid, self._busy_answer(cid))
+                    return
+                _owned[0] = True
+        except BaseException:                                # noqa: BLE001
+            _give_back()
+            raise
         # WHOSE JOB THIS IS, ON THE WIRE. Derived from the asking chat here,
         # at the one place a wake starts, and nowhere else: a chat can only
         # ever emit its own token. A fresh (leg 0) withdrawal also clears the
@@ -4546,7 +4668,12 @@ class Pager:
                              daemon=True).start()
         except BaseException as e:                           # noqa: BLE001
             self._running = None
-            self.busy.release()
+            _give_back()
+            # ...AND THE PERSISTED BIT, which the lines above had already
+            # set. Left on, nothing in this process read it, and the NEXT
+            # process held every command for up to seventeen hours for a
+            # job that was just reported as never having started.
+            self._set_in_flight(False)
             integrity_log("pager", "worker_start_failed")
             # THE REASON TO THE TERMINAL, A CLOSED SENTENCE TO THE CHAT: the
             # redacted text still carried a file's basename ("No space left
@@ -4608,16 +4735,48 @@ class Pager:
                   "      first poll — it is retried on the next start.")
         return ok
 
+    #: One chain entry per KIND of silent refusal per this many seconds.
+    #:
+    #: Every ignored update was a write to the hash chain on the SD card:
+    #: one line per message from a stranger who found the username, one per
+    #: tap from a non-operator in a group, one per unknown command from a
+    #: client -- and one PER POLL for an update Telegram redelivers because
+    #: it carries no id. None of those is rate limited by anything this side
+    #: of Telegram, so a bored stranger could put ten thousand lines on the
+    #: card in an hour and the entries that matter (a poke, a refusal, a
+    #: crashed worker) would sit somewhere inside them. The counter still
+    #: counts every one; the chain records that the kind is HAPPENING, at
+    #: most once a window, which is what an audit of the card needs to know.
+    IGNORED_LOG_EVERY_S = 600
+
+    def _log_ignored(self, kind: str) -> None:
+        """Count a silently ignored update, and put its kind on the chain
+        at most once per IGNORED_LOG_EVERY_S."""
+        self.ignored += 1
+        now = time.time()
+        # setdefault: a Pager built without __init__ (the tests do this)
+        # must count and log like one that was.
+        seen = self.__dict__.setdefault("_ignored_logged", {})
+        last = seen.get(kind, 0.0)
+        if now - last >= self.IGNORED_LOG_EVERY_S or now < last:
+            seen[kind] = now
+            integrity_log("pager", kind)
+
     def _set_in_flight(self, on: bool, until: float = 0.0) -> None:
         """Persist the one bit that says a wake is between start and result,
         and with it the latest wall-clock moment that wake can still be
         running (0 when the bit is off)."""
         try:
             if hasattr(self.limits, "in_flight"):
-                self.limits.in_flight = bool(on)
-                self.limits.in_flight_until = (float(until or 0.0)
-                                               if on else 0.0)
-                self.limits.save()
+                # UNDER THE LIMITS LOCK when there is one: the bit and its
+                # window go to the card as one picture, not interleaved
+                # with a save from the poll thread.
+                _lk = getattr(self.limits, "_lk", None)
+                with (_lk() if callable(_lk) else threading.Lock()):
+                    self.limits.in_flight = bool(on)
+                    self.limits.in_flight_until = (float(until or 0.0)
+                                                   if on else 0.0)
+                    self.limits.save()
         except Exception as e:                               # noqa: BLE001
             print(f"  [!] could not persist the in-flight bit "
                   f"({_redact(e)[:80]}).")
@@ -4694,29 +4853,41 @@ class Pager:
         done, money reported on the address, a leg with more to come) for
         DEPOSIT_PLACE_TTL_S is an unpaid deposit and stops counting -- the
         same rule, on the same clock, as the vault's own reserve."""
-        _inf = self.__dict__.get("inflight_owners")
-        if not isinstance(_inf, dict):
-            # A set from an older build or a harness: every entry is alive
-            # as of now, and the dict takes over from here.
-            _inf = {t: time.time() for t in (_inf or ())}
-            self.__dict__["inflight_owners"] = _inf
-        _now = time.time()
-        for _t in [t for t, s in _inf.items()
-                   if _now - float(s or 0.0) >= proto.DEPOSIT_PLACE_TTL_S]:
-            _inf.pop(_t, None)
-        return _inf
+        # UNDER ONE LOCK, on both threads. The worker takes and gives back
+        # places when a job reports; the poll thread reads them on every
+        # /deposit, /status and conversation start. The prune below walked
+        # the dict while the worker could insert into it, which is a
+        # RuntimeError out of the one command whose job is to answer.
+        with self._PLACES_LOCK:
+            _inf = self.__dict__.get("inflight_owners")
+            if not isinstance(_inf, dict):
+                # A set from an older build or a harness: every entry is
+                # alive as of now, and the dict takes over from here.
+                _inf = {t: time.time() for t in (_inf or ())}
+                self.__dict__["inflight_owners"] = _inf
+            _now = time.time()
+            for _t in [t for t, s in list(_inf.items())
+                       if _now - float(s or 0.0) >= proto.DEPOSIT_PLACE_TTL_S]:
+                _inf.pop(_t, None)
+            return _inf
+
+    #: Guards inflight_owners across the poll and worker threads. Re-entrant
+    #: because _hold_place and _drop_place take it and then call _places().
+    _PLACES_LOCK = threading.RLock()
 
     def _hold_place(self, cid: int) -> None:
         """This chat's place is alive as of now (taken, or kept)."""
         try:
-            self._places()[owner_token(self.key, cid)] = time.time()
+            with self._PLACES_LOCK:
+                self._places()[owner_token(self.key, cid)] = time.time()
         except Exception:                                    # noqa: BLE001
             pass
 
     def _drop_place(self, cid: int) -> None:
         """This chat's place is given back: nothing of theirs is left."""
         try:
-            self._places().pop(owner_token(self.key, cid), None)
+            with self._PLACES_LOCK:
+                self._places().pop(owner_token(self.key, cid), None)
         except Exception:                                    # noqa: BLE001
             pass
 
@@ -4819,7 +4990,15 @@ class Pager:
                     "finished or failed on its own and this end was not "
                     "told, so its result is lost: CHECK before starting "
                     "another.")
-        for _cid in sorted(self.allow):
+        # TO THE ONE PERSON ON A ONE-PERSON BOT, AND TO NOBODY ON A BOT
+        # SERVING SEVERAL. This process does not know whose job was in
+        # flight (that was the last process's memory), and a broadcast told
+        # every client that somebody's run was, with "CHECK before starting
+        # another" to people who had nothing running. Above one client each
+        # chat hears the hold in its own words when it next taps
+        # (_hold_why), which is where the sentence is true for them.
+        _to = sorted(self.allow) if self._max_clients() <= 1 else []
+        for _cid in _to:
             self.send(_cid, _msg, buttons=MENU_BUTTONS)
         if _left <= 0:
             self._set_in_flight(False)
@@ -4833,17 +5012,17 @@ class Pager:
               + (f", {len(self.allow_users)} allowlisted sender(s)"
                  if self.allow_users else "")
               + ", Tor only, one wake at a time.")
-        # NOTHING HERE ABOUT SHARING, BECAUSE NOTHING IS SHARED ANY MORE.
-        #
-        # This block used to print a warning: one wake budget, one job lock,
-        # one handle namespace, later one pot of money. Every line of it was a
-        # description of a configuration that main() now refuses outright --
-        # one wallet means one person, and there is no flag to say otherwise.
-        # A banner explaining the consequences of a state the program will not
-        # enter is decoration, and this file removes guards that cannot fire
-        # rather than keeping them for reassurance.
+        # NOTHING HERE ABOUT SHARING. Several people on one bot is a choice
+        # main() gates (--max-clients) and OPSEC_SETUP.md 4f explains; what
+        # is shared (one wake at a time, one budget) and what is not (money,
+        # labels, phase words) is enforced in code, not announced in a
+        # banner. A banner explaining the consequences of a configuration is
+        # decoration, and this file removes guards that cannot fire rather
+        # than keeping them for reassurance.
         while not shutdown_requested():
-            for upd in self.updates():
+            _batch = self.updates()
+            _cursor_before = self.limits.offset
+            for upd in _batch:
                 uid = upd.get("update_id")
                 if isinstance(uid, int) and not isinstance(uid, bool):
                     # Advance the cursor BEFORE acting: a message that crashes
@@ -4888,13 +5067,20 @@ class Pager:
                     # counter rather than as a pager that has quietly become a
                     # loop. `bool` is excluded because True == 1 and would
                     # advance the cursor to 2.
-                    self.ignored += 1
-                    integrity_log("pager", "update_without_id")
+                    self._log_ignored("update_without_id")
                     continue
                 try:
                     self.handle(upd)
                 except Exception as e:                       # noqa: BLE001
                     print(f"  [!] update dropped: {_redact(e)[:200]}")
+            if _batch and self.limits.offset == _cursor_before:
+                # A BATCH THAT MOVED THE CURSOR NOWHERE comes straight back:
+                # nothing in it carried an id to confirm, and long-polling
+                # returns at once while there is something to return. Every
+                # element was skipped and counted above; without a pause
+                # this is one request per circuit round trip for as long as
+                # that element sits in Telegram's queue. One poll period.
+                time.sleep(5)
             # EVERY TICK, INCLUDING THE QUIET ONES, and that is the point:
             # updates() long-polls for POLL_HOLD_S and returns an empty list
             # when nothing was said, so a chat nobody touches still empties
@@ -4911,11 +5097,20 @@ class Pager:
                 # process -- a permanent stream of delete requests over Tor
                 # from one signal.
                 self.burn_now = False
+                _resumed = bool(getattr(self, "_burn_resumed", False))
+                self._burn_resumed = False
                 _g, _t = self.burn_all()
-                integrity_log("pager", "burn_signal")
+                # ONCE PER SIGNAL, not once per pass: a pass that burn_all
+                # asked for itself (cap reached, circuit dead) is the same
+                # signal still being carried out.
+                if not _resumed:
+                    integrity_log("pager", "burn_signal")
                 print(f"  [*] burn: {_g}/{_t} message(s) deleted"
                       + ("" if _g == _t
-                         else "; the rest are past Telegram's 48h window"))
+                         else ("; the rest are retried next tick"
+                               if self.burn_now
+                               else "; the rest are past Telegram's 48h "
+                                    "window")))
             _burned = self.burn_expired(self.burn_after)
             if _burned:
                 integrity_log("pager", "messages_burned")
@@ -5346,6 +5541,18 @@ def main(argv=None) -> int:
             f"one account one\n"
             f"     chat with this bot, whatever it is signed in on. That is "
             f"one --chat-id.)")
+    # THE COURTESY LIMITS ARE SHARED BY EVERY CHAT. --daily-cap counts pokes
+    # for the whole bot and --min-interval is the gap between ANY two pokes,
+    # so several people on the defaults (12 a day, 300 s apart) hear "daily
+    # limit reached" by early afternoon. Said here, at the terminal, with
+    # the arithmetic the operator needs: about four pokes per person per
+    # cycle (a deposit, a check or two, a withdrawal).
+    if _max_clients > 1 and int(getattr(args, "daily_cap", 0) or 0) < 4 * _max_clients:
+        print(f"[i] --daily-cap {int(args.daily_cap)} is shared by every chat: "
+              f"at about four pokes per person per cycle it serves "
+              f"{max(1, int(args.daily_cap) // 4)} a day, and --max-clients is "
+              f"{_max_clients}. Raise it with the places (OPSEC_SETUP.md 4f).",
+              file=sys.stderr)
     key = doorbell().load_key(Path(args.key))
     # A PAGER THAT CANNOT BIND A LABEL TO A CHAT MUST NOT START.
     #

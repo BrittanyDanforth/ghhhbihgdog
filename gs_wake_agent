@@ -115,7 +115,10 @@ class Refused(Exception):
         super().__init__(msg)
         self.code = code
         self.msg = msg
-        #: False only for the two cases where a human is demonstrably present.
+        #: False where a human is demonstrably present (an inhibit file, a
+        #: mix already running on the console) or the box is theirs to keep
+        #: on (a dry run, a hand-run fee sweep with nothing configured).
+        #: main() reads it ONCE, into the flag its finally decides on.
         self.power = power
 
 
@@ -913,8 +916,12 @@ def _ghost():
 
 
 #: The shallowest depth's wallet count: the floor is "the smallest minimum of
-#: any depth", because the depth is chosen later, on another surface.
-_MIN_OUT_WALLETS = 3
+#: any depth", because the depth is chosen later, on another surface. READ
+#: FROM THE PROTOCOL'S OWN TABLE, not typed: this was a literal 3 beside
+#: WITHDRAW_DEPTHS[1] = (3, ...), and it feeds the deposit gate, the
+#: below-minimum refusal and the "more left" floor -- three places that
+#: would have gone on using a stale count if the table ever changed.
+_MIN_OUT_WALLETS = proto.WITHDRAW_DEPTHS[min(proto.WITHDRAW_DEPTHS)][0]
 
 
 def live_floor_xmr(key: dict, wallets: int) -> str:
@@ -1207,6 +1214,11 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
                   f"{'follows on this terminal' if _watched else '-> ' + str(_jl)}.")
         if legs == 0:
             integrity_log("wake", "fee_sweep:start")
+        # A CHILD IS ABOUT TO SPEND. The flag run_once's handler reads to
+        # choose between "refused before it started" and "failed" was set
+        # only by _dispatch; a sweep's GhostSpiral is the one tool that
+        # spends and it went unmarked.
+        _CHILD_STARTED[0] = True
         rc, killed = run_child(argv, env_extra, leg_budget,
                                runner=d.get("run_child"),
                                log_path=None if _watched else _jl)
@@ -1218,17 +1230,24 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
                       f"Some of it may already have moved: check the fee "
                       f"wallet's balances and the job log before running "
                       f"another.")
+            _retire_fee_bundle(artifact_dir)
             return code
     integrity_log("wake", "fee_sweep:done")
-    # THE ENTRY BUNDLE NAMED THE FEE WALLET'S OUTPUT. Gone with the sweep.
+    _retire_fee_bundle(artifact_dir)
+    agent_say(f"  [+] Fee sweep finished: {legs} leg(s).")
+    return "done"
+
+
+def _retire_fee_bundle(artifact_dir: Path) -> None:
+    """THE ENTRY BUNDLE NAMED THE FEE WALLET'S OUTPUT. Gone with the sweep,
+    finished or not: it said only where the sweep started from, on a disk
+    that auto-unlocks, and the wallet still knows that for itself."""
     try:
         if (artifact_dir / FEE_SWEEP_BUNDLE).is_file():
             secure_delete_or_warn(artifact_dir / FEE_SWEEP_BUNDLE,
                                   "the fee sweep's entry bundle")
     except Exception:                                        # noqa: BLE001
         integrity_log("wake", "retire_failed:fee_bundle")
-    agent_say(f"  [+] Fee sweep finished: {legs} leg(s).")
-    return "done"
 
 
 def run_fee_sweep_cli(args, deps: dict = None) -> str:
@@ -1282,8 +1301,10 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                bundle: str = None, slip: str = None, handle: str = None,
                owned_fee=()) -> list:
-    """(argv, env_extra) pairs for one job, composed ENTIRELY from the fixed
-    template plus this machine's own keyfile.
+    """The argv lists for one job, in order, composed ENTIRELY from the fixed
+    template plus this machine's own keyfile. (The per-step environment is
+    built by _dispatch beside each step; only build_fee_sweep_argv returns
+    an (argv, env) pair.)
 
     The only things that come from the note are: an int already range-checked
     against a closed schema, and a handle already matched against
@@ -2059,7 +2080,8 @@ def run_once(args, deps: dict = None) -> tuple:
         raise Refused("no_job",
                       "the doorbell answered, and it has no job for this boot. "
                       "That is what a magic packet from anyone on the switch "
-                      "looks like: boot, sit, shut down.")
+                      "looks like: boot, run the idle-boot fee sweep if one "
+                      "is configured (above), shut down.")
     if status != 200:
         raise Refused("doorbell_unreachable",
                       f"the doorbell answered {status}, which is not an "
@@ -2329,6 +2351,15 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
                 plain=plain, phase=phase, poster=d.get("post_record"),
                 sleeper=d.get("sleep"))
+    # THE PROBE'S ANSWER IS READ ONCE AND THEN GONE. The status file holds
+    # the probe's state word and figures; it was deleted only at the START
+    # of the next probe, so between two probes it sat on the auto-unlocking
+    # disk. Removed here, after the one read that needed it.
+    if job in ("watch", "swap_status"):
+        try:
+            (artifact_dir / STATUS_FILE).unlink()
+        except OSError:
+            pass
     return code, status, handle
 
 
@@ -2752,8 +2783,18 @@ def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
     return _total != 0
 
 
-def _reusable_receive(key: dict, handles: dict, balance=None):
+def _reusable_receive(key: dict, handles: dict, balance=None, owner=None):
     """(handle, bundle) of a receive address minted and never quoted, or None.
+
+    THE SAME OWNER'S, OR NOBODY'S. The mint at step 0 records the account as
+    the asking owner's before the quote runs (the argv needs the record), so
+    a quote that fails leaves the account in THAT owner's set. Handing the
+    bundle to the next deposit regardless of whose it was put one account in
+    two owners' sets: the second owner's money landed on it and the first
+    owner's withdrawal -- largest unlocked output among THEIR accounts --
+    could spend it. A record that names a different owner is not reusable;
+    one that names none (from before owners existed) is anyone's, as it
+    always was.
 
     A DEPOSIT WHOSE QUOTE FAILED LEFT AN ACCOUNT BEHIND, FOREVER. Step 0
     mints a fresh wallet account and step 1 quotes the swap; when step 1
@@ -2774,6 +2815,8 @@ def _reusable_receive(key: dict, handles: dict, balance=None):
     _ask = (lambda k, a, s: balance(k, a, s)) if balance else _subaddress_total
     for _h, _rec in handles.items():
         if _rec.get("spent") is True or not _rec.get("bundle"):
+            continue
+        if _rec.get("owner") and _rec.get("owner") != owner:
             continue
         _slip = _rec.get("slip")
         if _slip and Path(_slip).exists():
@@ -2810,9 +2853,12 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     led = _load_ledger(artifact_dir)
     handles = led["handles"]
     # WHOSE JOB. Off the validated note, never off a chat: the vault holds an
-    # opaque token and a ledger of what that token's money created. Absent
-    # only on a hand-run of this function (the wire makes it mandatory), and
-    # absent means the whole wallet, which is the host's own use.
+    # opaque token and a ledger of what that token's money created. Never
+    # absent on the wire -- a hand-poked job carries HOST_OWNER (the
+    # all-zero token), so the host's own deposits and mixes are one more
+    # owner's, and a hand-poked withdrawal spends from THOSE accounts, not
+    # from the wallet at large. Absent only on a direct call of this
+    # function, where None means the whole wallet (the fee wallet, a test).
     _owner = params.get("owner") if isinstance(params, dict) else None
 
     # A HANDLE IS FOUR HEX CHARACTERS, SO COLLISIONS ARE NOT A CURIOSITY.
@@ -3055,7 +3101,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # AN ADDRESS MINTED FOR A DEPOSIT THAT NEVER GOT ITS QUOTE IS THE NEXT
     # DEPOSIT'S ADDRESS. See _reusable_receive; decided before the loop so
     # step 0 (the mint) can be skipped whole.
-    _reuse = (_reusable_receive(key, handles, balance=reuse_balance)
+    _reuse = (_reusable_receive(key, handles, balance=reuse_balance,
+                                owner=_owner)
               if job == "receive_and_quote" else None)
     before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
     for i, argv in enumerate(steps):
@@ -3382,6 +3429,18 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             rec = handles.get(handle)
             if rec and rec.get("slip") and not Path(rec["slip"]).exists():
                 rec["slip"] = None
+            # THE WITHDRAWAL'S ENTRY BUNDLE GOES ON THIS PATH TOO. It names
+            # the account and subaddress the run spent from, on a disk that
+            # auto-unlocks, and "gone with the job" below was only true of a
+            # job that finished. The wallet itself still knows where the
+            # money is; the file added nothing but a record.
+            if job == "withdraw" and bundle:
+                try:
+                    if Path(bundle).is_file():
+                        secure_delete_or_warn(Path(bundle),
+                                              "the withdrawal's entry bundle")
+                except Exception:                            # noqa: BLE001
+                    integrity_log("wake", "retire_failed:withdraw_bundle")
             _save_handles(artifact_dir, handles, led["owners"])
             return "job_failed", "failed", handle
 
@@ -3403,10 +3462,29 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # are recorded as this owner's for the next leg. Unreadable on
         # either side means nothing is recorded, never a guess.
         if _owner and _accts_before is not None:
-            _accts_after = _account_indices(key, injected=accounts)
+            # ASKED AGAIN BEFORE GIVING UP, AND SAID OUT LOUD WHEN IT CANNOT
+            # BE. _account_indices swallows the RPC error into None, and a
+            # None here meant the accounts the mix just minted were never
+            # recorded as this owner's -- so their own change could never be
+            # found by their next leg, silently. Three tries a few seconds
+            # apart cover a wallet-rpc that is busy; a wallet that still
+            # cannot be asked is written to the chain and the terminal, so
+            # the host knows which run left accounts unattributed.
+            _accts_after = None
+            for _try in range(3):
+                _accts_after = _account_indices(key, injected=accounts)
+                if _accts_after is not None:
+                    break
+                time.sleep(2)
             if _accts_after is not None:
                 _add_owner_accounts(led, _owner,
                                     set(_accts_after) - set(_accts_before))
+            else:
+                integrity_log("wake", "owner_accounts_unreadable")
+                agent_say("  [!] could not read the wallet's accounts after "
+                          "the mix, so what it minted is not recorded as "
+                          "this owner's. Their next withdrawal will not see "
+                          "that change until the ledger is repaired by hand.")
         # THE WITHDRAWAL'S OWN BUNDLE NAMED THE ACCOUNT IT SPENT. Gone with
         # the job; the ledger keeps the pair.
         if bundle:
@@ -3864,6 +3942,9 @@ def main(argv=None) -> int:
     install_signal_handlers()
     args = build_cli().parse_args(argv)
     code = "unknown"
+    #: Set by a Refused(power=False): the machine stays on. Read by the
+    #: finally, which is the one place the power-off is decided.
+    _keep_on = False
     try:
         try:
             if getattr(args, "fee_sweep", False):
@@ -3878,9 +3959,13 @@ def main(argv=None) -> int:
             agent_say(f"  [!] Wake refused ({e.code}): {e.msg}")
             integrity_log("wake", f"refused:{e.code}")
             if not e.power:
-                # The two cases where a human is demonstrably present. Disarm
-                # the deadman so the machine they are using does not go down
-                # under them.
+                # The cases where a human is demonstrably present or the
+                # box is theirs to keep on (Refused.power=False). Disarm the
+                # deadman so the machine they are using does not go down
+                # under them -- and REMEMBER IT for the finally below, which
+                # used to re-decide from a hand-typed pair of codes and
+                # powered the machine off anyway on every other one.
+                _keep_on = True
                 disarm_deadman()
                 return 0
             return 1
@@ -3915,7 +4000,7 @@ def main(argv=None) -> int:
         # Powering the machine off under somebody who is using it is the one
         # failure this feature must not introduce, and it is worth one stat
         # and one socket bind on every path to avoid it.
-        if code not in ("inhibited", "mix_running"):
+        if not _keep_on:
             _late = somebody_is_here()
             if _late:
                 agent_say(f"  [!] {_late} NOT powering off.")

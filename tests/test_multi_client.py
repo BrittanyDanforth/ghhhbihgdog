@@ -314,6 +314,53 @@ check("a deposit records its owner on the handle and its account under the "
       _r7[:2] == ("done", "done")
       and _led7["handles"]["F7A8"].get("owner") == OX
       and 11 in _led7["owners"][OX]["accounts"])
+# A BUNDLE MINTED FOR ONE OWNER IS NEVER THE NEXT OWNER'S ADDRESS. The mint
+# records the account as the asker's before the quote runs, so a failed quote
+# leaves an unquoted bundle in X's set. Reused for Y it would sit in BOTH
+# sets: Y's money lands on it and X's withdrawal (largest unlocked output
+# among X's accounts) could spend it.
+_bq = _bundle(_dd, "wallet_unq.json", 12, 1)
+_led8 = A._load_ledger(_dd)
+_led8["handles"]["A8B9"] = {"bundle": str(_bq), "slip": None, "minted": 1,
+                            "owner": OX}
+A._add_owner_accounts(_led8, OX, {12})
+A._save_handles(_dd, _led8["handles"], _led8["owners"])
+_seen.clear()
+
+
+def _mint13(argv, env_extra, budget_s):
+    _seen.append(list(argv))
+    if "create_receive_wallet" in " ".join(argv):
+        _bundle(_dd, "wallet_new13.json", 13, 1)
+    return 0, False
+
+
+with contextlib.redirect_stdout(io.StringIO()):
+    _r8 = A._dispatch("receive_and_quote", {"amount_sat": 5000000, "owner": OY},
+                      _K, _dd, "B9C0", _mint13, "job-8",
+                      reuse_balance=lambda k, a, s: 0)
+_led9 = A._load_ledger(_dd)
+check("an unquoted address minted for X is NOT reused for Y: Y mints its own, "
+      "X's record stays, and account 12 is in X's set only",
+      _r8[:2] == ("done", "done")
+      and any("create_receive_wallet" in " ".join(a) for a in _seen)
+      and "A8B9" in _led9["handles"]
+      and 13 in _led9["owners"][OY]["accounts"]
+      and 12 not in _led9["owners"][OY]["accounts"]
+      and 12 in _led9["owners"][OX]["accounts"])
+_seen.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    _r9 = A._dispatch("receive_and_quote", {"amount_sat": 5000000, "owner": OX},
+                      _K, _dd, "C0D1", _mint13, "job-9",
+                      reuse_balance=lambda k, a, s: 0)
+_led10 = A._load_ledger(_dd)
+check("...while X's own next deposit reuses one of X's: no mint, and the new "
+      "record names X and one of X's bundles",
+      _r9[:2] == ("done", "done")
+      and not any("create_receive_wallet" in " ".join(a) for a in _seen)
+      and _led10["handles"]["C0D1"].get("owner") == OX
+      and _led10["handles"]["C0D1"].get("bundle")
+      in (str(_bq), str(_dd / "wallet_new.json")))
 # THE OWNER-SCOPED PHASE.
 _cap = {}
 
@@ -335,8 +382,10 @@ try:
 finally:
     A._funded_entry, A._locked_value = _sfe, _slv
 check("the 'more left' question after a withdrawal is asked over the owner's "
-      "accounts and no other",
-      _ph == "" and _cap["owned"] == {2, 7, 8, 9} and _cap["lowned"] == {2, 7, 8, 9})
+      "accounts and no other (Y's: its deposit, its mix, and the account its "
+      "second deposit minted above)",
+      _ph == "" and _cap["owned"] == {2, 7, 8, 9, 13}
+      and _cap["lowned"] == {2, 7, 8, 9, 13})
 
 # ===========================================================================
 print("\n== capacity: the vault reserves what every admitted deposit may mint ==")
@@ -819,6 +868,59 @@ _src = open(os.path.join(REPO, "gs_telegram_pager"), encoding="utf-8").read()
 check("a stop mid-wake with no known chat tells the one person on a one-"
       "person bot, and NOBODY on a bot serving several",
       "else sorted(self.allow) if self._max_clients() <= 1 else []" in _src)
+check("main() says at startup when the shared --daily-cap is too small for "
+      "the places, with the arithmetic",
+      "is shared by every chat" in _src
+      and "4 * _max_clients" in _src)
+# TWO WRITES TO THE CHAIN SIT ABOVE EVERY REPLY BRANCH OF poke(); one was
+# guarded and one was not, so a full card threw out before the operator heard
+# what happened. Both are guarded now.
+check("the events write above poke()'s reply branches is guarded like the "
+      "outcome write below it",
+      '            try:\n                integrity_log("pager", "event_reported")'
+      in _src)
+check("the wizard's delete-retry queue is initialised, not conjured by a "
+      "getattr fallback on first failure",
+      "        self._wizard_retry = []" in _src)
+# A WIZARD QUESTION THAT DID NOT LAND IS NOT WAITED ON. Every caller of _ask
+# discarded its result, so a failed send left a conversation waiting for the
+# answer to a question nobody saw.
+_qp, _qs = _pager([111], max_clients=1)
+_qp.send = lambda c, t, buttons=None: (_qs.append((c, t)), False)[1]
+_saved_il3 = pg.integrity_log
+try:
+    pg.integrity_log = lambda *a, **k: None
+    _qp.begin_convo(111, kind="depo")
+finally:
+    pg.integrity_log = _saved_il3
+check("a wizard question whose send fails ends the conversation instead of "
+      "waiting on an answer to a question nobody saw",
+      _qs and 111 not in _qp.convos)
+_qp2, _qs2 = _pager([111], max_clients=1)
+_qp2.begin_convo(111, kind="depo")
+check("NON-VACUITY -- the same question that lands leaves the conversation "
+      "open", _qs2 and 111 in _qp2.convos)
+# ...AND THE RESTART NOTICE LIKEWISE. The last process's memory of whose job
+# was in flight is gone; a broadcast told every client somebody's run was,
+# with "CHECK before starting another" to people who had nothing running.
+# Above one client each chat hears the hold when it next taps, in its own
+# words, which is where the sentence is true for them.
+_rp1, _rs1 = _pager([111], max_clients=1)
+_rp1.limits.in_flight, _rp1.limits.in_flight_until = True, time.time() + 3600
+_rp2, _rs2 = _pager([111, 222, 333], max_clients=2)
+_rp2.limits.in_flight, _rp2.limits.in_flight_until = True, time.time() + 3600
+_saved_il2 = pg.integrity_log
+try:
+    pg.integrity_log = lambda *a, **k: None
+    _a1, _a2 = _rp1.announce_restart(), _rp2.announce_restart()
+finally:
+    pg.integrity_log = _saved_il2
+check("a restart with a wake in flight is announced to the one person on a "
+      "one-person bot, and to NOBODY on a bot serving several -- who each "
+      "hear the hold when they tap",
+      _a1 is True and [c for c, _ in _rs1] == [111]
+      and _a2 is True and _rs2 == []
+      and "before the restart" in _rp2._hold_why())
 check("no chain kind on the Pi carries the job word",
       'integrity_log("pager", f"poke:' not in _src
       and 'integrity_log("pager", f"collected:' not in _src
