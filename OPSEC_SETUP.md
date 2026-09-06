@@ -1922,26 +1922,25 @@ write one into a keyfile paired with `--deposit-in-chat`.
 ```
 /deposit               -> How much? Reply with the amount — for example 0.05.
 0.05                   -> Deposit 0.05. Confirm and it starts.  7 + 6 = ?
-13                     -> depo: getting your payment details — a few minutes,
-                          2h at most. They arrive here. Nothing else can run
-                          until then.
+13                     -> depo: getting your payment details now. They come
+                          here. Nothing else can run for up to 2h.
                        -> =:XMR.XMR:44AF…:0/1/0      (its own message, FIRST)
-                       -> depo: pay this.
+                       -> depo: here is how to pay.
 
                           Send exactly:  0.05000000
                           To address:    bc1q…
-                          Expected out:  ~1.23
+                          You get back:  ~1.23
                           Confirmation:  A3F1-9C2B7E01
 
-                          Attach the note above to the payment — it is what
-                          makes the money arrive. Most phone apps CANNOT
-                          attach one; use a desktop app that can.
-                          Pay it once. Do not send here again — a second
-                          payment, now or later, loses the money.
+                          The code above is the note for this payment — add
+                          it to the payment. Most phone apps CANNOT add a
+                          note, and without it the money never arrives.
+                          Pay it once. Never send to this address again — a
+                          second payment, now or later, loses the money.
 
-                          Once it is paid, tap below or /check that number —
-                          it says when it has arrived. Then /withdraw sends
-                          it on.
+                          When it is paid, tap below or /check that number —
+                          it tells you when the money has arrived. Then
+                          /withdraw sends it on.
 /check A3F1-9C2B7E01     -> A3F1-9C2B7E01: nothing on the address yet. Normal —
                           ask again in a while.
 ```

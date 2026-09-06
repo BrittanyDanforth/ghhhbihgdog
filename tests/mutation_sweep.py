@@ -3498,8 +3498,8 @@ MUTATIONS = [
  # is not part of the address, which is not unique to them either.
  ("the deposit instructions stop saying the address is for one payment only",
   "gs_wake_proto.py",
-  '        "Pay it once. Do not send here again \u2014 a second payment, now or "\n'
-  '        "later, loses the money.",',
+  '        "Pay it once. Never send to this address again \u2014 a second payment, "\n'
+  '        "now or later, loses the money.",',
   '        "",',
   ["test_depo_wizard"]),
 
@@ -3507,8 +3507,9 @@ MUTATIONS = [
  # note that routes the payment; a reader not told so pays from one.
  ("the deposit instructions stop warning that a phone cannot attach the note",
   "gs_wake_proto.py",
-  '        "Attach the note above to the payment \u2014 it is what makes the money "\n'
-  '        "arrive. Most phone apps CANNOT attach one; use a desktop app that can.",',
+  '        "The code above is the note for this payment \u2014 add it to the "\n'
+  '        "payment. Most phone apps CANNOT add a note, and without it the "\n'
+  '        "money never arrives.",',
   '        "",',
   ["test_depo_wizard", "test_plain_slip"]),
 
