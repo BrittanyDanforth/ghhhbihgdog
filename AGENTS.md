@@ -113,9 +113,17 @@ Once BTC has settled through the swap, the XMR is on an address a public
 deposit instructions exist, where "nothing has been spent" is true of the
 deposit as well as of the wallet.
 
-## 8. One operator. One wallet. One person.
+## 8. One wallet. Each person's money is theirs, or there is one person.
 
-There is a single wallet behind this and a withdrawal does not ask who is
-asking. The pager refuses more than one allowlisted person and there is
-deliberately no override: consent from one party to a loss that falls on a
-second is not consent.
+There is a single wallet behind this. Several people may use it only because
+the vault keeps their money apart: every job carries an owner token the pager
+derives from the asking chat (a keyed one-way function of the chat id), the
+vault records which wallet accounts each owner's deposits and mixes created,
+and a withdrawal for one owner can only ever spend those. That isolation is
+enforced on the machine holding the money, rests on the pairing secret and
+nothing else, and is never traded for convenience: a withdrawal that cannot
+find the asker's own money is refused, never widened to the wallet. The pager
+serves one person unless the operator passes `--max-clients`, and above one
+every client has their own private chat -- a group shares a chat id and a
+transcript, and is refused. Consent from one party to a loss that falls on a
+second is not consent, and no flag makes it so.

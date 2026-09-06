@@ -281,7 +281,7 @@ _dep_said = _default_deposit_replies()
 _deposit_reply = [t for t in _dep_said if "ON THE MACHINE" in t]
 # CONFIRM_RE is anchored with \Z -- it decides whether a WHOLE argument is a
 # confirmation number -- so it cannot be used to find one inside a sentence.
-_CN_IN_TEXT = re.compile(r"\b[0-9A-F]{4}-[0-9A-F]{6}\b")
+_CN_IN_TEXT = re.compile(r"\b[0-9A-F]{4}-[0-9A-F]{8}\b")
 check("by default the pager reports a confirmation number and says where the "
       "address is, without naming it",
       len(_deposit_reply) == 1

@@ -164,7 +164,7 @@ import time
 #: misread. That is the intended failure. A silent partial upgrade, where the
 #: vault seals a slip the Pi cannot carry, is the one outcome worth ruling
 #: out, because it fails at the moment money is waiting on it.
-WIRE_VERSION = 2
+WIRE_VERSION = 3
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -359,8 +359,29 @@ PLAIN_FIELDS = {
 #: a key to the M3 record instead would break the doorbell's exact-key-set
 #: check and force both boxes to be updated in the same sitting, which is a
 #: real cost to pay for a fact that fits in a word this record already carries.
+#:   full       a deposit was refused because the vault cannot carry another
+#:              until some are paid out (at_capacity). ON A REFUSAL, and the
+#:              only refusal that says anything: every other reason stays on
+#:              the vault, but "wait, this frees up" is the one answer a
+#:              person can act on, and it names nobody and no number. The
+#:              Pi's own soft cap says the same words from memory; this is
+#:              the vault saying them when the Pi's memory was wrong (a
+#:              restart forgot who holds a place).
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
-          "more_locked", "moved", "partial")
+          "more_locked", "moved", "partial", "full")
+
+#: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
+#: reported done and was never paid would otherwise hold its place forever:
+#: on the Pi in the count that answers "full", on the vault in the account
+#: reserve that refuses the next deposit. After this long with NOTHING on its
+#: address it is a ghost and stops counting -- the vault checks the address
+#: (a funded one keeps its place at any age, and "could not ask" counts as
+#: funded), the Pi goes by the clock and by what the watching jobs report.
+#: Two days: a quote expires in minutes and a paid swap lands in hours, so a
+#: deposit with nothing on it after two days is not coming. Nothing else is
+#: forgotten -- the owner's accounts stay theirs, and a payment that lands
+#: on day three is still theirs to withdraw; only the reserve lets go.
+DEPOSIT_PLACE_TTL_S = 2 * 86400
 
 CHALLENGE_BYTES = 32
 JOB_ID_BYTES = 16
@@ -821,6 +842,12 @@ PHASE_LINES = {
     # coming is a verdict only the long watch can reach ("short").
     "partial": "some of it is here and spendable, under what was quoted "
                "so far. Ask again later.",
+    # THE ONE REFUSAL WITH WORDS, and they are the Pi's own "full" words so
+    # the two ends cannot drift: no figure, no count, no whose. Rendered by
+    # the pager on a refused deposit that carries this word, and nowhere
+    # else -- it never follows a label, because there is no deposit.
+    "full": "no: this is full at the moment and cannot take another right "
+            "now. Try again later — space frees up as things finish.",
 }
 
 
@@ -1912,6 +1939,32 @@ def _handle_field(v):
 
 _handle_field.spec = "handle ^[0-9A-F]{4}$"
 
+#: WHOSE JOB THIS IS, WITHOUT SAYING WHO. Sixteen hex characters: the first
+#: eight bytes of an HMAC the pager computes over its own chat id, under a key
+#: derived from the pairing secret (gs_telegram_pager.owner_token). The vault
+#: keeps, per owner, the wallet ACCOUNTS that owner's deposits and mixes
+#: created, and a withdrawal for one owner can only ever spend those -- which
+#: is what lets one vault serve several people without one person's
+#: withdrawal taking another's arrival. The vault never learns a chat id:
+#: the token is one-way, and forging one needs the pairing secret.
+#:
+#: THE WIDTH IS NOT A BARRIER. Sixteen hex avoids accidental collision among a
+#: host's handful of clients; it does not have to resist search, because a
+#: guessed token is refused by the sealed wire before it reaches any ledger.
+#: HOST_OWNER is the owner of a job the host pokes by hand from the Pi's own
+#: terminal, where there is no chat to derive one from.
+OWNER_RE = re.compile(r"^[0-9a-f]{16}\Z")
+HOST_OWNER = "0" * 16
+
+
+def _owner_field(v):
+    if not isinstance(v, str) or not OWNER_RE.match(v):
+        raise WakeError("expected a 16-character lowercase hex owner")
+    return v
+
+
+_owner_field.spec = "owner ^[0-9a-f]{16}$"
+
 #: A Monero address, and THE ONLY FREE TEXT THIS CHANNEL HAS EVER CARRIED.
 #:
 #: Every other field is a bounded int or a 4-hex label, and that was a design
@@ -2032,7 +2085,7 @@ MAX_WAKE_EXIT_DESTS = 7
 _MAX_WITHDRAW_NOTE = (
     TAG_LEN
     + len(json.dumps({"job_id": "0" * 32, "challenge": "0" * 64,
-                      "job": "withdraw", "depth": 3,
+                      "job": "withdraw", "depth": 3, "owner": "0" * 16,
                       "exit_to": ["4" + "1" * 105] * MAX_WAKE_EXIT_DESTS},
                      sort_keys=True, separators=(",", ":")).encode()))
 if _MAX_WITHDRAW_NOTE > MAX_INNER:                           # pragma: no cover
@@ -2478,15 +2531,22 @@ JOBS = {
     # operator picked off a list is a quote for a number that is not the
     # number they are about to send, and a swap quoted for the wrong amount is
     # simply wrong.
+    # EVERY JOB CARRIES AN OWNER (see _owner_field), so the rule is one rule:
+    # a deposit is recorded as its owner's, a watch is refused on another
+    # owner's label at the vault as well as at the pager, and a withdrawal
+    # spends only its owner's accounts. validate_job's exact key set makes the
+    # field mandatory on every note; an older pager's note is refused loud
+    # ("missing ['owner']"), as this file's header promises for a wire change.
     "receive_and_quote": {
         "schema": {"amount_sat": _int_range(DEPOSIT_MIN_SAT,
-                                            DEPOSIT_MAX_SAT)},
+                                            DEPOSIT_MAX_SAT),
+                   "owner": _owner_field},
         "tools": ("create_receive_wallet", "thor_swap_preparer"),
         "budget_s": 1800,
     },
     # Wait for a payment to land on a bundle this machine already minted.
     "watch": {
-        "schema": {"handle": _handle_field},
+        "schema": {"handle": _handle_field, "owner": _owner_field},
         "tools": ("receive_watch",),
         "budget_s": 7200,
     },
@@ -2509,7 +2569,7 @@ JOBS = {
     # every watch. A new name fails cleanly on an old vault instead -- "wake
     # note names a job this machine does not run".
     "swap_status": {
-        "schema": {"handle": _handle_field},
+        "schema": {"handle": _handle_field, "owner": _owner_field},
         "tools": ("receive_watch",),
         # Five minutes of looking. Long enough for the wallet to answer, short
         # enough that the vault is off again before it is worth noticing.
@@ -2569,7 +2629,8 @@ JOBS = {
         # string is still accepted and means a list of one, so an older pager
         # keeps working against a newer vault.
         "schema": {"exit_to": _xmr_address_list,
-                   "depth": _int_range(1, 3)},
+                   "depth": _int_range(1, 3),
+                   "owner": _owner_field},
         "tools": ("GhostSpiral",),
         # SIZED FOR THE DEEPEST DEPTH OFFERED, and this number was wrong.
         #

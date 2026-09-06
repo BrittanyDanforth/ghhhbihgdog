@@ -284,8 +284,12 @@ check("...and every value is a plain int, never a string or a bool",
       all(isinstance(v, int) and not isinstance(v, bool)
           for _, pa in _wiz for v in pa.values()))
 for _j, _pa in _wiz:
+    # PLUS THE OWNER start_job stamps on the way out: the wizard's params
+    # stop short of it on purpose (a chat can only ever emit its own token),
+    # and the wire refuses a note without one.
     P.validate_job({"job_id": P.new_job_id(),
-                    "challenge": P.new_challenge().hex(), "job": _j, **_pa})
+                    "challenge": P.new_challenge().hex(), "job": _j, **_pa,
+                    "owner": P.HOST_OWNER})
 check("...and every one passes the REAL job schema", True)
 # ...and the protocol itself agrees, rather than this file asserting it alone.
 for _t in (f"/watch {_CN}", f"/check {_CN}"):
@@ -381,8 +385,11 @@ for _out, _h in (("done", "A3F1"), ("refused", ""), ("failed", ""),
         check("refused: ...it gives the rule that is right for both kinds, "
               "and needs no reason from the wire",
               "a second try is refused" in _text and "stop" in _text)
-        check("refused: ...and says some refusals need somebody at the machine",
-              "somebody at the machine" in _text)
+        # NOT "AT THE MACHINE": a client has no machine to be at. The sentence
+        # says the same thing from where the reader is standing.
+        check("refused: ...and says some refusals clear only at the other end",
+              "looks at the other end" in _text
+              and "at the machine" not in _text)
         check("refused: ...and says retrying is not free, without a figure",
               "tries are limited" in _text
               and "allowance" not in _text.lower())
@@ -811,7 +818,12 @@ import threading as _th2
 
 def _wedge_pager(fail_on):
     p = pg.Pager.__new__(pg.Pager)
-    p.proxies, p.token, p.key = {"http": "x"}, "T", {}
+    # A REAL PAIRING SECRET: start_job now derives the wire's owner token
+    # (owner_token -> _owner_key) from it BEFORE the state write it is guarding,
+    # so a Pager with no usable secret raises there instead of exercising the
+    # release guard this block is about. The wedge is the state write, not the
+    # key.
+    p.proxies, p.token, p.key = {"http": "x"}, "T", {"secret": "11" * 32}
     p.args = types.SimpleNamespace()
     p.allow, p.ignored, p.convos = {111}, 0, {}
     p.allow_users, p.handle_owner, p.handle_job = set(), {}, {}
@@ -1071,6 +1083,8 @@ _said = []
 _wp = pg.Pager.__new__(pg.Pager)
 _wp.args = types.SimpleNamespace(no_jitter=False)
 _wp.spenders = 1
+# start_job now stamps the wire's owner token, derived from a real secret.
+_wp.key = {"secret": "11" * 32}
 _wp.limits = types.SimpleNamespace(why_not=lambda: "", record=lambda: None)
 _wp.send = lambda cid, t, buttons=None: (_said.append((cid, t)), True)[1]
 _saved_thread = threading.Thread
@@ -1255,10 +1269,20 @@ check("status: ...and says which of the three gates it is, since this is the "
 # THE SAME PAGER REALLY DOES REFUSE THE WORK, so this is not a warning about
 # a condition that would have been fine.
 _sp4.send = lambda c, t, buttons=None: (_ss4.append(t), True)[1]
-_sp4.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
-check("status: NON-VACUITY -- and start_job on that same pager refuses too, "
-      "so the answer matched what would actually have happened",
-      "more than one person" in _ss4[-1] and len(_ss4) == 2)
+# CAUGHT, NOT CRASHED. With the gate deleted this harness pager goes on to
+# start a wake it has no doorbell for and raises; a suite that dies there
+# scores NO-RESULT in the mutation sweep, which proves nothing. The
+# exception becomes a failing check with its own words instead.
+_sp4_raised = ""
+try:
+    _sp4.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
+except BaseException as _e:                                  # noqa: BLE001
+    _sp4_raised = type(_e).__name__
+check(f"status: NON-VACUITY -- and start_job on that same pager refuses too, "
+      f"so the answer matched what would actually have happened"
+      f"{' (raised ' + _sp4_raised + ')' if _sp4_raised else ''}",
+      _sp4_raised == "" and _ss4 and "more than one person" in _ss4[-1]
+      and len(_ss4) == 2)
 # NON-VACUITY: one spender and everything else equal still answers ready, so
 # this reads the count and not something else.
 _sp5, _ss5 = _plain_pager(spenders=1)
@@ -1388,7 +1412,7 @@ check("help: NON-VACUITY -- with no argument they ask handle() what is "
       and pg.parse_command("/wait")[2] == "whats_running")
 check("help: ...and a malformed one is refused in words, naming the shape",
       "confirmation number" in pg.parse_command("/check ZZZZ")[2]
-      and "A3F1-9C2B7E" in pg.parse_command("/check ZZZZ")[2])
+      and "A3F1-9C2B7E01" in pg.parse_command("/check ZZZZ")[2])
 # THE WORD "handle" IS THE MACHINE'S, and it does not belong in a reply.
 for _bad in ("/check", "/wait", "/check ZZZZ", "/wait nope"):
     check(f"help: {_bad!r} answers without the word 'handle'",
@@ -1530,6 +1554,10 @@ class _PubPager:
         self.proxies = {}
         self.token = "123456:TOKEN"
         self._answer = answer
+        # publish_commands now EMPTIES THE DEFAULT SCOPE, then sets the list
+        # once per allowlisted chat with a per-chat scope, so a stranger who
+        # opens the bot is served no menu at all. It reads self.allow.
+        self.allow = {111, 222}
 
     _url = pg.Pager._url
     publish_commands = pg.Pager.publish_commands
@@ -1541,7 +1569,21 @@ try:
                                            {"ok": True})[1]
     _ok = _PubPager(True).publish_commands()
     check("menu: the pager publishes its command list on start", _ok)
-    _url, _data = _pub[0]
+    # THE DEFAULT SCOPE IS EMPTIED FIRST. Telegram serves the default menu to
+    # anyone who opens the bot; deleting it is what keeps the arrangement off a
+    # stranger's screen. Then setMyCommands is called once per allowlisted chat.
+    check("menu: ...emptying the default scope before any is set",
+          _pub[0][0].endswith("/deleteMyCommands"))
+    _sets = [(u, d) for u, d in _pub if u.endswith("/setMyCommands")]
+    check("menu: ...to setMyCommands, once per allowlisted chat",
+          len(_sets) == 2)
+    # EACH IS SCOPED TO ONE CHAT, never the default, and the chats are exactly
+    # the allowlist.
+    check("menu: ...each carrying a per-chat scope for an allowlisted chat",
+          all(json.loads(_d["scope"]).get("type") == "chat" for _u, _d in _sets)
+          and {json.loads(_d["scope"]).get("chat_id") for _u, _d in _sets}
+              == {111, 222})
+    _url, _data = _sets[0]
     check("menu: ...to setMyCommands", _url.endswith("/setMyCommands"))
     _cmds = json.loads(_data["commands"])
     check("menu: ...carrying every command it advertises",
@@ -1692,8 +1734,11 @@ for _u, _txt in _UNITS.items():
                   for w in ("ghostspiral", "gs_", "pager", "doorbell",
                             "telegram", "wake", "vault")))
     # A CEILING, because the drift was length rather than a forbidden word.
-    check(f"card: {_u} is under 110 lines ({len(_txt.splitlines())})",
-          len(_txt.splitlines()) <= 110)
+    # Raised from 110 to 115 when the pager unit gained a paragraph on what
+    # imaging the card reveals (the toolchain runs FROM it) -- legitimate OPSEC
+    # content, not a restatement of the wake budget the check below still bars.
+    check(f"card: {_u} is under 115 lines ({len(_txt.splitlines())})",
+          len(_txt.splitlines()) <= 115)
     check(f"card: {_u} does not restate the wake budget or the threat model",
           not any(w in _txt.lower()
                   for w in ("24 h wake", "24h wake", "wake budget",
@@ -2069,7 +2114,11 @@ import threading as _th4
 
 def _room_pager(allow, users):
     p = pg.Pager.__new__(pg.Pager)
-    p.proxies, p.token, p.key = {"http": "x"}, "T", {}
+    # A REAL PAIRING SECRET: any path that reaches start_job (or begin_convo's
+    # inflight bookkeeping) now derives the wire's owner token from it, and a
+    # Pager with no usable secret is refused there. Harnesses that drive the
+    # real start_job (see _chain_run) need it; the rest are unaffected by it.
+    p.proxies, p.token, p.key = {"http": "x"}, "T", {"secret": "11" * 32}
     p.args = _ty4.SimpleNamespace()
     p.allow, p.ignored, p.convos = set(allow), 0, {}
     p.allow_users, p.handle_owner, p.handle_job = set(users), {}, {}
@@ -2583,16 +2632,28 @@ _sd_src = _SRC_PG_EARLY.split(
 check("shutdown: the mid-wake branch also tells the CHAT, not only a stdout "
       "the shipped unit sets to null",
       "self.send(_cid," in _sd_src)
-check("shutdown: ...to every allowlisted chat, since nothing here records "
-      "which one started the job", "for _cid in sorted(self.allow):" in _sd_src)
+# TO THE CHAT WHOSE JOB IT IS, which this process now knows: _running is set at
+# start and cleared by the worker's finally. Only when that is unknown does it
+# fall back to every allowlisted chat -- telling other people a run is in
+# flight is the thing that fallback exists to avoid unless there is no choice.
+check("shutdown: ...to the chat whose job it is, falling back to every "
+      "allowlisted chat only when that is unknown",
+      "[self._running] if self._running in self.allow" in _sd_src
+      and "else sorted(self.allow)" in _sd_src
+      and "for _cid in _to:" in _sd_src)
 check("shutdown: ...and says the job keeps going but its result is lost",
       "keeps going" in _sd_src and "not be told how it" in _sd_src)
-check("shutdown: ...and sends them to the machine rather than to a retry",
-      "CHECK AT THE MACHINE" in _sd_src)
+# NOT "AT THE MACHINE": a client is not standing at the vault, so the reply
+# tells them to check before starting another rather than to go somewhere they
+# cannot reach.
+check("shutdown: ...and steers them to check before a second start, without "
+      "naming a machine the chat cannot go to",
+      "Check before starting another." in _sd_src
+      and "AT THE MACHINE" not in _sd_src)
 check("shutdown: ...inside a bare except, so a dead circuit at shutdown does "
       "not turn stopping into a traceback",
       "except Exception:" in _sd_src and _sd_src.index("try:")
-      < _sd_src.index("for _cid in sorted(self.allow):"))
+      < _sd_src.index("for _cid in _to:"))
 check("shutdown: NON-VACUITY -- the prints are kept for the by-hand case, "
       "which is the one surface that DOES show them",
       "Shutdown requested WHILE A WAKE IS IN FLIGHT" in _sd_src)
@@ -2852,9 +2913,12 @@ check("chain/interrupted: ...and every leg reports the same short way, with "
       "no leg number and no reason",
       [t for t in _mi if t.startswith("withdraw: sent")][:3]
       == ["withdraw: sent.\nAnother is starting."] * 3)
+# THE MINE ANSWER, because the tap is from the same chat whose withdrawal is
+# running: _busy_answer(cid) returns BUSY_ANSWER_MINE when self._running == cid
+# (and the plain BUSY_ANSWER, a formatted "busy for about T", only to others).
 check("chain/interrupted: ...and the taps really were refused, so this is the "
       "refused-start path and not a quiet no-op",
-      sum(t == pg.BUSY_ANSWER for t in _mi) >= pg.Pager.MAX_CHAIN_LEGS)
+      sum(t == pg.BUSY_ANSWER_MINE for t in _mi) >= pg.Pager.MAX_CHAIN_LEGS)
 # NON-VACUITY: the same wallet with no interruption stops at the cap too, so
 # the check above is about the interruption and not about a chain that always
 # stops at six whatever happens.
@@ -2892,7 +2956,9 @@ check("chain: the leg number is carried by start_job, not by the slot the "
 # AND IT IS ARMED ONLY AFTER THE REPORT LANDS. If the completion could not be
 # delivered, the operator does not know a leg finished -- and starting another
 # one silently is the worst thing this could do.
-_arm = _SRC_PG_EARLY.split('integrity_log("pager", "withdraw_result_undelivered")')[1]
+# THE CHAIN KINDS ARE JOB-AGNOSTIC NOW: the undeliverable-result kind dropped
+# its "withdraw_" prefix (see the list at the top of _worker).
+_arm = _SRC_PG_EARLY.split('integrity_log("pager", "result_undelivered")')[1]
 check("chain: the next leg is armed below the report, not instead of it",
       _arm.index("self._chain = (chat_id") > 0)
 
@@ -3468,29 +3534,38 @@ try:
 
     _K = ["--key", "/nonexistent.key"]
     _two = _boot(_K + ["--chat-id", "111", "--chat-id", "222"])
-    check("pot: two allowlisted people is REFUSED at startup",
-          "spend from ONE wallet" in _two)
-    check("pot: ...and the refusal names what actually happens — the largest "
-          "balance, whoever put it there",
-          "LARGEST unlocked balance" in _two)
-    check("pot: ...with the driven figures, not an abstraction",
-          "1000 XMR" in _two and "300" in _two)
-    # THE REFUSAL IS UNCONDITIONAL, AND THAT IS THE FINDING.
+    # SEVERAL PEOPLE IS NOW A CHOICE THE OPERATOR SIZES FOR, not a wall.
+    # main() refuses more than one allowlisted spender only while --max-clients
+    # is its default of 1; the refusal names the flag that lifts it and the
+    # setup that has to agree first. The old design refused unconditionally and
+    # this block asserted that; the deliberate change made the refusal
+    # conditional, so the expectations move with it.
+    check("pot: two allowlisted people is REFUSED at startup while "
+          "--max-clients is 1",
+          "--max-clients is 1. Refusing." in _two)
+    check("pot: ...and the refusal names what makes several people safe or not "
+          "— a ledger that keeps each owner's money apart",
+          "keeps their money apart by owner" in _two)
+    check("pot: ...and names the rest of the setup that must agree, with the "
+          "doc that covers it",
+          "private chats for each" in _two and "OPSEC_SETUP.md 4f" in _two)
+    # --max-clients IS THE OVERRIDE, AND --shared-funds NEVER WAS ONE.
     #
-    # The first version of this offered --shared-funds: an acknowledgement the
-    # operator passes to say they understand. Wrong shape for a consent gate.
-    # The person who types the flag is the OPERATOR; the person who loses
-    # money is the other user, who never saw it, was never asked, and cannot
-    # find out it was passed. Consent by one party to a harm landing on a
-    # second party is not consent, it is a switch for silencing a warning.
-    check("pot: there is NO override flag — an operator cannot consent on "
+    # The first version offered --shared-funds: an acknowledgement the operator
+    # passes to say they understand. Wrong shape for a consent gate -- the
+    # person who types it is the OPERATOR; the person who loses money is the
+    # other user, who never saw it. That flag is still gone. What replaced the
+    # unconditional wall is --max-clients N: not consent on another's behalf but
+    # the operator sizing the whole system (ceiling, budget, private chats) for
+    # a known number of people.
+    check("pot: there is NO --shared-funds flag — an operator cannot consent on "
           "another person's behalf",
           "--shared-funds" not in _two and "shared_funds" not in _two)
-    check("pot: ...and the refusal says so, rather than leaving the operator "
-          "hunting for the flag that turns it off",
-          "NO FLAG TO OVERRIDE" in _two)
-    check("pot: ...and says what to do instead",
-          "own vault" in _two and "own bot" in _two)
+    check("pot: ...and the refusal names the flag that DOES lift it, so the "
+          "operator is not left hunting",
+          "Pass --max-clients N" in _two)
+    check("pot: ...and says what that flag commits them to sizing",
+          "account ceiling and wake budget sized for the number" in _two)
     # AND THE "SEVERAL DEVICES" JUSTIFICATION IS CORRECTED, because it was
     # never true: Telegram gives one ACCOUNT one chat with a given bot,
     # whatever it is signed in on. A second --chat-id is a second account.
@@ -3501,7 +3576,7 @@ try:
     _grp = _boot(_K + ["--chat-id", "-100123", "--user-id", "4242",
                        "--user-id", "777001"])
     check("pot: two allowlisted SENDERS in one group is refused too",
-          "spend from ONE wallet" in _grp)
+          "--max-clients is 1. Refusing." in _grp)
     # THE FLAG IS GONE FROM THE PARSER, not merely ignored -- an operator who
     # learned it must be told, not silently allowed.
     _opts = {a for _act in pg.build_cli()._actions
@@ -3522,9 +3597,12 @@ try:
             (_K + ["--chat-id", "111", "--chat-id", "111"],
              "the same chat id twice — one person, deduplicated"),
             (_K + ["--chat-id", "-100123", "--user-id", "4242"],
-             "a group with one allowlisted sender")):
+             "a group with one allowlisted sender"),
+            (_K + ["--chat-id", "111", "--chat-id", "222", "--max-clients", "2"],
+             "two private chats WITH --max-clients 2, the override that lifts "
+             "the wall")):
         check(f"pot: NON-VACUITY -- {_label} still starts",
-              "spend from ONE wallet" not in _boot(_argv))
+              "--max-clients is 1. Refusing." not in _boot(_argv))
 finally:
     (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
      pg.load_token) = _saved_m
@@ -4210,9 +4288,12 @@ check("chain: the next leg is started with the lock still held, and the "
       "lock is released only when there is no next leg",
       "held=True" in _hand
       and "if not _next:\n                self.busy.release()" in _hand)
+# THREE REFUSAL PATHS NOW, not two: the multi-spender check, the rate/restart
+# hold, and the new at-capacity refusal (refused_full, from _full_for) all
+# return before starting a thread, and each hands a held lock back.
 check("chain: ...and start_job gives a held lock back on every refusal path "
       "that does not start a thread",
-      _SRC_PG_EARLY.count("if held:\n                self._drop_busy()") == 2
+      _SRC_PG_EARLY.count("if held:\n                self._drop_busy()") == 3
       and "if not held and not self.busy.acquire(blocking=False):"
       in _SRC_PG_EARLY)
 _hb, _hbs = _room_pager([111], [])

@@ -251,8 +251,13 @@ os.chdir(_bay)
 try:
     print("== receive_and_quote, both halves, real HTTP ==")
     _cinfo = {}
+    # THE OWNER RIDES EVERY NOTE (wire v3): the pager stamps it in start_job
+    # and a hand-poked job gets the host's; a caller that sends none is
+    # refused by the vault, which is the fail-closed answer this test is not
+    # about. So the cycle carries one, the way every real caller does.
     p1, out1, err1, ran1, text1 = cycle("receive_and_quote",
-                                        {"amount_sat": 5000000}, _bay,
+                                        {"amount_sat": 5000000,
+                                         "owner": "0123456789abcdef"}, _bay,
                                         info_out=_cinfo)
     check("the two boxes showed the SAME pairing code, and it is the one the "
           "operator compares",
@@ -376,6 +381,14 @@ try:
 
 
     print("\n== the doorbell's queue depth is one, over the wire ==")
+    # AT THE STOCK CEILING ONE DEPOSIT IN FLIGHT IS THE CAPACITY (OPSEC_SETUP
+    # 4f), and the cycle above admitted one. Retire it as paid out, the way a
+    # finished withdrawal does, so the boot below is judged on the queue and
+    # not refused at the vault's reserve gate.
+    _led0 = A._load_ledger(_bay)
+    for _rec0 in _led0["handles"].values():
+        _rec0["spent"] = True
+    A._save_handles(_bay, _led0["handles"], _led0["owners"])
     # The first boot's M3 is DROPPED on the floor here, deliberately, for two
     # reasons at once: it keeps the doorbell listening (a result ends its
     # window, and then a second boot would meet a closed socket and report
@@ -397,7 +410,9 @@ try:
         # so the doorbell never bound and the agent's own refusal was the
         # first sign anything was wrong.
         hold["p"] = DB.run_wake(types.SimpleNamespace(no_jitter=True), pi2,
-                                "receive_and_quote", {"amount_sat": 5000000},
+                                "receive_and_quote",
+                                {"amount_sat": 5000000,
+                                 "owner": "0123456789abcdef"},
                                 sock_factory=lambda: FakeWOL(),
                                 sleep=lambda s: time.sleep(0.02),
                                 clock=lambda: _clk[0])

@@ -809,7 +809,7 @@ check("withdraw: ...and does NOT imply nothing was spent, because a run that "
       "may already have moved" in _mw[0]
       and "nothing was spent" not in _mw[0].lower())
 check("withdraw: ...and says to check the balance before running it again",
-      "CHECK THE BALANCE" in _mw[0])
+      "CHECK YOUR DESTINATION" in _mw[0])
 check("withdraw: ...and still says it failed, rather than burying that",
       "failed" in _mw[0])
 # A HINT, NOT A DIAGNOSIS. This box has never been told a balance and must not

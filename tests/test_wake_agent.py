@@ -93,6 +93,23 @@ XMR = ("44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaB"
 TP = NP.PrivateKey.generate()
 PI = NP.PrivateKey.generate()
 
+#: A 16-lowercase-hex owner token (P.OWNER_RE / gs_telegram_pager.owner_token).
+#: EVERY job schema now carries a mandatory "owner" field, so every M2 body a
+#: test seals -- and every params dict the doorbell will hand back -- has to
+#: include one, or validate_job refuses the note with "missing ['owner']".
+OWNER = "0123456789abcdef"
+
+
+def with_owner(params):
+    """A note's params with the mandatory owner filled in if it is missing.
+
+    The owner is part of the wire now; a fixture that omits it is testing a
+    note shape the vault refuses outright, not the field the fixture is about.
+    """
+    if isinstance(params, dict) and "owner" not in params:
+        params = dict(params, owner=OWNER)
+    return params
+
 
 def new_env(job="receive_and_quote", params=None):
     """A scratch vault: keyfile, artifact dir, and a doorbell holding one job."""
@@ -113,7 +130,9 @@ def new_env(job="receive_and_quote", params=None):
     os.chmod(kf, 0o400)
     bell = DB.Pending({"secret": PI.encode().hex(),
                        "peer_public": TP.public_key.encode().hex()},
-                      job, params if params is not None else {"amount_sat": 5000000},
+                      job,
+                      with_owner(params if params is not None
+                                 else {"amount_sat": 5000000}),
                       clock=lambda: 0.0)
     return d, kf, key, bell
 
@@ -239,7 +258,7 @@ check("the amount is a bounded satoshi count on the wire",
 # the note is the only thing an attacker writes, so what happens when the
 # thing they write is an address?
 d2, kf2, key2, bell2 = new_env()
-bell2.params = {"amount_sat": XMR}
+bell2.params = {"amount_sat": XMR, "owner": OWNER}
 dp2 = deps_for(d2, bell2)
 out2, err2, _t = run(kf2, dp2)
 check("a note whose amount is an ADDRESS is refused outright",
@@ -254,8 +273,10 @@ for bad in ("--tor-proxy", "socks5h://10.0.0.9:9050", "--allow-unbound-memo",
             "--outfile", "/srv/x.json", "; rm -rf ~", "../../etc/passwd",
             "--rpc", "--dests", XMR):
     d3, kf3, _k, bell3 = new_env()
-    # A doorbell that has been told to send a flag-shaped value.
-    bell3.params = {"amount_sat": bad}
+    # A doorbell that has been told to send a flag-shaped value. The owner is
+    # present and well-formed, so the refusal is about the flag-shaped amount
+    # and not about a missing wire field.
+    bell3.params = {"amount_sat": bad, "owner": OWNER}
     out3, err3, _t = run(kf3, deps_for(d3, bell3))
     check(f"a note carrying {bad[:20]!r} is refused",
           out3 is None and err3 is not None)
@@ -386,7 +407,8 @@ def _static_m2(url, path, rec, timeout=30):
         return 200, P.seal(PI, TP.public_key, P.TAG_M2,
                            {"job_id": P.new_job_id(),
                             "challenge": body["challenge"],
-                            "job": "receive_and_quote", "amount_sat": 5000000})
+                            "job": "receive_and_quote", "amount_sat": 5000000,
+                            "owner": OWNER})
     return 200, b""
 
 
@@ -408,7 +430,8 @@ def _wrong_chal(url, path, rec, timeout=30):
         return 200, P.seal(PI, eph, P.TAG_M2,
                            {"job_id": P.new_job_id(),
                             "challenge": P.new_challenge().hex(),
-                            "job": "receive_and_quote", "amount_sat": 5000000})
+                            "job": "receive_and_quote", "amount_sat": 5000000,
+                            "owner": OWNER})
     return 200, b""
 
 
@@ -438,7 +461,8 @@ first = json.loads((d12 / "gs_wake_state.json").read_text())["jobs"][0]["id"]
 # A doorbell (buggy or compromised) re-issuing the SAME job_id on a later boot.
 bell13 = DB.Pending({"secret": PI.encode().hex(),
                      "peer_public": TP.public_key.encode().hex()},
-                    "receive_and_quote", {"amount_sat": 5000000}, clock=lambda: 0.0)
+                    "receive_and_quote", {"amount_sat": 5000000, "owner": OWNER},
+                    clock=lambda: 0.0)
 bell13.job_id = first
 out13, err13, _t = run(kf12, deps_for(d12, bell13))
 check("the same job_id on a later boot is REFUSED — a second slip would "
@@ -780,7 +804,9 @@ try:
     outh1, errh1, _t = run(kfh1, deps_for(dh1, bellh1))
 finally:
     A.proto.new_handle = _saved_nh
-_recs = json.loads((dh1 / A.HANDLES_FILE).read_text())
+# The handles file is an ENVELOPE now -- {"handles": {...}, "owners": {...}} --
+# so the records are indexed one level in.
+_recs = json.loads((dh1 / A.HANDLES_FILE).read_text())["handles"]
 check("a handle that is already taken is REDRAWN, not reused",
       outh1 and outh1[2] == "BBBB")
 check("...and the record it would have overwritten is untouched",
@@ -809,7 +835,7 @@ _big = {f"{i:04X}": {"bundle": None, "minted": 0, "slip": None}
         for i in range(A.MAX_HANDLES + 250)}
 _bd = Path(tempfile.mkdtemp(prefix="wakeh_"))
 A._save_handles(_bd, _big)
-_back = json.loads((_bd / A.HANDLES_FILE).read_text())
+_back = json.loads((_bd / A.HANDLES_FILE).read_text())["handles"]
 check(f"the handles file is capped at {A.MAX_HANDLES}",
       len(_back) == A.MAX_HANDLES)
 check("...and it is the MOST RECENT that survive, not an arbitrary slice",
@@ -1181,7 +1207,7 @@ def _quote_fails(argv, env_extra, budget):
 
 dpw4 = deps_for(dw4, bellw4, run_child=_quote_fails)
 outw4, errw4, _t = run(kfw4, dpw4)
-_rec4 = json.loads((dw4 / A.HANDLES_FILE).read_text())[outw4[2]]
+_rec4 = json.loads((dw4 / A.HANDLES_FILE).read_text())["handles"][outw4[2]]
 check("a failed quote step does NOT leave a slip path that was never written",
       outw4[1] == "failed" and _rec4["slip"] is None
       and _rec4["bundle"].endswith("wallet_recv_1.json"))
@@ -1256,9 +1282,23 @@ check("NON-VACUITY -- a mix argv really was composed for the spending job",
 print("\n== the address the child is handed ==")
 _seen = []
 
+# A DONE WITHDRAWAL NOW SHREDS ITS OWN wallet_withdraw_*.json ENTRY BUNDLE (see
+# _dispatch's done branch, _retire_files / secure_delete_or_warn). The child
+# runs -- and so this capture fires -- while that file still exists, so snapshot
+# it here, preserving the basename and the 0600 mode, and read the copy below.
+_snap_dir = Path(tempfile.mkdtemp(prefix="wsnap_"))
+_wd_snap = {}
+
 
 def _capture(argv, env_extra, budget_s):
     _seen.append((list(argv), dict(env_extra or {})))
+    for _a in argv:
+        _b = os.path.basename(str(_a))
+        if _b.startswith("wallet_withdraw_") and _b.endswith(".json") \
+                and os.path.isfile(_a):
+            _dst = _snap_dir / _b
+            shutil.copy2(_a, _dst)
+            _wd_snap[str(_a)] = str(_dst)
     return 0, False
 
 
@@ -1318,7 +1358,7 @@ try:
         A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
                     _k, _ld, "C4D5", _lrun, "job-w",
                     funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000))
-    _ld_h = json.loads((_ld / A.HANDLES_FILE).read_text())
+    _ld_h = json.loads((_ld / A.HANDLES_FILE).read_text())["handles"]
     check("ledger: a finished withdrawal marks the handle whose receive "
           "subaddress it spent, and no other",
           _ld_h["A3F1"].get("spent") is True
@@ -1355,7 +1395,8 @@ finally:
 check("ledger: a withdrawal that FAILED marks nothing spent -- the money may "
       "still be there, and 'moved' about it would be the lie the other way",
       _ldf_out[1] == "failed"
-      and "spent" not in json.loads((_ldf / A.HANDLES_FILE).read_text())["A3F1"])
+      and "spent" not in json.loads(
+          (_ldf / A.HANDLES_FILE).read_text())["handles"]["A3F1"])
 
 # ---- A MINTED-BUT-NEVER-QUOTED ADDRESS IS THE NEXT DEPOSIT'S -------------
 #
@@ -1373,7 +1414,7 @@ def _reuse_env(prefix, acct=7, sub=2, new_pair=(8, 1)):
                               "subaddress_index": sub,
                               "rpc_endpoint": "http://127.0.0.1:18083"}))
     (_d / A.HANDLES_FILE).write_text(json.dumps(
-        {"OLD1": {"bundle": str(_b), "slip": None, "minted": 1}}))
+        {"A01D": {"bundle": str(_b), "slip": None, "minted": 1}}))
     _runs = []
 
     def _runner(argv, env_extra, budget_s):
@@ -1394,39 +1435,39 @@ try:
     A.integrity_log = lambda st, kind, *a, **k: _r_log.append(kind)
     with contextlib.redirect_stdout(io.StringIO()):
         _r_out = A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                             _k, _rd, "NEW1", _rrun, "job-r",
+                             _k, _rd, "B0E1", _rrun, "job-r",
                              reuse_balance=lambda k, a, s: 0)
 finally:
     A.integrity_log = _saved_il_ld
-_r_h = json.loads((_rd / A.HANDLES_FILE).read_text())
+_r_h = json.loads((_rd / A.HANDLES_FILE).read_text())["handles"]
 check("reuse: a record with a bundle, no slip and a wallet that says the "
       "subaddress holds nothing is taken by the next deposit -- no mint, one "
       "child (the quote), aimed at the old bundle",
       _r_out[:2] == ("done", "done") and len(_rruns) == 1
       and "thor_swap_preparer" in " ".join(_rruns[0])
       and str(_rb) in _rruns[0]
-      and _r_h["NEW1"]["bundle"] == str(_rb) and "OLD1" not in _r_h
+      and _r_h["B0E1"]["bundle"] == str(_rb) and "A01D" not in _r_h
       and "receive_bundle_reused" in _r_log)
 _rd2, _rb2, _rruns2, _rrun2 = _reuse_env("reuse2_")
 try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
         A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                    _k, _rd2, "NEW1", _rrun2, "job-r2",
+                    _k, _rd2, "B0E1", _rrun2, "job-r2",
                     reuse_balance=lambda k, a, s: 1)
 finally:
     A.integrity_log = _saved_il_ld
 check("reuse: ...but an address the wallet says has been paid -- or cannot "
       "be asked about -- is left alone and a fresh one is minted",
       len(_rruns2) == 2 and "create_receive_wallet" in " ".join(_rruns2[0])
-      and json.loads((_rd2 / A.HANDLES_FILE).read_text())["NEW1"]["bundle"]
-      .endswith("wallet_new.json"))
+      and json.loads((_rd2 / A.HANDLES_FILE).read_text())["handles"]["B0E1"]
+      ["bundle"].endswith("wallet_new.json"))
 _rd3, _rb3, _rruns3, _rrun3 = _reuse_env("reuse3_")
 try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
         A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                    _k, _rd3, "NEW1", _rrun3, "job-r3",
+                    _k, _rd3, "B0E1", _rrun3, "job-r3",
                     reuse_balance=lambda k, a, s: None)
 finally:
     A.integrity_log = _saved_il_ld
@@ -1440,7 +1481,7 @@ try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
         A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                    _k, _rd4, "NEW1", _rrun4, "job-r4",
+                    _k, _rd4, "B0E1", _rrun4, "job-r4",
                     reuse_balance=lambda k, a, s: 1)
     _r4 = None
 except A.Refused as _e:
@@ -1711,8 +1752,10 @@ check("dispatch: the argv names the mix and the bundle the VAULT found",
 # account the vault found -- not at a subaddress this job minted. Minting one
 # would be a second account for the wipe to miss and a second address for
 # nothing; the money is already somewhere.
-_bp = [a for a in _wargv
-       if os.path.basename(a).startswith("wallet_withdraw_")][0]
+_bp_orig = [a for a in _wargv
+            if os.path.basename(a).startswith("wallet_withdraw_")][0]
+# The original is shredded by the done withdrawal; read the capture-time copy.
+_bp = _wd_snap.get(_bp_orig, _bp_orig)
 _bundle_json = json.loads(open(_bp, encoding="utf-8").read())
 check("dispatch: the pointer names the account the wallet reported funded",
       _bundle_json["account_index"] == 9
@@ -2096,23 +2139,26 @@ try:
             # today's 0.0121; the chain chasing 0.04 XMR is now correct.
             ("a desk-minted 1.1% cut on a 0.5 XMR deposit", 5_500_000_000, ""),
             ("dust", 100_000_000, "")):
-        A._funded_entry = (lambda _a: (lambda k, injected=None:
+        # _phase_of asks _funded_entry over the owner's accounts now, so the
+        # stub takes owned_accounts (see _funded_entry's new signature).
+        A._funded_entry = (lambda _a: (lambda k, injected=None, rpc_url=None,
+                                       owned_accounts=None:
                                        (7, 1, "4x", _a)))(_atomic)
         _got = A._phase_of("withdraw", None, key=_ml_key, status="done")
         check(f"chain: {_lbl} -> {_want!r}", _got == _want)
     # THE FLOOR IS THE ONE THE DEPOSIT GATE USES, by the same predicate, so a
     # deposit this tool agreed to take is a deposit the chain will follow.
-    A._funded_entry = lambda k, injected=None: (
+    A._funded_entry = lambda k, injected=None, rpc_url=None, owned_accounts=None: (
         7, 1, "4x", int(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
                         * _GS.Decimal(10 ** 12)))
     check("chain: exactly the floor still counts as more, so the gate is >= "
           "and not >",
           A._phase_of("withdraw", None, key=_ml_key, status="done")
           == "more_left")
-    A._funded_entry = lambda k, injected=None: (
+    A._funded_entry = lambda k, injected=None, rpc_url=None, owned_accounts=None: (
         7, 1, "4x", int(_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
                         * _GS.Decimal(10 ** 12)) - 1)
-    check("chain: one piconero under it does not", 
+    check("chain: one piconero under it does not",
           A._phase_of("withdraw", None, key=_ml_key, status="done") == "")
     # AND A KEYFILE THAT TAKES A CUT USES THE SAME FLOOR, which is the fix to
     # my own first version: it used the higher with-cut figure there and so
@@ -2122,7 +2168,8 @@ try:
     _between = int((_GS.Decimal(P.MIX_MINIMUM_XMR_MIRROR)
                     + _GS.Decimal(P.MIX_MINIMUM_XMR_WITH_CUT_MIRROR))
                    / 2 * _GS.Decimal(10 ** 12))
-    A._funded_entry = lambda k, injected=None: (7, 1, "4x", _between)
+    A._funded_entry = lambda k, injected=None, rpc_url=None, \
+        owned_accounts=None: (7, 1, "4x", _between)
     for _lbl2, _k2 in (("without a fee destination", _ml_key),
                        ("WITH one", _ml_fee)):
         check(f"chain: an arrival between the two figures is 'more' "
@@ -2137,19 +2184,21 @@ try:
     # its locked value says nothing rather than "more".
     _ml_locked_saved = A._locked_value
     try:
-        A._funded_entry = lambda k, injected=None: None
+        A._funded_entry = lambda k, injected=None, rpc_url=None, \
+            owned_accounts=None: None
         for _lbl3, _locked, _want3 in (
                 ("half an XMR still unlocking", _GS.Decimal("0.5"),
                  "more_locked"),
                 ("locked dust", _GS.Decimal("0.001"), ""),
                 ("a wallet that could not be asked", None, "")):
             A._locked_value = (lambda _v: (lambda k, injected=None,
-                                           rpc_url=None: _v))(_locked)
+                                           rpc_url=None,
+                                           owned_accounts=None: _v))(_locked)
             check(f"chain: nothing unlocked and {_lbl3} -> {_want3!r}",
                   A._phase_of("withdraw", None, key=_ml_key, status="done")
                   == _want3)
-        A._locked_value = lambda k, injected=None, rpc_url=None: (
-            _GS.Decimal("0.5"))
+        A._locked_value = lambda k, injected=None, rpc_url=None, \
+            owned_accounts=None: (_GS.Decimal("0.5"))
         check("chain: ...and a run that did not finish never says more is "
               "locked either",
               A._phase_of("withdraw", None, key=_ml_key, status="failed") == "")
@@ -3312,15 +3361,19 @@ check("bound: ...and the fan-out's change rests in that same account",
 _CRW = open(os.path.join(REPO, "create_receive_wallet"), encoding="utf-8").read()
 check("bound: each receive gets its OWN account, so deposits do not pool",
       "create_fresh_account" in _CRW)
-# WHERE IT GOES AND HOW DEEP, and nothing else. No handle to remember and no
-# account index for a chat message to name -- the vault finds its own funded
-# output. `depth` joined this list because a single pinned hop count was a
-# floor on what could be withdrawn at all (the mix minimum rises with the hop
-# count), and it is safe to add precisely because it names a row of a closed
-# table rather than a quantity.
+# WHERE IT GOES AND HOW DEEP, and nothing else the CALLER chooses. No handle to
+# remember and no account index for a chat message to name -- the vault finds
+# its own funded output. `depth` joined this list because a single pinned hop
+# count was a floor on what could be withdrawn at all (the mix minimum rises
+# with the hop count), and it is safe to add precisely because it names a row of
+# a closed table rather than a quantity. `owner` is set aside because it is the
+# mandatory wire field every job now carries (the pager signs it, not the
+# caller), so it says nothing about what the caller gets to decide.
 check("bound: the job carries a destination and a depth — no handle to "
       "remember, and no account for a chat message to name",
-      sorted(P.JOBS["withdraw"]["schema"]) == ["depth", "exit_to"])
+      sorted(set(P.JOBS["withdraw"]["schema"]) - {"owner"})
+      == ["depth", "exit_to"]
+      and "owner" in P.JOBS["withdraw"]["schema"])
 # NON-VACUITY: there is no AMOUNT field on the WITHDRAW path, so nothing lets
 # a caller ask for more than the wallet holds -- and nothing lets them ask for
 # less either, which is worth knowing. The deposit path does carry one, which
@@ -4102,6 +4155,11 @@ try:
     _sw_dir = Path(tempfile.mkdtemp(prefix="feesweep_"))
 
     _armed_log = []
+    # A DONE fee sweep now SHREDS its wallet_feesweep.json entry bundle (see
+    # run_fee_sweep's done branch). The child runs while it still exists, so
+    # snapshot it from the injected runner, preserving name and 0600 mode.
+    _fee_snap_dir = Path(tempfile.mkdtemp(prefix="feesnap_"))
+    _fee_snap = []
 
     def _sweep(entries, floor="0.0270", dry_run=False, key=None,
                clock_step=0, rc=0, deadman=True):
@@ -4120,10 +4178,19 @@ try:
         def _arm(seconds):
             _armed_log.append(int(seconds))
             return bool(deadman)
+
+        def _rc(argv, env, budget):
+            ran.append((list(argv), dict(env), budget))
+            for _a in argv:
+                if os.path.basename(str(_a)) == A.FEE_SWEEP_BUNDLE \
+                        and os.path.isfile(_a):
+                    _dst = _fee_snap_dir / A.FEE_SWEEP_BUNDLE
+                    shutil.copy2(_a, _dst)
+                    _fee_snap.append(str(_dst))
+            return (rc, False)
         deps = {"fee_entry": _entry, "live_floor": lambda k, w: floor,
                 "clock": _clock, "extend_deadman": _arm,
-                "run_child": lambda argv, env, budget: (
-                    ran.append((list(argv), dict(env), budget)), (rc, False))[1]}
+                "run_child": _rc}
         with contextlib.redirect_stdout(io.StringIO()) as _o:
             code = A.run_fee_sweep(key or _FS_KEY, _sw_dir, deps, dry_run)
         return code, ran, _o.getvalue()
@@ -4159,14 +4226,15 @@ try:
     check("sweep/run: a dry run, a wait and an empty wallet arm nothing -- "
           "nothing was going to spend",
           _armed_log == [])
+    # The done sweep shreds its bundle, so read the capture-time snapshot the
+    # runner took while the child was running (from _c1's done leg above).
+    _fee_bp = _fee_snap[-1]
     check("sweep/run: ...whose entry bundle names the fee wallet's output, "
           "mode 0600",
-          json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())["address"]
-          == _FS_ADDR
-          and json.loads((_sw_dir / A.FEE_SWEEP_BUNDLE).read_text())
-          ["rpc_endpoint"] == "http://127.0.0.1:18085"
-          and _stat_m.S_IMODE(os.stat(_sw_dir / A.FEE_SWEEP_BUNDLE).st_mode)
-          == 0o600)
+          json.loads(open(_fee_bp).read())["address"] == _FS_ADDR
+          and json.loads(open(_fee_bp).read())["rpc_endpoint"]
+          == "http://127.0.0.1:18085"
+          and _stat_m.S_IMODE(os.stat(_fee_bp).st_mode) == 0o600)
     # IT CHAINS: what a leg leaves behind is the next leg's entry, and a
     # later leg needs only the floor -- the threshold was the trigger.
     _c2, _r2, _o2 = _sweep([int(0.6 * _XMR), int(0.2 * _XMR), None])

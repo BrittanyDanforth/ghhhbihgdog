@@ -324,9 +324,12 @@ def _env():
     kf = d / "tp.key"
     kf.write_text(json.dumps(P.lock_keyfile(key, b"", role="thinkpad")))
     os.chmod(kf, 0o400)
+    # WITH THE OWNER the wire now demands on every note (the pager stamps
+    # it in start_job; a hand-poked job carries the host's).
     bell = DB.Pending({"secret": PI.encode().hex(),
                        "peer_public": TP.public_key.encode().hex()},
-                      "receive_and_quote", {"amount_sat": 5000000},
+                      "receive_and_quote", {"amount_sat": 5000000,
+                                            "owner": P.HOST_OWNER},
                       clock=lambda: 0.0)
     return d, kf, bell
 

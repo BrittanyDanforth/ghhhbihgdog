@@ -745,6 +745,39 @@ class Pending:
                 self.events.append("plain_carried")
 
 
+class _DeadlineReader:
+    """A read side that enforces one wall-clock deadline across every read.
+
+    Wraps the handler's buffered rfile: before each read the socket timeout
+    is set to whatever is left of the deadline, and once nothing is left the
+    read raises the same socket.timeout the per-recv bound would have, which
+    BaseHTTPRequestHandler already handles by closing the connection.
+    """
+
+    def __init__(self, raw, sock, deadline: float):
+        self._raw, self._sock, self._deadline = raw, sock, deadline
+
+    def _arm(self) -> None:
+        _left = self._deadline - time.monotonic()
+        if _left <= 0:
+            raise socket.timeout("connection deadline")
+        try:
+            self._sock.settimeout(min(_left, 20.0))
+        except OSError:
+            pass
+
+    def readline(self, *a, **k):
+        self._arm()
+        return self._raw.readline(*a, **k)
+
+    def read(self, *a, **k):
+        self._arm()
+        return self._raw.read(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 def make_handler(pending: Pending):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -754,6 +787,25 @@ def make_handler(pending: Pending):
         #: thread per connection, on a Pi with 1 GB of RAM and Tor resident.
         #: The real vault sends its one RECORD_LEN-byte record immediately.
         timeout = 20
+
+        #: ...AND A DEADLINE FOR THE WHOLE CONNECTION, which the timeout
+        #: above is not. socketserver applies `timeout` PER recv: a client
+        #: that sends one byte every nineteen seconds never trips it, and
+        #: eight of them hold every slot MAX_CONNECTIONS allows for the whole
+        #: ten-minute window. The real vault's /window POST is then refused
+        #: at the socket, it boots for nothing, and the operator reads "never
+        #: picked up" -- indistinguishable from a flaky network, repeatable
+        #: on every poke by anyone on the switch. The pairing path already
+        #: has this bound (PAIR_MSG_S) and the reasoning beside it; the wake
+        #: path did not. A real vault sends its one fixed-length record at
+        #: once, so a few seconds is generous.
+        CONNECTION_DEADLINE_S = 8
+
+        def setup(self):
+            super().setup()
+            self.rfile = _DeadlineReader(
+                self.rfile, self.connection,
+                time.monotonic() + self.CONNECTION_DEADLINE_S)
 
         #: EMPTY, deliberately. BaseHTTPRequestHandler's default is
         #: "BaseHTTP/0.6 Python/3.11.15", which it puts in a Server: header on
@@ -901,6 +953,10 @@ def read_job_from_stdin(stream=None) -> tuple:
             '    echo \'{"job":"receive_and_quote","amount_sat":5000000}\' | '
             'gs_doorbell wake --key /etc/gs_wake_pi.key')
     body = proto.parse_body(raw.encode() if isinstance(raw, str) else raw)
+    # A HAND-POKED JOB IS THE HOST'S OWN. There is no chat here to derive an
+    # owner from, so it is the fixed host owner unless the JSON names one.
+    if isinstance(body, dict) and "owner" not in body:
+        body["owner"] = proto.HOST_OWNER
     job = body.get("job")
     if not isinstance(job, str) or job not in proto.JOBS:
         # THE LIST, AND NOTHING ABOUT WHAT IS NOT ON IT. This used to end "It

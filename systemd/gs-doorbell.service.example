@@ -2,10 +2,13 @@
 #
 # WHY THIS FILE IS SHORT. It used to explain what the doorbell is, what a
 # trigger may and may not report, and which section of the design says so. All
-# true, and all of it sat permanently on the SD card of the box that is meant
-# to hold nothing -- readable by anyone who images that card, without running
-# anything. The reasoning is in OPSEC_SETUP.md and in gs_doorbell's own
-# docstring, on the machine that has the source.
+# true, and none of it needs to be here twice. Be honest about what the card
+# carries, though: gs_doorbell and gs_wake_proto run FROM this card, docstrings
+# and all, so anyone who images it identifies the toolchain by construction.
+# What the card must not carry is anything about a client -- an address, an
+# amount, a label, a timetable -- and that is what the rest of this file and
+# OPSEC_SETUP.md are about. Ship a stripped build (python3 -OO, docstrings
+# removed) if the identification itself matters to you.
 #
 # NOT A DAEMON. One process per poke: it binds, wakes, hands over one job,
 # hears back and exits. There is deliberately no always-listening service.
@@ -46,6 +49,15 @@ UMask=0077
 # precisely so this cannot happen, and the example smuggled one back in through
 # a shell. systemd can open the file itself: no shell, no pipeline, nothing on
 # an argv.
-#   /etc/gs-wake-job.json   root:root 0600
-StandardInput=file:/etc/gs-wake-job.json
+#
+# ...AND NOT FROM /etc. A withdraw job is an address and a depth in the clear;
+# under /etc it sat on the card, outside every wipe, readable by anyone who
+# mounts it. RuntimeDirectory= is tmpfs and the file is removed when the poke
+# ends, whatever way it ends. Write the job there right before starting:
+#   install -m 0600 -o root -g root /dev/null /run/gs/wake-job.json
+#   printf '%s' '{"job":"receive_and_quote","amount_sat":5000000}' > /run/gs/wake-job.json
+RuntimeDirectory=gs
+RuntimeDirectoryMode=0700
+StandardInput=file:/run/gs/wake-job.json
 ExecStart=/usr/bin/python3 /opt/gs/gs_doorbell wake --key /etc/gs_wake_pi.key
+ExecStopPost=/bin/rm -f /run/gs/wake-job.json

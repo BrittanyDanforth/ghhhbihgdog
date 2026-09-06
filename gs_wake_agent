@@ -68,7 +68,8 @@ from gs_common import (                                      # noqa: E402
     daemon_fee_estimate, fee_estimate_per_tx, isolated_proxy,
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
     install_signal_handlers, resource_check, rpc_lock_scope,
-    scope_lock_taken, secure_mkdir, terminal_safe, wipe_covers,
+    scope_lock_taken, secure_delete_or_warn, secure_mkdir, terminal_safe,
+    wipe_covers,
 )
 import importlib.machinery, importlib.util                 # noqa: E402
 import gs_wake_proto as proto                                # noqa: E402
@@ -222,6 +223,30 @@ def disarm_deadman(runner=None, ext: bool = True) -> bool:
             if _u == DEADMAN_UNIT:
                 ok = False
     return ok
+
+
+#: ACCOUNTS A MIX MINTS ON THE WALLET IT RUNS FROM, beyond its outputs.
+#:
+#: GhostSpiral mints one wallet account per mix output -- `wallets` of them
+#: plus randint(DECOY_MIN, DECOY_MAX) decoys (GhostSpiral.DECOY_MAX = 7) --
+#: and, in receive mode, one veil carrier for the entry and one account for
+#: the change sweep. Seven plus two, worst case; a test pins the seven to
+#: GhostSpiral's own constant so this cannot drift from it.
+MIX_EXTRA_ACCOUNTS = 7 + 2
+
+
+def worst_mix_accounts(depth) -> int:
+    """The most accounts one withdrawal at `depth` can add to the wallet."""
+    return int(withdraw_wallets(depth)) + MIX_EXTRA_ACCOUNTS
+
+
+def deposit_reserve_accounts() -> int:
+    """What one admitted deposit reserves against the account ceiling: its own
+    receive account plus the deepest mix the phone can ask for. The deepest,
+    because the depth is chosen at withdrawal time and the reserve is made
+    at deposit time; a smaller figure would be a promise the wallet could not
+    keep for a client who then chose twenty hops."""
+    return 1 + worst_mix_accounts(max(proto.WITHDRAW_DEPTHS))
 
 
 def withdraw_wallets(depth) -> int:
@@ -1195,6 +1220,13 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
                       f"another.")
             return code
     integrity_log("wake", "fee_sweep:done")
+    # THE ENTRY BUNDLE NAMED THE FEE WALLET'S OUTPUT. Gone with the sweep.
+    try:
+        if (artifact_dir / FEE_SWEEP_BUNDLE).is_file():
+            secure_delete_or_warn(artifact_dir / FEE_SWEEP_BUNDLE,
+                                  "the fee sweep's entry bundle")
+    except Exception:                                        # noqa: BLE001
+        integrity_log("wake", "retire_failed:fee_bundle")
     agent_say(f"  [+] Fee sweep finished: {legs} leg(s).")
     return "done"
 
@@ -1852,6 +1884,18 @@ def run_once(args, deps: dict = None) -> tuple:
     # only -- there is no trusted directory to write to yet, and inventing one
     # from an untrusted keyfile is how you get a log outside the wipe roots.
     _AGENT_LOG[0] = artifact_dir / JOB_LOG
+    # ONE BOOT'S LOG, NOT THE SERVICE'S HISTORY. The children print the
+    # deposit address, the memo and the amounts, and this file was opened
+    # O_APPEND by every boot: every deposit the service ever quoted, in the
+    # clear, on a disk that auto-unlocks, until a hand-run wipe. Truncated at
+    # each boot instead, so what it holds is the run in progress and the last
+    # one -- read it before the next wake if a run needs looking at.
+    try:
+        _fd = os.open(str(_AGENT_LOG[0]),
+                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(_fd)
+    except OSError:
+        pass
 
     preflight(key, artifact_dir, args.dry_run, probes=d)
 
@@ -2101,8 +2145,14 @@ def run_once(args, deps: dict = None) -> tuple:
         # started and did not finish, and the pager already renders it without
         # any promise about the money: "Some of it may already have moved ...
         # CHECK THE BALANCE before running it again."
+        # ONE REFUSAL CARRIES A WORD: "full" (at_capacity), because "wait,
+        # this frees up" is the one reason a person can act on and it names
+        # nothing about this wallet. Every other reason stays here.
         report_back(key, job_id, challenge.hex(),
                     "failed" if _CHILD_STARTED[0] else "refused", "",
+                    phase=("full" if isinstance(e, Refused)
+                           and e.code == "at_capacity"
+                           and not _CHILD_STARTED[0] else ""),
                     poster=d.get("post_record"), sleeper=d.get("sleep"))
         raise e
 
@@ -2126,7 +2176,12 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
 
     # A 24 h wake budget. A wipe resets it, and the account ceiling below is
     # the half that cannot be reset from this disk.
-    now_wall = int(time.time())
+    # BUCKETED LIKE EVERYTHING ELSE THAT TOUCHES THIS DISK. The chain, the
+    # bundles and the slips all coarsen to ten minutes; this file held the
+    # exact second each job was accepted, beside its kind, for the last two
+    # hundred -- a timetable correlatable with chain timestamps. The 24 h
+    # budget and the replay refusal both survive ten-minute stamps.
+    now_wall = int(time.time()) // 600 * 600
     recent = [w for w in state["wakes"] if now_wall - int(w) < 86400]
     if len(recent) >= int(key.get("daily_wake_budget", 12)):
         raise Refused("wake_budget",
@@ -2148,13 +2203,52 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                           f"{ceiling}. OPSEC_SETUP.md §4: the offline signing "
                           f"wallet derives subaddresses for a bounded number. "
                           f"Refusing to mint more from a pager.")
+        # ...AND ROOM FOR WHAT EVERY ADMITTED DEPOSIT WILL STILL MINT.
+        #
+        # The ceiling was checked at the deposit and never at the withdrawal
+        # -- and the withdrawal is what mints: one account per mix output,
+        # decoys, a carrier and a change sweep, up to twenty-nine at twenty
+        # hops. So a wallet at 44 accounts took a deposit and then ran to 73.
+        # Each deposit that has not been paid out is a mix still to come; this
+        # reserves the deepest one the phone can ask for, per arrival, plus
+        # this one, and refuses a deposit the wallet could not carry. A
+        # withdrawal of an admitted deposit is NEVER refused for this: you
+        # can always get your own money out. This is the capacity of the
+        # service in accounts, and OPSEC_SETUP 4f gives the arithmetic and
+        # the knobs that raise it.
+        # ...MINUS THE GHOSTS. A deposit that was quoted and never paid held
+        # its place forever, and a service whose clients ask for an address
+        # and then think better of it filled up with nothing in it: after
+        # (ceiling / 30) such deposits every /deposit was "full" for good.
+        # An unpaid deposit past DEPOSIT_PLACE_TTL_S stops counting; a paid
+        # one keeps its place at any age, and one that cannot be asked
+        # about counts as paid. Nothing else changes for it: its accounts
+        # stay its owner's and a late payment is still theirs to withdraw.
+        _pending = sum(
+            1 for _r in _load_ledger(artifact_dir)["handles"].values()
+            if _deposit_pending(_r, key, now_wall,
+                                ask=d.get("subaddress_total")))
+        _need = n + deposit_reserve_accounts() * (_pending + 1)
+        if _need > ceiling:
+            integrity_log("wake", "at_capacity")
+            raise Refused("at_capacity",
+                          f"this wallet holds {n} accounts, {_pending} "
+                          f"deposit(s) are admitted and not yet paid out, and "
+                          f"each may still mint up to "
+                          f"{deposit_reserve_accounts()}: {_need} against a "
+                          f"ceiling of {ceiling}. Refusing to admit another "
+                          f"until some are paid out, or the wallet is "
+                          f"recreated with a larger lookahead and the ceiling "
+                          f"raised (OPSEC_SETUP.md 4f).")
 
     # WRITE THE LEDGER BEFORE DISPATCH. If power is lost mid-job, the next boot
     # must refuse this job_id rather than run it twice -- a second slip would
     # overwrite the first, and if BTC was already sent against the first, the
     # only record of what was paid is gone.
-    state["jobs"] = (state["jobs"] + [{"id": job_id, "job": job,
-                                       "at": now_wall}])[-200:]
+    # THE ID AND THE BUCKET, NOT THE KIND. The replay refusal reads the id;
+    # nothing reads the job word, and a job word beside a stamp is the shape
+    # of the arrangement on a disk that auto-unlocks.
+    state["jobs"] = (state["jobs"] + [{"id": job_id, "at": now_wall}])[-200:]
     # `recent` already dropped everything older than 24 h, so this is the
     # window plus this wake -- not an append to the unpruned list.
     state["wakes"] = recent + [now_wall]
@@ -2219,7 +2313,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                 "not started. The short one is still armed and this machine "
                 "will still power itself off.")
     code, status, handle = _dispatch(job, params, key, artifact_dir,
-                                     handle, _child, job_id)
+                                     handle, _child, job_id,
+                                     accounts=d.get("account_indices"))
     # A STATUS PROBE REPORTS THE HANDLE IT WAS ASKED ABOUT, not the fresh one
     # _run_validated drew. See _dispatch: handles[] is written only for
     # receive_and_quote, and the collision loop guarantees the
@@ -2229,7 +2324,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         handle = params["handle"]
     slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
     plain = plain_slip_for_chat(key, artifact_dir, status, handle)
-    phase = _phase_of(job, artifact_dir, key=key, status=status)
+    phase = _phase_of(job, artifact_dir, key=key, status=status,
+                      owner=params.get("owner"))
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
                 plain=plain, phase=phase, poster=d.get("post_record"),
                 sleeper=d.get("sleep"))
@@ -2256,7 +2352,7 @@ _PHASE_OF_STATE = {
 
 
 def _phase_of(job: str, artifact_dir: Path, reader=None,
-              key: dict = None, status: str = "") -> str:
+              key: dict = None, status: str = "", owner=None) -> str:
     """The one word a status probe earned, or "". NEVER raises.
 
     BOTH WATCHING JOBS, not just the short one. `watch` used to be excluded
@@ -2283,8 +2379,21 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
     if job == "withdraw":
         if status != "done":
             return ""
+        # THE OWNER'S OWN REMAINDER, not the wallet's. Unscoped, a finished
+        # withdrawal said "more is here" about another client's arrival and
+        # invited this one to take it -- the largest output on the wallet,
+        # whoever put it there. With an owner the question is asked over that
+        # owner's accounts alone; a ledger that cannot be read gives an empty
+        # set, which says nothing rather than the wallet.
+        _owned = None
+        if owner:
+            try:
+                _owned = _owner_accounts(_load_ledger(Path(artifact_dir)),
+                                         owner)
+            except Exception:                                # noqa: BLE001
+                _owned = set()
         try:
-            _left = _funded_entry(key)
+            _left = _funded_entry(key, owned_accounts=_owned)
             if not _left:
                 # NOTHING UNLOCKED IS NOT NOTHING. A deposit that landed
                 # while this leg ran is inside the network's unlock window
@@ -2295,7 +2404,7 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
                 # making one -- and the client, told that, was done, with
                 # their second deposit still on the wallet. The same floor
                 # as below: locked dust is not more.
-                _locked = _locked_value(key)
+                _locked = _locked_value(key, owned_accounts=_owned)
                 if (_locked is not None
                         and _locked >= Decimal(live_min_out_xmr(key))):
                     return "more_locked"
@@ -2393,7 +2502,34 @@ def _account_count(key: dict, injected=None):
         return None
 
 
-def _funded_entry(key: dict, injected=None, rpc_url: str = None):
+def _account_indices(key: dict, injected=None):
+    """The wallet's account indices as a set, or None when it cannot be asked.
+
+    Read BEFORE and AFTER a withdrawal's mix: every account the mix minted --
+    its outputs, its decoys, the veil carrier, the change sweep -- is one the
+    requesting owner's money created, and the difference is recorded as that
+    owner's, so a later leg chases the owner's own change and nobody else's.
+    Correct because ONE job runs per boot (run_once has no loop); a test
+    anchors that invariant beside this one.
+    """
+    if injected is not None:
+        return injected()
+    try:
+        from gs_common import connect_rpc
+        rpc = connect_rpc(key["rpc_primary"], proxy_url=key.get("tor_proxy", ""))
+        r = rpc.raw_request("get_accounts", {}) or {}
+        out = set()
+        for _a in (r.get("subaddress_accounts") or []):
+            _i = _a.get("account_index") if isinstance(_a, dict) else None
+            if isinstance(_i, int) and not isinstance(_i, bool):
+                out.add(_i)
+        return out
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _funded_entry(key: dict, injected=None, rpc_url: str = None,
+                  owned_accounts=None):
     """The (account, subaddress, address, atomic) holding this wallet's money.
 
     THE VAULT ANSWERS THIS, NOT THE PHONE. A withdrawal used to name a 4-hex
@@ -2416,9 +2552,21 @@ def _funded_entry(key: dict, injected=None, rpc_url: str = None):
 
     RETURNS None WHEN NOTHING QUALIFIES, and the caller refuses. Guessing an
     account here would point a spend at the wrong pile.
+
+    `owned_accounts`: THE ONE FILTER, and it only ever NARROWS. When it is a
+    set, an output is a candidate only if its account is in it -- the accounts
+    the requesting owner's own deposits and mixes created, from the ledger.
+    None means the whole wallet, which is right for the fee wallet (it has no
+    clients) and for a hand-run. An EMPTY set means nothing of this owner's
+    is here, and that is answered as None, never widened to the wallet:
+    isolation between clients rests on this line and the pairing secret that
+    signs the owner token, not on anyone not knowing the code.
     """
     if injected is not None:
-        return injected()
+        _got = injected()
+        if owned_accounts is not None and _got and _got[0] not in owned_accounts:
+            return None
+        return _got
     try:
         from gs_common import connect_rpc
         rpc = connect_rpc(rpc_url or key["rpc_primary"],
@@ -2436,6 +2584,8 @@ def _funded_entry(key: dict, injected=None, rpc_url: str = None):
         for _a in accts:
             _ai = _a.get("account_index")
             if not isinstance(_ai, int) or isinstance(_ai, bool):
+                continue
+            if owned_accounts is not None and _ai not in owned_accounts:
                 continue
             r = rpc.raw_request("get_balance",
                                 {"account_index": _ai,
@@ -2465,7 +2615,8 @@ def _funded_entry(key: dict, injected=None, rpc_url: str = None):
         return None
 
 
-def _locked_value(key: dict, injected=None, rpc_url: str = None):
+def _locked_value(key: dict, injected=None, rpc_url: str = None,
+                  owned_accounts=None):
     """XMR on this wallet that has arrived and not yet unlocked, or None.
 
     ONE NUMBER, NOT AN ENTRY. Nothing is spent from this; it decides whether
@@ -2474,6 +2625,10 @@ def _locked_value(key: dict, injected=None, rpc_url: str = None):
     -- the arrival is on SOME subaddress, and which one is the next leg's
     question, asked when it can be answered. None when the wallet could not
     be asked, which the caller treats as "" (say nothing), never as "more".
+
+    `owned_accounts` scopes it the way _funded_entry is scoped: the sum over
+    the owner's accounts alone, so one client is never told another's
+    arrival is "still unlocking". An empty set is zero, not the wallet.
     """
     if injected is not None:
         return injected()
@@ -2481,13 +2636,20 @@ def _locked_value(key: dict, injected=None, rpc_url: str = None):
         from gs_common import connect_rpc
         rpc = connect_rpc(rpc_url or key["rpc_primary"],
                           proxy_url=key.get("tor_proxy", ""))
-        r = rpc.raw_request("get_balance",
-                            {"account_index": 0, "all_accounts": True}) or {}
-        _bal, _unl = r.get("balance"), r.get("unlocked_balance")
-        for _v in (_bal, _unl):
-            if not isinstance(_v, int) or isinstance(_v, bool):
-                return None
-        return Decimal(str(max(_bal - _unl, 0))) / Decimal(10 ** 12)
+        if owned_accounts is None:
+            _queries = [{"account_index": 0, "all_accounts": True}]
+        else:
+            _queries = [{"account_index": int(_i), "all_accounts": False}
+                        for _i in sorted(owned_accounts)]
+        _locked = 0
+        for _q in _queries:
+            r = rpc.raw_request("get_balance", _q) or {}
+            _bal, _unl = r.get("balance"), r.get("unlocked_balance")
+            for _v in (_bal, _unl):
+                if not isinstance(_v, int) or isinstance(_v, bool):
+                    return None
+            _locked += max(_bal - _unl, 0)
+        return Decimal(str(_locked)) / Decimal(10 ** 12)
     except Exception:                                        # noqa: BLE001
         return None
 
@@ -2497,14 +2659,41 @@ def _bundle_pair(rec: dict):
 
     Read from the bundle FILE through the one strict loader, never from the
     record: the record holds a path and the file holds the address, and a
-    record whose file is gone (wiped, or never written) names nothing.
+    record whose file is gone (wiped, or never written) names nothing --
+    EXCEPT a record retired on purpose: a paid-out deposit's bundle is
+    shredded (see _retire_files) and the pair it named is kept on the record,
+    two small integers, so the ledger can still answer for it.
     """
     try:
         from gs_common import load_receive_bundle
         _b = load_receive_bundle(rec.get("bundle"))
         return (int(_b["account_index"]), int(_b["subaddress_index"]))
     except Exception:                                        # noqa: BLE001
-        return None
+        pass
+    _p = rec.get("pair")
+    if (isinstance(_p, list) and len(_p) == 2
+            and all(isinstance(_i, int) and not isinstance(_i, bool)
+                    and _i >= 0 for _i in _p)):
+        return (int(_p[0]), int(_p[1]))
+    return None
+
+
+def _retire_files(rec: dict) -> None:
+    """Shred a paid-out deposit's slip and bundle. The record keeps its
+    (account, subaddress) pair and its spent flag; the files kept the deposit
+    address, the memo naming the receive address in full, the amounts and the
+    account -- a who-sent-what line for every client, on a disk that
+    auto-unlocks, until a hand-run wipe that would also end every other
+    client's open run. Retired the moment the money has left instead."""
+    for _k in ("slip", "bundle"):
+        _p = rec.get(_k)
+        if not _p:
+            continue
+        try:
+            if Path(_p).is_file():
+                secure_delete_or_warn(Path(_p), f"a paid-out deposit's {_k}")
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", f"retire_failed:{_k}")
 
 
 def _subaddress_total(key: dict, acct: int, sub: int, injected=None):
@@ -2532,6 +2721,35 @@ def _subaddress_total(key: dict, acct: int, sub: int, injected=None):
         return 0
     except Exception:                                        # noqa: BLE001
         return None
+
+
+def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
+    """Does this handle record still hold a place in the account reserve?
+
+    Pending is: quoted (bundle and slip on record) and not paid out. A
+    record like that is a mix still to come, and the reserve gate keeps
+    room for it -- unless it is a GHOST: older than DEPOSIT_PLACE_TTL_S and
+    with NOTHING on its address, locked or unlocked. Then it is a quote
+    nobody paid, and it stops counting.
+
+    FAILS TOWARD RESERVING. No `admitted` stamp (a record from before the
+    stamp existed) is treated as old, so a stale unpaid one from then can
+    let go too; but a pair the record cannot name, or a wallet that cannot
+    be asked (`None` from _subaddress_total), keeps the place. Age alone
+    never frees anything: only the address saying it holds nothing does.
+    """
+    if not (rec.get("bundle") and rec.get("slip")) or rec.get("spent") is True:
+        return False
+    _adm = rec.get("admitted")
+    if not isinstance(_adm, int) or isinstance(_adm, bool):
+        _adm = 0
+    if int(now) - _adm < proto.DEPOSIT_PLACE_TTL_S:
+        return True
+    _pair = _bundle_pair(rec)
+    if _pair is None:
+        return True
+    _total = (ask or _subaddress_total)(key, _pair[0], _pair[1])
+    return _total != 0
 
 
 def _reusable_receive(key: dict, handles: dict, balance=None):
@@ -2586,10 +2804,16 @@ def _handles_on_disk(d: Path) -> set:
 
 
 def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
-              funded=None, reuse_balance=None) -> tuple:
+              funded=None, reuse_balance=None, accounts=None) -> tuple:
     """Run the job's tools in order. Returns (code, status, handle)."""
     budget = proto.JOBS[job]["budget_s"]
-    handles = _load_handles(artifact_dir)
+    led = _load_ledger(artifact_dir)
+    handles = led["handles"]
+    # WHOSE JOB. Off the validated note, never off a chat: the vault holds an
+    # opaque token and a ledger of what that token's money created. Absent
+    # only on a hand-run of this function (the wire makes it mandatory), and
+    # absent means the whole wallet, which is the host's own use.
+    _owner = params.get("owner") if isinstance(params, dict) else None
 
     # A HANDLE IS FOUR HEX CHARACTERS, SO COLLISIONS ARE NOT A CURIOSITY.
     # 65536 values: at ~300 recorded handles a repeat is more likely than not,
@@ -2631,13 +2855,21 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # first version reached for `d`, which is _run_validated's parameter
         # and does not exist in this scope -- a NameError on the one job that
         # spends, caught immediately by driving it.
-        _found = _funded_entry(key, injected=funded)
+        # THIS OWNER'S ACCOUNTS AND NO OTHER'S. The candidate set is the
+        # ledger's answer for the note's owner; an owner the ledger has never
+        # seen has an empty set and is refused, never handed the wallet.
+        _owned = _owner_accounts(led, _owner) if _owner else None
+        _found = _funded_entry(key, injected=funded, owned_accounts=_owned)
         if not _found:
             raise Refused(
                 "nothing_to_withdraw",
                 "no unlocked balance is visible on this wallet, so there is "
                 "nothing to mix. If a payment is still confirming it is not "
-                "spendable yet; ask again once it has.")
+                "spendable yet; ask again once it has."
+                if _owned is None else
+                "nothing of this owner's is unlocked on this wallet: no "
+                "arrival recorded for them has cleared. If a payment is still "
+                "confirming it is not spendable yet; ask again once it has.")
         _fa, _fs, _fad, _famt = _found
         # ...AND IT HAS TO BE BIG ENOUGH TO MIX, WHICH NOTHING ASKED HERE.
         #
@@ -2711,12 +2943,29 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # nothing it can be sure of, and a handle marked spent about money
         # still sitting there is the lie in the other direction.
         _spent_pair = (int(_fa), int(_fs))
+        # THE WALLET'S ACCOUNTS BEFORE THE MIX. Every account the mix adds is
+        # this owner's money at work (see _account_indices); the difference
+        # is recorded on success so the next leg chases the owner's own
+        # change and the ledger's answer stays whole.
+        _accts_before = (_account_indices(key, injected=accounts)
+                         if _owner else None)
     elif job in ("watch", "swap_status"):
         rec = handles.get(params["handle"])
         if not rec:
             raise Refused("unknown_handle",
                           f"no bundle on this machine for handle "
                           f"{params['handle']}.")
+        # NOT YOURS, REFUSED HERE TOO. The pager binds a label to a chat with
+        # its own MAC; this is the second wall, on the machine that holds the
+        # money, so a label that reached the wire anyway -- a guessed tag, a
+        # forged note from a stolen card -- cannot surface another owner's
+        # arrival. A record from before owners existed carries none and is
+        # answered as before.
+        if _owner and rec.get("owner") and rec.get("owner") != _owner:
+            integrity_log("wake", "watch_not_owner")
+            raise Refused("handle_not_yours",
+                          f"handle {params['handle']} was recorded for a "
+                          f"different owner.")
         # PAID AND SENT ON, ANSWERED FROM THE LEDGER. A watcher on an
         # address that was paid and then emptied by a withdrawal sees a
         # zero balance and times out into "nothing on the address yet.
@@ -2871,9 +3120,23 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # million times the intended swap, quoted without complaint.
             env_extra["GS_SWAP_AMOUNTS"] = proto.sat_to_btc(
                 params["amount_sat"])
+            # `admitted` IS A TEN-MINUTE BUCKET, like every stamp on this
+            # disk, and it is what lets an unpaid deposit stop holding a
+            # place (DEPOSIT_PLACE_TTL_S): the reserve gate reads it beside
+            # the address's balance. Not a second, not the kind of job.
             handles[handle] = {"bundle": new[0], "minted": 1,
+                               "admitted": int(time.time()) // 600 * 600,
                                "slip": str(artifact_dir /
                                            f"thor_pairs_{handle}.json")}
+            # RECORDED AS THE OWNER'S, address and account both. The account
+            # is what a withdrawal for this owner may later spend from; a
+            # reused bundle (see _reusable_receive) belongs to whoever is
+            # quoting it now, which is what this line says.
+            if _owner:
+                handles[handle]["owner"] = _owner
+                _np = _bundle_pair({"bundle": new[0]})
+                if _np is not None:
+                    _add_owner_accounts(led, _owner, {_np[0]})
         if job == "withdraw":
             # THE DESTINATION, IN THE ENVIRONMENT, NEVER ON THE ARGV.
             # GhostSpiral reads GS_EXIT_TO through env_or_argv and prefers it
@@ -3033,7 +3296,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         _inh = artifact_dir / INHIBIT_FILE
         if _inh.exists():
             integrity_log("wake", "inhibited_mid_job")
-            _save_handles(artifact_dir, handles)
+            _save_handles(artifact_dir, handles, led["owners"])
             raise Refused(
                 "inhibited",
                 f"{_inh} appeared while this job was running, so somebody is "
@@ -3119,7 +3382,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             rec = handles.get(handle)
             if rec and rec.get("slip") and not Path(rec["slip"]).exists():
                 rec["slip"] = None
-            _save_handles(artifact_dir, handles)
+            _save_handles(artifact_dir, handles, led["owners"])
             return "job_failed", "failed", handle
 
     # THE DEPOSIT THAT JUST LEFT IS MARKED, on the run that reports done and
@@ -3132,7 +3395,28 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         for _rec in handles.values():
             if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:
                 _rec["spent"] = True
-    _save_handles(artifact_dir, handles)
+                # THE PAIR STAYS, THE FILES GO. See _retire_files.
+                _rec["pair"] = [int(_spent_pair[0]), int(_spent_pair[1])]
+                _retire_files(_rec)
+        # THE MIX'S ACCOUNTS ARE THE OWNER'S. Read after the child so the
+        # fan-out, the decoys, the carrier and the change sweep it minted
+        # are recorded as this owner's for the next leg. Unreadable on
+        # either side means nothing is recorded, never a guess.
+        if _owner and _accts_before is not None:
+            _accts_after = _account_indices(key, injected=accounts)
+            if _accts_after is not None:
+                _add_owner_accounts(led, _owner,
+                                    set(_accts_after) - set(_accts_before))
+        # THE WITHDRAWAL'S OWN BUNDLE NAMED THE ACCOUNT IT SPENT. Gone with
+        # the job; the ledger keeps the pair.
+        if bundle:
+            try:
+                if Path(bundle).is_file():
+                    secure_delete_or_warn(Path(bundle),
+                                          "the withdrawal's entry bundle")
+            except Exception:                                # noqa: BLE001
+                integrity_log("wake", "retire_failed:withdraw_bundle")
+    _save_handles(artifact_dir, handles, led["owners"])
     integrity_log("wake", f"job_done:{job}")
     return "done", "done", handle
 
@@ -3156,14 +3440,70 @@ def _load_handles(d: Path) -> dict:
     discarded: one damaged entry should cost that one handle, not every other
     handle on the machine.
     """
+    return _load_ledger(d)["handles"]
+
+
+def _load_ledger(d: Path) -> dict:
+    """{"handles": {...}, "owners": {owner: {"accounts": [int, ...]}}}.
+
+    THE LEDGER GREW A SECOND HALF, and the file kept its name. `handles` is
+    the record _load_handles has always returned; `owners` is which wallet
+    ACCOUNTS each owner token's deposits and mixes created -- the set a
+    withdrawal for that owner may spend from, and nothing else. A file written
+    before this existed is a bare handles dict; it loads as handles with no
+    owners, which is exactly what it says: nothing on it is anyone's.
+
+    Account 0 is never anyone's: it is the wallet's own primary and change
+    address, and money there belongs to the host. Indices are checked the way
+    every integer off this disk is (no bools), and duplicates collapse.
+    """
+    _empty = {"handles": {}, "owners": {}}
     try:
         v = json.loads((d / HANDLES_FILE).read_text())
-        if not isinstance(v, dict):
-            return {}
-        return {k: r for k, r in v.items()
-                if isinstance(k, str) and isinstance(r, dict)}
     except Exception:                                        # noqa: BLE001
-        return {}
+        return _empty
+    if not isinstance(v, dict):
+        return _empty
+    if isinstance(v.get("handles"), dict):
+        _h, _o = v["handles"], v.get("owners")
+    else:
+        _h, _o = v, {}
+    # A KEY THAT IS NOT A HANDLE IS NOT A RECORD. Four uppercase hex is what
+    # every job names and every slip file is called after; a key of any
+    # other shape can never be looked up and only ever counts -- toward the
+    # ceiling of the file and toward the deposits held pending.
+    handles = {k: r for k, r in _h.items()
+               if isinstance(k, str) and proto.HANDLE_RE.match(k)
+               and isinstance(r, dict)}
+    owners = {}
+    if isinstance(_o, dict):
+        for k, r in _o.items():
+            if not (isinstance(k, str) and isinstance(r, dict)):
+                continue
+            _acc = [a for a in (r.get("accounts") or [])
+                    if isinstance(a, int) and not isinstance(a, bool)
+                    and a > 0]
+            owners[k] = {"accounts": sorted(set(_acc))}
+    return {"handles": handles, "owners": owners}
+
+
+def _owner_accounts(led: dict, owner) -> set:
+    """The wallet accounts this owner may spend from. Empty when unknown."""
+    if not owner:
+        return set()
+    return set((led.get("owners") or {}).get(owner, {}).get("accounts") or [])
+
+
+def _add_owner_accounts(led: dict, owner, idxs) -> None:
+    """Record accounts as this owner's. Account 0 is never recorded."""
+    if not owner:
+        return
+    _o = led.setdefault("owners", {}).setdefault(owner, {"accounts": []})
+    _have = set(_o.get("accounts") or [])
+    for _i in idxs or ():
+        if isinstance(_i, int) and not isinstance(_i, bool) and _i > 0:
+            _have.add(_i)
+    _o["accounts"] = sorted(_have)
 
 
 #: Bound on the handles file. Insertion order is preserved by dict, so this
@@ -3174,10 +3514,15 @@ def _load_handles(d: Path) -> dict:
 MAX_HANDLES = 1000
 
 
-def _save_handles(d: Path, h: dict) -> None:
+def _save_handles(d: Path, h: dict, owners: dict = None) -> None:
+    """Write the ledger. `owners` omitted keeps what the file already holds,
+    so a caller that only touched handles cannot drop the other half."""
     if len(h) > MAX_HANDLES:
         h = dict(list(h.items())[-MAX_HANDLES:])
-    atomic_write_json(h, d / HANDLES_FILE, perms=0o600)
+    if owners is None:
+        owners = _load_ledger(d)["owners"]
+    atomic_write_json({"handles": h, "owners": owners},
+                      d / HANDLES_FILE, perms=0o600)
 
 
 # ---------------------------------------------------------------------------
