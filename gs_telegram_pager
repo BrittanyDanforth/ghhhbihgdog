@@ -892,12 +892,19 @@ def owner_token(key: dict, chat_id: int) -> str:
 #: What is true on every install is the part that matters: the details come
 #: from the machine, they turn up when /deposit is answered, and a phone
 #: wallet cannot pay them.
+#: ...AND WHAT A READER DOES WITH THEM, in words a stranger can act on.
+#: "Pay them from the machine" told a person who has no machine to go to
+#: one; what they actually need is an app that can attach the note that
+#: routes the payment, and the one thing they must not do, said plainly:
+#: a phone app cannot attach it, and paying from one loses the money.
 _DEPO_ON_MACHINE = (
-    "  /deposit   you pay in. The details come back when you ask — pay "
-    "them from the machine, never from your phone.")
+    "  /deposit   you pay in. The details come back when you ask, from the "
+    "machine. Pay them from a desktop app that can attach a note to a "
+    "payment — never from your phone: it cannot, and the money would be lost.")
 _DEPO_IN_CHAT = (
-    "  /deposit   you pay in. A fresh address and the amount arrive HERE, "
-    "every time — pay it from the machine, not from your phone.")
+    "  /deposit   you pay in. A fresh address, the amount and a payment note "
+    "arrive HERE, every time. Pay them from a desktop app that can attach the "
+    "note — never from your phone: it cannot, and the money would be lost.")
 _DEPO_LINE = _DEPO_ON_MACHINE
 
 WELCOME_LINES = [
@@ -3304,7 +3311,13 @@ class Pager:
                                       and getattr(self, "_contended", False)))
                 # NO LEG NUMBER, NO CAP, NO "SEPARATE": each is the shape of
                 # the withdrawal, on the surface a stranger reads.
-                _msg = ("withdraw: sent.\n"
+                # WHERE IT WENT, in the reader's words. "sent." alone left a
+                # stranger asking "sent where, and is that it?"; the second
+                # clause answers the first and the variant below answers the
+                # second. "your addresses", not "the addresses you gave":
+                # this lands hours later, possibly after a reboot, and must
+                # not lean on a conversation the reader has to scroll for.
+                _msg = ("withdraw: sent. It is on its way to your addresses.\n"
                         + ("Another is starting."
                            if _next_leg else
                            "More remains — /withdraw again when you are ready."
@@ -3397,21 +3410,43 @@ class Pager:
                 # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
                 # own vault keyfile asked for it. gs_wake_proto's "THE PLAINTEXT
                 # SLIP" is where that trade is argued; this branch only renders
-                # it. Two messages: the memo must be copied alone (see below).
-                # ONE MESSAGE, BECAUSE THERE IS NO LONGER A SECOND.
+                # it. TWO MESSAGES, AND THE NOTE GOES FIRST.
                 #
-                # This used to send the body and then the MEMO on its own,
-                # with a retry and a "do NOT send without it" fallback,
-                # because the memo had to reach a wallet character for
-                # character. The memo does not travel any more -- see
-                # gs_wake_proto.PLAIN_FIELDS -- so all of that goes with it:
-                # the second send, the retry, the failure warning, and the one
-                # field in this record that named the operator's destination.
+                # The note (the memo) is the only thing that routes the
+                # payment: the address is a shared line paid by everyone, so
+                # an address that arrives without its note is a trap -- money
+                # sent to it is nobody's. It goes in its own message so a
+                # tap-and-hold copies it alone, and it goes BEFORE the address
+                # so that the one failure that can strand money -- the note
+                # not getting through -- leaves the reader with nothing to
+                # pay rather than something to pay wrongly. One retry, like
+                # every payload send here; then a refusal in plain words and
+                # NO address.
+                _note = plain.get("m") or ""
+                _ok = bool(_note) and self.send(chat_id, _note)
+                if _note and not _ok:
+                    time.sleep(SLIP_RETRY_S)
+                    _ok = self.send(chat_id, _note)
+                if not _ok:
+                    integrity_log("pager", "note_undelivered")
+                    self.send(chat_id,
+                              f"{chat_name(job)}: the payment details did not "
+                              f"get through, so there is nothing to pay yet. "
+                              f"/deposit again for a fresh one.",
+                              buttons=MENU_BUTTONS)
+                    return
+                # THE ADDRESS, THE AMOUNT AND WHAT TO DO, with the label and
+                # the button that asks whether it has arrived. The lines
+                # come from the protocol's own renderer, shared with the
+                # doorbell's terminal, so the two cannot drift.
                 self.send(chat_id,
                           f"{chat_name(job)}: pay this. Confirmation "
                           f"number: {_cn}\n\n"
                           + "\n".join(proto.plain_lines(
-                              plain, label=_cn)).rstrip(),
+                              plain, label=_cn)).rstrip()
+                          + "\n\nOnce you have paid, tap below or /check "
+                            "with that number — it says when it has "
+                            "arrived. Then /withdraw sends it on.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
             if not slip:
@@ -4496,10 +4531,17 @@ class Pager:
             # leg, six times over, on the surface this design spends its whole
             # effort keeping short. The window has not changed since leg one
             # and the operator has already been told it.
+            # WHAT IS HAPPENING AND HOW LONG, in the reader's terms. "working.
+            # Nothing else can run for up to 17h" was true and said nothing a
+            # stranger could use: not what is being done, not what will
+            # arrive, and a figure that is the lock window dressed as an
+            # estimate. Each job says what it is doing and where the answer
+            # lands; a withdrawal leads with the hours for the depth THEY
+            # chose (the menu's own figure) and keeps the ceiling as what it
+            # is. The lock sentence stays, because it is the one thing that
+            # explains the next "busy".
             if not self._chain_leg:
-                self.send(cid,
-                          f"{chat_name(job)}: working. Nothing else can run "
-                          f"for up to {_how}.")
+                self.send(cid, self._working_line(job, params, _how))
             threading.Thread(target=self._worker, args=(cid, job, params),
                              daemon=True).start()
         except BaseException as e:                           # noqa: BLE001
@@ -4586,6 +4628,34 @@ class Pager:
             self.busy.release()
         except RuntimeError:
             pass
+
+    def _working_line(self, job: str, params: dict, how: str) -> str:
+        """The acknowledgement after a poke: what is being done, where the
+        answer will land, and how long this box may refuse everything else.
+
+        `how` is the lock window (the public worst case for the job plus the
+        doorbell's windows), which is the ONLY figure this box can promise;
+        a withdrawal leads with the menu's own hours for the depth the reader
+        chose, because that is the figure they were just shown and the one
+        they are actually waiting on. "Nothing else can run" stays in every
+        variant: it is what makes the next "busy" read as expected rather
+        than broken.
+        """
+        _n = chat_name(job)
+        if job == "receive_and_quote":
+            return (f"{_n}: getting your payment details — a few minutes. "
+                    f"They arrive here. Nothing else can run for up to {how}.")
+        if job == "withdraw":
+            try:
+                _lead = (f"About {proto.depth_hours(int(params.get('depth')))}h "
+                         f"for what you chose.")
+            except Exception:                                # noqa: BLE001
+                _lead = "This takes hours."
+            return (f"{_n}: sending. {_lead} I will say here when it is done "
+                    f"— you can close this. Nothing else can run for up to "
+                    f"{how}.")
+        return (f"{_n}: looking — a few minutes. I will say here. Nothing "
+                f"else can run for up to {how}.")
 
     def _busy_answer(self, cid: int) -> str:
         """The "not now" for a chat while a wake holds the lock.

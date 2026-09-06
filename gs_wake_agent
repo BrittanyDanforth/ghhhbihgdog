@@ -3642,23 +3642,28 @@ def _read_json(path: Path):
 #: neither, so both fields would be extra copies of sensitive values in a
 #: transcript, bought for nothing. What is left is exactly what a human needs
 #: to make the payment.
-#: THE MEMO IS NOT IN THIS MAP, so it never reaches the wire.
+#: THE MEMO IS IN THIS MAP, and for one turn it was not.
 #:
-#: ("memo", "m") was here. It is the only field in the quoted pair that names
-#: anybody: the deposit address is a shared pooled vault, the amount is
-#: already in the transcript because the confirm echoes it, and the handle is
-#: four hex characters this machine drew. The memo NAMES THE DESTINATION
-#: MONERO ADDRESS IN FULL.
+#: It was dropped on two true arguments -- it names the destination address,
+#: and a token holder could substitute it -- and the drop broke the one mode
+#: this record exists for. `deposit_in_chat` is the mode for a person whose
+#: only device is a phone (OPSEC_SETUP.md, "If you have only a phone"): the
+#: deposit address is a SHARED pooled inbound vault, the memo is the entire
+#: binding between their Bitcoin and their Monero, and BTC paid to that
+#: address without it is routed to nobody. Handing them the address and the
+#: amount with no memo was the trap the docs warn about, in the mode the
+#: docs said carries both. A service whose clients pay from their own desktop
+#: app cannot take a deposit without it.
 #:
-#: Dropping it here rather than at the pager is the point. The Pi never
-#: receives it, so a stolen bot token, a seized SD card and a compromised
-#: doorbell all hold a record that identifies nothing -- and the substitution
-#: attack OPSEC_SETUP.md says no scheme rescues (hold the token, leave the
-#: address, swap the memo, take the deposit) has nothing left to substitute.
-#:
-#: The operator loses nothing: composing the OP_RETURN needs a desktop wallet,
-#: which is THIS machine, and the memo is on its disk in the quoted pair.
-PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"), ("expected_xmr", "x"))
+#: What the memo costs is paid where it is stated (gs_wake_proto's
+#: PLAIN_FIELDS): a one-shot destination, public in the OP_RETURN once paid,
+#: a message deleted after --burn-after, and the token as the only mitigation
+#: for substitution -- exactly as it is for the address line beside it. And
+#: the binding is CHECKED here, on this machine, against this machine's own
+#: dest_xmr, right before the record is built: a memo naming anyone else is
+#: refused, loudly, and nothing is sent.
+PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"), ("memo", "m"),
+             ("expected_xmr", "x"))
 
 
 def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
@@ -3693,6 +3698,17 @@ def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
                 raise ValueError(f"the quoted pair has no {src!r}")
             body[short] = str(v)
         body["h"] = handle
+        # THE MEMO MUST NAME THIS MACHINE'S OWN DESTINATION, checked here at
+        # the last line before it reaches a wire, against the pair's own
+        # dest_xmr -- the same check thor_swap_preparer made when it quoted
+        # and gs_unseal makes on a sealed slip. The Pi cannot make it (it
+        # never learns the destination), so the one box that can, does. A
+        # memo naming anyone else is a payment to anyone else.
+        from gs_common import memo_binds_destination as _binds
+        if not _binds(str(pair.get("memo") or ""), str(pair.get("dest_xmr") or "")):
+            integrity_log("wake", "plain_memo_unbound")
+            raise ValueError("the quoted pair's memo does not name its own "
+                             "destination; refusing to send it anywhere")
         # Checked against the SAME predicate the doorbell will use, here, where
         # the operator can be told. Otherwise a control character in a memo
         # would be refused by the Pi and the vault would have powered off
