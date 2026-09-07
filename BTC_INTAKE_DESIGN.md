@@ -105,8 +105,12 @@ is live (`NATIVE` / `BACKEND`). The vault installs it and the signing path
 (stage 2) refuses to sign without it. The watch-only Pi holds no secret and is
 correct on the pure-Python fallback, so it needs no native library.
 
-Until a library is chosen, nothing can derive even one real address, so stage 1
-cannot begin. This is the gate, not a preference.
+That gate is passed: embit is vendored (stage 0, `8c86548` / `69d379a`) and
+stage 1 derives real addresses from it. The stage-1 exit criterion "against a
+mock and a testnet server" is met on the mock side (an in-process SOCKS5 proxy
+and Electrum server, plaintext and TLS, drive the REAL transport and client);
+the live-testnet look needs Tor on the box and is folded into stage 3's
+testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
 
 ## Wire and schema changes
 

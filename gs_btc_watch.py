@@ -30,7 +30,8 @@ depth-checked on its own, and
 The vault (stage 2) spends only the settled outputs it is handed; nothing
 shallower ever becomes an input.
 
-How the looking stays quiet (BTC_INTAKE_DESIGN.md, rule 6):
+How the looking stays quiet (AGENTS.md rule 6; BTC_INTAKE_DESIGN.md, "Chain
+source"):
 
   * Over Tor, always, `socks5h` -- the destination goes to the proxy as a
     DOMAIN NAME, so DNS resolves at the proxy and never here.
@@ -50,16 +51,21 @@ How the looking stays quiet (BTC_INTAKE_DESIGN.md, rule 6):
     three read-only calls and hangs up, and announces a stock wallet's
     version string; a server that fingerprints by behaviour can still
     cluster them. That residual is only removed by the operator's OWN node
-    (BTC_INTAKE_DESIGN.md recommends exactly that), and the server list
-    exists so it can be pointed there.
+    (BTC_INTAKE_DESIGN.md recommends exactly that). The server list is
+    reached the one way this module speaks -- over Tor, TLS on -- so an own
+    node is pointed at by its onion service (electrs/Fulcrum expose one in a
+    few lines of torrc); no second code path, no clearnet path, no plaintext
+    path exists to misconfigure.
   * TLS is unverified by default, as every Electrum client's is against
     self-signed servers -- that stops a passive listener, not an active one.
     Over a `.onion` there is no exit hop and the onion address itself
     authenticates the server, so that is the sound third-party choice. For
     a clearnet server, give its certificate's SHA-256 as a PIN with the
     server entry -- (host, port, pin) -- and a certificate that does not
-    match is refused; every result carries the certificate it saw, so a
-    caller can record it once and pin from then on.
+    match is refused AND ends the look at once (PinMismatch): a detected
+    interception is not a dead server to route around. Every result carries
+    the certificate it saw, so a caller can record it once and pin from
+    then on.
   * Nothing here is written to the hash chain. Watching is frequent and the
     deep-read pass already taught that a frequent path must not flood the SD
     card. The caller records a state CHANGE, never a poll.
@@ -80,6 +86,7 @@ only ever answers "did the money arrive, and which of it is settled".
 import hashlib
 import hmac
 import json
+import math
 import socket
 import ssl
 import struct
@@ -147,7 +154,14 @@ _ATYP_IPV4, _ATYP_DOMAIN, _ATYP_IPV6 = 0x01, 0x03, 0x04
 
 
 class BtcWatchError(Exception):
-    """A watch could not be completed. Never carries key material."""
+    """A watch could not be completed. Never carries key material, and never
+    text a server or the network chose."""
+
+
+class PinMismatch(BtcWatchError):
+    """A PINNED server presented a different certificate. That is a detected
+    interception, not a dead server: look() raises it at once instead of
+    quietly failing over to the next server and hiding the signal."""
 
 
 # --- derivation and scripthash: pure, no network, no secret -----------------
@@ -283,31 +297,34 @@ def _split_hostport(spec, default_port=None):
     """'host', 'host:port' or '[v6]:port' -> (host, port). Raises on a port
     that is not a number in 1..65535, on an empty host, and on a bare IPv6
     literal (ambiguous: bracket it)."""
+    # The messages deliberately do not repeat the spec: it names a machine
+    # (a server, or the proxy host), and an error is the one string a caller
+    # is likeliest to log.
     spec = str(spec).strip()
     if spec.startswith("["):
         host, sep, rest = spec[1:].partition("]")
         if not sep:
-            raise BtcWatchError(f"malformed address {spec!r}")
+            raise BtcWatchError("address: unclosed IPv6 bracket")
         port = rest[1:] if rest.startswith(":") else (None if not rest
                                                      else "")
     elif spec.count(":") > 1:
-        raise BtcWatchError(f"bracket an IPv6 literal: {spec!r}")
+        raise BtcWatchError("address: bracket an IPv6 literal")
     else:
         host, sep, port = spec.partition(":")
         if not sep:
             port = None
     if not host:
-        raise BtcWatchError(f"empty host in {spec!r}")
+        raise BtcWatchError("address: empty host")
     if port is None:
         if default_port is None:
-            raise BtcWatchError(f"a port is required in {spec!r}")
+            raise BtcWatchError("address: a port is required")
         return host, default_port
     try:
         p = int(port)
     except ValueError:
-        raise BtcWatchError(f"port is not a number in {spec!r}")
+        raise BtcWatchError("address: port is not a number")
     if not 1 <= p <= 0xFFFF:
-        raise BtcWatchError(f"port out of range in {spec!r}")
+        raise BtcWatchError("address: port out of range")
     return host, p
 
 
@@ -409,8 +426,13 @@ def _socks5_connect(dest_host, dest_port, proxy_host, proxy_port,
         # up with an error that points nowhere near the cause.
         if not (1 <= len(u) <= 255 and 1 <= len(p) <= 255):
             raise BtcWatchError("socks: credential must be 1..255 bytes")
-    sock = socket.create_connection((proxy_host, int(proxy_port)),
-                                    timeout=_remaining(deadline))
+    try:
+        sock = socket.create_connection((proxy_host, int(proxy_port)),
+                                        timeout=_remaining(deadline))
+    except UnicodeError:
+        # The resolver's IDNA codec, on a proxy host that is not a valid
+        # hostname: a configuration fault, reported as one.
+        raise BtcWatchError("socks: proxy host is not a valid hostname")
     try:
         # Greeting: offer exactly ONE method, and require that one back. A
         # proxy answering "no auth" when a credential was offered would give
@@ -458,6 +480,16 @@ def _socks5_connect(dest_host, dest_port, proxy_host, proxy_port,
         raise
 
 
+def _tls_context():
+    """TLS 1.2 or newer, no authority verification (Electrum servers are
+    self-signed; pinning is the authentication, see _wrap_tls)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _wrap_tls(sock, server_name, deadline, pin=None):
     """Wrap a connected socket in TLS 1.2+ and return (tls_socket,
     certificate_sha256).
@@ -470,12 +502,11 @@ def _wrap_tls(sock, server_name, deadline, pin=None):
     server is authenticated and a wrong certificate is refused. Over a
     .onion no exit exists and the onion address does the authenticating.
     """
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     sock.settimeout(_remaining(deadline))
-    tls = ctx.wrap_socket(sock, server_hostname=server_name)
+    try:
+        tls = _tls_context().wrap_socket(sock, server_hostname=server_name)
+    except UnicodeError:
+        raise BtcWatchError("tls: server name is not a valid hostname")
     try:
         der = tls.getpeercert(binary_form=True)
         if not der:
@@ -485,7 +516,7 @@ def _wrap_tls(sock, server_name, deadline, pin=None):
             # The fingerprint is deliberately NOT in the message: it is a
             # fact about what an attacker presented, and it would otherwise
             # travel wherever the error is logged.
-            raise BtcWatchError("tls: certificate does not match the pin")
+            raise PinMismatch("tls: certificate does not match the pin")
         return tls, seen
     except BaseException:
         try:
@@ -587,7 +618,12 @@ def _error_code(err):
     it, so passing it on would carry the scripthash into whatever the
     caller logs."""
     code = err.get("code") if isinstance(err, dict) else None
-    if isinstance(code, int) and not isinstance(code, bool):
+    # A JSON integer is arbitrary-precision, so an unbounded pass-through
+    # would be a 256-bit channel for a server to put a scripthash into the
+    # error after all. Real codes (JSON-RPC's -32768..-32000, Electrum's
+    # small positives) fit in 16 bits; anything else is "unknown".
+    if isinstance(code, int) and not isinstance(code, bool) \
+            and -32768 <= code <= 32767:
         return code
     return "unknown"
 
@@ -689,6 +725,10 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
     if not _is_uint(min_conf) or min_conf < 1:
         raise BtcWatchError("min_conf must be an int of at least 1: an "
                             "unconfirmed deposit is never settled money")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+            or not math.isfinite(timeout) or timeout <= 0:
+        raise BtcWatchError("timeout must be a finite, positive number of "
+                            "seconds")
     if not servers:
         raise BtcWatchError("no Electrum servers configured")
     checked = []
@@ -706,6 +746,10 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
     start = int(scripthash[:8], 16) % len(checked)
     order = checked[start:] + checked[:start]
     tag = "btcwatch:" + address       # one circuit per address; see the header
+    if transport_factory is None:
+        # A proxy URL that can never work is ONE configuration refusal,
+        # not a failover per configured server.
+        _socks_parts(proxy_url, tag)
     last = None
     for host, port, pin in order:
         if transport_factory is not None:
@@ -718,6 +762,9 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
                 e.handshake()
                 tip = e.tip_height()
                 picture = summarize(e.listunspent(scripthash), tip, min_conf)
+        except PinMismatch:
+            # A detected interception is not a dead server to route around.
+            raise
         except (BtcWatchError, OSError) as ex:
             last = ex
             continue
@@ -768,7 +815,8 @@ def _main(argv=None):
           f"mempool: {r['unconfirmed_sat']} sat  "
           f"newest depth: {r['confirmations']}  outputs: {len(r['utxos'])}")
     if r.get("cert_sha256"):
-        print(f"  server certificate sha256 (pin it): {r['cert_sha256']}")
+        print(f"  certificate sha256 of {r['server']} (pin it as "
+              f"HOST:PORT,PIN): {r['cert_sha256']}")
     return 0
 
 
