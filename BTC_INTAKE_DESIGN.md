@@ -69,12 +69,21 @@ secp256k1; everything here uses libsodium (ed25519/X25519) — the wrong curve.
 Building this needs a vetted BTC library on the vault. **Hand-rolling
 elliptic-curve transaction signing for real money is forbidden.**
 
-Recommendation: **`embit`** — small, auditable, pure-Python, built for
+Decided and done (stage 0): **`embit`** — small, auditable, built for
 air-gapped/offline signing (SeedSigner, Specter-DIY). Covers BIP32 (watch-only
 derivation on the Pi and signing on the vault), bech32/bech32m, and PSBT/tx
-construction. **Vendored into the repo and pinned**, so exactly what runs is in
-the tree and auditable. If the operator prefers another library to audit
-(`coincurve` for libsecp256k1 bindings, say), name it and the design adapts.
+construction. **Vendored into the repo, trimmed to the used surface, and
+pinned**, so exactly what runs is in the tree and auditable; its in-package
+native blobs are deleted.
+
+**Constant-time is not optional for the signer.** embit's pure-Python curve is
+variable-time — a timing side channel on the key that moves the money. So the
+vendored selector prefers the **system** libsecp256k1 (Bitcoin Core's
+constant-time library, installed from the distro's signed `libsecp256k1-1`
+package, the same trust root as the rest of the OS) and exposes which backend
+is live (`NATIVE` / `BACKEND`). The vault installs it and the signing path
+(stage 2) refuses to sign without it. The watch-only Pi holds no secret and is
+correct on the pure-Python fallback, so it needs no native library.
 
 Until a library is chosen, nothing can derive even one real address, so stage 1
 cannot begin. This is the gate, not a preference.
