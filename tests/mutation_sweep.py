@@ -4260,6 +4260,21 @@ MUTATIONS = [
   '        sock.settimeout(_remaining(deadline))\n        try:\n            chunk = sock.recv(n - len(out))',
   '        sock.settimeout(None)\n        try:\n            chunk = sock.recv(n - len(out))',
   ['test_btc_watch']),
+ ('a pinned server presenting the wrong certificate is accepted (exit MITM)',
+  'gs_btc_watch.py',
+  '        if pin is not None and not hmac.compare_digest(seen, pin):',
+  '        if False:',
+  ['test_btc_watch']),
+ ("a system error's own text (which can name a peer) travels in look()'s error",
+  'gs_btc_watch.py',
+  '    why = str(last) if isinstance(last, BtcWatchError) \\\n        else type(last).__name__',
+  '    why = str(last) if isinstance(last, BaseException) \\\n        else type(last).__name__',
+  ['test_btc_watch']),
+ ("a server's error TEXT is copied into the error the caller logs",
+  'gs_btc_watch.py',
+  '    if isinstance(code, int) and not isinstance(code, bool):\n        return code\n    return "unknown"',
+  '    if isinstance(code, int) and not isinstance(code, bool):\n        return code\n    return str(err)',
+  ['test_btc_watch']),
 ]
 
 

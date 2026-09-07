@@ -168,6 +168,33 @@ check("a key one level below the account (depth 4) is refused too",
 check("an unknown network name is refused",
       _refused(W.derive_receive_address, _ACCT_XPUB, 0, network="mars"))
 
+
+def _errtext(fn, *a, **k):
+    try:
+        fn(*a, **k)
+        return None
+    except W.BtcWatchError as e:
+        return str(e)
+
+
+check("the xPRV refusal never echoes the key it refused (the error class "
+      "promises: never carries key material)",
+      _ACCT_XPRV[:12] not in _errtext(W.derive_receive_address, _ACCT_XPRV, 0)
+      and _ACCT_XPRV[-12:] not in _errtext(W.derive_receive_address,
+                                           _ACCT_XPRV, 0))
+check("...and it says WHY -- a private key was handed to the watch-only box "
+      "-- rather than falling through to the version-bytes check, so an "
+      "operator who pasted the wrong key is told exactly that",
+      "xPRV" in _errtext(W.derive_receive_address, _ACCT_XPRV, 0))
+check("the junk refusal never echoes the junk",
+      "not-an-xpub" not in _errtext(W.derive_receive_address,
+                                    "not-an-xpub", 0))
+check("no derivation refusal echoes the input xpub either",
+      all(_ACCT_XPUB[:12] not in (_errtext(W.derive_receive_address,
+                                           _ACCT_XPUB, *a, **k) or "")
+          for a, k in ((( -1,), {}), ((0,), {"network": "testnet"}),
+                       ((0,), {"change": 2}))))
+
 # ===========================================================================
 print("\n== scripthash: cross-computed from the address, not from the module ==")
 _A0 = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
@@ -242,6 +269,10 @@ check("two mempool outputs sum; a negative Electrum height (-1, unconfirmed "
 check("tx_hash is normalised to lower case, vout carried through",
       W.summarize([_u(1, 1, _H.upper(), 7)], 1, 1)["utxos"][0]
       == {"tx_hash": _H, "vout": 7, "value": 1, "confirmations": 1})
+check("classify truth table: (mined, mempool, settled) -> state",
+      [W.classify(*t) for t in ((0, 0, 0), (5, 0, 0), (0, 5, 0), (5, 5, 0),
+                                (5, 0, 5), (12, 7, 3))]
+      == ["not_seen", "seen", "seen", "seen", "confirmed", "confirmed"])
 
 for _label, _bad in [
         ("value as a string", [_u(1, "5")]),
@@ -263,17 +294,24 @@ for _label, _bad in [
 
 # ===========================================================================
 print("\n== host:port parsing, for the proxy and the server list ==")
-check("a bare host takes the TLS default port",
-      W.parse_server("s.onion") == ("s.onion", 50002))
+check("a bare host takes the TLS default port and no pin",
+      W.parse_server("s.onion") == ("s.onion", 50002, None))
 check("host:port is honoured",
-      W.parse_server("s.onion:50001") == ("s.onion", 50001))
+      W.parse_server("s.onion:50001") == ("s.onion", 50001, None))
 check("a bracketed IPv6 literal parses",
-      W.parse_server("[::1]:50001") == ("::1", 50001)
-      and W.parse_server("[::1]") == ("::1", 50002))
+      W.parse_server("[::1]:50001") == ("::1", 50001, None)
+      and W.parse_server("[::1]") == ("::1", 50002, None))
 check("a bare IPv6 literal is refused as ambiguous",
       _refused(W.parse_server, "::1"))
+_PIN = "ab" * 32
+check("host:port,pin carries the certificate pin, lower-cased, with or "
+      "without a sha256: prefix",
+      W.parse_server(f"s.onion:50002,{_PIN}") == ("s.onion", 50002, _PIN)
+      and W.parse_server(f"s.onion,sha256:{_PIN.upper()}")
+      == ("s.onion", 50002, _PIN))
 for _spec in ("s.onion:0", "s.onion:70000", "s.onion:abc", ":50002", "",
-              "[::1", "s.onion:-5"):
+              "[::1", "s.onion:-5", "s.onion,abc", "s.onion," + "zz" * 32,
+              "s.onion," + "ab" * 31):
     check(f"a bad server spec is refused up front: {_spec!r}",
           _refused(W.parse_server, _spec))
 
@@ -597,6 +635,10 @@ check("...and the clock was re-armed from the deadline before each of the "
 _t = _transport([b"x" * 65536] * 40)
 check("a line that never ends is cut off at MAX_LINE_BYTES",
       _refused(_t.recv_line))
+_t = _transport([b"{}\n"] * 3)
+_t._received = W.MAX_SESSION_BYTES - 1
+check("a server that has sent MAX_SESSION_BYTES in one exchange is cut off, "
+      "however well-formed its lines", _refused(_t.recv_line))
 _t = _transport([])
 check("a connection closed mid-line is a loud failure", _refused(_t.recv_line))
 _t = _transport([b"late\n"], deadline=time.monotonic() - 1)
@@ -626,14 +668,15 @@ print("\n== END TO END: real transport + real client, through the mock proxy "
 _SCEN = {"tip": _TIP, "utxos": [_u(_TIP - 2, 700000)]}
 
 
-def _e2e(scenario, *, tls_ctx=None, min_conf=1, timeout=5.0):
+def _e2e(scenario, *, tls_ctx=None, min_conf=1, timeout=5.0, pin=None):
     port, cap, srv = _mock_socks("electrum", scenario, tls_ctx=tls_ctx)
     proxy = f"socks5h://127.0.0.1:{port}"
 
     def factory(host, p, tag):
         cap["tag"] = tag
         return W.SocksTlsTransport(host, p, proxy, tag,
-                                   tls=tls_ctx is not None, timeout=timeout)
+                                   tls=tls_ctx is not None, timeout=timeout,
+                                   pin=pin)
     try:
         r = W.look(_A0, [("watch.example.onion", 50002)], proxy,
                    min_conf=min_conf, transport_factory=factory)
@@ -662,6 +705,11 @@ check("...and the server was asked ONLY the three read-only methods, "
       _cap["methods_asked"] == ["server.version",
                                 "blockchain.headers.subscribe",
                                 "blockchain.scripthash.listunspent"])
+check("...announcing a stock wallet's version string, not a bare badge",
+      _cap["requests"][0]["params"] == [W.CLIENT_NAME, "1.4"]
+      and W.CLIENT_NAME.startswith("electrum/") and "." in W.CLIENT_NAME)
+check("...and a plaintext session reports no certificate",
+      _r["cert_sha256"] is None)
 
 _r, _cap = _e2e({"tip": _TIP, "utxos": [_u(_TIP - 2, 700000)],
                  "notify_before": 3})
@@ -692,12 +740,46 @@ with open(_cert_path, "w") as _fh:
     _fh.write(_CERT)
 _sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 _sctx.load_cert_chain(_cert_path)
+_CERT_SHA256 = hashlib.sha256(ssl.PEM_cert_to_DER_cert(
+    _CERT.split("-----END CERTIFICATE-----")[0]
+    + "-----END CERTIFICATE-----\n")).hexdigest()
 _r, _cap = _e2e(_SCEN, tls_ctx=_sctx, min_conf=1)
 check("TLS end to end: SOCKS5, then TLS to a self-signed server, then the "
       "client -- confirmed, with the right figures",
       _r["state"] == "confirmed" and _r["settled_sat"] == 700000)
 check("...and the session was TLS 1.2 or newer",
       _cap.get("tls_version") in ("TLSv1.2", "TLSv1.3"))
+check("...and the result carries the certificate's SHA-256, so a caller can "
+      "record it once and pin from then on",
+      _r["cert_sha256"] == _CERT_SHA256)
+_r, _cap = _e2e(_SCEN, tls_ctx=_sctx, min_conf=1, pin=_CERT_SHA256)
+check("with the RIGHT pin the session completes",
+      _r["state"] == "confirmed" and _r["cert_sha256"] == _CERT_SHA256)
+_r, _cap = _e2e(_SCEN, tls_ctx=_sctx, pin="sha256:" + _CERT_SHA256.upper())
+check("...however the pin is spelled", _r["state"] == "confirmed")
+_wrong = "00" * 32
+_port, _cap, _srv = _mock_socks("electrum", _SCEN, tls_ctx=_sctx)
+_proxy = f"socks5h://127.0.0.1:{_port}"
+try:
+    W.look(_A0, [("watch.example.onion", 50002)], _proxy,
+           transport_factory=lambda h, p, t: W.SocksTlsTransport(
+               h, p, _proxy, t, tls=True, timeout=5.0, pin=_wrong))
+    _pinned = False
+    _pmsg = ""
+except W.BtcWatchError as _e:
+    _pinned = True
+    _pmsg = str(_e)
+finally:
+    _srv.close()
+check("with a WRONG pin the certificate is refused and look() fails loudly: "
+      "an exit terminating TLS itself would be caught", _pinned)
+check("...and neither fingerprint is in the error (a fact about what an "
+      "attacker presented would otherwise travel with the log)",
+      _CERT_SHA256 not in _pmsg and _wrong not in _pmsg)
+check("...and the mock server was never asked a question over that session",
+      _cap["methods_asked"] == [])
+check("a malformed pin is refused before any connection",
+      _refused(W.SocksTlsTransport, "h", 1, _PROXY, "t", pin="abc"))
 os.remove(_cert_path)
 
 # a server that hangs up straight after the SOCKS handshake, via the real
@@ -846,6 +928,9 @@ for _label, _ft in [
             "blockchain.headers.subscribe": "not json"})),
         ("a non-object frame", _FakeTransport(raw={
             "blockchain.headers.subscribe": "[1,2,3]"})),
+        ("a line nested a hundred thousand deep (json raises "
+         "RecursionError, not ValueError)", _FakeTransport(raw={
+             "blockchain.headers.subscribe": "[" * 100000})),
         ("an error reply to our request", _FakeTransport(raw={
             "blockchain.scripthash.listunspent":
             '{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"no"}}'})),
@@ -872,39 +957,78 @@ for _label, _ft in [
           f"stray exception or an invented state", _refused(_look, _ft))
 
 
-# failover: the first transport dies at connect, the second answers.
+# failover: whichever server this address starts at, the first transport
+# dies at connect and the second answers. (Which server is first is the
+# address's own choice -- see the rotation checks below.)
+_order = []
+
+
 def _failover_factory(host, port, tag):
-    if host == "dead.onion":
+    _order.append(host)
+    if len(_order) == 1:
         return _FakeTransport(connect_error=OSError("circuit died"))
     return _FakeTransport(utxos=[_u(_TIP - 1, 700000)])
 
 
-_r = W.look(_A0, [("dead.onion", 50002), ("live.onion", 50002)], _PROXY,
+_r = W.look(_A0, [("x.onion", 50002), ("y.onion", 50002)], _PROXY,
             transport_factory=_failover_factory)
-check("a dead first server fails over to a live second one",
-      _r["state"] == "confirmed" and _r["server"] == "live.onion"
+check("a dead first server fails over to the live second one",
+      _r["state"] == "confirmed" and len(_order) == 2
+      and _r["server"] == _order[1] and _order[0] != _order[1]
       and _r["confirmed_sat"] == 700000)
 
 _bad = _FakeTransport(unspent_reply=[_u(1, "5")])
 _good = _FakeTransport(utxos=[_u(_TIP, 1)])
+_order.clear()
 _r = W.look(_A0, [("a.onion", 50002), ("b.onion", 50002)], _PROXY,
-            transport_factory=lambda h, p, t: _bad if h == "a.onion"
-            else _good)
+            transport_factory=lambda h, p, t: (_order.append(h),
+                                               _bad if len(_order) == 1
+                                               else _good)[1])
 check("a server whose reply is malformed is failed over, and its transport "
       "was closed on the way out",
-      _r["server"] == "b.onion" and _bad.closed and _good.closed)
+      _r["server"] == _order[1] and _bad.closed and _good.closed)
 
 check("every server dead: look() raises, naming the last error",
       _raises(lambda: W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(
           _FakeTransport(connect_error=OSError("nope")))), W.BtcWatchError))
 try:
     W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(
-        _FakeTransport(connect_error=OSError("circuit died"))))
+        _FakeTransport(connect_error=OSError("refused by 10.1.2.3:9050"))))
     _msg = ""
 except W.BtcWatchError as _e:
     _msg = str(_e)
-check("...and the message says which failure it was",
-      "circuit died" in _msg)
+check("...by CLASS for a system error: the socket's own text (which can "
+      "name a peer) never travels with it",
+      "OSError" in _msg and "10.1.2.3" not in _msg
+      and "refused by" not in _msg)
+try:
+    W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(_FakeTransport(
+        raw={"blockchain.scripthash.listunspent":
+             '{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":'
+             '"SECRET-TEXT-CHOSEN-BY-SERVER"}}'})))
+    _msg = ""
+except W.BtcWatchError as _e:
+    _msg = str(_e)
+check("a server's error is reported by its CODE only: text the server chose "
+      "(ElectrumX echoes the scripthash there) never reaches the caller",
+      "code 1" in _msg and "SECRET" not in _msg)
+try:
+    W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(_FakeTransport(
+        raw={"blockchain.headers.subscribe":
+             '{"jsonrpc":"2.0","id":null,"error":"SECRET-TEXT"}'})))
+    _msg = ""
+except W.BtcWatchError as _e:
+    _msg = str(_e)
+check("...and the same for a null-id rejection with a bare-string error",
+      "code unknown" in _msg and "SECRET" not in _msg)
+try:
+    W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(
+        _FakeTransport(drop_after="blockchain.headers.subscribe")))
+    _msg = ""
+except W.BtcWatchError as _e:
+    _msg = str(_e)
+check("...while the module's OWN reason is repeated in full",
+      "connection closed" in _msg)
 check("no servers configured: refused up front",
       _refused(W.look, _A0, [], _PROXY, transport_factory=_one(
           _FakeTransport())))
@@ -923,6 +1047,12 @@ check("a bad server spec (port 0) is refused BEFORE any connection is tried",
 check("a server spec that is not a pair is refused",
       _refused(W.look, _A0, ["a.onion:50002"], _PROXY,
                transport_factory=_counting) and _calls == [])
+check("a server spec with a malformed pin is refused",
+      _refused(W.look, _A0, [("a.onion", 50002, "nope")], _PROXY,
+               transport_factory=_counting) and _calls == [])
+check("a four-element server spec is refused",
+      _refused(W.look, _A0, [("a.onion", 50002, None, 1)], _PROXY,
+               transport_factory=_counting) and _calls == [])
 for _mc in (0, -1, True, "1", 1.0):
     check(f"min_conf={_mc!r} is refused: an unconfirmed deposit is never "
           f"settled money", _refused(_look, _FakeTransport(), min_conf=_mc))
@@ -937,6 +1067,15 @@ check("a legacy (non-segwit) address is refused by look(): it is not a kind "
       "this module ever derives", _refused(
           W.look, "1BitcoinEaterAddressDontSendf59kuE", _SERVERS, _PROXY,
           transport_factory=_counting))
+_TAPROOT = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+check("a taproot (bc1p, witness v1) address is refused by look() for the "
+      "same reason, even though it is valid bech32m on this network",
+      bech32.decode("bc", _TAPROOT)[0] == 1
+      and _refused(W.look, _TAPROOT, _SERVERS, _PROXY,
+                   transport_factory=_counting))
+check("a P2WSH (bc1q, 32-byte) address is refused by look() too",
+      _refused(W.look, "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q"
+               "ccfmv3", _SERVERS, _PROXY, transport_factory=_counting))
 check("an unknown network is refused by look()",
       _refused(W.look, _A0, _SERVERS, _PROXY, network="mars",
                transport_factory=_counting))
@@ -957,6 +1096,54 @@ W.look(_addrs[0], _SERVERS, _PROXY, transport_factory=_tag_factory)
 check("look() isolates each address on its own circuit tag: the address is "
       "in the tag, two addresses give two tags, a retry gives the same tag",
       _addrs[0] in _tags[0] and _tags[0] != _tags[1] and _tags[0] == _tags[2])
+
+_seen = []
+
+
+def _seen_factory(host, port, tag):
+    _seen.append((host, tag))
+    if host == "dead.onion":
+        return _FakeTransport(connect_error=OSError("down"))
+    return _FakeTransport()
+
+
+def _first_dies_factory(host, port, tag):
+    _seen.append((host, tag))
+    if len(_seen) == 1:
+        return _FakeTransport(connect_error=OSError("down"))
+    return _FakeTransport()
+
+
+W.look(_addrs[0], [("p.onion", 50002), ("q.onion", 50002)], _PROXY,
+       transport_factory=_first_dies_factory)
+check("within ONE look(), the failover server is reached on the SAME "
+      "circuit tag as the dead one: a retry is not a new fact to leak",
+      len(_seen) == 2 and _seen[0][1] == _seen[1][1]
+      and _seen[0][0] != _seen[1][0]
+      and _seen[0][1] == "btcwatch:" + _addrs[0])
+
+# no single server sees every address: the starting server is chosen by
+# the address's own scripthash, and every server is still tried on failure.
+_THREE = [("a.onion", 50002), ("b.onion", 50002), ("c.onion", 50002)]
+_by_start = {}
+for _a in _addrs:
+    _by_start.setdefault(
+        int(W.address_to_scripthash(_a)[:8], 16) % 3, _a)
+_firsts = {}
+for _start, _a in sorted(_by_start.items()):
+    _seen.clear()
+    W.look(_a, _THREE, _PROXY, transport_factory=_seen_factory)
+    _firsts[_start] = _seen[0][0]
+check("with three servers configured, addresses start at different servers "
+      f"(seen: {sorted(_firsts.values())}) -- one third party never gets "
+      "the whole set", len(set(_firsts.values())) == 3
+      and _firsts == {0: "a.onion", 1: "b.onion", 2: "c.onion"})
+_seen.clear()
+_refused(W.look, _addrs[5], [("dead.onion", 1), ("dead.onion", 2),
+                             ("dead.onion", 3)], _PROXY,
+         transport_factory=_seen_factory)
+check("...and rotation is a rotation, not a truncation: every server is "
+      "still tried when all are dead", len(_seen) == 3)
 
 _ft = _FakeTransport(utxos=[_u(_TIP, 1)])
 _look(_ft)
