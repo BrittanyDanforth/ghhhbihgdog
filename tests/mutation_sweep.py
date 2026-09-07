@@ -4221,6 +4221,23 @@ MUTATIONS = [
   '    integrity_log("wake", "fee_sweep:done")',
   ['test_stability_pass']),
 
+ # ---- stage 1: watch-only BTC intake (gs_btc_watch) ----------------------
+ ('the watch-only Pi accepts an xPRV where an xPUB belongs', 'gs_btc_watch.py',
+  '    if hd.key.is_private:',
+  '    if False:',
+  ['test_btc_watch']),
+ ('look() stops isolating each address on its own Tor circuit', 'gs_btc_watch.py',
+  '    tag = "btcwatch:" + address       # one circuit per address; see the header',
+  '    tag = "btcwatch:one"       # one circuit per address; see the header',
+  ['test_btc_watch']),
+ ('a payment below the confirmation threshold is called confirmed', 'gs_btc_watch.py',
+  '                if confirmed > 0 and best >= min_conf:',
+  '                if confirmed > 0 and best >= 0:',
+  ['test_btc_watch']),
+ ('the deposit destination is sent as a raw IP, leaking DNS locally', 'gs_btc_watch.py',
+  '        s.sendall(b"\\x05\\x01\\x00\\x03" + bytes([len(host_b)]) + host_b',
+  '        s.sendall(b"\\x05\\x01\\x00\\x01" + bytes([len(host_b)]) + host_b',
+  ['test_btc_watch']),
 ]
 
 

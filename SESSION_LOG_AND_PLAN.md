@@ -124,6 +124,31 @@ suite goes red — proof the test is load-bearing, not decorative.
   one failing vector turned out to be a hand-typed expected string and was
   resolved against the canonical BIP32 value (embit's output was right).
 
+### Stage 1: watch-only derivation + Electrum-over-Tor detector (`gs_btc_watch.py`)
+- Pi-side, holds an xpub and no key, spends nothing. `derive_receive_address`
+  turns an account xpub + index into a unique bc1q address by PUBLIC BIP32
+  derivation (refuses a hardened index, a negative/boolean index, and an
+  xPRV — a Pi must never hold or reach a secret). `look()` asks an Electrum
+  server whether that address has been paid and how confirmed, returning
+  not_seen / seen / confirmed with the amounts and an exact confirmation
+  count, and raising only for "could not ask anyone" — never for "not paid".
+- Over Tor with ONE FRESH CIRCUIT PER ADDRESS: the tag is the address, fed
+  through `gs_common.isolated_proxy` so each address's query rides its own
+  Tor circuit (a server logging queries cannot cluster the operator's
+  addresses); a retry of one address reuses its circuit. SOCKS5 is
+  hand-rolled (a small framing protocol, not crypto, no new dependency) with
+  a DOMAINNAME CONNECT so DNS resolves at the proxy, never locally; TLS wraps
+  the stream. Servers are tried in order, so one dead server is not a dead
+  watch. Writes nothing to the hash chain (watching is frequent).
+- `tests/test_btc_watch.py` (34 checks): BIP84 known-answer derivation and
+  its refusals, the scripthash known-answer, per-address SOCKS username
+  isolation, the SOCKS5 handshake against a REAL in-process SOCKS5 server
+  (username carried, destination sent as a domain, auth-reject and
+  connect-refuse both loud), and the Electrum client + `look()` through every
+  state — nothing, mempool, below-threshold, confirmed — plus failover, a
+  skipped notification, a dropped connection, and the confirmations
+  arithmetic. Four mutation anchors, all caught.
+
 ### `cd3c1f9` — Design: BTC intake by unique address, host-side forward into the swap
 - `BTC_INTAKE_DESIGN.md`: the blueprint for the rework (section 4 below).
   Design only; nothing ships from it until each stage is validated.
@@ -362,7 +387,7 @@ rule-6 material).
 | # | Stage | State |
 |---|-------|-------|
 | 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
-| 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; dry-run seen/confirmed against a mock and testnet; no keys, no money; tests | **in progress** |
+| 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; seen/confirmed against a mock; no keys, no money; tests | **DONE** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 34/34, 4 anchors |
 | 2 | `forward_to_swap` job: build + sign the BTC tx (inputs from the derived address, OP_RETURN memo with the 80-byte handling, change), `--dry-run` prints and does not broadcast; fetch current inbound over Tor; `WIRE_VERSION` bump; testnet | pending |
 | 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
