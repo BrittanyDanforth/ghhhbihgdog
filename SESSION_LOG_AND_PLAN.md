@@ -1,197 +1,401 @@
-# Session log and plan — GhostSpiral phone bot
+# Session log, every fix, and the plan — GhostSpiral phone bot
 
-A single place to see what was changed in this working session, why, and what
-is planned next (the BTC-intake build). It is a handoff / context document, not
-a spec the code depends on. The authoritative spec for the new work is
-`BTC_INTAKE_DESIGN.md`; the authoritative OPSEC rules live in `OPSEC_SETUP.md`
-and `AGENTS.md`. Where they disagree with this file, they win.
+A complete handoff of this working session: what the system is, every change
+made and why, how each is validated, the decisions taken, and the staged plan
+for the BTC-intake rework. Written so a reader with no memory of this session
+(a person, or a later session) can pick up exactly where this stopped.
 
-Branch: `claude/phone-withdrawal-destinations-ey6ovb`.
+This is a context document. The authoritative spec for the new work is
+`BTC_INTAKE_DESIGN.md`; the authoritative operating rules are `OPSEC_SETUP.md`
+and `AGENTS.md`; the code and its tests are the truth. Where this file
+disagrees with any of those, they win.
 
----
-
-## The system in one paragraph
-
-Three machines. A **vault** laptop that holds the Monero keys, is OFF by
-default, and boots only to run ONE job then powers off (disk auto-unlocks on
-boot). A **Pi** that runs the Telegram pager, holds no wallet and no keys, and
-is assumed seizable. A **phone** on Telegram. The Pi wakes the vault with an
-authenticated magic packet (the "doorbell"); the vault does the job and reports
-back over the LAN. Everything the chat says is assumed readable by someone who
-is not the operator (AGENTS.md rule 6): no machine name, address, amount, memo,
-or shape of the arrangement in the transcript. Security rests on the keys, not
-on hiding the design (Kerckhoffs).
-
-Today a deposit is a ThorChain BTC→XMR swap the client pays directly: BTC to
-ThorChain's shared inbound vault with a swap memo in an OP_RETURN. The received
-XMR is mixed and later withdrawn to the client's own address.
+Branch: `claude/phone-withdrawal-destinations-ey6ovb`. Every commit named
+below is on it and pushed. No pull request has been opened (none was asked
+for). Development happens only on that branch.
 
 ---
 
-## What changed this session (newest first)
+## 1. What the system is (the facts every fix rests on)
 
-Commits are on the branch above. Every suite is run per-file
-(`python3 tests/test_X.py`), plus a mutation sweep (`tests/mutation_sweep.py`)
-whose anchors each flip one line of source and assert a named test goes red.
+**GhostSpiral** is a BTC→XMR privacy pipeline driven from a phone.
 
-### Deposit and withdraw wording, made plain (commits `a9976f0`, `58a1392`, `c63ca93`)
-- The deposit reply led with a confirmation number where the reader expected
-  the thing to pay, and printed the number twice. It now leads with the
-  payment: `here is how to pay`, then amount / address / `You get back` /
-  `Confirmation`, then two short instruction lines, then what to do next.
-- The three working lines lost their filler ("a few minutes", "looking"):
+- **Vault (laptop).** OFF by default. Boots on a wake, runs ONE job, powers
+  off, disk resealed (it auto-unlocks on boot, which is why "off" is the
+  security posture). Holds the Monero spend wallet and the receive wallet.
+  Tools: `gs_wake_agent` (the job runner), `GhostSpiral` (the mixer),
+  `create_receive_wallet`, `thor_swap_preparer` (ThorChain quote + memo),
+  `receive_watch`, `monero-wallet-rpc`. Also a separate hot **fee wallet**
+  with a threshold sweep (`--fee-sweep`), so a usage fee never lands on the
+  mixing wallet.
+- **Pi.** Always on, assumed seizable, holds NO wallet and NO keys. Runs
+  `gs_telegram_pager` (the Telegram bot) with an in-process `gs_doorbell`
+  (the wake/collect endpoint on a fixed LAN port). Persists exactly one file
+  (rate state, stamps coarsened to 5-minute buckets) and an integrity
+  hash-chain on the SD card.
+- **Phone.** Telegram. Talks only to the Pi. Every message in that chat is
+  assumed readable by someone who is not the operator.
+- **Wire.** `gs_wake_proto.py`: sealed M1/M2/M3 records between Pi and vault;
+  `validate_job` enforces an EXACT key set per job (adding a field is a wire
+  change: bump `WIRE_VERSION`, update both boxes together, an old box refuses
+  loud). Every job carries an `owner` token: 16 hex, derived one-way by the
+  pager from the asking chat, keyed by the pairing secret; `HOST_OWNER` is
+  all zeros. `WIRE_VERSION` is 3.
+- **Jobs** (`JOBS`): `receive_and_quote` (mint a receive subaddress + quote a
+  ThorChain swap to it; spends nothing), `watch` (long wait for a payment),
+  `swap_status` (the 5-minute /check: look once, answer in one word, power
+  off), `withdraw` (the only job that spends; runs GhostSpiral at a chosen
+  depth). `receive_new` (pay a subaddress directly in XMR) existed and was
+  removed as half-wired.
+- **The deposit today.** The client pays BTC to ThorChain's SHARED inbound
+  vault address with a swap memo (`=:XMR.XMR:<dest>:...`) in an OP_RETURN.
+  That memo is the only thing that routes the payment; BTC sent without it
+  arrives belonging to nobody. The received XMR lands on a fresh receive
+  subaddress minted for that deposit, is mixed, and is later withdrawn to the
+  client's own address(es).
+- **Phases** a /check can report (`PHASE_LINES`): `not_yet`, `arriving`
+  (received, not yet spendable), `landed` (CONFIRMED, spendable, the rest not
+  run yet), `short`, `stuck`, `more_left`, `more_locked`, `moved`, `partial`,
+  and `full` (the one refusal that carries a word: the vault is at capacity).
+- **Depths** (`WITHDRAW_DEPTHS`): 3 hops ≈ 6 h, 10 hops ≈ 9 h, 20 hops ≈ 13 h a
+  leg; the chat talks in hops, the wire in keys. A withdrawal with several
+  arrivals runs leg after leg (a chain) up to `MAX_CHAIN_LEGS`.
+- **Windows the Pi holds the line for** (`result_budget_s`): swap_status
+  1800 s, receive_and_quote 5100 s, watch 8700 s, withdraw 59700 s (≈17 h) —
+  which is why the working line says "Nothing else can run for up to N".
+
+### The two rules everything is measured against
+- **AGENTS.md rule 6.** Assume the chat is read by someone who is not the
+  operator and the Pi's SD card is in someone else's hands. Nothing may reach
+  either that names a machine, a tool, an address, an amount, a memo, or the
+  shape of the arrangement. Enforced by tests: a banned-word list (vault,
+  thorchain, monero, xmr, bitcoin, btc, memo, op_return, swap, wallet, tor,
+  mix/hop words, …) scanned over every literal the bot can send, a currency
+  scrub with a ceiling of zero, per-literal length caps, and welcome-text
+  sweeps for architecture words.
+- **Kerckhoffs.** Nothing rests on hiding how the system works; the repo is
+  the design. Security rests on the keys. Rule 6 is separate from this: it is
+  about what a *transcript* reveals, not about the design being secret.
+
+---
+
+## 2. Everything changed this session, by commit (newest first)
+
+Validation vocabulary: every suite runs per file (`python3 tests/test_X.py`,
+prints `RESULT: N passed, M failed`); `tests/mutation_sweep.py` holds
+**anchors**, each of which flips one exact line of source and asserts a named
+suite goes red — proof the test is load-bearing, not decorative.
+
+### `8c86548` — Stage 0: vendor embit (pure-Python), proven; session log + plan
+- `third_party/embit/` = embit 0.8.0 `src/embit/` verbatim, minus the seven
+  native libsecp256k1 blobs (`util/prebuilt/`, ~1.4 MB, deleted) and with
+  `util/secp256k1.py` pinned to the pure-Python `py_secp256k1` path that
+  embit ships and tests. MIT licence kept. `third_party/README.md` records
+  the sdist sha256, the two deviations, reproduction steps, and the three
+  expected inert import failures (`ctypes_secp256k1` with no native lib;
+  MicroPython-only `ubip39`/`uslip39`).
+- `tests/test_btc_embit.py` (30 checks) proves it against values published
+  outside this repo: BIP32 test vector 1 (master, `m/0h`, and the deep path
+  `m/0h/1/2h/2/1000000000` xprv+xpub), the BIP84 reference mnemonic's first
+  two receive and first change addresses, public derivation agreeing with
+  private derivation on a non-hardened path (the Pi/vault split in
+  miniature) and refusing hardened steps, fifty consecutive indexes giving
+  fifty distinct bc1q addresses, a testnet tb1 derivation, BIP173 bech32
+  decode/encode/round-trip and checksum rejection, HASH160('') against
+  RIPEMD160(SHA256('')), and secp256k1 sign→verify broken on a wrong hash and
+  a wrong key. It pins the vendoring: pure-Python path live, native path
+  never loaded, no binary in the tree.
+- A vacuous always-true check found in review was removed before commit; the
+  one failing vector turned out to be a hand-typed expected string and was
+  resolved against the canonical BIP32 value (embit's output was right).
+
+### `cd3c1f9` — Design: BTC intake by unique address, host-side forward into the swap
+- `BTC_INTAKE_DESIGN.md`: the blueprint for the rework (section 4 below).
+  Design only; nothing ships from it until each stage is validated.
+
+### `c63ca93` — Plain words on the three working lines and the deposit reply
+- Working lines lost their filler. Now:
   `depo: getting your payment details now. They come here. Nothing else can
-  run for up to {how}.`; `check: checking now. ...`; `withdraw: sending now.
-  About {N}h. ... Nothing else can run for up to {how}.` The withdraw variant
-  keeps "Nothing else can run", which the chain tests pin.
-- The note instruction now says WHY, in plain words the transcript may leak
-  without cost: `The code above is the note for this payment — add it to the
-  payment. Most phone apps CANNOT add a note, and without it the money never
-  arrives.` The note stays because ThorChain requires it; only the wording
-  changed. The once-rule names the address: `Pay it once. Never send to this
-  address again — a second payment, now or later, loses the money.`
-- The `arriving` status line says `received — waiting for it to confirm. Not
-  spendable yet; ask again shortly.` instead of "something arrived".
+  run for up to {how}.` / `check: checking now. I will tell you here. Nothing
+  else can run for up to {how}.` / `withdraw: sending now. About {N}h. I will
+  tell you here when it is done — you can close this. Nothing else can run
+  for up to {how}.` "Nothing else can run" stays in every variant (the chain
+  tests count it once per chain; it is what makes the next "busy" read as
+  expected).
+- Deposit reply opens `here is how to pay.` The receipt's `Expected out`
+  reads `You get back`. The instruction lines: `The code above is the note
+  for this payment — add it to the payment. Most phone apps CANNOT add a
+  note, and without it the money never arrives.` and `Pay it once. Never send
+  to this address again — a second payment, now or later, loses the money.`
+  Trailer: `When it is paid, tap below or /check that number — it tells you
+  when the money has arrived. Then /withdraw sends it on.` The two mutation
+  anchors on the instruction sentences follow; the OPSEC doc's transcript
+  example follows.
 
-### Deep-read stability pass (commit `767909b`, tests in `tests/test_stability_pass.py`)
-An end-to-end read for half-wired / unstable / hot-loop paths, each fix driven
-by a staged failure and pinned by a mutation anchor:
-- `start_job` owns the ONE release of `busy` through a flag, so a gate that
-  raises (integrity_log on a full SD card) cannot leak the lock or free it
-  twice.
-- A failed start clears the persisted in-flight bit as well as the lock.
-- Silent refusals (stranger chats, non-operator senders, unknown commands,
-  id-less updates) count every one but reach the hash chain at most once per
-  kind per 10 minutes — a stranger can no longer flood the SD card.
-- A `getUpdates` batch that cannot advance the cursor pauses one poll period
-  instead of hot-looping.
-- `burn_all` is capped at 32 deletes per tick and re-arms as a continuation;
-  `burn_signal` is logged once per signal, not once per pass.
-- `Limits` (the one persisted file) is written under one re-entrant lock from
-  both threads, bit + window as one picture; `why_not` treats a backwards
-  clock jump as elapsed.
-- The second label-backoff site is exponent-capped (no `OverflowError`).
-- `_places` and `handle_owner` are walked from snapshots under a lock.
-- Vault: `main()` remembers a `Refused(power=False)` instead of re-deciding at
-  power-off; the accounts a mix minted are asked for 3× before giving up and
-  said on the chain when unreadable; a failed withdrawal shreds its entry
-  bundle; the fee sweep retires its bundle on failure and success.
-- Shared: `integrity_log` reads the chain's last hash from the file TAIL in
-  4 KiB steps, not a whole-file read; `atomic_write_json` gives each write its
-  own `mkstemp` name so two writers cannot truncate each other's tmp.
+### `58a1392` — Say why the note matters; say "received" when money is in but not yet spendable
+- `arriving` phase line: `received — waiting for it to confirm. Not spendable
+  yet; ask again shortly.` (was "something arrived and is still confirming",
+  which made a reader ask what "something" was).
+- The phone warning now states its reason (the note is what makes the money
+  arrive) instead of ordering. Verified first that `/deposit` already asks
+  the amount + a confirm sum and `/withdraw` already asks the destination
+  address(es), the depth, and a confirm that says it spends — the bot was
+  never skipping those; the load-model page's simulation was, and it was
+  republished walking the real wizard.
 
-### Multi-client capacity + fund isolation (commits `c2656ec`, `30f94fa`, earlier)
-- Several people on one vault: an **owner token** on every job (derived from
-  the asking chat, one-way, keyed by the pairing secret); a vault ledger of
-  which wallet ACCOUNTS each owner's deposits and mixes created; spend
-  selection that never leaves that set. `--max-clients N` = places (deposits
-  in flight); the allowlist may be longer; everyone past it hears "full" from
-  the Pi's memory with no wake spent. The one-person rule fires only on a bot
-  built for one. A chain yields its turn when someone was refused during it.
-- Capacity is DERIVED, not "10": the smallest of three bounds — accounts
-  (`accounts_now + 30 × (in_flight + 1) ≤ ceiling`), wakes/day, and wall clock
-  (legs run one at a time). At the shipped defaults it is ONE; sized per
-  OPSEC_SETUP.md §4f it is a few. The load-model artifact ("Places on One
-  Vault") visualises this and is read out of the shipped constants.
+### `a9976f0` — Deposit reply: lead with the payment, say the two rules in two sentences
+- The reply used to open `pay this. Confirmation number: A3F1-9C2B7E01`, so
+  the first thing a reader with money in hand saw was a reference code where
+  they expected the thing to pay, then the same code again four lines down.
+  The receipt now leads with amount and address; the number is one line of
+  the receipt.
 
-### Earlier phases (summarised)
-OPSEC leak closure on the transcript and the Pi's disk; button / instability /
-stale-value / fake-wiring fixes; fee never onto the mixing wallet; hot fee
-wallet with a threshold sweep; service-lifecycle pass (fees always swept,
-restart resilience, multi-deposit tracking); the phone-only deposit rework
-(note first and alone, vault re-checks `memo_binds_destination`).
+### `767909b` — Deep-read pass: leaked locks, hot loops, chain floods, racing saves
+An end-to-end read for half-wired / unstable code. Every fix is driven by a
+staged failure in `tests/test_stability_pass.py` (50 checks) and pinned by
+18 new anchors, all caught.
+- **Pager.** `start_job` owns the ONE release of `busy` through an ownership
+  flag (`_give_back`): a chained leg whose gate raised (integrity_log on a
+  full SD card) used to keep the lock for the life of the process, and
+  releasing from the worker's except could free a lock the poll thread had
+  just taken. A failed start clears the persisted in-flight bit as well as the
+  lock. Silent refusals (stranger chats, non-operator senders, unknown
+  commands, id-less updates) count every one but reach the hash chain at most
+  once per kind per 10 minutes (`_log_ignored`, `IGNORED_LOG_EVERY_S=600`) —
+  a stranger could put thousands of lines on the card in an hour. A
+  getUpdates batch that cannot advance the cursor (all chaff, or a dict with
+  no id) waits one poll period instead of spinning. `burn_all` is capped at 32
+  deletes per tick and re-arms as a continuation; "burn_signal" is chained
+  once per signal, not once per pass (a dead circuit re-armed it every tick).
+  `Limits` (the one persisted file) is written under one re-entrant lock from
+  both threads, in-flight bit and window as one picture; `why_not` treats a
+  backwards clock jump (Pi has no battery clock) as elapsed. The second
+  label-backoff site is exponent-capped (`60.0 * 2**1030` raised
+  OverflowError and turned a chat's every later /check into "update
+  dropped"). `_places` and `handle_owner` are walked from snapshots under a
+  lock.
+- **Vault.** `main()` remembers a `Refused(power=False)` instead of
+  re-deciding from a hand-typed pair of codes at power-off (the box a person
+  is using stays on). The accounts a mix minted are asked for three times
+  before giving up, and an unreadable answer is written to the chain and the
+  terminal rather than silently leaving the owner's change unattributed. A
+  failed withdrawal shreds its entry bundle (it named the account it spent
+  from) like a finished one; the fee sweep retires its bundle on the failed
+  leg and after the last. The status file is unlinked once reported; the
+  withdrawal minimum comes from the wire's depth table, not a duplicated
+  literal.
+- **Shared.** `integrity_log` reads the chain's last hash from the file TAIL
+  in 4 KiB steps instead of reading and splitting the whole chain on every
+  call. `atomic_write_json` gives each write its own `mkstemp` name beside
+  the file (two writers of one path could truncate each other's tmp and
+  rename an empty file over the real one).
+- Test-side: a corrupted test file with an unterminated string literal was
+  repaired before commit; a fee-kind pin that matched a name only a comment
+  still carried now asserts the three real kinds.
 
-### Validation state
-40 of 40 suites green on the last full run; 447 mutation anchors match and each
-new one is caught. `tests/test_btc_embit.py` (stage 0 below) adds 30 more,
-green.
+### `30f94fa` — Give a phone-only client something to pay: the note travels, first and checked
+- With `--deposit-in-chat`, the memo (the note) travels in the plain slip
+  (`PLAIN_FIELDS` includes `m`), is sent as its own message FIRST and ALONE so
+  a tap-and-hold copies it cleanly, with one retry; if it does not get
+  through, the chat hears "nothing to pay yet" and the address is NEVER sent
+  (an address without its note is a trap, not a partial delivery). The vault
+  re-checks `memo_binds_destination` before building the record. The
+  doorbell's console prints the note first too. OPSEC_SETUP.md §8 documents
+  the mode.
+
+### `c2656ec` — Serve several people on one vault: owner tokens, places, "busy" and "full"
+- **Fund isolation.** Owner token on every job; a vault ledger (`handles` +
+  `owners` envelope) of which wallet ACCOUNTS each owner's deposits and mixes
+  created; `_funded_entry(owned_accounts=)` and `_locked_value(owned_accounts=)`
+  never leave that set; `_reusable_receive` never hands one owner's unquoted
+  address to another; a /check on someone else's label is refused on both
+  boxes.
+- **Capacity.** `--max-clients N` = places (deposits in flight); the
+  allowlist may be longer; `_places()` prunes after `DEPOSIT_PLACE_TTL_S`
+  (2 days) without a sign of life; beyond the cap a newcomer hears the
+  protocol's own `full` sentence from the Pi's memory with no wake spent.
+  The vault enforces its own reserve: `accounts_now + 30 × (in_flight + 1) ≤
+  account_ceiling` (`at_capacity`), where 30 = one receive account + the
+  deepest mix's outputs + decoys + carrier + change sweep. The one-person
+  rule fires only on a bot configured for one. A chain yields its turn when
+  anyone was refused during it. Shared `--daily-cap` and `--min-interval`
+  across chats, with a startup note when the cap is too small for the places.
+- **Honest number.** Capacity is derived, not "10": the smallest of accounts,
+  wakes-per-day, and wall clock. At the shipped defaults it is ONE; sized per
+  OPSEC_SETUP.md §4f it is three or four before withdraw queues run to days.
+  The artifact "Places on One Vault" visualises this from the shipped
+  constants and simulates people walking the real wizard.
+
+### `f580584` and earlier — the earlier phases (summarised)
+- Deposits tracked through to `spent` (pair kept, files shredded); the pager
+  holds every command through a restart while a wake may still be running
+  (persisted in-flight bit + window); the fee sweep's dead-man backstop armed.
+- Hot fee wallet with a threshold sweep; the fee never lands on the mixing
+  wallet from any path.
+- OPSEC leak closure: machine names, paths, amounts and architecture words
+  scrubbed from every chat literal, the hash chain redacted, the Pi's disk
+  reduced to one coarsened file; sealed-slip delivery for a second machine.
+- Button / instability / stale-value / fake-wiring fixes across the pager and
+  console; service-lifecycle pass; half-fix audits after each phase.
+
+### Validation state at the end of the session
+- 40 of 40 suites green on the last full run; `tests/test_btc_embit.py` adds
+  a 41st, 30/30.
+- 447 mutation anchors match the sources; every new anchor is caught.
+- One lesson recorded: the end-to-end suite and the pager suite both bind the
+  doorbell's fixed LAN port, so running the mutation sweep concurrently with
+  a full suite run produces spurious failures. Serialise them.
 
 ---
 
-## The BTC-intake build (in progress) — see BTC_INTAKE_DESIGN.md
+## 3. What the chat says now (so nobody re-derives it)
 
-Goal, in the operator's words: the client pays a **plain, unique BTC address
-the host owns** (any phone can pay a plain address, no note), and the **host**
-forwards it into ThorChain, attaching the swap memo itself. Unique address ⇒
-the host auto-detects the arrival and can carry a per-person balance.
-"Forward" = start the mix.
+The `/deposit` wizard: `How much? Reply with the amount — for example 0.05.`
+→ `Deposit 0.05. Confirm and it starts.  a + b = ?` → working line → the note
+alone → the "here is how to pay" receipt. A typed `/deposit 0.05` is refused
+("just /depo — it asks").
 
-Why the note cannot just be dropped for a client-paid BTC deposit: ThorChain's
-BTC inbound is a SHARED address for every user, and the memo is the only thing
-that routes a payment. That is ThorChain's design, not a code choice. Moving
-the note to the host means the host receives the BTC and forwards it — which is
-the build below.
+The `/withdraw` wizard: `Where do you want it? Reply with the address.`
+(one to seven, validated by the protocol's address gate) → `How deep?` (3, 10
+or 20 hops — the speed-and-cover choice) → a confirm that says it SPENDS →
+sum → working line → `withdraw: sent. It is on its way to your addresses.`
+plus one of: another is starting / more remains / still unlocking / nothing
+more was found.
 
-The insight that makes it fit the off-by-default vault: split it across the two
-boxes. The **Pi** holds an **xpub only** (watch-only), derives a unique address
-per deposit, and watches for the payment. The **vault** holds the seed and does
-the forward as a **woken job** (`forward_to_swap`), signing only while awake.
+Refusals a client can hear: `busy… try again in about T` (the Pi's own
+ceiling on the running job, never whose), `yours is still running`, the `full`
+sentence, `wait Ns`, `daily limit reached`. What one client can learn about
+another: that the vault is busy for up to about T, and that the service is
+full. Not who, how many, what kind of job, or a queue position.
 
-Decisions taken:
-- **Chain source:** Electrum protocol over Tor, one fresh circuit per address,
-  watch-only (default); "point at your own node / Electrum server" as the
-  zero-third-party upgrade. Tor removes the IP leak; the residual content
-  correlation is kept weak by per-address circuits or removed by a private
-  node. (A block-explorer API over Tor is usable but the weakest private
-  option — not the default.)
-- **Library:** `embit` 0.8.0, vendored into `third_party/embit` pure-Python
-  only (native blobs stripped), pinned, MIT licence kept, provenance in
-  `third_party/README.md`. Hand-rolling curve signing for real money is
-  forbidden.
+---
 
-Hazards named (not glossed): custody between receipt and forward; the hot key
-at rest (mitigated: box off/sealed at rest, signs only during a woken job,
-receive path swept empty); the rate floats to forward time; the 80-byte
-OP_RETURN limit a 95-char XMR address exceeds; confirmation-wait before
-forwarding; dust/fee floors; ThorChain inbound churn (fetch current at forward
-time); the host's new on-chain footprint (client's gets cleaner, host's gains
-one).
+## 4. The BTC-intake rework (in progress) — see `BTC_INTAKE_DESIGN.md`
+
+**The ask, in the operator's words.** The client pays a plain, unique BTC
+address the host owns — any phone can pay a plain address, no note — and the
+host forwards it into ThorChain, attaching the swap memo itself. Unique
+address ⇒ the host auto-detects the arrival ("received") and can carry a
+per-person balance. "Forward" means **start the mix**: the swap lands XMR on a
+fresh receive subaddress and the existing pipeline runs; the final send to the
+client's own address stays `/withdraw`.
+
+**Why the note cannot simply be dropped today.** ThorChain's BTC inbound is a
+SHARED address for every user on earth, and the memo is the only thing that
+routes a payment. That is ThorChain's design, not a code choice; no code here
+can make it hand out a unique BTC address per person. The unique-address model
+IS native to Monero (subaddresses), and the vault already mints one per
+deposit — as the swap's destination. Moving the note to the host means the host
+receives the BTC and forwards it: the build below.
+
+**The insight that makes it fit the off-by-default vault.** Split it across
+the two boxes the way everything else here is:
+- **Pi — watch-only.** Holds a BTC **xpub only** (no spend key). Derives a
+  fresh address per deposit (BIP32 public derivation, index bound to the
+  handle) and watches the chain for a payment to that one address. A seized
+  Pi can watch, never spend.
+- **Vault — the seed and the signing.** Holds the BTC seed. Forwarding is a
+  new woken **job** (`forward_to_swap`), exactly like a withdrawal: sign one
+  BTC tx paying ThorChain's *current* inbound with the memo in an OP_RETURN,
+  broadcast over Tor, power off. The seed signs only while awake.
+
+**Decisions taken (by the operator, or delegated and taken):**
+- Model: host-side BTC intermediary (not XMR-direct, not keep-as-is).
+- Chain source: **Electrum protocol over Tor, one fresh circuit per address,
+  watch-only** as the default; **own node / Electrum server** as the
+  zero-third-party upgrade. Tor removes the IP/identity leak entirely; the
+  residual is *content correlation* against a third-party server, kept weak
+  by per-address circuits or removed by a private node. A block-explorer REST
+  API over Tor works but is the weakest private option, not the default;
+  over clearnet it is never acceptable.
+- Library: **embit 0.8.0**, vendored pure-Python, pinned, provenance
+  recorded (stage 0, done). Hand-rolling elliptic-curve signing for real money
+  is forbidden.
+
+**Hazards named, not glossed:**
+1. Custody between receipt and forward (minutes to hours): a theft target
+   and the legal posture of a money transmitter. Accepted deliberately.
+2. Hot key at rest on the auto-unlocking vault: mitigated by the box being
+   off/sealed at rest, signing only during a woken job, and sweeping the
+   receive path empty per forward; a separate air-gapped signer is a later
+   option.
+3. The rate floats to forward time; "you get back ~X" is an estimate that
+   settles at forward and must be reconciled.
+4. The 80-byte standard OP_RETURN limit that a 95-char XMR address plus the
+   swap prefix exceeds — the repo already flags it (`OP_RETURN_STD_BYTES`,
+   `memo_will_overflow`); the forward must use ThorChain's supported
+   long-memo path (or a THORName/short memo).
+5. Confirmation wait before forwarding (double-spend), N configurable.
+6. Dust and fees: refuse up front with a stated minimum, never strand.
+7. ThorChain inbound churn: fetch the current inbound at forward time, over
+   Tor, never cached.
+8. The on-chain footprint moves: the client's gets cleaner (plain address, no
+   public memo naming the XMR destination); the host gains a new one (host
+   address → ThorChain, memo on the host's tx).
+
+**Wire and schema changes to come:** BTC seed + derivation path +
+confirmation threshold + dust/fee floors in the vault keyfile (sealed like the
+XMR key); xpub + Electrum/Tor config in the Pi keyfile; new `JOBS` entry
+`forward_to_swap {handle, owner}` with tool `btc_forwarder`; `WIRE_VERSION`
+bump; `/deposit` returns a unique address with no note and no phone warning
+in this mode; auto received → confirmed → forwarding; per-owner `/balance`
+gated behind the same plaintext opt-in as the deposit surface (an amount is
+rule-6 material).
 
 ### Stage status
 
 | # | Stage | State |
 |---|-------|-------|
-| 0 | Vendor embit (pure-Python) + prove with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — `third_party/embit`, `tests/test_btc_embit.py` 30/30 |
-| 1 | Watch-only derivation + Electrum-over-Tor detector (xpub→address per handle; dry-run; no keys/money) | next |
-| 2 | `forward_to_swap` job: build+sign the BTC tx with the OP_RETURN memo, `--dry-run` (print, no broadcast); WIRE_VERSION bump | pending |
-| 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end | pending |
-| 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated behind the plaintext opt-in) | pending |
-| 5 | Failure handling + floating-rate reconciliation; full suite + anchors green; mainnet only after all green on testnet | pending |
+| 0 | Vendor embit (pure-Python) + prove with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — `8c86548` |
+| 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; dry-run seen/confirmed against a mock and testnet; no keys, no money; tests | **in progress** |
+| 2 | `forward_to_swap` job: build + sign the BTC tx (inputs from the derived address, OP_RETURN memo with the 80-byte handling, change), `--dry-run` prints and does not broadcast; fetch current inbound over Tor; `WIRE_VERSION` bump; testnet | pending |
+| 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
+| 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
+| 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |
 
 Each stage is validated before the next. Mainnet is not touched until every
 stage is green on testnet and reviewed.
 
-### Stage 0 detail (done)
-- `third_party/embit/` = embit 0.8.0 `src/embit/` verbatim minus
-  `util/prebuilt/` (7 native libsecp256k1 blobs deleted) and with
-  `util/secp256k1.py` pinned to the pure-Python `py_secp256k1` path. sdist
-  sha256 and reproduction steps are in `third_party/README.md`.
-- `tests/test_btc_embit.py` proves it against values published outside this
-  repo: BIP32 test vector 1 (master + hardened + the deep path xprv/xpub),
-  BIP84 reference mnemonic → `bc1qcr8te4...` receive/change addresses,
-  watch-only public derivation agreeing with private derivation and refusing
-  hardened steps, BIP173 bech32 decode/encode/round-trip and checksum
-  rejection, HASH160('') against RIPEMD160(SHA256('')), and secp256k1
-  sign→verify then broken on a wrong hash / wrong key. It also pins the
-  vendoring: the pure-Python path must be live, the native path must never
-  load, and no binary may exist in the tree.
-
 ---
 
-## How to run things
+## 5. How to run and check things
 
-- One suite: `python3 tests/test_X.py` (prints `RESULT: N passed, M failed`).
+- One suite: `python3 tests/test_X.py`. All of them: loop over
+  `tests/test_*.py` and read each `RESULT:` line (five suites print
+  `<name>: N passed, M failed` instead of `RESULT:`; they are not failures).
 - The BTC library proof: `python3 tests/test_btc_embit.py`.
-- Mutation sweep (all): `cd tests && python3 mutation_sweep.py`; a range:
-  `python3 mutation_sweep.py 428 429 …`; verify anchors match source:
-  `anchors_ok(list(enumerate(MUTATIONS)))`.
-- The vendored library imports from `third_party/` (tests add it to
+- Mutation sweep: `cd tests && python3 mutation_sweep.py` (all) or with index
+  arguments for a range; verify every anchor still matches its source with
+  `anchors_ok(list(enumerate(MUTATIONS)))` — an empty list means all match.
+- The vendored library imports from `third_party/` (tests insert it on
   `sys.path`); it has no external dependencies.
+- The load-model artifact can be rendered headlessly with Playwright
+  (`NODE_PATH=$(npm root -g)`, Chromium at `/opt/pw-browsers`) to check for
+  JS errors and that the simulation walks the wizard.
+- Do not run the mutation sweep and a full suite run at the same time (port
+  collision, see section 2).
 
-## Standing rules (do not drift)
-- Develop only on `claude/phone-withdrawal-destinations-ey6ovb`.
-- No model identifier in commits, code, or any pushed artifact.
-- Never send the operator's email to any service; identity-only.
-- Confirm before destructive or outward actions.
+## 6. Standing rules for this branch (do not drift)
+
+- Develop only on `claude/phone-withdrawal-destinations-ey6ovb`; never push
+  elsewhere without being told.
+- No pull request unless explicitly asked.
+- No model identifier in commits, code, comments, or any pushed artifact.
+- The operator's email is identity-only; never send it to any service.
+- Confirm before destructive or outward-facing actions.
 - Rule 6 on every chat surface; Kerckhoffs everywhere.
-- No hand-rolled cryptography for money — vetted, vendored, pinned only.
+- No hand-rolled cryptography for money: vetted, vendored, pinned only.
+- No half-wired features: a stage is not done until it is driven by tests and
+  its anchors are caught.
+
+## 7. Residual risks worth carrying forward
+
+- Capacity is genuinely small; a vault sized per §4f serves three or four
+  people in flight before waits run to days. More vaults are the only way
+  past that.
+- The BTC intermediary, once built, makes the host a custodian and gives it a
+  BTC footprint it does not have today. Both are accepted on purpose; the
+  design records the mitigations.
+- The note-first, address-only-if-note-landed rule is the one property of the
+  current deposit path that must survive any UX simplification; it was
+  removed once, made the phone-only mode a trap, and was restored.
