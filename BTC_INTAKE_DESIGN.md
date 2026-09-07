@@ -53,6 +53,26 @@ To watch an address you need a chain source.
   address**, watch-only. Tor removes the IP/identity leak entirely. The residual
   is *content correlation* — a third-party server can log which addresses were
   queried and cluster them — which per-address circuit isolation keeps weak.
+  Stage 1 adds two more cuts at it: with several servers configured, each
+  address starts at a server chosen by its own scripthash (no single server is
+  handed the whole set), and the client announces a stock wallet's version
+  string. What isolation cannot hide is *behaviour* — three read-only calls
+  and hang up, the same on every circuit — so a server that fingerprints by
+  behaviour can still cluster; that residual is stated in the module header
+  and only an own node removes it.
+- **TLS on that link:** Electrum servers are self-signed, so unverified TLS
+  stops a passive listener and nothing more. A `.onion` server needs no more
+  than that (there is no exit hop; the onion address authenticates the
+  server). A clearnet server should be **pinned**: a server entry is
+  `(host, port, pin)` with the SHA-256 of its certificate, a mismatch is
+  refused, and every result carries the certificate seen so the pin can be
+  recorded once and enforced from then on.
+- **Settlement is per output, never an aggregate.** The watcher depth-checks
+  each unspent output (`listunspent`); "confirmed" means *some output is at
+  least N deep*, and the forward (stage 2) may spend only those outputs. An
+  aggregate balance plus a history-wide confirmation count would let settled
+  dust vouch for a fresh, reorg-able deposit (hazard 5); the module names that
+  trap in a test.
 - **Upgrade (recommended for the paranoid):** point at **your own node /
   Electrum server** (e.g. Fulcrum/electrs behind a pruned Bitcoin node) over the
   LAN. No third party sees anything; correlation leak gone.

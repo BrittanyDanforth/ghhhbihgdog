@@ -42,8 +42,24 @@ How the looking stays quiet (BTC_INTAKE_DESIGN.md, rule 6):
     of one address reuses that address's circuit -- a retry is not a new fact
     to leak. A proxy URL that already carries a credential is REFUSED rather
     than used as-is: it would put every address on one circuit, silently.
-  * Default is a public Electrum server over Tor; an operator who wants no
-    third party at all points the server list at their own node.
+  * NO SINGLE SERVER SEES EVERY ADDRESS. With several servers configured,
+    each address starts at a server chosen by its own scripthash and fails
+    over from there, so one third party collects a share of the set, never
+    all of it.
+  * What isolation CANNOT hide: behaviour. Every connection speaks the same
+    three read-only calls and hangs up, and announces a stock wallet's
+    version string; a server that fingerprints by behaviour can still
+    cluster them. That residual is only removed by the operator's OWN node
+    (BTC_INTAKE_DESIGN.md recommends exactly that), and the server list
+    exists so it can be pointed there.
+  * TLS is unverified by default, as every Electrum client's is against
+    self-signed servers -- that stops a passive listener, not an active one.
+    Over a `.onion` there is no exit hop and the onion address itself
+    authenticates the server, so that is the sound third-party choice. For
+    a clearnet server, give its certificate's SHA-256 as a PIN with the
+    server entry -- (host, port, pin) -- and a certificate that does not
+    match is refused; every result carries the certificate it saw, so a
+    caller can record it once and pin from then on.
   * Nothing here is written to the hash chain. Watching is frequent and the
     deep-read pass already taught that a frequent path must not flood the SD
     card. The caller records a state CHANGE, never a poll.
@@ -53,12 +69,16 @@ answer. A malformed server reply, a proxy that will not isolate, a stream
 that drips one byte at a time past the deadline, a port out of range -- each
 is a refusal the caller sees, not a silent "not paid yet". look() falls
 through to the next configured server only on a transport or server fault;
-the state it returns was computed from a complete, well-typed reply.
+the state it returns was computed from a complete, well-typed reply. And no
+error message ever carries text a server chose: a server's error is
+reported by its numeric code only, so a scripthash echoed back by a server
+(ElectrumX does that) can never reach a caller's log or a chat.
 
 The forward that SPENDS is a woken vault job (stage 2), not this. This side
 only ever answers "did the money arrive, and which of it is settled".
 """
 import hashlib
+import hmac
 import json
 import socket
 import ssl
@@ -82,13 +102,18 @@ DEFAULT_ELECTRUM_PORT = 50002
 #: TLS, every request and reply. A deadline, not a per-read timeout, so a
 #: server that drips one byte at a time cannot hold the watcher for ever.
 DEFAULT_TIMEOUT = 30.0
-#: server.version identity. Deliberately generic -- a distinctive name would
-#: be a fingerprint that survives across circuits.
-CLIENT_NAME = "electrum"
+#: server.version identity: the string a stock Electrum wallet of a widely
+#: deployed release announces, so this badge is one shared with a crowd. A
+#: bare or invented name would be a fingerprint that survives every circuit.
+CLIENT_NAME = "electrum/4.5.8"
 PROTOCOL_VERSION = "1.4"
 #: Ceiling on one server response line, so a hostile or broken server cannot
 #: make a single read grow without bound.
 MAX_LINE_BYTES = 2 * 1024 * 1024
+#: Ceiling on everything one server may send in one exchange. A deposit
+#: address's unspent list is a few hundred bytes; this is generous a
+#: thousandfold and still stops a server feeding a watcher by the gigabyte.
+MAX_SESSION_BYTES = 8 * 1024 * 1024
 #: Ceiling on how many unmatched lines (subscription notifications) a server
 #: may interleave before we give up on an answer -- a server cannot stall us
 #: by streaming frames instead of the reply we asked for.
@@ -186,9 +211,9 @@ def _require_native_segwit(address, net):
     kind derived here -- so a testnet address is never looked up as if it
     were mainnet money, and vice versa."""
     witver, prog = bech32.decode(net["bech32"], str(address))
-    if witver is None:
-        raise BtcWatchError("address is not a native-segwit address of the "
-                            f"{net['name']} network")
+    if witver != 0 or prog is None or len(prog) != 20:
+        raise BtcWatchError("address is not a P2WPKH (bc1q..., 20-byte) "
+                            f"address of the {net['name']} network")
 
 
 def _is_uint(v):
@@ -286,9 +311,24 @@ def _split_hostport(spec, default_port=None):
     return host, p
 
 
+def _check_pin(pin):
+    """A certificate pin is the SHA-256 of the server's DER certificate as
+    64 hex characters, or None for 'no pin'."""
+    if pin is None:
+        return None
+    p = str(pin).lower().replace("sha256:", "")
+    if len(p) != 64 or any(c not in "0123456789abcdef" for c in p):
+        raise BtcWatchError("a certificate pin must be 64 hex characters "
+                            "(the SHA-256 of the server's certificate)")
+    return p
+
+
 def parse_server(spec):
-    """'host' or 'host:port' -> (host, port), defaulting the TLS port."""
-    return _split_hostport(spec, DEFAULT_ELECTRUM_PORT)
+    """'host', 'host:port' or 'host:port,pin' -> (host, port, pin), the TLS
+    port by default and no pin unless one is given."""
+    hostport, _, pin = str(spec).partition(",")
+    host, port = _split_hostport(hostport, DEFAULT_ELECTRUM_PORT)
+    return host, port, _check_pin(pin.strip() or None)
 
 
 # --- SOCKS5 over Tor: a small framing protocol, hand-rolled, no dependency --
@@ -418,19 +458,41 @@ def _socks5_connect(dest_host, dest_port, proxy_host, proxy_port,
         raise
 
 
-def _wrap_tls(sock, server_name, deadline):
-    """Wrap a connected socket in TLS 1.2+. Electrum servers use self-signed
-    certificates and clients pin on first use; here the channel's
-    confidentiality is Tor and the queried data is public, so an unverified
-    wrapper is the standard, correct choice -- it stops a Tor exit or the
-    server's neighbours reading the scripthash in the clear, which is all
-    TLS is for on this link."""
+def _wrap_tls(sock, server_name, deadline, pin=None):
+    """Wrap a connected socket in TLS 1.2+ and return (tls_socket,
+    certificate_sha256).
+
+    Electrum servers use self-signed certificates, so there is no authority
+    to verify against; a real wallet pins the certificate it first saw.
+    Unverified, this stops a PASSIVE listener reading the scripthash, and
+    that is all it stops: an exit that terminates TLS itself would not be
+    noticed. With `pin` (the SHA-256 of the expected certificate) the
+    server is authenticated and a wrong certificate is refused. Over a
+    .onion no exit exists and the onion address does the authenticating.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     sock.settimeout(_remaining(deadline))
-    return ctx.wrap_socket(sock, server_hostname=server_name)
+    tls = ctx.wrap_socket(sock, server_hostname=server_name)
+    try:
+        der = tls.getpeercert(binary_form=True)
+        if not der:
+            raise BtcWatchError("tls: no server certificate")
+        seen = hashlib.sha256(der).hexdigest()
+        if pin is not None and not hmac.compare_digest(seen, pin):
+            # The fingerprint is deliberately NOT in the message: it is a
+            # fact about what an attacker presented, and it would otherwise
+            # travel wherever the error is logged.
+            raise BtcWatchError("tls: certificate does not match the pin")
+        return tls, seen
+    except BaseException:
+        try:
+            tls.close()
+        except OSError:
+            pass
+        raise
 
 
 # --- the transport seam: a line channel the Electrum client speaks over -----
@@ -442,25 +504,33 @@ class SocksTlsTransport:
     sees a socket."""
 
     def __init__(self, host, port, proxy_url, tag, *, tls=True,
-                 timeout=DEFAULT_TIMEOUT):
+                 timeout=DEFAULT_TIMEOUT, pin=None):
         self._host = str(host)
         self._port = int(port)
         self._proxy = proxy_url
         self._tag = tag
         self._tls = tls
         self._timeout = float(timeout)
+        self._pin = _check_pin(pin)
         self._deadline = None
         self._sock = None
         self._buf = b""
+        self._received = 0
+        #: SHA-256 of the certificate the server presented (TLS only).
+        self.cert_sha256 = None
 
     def connect(self):
         self._deadline = time.monotonic() + self._timeout
+        self._received = 0
         ph, pp, user, password = _socks_parts(self._proxy, self._tag)
         sock = _socks5_connect(self._host, self._port, ph, pp, user,
                                password, self._deadline)
         try:
-            self._sock = (_wrap_tls(sock, self._host, self._deadline)
-                          if self._tls else sock)
+            if self._tls:
+                self._sock, self.cert_sha256 = _wrap_tls(
+                    sock, self._host, self._deadline, self._pin)
+            else:
+                self._sock = sock
         except BaseException:
             sock.close()
             raise
@@ -492,6 +562,9 @@ class SocksTlsTransport:
                 raise BtcWatchError("electrum: deadline exceeded")
             if not chunk:
                 raise BtcWatchError("electrum: connection closed")
+            self._received += len(chunk)
+            if self._received > MAX_SESSION_BYTES:
+                raise BtcWatchError("electrum: server sent too much")
             self._buf += chunk
         line, _, self._buf = self._buf.partition(b"\n")
         return line.decode("utf-8", "replace")
@@ -507,6 +580,17 @@ class SocksTlsTransport:
 
 
 # --- the Electrum client: synchronous JSON-RPC over a transport, read-only --
+
+def _error_code(err):
+    """The numeric code of a server error, and NOTHING else of it: the
+    message is text the server chose, and ElectrumX echoes the query into
+    it, so passing it on would carry the scripthash into whatever the
+    caller logs."""
+    code = err.get("code") if isinstance(err, dict) else None
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return "unknown"
+
 
 class Electrum:
     """A minimal, synchronous, READ-ONLY Electrum-protocol client over a
@@ -536,22 +620,25 @@ class Electrum:
             raw = self._t.recv_line()
             try:
                 obj = json.loads(raw)
-            except ValueError:
-                raise BtcWatchError("electrum: non-JSON line")
+            except (ValueError, RecursionError):
+                # RecursionError: a line nested tens of thousands deep is
+                # well under the byte ceiling and json raises THAT, not
+                # ValueError.
+                raise BtcWatchError("electrum: unparseable line")
             if not isinstance(obj, dict):
                 raise BtcWatchError("electrum: non-object frame")
             if obj.get("id") == want:
                 if obj.get("error") is not None:
                     raise BtcWatchError(
-                        f"electrum error: {str(obj['error'])[:120]}")
+                        f"electrum error (code {_error_code(obj['error'])})")
                 return obj.get("result")
             if obj.get("id") is None and obj.get("error") is not None:
                 # A request the server could not even parse comes back with
                 # a null id. That is our failure to hear about, not a
                 # notification to skip past.
                 raise BtcWatchError(
-                    f"electrum rejected the request: "
-                    f"{str(obj['error'])[:120]}")
+                    "electrum rejected the request "
+                    f"(code {_error_code(obj['error'])})")
         raise BtcWatchError("electrum: no matching reply")
 
     def handshake(self):
@@ -581,15 +668,20 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
          timeout=DEFAULT_TIMEOUT, transport_factory=None):
     """Ask the network what unspent money sits at `address`, and how settled.
 
-    `servers` is a list of (host, port), tried in order until one answers,
-    so a single dead server is not a dead watch. `network` names the chain
-    the address must belong to. `timeout` bounds ONE server's whole
-    exchange. `transport_factory(host, port, tag)` may inject a transport
-    for tests. Returns
+    `servers` is a list of (host, port) or (host, port, pin) entries -- the
+    pin being the SHA-256 of the server's TLS certificate, or None. Each
+    address starts at a server chosen by its own scripthash and fails over
+    from there, so a single dead server is not a dead watch and no single
+    server sees every address. `network` names the chain the address must
+    belong to. `timeout` bounds ONE server's whole exchange.
+    `transport_factory(host, port, tag)` may inject a transport for tests.
+    Returns
         {state, confirmed_sat, unconfirmed_sat, settled_sat, confirmations,
-         utxos, tip, server}
+         utxos, tip, server, cert_sha256}
     and NEVER raises for "not paid yet" -- only for "could not ask anyone",
-    or for a configuration that could not be right.
+    or for a configuration that could not be right. The error names the
+    module's own reason or the CLASS of a system error, never text a
+    server or the network chose.
     """
     net = _network(network)
     _require_native_segwit(address, net)
@@ -601,20 +693,26 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
         raise BtcWatchError("no Electrum servers configured")
     checked = []
     for spec in servers:
-        try:
-            host, port = spec
-        except (TypeError, ValueError):
-            raise BtcWatchError("each server must be a (host, port) pair")
-        checked.append(_split_hostport(f"[{host}]:{port}" if ":" in str(host)
-                                       else f"{host}:{port}"))
+        if not isinstance(spec, (tuple, list)) or len(spec) not in (2, 3):
+            raise BtcWatchError("each server must be (host, port) or "
+                                "(host, port, pin)")
+        host, port = spec[0], spec[1]
+        pin = _check_pin(spec[2] if len(spec) == 3 else None)
+        host, port = _split_hostport(f"[{host}]:{port}" if ":" in str(host)
+                                     else f"{host}:{port}")
+        checked.append((host, port, pin))
+    # Start where this address's own hash points, so with several servers
+    # configured no one of them is handed the whole address set.
+    start = int(scripthash[:8], 16) % len(checked)
+    order = checked[start:] + checked[:start]
     tag = "btcwatch:" + address       # one circuit per address; see the header
     last = None
-    for host, port in checked:
+    for host, port, pin in order:
         if transport_factory is not None:
             transport = transport_factory(host, port, tag)
         else:
             transport = SocksTlsTransport(host, port, proxy_url, tag,
-                                          timeout=timeout)
+                                          timeout=timeout, pin=pin)
         try:
             with Electrum(transport) as e:
                 e.handshake()
@@ -628,8 +726,13 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
                                     picture["settled_sat"])
         picture["tip"] = tip
         picture["server"] = host
+        picture["cert_sha256"] = getattr(transport, "cert_sha256", None)
         return picture
-    raise BtcWatchError(f"no Electrum server answered (last: {last})")
+    # Our own reasons are safe to repeat; anything else is named by class
+    # only, so no socket or TLS text about a peer travels with the error.
+    why = str(last) if isinstance(last, BtcWatchError) \
+        else type(last).__name__
+    raise BtcWatchError(f"no Electrum server answered (last: {why})")
 
 
 # --- a small manual dry-run (no key, no money) ------------------------------
@@ -644,8 +747,9 @@ def _main(argv=None):
     ap.add_argument("--index", type=int, required=True)
     ap.add_argument("--network", default="main")
     ap.add_argument("--electrum", action="append", default=[],
-                    metavar="HOST[:PORT]",
-                    help="Electrum server; repeatable. Omit to derive only.")
+                    metavar="HOST[:PORT][,PIN]",
+                    help="Electrum server, PIN its certificate's SHA-256; "
+                         "repeatable. Omit to derive only.")
     ap.add_argument("--tor", default="socks5h://127.0.0.1:9050")
     ap.add_argument("--min-conf", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
@@ -663,6 +767,8 @@ def _main(argv=None):
           f"mined: {r['confirmed_sat']} sat  "
           f"mempool: {r['unconfirmed_sat']} sat  "
           f"newest depth: {r['confirmations']}  outputs: {len(r['utxos'])}")
+    if r.get("cert_sha256"):
+        print(f"  server certificate sha256 (pin it): {r['cert_sha256']}")
     return 0
 
 
