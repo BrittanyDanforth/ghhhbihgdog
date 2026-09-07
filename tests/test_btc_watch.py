@@ -4,28 +4,40 @@
 gs_btc_watch runs on the seizable Pi. These checks prove the two things it
 does and the things it must NOT do:
 
-  * DERIVATION against the BIP84 known-answer vector, from an account xPUB by
-    public derivation; a hardened index or an xPRV is refused (a Pi must never
-    hold or reach a secret).
-  * The SOCKS5 layer against a REAL in-process SOCKS5 server: the handshake is
-    framed correctly, the destination is sent as a DOMAIN name (resolved at
-    the proxy -- no local DNS leak), and the per-address isolation tag becomes
-    the SOCKS username so each address rides its own Tor circuit.
-  * The Electrum client and look() against a fake transport speaking the line
-    protocol, through every state -- nothing, unconfirmed, confirmed below the
-    threshold, confirmed at it -- plus server failover, a skipped notification,
-    and the confirmations arithmetic.
+  * DERIVATION against the BIP84 known-answer vectors, from an account xPUB
+    (and the published zpub) by public derivation; a hardened index, an
+    xPRV, a key for another network or script type, and a key at the wrong
+    depth are each refused (a Pi must never hold, reach, or quietly
+    mis-derive).
+  * SETTLEMENT as a pure function of the unspent outputs: each output is
+    depth-checked on its own, so settled dust can never vouch for a fresh
+    deposit, and a malformed reply is refused rather than coerced.
+  * The SOCKS5 layer against a REAL in-process SOCKS5 server: the framing,
+    the destination sent as a DOMAIN name (resolved at the proxy -- no local
+    DNS), the per-address isolation tag as the SOCKS username, and the
+    refusals -- a proxy that will not take the credential, a rejected auth,
+    a refused CONNECT, a byte-trickle past the deadline.
+  * The real transport and the real client END TO END through that mock
+    proxy to an in-process Electrum server, in plaintext AND over TLS, and
+    then look() against a fake transport through every state, server
+    failover, a skipped notification, a notification flood, and every
+    malformed reply a hostile server could send.
 
 No real network and no money. The one live network fact -- that this Tor's
 SOCKS port isolates by credential -- is already proven in gs_common's suite;
 here the SOCKS server is ours, so the framing is what is under test.
 """
+import hashlib
+import io
 import json
 import os
 import socket
+import ssl
 import sys
+import tempfile
 import threading
-from pathlib import Path
+import time
+from contextlib import redirect_stdout
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -54,19 +66,53 @@ _finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS),
                                  "test_btc_watch.py")
 
 import gs_btc_watch as W                                     # noqa: E402
-from embit import bip32, bip39                               # noqa: E402
+from embit import bech32, bip32, bip39                       # noqa: E402
+from embit.networks import NETWORKS                          # noqa: E402
 
-# The BIP84 reference account xPUB (m/84'/0'/0'), public only.
-_root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(
-    "abandon abandon abandon abandon abandon abandon abandon abandon "
-    "abandon abandon abandon about"))
-_ACCT_XPUB = _root.derive("m/84h/0h/0h").to_public().to_base58()
-_ACCT_XPRV = _root.derive("m/84h/0h/0h").to_base58()
+
+def _refused(fn, *a, **k):
+    """True iff fn raises the module's own error -- never a stray one."""
+    try:
+        fn(*a, **k)
+        return False
+    except W.BtcWatchError:
+        return True
+
+
+def _raises(fn, exc, *a, **k):
+    try:
+        fn(*a, **k)
+        return False
+    except exc:
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+# The BIP84 reference account keys (m/84'/0'/0' and m/84'/1'/0'), public only.
+_MNEMONIC = ("abandon abandon abandon abandon abandon abandon abandon abandon "
+             "abandon abandon abandon about")
+_root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(_MNEMONIC))
+_acct = _root.derive("m/84h/0h/0h")
+_ACCT_XPUB = _acct.to_public().to_base58()
+_ACCT_XPRV = _acct.to_base58()
+_ACCT_ZPUB = _acct.to_public(version=NETWORKS["main"]["zpub"]).to_base58()
+_troot = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(_MNEMONIC),
+                               version=NETWORKS["test"]["xprv"])
+_tacct = _troot.derive("m/84h/1h/0h")
+_ACCT_TPUB = _tacct.to_public().to_base58()
+_ACCT_VPUB = _tacct.to_public(version=NETWORKS["test"]["zpub"]).to_base58()
 
 # ===========================================================================
-print("== derivation: the vector, uniqueness, and what it refuses ==")
+print("== derivation: the vectors, uniqueness, and what it refuses ==")
+check("the account key re-encodes to the zpub BIP84 publishes for this seed",
+      _ACCT_ZPUB == "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3"
+                    "EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
 check("index 0 is the BIP84 published first receive address",
       W.derive_receive_address(_ACCT_XPUB, 0)
+      == "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
+check("...and the zpub encoding of the same key derives the same address",
+      W.derive_receive_address(_ACCT_ZPUB, 0)
       == "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
 check("index 1 is the published second receive address",
       W.derive_receive_address(_ACCT_XPUB, 1)
@@ -74,40 +120,162 @@ check("index 1 is the published second receive address",
 check("change=1 index 0 is the published first change address",
       W.derive_receive_address(_ACCT_XPUB, 0, change=1)
       == "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el")
+check("testnet: a tpub derives the published first testnet address",
+      W.derive_receive_address(_ACCT_TPUB, 0, network="testnet")
+      == "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl")
+check("testnet: ...and so does its vpub encoding, on signet too (same hrp)",
+      W.derive_receive_address(_ACCT_VPUB, 0, network="signet")
+      == "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl")
+check("regtest gives a bcrt1 address from the same testnet key",
+      W.derive_receive_address(_ACCT_TPUB, 0, network="regtest")
+      .startswith("bcrt1q"))
 _addrs = [W.derive_receive_address(_ACCT_XPUB, i) for i in range(64)]
 check("sixty-four indexes give sixty-four distinct bc1q addresses",
       len(set(_addrs)) == 64 and all(a.startswith("bc1q") for a in _addrs))
-check("a testnet derivation is a tb1 address",
-      W.derive_receive_address(_ACCT_XPUB, 0, network="testnet")
-      .startswith("tb1q"))
-
-
-def _refused(fn):
-    try:
-        fn()
-        return False
-    except W.BtcWatchError:
-        return True
-
+check("the largest non-hardened index derives (the boundary is inclusive)",
+      W.derive_receive_address(_ACCT_XPUB, W.HARDENED - 1).startswith("bc1q"))
 
 check("a hardened index is refused (a Pi must not walk toward the key)",
-      _refused(lambda: W.derive_receive_address(_ACCT_XPUB, 0x80000000)))
+      _refused(W.derive_receive_address, _ACCT_XPUB, W.HARDENED))
 check("a negative index is refused",
-      _refused(lambda: W.derive_receive_address(_ACCT_XPUB, -1)))
+      _refused(W.derive_receive_address, _ACCT_XPUB, -1))
 check("a boolean index is refused (True is not index 1 here)",
-      _refused(lambda: W.derive_receive_address(_ACCT_XPUB, True)))
+      _refused(W.derive_receive_address, _ACCT_XPUB, True))
+check("a float index is refused",
+      _refused(W.derive_receive_address, _ACCT_XPUB, 1.0))
 check("change other than 0/1 is refused",
-      _refused(lambda: W.derive_receive_address(_ACCT_XPUB, 0, change=2)))
+      _refused(W.derive_receive_address, _ACCT_XPUB, 0, change=2))
+check("a boolean change is refused",
+      _refused(W.derive_receive_address, _ACCT_XPUB, 0, change=True))
 check("an xPRV where an xPUB belongs is refused -- no secret on the Pi",
-      _refused(lambda: W.derive_receive_address(_ACCT_XPRV, 0)))
-check("a junk xpub is refused, loudly",
-      _refused(lambda: W.derive_receive_address("not-an-xpub", 0)))
+      _refused(W.derive_receive_address, _ACCT_XPRV, 0))
+check("a junk xpub is refused, loudly, through the module's own error",
+      _refused(W.derive_receive_address, "not-an-xpub", 0))
+check("a mainnet xpub asked for a testnet address is refused (it would "
+      "quietly derive a tb1 address nobody's wallet holds)",
+      _refused(W.derive_receive_address, _ACCT_XPUB, 0, network="testnet"))
+check("a testnet tpub asked for a mainnet address is refused",
+      _refused(W.derive_receive_address, _ACCT_TPUB, 0, network="main"))
+check("a ypub (nested segwit) is refused: wrong script type for bc1q",
+      _refused(W.derive_receive_address,
+               _acct.to_public(version=NETWORKS["main"]["ypub"]).to_base58(),
+               0))
+check("a ROOT xpub (depth 0) is refused: only an account key derives here",
+      _refused(W.derive_receive_address, _root.to_public().to_base58(), 0))
+check("a key one level below the account (depth 4) is refused too",
+      _refused(W.derive_receive_address,
+               _acct.derive([0]).to_public().to_base58(), 0))
+check("an unknown network name is refused",
+      _refused(W.derive_receive_address, _ACCT_XPUB, 0, network="mars"))
 
-check("the scripthash of index 0 is the Electrum-standard value",
-      W.address_to_scripthash("bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
-      == "6e4f16236139f15046b38f399a683fb2aa8edf5fd128b3e5db017fb0ac74078a")
+# ===========================================================================
+print("\n== scripthash: cross-computed from the address, not from the module ==")
+_A0 = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+_wv, _prog = bech32.decode("bc", _A0)
+_cross = hashlib.sha256(b"\x00\x14" + bytes(_prog)).digest()[::-1].hex()
+check("scripthash = reversed sha256(OP_0 PUSH20 <program>) -- matches an "
+      "independent computation from the bech32 program",
+      _wv == 0 and len(_prog) == 20 and W.address_to_scripthash(_A0) == _cross)
+check("...and it is the Electrum-standard value for the BIP84 first address",
+      _cross == "6e4f16236139f15046b38f399a683fb2aa8edf5fd128b3e5db017fb0ac74078a")
 check("a junk address has no scripthash, loudly",
-      _refused(lambda: W.address_to_scripthash("nope")))
+      _refused(W.address_to_scripthash, "nope"))
+check("an address with one character altered has no scripthash (checksum)",
+      _refused(W.address_to_scripthash, _A0[:-1] + ("a" if _A0[-1] != "a"
+                                                     else "b")))
+
+# ===========================================================================
+print("\n== settlement: a pure function of the unspent outputs ==")
+_H = "ab" * 32
+_H2 = "cd" * 32
+
+
+def _u(height, value, txid=_H, pos=0):
+    return {"tx_hash": txid, "tx_pos": pos, "height": height, "value": value}
+
+
+_s = W.summarize([], 800000, 3)
+check("nothing unspent: every figure is zero and the state is not_seen",
+      _s == {"confirmed_sat": 0, "unconfirmed_sat": 0, "settled_sat": 0,
+             "confirmations": 0, "utxos": []}
+      and W.classify(0, 0, 0) == "not_seen")
+_s = W.summarize([_u(0, 500000)], 800000, 1)
+check("money in the mempool only: seen, the amount counted as unconfirmed, "
+      "nothing settled even at min_conf=1",
+      _s["unconfirmed_sat"] == 500000 and _s["confirmed_sat"] == 0
+      and _s["settled_sat"] == 0 and _s["confirmations"] == 0
+      and W.classify(0, 500000, 0) == "seen")
+_s = W.summarize([_u(799999, 500000)], 800000, 3)
+check("mined two blocks ago (800000-799999+1=2) with three required: seen, "
+      "the depth reported exactly, nothing settled",
+      _s["confirmed_sat"] == 500000 and _s["confirmations"] == 2
+      and _s["settled_sat"] == 0
+      and W.classify(500000, 0, 0) == "seen")
+_s = W.summarize([_u(799998, 500000)], 800000, 3)
+check("three deep with three required: settled, confirmed",
+      _s["settled_sat"] == 500000 and _s["confirmations"] == 3
+      and W.classify(500000, 0, 500000) == "confirmed")
+_s = W.summarize([_u(799900, 1, _H, 0), _u(800000, 500000, _H2, 1)],
+                 800000, 3)
+check("THE DUST TRAP: 1 sat settled 101 deep plus the real deposit 1 deep -- "
+      "only the dust is settled, the newest depth is 1, and the deposit's "
+      "own output is marked 1 deep so it can never be handed over as spendable",
+      _s["settled_sat"] == 1 and _s["confirmed_sat"] == 500001
+      and _s["confirmations"] == 1
+      and [x["confirmations"] for x in _s["utxos"]] == [101, 1])
+_s = W.summarize([_u(799990, 500000, _H, 0), _u(800000, 546, _H2, 1)],
+                 800000, 3)
+check("the reverse: a settled deposit plus fresh dust -- the deposit IS "
+      "settled (fresh dust cannot hold a settled deposit hostage)",
+      _s["settled_sat"] == 500000 and _s["confirmations"] == 1
+      and W.classify(500546, 0, 500000) == "confirmed")
+_s = W.summarize([_u(800001, 10)], 800000, 1)
+check("a mined output above the tip we were told (server race) is at least 1 "
+      "deep, never zero or negative",
+      _s["confirmations"] == 1 and _s["confirmed_sat"] == 10
+      and _s["settled_sat"] == 10)
+_s = W.summarize([_u(0, 5), _u(0, 7, _H2, 3)], 800000, 1)
+check("two mempool outputs sum; a negative Electrum height (-1, unconfirmed "
+      "parent) also counts as unconfirmed",
+      _s["unconfirmed_sat"] == 12
+      and W.summarize([_u(-1, 9)], 800000, 1)["unconfirmed_sat"] == 9)
+check("tx_hash is normalised to lower case, vout carried through",
+      W.summarize([_u(1, 1, _H.upper(), 7)], 1, 1)["utxos"][0]
+      == {"tx_hash": _H, "vout": 7, "value": 1, "confirmations": 1})
+
+for _label, _bad in [
+        ("value as a string", [_u(1, "5")]),
+        ("value as a bool", [_u(1, True)]),
+        ("value as a float", [_u(1, 5.0)]),
+        ("a negative value", [_u(1, -5)]),
+        ("height as a float", [_u(1.0, 5)]),
+        ("height as a bool", [_u(True, 5)]),
+        ("height as a string", [_u("1", 5)]),
+        ("tx_hash that is not 64 hex chars", [_u(1, 5, "zz" * 32)]),
+        ("tx_hash too short", [_u(1, 5, "ab" * 31)]),
+        ("tx_pos negative", [_u(1, 5, _H, -1)]),
+        ("a missing field", [{"tx_hash": _H, "height": 1, "value": 5}]),
+        ("an entry that is not an object", [7]),
+        ("a reply that is not a list", {"tx_hash": _H}),
+]:
+    check(f"a malformed reply is refused, not coerced: {_label}",
+          _refused(W.summarize, _bad, 800000, 1))
+
+# ===========================================================================
+print("\n== host:port parsing, for the proxy and the server list ==")
+check("a bare host takes the TLS default port",
+      W.parse_server("s.onion") == ("s.onion", 50002))
+check("host:port is honoured",
+      W.parse_server("s.onion:50001") == ("s.onion", 50001))
+check("a bracketed IPv6 literal parses",
+      W.parse_server("[::1]:50001") == ("::1", 50001)
+      and W.parse_server("[::1]") == ("::1", 50002))
+check("a bare IPv6 literal is refused as ambiguous",
+      _refused(W.parse_server, "::1"))
+for _spec in ("s.onion:0", "s.onion:70000", "s.onion:abc", ":50002", "",
+              "[::1", "s.onion:-5"):
+    check(f"a bad server spec is refused up front: {_spec!r}",
+          _refused(W.parse_server, _spec))
 
 # ===========================================================================
 print("\n== per-address circuit isolation: the tag becomes the SOCKS user ==")
@@ -116,28 +284,66 @@ _h1, _p1, _u1, _pw1 = W._socks_parts(_PROXY, "btcwatch:addrA")
 _h2, _p2, _u2, _pw2 = W._socks_parts(_PROXY, "btcwatch:addrB")
 _h1b, _, _u1b, _ = W._socks_parts(_PROXY, "btcwatch:addrA")
 check("the proxy host/port are parsed out for a raw socket",
-      _h1 == "127.0.0.1" and _p1 == 9050)
+      _h1 == "127.0.0.1" and _p1 == 9050 and _pw1)
 check("two different addresses get two different SOCKS usernames "
       "(different circuits)", _u1 and _u2 and _u1 != _u2)
 check("the SAME address gets the SAME username (a retry reuses its circuit)",
       _u1 == _u1b)
+check("the address itself never appears in the credential (only its hash)",
+      "addrA" not in _u1 and "btcwatch" not in _u1)
 check("an empty proxy is refused rather than connecting directly",
-      _refused(lambda: W._socks_parts("", "btcwatch:x")))
+      _refused(W._socks_parts, "", "btcwatch:x"))
+check("a proxy URL that already carries a credential is REFUSED: used as-is "
+      "it would put every address on one circuit",
+      _refused(W._socks_parts, "socks5h://op:pw@127.0.0.1:9050", "btcwatch:x"))
+check("a socks5:// (local-DNS) URL is refused; only socks5h:// is accepted",
+      _refused(W._socks_parts, "socks5:// 127.0.0.1:9050".replace(" ", ""),
+               "btcwatch:x"))
+check("an http:// proxy is refused",
+      _refused(W._socks_parts, "http://127.0.0.1:8118", "btcwatch:x"))
+check("a proxy with a bad port is refused",
+      _refused(W._socks_parts, "socks5h://127.0.0.1:90500", "btcwatch:x"))
+check("a proxy with no port is refused (no guessing 9050)",
+      _refused(W._socks_parts, "socks5h://127.0.0.1", "btcwatch:x"))
 
 
 # ===========================================================================
 print("\n== the SOCKS5 handshake, against a real in-process SOCKS5 server ==")
 
+_TIP = 800000
+_SCRIPTHASH = W.address_to_scripthash(_A0)
 
-def _mock_socks(behaviour="ok"):
-    """A one-shot SOCKS5 server. Returns (port, captured, stop). `captured`
-    fills with what the client sent; `behaviour` picks the reply."""
+
+def _electrum_reply(req, scenario):
+    """A tiny Electrum server's answer to one request, for the end-to-end
+    runs through the mock proxy."""
+    i, m = req.get("id"), req.get("method")
+    if m == "server.version":
+        res = ["ElectrumX 1.16.0", "1.4"]
+    elif m == "blockchain.headers.subscribe":
+        res = {"height": scenario["tip"], "hex": "00"}
+    elif m == "blockchain.scripthash.listunspent":
+        res = (scenario["utxos"] if req.get("params") == [_SCRIPTHASH]
+               else [])
+    else:
+        return json.dumps({"jsonrpc": "2.0", "id": i,
+                           "error": {"code": -32601,
+                                     "message": "unknown method"}}) + "\n"
+    return json.dumps({"jsonrpc": "2.0", "id": i, "result": res}) + "\n"
+
+
+def _mock_socks(behaviour="ok", scenario=None, tls_ctx=None):
+    """A one-shot SOCKS5 server. Returns (port, captured, srv). `captured`
+    fills with what the client sent; `behaviour` picks the reply. With
+    behaviour "electrum" it goes on to speak Electrum after CONNECT (over
+    `tls_ctx` if given), so the real transport and client can be driven end
+    to end."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     port = srv.getsockname()[1]
-    captured = {}
+    captured = {"methods_asked": []}
 
     def _recvn(c, n):
         b = b""
@@ -150,38 +356,94 @@ def _mock_socks(behaviour="ok"):
 
     def serve():
         try:
+            srv.settimeout(10)
             c, _ = srv.accept()
         except OSError:
             return
         try:
+            c.settimeout(10)
             ver, nm = _recvn(c, 2)
             methods = _recvn(c, nm)
+            captured["greeting_ver"] = ver
             captured["methods"] = list(methods)
+            if behaviour == "ver4":
+                c.sendall(b"\x04\x00")
+                return
+            if behaviour == "method_none":
+                # a proxy that "helpfully" downgrades to no-auth
+                c.sendall(b"\x05\x00")
+                head = _recvn(c, 4)              # would the client CONNECT?
+                captured["connect_after_downgrade"] = head
+                return
+            if behaviour == "method_ff":
+                c.sendall(b"\x05\xff")
+                return
+            if behaviour == "drip":
+                # one byte of the greeting reply per 0.25 s, for ever
+                for b in (b"\x05", b"\x02", b"\x01", b"\x00", b"\x00"):
+                    c.sendall(b)
+                    time.sleep(0.25)
+                return
+            if behaviour == "close_early":
+                c.sendall(b"\x05")
+                return
             if 0x02 in methods:
                 c.sendall(b"\x05\x02")
-                _av, ul = _recvn(c, 2)
+                av, ul = _recvn(c, 2)
                 user = _recvn(c, ul)
                 pl = _recvn(c, 1)[0]
-                _recvn(c, pl)
+                pw = _recvn(c, pl)
+                captured["auth_ver"] = av
                 captured["user"] = user.decode()
+                captured["password"] = pw.decode()
                 if behaviour == "auth_reject":
                     c.sendall(b"\x01\x01")
+                    return
+                if behaviour == "auth_badver":
+                    c.sendall(b"\x05\x00")
                     return
                 c.sendall(b"\x01\x00")
             else:
                 c.sendall(b"\x05\x00")
             head = _recvn(c, 4)
+            captured["cmd"] = head[1]
             captured["atyp"] = head[3]
             if head[3] == 0x03:
                 hl = _recvn(c, 1)[0]
                 captured["dest_host"] = _recvn(c, hl).decode()
+            elif head[3] == 0x01:
+                captured["dest_host"] = socket.inet_ntoa(_recvn(c, 4))
             captured["dest_port"] = int.from_bytes(_recvn(c, 2), "big")
             if behaviour == "connect_refuse":
                 c.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            if behaviour == "bound_v6":
+                c.sendall(b"\x05\x00\x00\x04" + b"\x00" * 16 + b"\x00\x00")
+            elif behaviour == "bound_domain":
+                c.sendall(b"\x05\x00\x00\x03\x05bound\x00\x00")
             else:
                 c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-                # leave the stream open; the SOCKS test does not speak Electrum
-        except OSError:
+            if behaviour != "electrum":
+                return                           # leave the stream to the test
+            stream = c
+            if tls_ctx is not None:
+                stream = tls_ctx.wrap_socket(c, server_side=True)
+                captured["tls_version"] = stream.version()
+            f = stream.makefile("rb")
+            for raw in f:
+                req = json.loads(raw.decode())
+                captured["methods_asked"].append(req.get("method"))
+                captured.setdefault("requests", []).append(req)
+                if scenario.get("notify_before") and \
+                        req.get("method") == "blockchain.headers.subscribe":
+                    for _ in range(scenario["notify_before"]):
+                        stream.sendall((json.dumps(
+                            {"jsonrpc": "2.0",
+                             "method": "blockchain.headers.subscribe",
+                             "params": [{"height": scenario["tip"]}]})
+                            + "\n").encode())
+                stream.sendall(_electrum_reply(req, scenario).encode())
+        except (OSError, ValueError):
             pass
         finally:
             try:
@@ -194,218 +456,581 @@ def _mock_socks(behaviour="ok"):
     return port, captured, srv
 
 
+def _deadline(seconds=5.0):
+    return time.monotonic() + seconds
+
+
 _port, _cap, _srv = _mock_socks("ok")
 try:
     _s = W._socks5_connect("deposit.example.onion", 50002, "127.0.0.1", _port,
-                           "isotag123", "x", 5.0)
+                           "isotag123", "x", _deadline())
+    _s.close()
+    _ok = True
+except Exception as _e:                                      # noqa: BLE001
+    _ok = False
+finally:
+    _srv.close()
+check("the handshake completes and returns a socket", _ok)
+check("...offering exactly ONE method, username/password, as SOCKS5",
+      _cap.get("greeting_ver") == 5 and _cap.get("methods") == [2])
+check("...the isolation tag was sent as the SOCKS username (RFC 1929 v1)",
+      _cap.get("auth_ver") == 1 and _cap.get("user") == "isotag123"
+      and _cap.get("password") == "x")
+check("...the destination went as a DOMAIN name (resolved at the proxy, no "
+      "local DNS), by CONNECT", _cap.get("cmd") == 1 and _cap.get("atyp") == 3
+      and _cap.get("dest_host") == "deposit.example.onion")
+check("...to the right port", _cap.get("dest_port") == 50002)
+
+_port, _cap, _srv = _mock_socks("ok")
+try:
+    _s = W._socks5_connect("h.onion", 1, "127.0.0.1", _port, "", "",
+                           _deadline())
     _s.close()
     _ok = True
 except Exception:                                            # noqa: BLE001
     _ok = False
 finally:
     _srv.close()
-check("the handshake completes and returns a socket", _ok)
-check("...the isolation tag was sent as the SOCKS username",
-      _cap.get("user") == "isotag123")
-check("...the destination went as a DOMAIN name (resolved at the proxy, no "
-      "local DNS)", _cap.get("atyp") == 0x03
-      and _cap.get("dest_host") == "deposit.example.onion")
-check("...to the right port", _cap.get("dest_port") == 50002)
+check("with no credential at all the greeting offers no-auth only, and the "
+      "handshake still completes", _ok and _cap.get("methods") == [0])
 
-_port, _cap, _srv = _mock_socks("auth_reject")
-try:
-    W._socks5_connect("h.onion", 50002, "127.0.0.1", _port, "u", "p", 5.0)
-    _rej = False
-except W.BtcWatchError:
-    _rej = True
-finally:
-    _srv.close()
-check("a rejected SOCKS auth is a loud failure, not a silent direct connect",
-      _rej)
+_port, _cap, _srv = _mock_socks("method_none")
+_rej = _refused(W._socks5_connect, "h.onion", 50002, "127.0.0.1", _port,
+                "u", "p", _deadline())
+time.sleep(0.05)
+_srv.close()
+check("a proxy that answers 'no auth' to an offer of username/password is "
+      "REFUSED -- a stream with no isolation is never used", _rej)
+check("...and no CONNECT was ever sent on that un-isolated stream",
+      "connect_after_downgrade" not in _cap)
 
-_port, _cap, _srv = _mock_socks("connect_refuse")
-try:
-    W._socks5_connect("h.onion", 50002, "127.0.0.1", _port, "u", "p", 5.0)
-    _cref = False
-except W.BtcWatchError:
-    _cref = True
-finally:
+for _b, _why in (("method_ff", "no acceptable method"),
+                 ("ver4", "not a SOCKS5 proxy"),
+                 ("auth_reject", "auth rejected"),
+                 ("auth_badver", "auth reply with a bad version byte"),
+                 ("connect_refuse", "CONNECT refused"),
+                 ("close_early", "stream closed mid-frame")):
+    _port, _cap, _srv = _mock_socks(_b)
+    _r = _refused(W._socks5_connect, "h.onion", 50002, "127.0.0.1", _port,
+                  "u", "p", _deadline())
     _srv.close()
-check("a refused CONNECT is a loud failure", _cref)
+    check(f"{_why}: a loud failure, not a silent direct connect", _r)
+
+for _b in ("bound_v6", "bound_domain"):
+    _port, _cap, _srv = _mock_socks(_b)
+    try:
+        W._socks5_connect("h.onion", 50002, "127.0.0.1", _port, "u", "p",
+                          _deadline()).close()
+        _ok = True
+    except Exception:                                        # noqa: BLE001
+        _ok = False
+    _srv.close()
+    check(f"a CONNECT reply with a {_b[6:]} bound address is consumed "
+          f"correctly", _ok)
+
+# THE TRICKLE. One byte per 0.25 s never trips a per-read timeout of 0.6 s;
+# the deadline must.
+_port, _cap, _srv = _mock_socks("drip")
+_t0 = time.monotonic()
+_r = _refused(W._socks5_connect, "h.onion", 50002, "127.0.0.1", _port,
+              "u", "p", time.monotonic() + 0.6)
+_el = time.monotonic() - _t0
+_srv.close()
+check("a proxy that trickles one byte at a time is cut off at the DEADLINE "
+      f"(refused after {_el:.2f}s, not held open)", _r and _el < 1.5)
+
+check("a destination port out of range is refused BEFORE any connection, "
+      "through the module's own error", all(
+          _refused(W._socks5_connect, "h.onion", p, "127.0.0.1", 1, "u", "p",
+                   _deadline()) for p in (0, 65536, -1)))
+check("an empty password with a username is refused (RFC 1929: PLEN 1..255)",
+      _refused(W._socks5_connect, "h.onion", 1, "127.0.0.1", 1, "u", "",
+               _deadline()))
+check("a destination host over 255 bytes is refused before connecting",
+      _refused(W._socks5_connect, "h" * 256, 1, "127.0.0.1", 1, "u", "p",
+               _deadline()))
+check("a deadline already passed is refused before connecting",
+      _refused(W._socks5_connect, "h.onion", 1, "127.0.0.1", 1, "u", "p",
+               time.monotonic() - 1))
+check("a proxy that is not listening is an OSError (the failover kind)",
+      _raises(W._socks5_connect, OSError, "h.onion", 1, "127.0.0.1", 1,
+              "u", "p", _deadline()))
+
+
+# ===========================================================================
+print("\n== the transport's line framing, on a fake socket ==")
+
+
+class _ChunkSock:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.sent = b""
+        self.timeouts = []
+        self.closed = False
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+    def recv(self, n):
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def sendall(self, b):
+        self.sent += b
+
+    def close(self):
+        self.closed = True
+
+
+def _transport(chunks, deadline=None):
+    t = W.SocksTlsTransport("h.onion", 50002, _PROXY, "btcwatch:x", tls=False)
+    t._sock = _ChunkSock(chunks)
+    t._deadline = deadline if deadline is not None else _deadline()
+    return t
+
+
+_t = _transport([b'{"a"', b":1}\n{", b'"b":2}\n'])
+check("a line split across reads, and two lines in one read, both frame "
+      "correctly", _t.recv_line() == '{"a":1}' and _t.recv_line() == '{"b":2}')
+check("...and the clock was re-armed from the deadline before each of the "
+      "three reads it took", len(_t._sock.timeouts) == 3
+      and all(0 < x <= 5 for x in _t._sock.timeouts))
+_t = _transport([b"x" * 65536] * 40)
+check("a line that never ends is cut off at MAX_LINE_BYTES",
+      _refused(_t.recv_line))
+_t = _transport([])
+check("a connection closed mid-line is a loud failure", _refused(_t.recv_line))
+_t = _transport([b"late\n"], deadline=time.monotonic() - 1)
+check("a deadline that has passed refuses the read before it happens",
+      _refused(_t.recv_line))
+_t = _transport([])
+_t.send_line('{"m":1}')
+check("send_line frames with a newline", _t._sock.sent == b'{"m":1}\n')
+_t = _transport([b"\xff\xfe\n"])
+check("undecodable bytes become a replaced-character line, not a crash",
+      _t.recv_line() == "\ufffd\ufffd")
+_t = _transport([])
+_sk = _t._sock
+_t.close()
+_t.close()
+check("close() closes the socket, forgets it, and is idempotent",
+      _sk.closed and _t._sock is None)
+check("an unconnected transport refuses to speak",
+      _refused(W.SocksTlsTransport("h", 1, _PROXY, "t").send_line, "x")
+      and _refused(W.SocksTlsTransport("h", 1, _PROXY, "t").recv_line))
+
+
+# ===========================================================================
+print("\n== END TO END: real transport + real client, through the mock proxy "
+      "to an in-process Electrum server ==")
+
+_SCEN = {"tip": _TIP, "utxos": [_u(_TIP - 2, 700000)]}
+
+
+def _e2e(scenario, *, tls_ctx=None, min_conf=1, timeout=5.0):
+    port, cap, srv = _mock_socks("electrum", scenario, tls_ctx=tls_ctx)
+    proxy = f"socks5h://127.0.0.1:{port}"
+
+    def factory(host, p, tag):
+        cap["tag"] = tag
+        return W.SocksTlsTransport(host, p, proxy, tag,
+                                   tls=tls_ctx is not None, timeout=timeout)
+    try:
+        r = W.look(_A0, [("watch.example.onion", 50002)], proxy,
+                   min_conf=min_conf, transport_factory=factory)
+    finally:
+        srv.close()
+    return r, cap
+
+
+_r, _cap = _e2e(_SCEN, min_conf=3)
+check("plaintext end to end: the real SOCKS5 handshake, then the real client "
+      "asks and gets 'confirmed' with the right figures",
+      _r["state"] == "confirmed" and _r["settled_sat"] == 700000
+      and _r["confirmations"] == 3 and _r["tip"] == _TIP
+      and _r["server"] == "watch.example.onion")
+check("...the destination reached the proxy as a domain name",
+      _cap.get("atyp") == 3 and _cap.get("dest_host") == "watch.example.onion"
+      and _cap.get("dest_port") == 50002)
+check("...on a circuit credential derived from the address tag",
+      _cap.get("user") == W._socks_parts(_PROXY, _cap["tag"])[2]
+      and _A0 in _cap["tag"])
+check("...every request carried the JSON-RPC 2.0 member and an id",
+      all(q.get("jsonrpc") == "2.0" and isinstance(q.get("id"), int)
+          for q in _cap.get("requests", [])) and _cap.get("requests"))
+check("...and the server was asked ONLY the three read-only methods, "
+      "in order: version, tip, listunspent -- nothing that could spend",
+      _cap["methods_asked"] == ["server.version",
+                                "blockchain.headers.subscribe",
+                                "blockchain.scripthash.listunspent"])
+
+_r, _cap = _e2e({"tip": _TIP, "utxos": [_u(_TIP - 2, 700000)],
+                 "notify_before": 3})
+check("three subscription notifications interleaved before the tip reply "
+      "are skipped, not mistaken for the answer",
+      _r["state"] == "confirmed" and _r["tip"] == _TIP)
+
+# TLS: the same, wrapped. A throwaway self-signed certificate lives here so
+# the test needs no binary and no network; it signs nothing but this test.
+_CERT = """-----BEGIN CERTIFICATE-----
+MIIBdTCCARugAwIBAgIUDJRNtLwkLwZf7LiAeFsSb1QGZOIwCgYIKoZIzj0EAwIw
+DzENMAsGA1UEAwwEdGVzdDAgFw0yNjA5MDcxMjE3MzVaGA8yMTI2MDgxNDEyMTcz
+NVowDzENMAsGA1UEAwwEdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABLL+
+8FOfUNx6Wb0wNEL5AMErj37LWDte4iePjiTiZJJ5nn3K/6ASgc/8yxid7tf/eaOg
+czBRfRAWvo8ajre2PaCjUzBRMB0GA1UdDgQWBBSaCWiY15FNripajzLhwREtwUXa
+3TAfBgNVHSMEGDAWgBSaCWiY15FNripajzLhwREtwUXa3TAPBgNVHRMBAf8EBTAD
+AQH/MAoGCCqGSM49BAMCA0gAMEUCIQDlzYSszz/pDduksVN8OJP8Uq2Uxk8f0jzl
+oBJYqtMHQwIgd1IPLkFTBJ/zddKG/Q3yvxIxDaN/S/6nLfMw7Dbiumo=
+-----END CERTIFICATE-----
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgn49cpPD0RG7XY+kl
+IT1dHKG9k01uZw1A+YoscdQwNKyhRANCAASy/vBTn1Dcelm9MDRC+QDBK49+y1g7
+XuInj44k4mSSeZ59yv+gEoHP/MsYne7X/3mjoHMwUX0QFr6PGo63tj2g
+-----END PRIVATE KEY-----
+"""
+_cert_path = os.path.join(tempfile.mkdtemp(prefix="gs_btcw_"), "tls.pem")
+with open(_cert_path, "w") as _fh:
+    _fh.write(_CERT)
+_sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+_sctx.load_cert_chain(_cert_path)
+_r, _cap = _e2e(_SCEN, tls_ctx=_sctx, min_conf=1)
+check("TLS end to end: SOCKS5, then TLS to a self-signed server, then the "
+      "client -- confirmed, with the right figures",
+      _r["state"] == "confirmed" and _r["settled_sat"] == 700000)
+check("...and the session was TLS 1.2 or newer",
+      _cap.get("tls_version") in ("TLSv1.2", "TLSv1.3"))
+os.remove(_cert_path)
+
+# a server that hangs up straight after the SOCKS handshake, via the real
+# transport: look() reports 'no server answered', never a state.
+_port, _cap, _srv = _mock_socks("ok")
+_proxy = f"socks5h://127.0.0.1:{_port}"
+check("through the real transport, a server that says nothing is a loud "
+      "failure of look(), not an invented state",
+      _refused(W.look, _A0, [("h.onion", 50002)], _proxy,
+               transport_factory=lambda h, p, t: W.SocksTlsTransport(
+                   h, p, _proxy, t, tls=False, timeout=2.0)))
+_srv.close()
 
 
 # ===========================================================================
 print("\n== the Electrum client and look(), against a fake transport ==")
 
 
-class _FakeSock:
-    """A socket-like object that speaks the Electrum line protocol from a
-    fixed balance/history/tip. Optionally prepends a subscription-style
-    notification, or drops the connection, to test those paths."""
+class _FakeTransport:
+    """Speaks the Electrum line protocol from a fixed tip and utxo set.
+    Knobs reproduce every way a server can misbehave."""
 
-    def __init__(self, *, tip, balance, history, notify_first=False,
-                 drop=False):
-        self._tip = tip
-        self._bal = balance
-        self._hist = history
-        self._notify = notify_first
-        self._drop = drop
-        self._in = b""
-        self._out = b""
-        self._sent_methods = []
+    def __init__(self, *, tip=_TIP, utxos=(), connect_error=None,
+                 notify=0, raw=None, tip_reply=None, unspent_reply=None,
+                 version_error=False, drop_after=None):
+        self.tip = tip
+        self.utxos = list(utxos)
+        self.connect_error = connect_error
+        self.notify = notify
+        self.raw = raw or {}                     # method -> raw line override
+        self.tip_reply = tip_reply
+        self.unspent_reply = unspent_reply
+        self.version_error = version_error
+        self.drop_after = drop_after             # method after which it dies
+        self.queue = []
+        self.methods = []
+        self.requests = []
+        self.connected = False
+        self.closed = False
 
-    def sendall(self, data):
-        self._in += data
-        while b"\n" in self._in:
-            line, _, self._in = self._in.partition(b"\n")
-            req = json.loads(line.decode())
-            self._sent_methods.append(req.get("method"))
-            self._out += self._respond(req)
+    def connect(self):
+        if self.connect_error:
+            raise self.connect_error
+        self.connected = True
 
-    def _respond(self, req):
+    def send_line(self, line):
+        req = json.loads(line)
+        self.requests.append(req)
         i, m = req.get("id"), req.get("method")
+        self.methods.append(m)
+        if m in self.raw:
+            self.queue.append(self.raw[m])
+            return
         if m == "server.version":
+            if self.version_error:
+                self.queue.append(json.dumps(
+                    {"jsonrpc": "2.0", "id": i,
+                     "error": {"code": 1, "message": "unsupported"}}))
+                return
             res = ["ElectrumX 1.16.0", "1.4"]
         elif m == "blockchain.headers.subscribe":
-            res = {"height": self._tip, "hex": "00"}
-        elif m == "blockchain.scripthash.get_balance":
-            res = self._bal
-        elif m == "blockchain.scripthash.get_history":
-            res = self._hist
+            for _ in range(self.notify):
+                self.queue.append(json.dumps(
+                    {"jsonrpc": "2.0",
+                     "method": "blockchain.headers.subscribe",
+                     "params": [{"height": self.tip}]}))
+            res = (self.tip_reply if self.tip_reply is not None
+                   else {"height": self.tip, "hex": "00"})
+        elif m == "blockchain.scripthash.listunspent":
+            res = (self.unspent_reply if self.unspent_reply is not None
+                   else self.utxos)
         else:
-            return (json.dumps({"id": i, "error": "unknown"}) + "\n").encode()
-        out = b""
-        if self._notify and m == "blockchain.headers.subscribe":
-            # a notification carries no matching id; the client must skip it
-            out += (json.dumps({"method": "blockchain.headers.subscribe",
-                                "params": [{"height": self._tip}]})
-                    + "\n").encode()
-        out += (json.dumps({"id": i, "result": res}) + "\n").encode()
-        return out
+            self.queue.append(json.dumps({"jsonrpc": "2.0", "id": i,
+                                          "error": "unknown method"}))
+            return
+        self.queue.append(json.dumps({"jsonrpc": "2.0", "id": i,
+                                      "result": res}))
+        if self.drop_after == m:
+            # a dropped connection stays dropped: nothing more ever arrives
+            self.queue = []
+            self.dead = True
 
-    def recv(self, n):
-        if self._drop:
-            return b""
-        chunk, self._out = self._out[:n], self._out[n:]
-        return chunk
+    dead = False
+
+    def recv_line(self):
+        if self.dead or not self.queue:
+            raise W.BtcWatchError("electrum: connection closed")
+        return self.queue.pop(0)
 
     def close(self):
-        pass
+        self.closed = True
 
 
-_ADDR = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
 _SERVERS = [("s1.onion", 50002)]
 
 
-def _factory(sock):
-    return lambda host, port, tag: (lambda: sock)
+def _one(ft):
+    return lambda host, port, tag: ft
 
 
-_r = W.look(_ADDR, _SERVERS, _PROXY, min_conf=1,
-            connect_factory=_factory(_FakeSock(
-                tip=800000, balance={"confirmed": 0, "unconfirmed": 0},
-                history=[])))
-check("nothing on the address: not_seen, zero, zero",
+def _look(ft, **kw):
+    return W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(ft), **kw)
+
+
+_r = _look(_FakeTransport())
+check("nothing on the address: not_seen, all zeros, an empty utxo list",
       _r["state"] == "not_seen" and _r["confirmed_sat"] == 0
-      and _r["unconfirmed_sat"] == 0 and _r["confirmations"] == 0)
-
-_r = W.look(_ADDR, _SERVERS, _PROXY, min_conf=1,
-            connect_factory=_factory(_FakeSock(
-                tip=800000, balance={"confirmed": 0, "unconfirmed": 500000},
-                history=[{"tx_hash": "aa", "height": 0}])))
+      and _r["unconfirmed_sat"] == 0 and _r["settled_sat"] == 0
+      and _r["confirmations"] == 0 and _r["utxos"] == [])
+_r = _look(_FakeTransport(utxos=[_u(0, 500000)]))
 check("money landed, in the mempool: seen, the unconfirmed amount, zero confs",
       _r["state"] == "seen" and _r["unconfirmed_sat"] == 500000
-      and _r["confirmations"] == 0)
-
-_r = W.look(_ADDR, _SERVERS, _PROXY, min_conf=3,
-            connect_factory=_factory(_FakeSock(
-                tip=800000, balance={"confirmed": 500000, "unconfirmed": 0},
-                history=[{"tx_hash": "bb", "height": 799999}])))
-check("one confirmation but three required: still seen, not confirmed, and "
-      "the confirmation count is exact (800000-799999+1=2)",
-      _r["state"] == "seen" and _r["confirmed_sat"] == 500000
-      and _r["confirmations"] == 2)
-
-_r = W.look(_ADDR, _SERVERS, _PROXY, min_conf=3,
-            connect_factory=_factory(_FakeSock(
-                tip=800000, balance={"confirmed": 500000, "unconfirmed": 0},
-                history=[{"tx_hash": "bb", "height": 799998}])))
-check("three confirmations and three required: confirmed",
-      _r["state"] == "confirmed" and _r["confirmations"] == 3)
-
-_r = W.look(_ADDR, _SERVERS, _PROXY, min_conf=1,
-            connect_factory=_factory(_FakeSock(
-                tip=800000, balance={"confirmed": 500000, "unconfirmed": 0},
-                history=[{"tx_hash": "bb", "height": 800000}],
-                notify_first=True)))
-check("a subscription notification interleaved before the answer is skipped, "
-      "not mistaken for the result", _r["state"] == "confirmed"
+      and _r["settled_sat"] == 0 and _r["confirmations"] == 0)
+_r = _look(_FakeTransport(utxos=[_u(_TIP - 1, 500000)]), min_conf=3)
+check("two deep but three required: still seen, not confirmed, the depth "
+      "exact", _r["state"] == "seen" and _r["confirmed_sat"] == 500000
+      and _r["confirmations"] == 2 and _r["settled_sat"] == 0)
+_r = _look(_FakeTransport(utxos=[_u(_TIP - 2, 500000)]), min_conf=3)
+check("three deep and three required: confirmed, settled in full",
+      _r["state"] == "confirmed" and _r["settled_sat"] == 500000
+      and _r["confirmations"] == 3)
+_r = _look(_FakeTransport(utxos=[_u(_TIP - 100, 1, _H, 0),
+                                 _u(_TIP, 500000, _H2, 1)]), min_conf=3)
+check("through look(): settled dust plus a fresh deposit -- settled_sat is "
+      "the dust alone and the deposit's output is marked 1 deep",
+      _r["settled_sat"] == 1 and _r["confirmations"] == 1
+      and _r["utxos"][1]["confirmations"] == 1)
+_r = _look(_FakeTransport(utxos=[_u(_TIP, 500000)], notify=1))
+check("a subscription notification before the answer is skipped, not "
+      "mistaken for the result", _r["state"] == "confirmed"
       and _r["confirmations"] == 1)
+_r = _look(_FakeTransport(utxos=[_u(_TIP, 500000)],
+                          notify=W.MAX_SKIPPED_LINES))
+check("exactly MAX_SKIPPED_LINES notifications are tolerated",
+      _r["state"] == "confirmed")
+check("one more than MAX_SKIPPED_LINES notifications: the server is given up "
+      "on -- it cannot stall the watcher by streaming frames",
+      _refused(_look, _FakeTransport(utxos=[_u(_TIP, 500000)],
+                                     notify=W.MAX_SKIPPED_LINES + 1)))
+_r = _look(_FakeTransport(utxos=[_u(_TIP, 500000)], version_error=True))
+check("a server that rejects server.version is still asked the real "
+      "questions (the handshake is best effort)", _r["state"] == "confirmed")
+
+for _label, _ft in [
+        ("a non-JSON line", _FakeTransport(raw={
+            "blockchain.headers.subscribe": "not json"})),
+        ("a non-object frame", _FakeTransport(raw={
+            "blockchain.headers.subscribe": "[1,2,3]"})),
+        ("an error reply to our request", _FakeTransport(raw={
+            "blockchain.scripthash.listunspent":
+            '{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"no"}}'})),
+        ("an error with a null id (the request itself rejected)",
+         _FakeTransport(raw={"blockchain.headers.subscribe":
+                             '{"jsonrpc":"2.0","id":null,"error":"bad"}'})),
+        ("a tip reply that is not an object", _FakeTransport(tip_reply=7)),
+        ("a tip height that is a string", _FakeTransport(
+            tip_reply={"height": "800000"})),
+        ("a tip height that is a bool", _FakeTransport(
+            tip_reply={"height": True})),
+        ("a listunspent reply that is an object", _FakeTransport(
+            unspent_reply={"value": 5})),
+        ("a listunspent entry with a string value", _FakeTransport(
+            unspent_reply=[_u(1, "5")])),
+        ("a listunspent entry with a bool value", _FakeTransport(
+            unspent_reply=[_u(1, True)])),
+        ("a connection dropped after the tip", _FakeTransport(
+            drop_after="blockchain.headers.subscribe")),
+        ("a connection dropped before anything", _FakeTransport(
+            drop_after="server.version")),
+]:
+    check(f"{_label}: a loud failure through the module's error, never a "
+          f"stray exception or an invented state", _refused(_look, _ft))
 
 
-# server failover: the first connect dies, the second answers.
+# failover: the first transport dies at connect, the second answers.
 def _failover_factory(host, port, tag):
     if host == "dead.onion":
-        def _bad():
-            raise OSError("circuit died")
-        return _bad
-    return lambda: _FakeSock(tip=800000,
-                             balance={"confirmed": 700000, "unconfirmed": 0},
-                             history=[{"tx_hash": "cc", "height": 799999}])
+        return _FakeTransport(connect_error=OSError("circuit died"))
+    return _FakeTransport(utxos=[_u(_TIP - 1, 700000)])
 
 
-_r = W.look(_ADDR, [("dead.onion", 50002), ("live.onion", 50002)], _PROXY,
-            min_conf=1, connect_factory=_failover_factory)
+_r = W.look(_A0, [("dead.onion", 50002), ("live.onion", 50002)], _PROXY,
+            transport_factory=_failover_factory)
 check("a dead first server fails over to a live second one",
       _r["state"] == "confirmed" and _r["server"] == "live.onion"
       and _r["confirmed_sat"] == 700000)
 
+_bad = _FakeTransport(unspent_reply=[_u(1, "5")])
+_good = _FakeTransport(utxos=[_u(_TIP, 1)])
+_r = W.look(_A0, [("a.onion", 50002), ("b.onion", 50002)], _PROXY,
+            transport_factory=lambda h, p, t: _bad if h == "a.onion"
+            else _good)
+check("a server whose reply is malformed is failed over, and its transport "
+      "was closed on the way out",
+      _r["server"] == "b.onion" and _bad.closed and _good.closed)
 
-def _all_dead(host, port, tag):
-    def _bad():
-        raise OSError("nope")
-    return _bad
-
-
-check("every server dead: look() raises rather than inventing an answer",
-      _refused(lambda: W.look(_ADDR, _SERVERS, _PROXY,
-                              connect_factory=_all_dead)))
+check("every server dead: look() raises, naming the last error",
+      _raises(lambda: W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(
+          _FakeTransport(connect_error=OSError("nope")))), W.BtcWatchError))
+try:
+    W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(
+        _FakeTransport(connect_error=OSError("circuit died"))))
+    _msg = ""
+except W.BtcWatchError as _e:
+    _msg = str(_e)
+check("...and the message says which failure it was",
+      "circuit died" in _msg)
 check("no servers configured: refused up front",
-      _refused(lambda: W.look(_ADDR, [], _PROXY, connect_factory=_factory(
-          _FakeSock(tip=1, balance={"confirmed": 0, "unconfirmed": 0},
-                    history=[])))))
+      _refused(W.look, _A0, [], _PROXY, transport_factory=_one(
+          _FakeTransport())))
 
-# a server that hangs up mid-conversation is a failure, not a partial answer.
-check("a dropped connection is a loud failure",
-      _refused(lambda: W.look(_ADDR, _SERVERS, _PROXY, connect_factory=_factory(
-          _FakeSock(tip=800000, balance={"confirmed": 0, "unconfirmed": 0},
-                    history=[], drop=True)))))
+_calls = []
 
-# look() tags each address's circuit by the address itself, so the network
-# sees each on its own Tor circuit. Capture the tag it hands the transport.
+
+def _counting(host, port, tag):
+    _calls.append(host)
+    return _FakeTransport()
+
+
+check("a bad server spec (port 0) is refused BEFORE any connection is tried",
+      _refused(W.look, _A0, [("a.onion", 50002), ("b.onion", 0)], _PROXY,
+               transport_factory=_counting) and _calls == [])
+check("a server spec that is not a pair is refused",
+      _refused(W.look, _A0, ["a.onion:50002"], _PROXY,
+               transport_factory=_counting) and _calls == [])
+for _mc in (0, -1, True, "1", 1.0):
+    check(f"min_conf={_mc!r} is refused: an unconfirmed deposit is never "
+          f"settled money", _refused(_look, _FakeTransport(), min_conf=_mc))
+check("a testnet address looked up as mainnet is refused (never the wrong "
+      "chain)", _refused(W.look, "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl",
+                         _SERVERS, _PROXY, transport_factory=_counting))
+check("...and it is accepted when the network says testnet",
+      W.look("tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl", _SERVERS, _PROXY,
+             network="testnet", transport_factory=_one(_FakeTransport()))
+      ["state"] == "not_seen")
+check("a legacy (non-segwit) address is refused by look(): it is not a kind "
+      "this module ever derives", _refused(
+          W.look, "1BitcoinEaterAddressDontSendf59kuE", _SERVERS, _PROXY,
+          transport_factory=_counting))
+check("an unknown network is refused by look()",
+      _refused(W.look, _A0, _SERVERS, _PROXY, network="mars",
+               transport_factory=_counting))
+check("NON-VACUITY: none of those refusals reached the transport",
+      _calls == [])
+
 _tags = []
 
 
 def _tag_factory(host, port, tag):
     _tags.append(tag)
-    return lambda: _FakeSock(tip=1, balance={"confirmed": 0, "unconfirmed": 0},
-                             history=[])
+    return _FakeTransport()
 
 
-W.look(_addrs[0], _SERVERS, _PROXY, connect_factory=_tag_factory)
-W.look(_addrs[1], _SERVERS, _PROXY, connect_factory=_tag_factory)
+W.look(_addrs[0], _SERVERS, _PROXY, transport_factory=_tag_factory)
+W.look(_addrs[1], _SERVERS, _PROXY, transport_factory=_tag_factory)
+W.look(_addrs[0], _SERVERS, _PROXY, transport_factory=_tag_factory)
 check("look() isolates each address on its own circuit tag: the address is "
-      "in the tag, and two addresses give two different tags",
-      _addrs[0] in _tags[0] and _tags[0] != _tags[1])
+      "in the tag, two addresses give two tags, a retry gives the same tag",
+      _addrs[0] in _tags[0] and _tags[0] != _tags[1] and _tags[0] == _tags[2])
 
-# the client really did ask for balance AND history (confirmations need both).
-_fs = _FakeSock(tip=800000, balance={"confirmed": 1, "unconfirmed": 0},
-                history=[{"tx_hash": "dd", "height": 800000}])
-W.look(_ADDR, _SERVERS, _PROXY, connect_factory=_factory(_fs))
-check("look() asks the server for the tip, the balance AND the history",
-      "blockchain.headers.subscribe" in _fs._sent_methods
-      and "blockchain.scripthash.get_balance" in _fs._sent_methods
-      and "blockchain.scripthash.get_history" in _fs._sent_methods)
+_ft = _FakeTransport(utxos=[_u(_TIP, 1)])
+_look(_ft)
+check("the transport is connected, asked exactly the three read-only "
+      "methods with JSON-RPC 2.0 framing and increasing ids, and closed",
+      _ft.connected and _ft.closed
+      and _ft.methods == ["server.version", "blockchain.headers.subscribe",
+                          "blockchain.scripthash.listunspent"]
+      and [q["id"] for q in _ft.requests] == [1, 2, 3]
+      and all(q["jsonrpc"] == "2.0" for q in _ft.requests))
+check("...and listunspent was asked about THIS address's scripthash",
+      _ft.requests[2]["params"] == [_SCRIPTHASH])
+_ft = _FakeTransport(drop_after="server.version")
+_refused(_look, _ft)
+check("a transport is closed even when the exchange fails", _ft.closed)
+
+# The default (no factory) path builds the real transport with the caller's
+# timeout and the proxy, and a dead proxy is a loud look() failure.
+_dead = socket.socket()
+_dead.bind(("127.0.0.1", 0))
+_dead_port = _dead.getsockname()[1]
+_dead.close()
+check("without a factory, look() builds the real Tor transport; a proxy that "
+      "is not there is a loud failure, not a direct connection",
+      _refused(W.look, _A0, _SERVERS, f"socks5h://127.0.0.1:{_dead_port}",
+               timeout=2.0))
+check("...and a proxy URL with a credential is refused there too",
+      _refused(W.look, _A0, _SERVERS, "socks5h://u:p@127.0.0.1:9050",
+               timeout=2.0))
+
+
+# ===========================================================================
+print("\n== the manual dry-run ==")
+_out = io.StringIO()
+with redirect_stdout(_out):
+    _rc = W._main(["--xpub", _ACCT_XPUB, "--index", "1"])
+check("derive-only: prints the address and scripthash, asks nobody, exits 0",
+      _rc == 0 and "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g" in _out.getvalue()
+      and W.address_to_scripthash(
+          "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g") in _out.getvalue()
+      and "derived only" in _out.getvalue())
+_out = io.StringIO()
+with redirect_stdout(_out):
+    _rc = W._main(["--xpub", _ACCT_TPUB, "--index", "0", "--network",
+                   "testnet"])
+check("derive-only on testnet prints the tb1 address",
+      _rc == 0 and "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl"
+      in _out.getvalue())
+check("a bad xpub on the command line fails loudly",
+      _refused(W._main, ["--xpub", "junk", "--index", "0"]))
+_out = io.StringIO()
+with redirect_stdout(_out):
+    _r = _refused(W._main, ["--xpub", _ACCT_XPUB, "--index", "0",
+                            "--electrum", "s.onion",
+                            "--tor", f"socks5h://127.0.0.1:{_dead_port}",
+                            "--timeout", "2"])
+check("with a server named and no proxy there: the look fails loudly and "
+      "prints no state", _r and "state:" not in _out.getvalue())
+
+# ===========================================================================
+print("\n== what the module must not be ==")
+_src = open(os.path.join(REPO, "gs_btc_watch.py"), encoding="utf-8").read()
+check("the module never speaks a method that could spend or broadcast",
+      "transaction.broadcast" not in _src and "sendrawtransaction" not in _src
+      and "blockchain.transaction." not in _src)
+check("the module never touches a private key API",
+      "from_seed" not in _src and "mnemonic" not in _src
+      and ".sign(" not in _src and "PrivateKey" not in _src)
+check("the module never writes the hash chain or a log",
+      "integrity_log" not in _src and "import logging" not in _src
+      and "open(" not in _src)
+check("the module imports no third-party SOCKS or HTTP client (no PySocks, "
+      "no requests): the framing is its own, so the dependency surface is",
+      "import socks" not in _src and "import requests" not in _src)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
