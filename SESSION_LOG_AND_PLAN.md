@@ -86,25 +86,40 @@ prints `RESULT: N passed, M failed`); `tests/mutation_sweep.py` holds
 **anchors**, each of which flips one exact line of source and asserts a named
 suite goes red — proof the test is load-bearing, not decorative.
 
-### `8c86548` — Stage 0: vendor embit (pure-Python), proven; session log + plan
-- `third_party/embit/` = embit 0.8.0 `src/embit/` verbatim, minus the seven
-  native libsecp256k1 blobs (`util/prebuilt/`, ~1.4 MB, deleted) and with
-  `util/secp256k1.py` pinned to the pure-Python `py_secp256k1` path that
-  embit ships and tests. MIT licence kept. `third_party/README.md` records
-  the sdist sha256, the two deviations, reproduction steps, and the three
-  expected inert import failures (`ctypes_secp256k1` with no native lib;
-  MicroPython-only `ubip39`/`uslip39`).
-- `tests/test_btc_embit.py` (30 checks) proves it against values published
-  outside this repo: BIP32 test vector 1 (master, `m/0h`, and the deep path
+### Stage 0 (first landed as `8c86548`, then REWORKED): vendor embit, constant-time native preferred, trimmed, proven
+- The first cut pinned embit to its pure-Python curve and forbade the native
+  path. That was the wrong call for a box that signs: pure-Python big-integer
+  curve arithmetic is variable-time — a timing side channel on the key that
+  moves the money. The rework reverses it on principle.
+- `third_party/embit/` = embit 0.8.0 `src/embit/` with THREE deliberate
+  changes, all recorded in `third_party/README.md`: the seven in-package
+  native blobs (`util/prebuilt/`) deleted — native code comes only from the
+  operating system; the unused surface deleted (`bip85`, `slip39`,
+  `psbtview`, `finalizer`, `liquid/`, `descriptor/`, the non-BIP39
+  wordlists) — 50 files → 23, 14 380 → 7 612 lines, with a guard proving no
+  kept module imports or references a removed one; and `util/secp256k1.py`
+  replaced by a selector that prefers the SYSTEM libsecp256k1 (Bitcoin
+  Core's constant-time library, from the distro's signed `libsecp256k1-1`)
+  through embit's own ctypes bindings, falls back to the pure-Python curve,
+  and exposes `NATIVE` / `BACKEND` so the signing path can refuse to degrade.
+  The sdist sha256 was checked against PyPI's independently published digest,
+  not only the downloaded file. `py_ripemd160` stays: `hashes.py` falls back
+  to it when the host's OpenSSL 3 has RIPEMD-160 disabled.
+- Split of trust: the **vault** (it signs) must install `libsecp256k1-1`;
+  the **Pi** (watch-only, no secret) is correct and safe on the fallback.
+- `tests/test_btc_embit.py` proves it against values published outside this
+  repo: BIP32 test vector 1 (master, `m/0h`, and the deep path
   `m/0h/1/2h/2/1000000000` xprv+xpub), the BIP84 reference mnemonic's first
   two receive and first change addresses, public derivation agreeing with
   private derivation on a non-hardened path (the Pi/vault split in
   miniature) and refusing hardened steps, fifty consecutive indexes giving
   fifty distinct bc1q addresses, a testnet tb1 derivation, BIP173 bech32
   decode/encode/round-trip and checksum rejection, HASH160('') against
-  RIPEMD160(SHA256('')), and secp256k1 sign→verify broken on a wrong hash and
-  a wrong key. It pins the vendoring: pure-Python path live, native path
-  never loaded, no binary in the tree.
+  RIPEMD160(SHA256('')) with the `py_ripemd160` fallback forced, secp256k1
+  sign→verify broken on a wrong hash and a wrong key, the pure-Python
+  fallback computing the same public key as the native library, the
+  selector preferring native and reporting truthfully whichever is live, and
+  the 23-file manifest pinned with no binary anywhere in the tree.
 - A vacuous always-true check found in review was removed before commit; the
   one failing vector turned out to be a hand-typed expected string and was
   resolved against the canonical BIP32 value (embit's output was right).
@@ -308,7 +323,7 @@ the two boxes the way everything else here is:
   by per-address circuits or removed by a private node. A block-explorer REST
   API over Tor works but is the weakest private option, not the default;
   over clearnet it is never acceptable.
-- Library: **embit 0.8.0**, vendored pure-Python, pinned, provenance
+- Library: **embit 0.8.0**, vendored and trimmed, the system's constant-time libsecp256k1 preferred with a pure-Python fallback for the watch-only side, pinned, provenance
   recorded (stage 0, done). Hand-rolling elliptic-curve signing for real money
   is forbidden.
 
@@ -346,7 +361,7 @@ rule-6 material).
 
 | # | Stage | State |
 |---|-------|-------|
-| 0 | Vendor embit (pure-Python) + prove with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — `8c86548` |
+| 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
 | 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; dry-run seen/confirmed against a mock and testnet; no keys, no money; tests | **in progress** |
 | 2 | `forward_to_swap` job: build + sign the BTC tx (inputs from the derived address, OP_RETURN memo with the 80-byte handling, change), `--dry-run` prints and does not broadcast; fetch current inbound over Tor; `WIRE_VERSION` bump; testnet | pending |
 | 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |

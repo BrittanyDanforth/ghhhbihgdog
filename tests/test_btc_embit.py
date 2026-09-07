@@ -10,10 +10,13 @@ signatures it produces are verified and then broken on purpose. Nothing below
 is "it imports and runs"; every check compares against a value published
 outside this repository.
 
-It also pins the vendoring deviation: the pure-Python secp256k1 path must be
-the one that is live, the native/ctypes path must never load, and no prebuilt
-binary may exist in the tree. A future re-vendor that quietly brings the blobs
-back fails here.
+It also pins the vendoring as reworked: the tree is exactly the trimmed
+23-file manifest with no binary anywhere in it; the secp256k1 selector prefers
+the SYSTEM libsecp256k1 (constant-time -- what a signer must use) and falls
+back to embit's pure-Python curve, and reports truthfully which is live; the
+pure-Python fallback the watch-only Pi relies on computes the same public keys
+as the native library; and the pure-Python RIPEMD-160 that an OpenSSL-3 vault
+falls back to gives the published digest.
 """
 import hashlib
 import os
@@ -48,25 +51,65 @@ _finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS),
 
 from embit import bip32, bip39, script, ec, hashes, bech32   # noqa: E402
 from embit.networks import NETWORKS                          # noqa: E402
+from embit.util import secp256k1 as _sel                     # noqa: E402
+from embit.util import py_secp256k1 as _py                   # noqa: E402
+from embit.util import py_ripemd160 as _pyrmd                # noqa: E402
+
+_tp = Path(REPO) / "third_party" / "embit"
 
 # ===========================================================================
-print("== the vendoring deviation holds: pure Python, no native path, no blobs ==")
-check("the pure-Python secp256k1 is the live implementation",
-      "embit.util.py_secp256k1" in sys.modules)
-check("the ctypes/native secp256k1 path was never loaded",
-      "embit.util.ctypes_secp256k1" not in sys.modules)
-_tp = Path(REPO) / "third_party" / "embit"
-check("no prebuilt binary directory exists in the vendored tree",
-      not (_tp / "util" / "prebuilt").exists())
-check("...and no .so/.dylib/.dll anywhere under it",
-      not any(p.suffix in (".so", ".dylib", ".dll")
-              for p in _tp.rglob("*") if p.is_file()))
-check("the selector is the documented one-line pin to py_secp256k1",
-      "from .py_secp256k1 import *" in (_tp / "util" / "secp256k1.py").read_text()
-      and "ctypes" not in (_tp / "util" / "secp256k1.py").read_text()
-                          .split("from .py_secp256k1")[1])
+print("== the vendored tree is the trimmed manifest, and nothing else ==")
+_MANIFEST = {
+    "LICENSE", "__init__.py", "base.py", "base58.py", "bech32.py", "bip32.py",
+    "bip39.py", "compact.py", "ec.py", "hashes.py", "misc.py", "networks.py",
+    "psbt.py", "script.py", "transaction.py",
+    "util/__init__.py", "util/ctypes_secp256k1.py", "util/key.py",
+    "util/py_ripemd160.py", "util/py_secp256k1.py", "util/secp256k1.py",
+    "wordlists/__init__.py", "wordlists/bip39.py",
+}
+_have = {str(p.relative_to(_tp)) for p in _tp.rglob("*")
+         if p.is_file() and "__pycache__" not in p.parts}
+check("exactly the 23 files of the manifest are present (surface pinned)",
+      _have == _MANIFEST)
+check("...none of the removed surface came back (liquid, descriptor, slip39, "
+      "bip85, psbtview, finalizer, other wordlists)",
+      not any(p in _have for p in ("bip85.py", "slip39.py", "psbtview.py",
+                                   "finalizer.py", "wordlists/ubip39.py",
+                                   "wordlists/uslip39.py"))
+      and not any(p.split("/")[0] in ("liquid", "descriptor") for p in _have))
+check("no prebuilt binary directory and no .so/.dylib/.dll anywhere",
+      not (_tp / "util" / "prebuilt").exists()
+      and not any(p.suffix in (".so", ".dylib", ".dll")
+                  for p in _tp.rglob("*") if p.is_file()))
 check("the MIT licence travels with the code", (_tp / "LICENSE").is_file()
       and "MIT License" in (_tp / "LICENSE").read_text())
+
+# ===========================================================================
+print("\n== the secp256k1 selector: native preferred, pure-Python fallback, "
+      "and it says which ==")
+check("the selector exposes NATIVE and BACKEND",
+      isinstance(_sel.NATIVE, bool)
+      and _sel.BACKEND in ("libsecp256k1", "python", "micropython"))
+check("...and they agree with each other",
+      _sel.NATIVE == (_sel.BACKEND in ("libsecp256k1", "micropython")))
+# CODE ONLY: the selector's comment explains that prebuilt/ is gone, and a
+# raw substring search cannot tell that explanation from a reference (see
+# srcutil). What must be true is that the code never names it.
+from srcutil import code_only                                # noqa: E402
+_src_sel = code_only(str(_tp / "util" / "secp256k1.py"))
+check("the selector never loads a library from inside the package: its code "
+      "does not name prebuilt/", "prebuilt" not in _src_sel)
+check("...it tries the system ctypes binding BEFORE the pure-Python one",
+      _src_sel.index("ctypes_secp256k1") < _src_sel.index("py_secp256k1"))
+_has_os_lib = bool(__import__("ctypes.util").util.find_library("secp256k1"))
+if _has_os_lib:
+    check("with the OS libsecp256k1 installed, the constant-time native "
+          "backend is the live one",
+          _sel.NATIVE and _sel.BACKEND == "libsecp256k1")
+else:
+    check("with no OS libsecp256k1, the pure-Python backend is the live one "
+          "and says so", not _sel.NATIVE and _sel.BACKEND == "python")
+print(f"      (live backend here: {_sel.BACKEND})")
 
 # ===========================================================================
 print("\n== BIP32 test vector 1 (seed 000102...0f) ==")
@@ -144,14 +187,22 @@ check("a one-character corruption fails the checksum and decodes to nothing",
 _wrong_hrp = bech32.decode("tb", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
 check("...and a mainnet address does not decode under the testnet hrp",
       _wrong_hrp == (None, None) or _wrong_hrp[0] is None)
-check("hash160('') is ripemd160(sha256('')) -- the pure-Python ripemd160 is "
-      "correct", hashes.hash160(b"").hex()
-      == "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb")
-check("...and sha256 underneath it is Python's own",
+_H160_EMPTY = "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb"
+check("hash160('') is ripemd160(sha256('')) -- the published value",
+      hashes.hash160(b"").hex() == _H160_EMPTY)
+# THE OPENSSL-3 FALLBACK, EXERCISED DIRECTLY. hashes.py switches to
+# py_ripemd160 when hashlib has no RIPEMD-160 (OpenSSL 3's default), so the
+# vault's address derivation stands or falls on that pure-Python function.
+check("py_ripemd160 -- the fallback an OpenSSL-3 vault uses -- gives the same "
+      "published HASH160",
+      _pyrmd.ripemd160(hashlib.sha256(b"").digest()).hex() == _H160_EMPTY)
+check("...and RIPEMD-160('') itself is the published digest",
+      _pyrmd.ripemd160(b"").hex() == "9c1185a5c5e9fc54612808977ee8f548b2258d31")
+check("sha256 underneath it is Python's own",
       hashes.sha256(b"abc").hex() == hashlib.sha256(b"abc").hexdigest())
 
 # ===========================================================================
-print("\n== signing with the pure-Python curve: verifies, and breaks on purpose ==")
+print("\n== signing: verifies, breaks on purpose, and both curves agree ==")
 _k = _m.derive("m/0h").key
 _pub = _k.get_public_key()
 _h = hashlib.sha256(b"forward this deposit").digest()
@@ -164,11 +215,25 @@ check("...and does NOT verify over a different hash",
 _other = _m.derive("m/1h").key.get_public_key()
 check("...and does NOT verify under a different key",
       _other.verify(_sig, _h) is False)
-check("the signature is low-S (grind) so it is standard on the network",
+check("the signature is DER (0x30) and low-S (grind), standard on the network",
       _sig.serialize()[0] == 0x30)
-check("a private key's public key round-trips through compressed SEC bytes",
+check("a public key round-trips through compressed SEC bytes",
       ec.PublicKey.parse(_pub.sec()).sec() == _pub.sec()
       and len(_pub.sec()) == 33)
+# THE FALLBACK AGREES WITH THE NATIVE LIBRARY. The watch-only Pi may run on
+# the pure-Python curve; the vault signs on libsecp256k1. If they disagreed
+# about a public key, the Pi would hand out an address the vault cannot spend.
+# Computed straight through the pure-Python module regardless of which
+# backend is live, and compared with the live backend's serialisation.
+_sec = _k.secret
+_py_pub = _py.ec_pubkey_serialize(_py.ec_pubkey_create(_sec))
+check("the pure-Python curve derives the SAME compressed public key as the "
+      "live backend for the same secret",
+      bytes(_py_pub) == _pub.sec() and len(bytes(_py_pub)) == 33)
+if _sel.NATIVE:
+    _live_pub = _sel.ec_pubkey_serialize(_sel.ec_pubkey_create(_sec))
+    check("...and the native library (the live one here) serialises it "
+          "identically", bytes(_live_pub) == bytes(_py_pub))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
