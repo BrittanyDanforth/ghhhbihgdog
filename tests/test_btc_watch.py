@@ -303,6 +303,10 @@ check("a bracketed IPv6 literal parses",
       and W.parse_server("[::1]") == ("::1", 50002, None))
 check("a bare IPv6 literal is refused as ambiguous",
       _refused(W.parse_server, "::1"))
+check("a spec refusal never repeats the spec (it names a machine, and an "
+      "error is the string a caller is likeliest to log)",
+      "evil.onion" not in _errtext(W.parse_server, "evil.onion:99999")
+      and "evil" not in _errtext(W.parse_server, "[evil:1"))
 _PIN = "ab" * 32
 check("host:port,pin carries the certificate pin, lower-cased, with or "
       "without a sha256: prefix",
@@ -408,19 +412,36 @@ def _mock_socks(behaviour="ok", scenario=None, tls_ctx=None):
                 c.sendall(b"\x04\x00")
                 return
             if behaviour == "method_none":
-                # a proxy that "helpfully" downgrades to no-auth
+                # a proxy that "helpfully" downgrades to no-auth; then
+                # record WHATEVER the client sends next (a conforming client
+                # sends nothing and hangs up; a downgraded one CONNECTs)
                 c.sendall(b"\x05\x00")
-                head = _recvn(c, 4)              # would the client CONNECT?
-                captured["connect_after_downgrade"] = head
+                c.settimeout(1.0)
+                try:
+                    captured["after_downgrade"] = c.recv(64)
+                except OSError:
+                    captured["after_downgrade"] = b""
                 return
             if behaviour == "method_ff":
                 c.sendall(b"\x05\xff")
                 return
             if behaviour == "drip":
-                # one byte of the greeting reply per 0.25 s, for ever
-                for b in (b"\x05", b"\x02", b"\x01", b"\x00", b"\x00"):
-                    c.sendall(b)
-                    time.sleep(0.25)
+                # A valid handshake, one byte per 0.25 s, then padding, for
+                # ten seconds -- longer than any deadline a test sets, so
+                # the client's clock, not this mock's hang-up, decides.
+                stream = (b"\x05\x02" + b"\x01\x00"
+                          + b"\x05\x00\x00\x01" + b"\x00" * 6 + b"\x00" * 26)
+                try:
+                    for i in range(len(stream)):
+                        c.sendall(stream[i:i + 1])
+                        time.sleep(0.25)
+                except OSError:
+                    pass
+                return
+            if behaviour == "stall":
+                # the proxy handshake completes, then the "server" says
+                # nothing at all
+                time.sleep(4.0)
                 return
             if behaviour == "close_early":
                 c.sendall(b"\x05")
@@ -461,6 +482,12 @@ def _mock_socks(behaviour="ok", scenario=None, tls_ctx=None):
                 c.sendall(b"\x05\x00\x00\x03\x05bound\x00\x00")
             else:
                 c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            if behaviour == "stall_tls":
+                # TLS completes, then the server says nothing at all
+                stream = tls_ctx.wrap_socket(c, server_side=True)
+                captured["tls_version"] = stream.version()
+                time.sleep(4.0)
+                return
             if behaviour != "electrum":
                 return                           # leave the stream to the test
             stream = c
@@ -491,11 +518,28 @@ def _mock_socks(behaviour="ok", scenario=None, tls_ctx=None):
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()
+    captured["_thread"] = t
     return port, captured, srv
 
 
 def _deadline(seconds=5.0):
     return time.monotonic() + seconds
+
+
+def _handshake(*a):
+    """(refused, message) for a _socks5_connect call against a mock. The
+    module's own refusal is the only thing that counts as refused; a raw
+    socket error is reported and counts as NOT refused, so one peer-close
+    can never kill this file and silently disarm every check after it."""
+    try:
+        W._socks5_connect(*a).close()
+        return False, ""
+    except W.BtcWatchError as e:
+        return True, str(e)
+    except OSError as e:
+        print("       (raw socket error, not a refusal:",
+              type(e).__name__ + ")")
+        return False, type(e).__name__
 
 
 _port, _cap, _srv = _mock_socks("ok")
@@ -533,26 +577,30 @@ check("with no credential at all the greeting offers no-auth only, and the "
       "handshake still completes", _ok and _cap.get("methods") == [0])
 
 _port, _cap, _srv = _mock_socks("method_none")
-_rej = _refused(W._socks5_connect, "h.onion", 50002, "127.0.0.1", _port,
-                "u", "p", _deadline())
-time.sleep(0.05)
+_rej, _msg = _handshake("h.onion", 50002, "127.0.0.1", _port, "u", "p",
+                        _deadline())
+_cap["_thread"].join(3.0)
 _srv.close()
 check("a proxy that answers 'no auth' to an offer of username/password is "
-      "REFUSED -- a stream with no isolation is never used", _rej)
-check("...and no CONNECT was ever sent on that un-isolated stream",
-      "connect_after_downgrade" not in _cap)
+      "REFUSED -- a stream with no isolation is never used",
+      _rej and "isolation" in _msg)
+check("...and NOTHING was sent on that un-isolated stream afterwards (the "
+      "mock recorded what came next: nothing)",
+      "after_downgrade" in _cap and _cap["after_downgrade"] == b"")
 
-for _b, _why in (("method_ff", "no acceptable method"),
-                 ("ver4", "not a SOCKS5 proxy"),
-                 ("auth_reject", "auth rejected"),
-                 ("auth_badver", "auth reply with a bad version byte"),
-                 ("connect_refuse", "CONNECT refused"),
-                 ("close_early", "stream closed mid-frame")):
+for _b, _why, _text in (
+        ("method_ff", "no acceptable method", "isolation"),
+        ("ver4", "not a SOCKS5 proxy", "not a SOCKS5"),
+        ("auth_reject", "auth rejected", "auth rejected"),
+        ("auth_badver", "auth reply with a bad version byte", "bad auth"),
+        ("connect_refuse", "CONNECT refused", "CONNECT refused"),
+        ("close_early", "stream closed mid-frame", "closed mid-frame")):
     _port, _cap, _srv = _mock_socks(_b)
-    _r = _refused(W._socks5_connect, "h.onion", 50002, "127.0.0.1", _port,
-                  "u", "p", _deadline())
+    _r, _msg = _handshake("h.onion", 50002, "127.0.0.1", _port, "u", "p",
+                          _deadline())
     _srv.close()
-    check(f"{_why}: a loud failure, not a silent direct connect", _r)
+    check(f"{_why}: a loud failure with the module's own reason, not a "
+          f"silent direct connect", _r and _text in _msg)
 
 for _b in ("bound_v6", "bound_domain"):
     _port, _cap, _srv = _mock_socks(_b)
@@ -566,16 +614,20 @@ for _b in ("bound_v6", "bound_domain"):
     check(f"a CONNECT reply with a {_b[6:]} bound address is consumed "
           f"correctly", _ok)
 
-# THE TRICKLE. One byte per 0.25 s never trips a per-read timeout of 0.6 s;
-# the deadline must.
+# THE TRICKLE. One byte per 0.25 s never trips a per-read timeout of 0.6 s,
+# and the mock keeps dripping a VALID handshake for ten seconds -- so a
+# client without a deadline would complete it at ~3.5 s and return a
+# socket. Only the client's own deadline can produce a refusal under 1 s.
 _port, _cap, _srv = _mock_socks("drip")
 _t0 = time.monotonic()
-_r = _refused(W._socks5_connect, "h.onion", 50002, "127.0.0.1", _port,
-              "u", "p", time.monotonic() + 0.6)
+_r, _msg = _handshake("h.onion", 50002, "127.0.0.1", _port, "u", "p",
+                      time.monotonic() + 0.6)
 _el = time.monotonic() - _t0
 _srv.close()
 check("a proxy that trickles one byte at a time is cut off at the DEADLINE "
-      f"(refused after {_el:.2f}s, not held open)", _r and _el < 1.5)
+      f"by the module's own clock (refused after {_el:.2f}s with its own "
+      "reason, not held open)",
+      _r and _el < 1.0 and "deadline exceeded" in _msg)
 
 check("a destination port out of range is refused BEFORE any connection, "
       "through the module's own error", all(
@@ -780,6 +832,65 @@ check("...and the mock server was never asked a question over that session",
       _cap["methods_asked"] == [])
 check("a malformed pin is refused before any connection",
       _refused(W.SocksTlsTransport, "h", 1, _PROXY, "t", pin="abc"))
+
+# THE OPERATOR'S ROUTE: no factory. The pin travels from the (host, port,
+# pin) server entry through look() into the real transport. Every check
+# above injected its own transport; this is the wiring a real caller uses.
+_port, _cap, _srv = _mock_socks("electrum", _SCEN, tls_ctx=_sctx)
+_proxy = f"socks5h://127.0.0.1:{_port}"
+try:
+    _r = W.look(_A0, [("watch.example.onion", 50002, _CERT_SHA256)], _proxy,
+                min_conf=3, timeout=5.0)
+finally:
+    _srv.close()
+check("WITHOUT a factory: the pin in a (host, port, pin) entry reaches the "
+      "real transport, TLS is on by default, and the right pin completes",
+      _r["state"] == "confirmed" and _r["cert_sha256"] == _CERT_SHA256
+      and _cap.get("tls_version") in ("TLSv1.2", "TLSv1.3")
+      and _cap["methods_asked"] == ["server.version",
+                                    "blockchain.headers.subscribe",
+                                    "blockchain.scripthash.listunspent"])
+_port, _cap, _srv = _mock_socks("electrum", _SCEN, tls_ctx=_sctx)
+_proxy = f"socks5h://127.0.0.1:{_port}"
+try:
+    _pmsg = _errtext(W.look, _A0, [("watch.example.onion", 50002, _wrong)],
+                     _proxy, timeout=5.0)
+finally:
+    _srv.close()
+check("...and the WRONG pin in the entry is refused by look() itself, with "
+      "the module's reason, the server asked nothing",
+      _pmsg is not None and "does not match the pin" in _pmsg
+      and _cap["methods_asked"] == [])
+_port, _cap, _srv = _mock_socks("electrum", _SCEN, tls_ctx=_sctx)
+_proxy = f"socks5h://127.0.0.1:{_port}"
+try:
+    _is_pin = _raises(W.look, W.PinMismatch, _A0,
+                      [("watch.example.onion", 50002, _wrong)], _proxy,
+                      timeout=5.0)
+finally:
+    _srv.close()
+check("...raised as PinMismatch, the subclass a caller can single out from "
+      "an ordinary dead-server failure", _is_pin)
+
+# the deadline reaches the real transport from look()'s timeout argument:
+# a server that completes TLS and then says nothing is cut off at ~1 s.
+_port, _cap, _srv = _mock_socks("stall_tls", _SCEN, tls_ctx=_sctx)
+_proxy = f"socks5h://127.0.0.1:{_port}"
+_t0 = time.monotonic()
+try:
+    _smsg = _errtext(W.look, _A0, [("watch.example.onion", 50002)], _proxy,
+                     timeout=1.0)
+finally:
+    _el = time.monotonic() - _t0
+    _srv.close()
+check("WITHOUT a factory: look()'s timeout is the real transport's deadline "
+      f"-- a server that goes silent after TLS is cut off (after {_el:.2f}s)",
+      _smsg is not None and "deadline exceeded" in _smsg and _el < 2.5)
+_ctx = W._tls_context()
+check("the TLS context floors at 1.2 and does no authority verification "
+      "(the pin is the authentication)",
+      _ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+      and _ctx.verify_mode == ssl.CERT_NONE and not _ctx.check_hostname)
 os.remove(_cert_path)
 
 # a server that hangs up straight after the SOCKS handshake, via the real
@@ -831,7 +942,8 @@ class _FakeTransport:
         i, m = req.get("id"), req.get("method")
         self.methods.append(m)
         if m in self.raw:
-            self.queue.append(self.raw[m])
+            v = self.raw[m]
+            self.queue.extend(v if isinstance(v, list) else [v])
             return
         if m == "server.version":
             if self.version_error:
@@ -1021,6 +1133,34 @@ except W.BtcWatchError as _e:
     _msg = str(_e)
 check("...and the same for a null-id rejection with a bare-string error",
       "code unknown" in _msg and "SECRET" not in _msg)
+_big = int(_SCRIPTHASH, 16)
+try:
+    W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(_FakeTransport(
+        raw={"blockchain.scripthash.listunspent":
+             '{"jsonrpc":"2.0","id":3,"error":{"code":%d,"message":"x"}}'
+             % _big})))
+    _msg = ""
+except W.BtcWatchError as _e:
+    _msg = str(_e)
+check("a 256-bit 'code' (the scripthash in base 10 -- a JSON integer is "
+      "unbounded) is NOT passed through: only a 16-bit code is a code",
+      "code unknown" in _msg and str(_big) not in _msg)
+try:
+    W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(_FakeTransport(
+        raw={"blockchain.scripthash.listunspent":
+             '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"x"}}'}
+    )))
+    _msg = ""
+except W.BtcWatchError as _e:
+    _msg = str(_e)
+check("...while a real JSON-RPC code (-32601) is reported",
+      "code -32601" in _msg)
+_r = _look(_FakeTransport(raw={"blockchain.scripthash.listunspent": [
+    '{"jsonrpc":"2.0","id":2,"result":[]}',
+    json.dumps({"jsonrpc": "2.0", "id": 3, "result": [_u(_TIP, 900)]})]}))
+check("a reply carrying a STALE id (2) ahead of ours (3) is skipped, not "
+      "taken as the answer: the client matches on its own id",
+      _r["state"] == "confirmed" and _r["settled_sat"] == 900)
 try:
     W.look(_A0, _SERVERS, _PROXY, transport_factory=_one(
         _FakeTransport(drop_after="blockchain.headers.subscribe")))
@@ -1056,6 +1196,40 @@ check("a four-element server spec is refused",
 for _mc in (0, -1, True, "1", 1.0):
     check(f"min_conf={_mc!r} is refused: an unconfirmed deposit is never "
           f"settled money", _refused(_look, _FakeTransport(), min_conf=_mc))
+for _to in (float("inf"), float("nan"), "abc", None, 0, -1, True):
+    check(f"timeout={_to!r} is refused up front through the module's error "
+          f"(inf/nan used to escape from the socket layer)",
+          _refused(W.look, _A0, _SERVERS, _PROXY, timeout=_to,
+                   transport_factory=_counting))
+check("timeout=1 (an int) is fine",
+      W.look(_A0, _SERVERS, _PROXY, timeout=1,
+             transport_factory=_one(_FakeTransport()))["state"] == "not_seen")
+_bmsg = _errtext(W.look, _A0, [("a.onion", 50002), ("b.onion", 50002)],
+                 "socks5h://u:p@127.0.0.1:9050", timeout=2.0)
+check("without a factory, a proxy URL that can never work is ONE "
+      "configuration refusal, not a failover per server",
+      _bmsg is not None and "credential" in _bmsg
+      and "no Electrum server answered" not in _bmsg)
+check("a proxy host that is not a valid hostname (IDNA) is a refusal "
+      "through the module's error, not a UnicodeError from the resolver",
+      _refused(W.look, _A0, _SERVERS, "socks5h://x..y:9050", timeout=2.0))
+
+
+def _pin_then_good(host, port, tag):
+    _calls.append(host)
+    if len(_calls) == 1:
+        return _FakeTransport(connect_error=W.PinMismatch("tls: pin"))
+    return _FakeTransport()
+
+
+_calls.clear()
+check("a PIN MISMATCH on the first server is NOT absorbed by failover: "
+      "look() raises it at once and the second server is never contacted "
+      "(a detected interception is not a dead server to route around)",
+      _raises(W.look, W.PinMismatch, _A0,
+              [("a.onion", 50002), ("b.onion", 50002)], _PROXY,
+              transport_factory=_pin_then_good) and len(_calls) == 1)
+_calls.clear()
 check("a testnet address looked up as mainnet is refused (never the wrong "
       "chain)", _refused(W.look, "tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl",
                          _SERVERS, _PROXY, transport_factory=_counting))

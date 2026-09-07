@@ -179,7 +179,31 @@ refuters per finding) found real defects, all fixed in the rewrite:
   line (`RecursionError`, not `ValueError`) is caught; JSON-RPC 2.0 framing;
   a null-id error (our request rejected) is loud instead of skipped as a
   notification; the notification-skip loop is bounded (64).
-- `tests/test_btc_watch.py` (190 checks): BIP84 known-answer vectors (xpub
+- **Third round** (a second adversarial review over the FINAL code, tests
+  and anchors — 8 lenses, 3 refuters each, 6 confirmed of 23): a server's
+  integer `code` was an unbounded pass-through (a JSON integer is
+  arbitrary-precision, so a scripthash in base 10 fit in it) — now only a
+  16-bit code is a code; `timeout` is validated (inf/nan/str used to escape
+  from the socket layer as stray exceptions); a proxy URL that can never
+  work is ONE refusal, not a failover per server; an IDNA-invalid proxy or
+  server name is the module's error, not a `UnicodeError`; a spec refusal
+  never repeats the spec (it names a machine); a **pin mismatch is
+  `PinMismatch`** and ends the look at once — a detected interception is
+  not a dead server to route around; the header no longer claims a
+  plaintext/LAN path (an own node is reached by its onion service).
+  Test vacuity found and closed: the pin/timeout tests all injected their
+  own transport, so `look()`'s own wiring (`pin=pin`, `timeout=timeout`,
+  TLS on by default) was unproven — now driven with NO factory through the
+  mock proxy (right pin completes, wrong pin refused with the server asked
+  nothing, a server that goes silent after TLS is cut off by the deadline);
+  the trickle mock now drips a valid handshake for ten seconds so only the
+  client's clock can produce the refusal; a raw socket error in a
+  handshake check is a FAIL of that check, never a file death that disarms
+  every check after it; the id-matching rule has a test (a stale id is
+  skipped). Anchors added for the three settlement money guards (mempool
+  height, `min_conf` floor, depth formula), the pin/timeout wiring, the
+  code bound and the `PinMismatch` re-raise.
+- `tests/test_btc_watch.py` (213 checks): BIP84 known-answer vectors (xpub
   and the published zpub, testnet tpub/vpub → `tb1q6rz28...`), every
   refusal and that no refusal echoes the key, the settlement function as a
   truth table including the dust trap, a real in-process SOCKS5 server for
@@ -187,11 +211,13 @@ refuters per finding) found real defects, all fixed in the rewrite:
   versions, closed mid-frame), the transport's line framing and byte caps,
   the REAL transport + REAL client end to end through the mock proxy to an
   in-process Electrum server in plaintext and over TLS 1.2+ with a right
-  pin, a wrong pin and no pin, then `look()` against a fake transport
-  through every state, failover, rotation, the notification bound, every
-  malformed reply, and the error-text rules. 11 mutation anchors.
+  pin, a wrong pin and no pin — with and without a factory — then `look()`
+  against a fake transport through every state, failover, rotation, the
+  notification bound, every malformed reply, and the error-text rules.
+  18 mutation anchors, all caught.
 - `gs_console`'s compile action now names `gs_btc_watch.py` (test_console
-  had been flagging it missing since `b2d3993`).
+  had been flagging it missing since `b2d3993`); test_gitignore lists it
+  as this repo's own source.
 
 ### `cd3c1f9` — Design: BTC intake by unique address, host-side forward into the swap
 - `BTC_INTAKE_DESIGN.md`: the blueprint for the rework (section 4 below).
@@ -431,7 +457,7 @@ rule-6 material).
 | # | Stage | State |
 |---|-------|-------|
 | 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
-| 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 190/190, 11 anchors (`9f19781` + follow-up) |
+| 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 213/213, 18 anchors all caught (`9f19781`, `2cc59ea`, and the third-round commit) |
 | 2 | `forward_to_swap` job: build + sign the BTC tx (inputs from the derived address, OP_RETURN memo with the 80-byte handling, change), `--dry-run` prints and does not broadcast; fetch current inbound over Tor; `WIRE_VERSION` bump; testnet | pending |
 | 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
