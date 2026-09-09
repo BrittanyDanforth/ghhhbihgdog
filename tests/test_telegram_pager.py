@@ -4312,6 +4312,62 @@ check("chain: a held handover that is refused frees the lock (driven: the "
       "one-spender refusal)",
       not _hb.busy.locked() and any("more than one person" in t for t in _hbs))
 
+# ---- A FINISHED FORWARD IS ONE SENTENCE, AND NOT A DEPOSIT ONE ----------
+#
+# With no payload the new job fell through to "quoted ... the payment
+# details are ON THE MACHINE ... /check once you have paid", and with one
+# it said "here is how to pay" -- deposit vocabulary about a run that had
+# just signed a spend. Driven through the REAL start_job with the doorbell
+# stubbed to return a done forward.
+print("\n== a finished forward is reported as a signed spend ==")
+
+
+def _forward_done(result_extra=None):
+    _fp, _fs, _, _ = _tapper()
+    _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
+
+    class _Done:
+        def __init__(self):
+            self.result = {"status": "done", "handle": "A3F1", "slip": "",
+                           "plain": {}, "phase": ""}
+            self.result.update(result_extra or {})
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(
+            run_wake=lambda *a, **k: _Done())
+        _fp.start_job(111, "forward_to_swap", {"handle": "A3F1"})
+        for _ in range(600):
+            if not _fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return [t for t, _b in _fs]
+
+
+_ft = _forward_done()
+_last = _ft[-1] if _ft else ""
+check("a done forward is ONE sentence: signed on the machine, nothing sent "
+      "yet -- no address, no amount, no memo, no invitation to pay",
+      "forward signed on the machine" in _last
+      and "Nothing was sent yet" in _last
+      and not any(w in " ".join(_ft) for w in ("how to pay", "Send exactly",
+                                              "To address", "quoted",
+                                              "once you have paid")))
+_ft2 = _forward_done({"plain": {"b": "0.05", "d": "bc1qxx", "m": "=:XMR", "x": "1",
+                                "h": "A3F1"}})
+check("...and even a payload the vault should never send is NOT rendered "
+      "for this job", not any("bc1qxx" in t or "0.05" in t or "=:XMR" in t
+                             for t in _ft2)
+      and "forward signed on the machine" in (_ft2[-1] if _ft2 else ""))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

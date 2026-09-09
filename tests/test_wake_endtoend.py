@@ -206,12 +206,24 @@ def agent_deps(bay, ran, **over):
     return base
 
 
-def cycle(job, params, bay, info_out=None):
-    """One full poke: doorbell in a thread, agent against it over HTTP."""
+def cycle(job, params, bay, info_out=None, key_extra=None, env=None,
+          deps_over=None):
+    """One full poke: doorbell in a thread, agent against it over HTTP.
+    `key_extra` patches the vault's freshly minted keyfile (settings a
+    pairing would have written); `env` is set around the agent's run and
+    removed after; `deps_over` overrides injected deps."""
     port = free_port()
     kd, tp, pi, _info = mint_pair(port, bay)
     if info_out is not None:
         info_out.update(_info)
+    if key_extra:
+        _kp = Path(kd) / "gs_wake_thinkpad.key"
+        _plain = P.unlock_keyfile(json.loads(_kp.read_text()))
+        _plain.update(key_extra)
+        os.chmod(_kp, 0o600)
+        _kp.write_text(json.dumps(P.lock_keyfile(_plain, b"",
+                                                 role="thinkpad")))
+        os.chmod(_kp, 0o400)
     FakeWOL.sent = []
     pending = {}
 
@@ -235,11 +247,18 @@ def cycle(job, params, bay, info_out=None):
     args = types.SimpleNamespace(key=str(kf), dry_run=False)
     buf = io.StringIO()
     err = out = None
-    with contextlib.redirect_stdout(buf):
-        try:
-            out = A.run_once(args, agent_deps(bay, ran))
-        except (A.Refused, P.WakeError) as e:
-            err = e
+    for _k, _v in (env or {}).items():
+        os.environ[_k] = _v
+    try:
+        with contextlib.redirect_stdout(buf):
+            try:
+                out = A.run_once(args, agent_deps(bay, ran,
+                                                  **(deps_over or {})))
+            except (A.Refused, P.WakeError) as e:
+                err = e
+    finally:
+        for _k in (env or {}):
+            os.environ.pop(_k, None)
     t.join(timeout=30)
     return pending.get("p"), out, err, ran, buf.getvalue()
 
@@ -320,6 +339,68 @@ try:
           "--dest-from-receive-wallet" in ran1[1][0]
           and ran1[1][0][ran1[1][0].index("--dest-from-receive-wallet") + 1]
           .startswith(str(_bay)))
+
+    print("\n== forward_to_swap, both halves, real HTTP ==")
+    # THE FORWARD OF THE DEPOSIT THE FIRST CYCLE MINTED. The ledger in the
+    # bay carries that handle; stage 4 will record a BTC index on it when
+    # it mints the address -- here the record is given one by hand, the
+    # vault's fresh keyfile is given the BTC settings a pairing writes, the
+    # seed rides in the environment, and the child is the usual fake.
+    _h1 = out1[2]
+    _lp = _bay / "gs_wake_handles.json"
+    _led = json.loads(_lp.read_text())
+    (_led.get("handles") or _led)[_h1]["btc_index"] = 0
+    _lp.write_text(json.dumps(_led))
+    _BTC_KEY = {"allow_btc_forward": True,
+                "btc_account_xpub": "xpub6FIXTUREACCOUNT",
+                "btc_electrum": ["s.onion"], "btc_network": "main",
+                "btc_min_conf": 2, "op_return_max_bytes": 120}
+    _MNEMONIC = ("abandon abandon abandon abandon abandon abandon abandon "
+                 "abandon abandon abandon abandon about")
+    p2, out2, err2, ran2, text2 = cycle(
+        "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
+        key_extra=_BTC_KEY, env={"GS_BTC_SEED": _MNEMONIC},
+        deps_over={"extend_deadman": lambda s: True})
+    check("the agent finished the forward (the host forwarding a deposit a "
+          "pager minted), and the doorbell heard 'done'",
+          err2 is None and out2 and out2[0] == "done"
+          and p2 is not None and p2.result
+          and p2.result["status"] == "done")
+    check("...naming the DEPOSIT's handle, not a fresh one",
+          p2.result["handle"] == _h1 == out2[2])
+    check("...with NO slip and NO plain in the reply: the forward has "
+          "nothing to deliver, and the deposit's slip is not re-shipped",
+          p2.result["slip"] == "" and p2.result["plain"] == {})
+    check("...and the doorbell reports it as a SIGNED spend, not a ready "
+          "deposit", DB.report(p2) == 0)
+    check("ONE child ran, btc_forwarder, with --dry-run, no xpub and no "
+          "index and no seed on its argv",
+          len(ran2) == 1
+          and os.path.basename(ran2[0][0][1]) == "btc_forwarder"
+          and "--dry-run" in ran2[0][0]
+          and "--xpub" not in ran2[0][0] and "--index" not in ran2[0][0]
+          and "abandon" not in " ".join(ran2[0][0]))
+    check("...the seed, the xpub and the index reached it in the ENVIRONMENT",
+          ran2[0][1].get("GS_BTC_SEED") == _MNEMONIC
+          and ran2[0][1].get("GS_BTC_XPUB") == "xpub6FIXTUREACCOUNT"
+          and ran2[0][1].get("GS_BTC_INDEX") == "0")
+    _led2 = json.loads(_lp.read_text())
+    _rec2 = (_led2.get("handles") or _led2)[_h1]
+    check("...and the ledger marks the handle forwarded (a bucket and a plan "
+          "path, nothing else)",
+          isinstance(_rec2.get("forwarded"), int)
+          and str(_rec2.get("forward_plan", "")).endswith(
+              f"btc_forward_{_h1}.json"))
+    p3, out3, err3, ran3, text3 = cycle(
+        "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
+        key_extra=_BTC_KEY, env={"GS_BTC_SEED": _MNEMONIC},
+        deps_over={"extend_deadman": lambda s: True})
+    check("a SECOND forward of the same handle is refused on the real path "
+          "(already_forwarded) and the doorbell hears 'refused' -- no reason "
+          "travels", out3 is None and err3 is not None
+          and getattr(err3, "code", None) == "already_forwarded"
+          and p3 is not None and p3.result
+          and p3.result["status"] == "refused" and ran3 == [])
 
     print("\n== the ceremony survives whatever else is on the switch ==")
     # FOUND BY DRIVING IT. A two-line readiness probe in this very file

@@ -695,6 +695,27 @@ check("...and a clean cycle prints NO event line at all",
       and "did not authenticate" not in _buf3.getvalue())
 
 
+# ---- A FINISHED FORWARD IS NOT A READY DEPOSIT EITHER --------------------
+#
+# report() fell through to the deposit path for the new job: "Vault
+# finished job forward_to_swap. Handle A3F1." and then the slip or "the
+# deposit address, the memo and the slip stayed on the vault" -- deposit
+# instructions on a run that signed a spend of that deposit.
+_fw = Bell("forward_to_swap", params={"handle": "A3F1",
+                                      "owner": "0123456789abcdef"})
+_fw.close()
+_fw.pending.result = {"status": "done", "handle": "A3F1", "slip": "",
+                      "plain": {}, "phase": ""}
+_buf5 = io.StringIO()
+with contextlib.redirect_stdout(_buf5):
+    _rc5 = DB.report(_fw.pending)
+_t5 = _buf5.getvalue()
+check("a finished forward is reported as a SIGNED spend, stage 2, nothing "
+      "broadcast -- with no handle line, no slip line and no deposit "
+      "vocabulary", _rc5 == 0 and "SIGNED" in _t5 and "Nothing was broadcast"
+      in _t5 and "Handle" not in _t5 and "deposit address" not in _t5
+      and "how to pay" not in _t5 and "stayed on the vault. Read" not in _t5)
+
 # ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
 #
 # report() branched on the OUTCOME and never on the job, so a completed

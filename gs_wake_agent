@@ -1298,6 +1298,21 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
     return True
 
 
+def _btc_setting(key: dict, name: str, default: int, lo: int, hi: int) -> int:
+    """A whole-number BTC-intake setting from the keyfile: the default only
+    when the field is ABSENT (a keyfile from before it existed), refused
+    when present and not a whole number in [lo, hi]. Never coerced."""
+    v = key.get(name)
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise Refused("btc_config_malformed",
+                      f"this machine's keyfile carries a {name} that is not "
+                      f"a whole number in {lo}..{hi}; re-pair rather than "
+                      "let a guessed value decide a forward.")
+    return v
+
+
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                bundle: str = None, slip: str = None, handle: str = None,
                owned_fee=(), btc_index=None) -> list:
@@ -1509,16 +1524,40 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
             raise Refused("no_btc_deposit",
                           "this handle has no BTC deposit address recorded, "
                           "so there is nothing to forward.")
+        # VALIDATED, NEVER COERCED. `int(key.get(...) or 2)` turned a paired
+        # 0 into 2 confirmations the operator never chose; a keyfile value
+        # that is present and wrong is refused, and only an ABSENT one takes
+        # the default (a keyfile written before the field existed).
+        _min_conf = _btc_setting(key, "btc_min_conf", 2, 1, 1008)
+        _op_max = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)
+        _floor = _btc_setting(key, "feerate_floor_sat_vb", 1, 1, 100000)
+        _ceiling = _btc_setting(key, "feerate_ceiling_sat_vb", 200, 1, 100000)
+        if _floor > _ceiling:
+            raise Refused("btc_config_malformed",
+                          "this machine's keyfile puts the fee-rate floor "
+                          "above the ceiling; re-pair.")
+        _aff = _btc_setting(key, "max_affiliate_bps", 0, 0, 1000)
+        _net = str(key.get("btc_network") or "main")
+        if _net not in ("main", "testnet", "signet", "regtest"):
+            raise Refused("btc_config_malformed",
+                          "this machine's keyfile names a Bitcoin network "
+                          "this tool does not know; re-pair.")
+        # THE XPUB AND THE INDEX ARE NOT HERE. The xpub is the public
+        # generator of every deposit address this host has ever minted --
+        # holding it links all of them to each other and to this box -- and
+        # /proc/<pid>/cmdline is 0444 for the whole 900 s of Tor round trips.
+        # Both ride in the environment of this one step, set by _dispatch,
+        # like the seed and like GS_SWAP_AMOUNTS.
         argv = [sys.executable, _tool("btc_forwarder"),
                 "--dry-run",                       # stage 2: never broadcasts
                 "--tor-proxy", proxy,
-                "--network", str(key.get("btc_network") or "main"),
-                "--xpub", _xpub,
-                "--index", str(int(btc_index)),
+                "--network", _net,
                 "--dest-from-receive-wallet", str(bundle),
-                "--min-conf", str(int(key.get("btc_min_conf") or 2)),
-                "--op-return-max-bytes",
-                str(int(key.get("op_return_max_bytes") or 80)),
+                "--min-conf", str(_min_conf),
+                "--op-return-max-bytes", str(_op_max),
+                "--feerate-floor", str(_floor),
+                "--feerate-ceiling", str(_ceiling),
+                "--max-affiliate-bps", str(_aff),
                 # THE SAME MIX FLOOR the quote step is given, so a deposit
                 # that could not be mixed is not forwarded into the swap.
                 "--min-out-xmr", str(live_min_out_xmr(key)),
@@ -2393,8 +2432,19 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # "ready · slip 7C3D" for a label the operator could not look up.
     if job in ("watch", "swap_status", "forward_to_swap"):
         handle = params["handle"]
-    slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
-    plain = plain_slip_for_chat(key, artifact_dir, status, handle)
+    # ONLY THE QUOTING JOB HAS A SLIP. Both builders key on status and
+    # handle alone, and a forward reports the DEPOSIT's own handle -- whose
+    # record still points at the thor_pairs file the quote wrote. Left
+    # unguarded, a finished forward re-shipped that slip (the deposit
+    # address, the amount, the memo naming the full XMR destination) to the
+    # phone, captioned as deposit instructions, on the run that had just
+    # signed a spend of it. Driven and seen. The forward has nothing to
+    # deliver; the watching jobs never had.
+    if job == "receive_and_quote":
+        slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
+        plain = plain_slip_for_chat(key, artifact_dir, status, handle)
+    else:
+        slip, plain = "", {}
     phase = _phase_of(job, artifact_dir, key=key, status=status,
                       owner=params.get("owner"))
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
@@ -2765,7 +2815,7 @@ def _retire_files(rec: dict) -> None:
     account -- a who-sent-what line for every client, on a disk that
     auto-unlocks, until a hand-run wipe that would also end every other
     client's open run. Retired the moment the money has left instead."""
-    for _k in ("slip", "bundle"):
+    for _k in ("slip", "bundle", "forward_plan"):
         _p = rec.get(_k)
         if not _p:
             continue
@@ -3056,7 +3106,15 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             raise Refused("unknown_handle",
                           f"no deposit on this machine for handle "
                           f"{params['handle']}.")
-        if _owner and rec.get("owner") and rec.get("owner") != _owner:
+        # THE HOST MAY FORWARD ANY DEPOSIT; A CLIENT ONLY THEIR OWN. The
+        # forward is the host's act on the host's own key, and its reply
+        # reveals nothing but a status and a handle -- so a hand-poked note
+        # (which carries HOST_OWNER) may forward a record a client minted.
+        # Without this, every deposit a pager minted was refused on the one
+        # machine that holds the key, and the job existed for nothing.
+        # A CLIENT'S token is still walled to their own records.
+        if _owner and _owner != proto.HOST_OWNER and rec.get("owner") \
+                and rec.get("owner") != _owner:
             integrity_log("wake", "forward_not_owner")
             raise Refused("handle_not_yours",
                           f"handle {params['handle']} was recorded for a "
@@ -3065,6 +3123,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             raise Refused("already_moved",
                           f"handle {params['handle']} has already been paid "
                           "out; there is nothing left to forward.")
+        # ONCE. A done forward marks its record (a time bucket, no amount,
+        # no txid), and a second wake on the same handle is refused rather
+        # than re-quoting the same destination and amount on a fresh circuit
+        # and silently overwriting the plan the job log describes. Stage 3
+        # consumes the plan and clears the mark; a re-plan is explicit.
+        if rec.get("forwarded"):
+            integrity_log("wake", "forward_repeat")
+            raise Refused("already_forwarded",
+                          f"handle {params['handle']} already has a forward "
+                          "planned on this machine.")
         bundle = rec.get("bundle")
         if not bundle:
             raise Refused("handle_not_forwardable",
@@ -3287,6 +3355,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             if "GS_BTC_SEED_PASSPHRASE" in os.environ:
                 env_extra["GS_BTC_SEED_PASSPHRASE"] = \
                     os.environ["GS_BTC_SEED_PASSPHRASE"]
+            # THE XPUB AND THE INDEX, off the argv for the reasons build_argv
+            # gives; and the aggregator's API key, if this machine has one,
+            # so a keyed SwapKit does not refuse every quote (run_child strips
+            # every GS_ variable, so nothing reaches a child unless handed
+            # here).
+            env_extra["GS_BTC_XPUB"] = str(key["btc_account_xpub"])
+            env_extra["GS_BTC_INDEX"] = str(int(_btc_index))
+            if os.environ.get("GS_SWAPKIT_API_KEY"):
+                env_extra["GS_SWAPKIT_API_KEY"] = \
+                    os.environ["GS_SWAPKIT_API_KEY"]
         if job == "withdraw":
             # THE DESTINATION, IN THE ENVIRONMENT, NEVER ON THE ARGV.
             # GhostSpiral reads GS_EXIT_TO through env_or_argv and prefers it
@@ -3553,6 +3631,13 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # pointing at that (account, subaddress) is now a deposit that has been
     # paid out, and a /check on it is answered from here -- see the
     # watching branch above -- rather than from an emptied address.
+    # THE FORWARD IS MARKED ON ITS RECORD: when (a 600 s bucket) and where
+    # the plan is, so the wipe takes the plan with the handle and a repeat
+    # wake is refused (see the forward branch). No amount, no txid.
+    if job == "forward_to_swap" and handle in handles:
+        handles[handle]["forwarded"] = int(time.time()) // 600 * 600
+        handles[handle]["forward_plan"] = \
+            str(artifact_dir / f"btc_forward_{handle}.json")
     if _spent_pair is not None:
         for _rec in handles.values():
             if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:

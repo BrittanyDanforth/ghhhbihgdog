@@ -4460,6 +4460,54 @@ _FEE_OK = ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
            _fw_file, "--fee-sweep-to", _FS_TO[0]]
 check("pairing/fee: a complete fee wallet passes validation",
       _pairs_fee(_FEE_OK) is None)
+
+# THE BTC INTAKE'S FLAGS, REFUSED AT PAIRING like the wallet file: every
+# one of these used to be written unvalidated and refused per wake, after
+# the boot, the jitter and the Tor check -- and two were coerced.
+_BTC_XPUB_OK = ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r"
+                "1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
+
+
+def _pairs_btc(extra):
+    _argv = ["pair", "--out", os.path.join(_fw_dir2, "k.key"),
+             "--artifact-dir", _fw_dir2] + extra
+    try:
+        _K._validate(_K.build_cli().parse_args(_argv))
+        return None
+    except SystemExit as _e:
+        return str(_e)
+
+
+_BTC_OK = ["--allow-btc-forward", "--btc-xpub", _BTC_XPUB_OK,
+           "--btc-electrum", "s.onion", "--btc-electrum", "t.onion:50001,"
+           + "ab" * 32, "--thornode", "https://tn.example"]
+check("pairing/btc: a complete BTC intake passes validation",
+      _pairs_btc(_BTC_OK) is None)
+check("pairing/btc: --allow-btc-forward without an xpub or a server is "
+      "refused AT PAIRING, naming both",
+      "--btc-xpub" in (_pairs_btc(["--allow-btc-forward"]) or "")
+      and "--btc-electrum" in (_pairs_btc(["--allow-btc-forward",
+                                           "--btc-xpub", _BTC_XPUB_OK]) or ""))
+for _extra, _why in (
+        (_BTC_OK + ["--btc-network", "bogus"], "an unknown network"),
+        (_BTC_OK + ["--btc-min-conf", "0"], "min-conf 0"),
+        (_BTC_OK + ["--op-return-max-bytes", "0"], "op-return 0"),
+        (_BTC_OK + ["--op-return-max-bytes", "300"], "op-return 300"),
+        (_BTC_OK + ["--btc-electrum", "host:notaport"], "a bad server"),
+        (["--allow-btc-forward", "--btc-xpub", "junk", "--btc-electrum",
+          "s.onion"], "a junk xpub"),
+        (["--allow-btc-forward", "--btc-xpub", _BTC_XPUB_OK, "--btc-electrum",
+          "s.onion", "--btc-network", "testnet"],
+         "a mainnet xpub paired for testnet"),
+        (_BTC_OK + ["--feerate-floor-sat-vb", "50",
+                    "--feerate-ceiling-sat-vb", "10"], "an inverted fee band"),
+        (_BTC_OK + ["--max-affiliate-bps", "5000"], "an affiliate cap over 10%"),
+        (_BTC_OK + ["--thornode", "ftp:/x"], "a THORNode URL that is not http")):
+    check(f"pairing/btc: {_why} is refused at pairing",
+          _pairs_btc(_extra) is not None)
+check("pairing/btc: the keyfile carries the fee band and the affiliate cap",
+      '"feerate_floor_sat_vb": int(args.feerate_floor_sat_vb)' in _kp_src
+      and '"max_affiliate_bps": int(args.max_affiliate_bps)' in _kp_src)
 check("pairing/fee: any one of the three without the others is refused",
       "go together" in (_pairs_fee(["--fee-rpc", "http://127.0.0.1:18085"]) or "")
       and "go together" in (_pairs_fee(["--fee-sweep-to", _FS_TO[0]]) or ""))
@@ -4525,9 +4573,10 @@ _FWD_REC = {"bundle": "/tmp/bay/wallet_fwd.json", "minted": 1,
             "btc_index": 3}
 
 
-def _fwd_env(rec, key_extra=None, ledger=True):
+def _fwd_env(rec, key_extra=None, ledger=True, owner=None):
     dd, kk, _key, bb = new_env(job="forward_to_swap",
-                               params={"handle": "A3F1"})
+                               params={"handle": "A3F1", "owner": owner}
+                               if owner else {"handle": "A3F1"})
     if ledger:
         (dd / A.HANDLES_FILE).write_text(json.dumps({"A3F1": rec}))
     if key_extra:
@@ -4538,8 +4587,9 @@ def _fwd_env(rec, key_extra=None, ledger=True):
     return dd, kk, bb
 
 
-def _fwd_run(rec, key_extra=None, seed=_FWD_MNEMONIC, ledger=True):
-    dd, kk, bb = _fwd_env(rec, key_extra, ledger)
+def _fwd_run(rec, key_extra=None, seed=_FWD_MNEMONIC, ledger=True,
+             owner=None):
+    dd, kk, bb = _fwd_env(rec, key_extra, ledger, owner)
     dp = deps_for(dd, bb, extend_deadman=lambda s: True)
     if seed is None:
         os.environ.pop("GS_BTC_SEED", None)
@@ -4581,7 +4631,6 @@ check("...the argv is composed from the KEYFILE and the LEDGER: --dry-run, "
       "THORNode, the handle's bundle as the destination, its BTC index, and "
       "an outfile named for the handle",
       bool(_ran) and "--dry-run" in _argv
-      and _argv[_argv.index("--xpub") + 1] == "xpub6FIXTUREACCOUNT"
       and _argv.count("--electrum") == 2 and "t.onion:50001" in _argv
       and _argv[_argv.index("--network") + 1] == "main"
       and _argv[_argv.index("--min-conf") + 1] == "3"
@@ -4589,13 +4638,53 @@ check("...the argv is composed from the KEYFILE and the LEDGER: --dry-run, "
       and _argv[_argv.index("--thornode") + 1] == "https://tn.example"
       and _argv[_argv.index("--dest-from-receive-wallet") + 1]
       == "/tmp/bay/wallet_fwd.json"
-      and _argv[_argv.index("--index") + 1] == "3"
       and _argv[_argv.index("--outfile") + 1].endswith("btc_forward_A3F1.json")
       and "--min-out-xmr" in _argv)
+check("...THE XPUB AND THE INDEX ARE NOT ON THE ARGV (the xpub generates "
+      "every deposit address this host ever minted, and cmdline is 0444); "
+      "both ride in that one step's environment",
+      "--xpub" not in _argv and "--index" not in _argv
+      and "xpub6FIXTUREACCOUNT" not in " ".join(_argv)
+      and _env.get("GS_BTC_XPUB") == "xpub6FIXTUREACCOUNT"
+      and _env.get("GS_BTC_INDEX") == "3")
+check("...the fee band and the affiliate cap ride on argv from the keyfile, "
+      "with the defaults when a keyfile predates the fields",
+      _argv[_argv.index("--feerate-floor") + 1] == "1"
+      and _argv[_argv.index("--feerate-ceiling") + 1] == "200"
+      and _argv[_argv.index("--max-affiliate-bps") + 1] == "0")
 check("...THE SEED IS NOT ON THE ARGV and IS in that one step's environment",
       "abandon" not in " ".join(_argv)
       and _env.get("GS_BTC_SEED") == _FWD_MNEMONIC
       and "GS_BTC_SEED_PASSPHRASE" not in _env)
+check("...and the aggregator's API key, when the machine has one, reaches "
+      "that step too (no child sees it otherwise)",
+      "GS_SWAPKIT_API_KEY" not in _env)
+os.environ["GS_SWAPKIT_API_KEY"] = "k-test"
+try:
+    _o2, _e2, _ran2 = _fwd_run(_FWD_REC, _FWD_KEY)
+finally:
+    os.environ.pop("GS_SWAPKIT_API_KEY", None)
+check("...driven: with GS_SWAPKIT_API_KEY set it is in the forward's env",
+      _e2 is None and bool(_ran2)
+      and _ran2[0][1].get("GS_SWAPKIT_API_KEY") == "k-test")
+_o2, _e2, _ran2 = _fwd_run(_FWD_REC, {**_FWD_KEY, "feerate_floor_sat_vb": 3,
+                                      "feerate_ceiling_sat_vb": 50,
+                                      "max_affiliate_bps": 10})
+_argv2 = _ran2[0][0] if _ran2 else []
+check("a keyfile carrying the fee band and the affiliate cap puts THOSE on "
+      "argv", bool(_ran2)
+      and _argv2[_argv2.index("--feerate-floor") + 1] == "3"
+      and _argv2[_argv2.index("--feerate-ceiling") + 1] == "50"
+      and _argv2[_argv2.index("--max-affiliate-bps") + 1] == "10")
+for _bad in ({"btc_min_conf": 0}, {"btc_min_conf": "2"},
+             {"op_return_max_bytes": 300}, {"op_return_max_bytes": True},
+             {"feerate_floor_sat_vb": 50, "feerate_ceiling_sat_vb": 10},
+             {"btc_network": "bogus"}, {"max_affiliate_bps": 5000}):
+    _o2, _e2, _ran2 = _fwd_run(_FWD_REC, {**_FWD_KEY, **_bad})
+    check(f"a keyfile value present and wrong is REFUSED btc_config_malformed, "
+          f"never coerced: {_bad}",
+          _o2 is None and getattr(_e2, "code", None) == "btc_config_malformed"
+          and _ran2 == [])
 os.environ["GS_BTC_SEED_PASSPHRASE"] = "pp"
 try:
     _o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY)
@@ -4623,6 +4712,62 @@ _o, _e, _ran = _fwd_run({**_FWD_REC, "owner": "f" * 16}, _FWD_KEY)
 check("ANOTHER OWNER'S handle is refused handle_not_yours at the vault, "
       "whatever the note said", _o is None and getattr(_e, "code", None) == "handle_not_yours"
       and _ran == [])
+_o, _e, _ran = _fwd_run({**_FWD_REC, "owner": "f" * 16}, _FWD_KEY,
+                        owner=P.HOST_OWNER)
+check("...but THE HOST (a hand-poked note, HOST_OWNER) may forward a "
+      "client's deposit: the forward is the host's act on the host's key, "
+      "and the reply reveals nothing but a status and a handle",
+      _e is None and _o is not None and len(_ran) == 1)
+_o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000}, _FWD_KEY)
+check("a handle already forwarded is refused already_forwarded: no second "
+      "quote for the same destination and amount, no plan silently "
+      "overwritten", _o is None
+      and getattr(_e, "code", None) == "already_forwarded" and _ran == [])
+# A REAL PAIRS FILE ON THE RECORD, and a keyfile that asks for plaintext
+# slips. Without both, the slip builders swallow a missing file and return
+# empty -- and the check below would pass whether or not the vault guarded
+# the forward's reply. This is the exact fixture that showed the deposit
+# slip being re-shipped.
+_pairs_dir = Path(tempfile.mkdtemp(prefix="gs_fwd_pairs_"))
+_pairs_path = _pairs_dir / "thor_pairs_A3F1.json"
+_pairs_path.write_text(json.dumps([{
+    "schema": "thor_pairs_v1", "btc_in": "0.05",
+    "deposit": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "memo": "=:XMR.XMR:" + "4" + "A" * 94 + ":0/1/0",
+    "dest_xmr": "4" + "A" * 94, "expected_xmr": "1.5", "min_out_xmr": "",
+    "ts": 1700000000}]))
+_dd, _kk, _bb = _fwd_env({**_FWD_REC, "slip": str(_pairs_path)},
+                         {**_FWD_KEY, "deposit_in_chat": True})
+os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+try:
+    _o, _e, _t = run(_kk, deps_for(_dd, _bb, extend_deadman=lambda s: True))
+finally:
+    os.environ.pop("GS_BTC_SEED", None)
+check("NON-VACUITY: the same pairs file DOES produce a plain slip for the "
+      "quoting job's reply (so the empty reply below is the guard, not a "
+      "missing file)",
+      bool(A.plain_slip_for_chat({**_FWD_KEY, "deposit_in_chat": True,
+                                  "artifact_dir": str(_dd)},
+                                 _dd, "done", "A3F1")))
+_led = json.loads((_dd / A.HANDLES_FILE).read_text())
+_rec_after = (_led.get("handles") or _led).get("A3F1") or {}
+check("a DONE forward marks its record: a 600-second bucket and the plan's "
+      "path -- no amount, no txid -- so the wipe takes the plan with the "
+      "handle and a repeat is refused",
+      _e is None and isinstance(_rec_after.get("forwarded"), int)
+      and _rec_after["forwarded"] % 600 == 0
+      and str(_rec_after.get("forward_plan", "")).endswith(
+          "btc_forward_A3F1.json")
+      and not any(k in json.dumps(_rec_after) for k in ("txid", "sat")))
+check("...and the M3 reply carries NO slip and NO plain for a done forward "
+      "(the deposit's own slip used to be re-shipped to the phone)",
+      _bb.result is not None and _bb.result.get("status") == "done"
+      and _bb.result.get("slip") == "" and _bb.result.get("plain") == {})
+_pf = _dd / "btc_forward_A3F1.json"
+_pf.write_text("{}")
+A._retire_files({"forward_plan": str(_pf)})
+check("_retire_files takes the forward plan with the handle's other files",
+      not _pf.exists())
 _o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
 check("a handle naming no single bundle has no destination: "
       "handle_not_forwardable", _o is None

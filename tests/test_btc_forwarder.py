@@ -93,7 +93,10 @@ _PUB0 = T.key_for(_ACCT, 0, 0).get_public_key()
 _DEST = "8" + "A" + "1" * 93                                  # 95 chars
 _OTHER = "8" + "B" + "2" * 93
 _INBOUND = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"       # valid mainnet
-_MEMO = "=:XMR.XMR:" + _DEST + ":0/1/0"                       # 111 bytes
+# {LIMIT} is filled by the fake aggregator at quote time with the worst-case
+# arrival in 1e8 base units -- the chain-enforced minimum output a real quote
+# carries. A literal 0 there is a swap at ANY price, and is refused.
+_MEMO = "=:XMR.XMR:" + _DEST + ":{LIMIT}/1/0"
 _TIP = 850000
 _H1, _H2 = "ab" * 32, "cd" * 32
 _ORACLE = Decimal("0.004")                                    # BTC per XMR
@@ -156,7 +159,15 @@ class Net:
         if exp is None:
             exp = str((Decimal(payload["sellAmount"]) / _ORACLE * self.factor)
                       .quantize(Decimal("0.00000001")))
-        return {"routes": [{"targetAddress": self.inbound, "memo": self.memo,
+        memo = self.memo
+        if "{LIMIT}" in memo:
+            try:
+                _w = Decimal(exp) * Decimal("0.9")
+            except Exception:                                # noqa: BLE001
+                _w = Decimal(0)
+            memo = memo.replace("{LIMIT}", str(int(_w * 10 ** 8)))
+        self.last_memo = memo
+        return {"routes": [{"targetAddress": self.inbound, "memo": memo,
                             "expectedBuyAmount": exp}]}
 
     def safe_get(self, url, proxies=None):
@@ -183,13 +194,22 @@ class Net:
 _PROXY = "socks5h://127.0.0.1:9050"
 
 
-def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None):
-    """Drive main(). Returns (exit_code, stdout, plan_or_None, outfile)."""
+def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None,
+        ids="env", index="0"):
+    """Drive main(). Returns (exit_code, stdout, plan_or_None, outfile).
+    `ids` says how the xpub and index reach the tool: "env" (the wake
+    agent's way), "argv" (a hand run), or None (neither)."""
     net.install()
     out = outfile or os.path.join(_scratch, f"plan_{os.urandom(4).hex()}.json")
-    argv = ["--tor-proxy", _PROXY, "--electrum", "s.onion", "--xpub", _XPUB,
-            "--index", "0", "--dest-from-receive-wallet", _BUNDLE,
-            "--outfile", out]
+    argv = ["--tor-proxy", _PROXY, "--electrum", "s.onion",
+            "--dest-from-receive-wallet", _BUNDLE, "--outfile", out]
+    os.environ.pop("GS_BTC_XPUB", None)
+    os.environ.pop("GS_BTC_INDEX", None)
+    if ids == "env":
+        os.environ["GS_BTC_XPUB"] = _XPUB
+        os.environ["GS_BTC_INDEX"] = str(index)
+    elif ids == "argv":
+        argv += ["--xpub", _XPUB, "--index", str(index)]
     if dry_run:
         argv.append("--dry-run")
     if policy is not None:
@@ -205,11 +225,25 @@ def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None):
             code = F.main(argv)
     except SystemExit as e:
         code = e.code
+    finally:
+        os.environ.pop("GS_BTC_XPUB", None)
+        os.environ.pop("GS_BTC_INDEX", None)
     plan = None
     if os.path.exists(out):
         with open(out) as fh:
             plan = json.load(fh)
     return code, buf.getvalue(), plan, out
+
+
+_HEX_LINE = re.compile(r"signed hex \(stage 2: NOT broadcast, not persisted\): "
+                       r"([0-9a-f]+)")
+
+
+def _signed_tx(out):
+    """The signed transaction, from the ONE place stage 2 puts it: stdout
+    (the job log), never the plan file."""
+    m = _HEX_LINE.search(out)
+    return Transaction.parse(bytes.fromhex(m.group(1))) if m else None
 
 
 def _refusal(net, *extra, **kw):
@@ -228,7 +262,7 @@ check("exit 0, a plan file exists, mode 0600",
 check("the plan says: dry run, NOT broadcast, signed, schema v1",
       _plan["dry_run"] is True and _plan["broadcast"] is False
       and _plan["signed"] is True and _plan["schema"] == F.PLAN_SCHEMA)
-_tx = Transaction.parse(bytes.fromhex(_plan["tx_hex"]))
+_tx = _signed_tx(_out)
 check("the transaction spends the settled output with RBF, locktime = tip, "
       "version 2", len(_tx.vin) == 1 and _tx.vin[0].txid.hex() == _H1
       and _tx.vin[0].sequence == 0xFFFFFFFD and _tx.locktime == _TIP
@@ -240,8 +274,13 @@ check("output 0 pays the inbound vault EXACTLY settled minus the fee, and "
       and _tx.vout[0].script_pubkey.data == T.address_script(_INBOUND).data
       and _tx.vout[1].value == 0
       and _tx.vout[1].script_pubkey.data
-      == T.op_return_script(_MEMO.encode()).data
+      == T.op_return_script(_net.last_memo.encode()).data
       and _tx.vout[1].script_pubkey.data[1] == 0x4c)
+check("THE SIGNED BYTES ARE NOT IN THE PLAN FILE (a bearer instrument with "
+      "no consumer yet): tx_hex is null, signed_hex_written false, and the "
+      "hex went to stdout -- the job log -- instead",
+      _plan["tx_hex"] is None and _plan["signed_hex_written"] is False
+      and _tx is not None and _tx.is_segwit)
 check("no change output: the whole deposit is forwarded (the sizing slack "
       "goes to the miner, never to an output that chains forwards)",
       len(_tx.vout) == 2 and _plan["send_sat"] + _fee == 200000)
@@ -259,9 +298,14 @@ check("the fee is the bound at the target rate: bound vB * 10 sat/vB, and "
       and _plan["feerate_real_sat_vb"] >= 10
       and _plan["feerate_target_sat_vb"] == 10
       and T.measure(_tx)[0] == _plan["vsize"])
-check("the memo is recorded with its byte count against the policy",
-      _plan["memo"] == _MEMO and _plan["memo_bytes"] == 111
-      and _plan["op_return_max_bytes"] == 120)
+check("the memo is recorded with its byte count against the policy, and "
+      "its chain-enforced limit is the worst-case arrival in base units",
+      _plan["memo"] == _net.last_memo
+      and _plan["memo_bytes"] == len(_net.last_memo.encode())
+      and _plan["op_return_max_bytes"] == 120
+      and _plan["memo_limit_base_units"]
+      == int(Decimal(_plan["worst_case_xmr"]) * 10 ** 8)
+      and _plan["affiliate_bps"] == 0)
 check("txid in the plan is the transaction's",
       _plan["txid"] == T.txid_hex(_tx))
 check("expected and worst-case Monero are recorded (worst = 90% of expected)",
@@ -309,20 +353,22 @@ check("the hash chain got kinds only -- start, quoted, signed, not_broadcast "
       and not any(re.search(r"\d", k) for _, k in _net.kinds))
 
 print("\n== THE MEMO DOES NOT FIT: the default policy refuses ==")
-_code, _out, _plan, _kind = _refusal(Net(), policy=None)
+_net = Net()
+_code, _out, _plan, _kind = _refusal(_net, policy=None)
+_L = len(_net.last_memo.encode())               # a real memo: over 80 always
 check("on the DEFAULT 80-byte policy a real forward is REFUSED as "
       "memo_overflow, exit 2, nothing signed, no plan written",
-      _code == 2 and _kind == "memo_overflow" and _plan is None)
+      _code == 2 and _kind == "memo_overflow" and _plan is None and _L > 80)
 check("...and the refusal names the byte count and the policy, and points "
-      "at the plan section", "111 bytes" in _out and "80" in _out
+      "at the plan section", f"{_L} bytes" in _out and "80" in _out
       and "STAGE2_PLAN" in _out)
 check("...the quote WAS fetched first (the memo has to be seen to be "
       "measured) but no seed was touched: refused before signing",
       len(_net.posts) == 1 and F.SEED_ENV in os.environ)
 os.environ.pop(F.SEED_ENV, None)
-check("a policy of exactly the memo's size (111) signs; 110 refuses",
-      run(Net(), policy=111)[0] == 0
-      and _refusal(Net(), policy=110)[3] == "memo_overflow")
+check(f"a policy of exactly the memo's size ({_L}) signs; {_L - 1} refuses",
+      run(Net(), policy=_L)[0] == 0
+      and _refusal(Net(), policy=_L - 1)[3] == "memo_overflow")
 
 print("\n== multiple settled outputs, plan-only, the fee override ==")
 _net = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 150000,
@@ -332,7 +378,7 @@ _net = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 150000,
                   {"tx_hash": "ef" * 32, "vout": 0, "value": 50000,
                    "confirmations": 0}])
 _code, _out, _plan, _ = run(_net)
-_tx = Transaction.parse(bytes.fromhex(_plan["tx_hex"]))
+_tx = _signed_tx(_out)
 check("two settled outputs are both spent and both signed; the unconfirmed "
       "one is NOT an input and not in the plan",
       _code == 0 and len(_tx.vin) == 2
@@ -357,7 +403,7 @@ _net = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
                   {"tx_hash": _H2, "vout": 1, "value": 70000,
                    "confirmations": 1}])
 _code, _out, _plan, _ = run(_net)
-_tx = Transaction.parse(bytes.fromhex(_plan["tx_hex"]))
+_tx = _signed_tx(_out)
 check("an output mined ONE block deep under min-conf 2 is neither counted "
       "nor spent: one input, the fee is exactly the sized fee, and the "
       "shallow output is reported as not yet settled",
@@ -365,8 +411,7 @@ check("an output mined ONE block deep under min-conf 2 is neither counted "
       and 200000 - _tx.vout[0].value == _plan["fee_sat"]
       and _plan["unsettled_outputs"] == 1 and _plan["settled_sat"] == 200000)
 check("...and with --min-conf 1 the same output IS spent",
-      len(Transaction.parse(bytes.fromhex(
-          run(Net(utxos=_net.utxos), "--min-conf", "1")[2]["tx_hex"])).vin)
+      len(_signed_tx(run(Net(utxos=_net.utxos), "--min-conf", "1")[1]).vin)
       == 2)
 
 # DUST STORM. Two hundred 546-sat outputs parked on the address (anyone can
@@ -377,7 +422,7 @@ _storm = [{"tx_hash": ("%064x" % i), "vout": 0, "value": 546,
 _net = Net(utxos=_storm + [{"tx_hash": _H1, "vout": 0, "value": 300000,
                             "confirmations": 9}])
 _code, _out, _plan, _ = run(_net)
-_tx = Transaction.parse(bytes.fromhex(_plan["tx_hex"]))
+_tx = _signed_tx(_out)
 check("two hundred dust outputs beside a real deposit: the forward spends "
       "the deposit alone, leaves the dust, and says so",
       _code == 0 and len(_tx.vin) == 1 and _tx.vin[0].txid.hex() == _H1
@@ -409,6 +454,78 @@ check("--feerate-sat-vb overrides the server: the look asks for no estimate "
       "and the fee is at 7", _code == 0
       and _net.look_calls[0][3]["fee_blocks"] is None
       and _plan["feerate_target_sat_vb"] == 7)
+_code, _out, _plan, _ = run(Net(), "--write-signed-hex")
+check("--write-signed-hex puts the signed bytes in the plan file (stage 3's "
+      "consumer flag) and says so",
+      _code == 0 and _plan["signed_hex_written"] is True
+      and Transaction.parse(bytes.fromhex(_plan["tx_hex"])).is_segwit
+      and _HEX_LINE.search(_out) is None)
+
+print("\n== where the xpub and the index come from ==")
+_code, _out, _plan, _ = run(Net(), ids="argv")
+check("a hand run may pass --xpub/--index on argv: it works, and the tool "
+      "warns that argv is world-readable",
+      _code == 0 and _plan["index"] == 0
+      and "passed on the command line" in _out)
+_code, _out, _plan, _ = run(Net(), ids="env")
+check("the wake agent's way -- GS_BTC_XPUB / GS_BTC_INDEX in the "
+      "environment -- works with no warning and nothing on argv",
+      _code == 0 and "command line" not in _out)
+check("neither: refused bad_args before any network call",
+      _refusal(Net(), ids=None)[3] == "bad_args"
+      and not Net().look_calls)
+check("a non-numeric index in the environment is refused bad_args",
+      _refusal(Net(), ids="env", index="three")[3] == "bad_args")
+
+print("\n== the fee bound covers the largest inbound ThorChain could name ==")
+_P2WSH_MAIN = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+_code, _out, _plan, _ = run(Net(inbound=_P2WSH_MAIN))
+check("a P2WSH inbound (34-byte scriptPubKey): the real vsize is at or "
+      "under the bound and the real rate at or over the target",
+      _code == 0 and _plan["vsize"] <= _plan["vsize_bound"]
+      and _plan["feerate_real_sat_vb"] >= _plan["feerate_target_sat_vb"])
+
+print("\n== build_and_sign's own guards, driven directly ==")
+_net = Net().install()
+_chosen = [{"tx_hash": _H1, "vout": 0, "value": 200000, "confirmations": 5}]
+_spk = T.address_script(_INBOUND)
+_fee0 = 2540
+
+
+def _bas(**kw):
+    """The last refusal kind from a direct build_and_sign call."""
+    args = dict(chosen=_chosen, tip=_TIP, inbound_spk=_spk,
+                send_sat=200000 - _fee0, fee_sat=_fee0,
+                memo_b=("=:XMR.XMR:" + _DEST + ":40000000/1/0").encode(),
+                account=_ACCT, index=0, address=_ADDR0, network="main",
+                sign=True)
+    args.update(kw)
+    _net.kinds.clear()
+    try:
+        with redirect_stdout(io.StringIO()):
+            F.build_and_sign(**args)
+        return "signed"
+    except SystemExit:
+        kinds = [k for s, k in _net.kinds if k.startswith("refused:")]
+        return kinds[-1][8:] if kinds else "(none)"
+
+
+check("the good call signs", _bas() == "signed")
+check("key_address_mismatch when the key does not derive the address given "
+      "(a wrong index, or the inbound address in its place)",
+      _bas(index=1) == "key_address_mismatch"
+      and _bas(address=_INBOUND) == "key_address_mismatch")
+check("fee_mismatch when inputs minus outputs is not the sized fee, either "
+      "way", _bas(fee_sat=_fee0 + 1) == "fee_mismatch"
+      and _bas(send_sat=200000 - _fee0 - 1) == "fee_mismatch")
+_saved = T.verify_signed
+T.verify_signed = lambda *a, **k: False
+try:
+    _vk = _bas()
+finally:
+    T.verify_signed = _saved
+check("the independent re-verification refuses when it fails (driven by "
+      "making it fail)", _vk == "sign_failed")
 
 print("\n== refusals, each by kind, each signing nothing ==")
 
@@ -426,6 +543,27 @@ check("without --dry-run: refused before anything is asked of the network",
 _r("memo_unbound", Net(memo="=:XMR.XMR:" + _OTHER + ":0/1/0"))
 _r("bad_memo", Net(memo=_MEMO + "\n:extra"))
 _r("no_memo", Net(memo=""))
+# THE MEMO'S OWN TERMS: the chain reads the limit and the affiliate fee;
+# the aggregator's expectedBuyAmount says nothing about either.
+_r("memo_no_limit", Net(memo="=:XMR.XMR:" + _DEST + ":0/1/0"))
+_r("memo_no_limit", Net(memo="=:XMR.XMR:" + _DEST))
+_r("memo_no_limit", Net(memo="=:XMR.XMR:" + _DEST + ":abc/1/0"))
+_r("memo_limit_low", Net(memo="=:XMR.XMR:" + _DEST + ":1/1/0"))
+_r("memo_affiliate_fee", Net(memo=_MEMO + ":thorname:1000"), policy=255)
+_r("memo_affiliate_fee", Net(memo=_MEMO + ":thorname:abc"), policy=255)
+check("...an affiliate fee within --max-affiliate-bps is accepted and "
+      "recorded", (run(Net(memo=_MEMO + ":thorname:25"),
+                       "--max-affiliate-bps", "25", policy=255)[2] or {})
+      .get("affiliate_bps") == 25)
+check("a limit in scientific notation (the chain accepts 1e8) parses",
+      F.validate_memo_terms("=:XMR.XMR:x:1e8/1/0", Decimal("0.5"), 0)
+      == (100000000, 0))
+# HEX. memo_binds_destination accepts a memo that binds once hex-decoded;
+# this tool writes the OP_RETURN itself and must never embed the hex TEXT.
+_hexmemo = ("=:XMR.XMR:" + _DEST + ":40000000/1/0").encode().hex()
+_r("memo_hex", Net(memo=_hexmemo), policy=255)
+_r("memo_hex", Net(memo="0x" + _hexmemo), policy=255)
+_r("quote_refused", Net(post_error=SystemExit("401 from a keyed host")))
 _r("inbound_wrong_network", Net(inbound="tb1q6rz28mcfaxtmd6v789l9rrlrusdpr"
                                           "r9pqcpvkl"))
 _r("inbound_wrong_network", Net(inbound="1BitcoinEaterAddressDontSendf59kuE"))
@@ -439,9 +577,22 @@ _r("nothing_settled", Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 5,
 _r("no_fee_estimate", Net(fee=None))
 _r("fee_out_of_band", Net(fee=500))
 _r("fee_out_of_band", Net(fee=2), "--feerate-floor", "5")
+# THE FRACTION GUARD MUST BE THE DECIDING CHECK. A 20,000-sat fixture at
+# 100 sat/vB was refused by every guard downstream (the fee exceeded the
+# whole deposit), so the 20% rule was never what refused it. 100,000 sat at
+# 100 sat/vB: the fee is ~25% and the send is far above the floor.
 _out = _r("fee_eats_deposit", Net(utxos=[{"tx_hash": _H1, "vout": 0,
-                                            "value": 20000,
+                                            "value": 100000,
                                             "confirmations": 5}], fee=100))
+_b = run(Net())[2]["vsize_bound"]
+_v = 5 * _b * 100                                # fee = exactly 20%
+check("the boundary: a fee of exactly 20% of the deposit signs; one satoshi "
+      "less of deposit refuses fee_eats_deposit",
+      run(Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": _v,
+                      "confirmations": 5}], fee=100))[0] == 0
+      and _refusal(Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": _v - 1,
+                               "confirmations": 5}], fee=100))[3]
+      == "fee_eats_deposit")
 _out = _r("below_minimum", Net(utxos=[{"tx_hash": _H1, "vout": 0,
                                         "value": 10100, "confirmations": 5}],
                                fee=1))
@@ -526,12 +677,15 @@ for _label, _extra in (("op-return policy 0", ["--op-return-max-bytes", "0"]),
                         ["--min-send-sat", "5000"]),
                        ("floor above ceiling",
                         ["--feerate-floor", "50", "--feerate-ceiling", "10"]),
-                       ("a negative index", ["--index", "-1"]),
                        ("min-conf 0", ["--min-conf", "0"]),
                        ("a bad mix floor", ["--min-out-xmr", "abc"])):
     _code, _o, _p, _kind = _refusal(Net(), *_extra, policy=None)
     check(f"bad args: {_label} -> refused:bad_args before any network call",
           _code == 2 and _kind == "bad_args")
+_code, _o, _p, _kind = _refusal(Net(), policy=None, index="-1")
+check("bad args: a negative index (in the environment, the agent's way) -> "
+      "refused:bad_args before any network call",
+      _code == 2 and _kind == "bad_args")
 _bad_bundle = os.path.join(_scratch, "wallet_bad.json")
 with open(_bad_bundle, "w") as _fh:
     json.dump({"schema": "something_else", "address": _DEST}, _fh)

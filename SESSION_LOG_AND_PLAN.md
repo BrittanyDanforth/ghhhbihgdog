@@ -286,12 +286,51 @@ dust constant, OP_RETURN builder or coin selection.
   `--allow-btc-forward`); `CHAT_NAME` "forward"; OPSEC_SETUP's five jobs.
   Four tripwire tests updated by design; the forward's dispatch driven end
   to end (test_wake_agent 590/590, test_wake_protocol 189/189).
-- 16 mutation anchors over the money guards, plus two pre-existing anchors
-  re-pointed (the gate line changed; the mix-floor argv line was matched
-  twice).
+- **Adversarial review of stage 2** (eight lenses, three refuters per
+  finding, 27 raised, the real ones fixed end to end):
+  *Money:* a mined-but-shallow output (1 conf under a 2-conf policy) was
+  spent while not counted, so its whole value would have gone to the miner
+  — inputs are now selected by per-output depth AND worth (the dust-storm
+  defence: two hundred 546-sat outputs no longer strand a deposit), and the
+  built fee must equal the sized fee (`fee_mismatch`). The memo's own terms
+  are read: a zero or missing output limit (a swap at ANY price) and a limit
+  under the worst-case arrival are refused, as is an affiliate skim over
+  `max_affiliate_bps` (default 0). A hex-encoded memo — which the shared
+  validator accepts — is refused rather than embedded as hex text. The fee
+  fraction fixture was over 100% (the 20% guard was never deciding); fixed
+  and the boundary pinned. The fee bound's 34-byte inbound allowance is now
+  exercised with a P2WSH vault. `build_and_sign`'s three guards are driven
+  directly. *OPSEC:* a done forward re-shipped the DEPOSIT's slip (address,
+  amount, memo naming the XMR destination) to the phone — only the quoting
+  job has a slip now; the xpub (the generator of every deposit address) and
+  the index moved off the 0444 argv into the step's environment; the signed
+  bytes are no longer persisted in the plan file by default (a bearer
+  instrument with no consumer yet; stdout/job log instead, `--write-signed-hex`
+  for stage 3's consumer); a done forward marks its record and a repeat is
+  `already_forwarded`; the plan is retired with the handle. *Reachability:*
+  the host (a hand-poked note) may forward a client's deposit; a client token
+  is still walled. *Rendering:* the doorbell and the pager say "signed,
+  nothing sent" for a done forward, never deposit vocabulary. *Config:* the
+  keyfile's BTC settings are validated at pairing with the forwarder's own
+  functions (`_validate_btc`) and never coerced by the agent
+  (`btc_config_malformed`); the fee band and affiliate cap are keyfile
+  fields; `GS_SWAPKIT_API_KEY` reaches the step; a 401 from the aggregator is
+  `quote_refused`, not a bare exit. *Docs:* the unit file and OPSEC_SETUP
+  carry `GS_BTC_SEED`, the passphrase, the aggregator key and the
+  libsecp256k1-1 requirement; the vendored ctypes loader no longer searches
+  inside the package for a blob. *E2E:* the forward runs through the real
+  doorbell + real agent over real HTTP (a done forward of the handle the
+  first cycle minted; `already_forwarded` on the repeat).
+  Counts: test_btc_tx 73, test_btc_forwarder 116, test_wake_agent 621,
+  test_wake_doorbell 159, test_telegram_pager 651, test_wake_endtoend 59.
+- 33 mutation anchors over the money guards and the OPSEC rules, all caught;
+  two pre-existing anchors re-pointed.
 - Deferred on purpose: no real handle carries `btc_index` until stage 4
-  mints addresses (the job refuses `no_btc_deposit` on a live box);
-  broadcast and the relay strategy (stage 3).
+  mints addresses (the job refuses `no_btc_deposit` on a live box); the
+  pager has no command that starts a forward (stage 4 decides who may; the
+  host can by hand today); broadcast, which consumes the plan and clears
+  the mark, and the relay strategy (stage 3); stage 4's deposit minimum must
+  be `FORWARD_MIN_SAT` plus a fee allowance, not the typo guard.
 
 ### `cd3c1f9` — Design: BTC intake by unique address, host-side forward into the swap
 - `BTC_INTAKE_DESIGN.md`: the blueprint for the rework (section 4 below).
@@ -532,7 +571,7 @@ rule-6 material).
 |---|-------|-------|
 | 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
 | 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 213/213, 18 anchors all caught (`9f19781`, `2cc59ea`, and the third-round commit) |
-| 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only** — `gs_btc_tx.py` (test_btc_tx 70/70, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 87/87), job wiring (test_wake_agent 590/590, test_wake_protocol 189/189), 16 anchors; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
+| 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only, reviewed** — `gs_btc_tx.py` (test_btc_tx 73/73, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 116/116), job wiring (test_wake_agent 621/621, test_wake_protocol 189/189, test_wake_endtoend 59/59 over real HTTP), 33 anchors all caught; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
 | 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
 | 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |

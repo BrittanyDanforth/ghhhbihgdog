@@ -3244,6 +3244,20 @@ class Pager:
             slip = res.get("slip") or ""
             plain = res.get("plain") or {}
             phase = res.get("phase") or ""
+            # A FINISHED FORWARD IS ONE SENTENCE, AND NOT A DEPOSIT ONE.
+            # With no payload this job fell through to "quoted ... the
+            # payment details are ON THE MACHINE ... /check once you have
+            # paid", and with one it said "here is how to pay" -- deposit
+            # vocabulary about a run that signed a spend. The vault sends
+            # this job no slip and no plain (see _run_validated); this box
+            # renders nothing it might have been sent anyway. Rule 6: no
+            # address, no amount, no memo, and no invitation to pay.
+            if job == "forward_to_swap":
+                self.send(chat_id,
+                          f"{_cn}: forward signed on the machine. Nothing "
+                          f"was sent yet (stage 2).",
+                          buttons=self._handle_buttons(h, job, chat_id))
+                return
             # SCOPED TO THE WATCHING JOBS, and it used to catch everything.
             #
             # This branch renders the phase and RETURNS, which is right for a
