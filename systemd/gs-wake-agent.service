@@ -179,18 +179,27 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 # as before. Uncomment it and you have decided that this machine can spend
 # while nobody is sitting at it. OPSEC_SETUP.md section 4b is what that costs.
 #
-# ROOT-OWNED 0400, holding one line:
+# ROOT-OWNED 0400, holding one line per secret:
 #     GS_WALLET_PASSWORD=...
 #     GS_FEE_WALLET_PASSWORD=...      # only with a fee wallet paired (gs_wake_keys pair --fee-rpc)
+#     GS_BTC_SEED=word word ... word  # only with --allow-btc-forward paired: the
+#                                     # BIP39 mnemonic btc_forwarder signs with
+#     GS_BTC_SEED_PASSPHRASE=...      # optional BIP39 passphrase for that seed
+#     GS_SWAPKIT_API_KEY=...          # only if the aggregator requires a key
 #
 # /proc/<pid>/cmdline is 0444 and /proc/<pid>/environ is 0400, which is why
 # there is no flag for this and never will be.
 #
 # WHAT STOPS IT REACHING EVERYTHING ELSE: run_child strips every GS_ variable
 # out of the environment it inherits and puts back only what the dispatcher
-# hands that step. So this reaches the mix and reaches nothing else -- not
-# thor_swap_preparer, not create_receive_wallet. Without that scrub, putting a
-# password here would hand it to every child of every job.
+# hands that step. So the wallet password reaches the mix, the seed reaches
+# btc_forwarder, and each reaches nothing else -- not thor_swap_preparer, not
+# create_receive_wallet. Without that scrub, a secret here would be handed to
+# every child of every job.
+#
+# THE FORWARD SIGNS ONLY ON THE CONSTANT-TIME CURVE: btc_forwarder refuses to
+# sign unless the distro's libsecp256k1 (package libsecp256k1-1 on Debian and
+# Ubuntu) is installed. Install it with the rest of the box's packages.
 #EnvironmentFile=/etc/gs-wake-spend.env
 ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_wake_agent --key /etc/gs_wake_thinkpad.key
 

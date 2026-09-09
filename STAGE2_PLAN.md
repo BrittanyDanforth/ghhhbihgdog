@@ -12,24 +12,54 @@ What shipped, against the build order in section 7:
   `measure`, `build_unsigned` (RBF, fresh lists, refusals), `sign_input` /
   `sign_p2wpkh` (BIP143 script code, constant-time gate, self-verify),
   `verify_signed`, `account_from_mnemonic`, `account_matches_xpub`, `key_for`.
-  `tests/test_btc_tx.py`: 70 checks, BIP143's vector byte for byte.
+  `tests/test_btc_tx.py`: 73 checks, BIP143's vector byte for byte.
 - `gs_btc_watch.py`: `Electrum.estimate_fee` and `look(..., fee_blocks=)` --
   the fourth read-only method, same session, same circuit.
 - `btc_forwarder`: the tool, `--dry-run` required, `--plan-only` optional,
-  seed from `GS_BTC_SEED` only, the THORNode cross-check behind `--thornode`.
-  `tests/test_btc_forwarder.py`: 87 checks through the real `main()`.
+  seed from `GS_BTC_SEED` (and an optional `GS_BTC_SEED_PASSPHRASE`) only,
+  the xpub and index from `GS_BTC_XPUB` / `GS_BTC_INDEX` by preference
+  (argv works for a hand run, with the world-readable warning), the
+  THORNode cross-check behind `--thornode`. Inputs chosen by per-output
+  depth AND worth (the dust-storm defence); the built fee must equal the
+  sized fee. The memo is bound on its PLAIN form only (a hex-encoded memo is
+  refused, never embedded as hex), and its own terms are read: the output
+  limit must be present, non-zero and at least the worst-case arrival in
+  base units, and the affiliate fee at most `--max-affiliate-bps` (default
+  0). The signed bytes go to stdout (the job log), not the plan file,
+  unless `--write-signed-hex` (stage 3's consumer flag).
+  `tests/test_btc_forwarder.py`: 116 checks through the real `main()`, plus
+  `build_and_sign`'s three money guards driven directly.
 - The job: `forward_to_swap` in `JOBS`, `SPENDING_JOBS` and `GATED_TOOLS`,
-  `WIRE_VERSION` 4; the agent's argv branch, per-job spending switch
-  (`allow_btc_forward`), ledger resolution (`btc_index`, owner wall, spent),
-  seed injection into the one step's environment; pairing flags in
-  `gs_wake_keys`; `CHAT_NAME`; the four tripwire tests updated and the
-  forward's dispatch driven end to end in `tests/test_wake_agent.py`.
-- 16 mutation anchors over the money guards.
+  `WIRE_VERSION` 4; the agent's argv branch (keyfile settings validated,
+  never coerced: `btc_config_malformed`), per-job spending switch
+  (`allow_btc_forward`), ledger resolution (`btc_index`, owner wall with
+  the HOST allowed to forward a client's deposit, spent, and
+  `already_forwarded` on a repeat), the seed / xpub / index / aggregator
+  key injected into the one step's environment, the record marked
+  `forwarded` + `forward_plan` on a done run (and retired with the handle),
+  and NO slip and NO plain in the reply (only the quoting job has one --
+  the deposit's slip was being re-shipped to the phone). Pairing flags in
+  `gs_wake_keys`, validated at pairing with the forwarder's own functions
+  (`_validate_btc`), including the fee band (`feerate_floor_sat_vb` /
+  `feerate_ceiling_sat_vb`) and `max_affiliate_bps`. `CHAT_NAME`; the
+  pager and the doorbell render a done forward as a signed spend, never as
+  a ready deposit. The unit file and OPSEC_SETUP document `GS_BTC_SEED`,
+  the passphrase, the aggregator key and the libsecp256k1-1 requirement.
+  The four tripwire tests updated; the forward driven end to end in
+  `tests/test_wake_agent.py` (621) AND through the real doorbell + real
+  agent over real HTTP in `tests/test_wake_endtoend.py` (a done forward of
+  the handle the first cycle minted, then `already_forwarded` on the
+  repeat), plus the doorbell (159) and pager (651) rendering.
+- 33 mutation anchors over the money guards and the OPSEC rules (all
+  caught).
 
 Deferred, on purpose: the deposit ledger does not yet carry `btc_index` for
 any real handle (stage 4 mints the addresses), so on a live box the job
-refuses `no_btc_deposit` until then; broadcast (stage 3); the relay
-strategy for the >80-byte memo (stage 3, see section 2).
+refuses `no_btc_deposit` until then; the pager has no command that starts a
+forward (stage 4 decides who may, and the by-hand doorbell `wake` already
+can, as the host); broadcast (stage 3), which also consumes the plan and
+clears the `forwarded` mark; the relay strategy for the >80-byte memo
+(stage 3, see section 2).
 
 **A floor stage 4 must respect (found in review):** `FORWARD_MIN_SAT` is
 what must REACH ThorChain after the fee, and it equals the deposit wizard's

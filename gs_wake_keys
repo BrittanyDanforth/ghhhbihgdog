@@ -368,6 +368,15 @@ def build_cli() -> argparse.ArgumentParser:
                         "default, and SEPARATE from --allow-withdraw: "
                         "enabling one never enables the other. Stage 2 signs "
                         "and prints only; nothing is broadcast.")
+    p.add_argument("--feerate-floor-sat-vb", type=int, default=1,
+                   help="the lowest fee rate a forward will pay (default 1)")
+    p.add_argument("--feerate-ceiling-sat-vb", type=int, default=200,
+                   help="the highest fee rate a forward will pay; a server "
+                        "estimate above it is refused, not clamped "
+                        "(default 200)")
+    p.add_argument("--max-affiliate-bps", type=int, default=0,
+                   help="the largest affiliate fee (basis points) a quoted "
+                        "swap memo may carry (default 0)")
     # WHERE THE OPERATOR'S CUT GOES, and the default is deliberately nowhere.
     #
     # gs_wake_agent reads key["usage_fee_address"] and there was NO WAY TO SET
@@ -545,6 +554,48 @@ def _mint_fee_address(args) -> str:
     return addr
 
 
+def _validate_btc(args) -> None:
+    """The BTC intake's settings, REFUSED AT PAIRING like the wallet file:
+    every one of these was refused later, per wake, after the boot, the
+    jitter and the Tor check -- and two were COERCED by the agent instead
+    (a paired 0 became 2 confirmations). Checked with the same functions
+    the forwarder uses, so the two cannot disagree."""
+    if args.allow_btc_forward and not (args.btc_xpub and args.btc_electrum):
+        sys.exit("[!] --allow-btc-forward needs --btc-xpub and at least one "
+                 "--btc-electrum: the forward has to know which account to "
+                 "watch\n    and where to look. Without them every forward "
+                 "is refused after the wake.")
+    if args.btc_network not in ("main", "testnet", "signet", "regtest"):
+        sys.exit("[!] --btc-network must be main, testnet, signet or regtest.")
+    if args.btc_min_conf < 1:
+        sys.exit("[!] --btc-min-conf must be at least 1: an unconfirmed "
+                 "deposit is never settled money.")
+    if not 1 <= args.op_return_max_bytes <= 255:
+        sys.exit("[!] --op-return-max-bytes must be 1..255 (80 is the "
+                 "standard relay limit; no swap memo fits it -- see "
+                 "STAGE2_PLAN.md section 2).")
+    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb:
+        sys.exit("[!] the fee band must satisfy 1 <= --feerate-floor-sat-vb "
+                 "<= --feerate-ceiling-sat-vb.")
+    if not 0 <= args.max_affiliate_bps <= 1000:
+        sys.exit("[!] --max-affiliate-bps must be 0..1000.")
+    if args.thornode and not str(args.thornode).lower().startswith(
+            ("http://", "https://")):
+        sys.exit("[!] --thornode must be an http(s):// base URL.")
+    import gs_btc_watch as _w
+    for _s in (args.btc_electrum or []):
+        try:
+            _w.parse_server(_s)
+        except _w.BtcWatchError as e:
+            sys.exit(f"[!] --btc-electrum: {e}")
+    if args.btc_xpub:
+        try:
+            _w.derive_receive_address(args.btc_xpub, 0, args.btc_network)
+        except _w.BtcWatchError as e:
+            sys.exit(f"[!] --btc-xpub is not an account xpub of the "
+                     f"{args.btc_network} network: {e}")
+
+
 def _validate(args) -> None:
     # REFUSED AT PAIRING, not discovered mid-withdrawal. --allow-withdraw
     # without a wallet file writes a keyfile whose withdraw job relays a
@@ -556,6 +607,7 @@ def _validate(args) -> None:
                  "    Without it a withdrawal would relay its fan-out and "
                  "fail hours later at the\n"
                  "    signing step, with the money already moved on-chain.")
+    _validate_btc(args)
     # CHECKED AT PAIRING, with the protocol's own one-address gate. A typo here
     # is a cut paid to an address nobody can spend, discovered after a mix has
     # run.
@@ -952,6 +1004,9 @@ def do_pair(args) -> int:
         "op_return_max_bytes": int(args.op_return_max_bytes),
         "thornode_url": str(args.thornode or ""),
         "allow_btc_forward": bool(args.allow_btc_forward),
+        "feerate_floor_sat_vb": int(args.feerate_floor_sat_vb),
+        "feerate_ceiling_sat_vb": int(args.feerate_ceiling_sat_vb),
+        "max_affiliate_bps": int(args.max_affiliate_bps),
         "fee_rpc": str(args.fee_rpc or ""),
         "fee_wallet_file": str(args.fee_wallet_file or ""),
         "fee_address": fee_address,

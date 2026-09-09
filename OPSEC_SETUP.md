@@ -943,6 +943,15 @@ install -m 0400 -o root -g root /dev/null /etc/gs-wake-spend.env
 # and, only with a fee wallet paired (see 4c):
 # ( set +o history; umask 077; read -rs -p 'fee wallet password: ' p; echo
 #   printf 'GS_FEE_WALLET_PASSWORD=%s\n' "$p" >> /etc/gs-wake-spend.env )
+# and, only with the BTC intake paired (gs_wake_keys pair --allow-btc-forward
+# --btc-xpub <account xpub> --btc-electrum <host.onion>): the seed the forward
+# signs with, the same way -- never on an argv, never in the keyfile. The
+# forward refuses to sign unless the distro's libsecp256k1 (libsecp256k1-1)
+# is installed: it is the constant-time curve; the pure-Python one is not.
+# ( set +o history; umask 077; read -rs -p 'BTC seed (12/24 words): ' p; echo
+#   printf 'GS_BTC_SEED=%s\n' "$p" >> /etc/gs-wake-spend.env )
+# ( set +o history; umask 077; read -rs -p 'BTC seed passphrase (or empty): ' p; echo
+#   [ -n "$p" ] && printf 'GS_BTC_SEED_PASSPHRASE=%s\n' "$p" >> /etc/gs-wake-spend.env )
 #    then uncomment the EnvironmentFile line in systemd/gs-wake-agent.service.
 #    The same recipe writes /etc/gs-pager.env on the Pi, if you run the pager
 #    unattended at all -- read 4b's "one real cost" first.

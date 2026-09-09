@@ -67,6 +67,7 @@ required so that a future broadcast mode cannot be reached by omission.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from decimal import Decimal
@@ -77,12 +78,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "third_party"))
 
 from gs_common import (                                      # noqa: E402
     SWAPKIT_API, atomic_write_json, bech32_checksum_ok, btc_per_xmr_oracle,
-    decimal_arg, finite_decimal, fmt_btc, install_signal_handlers,
-    instruction_field_safe, integrity_log, isolated_proxy,
-    load_receive_bundle, memo_binds_destination, memo_bytes,
+    decimal_arg, env_or_argv, finite_decimal, fmt_btc,
+    install_signal_handlers, instruction_field_safe, integrity_log,
+    isolated_proxy, load_receive_bundle, memo_binds_destination, memo_bytes,
     memo_will_overflow, newnym, parse_swap_route, quote_deviation, safe_get,
     safe_post, scrub_address, shutdown_requested, validate_proxy, verify_tor,
-    OP_RETURN_STD_BYTES,
+    OP_RETURN_STD_BYTES, _memo_fields_bind,
 )
 import gs_btc_tx as btx                                      # noqa: E402
 import gs_btc_watch as watch                                 # noqa: E402
@@ -230,6 +231,16 @@ def fetch_quote(send_sat, dest_xmr, proxy_url):
     try:
         resp = safe_post(f"{SWAPKIT_API}/v3/quote",
                          quote_payload(send_sat, dest_xmr), proxies)
+    except SystemExit:
+        # safe_post sys.exits on a 401/403 from a keyed host. That is a
+        # BaseException, so the clause below would have let it escape with
+        # no kind on the chain and a bare exit 1; named here instead.
+        newnym(proxy_url=proxy_url)
+        integrity_log("forward", "quote_refused")
+        raise Refused("quote_refused",
+                      "the aggregator refused the request (an API key may "
+                      "be required: GS_SWAPKIT_API_KEY in the agent unit's "
+                      "EnvironmentFile)")
     except Exception as e:                                   # noqa: BLE001
         newnym(proxy_url=proxy_url)
         integrity_log("forward", f"quote_fail:{type(e).__name__}")
@@ -276,6 +287,16 @@ def validate_memo(memo, dest_xmr, op_return_limit):
         raise Refused("memo_unbound",
                       "the memo does not name this deposit's own XMR "
                       "destination; the swap would deliver to someone else")
+    # THE PLAIN FORM ONLY. memo_binds_destination also accepts a memo that
+    # binds once HEX-DECODED (an aggregator convention for a sender's
+    # OP_RETURN). This tool lays the OP_RETURN out itself, so embedding the
+    # hex TEXT would hand ThorChain a string of hex digits, not a memo, and
+    # the deposit would be refunded minus fees or stranded.
+    if not _memo_fields_bind(text, dest_xmr):
+        raise Refused("memo_hex",
+                      "the memo binds only when hex-decoded; this tool "
+                      "writes the OP_RETURN itself and will not embed a "
+                      "hex string as the memo")
     if memo_will_overflow(text, op_return_limit):
         raise Refused("memo_overflow",
                       f"the memo is {memo_bytes(text)} bytes and this box's "
@@ -285,6 +306,56 @@ def validate_memo(memo, dest_xmr, op_return_limit):
                       "--op-return-max-bytes ONLY for a node that will relay "
                       "it (see STAGE2_PLAN.md section 2)")
     return text.encode("utf-8")
+
+
+_LIMIT_RE = re.compile(r"^[0-9]+(?:[eE][0-9]+)?\Z")
+_BPS_RE = re.compile(r"^[0-9]{1,4}\Z")
+
+
+def validate_memo_terms(memo_text, worst_xmr, max_affiliate_bps):
+    """The memo's LIMIT and AFFILIATE FEE, the two fields the chain reads
+    that the aggregator's expectedBuyAmount says nothing about.
+
+        =:XMR.XMR:<dest>:<limit>/<interval>/<qty>:<affiliate>:<bps>
+
+    The limit is the only on-chain slippage protection a swap has -- the
+    minimum output, in 1e8 base units, under which ThorChain refunds
+    instead of executing. A zero or missing limit executes at ANY price.
+    It must be at least the worst-case arrival this tool already gates on
+    (less a 1% rounding margin). The affiliate fee, in basis points to a
+    THORName, is a skim of up to 10%; it is capped by policy, default 0.
+    Returns (limit_base_units, affiliate_bps)."""
+    parts = str(memo_text).strip().split(":")
+    lim_field = parts[3].strip() if len(parts) > 3 else ""
+    lim_text = lim_field.split("/")[0].strip()
+    if not lim_text or not _LIMIT_RE.match(lim_text):
+        raise Refused("memo_no_limit",
+                      "the memo carries no output limit, so the swap would "
+                      "execute at any price; refusing")
+    limit = int(Decimal(lim_text))
+    if limit <= 0:
+        raise Refused("memo_no_limit",
+                      "the memo's output limit is zero, so the swap would "
+                      "execute at any price; refusing")
+    floor = int(worst_xmr * Decimal(10 ** 8) * Decimal("0.99"))
+    if limit < floor:
+        raise Refused("memo_limit_low",
+                      "the memo's output limit is below the worst-case "
+                      "arrival this forward accepts; the chain would let "
+                      "the swap fill lower than the quote promised")
+    bps = 0
+    fee_field = parts[5].strip() if len(parts) > 5 else ""
+    if fee_field:
+        if not _BPS_RE.match(fee_field):
+            raise Refused("memo_affiliate_fee",
+                          "the memo's affiliate fee field is not a basis-"
+                          "point count")
+        bps = int(fee_field)
+    if bps > max_affiliate_bps:
+        raise Refused("memo_affiliate_fee",
+                      f"the memo carries an affiliate fee of {bps} basis "
+                      f"points, over the {max_affiliate_bps} this box allows")
+    return limit, bps
 
 
 def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
@@ -458,10 +529,24 @@ def build_cli():
                     metavar="HOST[:PORT][,PIN]", required=True,
                     help="Electrum server; repeatable")
     ap.add_argument("--network", default="main")
-    ap.add_argument("--xpub", required=True,
-                    help="the ACCOUNT xpub the Pi watches (public)")
-    ap.add_argument("--index", type=int, required=True,
-                    help="the deposit address's index under the xpub")
+    ap.add_argument("--xpub", default=None,
+                    help="the ACCOUNT xpub the Pi watches (public). Prefer "
+                         "GS_BTC_XPUB in the environment: the xpub is the "
+                         "generator of EVERY deposit address this host has "
+                         "minted, and /proc/<pid>/cmdline is world-readable.")
+    ap.add_argument("--index", type=int, default=None,
+                    help="the deposit address's index under the xpub. Prefer "
+                         "GS_BTC_INDEX in the environment, for the reason "
+                         "above.")
+    ap.add_argument("--max-affiliate-bps", type=int, default=0,
+                    help="the largest affiliate fee (basis points, to a "
+                         "THORName) a quoted memo may carry (default 0: none)")
+    ap.add_argument("--write-signed-hex", action="store_true",
+                    help="also write the SIGNED transaction into the plan "
+                         "file. Off by default in stage 2: a signed forward "
+                         "is a bearer instrument, and nothing consumes the "
+                         "file yet; the hex goes to stdout (the job log) "
+                         "instead.")
     ap.add_argument("--dest-from-receive-wallet", required=True,
                     metavar="BUNDLE",
                     help="the gs_receive_wallet_v1 bundle this deposit was "
@@ -498,9 +583,26 @@ def main(argv=None):
     if not args.dry_run:
         raise Refused("not_dry_run", "--dry-run is required: stage 2 builds "
                       "and signs and never broadcasts")
-    if args.index < 0 or args.min_conf < 1 or args.fee_target_blocks < 1:
+    # THE XPUB AND THE INDEX, from the environment by preference (the wake
+    # agent puts them there); argv still works for a hand run, with the
+    # warning env_or_argv prints. Neither present is a refusal.
+    xpub = env_or_argv("GS_BTC_XPUB", args.xpub, "the account xpub")
+    index = env_or_argv("GS_BTC_INDEX",
+                        None if args.index is None else str(args.index),
+                        "the deposit index")
+    if not xpub or index is None or index == "":
+        raise Refused("bad_args", "the account xpub and the deposit index "
+                      "are required (GS_BTC_XPUB / GS_BTC_INDEX, or --xpub "
+                      "/ --index)")
+    try:
+        index = int(str(index))
+    except ValueError:
+        raise Refused("bad_args", "the deposit index is not a whole number")
+    if index < 0 or args.min_conf < 1 or args.fee_target_blocks < 1:
         raise Refused("bad_args", "index, min-conf and fee target must be "
                       "sensible")
+    if not 0 <= args.max_affiliate_bps <= 1000:
+        raise Refused("bad_args", "--max-affiliate-bps must be 0..1000")
     if not 1 <= args.feerate_floor <= args.feerate_ceiling:
         raise Refused("bad_args", "the fee band must be 1 <= floor <= ceiling")
     if not 1 <= args.op_return_max_bytes <= btx.MAX_OP_RETURN_DATA:
@@ -515,7 +617,7 @@ def main(argv=None):
             raise Refused("bad_args", "--min-out-xmr is not a positive number")
     try:
         servers = [parse_server(s) for s in args.electrum]
-        address = derive_receive_address(args.xpub, args.index, args.network)
+        address = derive_receive_address(xpub, index, args.network)
     except watch.BtcWatchError as e:
         raise Refused("bad_args", str(e))
     try:
@@ -570,6 +672,8 @@ def main(argv=None):
     memo_b = validate_memo(memo, dest_xmr, args.op_return_max_bytes)
     expected_xmr, worst_xmr = validate_expected(
         expected, send_sat, min_out, args.max_slippage, oracle)
+    memo_limit, affiliate_bps = validate_memo_terms(
+        memo_b.decode("utf-8"), worst_xmr, args.max_affiliate_bps)
 
     # 4. THORNode's word on the inbound, when the operator named a node
     cross_checked = False
@@ -586,11 +690,11 @@ def main(argv=None):
     account = None
     if not args.plan_only:
         words, passphrase = take_seed()
-        account = account_for(words, passphrase, args.network, args.xpub)
+        account = account_for(words, passphrase, args.network, xpub)
         del words
     tx, txid, vsize, real_rate, signed = build_and_sign(
         chosen, picture["tip"], inbound_spk, send_sat, fee_sat, memo_b,
-        account, args.index, address, args.network, sign=not args.plan_only)
+        account, index, address, args.network, sign=not args.plan_only)
     if signed and real_rate < args.feerate_floor:
         raise Refused("fee_out_of_band", "the signed transaction's real "
                       "rate fell under the floor")
@@ -602,7 +706,7 @@ def main(argv=None):
         "dry_run": True,
         "broadcast": False,
         "signed": signed,
-        "index": args.index,
+        "index": index,
         "address": address,
         "inputs": [{"tx_hash": u["tx_hash"], "vout": u["vout"],
                     "value": u["value"], "confirmations": u["confirmations"]}
@@ -624,9 +728,17 @@ def main(argv=None):
         "feerate_real_sat_vb": real_rate,
         "expected_xmr": str(expected_xmr),
         "worst_case_xmr": str(worst_xmr),
+        "memo_limit_base_units": memo_limit,
+        "affiliate_bps": affiliate_bps,
         "dest_xmr": dest_xmr,
         "txid": txid,
-        "tx_hex": tx.serialize().hex(),
+        # THE SIGNED BYTES ARE NOT KEPT ON DISK UNLESS ASKED. Nothing in
+        # stage 2 consumes the plan, and a signed, RBF, valid-until-spent
+        # transaction is a bearer instrument for whoever copies the file.
+        # Unsigned (plan-only) bytes carry no such power and are kept.
+        "tx_hex": (tx.serialize().hex()
+                   if (not signed or args.write_signed_hex) else None),
+        "signed_hex_written": bool(signed and args.write_signed_hex),
         "server": picture.get("server"),
         "cert_sha256": picture.get("cert_sha256"),
         "ts": int(time.time()) // 600 * 600,
@@ -636,7 +748,7 @@ def main(argv=None):
     integrity_log("forward", "not_broadcast")
     print(f"  forward {'SIGNED' if signed else 'PLANNED (unsigned)'}, "
           f"NOT BROADCAST (dry run)")
-    print(f"  from {scrub_address(address)} index {args.index}: "
+    print(f"  from {scrub_address(address)} index {index}: "
           f"{settled_sat} sat in {n_inputs} spendable output(s)"
           f"{f', {skipped_dust} dust left' if skipped_dust else ''}"
           f"{f', {unsettled} not yet settled' if unsettled else ''}")
@@ -646,8 +758,14 @@ def main(argv=None):
           f"(bound {vsize_bound} vB"
           f"{f', real {vsize} vB at {real_rate} sat/vB' if signed else ''})")
     print(f"  memo {len(memo_b)} bytes (policy {args.op_return_max_bytes}); "
-          f"expected about {expected_xmr} XMR, worst case {worst_xmr}")
+          f"expected about {expected_xmr} XMR, worst case {worst_xmr}; "
+          f"chain limit {memo_limit} base units, affiliate {affiliate_bps} bps")
     print(f"  txid {txid}")
+    if signed and not args.write_signed_hex:
+        # To the job log, which the agent keeps at 0600 and truncates each
+        # boot; not to the plan file. See --write-signed-hex.
+        print(f"  signed hex (stage 2: NOT broadcast, not persisted): "
+              f"{tx.serialize().hex()}")
     print(f"  plan written: {args.outfile}")
     return EXIT_OK
 
