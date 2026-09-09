@@ -31,6 +31,25 @@ any real handle (stage 4 mints the addresses), so on a live box the job
 refuses `no_btc_deposit` until then; broadcast (stage 3); the relay
 strategy for the >80-byte memo (stage 3, see section 2).
 
+**A floor stage 4 must respect (found in review):** `FORWARD_MIN_SAT` is
+what must REACH ThorChain after the fee, and it equals the deposit wizard's
+`DEPOSIT_MIN_SAT` (10,000 sat) — so a deposit of exactly the wizard's
+minimum can never be forwarded (`send = settled − fee < 10,000`). The
+forwarder's refusal already names the number that must settle. Stage 4's
+deposit minimum must be `FORWARD_MIN_SAT` plus a fee allowance at the
+ceiling rate for a one-input transaction (about 202 vB × the ceiling), not
+the typo guard, and must be quoted to the client as such.
+
+**Input selection (added in review):** an output is spent only if it is
+settled to `min_conf` on its own AND worth more than twice its own input
+cost at the live rate. The first rule closes a real bug — a one-conf output
+under a two-conf policy was spent while not counted, and its whole value
+would have gone to the miner; the built transaction's fee is now required
+to equal the sized fee exactly (`fee_mismatch` otherwise). The second rule
+is the dust-storm defence: anyone can park two hundred 546-sat outputs on
+the address, and sweeping them would make the fee eat the deposit. Dust
+stays; the plan counts what was left.
+
 Stages 0 and 1 are done and green; this was the first one that touches a
 spend key.
 
