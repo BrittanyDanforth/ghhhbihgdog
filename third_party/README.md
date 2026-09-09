@@ -33,7 +33,12 @@ Vendored from the sdist's `src/embit/`, then THREE deliberate changes:
    back to embit's pure-Python `py_secp256k1`, and (c) **exposes which one is
    live** as `NATIVE` (bool) and `BACKEND` (`"libsecp256k1"` / `"python"` /
    `"micropython"`). Nothing in the package can load a library from inside
-   the package any more, because (1) removed the only in-package binaries.
+   the package any more: (1) removed the only in-package binaries, and
+   `util/ctypes_secp256k1.py`'s `_find_library` no longer looks there (nor at
+   a hand-installed `/usr/local/lib` path) -- only `ctypes.util.find_library`,
+   the dynamic linker's view of the system library. Deleting the blobs was
+   half the fix; a file dropped back into the tree would otherwise have been
+   loaded first. `tests/test_btc_embit.py` pins the loader's code to that.
 
 ### Why native is preferred, and where pure-Python is acceptable
 

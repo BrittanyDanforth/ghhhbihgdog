@@ -101,6 +101,16 @@ check("the selector never loads a library from inside the package: its code "
       "does not name prebuilt/", "prebuilt" not in _src_sel)
 check("...it tries the system ctypes binding BEFORE the pure-Python one",
       _src_sel.index("ctypes_secp256k1") < _src_sel.index("py_secp256k1"))
+# AND THE LOADER ITSELF. Deleting the blobs was half the fix: upstream's
+# _find_library looked for one INSIDE the package first, so a file dropped
+# into this tree would have become the curve that signs. The search is gone
+# too -- only the dynamic linker's view of the system library is consulted.
+_src_ld = code_only(str(_tp / "util" / "ctypes_secp256k1.py"))
+check("the ctypes loader searches nowhere inside the package and no "
+      "hand-installed path: only find_library (the system library)",
+      "prebuilt" not in _src_ld and "/usr/local" not in _src_ld
+      and "os.path.dirname(__file__)" not in _src_ld
+      and 'find_library("secp256k1")' in _src_ld)
 _has_os_lib = bool(__import__("ctypes.util").util.find_library("secp256k1"))
 if _has_os_lib:
     check("with the OS libsecp256k1 installed, the constant-time native "
