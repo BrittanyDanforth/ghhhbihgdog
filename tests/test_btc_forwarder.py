@@ -342,6 +342,61 @@ check("two settled outputs are both spent and both signed; the unconfirmed "
       and len(_plan["inputs"]) == 2 and _plan["settled_sat"] == 240000)
 check("...and the bound was sized for two inputs (larger than for one)",
       _plan["vsize_bound"] > run(Net())[2]["vsize_bound"])
+check("...the plan counts the unsettled output it left, and the fee the "
+      "transaction actually pays is EXACTLY the fee that was sized (no "
+      "input's value leaks to the miner)",
+      _plan["unsettled_outputs"] == 1 and _plan["skipped_dust"] == 0
+      and 150000 + 90000 - _tx.vout[0].value == _plan["fee_sat"])
+
+# A MINED BUT SHALLOW OUTPUT IS NOT AN INPUT. One confirmation under a
+# min-conf of two used to be spent while not counted: its whole value went
+# to the miner as fee. Found by review, fixed by selecting inputs by the
+# same per-output depth the settled sum uses, and pinned here.
+_net = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
+                   "confirmations": 5},
+                  {"tx_hash": _H2, "vout": 1, "value": 70000,
+                   "confirmations": 1}])
+_code, _out, _plan, _ = run(_net)
+_tx = Transaction.parse(bytes.fromhex(_plan["tx_hex"]))
+check("an output mined ONE block deep under min-conf 2 is neither counted "
+      "nor spent: one input, the fee is exactly the sized fee, and the "
+      "shallow output is reported as not yet settled",
+      _code == 0 and len(_tx.vin) == 1 and _tx.vin[0].txid.hex() == _H1
+      and 200000 - _tx.vout[0].value == _plan["fee_sat"]
+      and _plan["unsettled_outputs"] == 1 and _plan["settled_sat"] == 200000)
+check("...and with --min-conf 1 the same output IS spent",
+      len(Transaction.parse(bytes.fromhex(
+          run(Net(utxos=_net.utxos), "--min-conf", "1")[2]["tx_hex"])).vin)
+      == 2)
+
+# DUST STORM. Two hundred 546-sat outputs parked on the address (anyone can
+# send them) would, swept, make the fee eat the deposit and strand the real
+# payment. Dust is left where it lies.
+_storm = [{"tx_hash": ("%064x" % i), "vout": 0, "value": 546,
+           "confirmations": 9} for i in range(1, 201)]
+_net = Net(utxos=_storm + [{"tx_hash": _H1, "vout": 0, "value": 300000,
+                            "confirmations": 9}])
+_code, _out, _plan, _ = run(_net)
+_tx = Transaction.parse(bytes.fromhex(_plan["tx_hex"]))
+check("two hundred dust outputs beside a real deposit: the forward spends "
+      "the deposit alone, leaves the dust, and says so",
+      _code == 0 and len(_tx.vin) == 1 and _tx.vin[0].txid.hex() == _H1
+      and _plan["skipped_dust"] == 200 and "200 dust left" in _out
+      and _plan["settled_sat"] == 300000)
+check("...an output is dust when it is worth no more than twice its own "
+      "input cost at this rate (69 vB * 10 sat/vB * 2 = 1380): 1380 is left, "
+      "1381 is spent",
+      run(Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
+                      "confirmations": 5},
+                     {"tx_hash": _H2, "vout": 0, "value": 1380,
+                      "confirmations": 5}]))[2]["skipped_dust"] == 1
+      and run(Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
+                          "confirmations": 5},
+                         {"tx_hash": _H2, "vout": 0, "value": 1381,
+                          "confirmations": 5}]))[2]["skipped_dust"] == 0)
+check("an address holding only dust is refused nothing_economic, nothing "
+      "signed", _refusal(Net(utxos=_storm))[3] == "nothing_economic"
+      and _refusal(Net(utxos=_storm))[2] is None)
 _code, _out, _plan, _ = run(Net(), "--plan-only", seed=None)
 check("--plan-only needs no seed, writes an UNSIGNED transaction, signed "
       "false, and still no broadcast",

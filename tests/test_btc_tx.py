@@ -329,10 +329,26 @@ for _label, _bad_in, _bad_out in [
 ]:
     check(f"build_unsigned refuses {_label}",
           _refused(T.build_unsigned, _bad_in, _bad_out))
-check("build_unsigned refuses a locktime out of range",
+check("build_unsigned refuses a locktime that is not a block height: "
+      "negative, or at/above 500,000,000 (which Bitcoin reads as a date)",
       _refused(T.build_unsigned, _inputs, [(1, _inbound)], locktime=-1)
       and _refused(T.build_unsigned, _inputs, [(1, _inbound)],
-                   locktime=2 ** 32))
+                   locktime=500_000_000)
+      and T.build_unsigned(_inputs, [(1, _inbound)],
+                           locktime=499_999_999).locktime == 499_999_999)
+check("build_unsigned refuses a second OP_RETURN (valid, unrelayable)",
+      _refused(T.build_unsigned, _inputs, [(1, _inbound), (0, _memo_spk),
+                                           (0, _memo_spk)]))
+check("build_unsigned refuses wire-width overflows: vout above 2^32-1, an "
+      "input or an input sum above the money supply",
+      _refused(T.build_unsigned, [{"tx_hash": _H1, "vout": 2 ** 32,
+                                   "value": 5}], [(1, _inbound)])
+      and _refused(T.build_unsigned, [{"tx_hash": _H1, "vout": 0,
+                                       "value": T.MAX_MONEY + 1}],
+                   [(1, _inbound)])
+      and _refused(T.build_unsigned,
+                   [{"tx_hash": _H1, "vout": 0, "value": T.MAX_MONEY},
+                    {"tx_hash": _H2, "vout": 0, "value": 1}], [(1, _inbound)]))
 check("build_unsigned passes FRESH lists to embit (the mutable-default "
       "landmine): two builds do not share inputs",
       len(T.build_unsigned([_inputs[0]], [(1, _inbound)]).vin) == 1
@@ -369,6 +385,14 @@ check("...and restoring it restores verification (the cache was cleared, "
       "so this is a real re-derivation)",
       T.verify_signed(_stx, [300000, 250000],
                       [_k1.get_public_key(), _k2.get_public_key()]))
+check("verify_signed is independent of the signer's sighash cache: an "
+      "output tampered with AFTER signing fails verification even when the "
+      "caller never clears the cache (the signer's memo would have passed it)",
+      (lambda: (setattr(_stx.vout[0], "value", _send - 7),
+                not T.verify_signed(_stx, [300000, 250000],
+                                    [_k1.get_public_key(),
+                                     _k2.get_public_key()]))[1])())
+_stx.vout[0].value = _send
 check("verify_signed with the WRONG public key fails",
       not T.verify_signed(_stx, [300000, 250000],
                           [_k1.get_public_key(),
