@@ -168,8 +168,13 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
    that reports "seen / confirmed" against a mock and a testnet server. No keys,
    no money.
 2. **`forward_to_swap` job**, `--dry-run` first: build the BTC tx (inputs from
-   the derived address, OP_RETURN memo, change), sign with the seed, but print
-   rather than broadcast. Tested against testnet.
+   the derived address, OP_RETURN memo, no change -- the whole deposit is
+   forwarded), sign with the seed, but print rather than broadcast. DONE in
+   dry-run form (`STAGE2_PLAN.md` is its record); the testnet run belongs to
+   stage 3, where a broadcast exists to test. What stage 2 established: every
+   real swap memo (105+ bytes) is over the standard 80-byte OP_RETURN, so the
+   forwarder REFUSES on a default policy and stage 3 must choose the relay
+   strategy before mainnet.
 3. **Broadcast over Tor**, testnet end-to-end: a real testnet BTC → testnet
    ThorChain (or a stubbed inbound) → confirm the swap starts.
 4. **Deposit UX**: unique address, auto-received, per-owner balance; the note

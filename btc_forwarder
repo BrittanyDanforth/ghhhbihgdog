@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""Forward a client's settled BTC deposit into the ThorChain swap. DRY RUN.
+
+STAGE 2 of the BTC-intake rework (STAGE2_PLAN.md). This is the vault-side
+tool the `forward_to_swap` job runs. It takes ONE deposit address the Pi
+has been watching, every settled output on it, and builds and signs the
+transaction that pays ThorChain's current inbound vault with the swap memo
+in an OP_RETURN -- then PRINTS it and writes it to a 0600 file. It does not
+broadcast. There is no broadcast code in this file, no flag to enable one,
+and the Electrum client it uses knows no method that could. Stage 3 adds
+the broadcast as a separate, gated step.
+
+What it does, in order, and what it refuses at each step:
+
+  1. Derives the deposit address from the account xpub and the index -- the
+     same public derivation the Pi does -- and asks an Electrum server over
+     Tor what settled money sits there, plus a fee estimate, in ONE session
+     on the address's own circuit. Refuses when nothing is settled.
+  2. Sizes the fee against the LARGEST transaction the policy allows (the
+     memo is not known yet: the quote needs the amount, the amount needs
+     the fee, the fee needs the memo). The real transaction is never larger,
+     so the real fee-rate is never under the target. Refuses a fee estimate
+     the server does not have, or one outside the operator's band.
+  3. Asks SwapKit for a quote for EXACTLY the amount that will be sent, to
+     the XMR subaddress this deposit was minted for. The quote returns the
+     inbound vault address, the memo already bound to that destination, and
+     the expected Monero. Refuses a memo that does not name our destination,
+     a memo that will not fit the OP_RETURN policy, an inbound address that
+     is not this network's, a quote whose worst-case arrival is under the
+     mix floor, and a quote that deviates from the price oracle.
+  4. Optionally cross-checks the inbound address against THORNode's own
+     inbound_addresses over a second circuit, and refuses if the chain is
+     halted or the addresses differ: a compromised aggregator naming its
+     own address is the failure this catches.
+  5. Builds the transaction (inputs = the settled outputs, out0 = inbound,
+     out1 = OP_RETURN; no change -- the whole deposit is forwarded and the
+     sizing slack goes to the miner rather than to a change output that
+     would chain forwards together on-chain).
+  6. Takes the seed from the ENVIRONMENT (GS_BTC_SEED, a BIP39 mnemonic --
+     never argv, never a file this tool reads), proves it derives the very
+     account xpub the Pi watches, proves the key it derives IS the deposit
+     address, refuses to sign unless the constant-time system libsecp256k1
+     is the live backend, signs, verifies every signature, measures the
+     real size and rate.
+  7. Writes the plan -- inputs, outputs, memo, fee, rate, txid, the signed
+     hex -- to the outfile, 0600, with `broadcast: false`, and prints a
+     summary. The hex and the memo reach the job log and the file, never
+     the hash chain, never a reply to the phone.
+
+THE MEMO DOES NOT FIT A STANDARD OP_RETURN, and this tool says so rather
+than hoping. A Monero subaddress is 95 characters; the shortest swap memo
+is 105 bytes; the standard relay limit is 80. --op-return-max-bytes is the
+operator's relay policy (a node run with a raised datacarrier limit can
+carry more) and defaults to the standard 80, so on a default configuration
+every real forward is REFUSED at step 3 with the byte count. That is the
+honest outcome of a dry-run stage: the constraint is measured, not
+theoretical, and the relay strategy is stage 3's decision.
+
+What never reaches the hash chain: an address, an amount, a fee, a rate, a
+txid, a memo, an index, a token. Event kinds only, and the per-output loop
+logs nothing at all. What never reaches argv: the seed, the destination,
+the amount. What never reaches this file's output: the seed.
+
+--dry-run is REQUIRED. There is no other mode in stage 2, and the flag is
+required so that a future broadcast mode cannot be reached by omission.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "third_party"))
+
+from gs_common import (                                      # noqa: E402
+    SWAPKIT_API, atomic_write_json, bech32_checksum_ok, btc_per_xmr_oracle,
+    decimal_arg, finite_decimal, fmt_btc, install_signal_handlers,
+    instruction_field_safe, integrity_log, isolated_proxy,
+    load_receive_bundle, memo_binds_destination, memo_bytes,
+    memo_will_overflow, newnym, parse_swap_route, quote_deviation, safe_get,
+    safe_post, scrub_address, shutdown_requested, validate_proxy, verify_tor,
+    OP_RETURN_STD_BYTES,
+)
+import gs_btc_tx as btx                                      # noqa: E402
+import gs_btc_watch as watch                                 # noqa: E402
+from gs_btc_watch import derive_receive_address, look, parse_server  # noqa
+
+#: The forward's floor, in satoshis, on what reaches ThorChain AFTER the
+#: fee. It equals gs_wake_proto.DEPOSIT_MIN_SAT (10,000 sat, 0.0001 BTC),
+#: and that figure is not a coincidence: ThorChain's BTC dust threshold is
+#: 10,000 sat -- an inbound below it is ignored, not swapped, and the money
+#: is gone. tests/test_btc_forwarder.py pins the two constants together.
+FORWARD_MIN_SAT = 10_000
+#: A fee larger than this fraction of the settled deposit is refused: at
+#: that point the forward is paying the miner more than a fifth of the
+#: client's money, and the right answer is to wait for cheaper blocks, not
+#: to burn it.
+MAX_FEE_FRACTION = Decimal("0.20")
+#: The slippage the arrival watcher accepts, mirrored from
+#: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
+ARRIVAL_TOLERANCE = Decimal("0.10")
+#: The most bytes a scriptPubKey ThorChain could give us has: P2WSH or P2TR
+#: (1 + 1 + 32). The bound used before the quote is known.
+INBOUND_SPK_MAX = 34
+#: Version of the plan file this writes.
+PLAN_SCHEMA = "gs_btc_forward_v1"
+#: The environment variable that carries the seed, and its optional
+#: passphrase. Never argv: /proc/<pid>/cmdline is 0444.
+SEED_ENV = "GS_BTC_SEED"
+SEED_PASSPHRASE_ENV = "GS_BTC_SEED_PASSPHRASE"
+
+#: The ThorChain chain identifier of Bitcoin in inbound_addresses.
+_THOR_BTC_CHAIN = "BTC"
+
+#: Exit codes. The wake agent treats any non-zero as a failed job; the
+#: distinction matters on an operator's terminal and in a test.
+EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
+
+
+class Refused(SystemExit):
+    """A refusal: nothing was signed. The kind goes to the chain, the
+    message to the terminal (and so to the job log), never the reverse."""
+
+    def __init__(self, kind, message):
+        integrity_log("forward", f"refused:{kind}")
+        print(f"[!] refused ({kind}): {message}")
+        super().__init__(EXIT_REFUSED)
+
+
+# --- the pieces, each a function so tests can drive them alone --------------
+
+def sat_to_btc_text(sat):
+    """Satoshis -> the BTC text SwapKit is sent, fixed notation (fmt_btc:
+    str(Decimal) would emit 3E-8 for a small amount)."""
+    return fmt_btc(Decimal(int(sat)) / Decimal(10 ** 8))
+
+
+def fee_band(rate, floor, ceiling):
+    """The fee rate, or a refusal when it is outside the operator's band.
+    Outside is REFUSED, not clamped: a server saying 5000 sat/vB is broken
+    or hostile, and silently paying the ceiling instead would still be a
+    decision made for money on a number nobody trusts."""
+    if rate is None:
+        raise Refused("no_fee_estimate",
+                      "the server has no fee estimate for that target; "
+                      "give --feerate-sat-vb explicitly or try later")
+    if not isinstance(rate, int) or isinstance(rate, bool) or rate < 1:
+        raise Refused("bad_fee_estimate", "the fee estimate is not a "
+                      "positive whole number of sat/vB")
+    if rate < floor or rate > ceiling:
+        raise Refused("fee_out_of_band",
+                      f"the fee estimate is outside the {floor}-{ceiling} "
+                      "sat/vB band this box accepts; widen the band only if "
+                      "the network really is there")
+    return rate
+
+
+def size_the_fee(n_inputs, op_return_limit, rate):
+    """(vsize_upper_bound, fee_sat) for a transaction of `n_inputs` P2WPKH
+    inputs, the largest inbound output and the largest OP_RETURN the policy
+    allows, at `rate` sat/vB."""
+    bound = btx.vsize_upper_bound(
+        n_inputs, [INBOUND_SPK_MAX, btx.op_return_script_len(op_return_limit)])
+    return bound, btx.fee_for(bound, rate)
+
+
+def amount_to_send(settled_sat, fee_sat, min_send_sat):
+    """What reaches ThorChain: everything settled minus the fee, or a
+    refusal that names the number needed."""
+    if fee_sat > settled_sat * MAX_FEE_FRACTION:
+        raise Refused("fee_eats_deposit",
+                      "the network fee would take more than "
+                      f"{int(MAX_FEE_FRACTION * 100)}% of what settled; wait "
+                      "for cheaper blocks rather than burn the deposit")
+    send = settled_sat - fee_sat
+    if send < min_send_sat:
+        raise Refused("below_minimum",
+                      f"after the fee this forward would carry {send} sat "
+                      f"and the smallest forward that ThorChain does not "
+                      f"treat as dust is {min_send_sat} sat; at least "
+                      f"{min_send_sat + fee_sat} sat must settle first")
+    return send
+
+
+def quote_payload(send_sat, dest_xmr):
+    """The SwapKit v3 quote request, pinned to THORCHAIN, for EXACTLY the
+    amount that will be sent -- the memo's own limit is derived from it."""
+    return {
+        "sellAsset": "BTC.BTC",
+        "buyAsset": "XMR.XMR",
+        "sellAmount": sat_to_btc_text(send_sat),
+        "destinationAddress": dest_xmr,
+        "providers": ["THORCHAIN"],
+        "slippage": int(ARRIVAL_TOLERANCE * 100),
+    }
+
+
+def fetch_quote(send_sat, dest_xmr, proxy_url):
+    """(inbound, memo, expected_xmr) from a fresh SwapKit quote on its own
+    circuit. Every field is validated by validate_quote; this only fetches."""
+    proxies = isolated_proxy(proxy_url, "forward:quote")
+    try:
+        resp = safe_post(f"{SWAPKIT_API}/v3/quote",
+                         quote_payload(send_sat, dest_xmr), proxies)
+    except Exception as e:                                   # noqa: BLE001
+        newnym(proxy_url=proxy_url)
+        integrity_log("forward", f"quote_fail:{type(e).__name__}")
+        raise Refused("quote_failed",
+                      f"the quote could not be fetched ({type(e).__name__})")
+    routes = resp.get("routes", []) if isinstance(resp, dict) else []
+    if not routes or not isinstance(routes[0], dict):
+        raise Refused("no_route", "the aggregator returned no swap route")
+    inbound, memo, expected = parse_swap_route(routes[0])
+    return inbound, memo, expected
+
+
+def validate_inbound(inbound, network):
+    """The inbound vault address must be a native-segwit address of THIS
+    network with a valid checksum. Returns its scriptPubKey."""
+    net = btx.network_of(network)
+    text = str(inbound or "")
+    if not text or not instruction_field_safe(text):
+        raise Refused("bad_inbound", "the inbound address is empty or "
+                      "carries control characters")
+    if not text.lower().startswith(net["bech32"] + "1"):
+        raise Refused("inbound_wrong_network",
+                      f"the inbound address is not a {net['name']} "
+                      "native-segwit address")
+    if not bech32_checksum_ok(text):
+        raise Refused("bad_inbound", "the inbound address fails its "
+                      "checksum")
+    try:
+        return btx.address_script(text, network)
+    except btx.BtcTxError as e:
+        raise Refused("bad_inbound", str(e))
+
+
+def validate_memo(memo, dest_xmr, op_return_limit):
+    """The memo must be printable, must name OUR destination, and must fit
+    the operator's OP_RETURN policy. Returns the memo's bytes."""
+    text = str(memo or "")
+    if not text:
+        raise Refused("no_memo", "the quote carried no memo; ThorChain "
+                      "routes on it and a payment without it is lost")
+    if not instruction_field_safe(text):
+        raise Refused("bad_memo", "the memo carries control characters")
+    if not memo_binds_destination(text, dest_xmr):
+        raise Refused("memo_unbound",
+                      "the memo does not name this deposit's own XMR "
+                      "destination; the swap would deliver to someone else")
+    if memo_will_overflow(text, op_return_limit):
+        raise Refused("memo_overflow",
+                      f"the memo is {memo_bytes(text)} bytes and this box's "
+                      f"OP_RETURN policy is {op_return_limit}; a Monero "
+                      "address alone is 95 characters, so no swap memo fits "
+                      f"the standard {OP_RETURN_STD_BYTES}. Raise "
+                      "--op-return-max-bytes ONLY for a node that will relay "
+                      "it (see STAGE2_PLAN.md section 2)")
+    return text.encode("utf-8")
+
+
+def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
+                      oracle_rate):
+    """The quote's Monero: positive, clears the mix floor at the WORST
+    arrival the watcher accepts, and sits within `max_slippage` of the
+    oracle when an oracle is available. Returns (expected, worst_case)."""
+    exp = finite_decimal(expected)
+    if exp is None or exp <= 0:
+        raise Refused("expected_unreadable",
+                      "the quote's expected Monero is missing or not a "
+                      "positive number (a route field name may have changed)")
+    worst = (exp * (1 - ARRIVAL_TOLERANCE)).quantize(Decimal("0.000001"))
+    if min_out_xmr is not None and worst < min_out_xmr:
+        needed = (min_out_xmr / (1 - ARRIVAL_TOLERANCE)).quantize(
+            Decimal("0.000001"))
+        raise Refused("below_mix_minimum",
+                      f"this swap would deliver about {exp} XMR and after "
+                      f"the {int(ARRIVAL_TOLERANCE * 100)}% slippage the "
+                      f"watcher accepts as little as {worst} XMR could land, "
+                      f"under the {min_out_xmr} XMR mix floor; a quote of at "
+                      f"least {needed} XMR is needed")
+    if oracle_rate is None:
+        integrity_log("forward", "oracle_unavailable")
+        print("  [!] no price oracle reachable: the quote is NOT cross-checked")
+    else:
+        dev = quote_deviation(exp, Decimal(send_sat) / Decimal(10 ** 8),
+                              oracle_rate)
+        if dev is None:
+            integrity_log("forward", "oracle_unusable")
+            print("  [!] the oracle's answer could not be compared to the quote")
+        elif dev > max_slippage:
+            raise Refused("quote_deviates",
+                          f"the quote sits {dev * 100:.1f}% from the price "
+                          f"oracle, over the {max_slippage * 100:.0f}% this "
+                          "box accepts")
+        elif dev > Decimal("0.05"):
+            print(f"  [!] the quote sits {dev * 100:.1f}% from the oracle")
+    return exp, worst
+
+
+def cross_check_inbound(inbound, thornode_url, proxy_url):
+    """THORNode's own inbound_addresses, on a second circuit: the BTC
+    entry must exist, must not be halted, and must name the SAME address
+    the aggregator gave us. Returns the entry's dust threshold in sat, or
+    None when it did not carry one."""
+    proxies = isolated_proxy(proxy_url, "forward:inbound")
+    try:
+        entries = safe_get(f"{thornode_url.rstrip('/')}/thorchain/"
+                           "inbound_addresses", proxies)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("forward", f"inbound_fetch_fail:{type(e).__name__}")
+        raise Refused("inbound_unverified",
+                      f"THORNode's inbound list could not be fetched "
+                      f"({type(e).__name__}); refusing to pay an address "
+                      "only the aggregator vouched for")
+    if not isinstance(entries, list):
+        raise Refused("inbound_unverified", "THORNode's inbound list is not "
+                      "a list")
+    btc = [e for e in entries if isinstance(e, dict)
+           and e.get("chain") == _THOR_BTC_CHAIN]
+    if len(btc) != 1:
+        raise Refused("inbound_unverified", "THORNode lists no single BTC "
+                      "inbound")
+    entry = btc[0]
+    if any(entry.get(k) for k in ("halted", "chain_trading_paused",
+                                   "global_trading_paused",
+                                   "chain_lp_actions_paused")):
+        raise Refused("chain_halted", "ThorChain reports BTC trading halted "
+                      "or paused; a payment now would sit unswapped")
+    if str(entry.get("address") or "").lower() != str(inbound).lower():
+        raise Refused("inbound_mismatch",
+                      "the aggregator's inbound address is NOT the one "
+                      "THORNode publishes; refusing to pay it")
+    dust = finite_decimal(entry.get("dust_threshold"))
+    return int(dust) if dust is not None and dust > 0 else None
+
+
+def take_seed():
+    """The mnemonic from the environment, and nothing from anywhere else.
+    Removed from this process's environment once read so it is not
+    inherited by anything this tool might start (it starts nothing; the
+    removal is a habit worth keeping)."""
+    if SEED_ENV not in os.environ:
+        raise Refused("seed_missing",
+                      f"{SEED_ENV} is not in the environment; the seed is "
+                      "never taken from argv or a file")
+    words = os.environ.pop(SEED_ENV)
+    passphrase = os.environ.pop(SEED_PASSPHRASE_ENV, "")
+    if not words.strip():
+        raise Refused("seed_missing", f"{SEED_ENV} is empty")
+    return words, passphrase
+
+
+def account_for(words, passphrase, network, account_xpub):
+    """The private account key, proven to be the xpub the Pi watches."""
+    try:
+        account = btx.account_from_mnemonic(words, network, passphrase)
+    except btx.BtcTxError as e:
+        raise Refused("seed_invalid", str(e))
+    if not btx.account_matches_xpub(account, account_xpub):
+        raise Refused("seed_xpub_mismatch",
+                      "the seed does not derive the account xpub this "
+                      "deposit was watched under; a wrong seed would sign "
+                      "for addresses nobody paid")
+    return account
+
+
+def build_and_sign(picture, inbound_spk, send_sat, memo_b, account, index,
+                   address, network, sign):
+    """The transaction, unsigned when `sign` is False. Returns (tx, txid,
+    vsize, real_rate, signed)."""
+    settled = [u for u in picture["utxos"] if u["confirmations"] > 0
+               and u["value"] > 0]
+    inputs = [{"tx_hash": u["tx_hash"], "vout": u["vout"],
+               "value": u["value"]} for u in settled]
+    values = [u["value"] for u in settled]
+    tx = btx.build_unsigned(
+        inputs, [(send_sat, inbound_spk), (0, btx.op_return_script(memo_b))],
+        locktime=int(picture["tip"]))
+    if not sign:
+        return tx, btx.txid_hex(tx), None, None, False
+    try:
+        btx.require_native()
+    except btx.BtcTxError as e:
+        raise Refused("backend_refused", str(e))
+    key = btx.key_for(account, 0, index)
+    pub = key.get_public_key()
+    derived = btx.p2wpkh_script(pub).address(btx.network_of(network))
+    if derived != address:
+        raise Refused("key_address_mismatch",
+                      "the key at this index does not derive the address "
+                      "being spent; refusing to sign for money that is not "
+                      "at this key")
+    try:
+        btx.sign_p2wpkh(tx, values, [key] * len(values))
+    except btx.BtcTxError as e:
+        raise Refused("sign_failed", str(e))
+    if not btx.verify_signed(tx, values, [pub] * len(values)):
+        raise Refused("sign_failed", "a signature did not verify on "
+                      "re-derivation")
+    vsize = btx.measure(tx)[0]
+    fee = btx.fee_of(tx, values)
+    return tx, btx.txid_hex(tx), vsize, fee // vsize, True
+
+
+def write_plan(path, plan):
+    """The plan file, 0600, atomically; nothing else writes here."""
+    atomic_write_json(plan, Path(path))
+
+
+def build_cli():
+    ap = argparse.ArgumentParser(
+        description="Forward a settled BTC deposit into the ThorChain swap. "
+                    "DRY RUN ONLY in stage 2: builds, signs, prints, never "
+                    "broadcasts.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="REQUIRED. Stage 2 has no other mode; the flag is "
+                         "required so a future broadcast mode cannot be "
+                         "reached by omission.")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="stop before signing: no seed needed. The plan "
+                         "file carries the unsigned transaction.")
+    ap.add_argument("--tor-proxy", required=True, help="socks5h:// proxy")
+    ap.add_argument("--electrum", action="append", default=[],
+                    metavar="HOST[:PORT][,PIN]", required=True,
+                    help="Electrum server; repeatable")
+    ap.add_argument("--network", default="main")
+    ap.add_argument("--xpub", required=True,
+                    help="the ACCOUNT xpub the Pi watches (public)")
+    ap.add_argument("--index", type=int, required=True,
+                    help="the deposit address's index under the xpub")
+    ap.add_argument("--dest-from-receive-wallet", required=True,
+                    metavar="BUNDLE",
+                    help="the gs_receive_wallet_v1 bundle this deposit was "
+                         "minted for: its XMR subaddress is the swap's "
+                         "destination")
+    ap.add_argument("--min-conf", type=int, default=2)
+    ap.add_argument("--fee-target-blocks", type=int, default=3)
+    ap.add_argument("--feerate-sat-vb", type=int, default=None,
+                    help="use this rate instead of the server's estimate "
+                         "(still subject to the band)")
+    ap.add_argument("--feerate-floor", type=int, default=1)
+    ap.add_argument("--feerate-ceiling", type=int, default=200)
+    ap.add_argument("--op-return-max-bytes", type=int,
+                    default=OP_RETURN_STD_BYTES,
+                    help="this box's OP_RETURN relay policy in data bytes "
+                         f"(default {OP_RETURN_STD_BYTES}, the standard)")
+    ap.add_argument("--min-send-sat", type=int, default=FORWARD_MIN_SAT)
+    ap.add_argument("--min-out-xmr", default="", metavar="XMR",
+                    help="refuse a quote whose worst-case arrival is under "
+                         "this (the mix floor); absent means no gate")
+    ap.add_argument("--max-slippage", type=decimal_arg,
+                    default=Decimal("0.25"))
+    ap.add_argument("--thornode", default="",
+                    help="THORNode base URL to cross-check the inbound "
+                         "address and halt status against, over Tor")
+    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--outfile", required=True)
+    return ap
+
+
+def main(argv=None):
+    install_signal_handlers()
+    args = build_cli().parse_args(argv)
+    if not args.dry_run:
+        raise Refused("not_dry_run", "--dry-run is required: stage 2 builds "
+                      "and signs and never broadcasts")
+    if args.index < 0 or args.min_conf < 1 or args.fee_target_blocks < 1:
+        raise Refused("bad_args", "index, min-conf and fee target must be "
+                      "sensible")
+    if not 1 <= args.feerate_floor <= args.feerate_ceiling:
+        raise Refused("bad_args", "the fee band must be 1 <= floor <= ceiling")
+    if not 1 <= args.op_return_max_bytes <= btx.MAX_OP_RETURN_DATA:
+        raise Refused("bad_args", "--op-return-max-bytes must be 1..255")
+    if args.min_send_sat < FORWARD_MIN_SAT:
+        raise Refused("bad_args", f"--min-send-sat cannot be under "
+                      f"{FORWARD_MIN_SAT} (ThorChain's BTC dust threshold)")
+    min_out = None
+    if args.min_out_xmr:
+        min_out = finite_decimal(args.min_out_xmr)
+        if min_out is None or min_out <= 0:
+            raise Refused("bad_args", "--min-out-xmr is not a positive number")
+    try:
+        servers = [parse_server(s) for s in args.electrum]
+        address = derive_receive_address(args.xpub, args.index, args.network)
+    except watch.BtcWatchError as e:
+        raise Refused("bad_args", str(e))
+    try:
+        dest_xmr = load_receive_bundle(args.dest_from_receive_wallet)["address"]
+    except (ValueError, OSError) as e:
+        raise Refused("bad_bundle", f"{type(e).__name__}: {e}")
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
+    integrity_log("forward", "start")
+
+    # 1. what settled, and the server's fee estimate, in one session
+    try:
+        picture = look(address, servers, args.tor_proxy, min_conf=args.min_conf,
+                       network=args.network, timeout=args.timeout,
+                       fee_blocks=None if args.feerate_sat_vb else
+                       args.fee_target_blocks)
+    except watch.PinMismatch as e:
+        raise Refused("pin_mismatch", str(e))
+    except watch.BtcWatchError as e:
+        integrity_log("forward", "look_failed")
+        print(f"[!] could not look at the deposit address: {e}")
+        raise SystemExit(EXIT_FAILED)
+    if shutdown_requested():
+        raise SystemExit(EXIT_FAILED)
+    settled_sat = picture["settled_sat"]
+    n_inputs = sum(1 for u in picture["utxos"] if u["confirmations"] > 0)
+    if settled_sat <= 0 or n_inputs == 0:
+        raise Refused("nothing_settled",
+                      f"nothing is settled at this address to {args.min_conf} "
+                      "confirmations; ask again later")
+
+    # 2. the fee, sized against the largest transaction the policy allows
+    rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
+                    args.feerate_floor, args.feerate_ceiling)
+    vsize_bound, fee_sat = size_the_fee(n_inputs, args.op_return_max_bytes,
+                                        rate)
+    send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
+
+    # 3. the quote, for exactly that amount, to exactly this destination
+    oracle = btc_per_xmr_oracle(isolated_proxy(args.tor_proxy,
+                                               "forward:oracle"),
+                                getter=safe_get)
+    inbound, memo, expected = fetch_quote(send_sat, dest_xmr, args.tor_proxy)
+    inbound_spk = validate_inbound(inbound, args.network)
+    memo_b = validate_memo(memo, dest_xmr, args.op_return_max_bytes)
+    expected_xmr, worst_xmr = validate_expected(
+        expected, send_sat, min_out, args.max_slippage, oracle)
+
+    # 4. THORNode's word on the inbound, when the operator named a node
+    cross_checked = False
+    if args.thornode:
+        dust = cross_check_inbound(inbound, args.thornode, args.tor_proxy)
+        cross_checked = True
+        if dust is not None and send_sat < dust:
+            raise Refused("below_thor_dust",
+                          "ThorChain's live dust threshold is above what "
+                          "this forward would carry; it would be ignored")
+    integrity_log("forward", "quoted")
+
+    # 5-6. build, and sign unless plan-only
+    account = None
+    if not args.plan_only:
+        words, passphrase = take_seed()
+        account = account_for(words, passphrase, args.network, args.xpub)
+        del words
+    tx, txid, vsize, real_rate, signed = build_and_sign(
+        picture, inbound_spk, send_sat, memo_b, account, args.index, address,
+        args.network, sign=not args.plan_only)
+    if signed and real_rate < args.feerate_floor:
+        raise Refused("fee_out_of_band", "the signed transaction's real "
+                      "rate fell under the floor")
+
+    # 7. the plan file and the summary; NOT a broadcast
+    plan = {
+        "schema": PLAN_SCHEMA,
+        "network": args.network,
+        "dry_run": True,
+        "broadcast": False,
+        "signed": signed,
+        "index": args.index,
+        "address": address,
+        "inputs": [{"tx_hash": u["tx_hash"], "vout": u["vout"],
+                    "value": u["value"], "confirmations": u["confirmations"]}
+                   for u in picture["utxos"] if u["confirmations"] > 0],
+        "tip": picture["tip"],
+        "inbound": inbound,
+        "inbound_cross_checked": cross_checked,
+        "memo": memo,
+        "memo_bytes": len(memo_b),
+        "op_return_max_bytes": args.op_return_max_bytes,
+        "settled_sat": settled_sat,
+        "send_sat": send_sat,
+        "fee_sat": fee_sat,
+        "feerate_target_sat_vb": rate,
+        "vsize_bound": vsize_bound,
+        "vsize": vsize,
+        "feerate_real_sat_vb": real_rate,
+        "expected_xmr": str(expected_xmr),
+        "worst_case_xmr": str(worst_xmr),
+        "dest_xmr": dest_xmr,
+        "txid": txid,
+        "tx_hex": tx.serialize().hex(),
+        "server": picture.get("server"),
+        "cert_sha256": picture.get("cert_sha256"),
+        "ts": int(time.time()) // 600 * 600,
+    }
+    write_plan(args.outfile, plan)
+    integrity_log("forward", "signed" if signed else "planned")
+    integrity_log("forward", "not_broadcast")
+    print(f"  forward {'SIGNED' if signed else 'PLANNED (unsigned)'}, "
+          f"NOT BROADCAST (dry run)")
+    print(f"  from {scrub_address(address)} index {args.index}: "
+          f"{settled_sat} sat settled in {n_inputs} output(s)")
+    print(f"  to   {scrub_address(inbound)}"
+          f"{' (THORNode-verified)' if cross_checked else ''}: "
+          f"{send_sat} sat, fee {fee_sat} sat at {rate} sat/vB "
+          f"(bound {vsize_bound} vB"
+          f"{f', real {vsize} vB at {real_rate} sat/vB' if signed else ''})")
+    print(f"  memo {len(memo_b)} bytes (policy {args.op_return_max_bytes}); "
+          f"expected about {expected_xmr} XMR, worst case {worst_xmr}")
+    print(f"  txid {txid}")
+    print(f"  plan written: {args.outfile}")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

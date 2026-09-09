@@ -219,6 +219,80 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### Stage 2: `forward_to_swap` — build and sign the forward, print it, spend nothing (`STAGE2_PLAN.md`)
+Planned first (`030adbb`, the plan file), then built in the plan's order.
+Three code-mapping passes preceded the plan and corrected four things the
+design doc assumed existed: there is no ThorChain-native code (the repo talks
+to SwapKit and the inbound vault arrives inside a quote route); the repo never
+builds a memo and does not need to (the quote returns one bound to our
+destination, validated by `memo_binds_destination`); `memo_will_overflow` was
+cited in two docs and defined nowhere; and there was no BTC fee estimation,
+dust constant, OP_RETURN builder or coin selection.
+- **The blocking constraint, measured:** a Monero subaddress is 95 chars, so
+  the shortest swap memo is 105 bytes against the 80-byte standard OP_RETURN.
+  Every real forward is over. Not new (the client-paid flow only warns); now
+  the host's problem, which is better. `btc_forwarder` refuses on the default
+  policy with the byte count; `--op-return-max-bytes` is the operator's relay
+  policy; THORName rejected on the record for linkability. Stage 3 chooses the
+  relay strategy.
+- `gs_common`: `memo_will_overflow`, `memo_bytes`, `DUST_SAT_P2WPKH` (294,
+  not the P2PKH 546), `electrum_fee_to_sat_vb` (rounds UP, never 0, -1 → None);
+  `btc_forward_*.json` in the wipe patterns.
+- `gs_btc_tx.py` (pure, no network): OP_RETURN laid out literally (embit's
+  `Script.push` is CompactSize and malformed above 75 bytes — where every
+  real memo lives); `address_script` accepts only this network's native
+  segwit (embit's converter tries every network and returns None on base58
+  it cannot place); `build_unsigned` passes fresh lists (embit's mutable
+  default `vin=[]` is shared), RBF on every input, refuses duplicates, a
+  zero non-data output, outputs over inputs; `sign_input`/`sign_p2wpkh` use
+  the BIP143 SCRIPT CODE (P2PKH form), clear the sighash cache, refuse
+  without the constant-time backend, and verify every signature before
+  returning; `measure` computes vsize (the library has none);
+  `vsize_upper_bound` sizes the fee before the memo is known;
+  `account_from_mnemonic` / `account_matches_xpub` (key + chain code, depth
+  3, xpub or zpub encoding) / `key_for`. `tests/test_btc_tx.py` 70/70:
+  BIP143's native-P2WPKH vector reproduced BYTE FOR BYTE — script code,
+  digest, the RFC6979 signature, the witness, the entire final tx; the
+  75/76 push boundary; vault derivation meets the Pi's on the BIP84 vector.
+- `gs_btc_watch.py`: `Electrum.estimate_fee` and `look(..., fee_blocks=)`,
+  a fourth read-only method in the same session and circuit (220/220).
+- `btc_forwarder`: look → fee against the largest transaction the policy
+  allows (resolves the fee/amount/memo circularity without a loop; the real
+  rate is ≥ target, the slack goes to the miner) → `send = settled − fee`
+  (refuse if the fee eats > 20% or send < 10,000 sat, ThorChain's BTC dust)
+  → SwapKit quote for EXACTLY that amount, `fmt_btc` not `str(Decimal)` →
+  inbound (this network's native segwit, checksum), memo (printable, bound
+  to our destination, fits the policy), expected (worst case ≥ mix floor,
+  within `--max-slippage` of the oracle) → optional THORNode cross-check on
+  a second circuit (address must match, chain not halted, live dust) →
+  build → seed from `GS_BTC_SEED` only (removed from the environment once
+  read), proven to derive the watched xpub and the exact address → sign,
+  verify, measure → 0600 plan file with `broadcast: false`, `--dry-run`
+  required, `--plan-only` needs no seed. No broadcast code exists.
+  `tests/test_btc_forwarder.py` 87/87 through the real `main()`: the signed
+  tx verified independently against the test's own derived key; every
+  refusal by kind; the seed in neither file nor output; chain kinds carry no
+  digit.
+- The job: `forward_to_swap {handle, owner}` in `JOBS`, `SPENDING_JOBS`
+  (deadman extension) and `btc_forwarder` in `GATED_TOOLS`; `WIRE_VERSION`
+  4 (a changelog, not a check — an old vault refuses the unknown name);
+  `gs_wake_agent`: argv composed from the keyfile + the ledger's `bundle`
+  and `btc_index`, per-job spending switch (`allow_btc_forward`, never
+  `allow_withdraw`), owner wall, spent → `already_moved`, no index →
+  `no_btc_deposit`, seed injected into that one step's environment
+  (`btc_seed_unset` otherwise), the plan named for the deposit's handle;
+  `gs_wake_keys` pairing flags (`--btc-xpub`, `--btc-electrum`,
+  `--btc-network`, `--btc-min-conf`, `--op-return-max-bytes`, `--thornode`,
+  `--allow-btc-forward`); `CHAT_NAME` "forward"; OPSEC_SETUP's five jobs.
+  Four tripwire tests updated by design; the forward's dispatch driven end
+  to end (test_wake_agent 590/590, test_wake_protocol 189/189).
+- 16 mutation anchors over the money guards, plus two pre-existing anchors
+  re-pointed (the gate line changed; the mix-floor argv line was matched
+  twice).
+- Deferred on purpose: no real handle carries `btc_index` until stage 4
+  mints addresses (the job refuses `no_btc_deposit` on a live box);
+  broadcast and the relay strategy (stage 3).
+
 ### `cd3c1f9` — Design: BTC intake by unique address, host-side forward into the swap
 - `BTC_INTAKE_DESIGN.md`: the blueprint for the rework (section 4 below).
   Design only; nothing ships from it until each stage is validated.
@@ -458,7 +532,7 @@ rule-6 material).
 |---|-------|-------|
 | 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
 | 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 213/213, 18 anchors all caught (`9f19781`, `2cc59ea`, and the third-round commit) |
-| 2 | `forward_to_swap` job: build + sign the BTC tx (inputs from the derived address, OP_RETURN memo with the 80-byte handling, change), `--dry-run` prints and does not broadcast; fetch current inbound over Tor; `WIRE_VERSION` bump; testnet | pending |
+| 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only** — `gs_btc_tx.py` (test_btc_tx 70/70, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 87/87), job wiring (test_wake_agent 590/590, test_wake_protocol 189/189), 16 anchors; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
 | 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
 | 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |

@@ -164,7 +164,15 @@ import time
 #: misread. That is the intended failure. A silent partial upgrade, where the
 #: vault seals a slip the Pi cannot carry, is the one outcome worth ruling
 #: out, because it fails at the moment money is waiting on it.
-WIRE_VERSION = 3
+#:
+#: 4: a fifth job, `forward_to_swap` (the host-side BTC forward of the intake
+#: rework). No record changes shape; what changes is the set of job names
+#: validate_job accepts, so an old vault refuses a new pager's forward note
+#: with "wake note names a job this machine does not run" -- the loud,
+#: immediate failure the rest of this header promises. Update both boxes
+#: together. The job is in SPENDING_JOBS and its tool in GATED_TOOLS, gated
+#: on the keyfile's own `allow_btc_forward`, not on `allow_withdraw`.
+WIRE_VERSION = 4
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -2603,6 +2611,30 @@ JOBS = {
         # enough that the vault is off again before it is worth noticing.
         "budget_s": 300,
     },
+    # FORWARD A SETTLED BTC DEPOSIT INTO THE SWAP (BTC_INTAKE_DESIGN.md,
+    # STAGE2_PLAN.md). The client paid a plain, unique BTC address the vault's
+    # seed controls and the Pi watched; this job spends what settled there
+    # into ThorChain's inbound vault with the swap memo the CLIENT never had
+    # to attach. The handle names the deposit (its bundle is the XMR
+    # destination, its BTC index the address); the owner rule is the same
+    # rule as everywhere: another owner's handle is refused at the vault.
+    #
+    # IT SPENDS, so it is in SPENDING_JOBS -- the deadman is extended for it
+    # and it is refused unless the keyfile's OWN switch for it is on. That
+    # switch is `allow_btc_forward`, NOT `allow_withdraw`: enabling Monero
+    # withdrawals must not silently enable spending clients' Bitcoin.
+    #
+    # STAGE 2: the tool builds, signs, prints and writes the transaction and
+    # NEVER broadcasts (--dry-run is required and there is no other mode).
+    # Stage 3 adds the broadcast as its own gated step.
+    "forward_to_swap": {
+        "schema": {"handle": _handle_field, "owner": _owner_field},
+        "tools": ("btc_forwarder",),
+        # One look over Tor, one quote, one signature: minutes, not hours.
+        # Above swap_status (300) so the shortest-job property the doorbell
+        # suite pins is untouched, and far under withdraw.
+        "budget_s": 900,
+    },
     # MIX WHAT LANDED AND SEND IT OUT. The only job that spends, the only one
     # that carries free text, and the only one the vault refuses by default.
     #
@@ -2692,7 +2724,7 @@ JOBS = {
 #: Jobs that need a spend-capable wallet, and therefore an explicit keyfile
 #: opt-in on the vault. A tuple rather than a flag on each job, so the agent's
 #: gate and the doorbell's window sizing read the same list.
-SPENDING_JOBS = ("withdraw",)
+SPENDING_JOBS = ("withdraw", "forward_to_swap")
 
 
 #: THE VAULT'S MANDATORY JITTER, DECLARED WHERE BOTH BOXES CAN SEE IT.
@@ -2791,7 +2823,10 @@ FORBIDDEN_TOOLS = ("run_pipeline", "airgap_tx_signer",
 #: Tools only a SPENDING job may name, and only then. Kept separate from
 #: FORBIDDEN_TOOLS so "unreachable from every job" stays a testable property of
 #: that list, rather than becoming "unreachable except sometimes".
-GATED_TOOLS = ("GhostSpiral",)
+#: btc_forwarder spends a client's BITCOIN into the swap (stage 2: signs and
+#: prints, never broadcasts), so it is gated exactly like the mix -- on a
+#: spending job only, behind that job's own keyfile switch.
+GATED_TOOLS = ("GhostSpiral", "btc_forwarder")
 
 
 def job_tools_are_permitted() -> bool:

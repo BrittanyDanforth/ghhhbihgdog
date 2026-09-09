@@ -484,6 +484,7 @@ CHAT_NAME = {
     "swap_status": "check",
     "watch": "watch",
     "withdraw": "withdraw",
+    "forward_to_swap": "forward",
 }
 
 

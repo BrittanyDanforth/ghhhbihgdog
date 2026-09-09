@@ -101,7 +101,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "third_party"))
 from embit import bech32, bip32, script                      # noqa: E402
 from embit.networks import NETWORKS                          # noqa: E402
 
-from gs_common import isolated_proxy                         # noqa: E402
+from gs_common import electrum_fee_to_sat_vb, isolated_proxy  # noqa: E402
 
 #: Electrum's default TLS port (plaintext is 50001; TLS is the default here).
 DEFAULT_ELECTRUM_PORT = 50002
@@ -697,11 +697,24 @@ class Electrum:
             raise BtcWatchError("electrum: bad listunspent")
         return r
 
+    def estimate_fee(self, blocks):
+        """The server's fee estimate for confirmation within `blocks`, as
+        whole sat/vB rounded up, or None when the server has none (Electrum
+        answers -1 for that). Read-only; a fourth method that cannot move
+        money any more than the other three. The conversion refuses to say
+        0: an estimate a caller took as "free" would build a transaction no
+        node relays."""
+        if isinstance(blocks, bool) or not isinstance(blocks, int) \
+                or not 1 <= blocks <= 1008:
+            raise BtcWatchError("fee target must be 1..1008 blocks")
+        r = self._rpc("blockchain.estimatefee", [blocks])
+        return electrum_fee_to_sat_vb(r)
+
 
 # --- the answer the caller wants --------------------------------------------
 
 def look(address, servers, proxy_url, *, min_conf=1, network="main",
-         timeout=DEFAULT_TIMEOUT, transport_factory=None):
+         timeout=DEFAULT_TIMEOUT, transport_factory=None, fee_blocks=None):
     """Ask the network what unspent money sits at `address`, and how settled.
 
     `servers` is a list of (host, port) or (host, port, pin) entries -- the
@@ -711,9 +724,13 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
     server sees every address. `network` names the chain the address must
     belong to. `timeout` bounds ONE server's whole exchange.
     `transport_factory(host, port, tag)` may inject a transport for tests.
+    With `fee_blocks` set, the same session also asks the server's fee
+    estimate for that confirmation target (the forwarder needs both the
+    outputs and a rate, and one circuit is one fact fewer to leak); the
+    result then carries `fee_sat_vb`, None when the server has no estimate.
     Returns
         {state, confirmed_sat, unconfirmed_sat, settled_sat, confirmations,
-         utxos, tip, server, cert_sha256}
+         utxos, tip, server, cert_sha256[, fee_sat_vb]}
     and NEVER raises for "not paid yet" -- only for "could not ask anyone",
     or for a configuration that could not be right. The error names the
     module's own reason or the CLASS of a system error, never text a
@@ -725,6 +742,10 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
     if not _is_uint(min_conf) or min_conf < 1:
         raise BtcWatchError("min_conf must be an int of at least 1: an "
                             "unconfirmed deposit is never settled money")
+    if fee_blocks is not None and (isinstance(fee_blocks, bool)
+                                   or not isinstance(fee_blocks, int)
+                                   or not 1 <= fee_blocks <= 1008):
+        raise BtcWatchError("fee_blocks must be None or an int in 1..1008")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
             or not math.isfinite(timeout) or timeout <= 0:
         raise BtcWatchError("timeout must be a finite, positive number of "
@@ -762,6 +783,8 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
                 e.handshake()
                 tip = e.tip_height()
                 picture = summarize(e.listunspent(scripthash), tip, min_conf)
+                if fee_blocks is not None:
+                    picture["fee_sat_vb"] = e.estimate_fee(fee_blocks)
         except PinMismatch:
             # A detected interception is not a dead server to route around.
             raise

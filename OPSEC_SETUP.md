@@ -2018,8 +2018,12 @@ address — no phone, no bot token. A pager you start by hand, typing the
 passphrase, does not make that trade. Make it knowingly, and price it at the
 value at rest on the mixing wallet.
 
-The wake channel can ask for four jobs and no others —
-`receive_and_quote`, `watch`, `swap_status`, `withdraw`.
+The wake channel can ask for five jobs and no others —
+`receive_and_quote`, `watch`, `swap_status`, `withdraw`, and
+`forward_to_swap` (the BTC-intake forward: it spends a client's settled
+Bitcoin deposit into the swap, is gated on its own `allow_btc_forward`
+keyfile switch rather than on `allow_withdraw`, and in stage 2 signs and
+prints without broadcasting — see `STAGE2_PLAN.md`).
 
 **`receive_new` was the fifth and is gone.** It minted a Monero subaddress to
 be paid into directly — an entry point for somebody who already held XMR — and

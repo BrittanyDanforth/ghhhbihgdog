@@ -80,6 +80,7 @@ _OWNER = "0123456789abcdef"
 SAMPLE = {"receive_and_quote": {"amount_sat": 5_000_000, "owner": _OWNER},
           "watch": {"handle": "A3F1", "owner": _OWNER},
           "swap_status": {"handle": "A3F1", "owner": _OWNER},
+          "forward_to_swap": {"handle": "A3F1", "owner": _OWNER},
           "withdraw": {"exit_to": _SAMPLE_XMR, "depth": 1, "owner": _OWNER}}
 # KEYED ON JOBS, AND CHECKED TO BE. This table is what every per-job check
 # below iterates, so a job added to the protocol without a sample here would
@@ -242,8 +243,14 @@ check("...and the mix is GATED rather than free: it is on no ordinary job",
       "GhostSpiral" in P.GATED_TOOLS
       and all("GhostSpiral" not in P.JOBS[j]["tools"]
               for j in P.JOBS if j not in P.SPENDING_JOBS))
-check("...and exactly one job is allowed to spend at all",
-      P.SPENDING_JOBS == ("withdraw",))
+check("...and exactly two jobs are allowed to spend at all: the Monero "
+      "withdrawal and the BTC forward, each behind its own keyfile switch",
+      P.SPENDING_JOBS == ("withdraw", "forward_to_swap"))
+check("...the forward's tool is gated like the mix and named by no "
+      "non-spending job", "btc_forwarder" in P.GATED_TOOLS
+      and all("btc_forwarder" not in P.JOBS[j]["tools"]
+              for j in P.JOBS if j not in P.SPENDING_JOBS)
+      and P.JOBS["forward_to_swap"]["tools"] == ("btc_forwarder",))
 # NON-VACUITY: the predicate must be able to say no. Planted here rather than
 # trusted, because a checker that returns True for everything reads identical.
 _saved_tools = P.JOBS["watch"]["tools"]

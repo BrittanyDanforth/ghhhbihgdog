@@ -367,6 +367,8 @@ def _electrum_reply(req, scenario):
     elif m == "blockchain.scripthash.listunspent":
         res = (scenario["utxos"] if req.get("params") == [_SCRIPTHASH]
                else [])
+    elif m == "blockchain.estimatefee":
+        res = scenario.get("fee", -1)
     else:
         return json.dumps({"jsonrpc": "2.0", "id": i,
                            "error": {"code": -32601,
@@ -753,7 +755,8 @@ check("...every request carried the JSON-RPC 2.0 member and an id",
       all(q.get("jsonrpc") == "2.0" and isinstance(q.get("id"), int)
           for q in _cap.get("requests", [])) and _cap.get("requests"))
 check("...and the server was asked ONLY the three read-only methods, "
-      "in order: version, tip, listunspent -- nothing that could spend",
+      "in order: version, tip, listunspent -- nothing that could spend "
+      "(a fourth, estimatefee, only when a fee target is asked for)",
       _cap["methods_asked"] == ["server.version",
                                 "blockchain.headers.subscribe",
                                 "blockchain.scripthash.listunspent"])
@@ -768,6 +771,31 @@ _r, _cap = _e2e({"tip": _TIP, "utxos": [_u(_TIP - 2, 700000)],
 check("three subscription notifications interleaved before the tip reply "
       "are skipped, not mistaken for the answer",
       _r["state"] == "confirmed" and _r["tip"] == _TIP)
+
+
+def _e2e_fee(scenario, fee_blocks):
+    port, cap, srv = _mock_socks("electrum", scenario)
+    proxy = f"socks5h://127.0.0.1:{port}"
+    try:
+        r = W.look(_A0, [("watch.example.onion", 50002)], proxy,
+                   fee_blocks=fee_blocks,
+                   transport_factory=lambda h, p, t: W.SocksTlsTransport(
+                       h, p, proxy, t, tls=False, timeout=5.0))
+    finally:
+        srv.close()
+    return r, cap
+
+
+_r, _cap = _e2e_fee({"tip": _TIP, "utxos": [_u(_TIP - 2, 700000)],
+                     "fee": 0.00015}, 2)
+check("end to end with a fee target: four read-only methods, the estimate "
+      "converted to 15 sat/vB, the look unchanged",
+      _cap["methods_asked"] == ["server.version",
+                                "blockchain.headers.subscribe",
+                                "blockchain.scripthash.listunspent",
+                                "blockchain.estimatefee"]
+      and _cap["requests"][-1]["params"] == [2]
+      and _r["fee_sat_vb"] == 15 and _r["state"] == "confirmed")
 
 # TLS: the same, wrapped. A throwaway self-signed certificate lives here so
 # the test needs no binary and no network; it signs nothing but this test.
@@ -915,8 +943,9 @@ class _FakeTransport:
 
     def __init__(self, *, tip=_TIP, utxos=(), connect_error=None,
                  notify=0, raw=None, tip_reply=None, unspent_reply=None,
-                 version_error=False, drop_after=None):
+                 version_error=False, drop_after=None, fee_reply=-1):
         self.tip = tip
+        self.fee_reply = fee_reply
         self.utxos = list(utxos)
         self.connect_error = connect_error
         self.notify = notify
@@ -963,6 +992,8 @@ class _FakeTransport:
         elif m == "blockchain.scripthash.listunspent":
             res = (self.unspent_reply if self.unspent_reply is not None
                    else self.utxos)
+        elif m == "blockchain.estimatefee":
+            res = self.fee_reply
         else:
             self.queue.append(json.dumps({"jsonrpc": "2.0", "id": i,
                                           "error": "unknown method"}))
@@ -1333,6 +1364,29 @@ check("...and listunspent was asked about THIS address's scripthash",
 _ft = _FakeTransport(drop_after="server.version")
 _refused(_look, _ft)
 check("a transport is closed even when the exchange fails", _ft.closed)
+
+# THE FOURTH METHOD, asked only when the caller wants a fee estimate: still
+# read-only, still the same session and circuit as the look itself.
+_ft = _FakeTransport(utxos=[_u(_TIP, 1)], fee_reply=0.00002)
+_r = _look(_ft, fee_blocks=3)
+check("with fee_blocks set, the SAME session also asks blockchain.estimatefee "
+      "(one circuit, one fact fewer to leak) and reports it in sat/vB, "
+      "rounded up", _ft.methods[-1] == "blockchain.estimatefee"
+      and _ft.requests[-1]["params"] == [3] and _r["fee_sat_vb"] == 2
+      and len(_ft.methods) == 4)
+check("...and the result key is absent when no fee was asked for",
+      "fee_sat_vb" not in _look(_FakeTransport()))
+check("Electrum's -1 ('no estimate') is None, never 0 and never a refusal "
+      "of the look itself: the caller decides",
+      _look(_FakeTransport(fee_reply=-1), fee_blocks=3)["fee_sat_vb"] is None)
+check("a junk fee reply (string, dict, bool) is None too",
+      all(_look(_FakeTransport(fee_reply=v), fee_blocks=3)["fee_sat_vb"]
+          is None for v in ("abc", {"x": 1}, True)))
+check("fee_blocks out of range is refused up front",
+      all(_refused(_look, _FakeTransport(), fee_blocks=v)
+          for v in (0, 1009, True, "3", 1.0)))
+check("the client's own estimate_fee refuses a bad target before asking",
+      _refused(W.Electrum(_FakeTransport()).estimate_fee, 0))
 
 # The default (no factory) path builds the real transport with the caller's
 # timeout and the proxy, and a dead proxy is a loud look() failure.
