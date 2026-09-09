@@ -1300,7 +1300,7 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
 
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                bundle: str = None, slip: str = None, handle: str = None,
-               owned_fee=()) -> list:
+               owned_fee=(), btc_index=None) -> list:
     """The argv lists for one job, in order, composed ENTIRELY from the fixed
     template plus this machine's own keyfile. (The per-step environment is
     built by _dispatch beside each step; only build_fee_sweep_argv returns
@@ -1489,6 +1489,45 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  "--output", str(artifact_dir)]
                 + _withdraw_fee_argv(key, params.get("exit_to") or [],
                                      owned=owned_fee)]
+
+    if job == "forward_to_swap":
+        # EVERYTHING FROM THIS MACHINE'S KEYFILE, plus the ledger's two facts
+        # about the handle: the bundle (the XMR destination) and the BTC
+        # index (the address). The seed is NOT here: it rides in the
+        # environment of this one step, set by _dispatch, exactly as the
+        # wallet password does for a withdrawal.
+        _xpub = str(key.get("btc_account_xpub") or "")
+        _servers = [str(s) for s in (key.get("btc_electrum") or []) if s]
+        if not _xpub or not _servers:
+            raise Refused(
+                "no_btc_config",
+                "this machine's keyfile names no BTC account xpub or no "
+                "Electrum server, so it cannot forward a deposit. Re-pair "
+                "with --btc-xpub and --btc-electrum.")
+        if btc_index is None or isinstance(btc_index, bool) \
+                or not isinstance(btc_index, int) or btc_index < 0:
+            raise Refused("no_btc_deposit",
+                          "this handle has no BTC deposit address recorded, "
+                          "so there is nothing to forward.")
+        argv = [sys.executable, _tool("btc_forwarder"),
+                "--dry-run",                       # stage 2: never broadcasts
+                "--tor-proxy", proxy,
+                "--network", str(key.get("btc_network") or "main"),
+                "--xpub", _xpub,
+                "--index", str(int(btc_index)),
+                "--dest-from-receive-wallet", str(bundle),
+                "--min-conf", str(int(key.get("btc_min_conf") or 2)),
+                "--op-return-max-bytes",
+                str(int(key.get("op_return_max_bytes") or 80)),
+                # THE SAME MIX FLOOR the quote step is given, so a deposit
+                # that could not be mixed is not forwarded into the swap.
+                "--min-out-xmr", str(live_min_out_xmr(key)),
+                "--outfile", str(artifact_dir / f"btc_forward_{handle}.json")]
+        for _s in _servers:
+            argv += ["--electrum", _s]
+        if key.get("thornode_url"):
+            argv += ["--thornode", str(key["thornode_url"])]
+        return [argv]
 
     raise Refused("unknown_job", "no argv template for this job")
 
@@ -2316,13 +2355,23 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         # written before this job existed -- so upgrading the code does not
         # silently give a pager the ability to spend. getattr-with-default is
         # deliberate: an old keyfile means "no".
-        if not key.get("allow_withdraw"):
+        # EACH SPENDING JOB HAS ITS OWN SWITCH. Enabling Monero withdrawals
+        # must not silently enable spending clients' Bitcoin, or the reverse:
+        # `allow_withdraw` gates the mix, `allow_btc_forward` gates the
+        # forward, and both are absent from every keyfile that predates them.
+        if job == "forward_to_swap":
+            _allowed = key.get("allow_btc_forward")
+            _switch, _code = "--allow-btc-forward", "forward_not_allowed"
+        else:
+            _allowed = key.get("allow_withdraw")
+            _switch, _code = "--allow-withdraw", "withdraw_not_allowed"
+        if not _allowed:
             raise Refused(
-                "withdraw_not_allowed",
-                "this machine's keyfile does not allow spending jobs. That is "
-                "the default, and turning it on means the spend wallet is "
-                "reachable by a machine a pager can wake -- re-pair with "
-                "--allow-withdraw, with physical access, if you mean it.")
+                _code,
+                "this machine's keyfile does not allow this spending job. "
+                "That is the default, and turning it on means a machine a "
+                f"pager can wake can spend -- re-pair with {_switch}, with "
+                "physical access, if you mean it.")
         # THE BACKSTOP MUST OUTLAST THE JOB, or it becomes the thing that
         # breaks it. The shipped deadman is sized for the largest NON-spending
         # job; a mix runs far past it, and a power-off mid-round is the one
@@ -2342,7 +2391,7 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # receive_and_quote, and the collision loop guarantees the
     # drawn handle is absent from the file -- so a watch used to answer
     # "ready · slip 7C3D" for a label the operator could not look up.
-    if job in ("watch", "swap_status"):
+    if job in ("watch", "swap_status", "forward_to_swap"):
         handle = params["handle"]
     slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
     plain = plain_slip_for_chat(key, artifact_dir, status, handle)
@@ -2884,6 +2933,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
 
     bundle = slip = None
     _spent_pair = None
+    _btc_index = None
     # EVERY JOB THAT NAMES A HANDLE RESOLVES IT HERE, and `withdraw` was
     # missing from this tuple while its argv template already interpolated
     # `bundle`. Driven: the composed command was
@@ -2995,6 +3045,42 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # change and the ledger's answer stays whole.
         _accts_before = (_account_indices(key, injected=accounts)
                          if _owner else None)
+    elif job == "forward_to_swap":
+        # THE DEPOSIT THIS HANDLE NAMES: its bundle is the swap's XMR
+        # destination, its btc_index the address the client paid. Both from
+        # the ledger, never from the note. The owner wall is the same wall
+        # the watching jobs have; a handle another owner minted is refused
+        # here even if a forged note carried it.
+        rec = handles.get(params["handle"])
+        if not rec:
+            raise Refused("unknown_handle",
+                          f"no deposit on this machine for handle "
+                          f"{params['handle']}.")
+        if _owner and rec.get("owner") and rec.get("owner") != _owner:
+            integrity_log("wake", "forward_not_owner")
+            raise Refused("handle_not_yours",
+                          f"handle {params['handle']} was recorded for a "
+                          f"different owner.")
+        if rec.get("spent") is True:
+            raise Refused("already_moved",
+                          f"handle {params['handle']} has already been paid "
+                          "out; there is nothing left to forward.")
+        bundle = rec.get("bundle")
+        if not bundle:
+            raise Refused("handle_not_forwardable",
+                          f"handle {params['handle']} names no single "
+                          "receive bundle, so it has no swap destination.")
+        _btc_index = rec.get("btc_index")
+        if _btc_index is None:
+            raise Refused("no_btc_deposit",
+                          f"handle {params['handle']} has no BTC deposit "
+                          "address recorded (it was quoted for the client to "
+                          "pay ThorChain directly), so there is nothing on "
+                          "this machine's key to forward.")
+        # THE DEPOSIT'S OWN LABEL, not the fresh one drawn above: the plan
+        # file is named for the deposit it forwards, and the reply names the
+        # handle the operator asked about (as the watching jobs do).
+        handle = params["handle"]
     elif job in ("watch", "swap_status"):
         rec = handles.get(params["handle"])
         if not rec:
@@ -3096,7 +3182,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     _owned_fee = (wallet_owned_fee_addresses(key)
                   if job == "withdraw" else [])
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
-                       slip=slip, handle=handle, owned_fee=_owned_fee)
+                       slip=slip, handle=handle, owned_fee=_owned_fee,
+                       btc_index=_btc_index)
 
     # AN ADDRESS MINTED FOR A DEPOSIT THAT NEVER GOT ITS QUOTE IS THE NEXT
     # DEPOSIT'S ADDRESS. See _reusable_receive; decided before the loop so
@@ -3184,6 +3271,22 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 _np = _bundle_pair({"bundle": new[0]})
                 if _np is not None:
                     _add_owner_accounts(led, _owner, {_np[0]})
+        if job == "forward_to_swap":
+            # THE SEED, IN THE ENVIRONMENT OF THIS ONE STEP, NEVER ON THE
+            # ARGV AND NEVER IN THE KEYFILE -- the wallet password's rule,
+            # for the same reasons. Absent means refused, before the child
+            # starts: a forward that cannot sign should not spend a look.
+            if "GS_BTC_SEED" not in os.environ:
+                integrity_log("wake", "btc_seed_unset")
+                raise Refused(
+                    "btc_seed_unset",
+                    "the machine has no BTC seed configured, so the forward "
+                    "cannot sign. Nothing was spent. Set GS_BTC_SEED in the "
+                    "agent unit's EnvironmentFile, at the machine.")
+            env_extra["GS_BTC_SEED"] = os.environ["GS_BTC_SEED"]
+            if "GS_BTC_SEED_PASSPHRASE" in os.environ:
+                env_extra["GS_BTC_SEED_PASSPHRASE"] = \
+                    os.environ["GS_BTC_SEED_PASSPHRASE"]
         if job == "withdraw":
             # THE DESTINATION, IN THE ENVIRONMENT, NEVER ON THE ARGV.
             # GhostSpiral reads GS_EXIT_TO through env_or_argv and prefers it

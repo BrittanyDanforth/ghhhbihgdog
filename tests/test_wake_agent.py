@@ -1226,10 +1226,14 @@ _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
       # job can actually sign" below. A fixture missing it made the whole
       # sweep-over-JOBS loop raise instead of reporting, which is the
       # NO-RESULT outcome mutation_sweep scores as no verdict at all.
-      "wallet_file": "/var/lib/gs/spend.wallet"}
+      "wallet_file": "/var/lib/gs/spend.wallet",
+      # The forward composes from these two the same way; without them it
+      # refuses (no_btc_config) and the sweep-over-JOBS loop would raise.
+      "btc_account_xpub": "xpub6FIXTUREACCOUNT", "btc_electrum": ["s.onion"]}
 _XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 _sample = {"receive_and_quote": {"amount_sat": 5000000},
            "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
+           "forward_to_swap": {"handle": "A3F1"},
            "withdraw": {"exit_to": _XMR_SAMPLE, "depth": 1}}
 # Asserted rather than assumed: this loop runs over P.JOBS, so a job added
 # without a sample here KeyErrors and kills the suite -- which mutation_sweep
@@ -1240,7 +1244,7 @@ for _job in P.JOBS:
     for _argv in A.build_argv(_job, _sample[_job], _k, Path("/tmp/bay"),
                               bundle="/tmp/bay/wallet_recv_1.json",
                               slip="/tmp/bay/thor_pairs_A3F1.json",
-                              handle="A3F1"):
+                              handle="A3F1", btc_index=0):
         _argvs.append(_argv)
 check("no COMPOSED argv names a spending tool",
       not any(t in os.path.basename(a) for argv in _argvs for a in argv
@@ -1248,7 +1252,7 @@ check("no COMPOSED argv names a spending tool",
 check("...and every composed argv names only a whitelisted tool",
       {os.path.basename(a[1]) for a in _argvs}
       == {"create_receive_wallet", "thor_swap_preparer", "receive_watch",
-          "GhostSpiral"})
+          "GhostSpiral", "btc_forwarder"})
 # THE ADDRESS IS NOWHERE ON ANY ARGV. It is the first operator-chosen string
 # this channel carries and it crosses a machine boundary into a subprocess, so
 # it travels in GS_EXIT_TO like GS_SWAP_AMOUNTS -- /proc/<pid>/cmdline is 0444,
@@ -3503,18 +3507,22 @@ check("...and the only tools it can spawn are the four in JOBS, with the mix "
       "reachable ONLY from the spending job",
       set(t for spec in P.JOBS.values() for t in spec["tools"])
       == {"create_receive_wallet", "thor_swap_preparer", "receive_watch",
-          "GhostSpiral"}
+          "GhostSpiral", "btc_forwarder"}
       and set(t for j, spec in P.JOBS.items() if j not in P.SPENDING_JOBS
               for t in spec["tools"])
       == {"create_receive_wallet", "thor_swap_preparer", "receive_watch"})
 # THE GATE, at the source, because the argv table alone would compose a mix for
 # anyone who could name the job. The keyfile decides, and an old keyfile -- one
-# written before this job existed -- means no.
+# written before this job existed -- means no. EACH spending job reads its
+# OWN switch: enabling Monero withdrawals never enables the BTC forward.
 check("...and a spending job is refused unless the KEYFILE allows it",
-      'if not key.get("allow_withdraw"):' in _A_SRC)
+      '_allowed = key.get("allow_withdraw")' in _A_SRC
+      and '_allowed = key.get("allow_btc_forward")' in _A_SRC
+      and "if not _allowed:" in _A_SRC)
 check("...which an upgraded pair does not gain silently: absent means no",
       ".get(\"allow_withdraw\")" in _A_SRC
-      and "allow_withdraw\"]" not in _A_SRC)
+      and "allow_withdraw\"]" not in _A_SRC
+      and "allow_btc_forward\"]" not in _A_SRC)
 
 
 # ===========================================================================
@@ -3647,7 +3655,8 @@ check("...and no wake job composes --gpg-recipient",
       not any("--gpg-recipient" in _a
               for _j in P.JOBS
               for _argv in A.build_argv(_j, _sample[_j], _k, _wdir,
-                                        bundle="b", slip="s", handle="A3F1")
+                                        bundle="b", slip="s", handle="A3F1",
+                                        btc_index=0)
               for _a in _argv))
 check("the failure is written somewhere durable, not to the null stderr "
       "this unit sets",
@@ -4497,6 +4506,127 @@ check("pairing/fee: the fee address is minted by the fee wallet-rpc itself, "
       and _kp_src.index("_mint_fee_address(args) if args.fee_rpc")
       < _kp_src.index("srv = _listen(args)")
       and "serving the SAME" in _kp_src)
+
+# ===========================================================================
+print("\n== forward_to_swap: the BTC forward, gated on its OWN switch ==")
+# The job takes a deposit handle, resolves its bundle (the XMR destination)
+# and its BTC index (the address) from the LEDGER, composes btc_forwarder
+# from the keyfile, and hands the seed to that one child in its environment.
+# Driven through run_once against the real doorbell, with the child faked.
+_FWD_MNEMONIC = ("abandon abandon abandon abandon abandon abandon abandon "
+                 "abandon abandon abandon abandon about")
+_FWD_KEY = {"allow_btc_forward": True,
+            "btc_account_xpub": "xpub6FIXTUREACCOUNT",
+            "btc_electrum": ["s.onion", "t.onion:50001"],
+            "btc_network": "main", "btc_min_conf": 3,
+            "op_return_max_bytes": 120, "thornode_url": "https://tn.example"}
+_FWD_REC = {"bundle": "/tmp/bay/wallet_fwd.json", "minted": 1,
+            "slip": "/tmp/bay/thor_pairs_A3F1.json", "owner": OWNER,
+            "btc_index": 3}
+
+
+def _fwd_env(rec, key_extra=None, ledger=True):
+    dd, kk, _key, bb = new_env(job="forward_to_swap",
+                               params={"handle": "A3F1"})
+    if ledger:
+        (dd / A.HANDLES_FILE).write_text(json.dumps({"A3F1": rec}))
+    if key_extra:
+        _key.update(key_extra)
+        os.chmod(kk, 0o600)
+        kk.write_text(json.dumps(P.lock_keyfile(_key, b"", role="thinkpad")))
+        os.chmod(kk, 0o400)
+    return dd, kk, bb
+
+
+def _fwd_run(rec, key_extra=None, seed=_FWD_MNEMONIC, ledger=True):
+    dd, kk, bb = _fwd_env(rec, key_extra, ledger)
+    dp = deps_for(dd, bb, extend_deadman=lambda s: True)
+    if seed is None:
+        os.environ.pop("GS_BTC_SEED", None)
+    else:
+        os.environ["GS_BTC_SEED"] = seed
+    try:
+        out, err, text = run(kk, dp)
+    finally:
+        os.environ.pop("GS_BTC_SEED", None)
+    return out, err, dp["_ran"]
+
+
+_o, _e, _ran = _fwd_run(_FWD_REC, {"allow_withdraw": True,
+                                   "wallet_file": "/var/lib/gs/x.wallet",
+                                   **{k: v for k, v in _FWD_KEY.items()
+                                      if k != "allow_btc_forward"}})
+check("WITHOUT allow_btc_forward the forward is refused as "
+      "forward_not_allowed -- and allow_withdraw being ON does not unlock it",
+      _o is None and _e.code == "forward_not_allowed" and _ran == [])
+_o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY, seed=None)
+check("with the switch on but no GS_BTC_SEED in the environment: refused "
+      "btc_seed_unset before any child runs",
+      _o is None and _e.code == "btc_seed_unset" and _ran == [])
+_o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY)
+check("with the switch, the config and the seed: the job runs ONE child, "
+      "btc_forwarder, and reports done with the handle it was asked about",
+      _e is None and _o is not None and len(_ran) == 1
+      and os.path.basename(_ran[0][0][1]) == "btc_forwarder"
+      and _o[2] == "A3F1")
+_argv, _env = _ran[0]
+check("...the argv is composed from the KEYFILE and the LEDGER: --dry-run, "
+      "the xpub, both servers, the network, min-conf, the OP_RETURN policy, "
+      "THORNode, the handle's bundle as the destination, its BTC index, and "
+      "an outfile named for the handle",
+      "--dry-run" in _argv
+      and _argv[_argv.index("--xpub") + 1] == "xpub6FIXTUREACCOUNT"
+      and _argv.count("--electrum") == 2 and "t.onion:50001" in _argv
+      and _argv[_argv.index("--network") + 1] == "main"
+      and _argv[_argv.index("--min-conf") + 1] == "3"
+      and _argv[_argv.index("--op-return-max-bytes") + 1] == "120"
+      and _argv[_argv.index("--thornode") + 1] == "https://tn.example"
+      and _argv[_argv.index("--dest-from-receive-wallet") + 1]
+      == "/tmp/bay/wallet_fwd.json"
+      and _argv[_argv.index("--index") + 1] == "3"
+      and _argv[_argv.index("--outfile") + 1].endswith("btc_forward_A3F1.json")
+      and "--min-out-xmr" in _argv)
+check("...THE SEED IS NOT ON THE ARGV and IS in that one step's environment",
+      "abandon" not in " ".join(_argv)
+      and _env.get("GS_BTC_SEED") == _FWD_MNEMONIC
+      and "GS_BTC_SEED_PASSPHRASE" not in _env)
+os.environ["GS_BTC_SEED_PASSPHRASE"] = "pp"
+try:
+    _o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY)
+finally:
+    os.environ.pop("GS_BTC_SEED_PASSPHRASE", None)
+check("...and a passphrase, when set, rides alongside it",
+      _e is None and _ran[0][1].get("GS_BTC_SEED_PASSPHRASE") == "pp")
+_o, _e, _ran = _fwd_run(_FWD_REC, {"allow_btc_forward": True})
+check("the switch without the BTC config (no xpub, no server) is refused "
+      "no_btc_config, and no child runs",
+      _o is None and _e.code == "no_btc_config" and _ran == [])
+_o, _e, _ran = _fwd_run({**_FWD_REC, "btc_index": None}, _FWD_KEY)
+check("a handle with no BTC deposit index (a client-paid quote) is refused "
+      "no_btc_deposit", _o is None and _e.code == "no_btc_deposit"
+      and _ran == [])
+_o, _e, _ran = _fwd_run({k: v for k, v in _FWD_REC.items()
+                         if k != "btc_index"}, _FWD_KEY)
+check("...and so is one from before the field existed",
+      _o is None and _e.code == "no_btc_deposit")
+_o, _e, _ran = _fwd_run({**_FWD_REC, "spent": True}, _FWD_KEY)
+check("a handle already paid out is refused already_moved",
+      _o is None and _e.code == "already_moved" and _ran == [])
+_o, _e, _ran = _fwd_run({**_FWD_REC, "owner": "f" * 16}, _FWD_KEY)
+check("ANOTHER OWNER'S handle is refused handle_not_yours at the vault, "
+      "whatever the note said", _o is None and _e.code == "handle_not_yours"
+      and _ran == [])
+_o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
+check("a handle naming no single bundle has no destination: "
+      "handle_not_forwardable", _o is None
+      and _e.code == "handle_not_forwardable")
+_o, _e, _ran = _fwd_run(None, _FWD_KEY, ledger=False)
+check("an unknown handle is refused unknown_handle",
+      _o is None and _e.code == "unknown_handle" and _ran == [])
+check("the forward's result budget fits the unit and sits between the "
+      "probe's and the withdrawal's",
+      P.result_budget_s("swap_status") < P.result_budget_s("forward_to_swap")
+      < P.result_budget_s("withdraw"))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

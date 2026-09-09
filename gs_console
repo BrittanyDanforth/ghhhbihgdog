@@ -691,7 +691,8 @@ ACTIONS = {
                                         "gs_delivery_key", "gs_unseal",
                                         "gs_doorbell", "gs_telegram_pager",
                                         "gs_wake_agent", "gs_wake_keys",
-                                        "gs_wake_proto.py", "gs_btc_watch.py"]},
+                                        "gs_wake_proto.py", "gs_btc_watch.py",
+                                        "gs_btc_tx.py", "btc_forwarder"]},
 }
 
 PREFLIGHT_TOR = """

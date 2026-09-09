@@ -336,6 +336,38 @@ def build_cli() -> argparse.ArgumentParser:
                         "Required with --allow-withdraw. The password goes in "
                         "GS_WALLET_PASSWORD in the agent unit's "
                         "EnvironmentFile, never here and never on an argv.")
+    # THE BTC INTAKE (BTC_INTAKE_DESIGN.md). The vault holds the account xpub
+    # -- PUBLIC, the same one the Pi watches with -- and the Electrum servers
+    # to look with; the SEED is never in the keyfile: it goes in GS_BTC_SEED in
+    # the agent unit's EnvironmentFile, like the wallet password. Off by
+    # default, absent from every keyfile written before it existed.
+    p.add_argument("--btc-xpub", default="",
+                   help="the BIP84 ACCOUNT xpub (m/84'/coin'/0') the deposit "
+                        "addresses are derived from. Public. The seed that "
+                        "signs goes in GS_BTC_SEED in the agent unit's "
+                        "EnvironmentFile, never here.")
+    p.add_argument("--btc-electrum", action="append", default=[],
+                   metavar="HOST[:PORT][,PIN]",
+                   help="Electrum server the vault looks at deposits through, "
+                        "over Tor; repeatable. Prefer an .onion, or pin a "
+                        "clearnet server's certificate.")
+    p.add_argument("--btc-network", default="main",
+                   help="main, testnet, signet or regtest (default main)")
+    p.add_argument("--btc-min-conf", type=int, default=2,
+                   help="confirmations a deposit output needs before the "
+                        "forward may spend it (default 2)")
+    p.add_argument("--op-return-max-bytes", type=int, default=80,
+                   help="this box's OP_RETURN relay policy in data bytes "
+                        "(default 80, the standard -- under which no swap "
+                        "memo fits; see STAGE2_PLAN.md section 2)")
+    p.add_argument("--thornode", default="",
+                   help="THORNode base URL the forward cross-checks the "
+                        "inbound vault address against, over Tor")
+    p.add_argument("--allow-btc-forward", action="store_true",
+                   help="let a wake sign a BTC forward into the swap. Off by "
+                        "default, and SEPARATE from --allow-withdraw: "
+                        "enabling one never enables the other. Stage 2 signs "
+                        "and prints only; nothing is broadcast.")
     # WHERE THE OPERATOR'S CUT GOES, and the default is deliberately nowhere.
     #
     # gs_wake_agent reads key["usage_fee_address"] and there was NO WAY TO SET
@@ -911,6 +943,15 @@ def do_pair(args) -> int:
                                 [str(a) for a in
                                  (args.usage_fee_address or [])]),
         "wallet_file": str(args.wallet_file or ""),
+        # THE BTC INTAKE'S SETTINGS: public xpub, servers, policy, its own
+        # spending switch. No seed here, ever.
+        "btc_account_xpub": str(args.btc_xpub or ""),
+        "btc_electrum": [str(s) for s in (args.btc_electrum or [])],
+        "btc_network": str(args.btc_network or "main"),
+        "btc_min_conf": int(args.btc_min_conf),
+        "op_return_max_bytes": int(args.op_return_max_bytes),
+        "thornode_url": str(args.thornode or ""),
+        "allow_btc_forward": bool(args.allow_btc_forward),
         "fee_rpc": str(args.fee_rpc or ""),
         "fee_wallet_file": str(args.fee_wallet_file or ""),
         "fee_address": fee_address,

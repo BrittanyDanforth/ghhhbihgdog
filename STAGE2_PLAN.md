@@ -1,8 +1,38 @@
 # Stage 2: `forward_to_swap` — build and sign the forward, print it, spend nothing
 
-Status: **planned, not built.** This file is the whole context for stage 2 of the
-BTC-intake rework (`BTC_INTAKE_DESIGN.md`). Stages 0 and 1 are done and green;
-this is the next one and it is the first one that touches a spend key.
+Status: **BUILT, dry-run only** (the commit that carries this line). This file
+is the whole context for stage 2 of the BTC-intake rework
+(`BTC_INTAKE_DESIGN.md`), written before the build and kept as its record.
+What shipped, against the build order in section 7:
+
+- `gs_common`: `memo_will_overflow`, `memo_bytes`, `DUST_SAT_P2WPKH`,
+  `electrum_fee_to_sat_vb`; `btc_forward_*.json` in the wipe patterns.
+- `gs_btc_tx.py`: the OP_RETURN builder (OP_PUSHDATA1 above 75 bytes),
+  `address_script` (this network's native segwit only), `vsize_upper_bound`,
+  `measure`, `build_unsigned` (RBF, fresh lists, refusals), `sign_input` /
+  `sign_p2wpkh` (BIP143 script code, constant-time gate, self-verify),
+  `verify_signed`, `account_from_mnemonic`, `account_matches_xpub`, `key_for`.
+  `tests/test_btc_tx.py`: 70 checks, BIP143's vector byte for byte.
+- `gs_btc_watch.py`: `Electrum.estimate_fee` and `look(..., fee_blocks=)` --
+  the fourth read-only method, same session, same circuit.
+- `btc_forwarder`: the tool, `--dry-run` required, `--plan-only` optional,
+  seed from `GS_BTC_SEED` only, the THORNode cross-check behind `--thornode`.
+  `tests/test_btc_forwarder.py`: 87 checks through the real `main()`.
+- The job: `forward_to_swap` in `JOBS`, `SPENDING_JOBS` and `GATED_TOOLS`,
+  `WIRE_VERSION` 4; the agent's argv branch, per-job spending switch
+  (`allow_btc_forward`), ledger resolution (`btc_index`, owner wall, spent),
+  seed injection into the one step's environment; pairing flags in
+  `gs_wake_keys`; `CHAT_NAME`; the four tripwire tests updated and the
+  forward's dispatch driven end to end in `tests/test_wake_agent.py`.
+- 16 mutation anchors over the money guards.
+
+Deferred, on purpose: the deposit ledger does not yet carry `btc_index` for
+any real handle (stage 4 mints the addresses), so on a live box the job
+refuses `no_btc_deposit` until then; broadcast (stage 3); the relay
+strategy for the >80-byte memo (stage 3, see section 2).
+
+Stages 0 and 1 are done and green; this was the first one that touches a
+spend key.
 
 Written after mapping three surfaces in full: the wake protocol and the vault's
 job runner, the existing ThorChain/SwapKit preparer and the Tor helpers, and the
@@ -192,9 +222,14 @@ Consequences to handle, both already located:
   habit. Use 294 for the change output's own dust test and say so in a comment,
   because using 546 "because everyone does" is how a valid change output gets
   needlessly burned to fees.
-- Change below dust is **absorbed into the fee**, not created. Change at or above
-  dust goes to a fresh change address (`change=1`) derived from the same account
-  xpub — the vault can derive it, and the Pi can watch it.
+- **No change output, by decision.** The whole settled deposit is forwarded:
+  `send = settled - fee`, where the fee is sized against the upper bound, so
+  the only "change" that could exist is the sizing slack (a few dozen
+  satoshis) and it goes to the miner. A change output would chain every
+  forward to the next on-chain and give a forensic reader the host's
+  forwarding history for free. The builder supports a change output (tested)
+  for a future partial forward; the tool never emits one. `DUST_SAT_P2WPKH`
+  is kept for that day.
 - A deposit too small to forward net of fee is refused **up front with the number**
   ("this needs at least N sat to forward; M arrived"), never silently stranded.
 - The mix floor gate is the existing worst-case-arrival test, reused exactly:

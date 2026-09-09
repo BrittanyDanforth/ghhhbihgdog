@@ -1076,6 +1076,10 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # destination in plain text.
     "thor_pairs.json", "thor_pairs.json.gpg",
     "thor_pairs_*.json", "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+    # The BTC forward's plan: the deposit address, every input, the inbound
+    # vault, the memo naming the XMR destination, and the SIGNED transaction.
+    # Everything a forensic reader wants in one file; it does not survive.
+    "btc_forward_*.json",
     "exitplan_*.json", "exitplan_v1.json",
     "integrity_chain.log", "integrity.log",
     "*.blob", "*.signed", "*.unsigned",
@@ -2460,6 +2464,57 @@ def memo_size_note(memo: str) -> str:
             f"OP_RETURN, and the network must relay it, or the memo is "
             f"refused or cut short -- and a cut memo pays nobody. Confirm the "
             f"wallet can carry it BEFORE sending.")
+
+
+def memo_bytes(memo: str) -> int:
+    """How many bytes the memo occupies in an OP_RETURN: its UTF-8 length.
+    The relay limit counts pushed data bytes, not characters."""
+    return len((memo or "").encode("utf-8"))
+
+
+def memo_will_overflow(memo: str, limit: int = OP_RETURN_STD_BYTES) -> bool:
+    """True when the memo cannot ride in an OP_RETURN of `limit` data bytes.
+
+    The predicate behind memo_size_note, split out because the host-side
+    forward (btc_forwarder) REFUSES on it rather than warning: when this box
+    builds the OP_RETURN itself, a memo that will not relay is its own
+    transaction to refuse, not a sender's wallet to warn about. `limit` is the
+    operator's relay policy (a node run with a raised datacarrier limit can
+    carry more), never lower than what a valid push can express.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit must be a positive int")
+    return memo_bytes(memo) > limit
+
+
+#: The dust threshold for a P2WPKH output at the default 3000 sat/kvB relay
+#: rate: 294 sat. The 546 the ecosystem quotes from habit is the P2PKH figure;
+#: using it here would burn a valid change output to fees for no reason.
+DUST_SAT_P2WPKH = 294
+
+
+def electrum_fee_to_sat_vb(btc_per_kb) -> Optional[int]:
+    """Electrum's blockchain.estimatefee answer -- BTC per kilobyte, or -1 for
+    "no estimate" -- as whole satoshis per virtual byte, rounded UP, or None.
+
+    None, never 0, for anything that is not a positive finite number: a
+    server that cannot estimate says -1, and a caller that took that as "free"
+    would build a transaction no node relays. Integer arithmetic on the
+    Decimal of the text form, so a float like 0.00001234 does not pick up
+    binary noise on the way to a satoshi count.
+    """
+    if isinstance(btc_per_kb, bool):
+        return None
+    if not isinstance(btc_per_kb, (int, float, str, Decimal)):
+        return None
+    d = finite_decimal(str(btc_per_kb))
+    if d is None or d <= 0:
+        return None
+    # BTC/kB -> sat/vB: x * 1e8 / 1000 = x * 1e5. Ceil so an estimate of
+    # 1.2 sat/vB pays 2, never 1 -- under the target is the failure mode
+    # that strands the forward.
+    sat_vb = (d * 100000).to_integral_value(rounding="ROUND_CEILING")
+    return int(sat_vb) if sat_vb >= 1 else None
 
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)

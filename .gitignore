@@ -35,6 +35,8 @@ thor_pairs.json
 thor_pairs.json.gpg
 thor_pairs_*.json
 thor_pairs_*.json.gpg
+# The BTC forward's plan: inputs, inbound, memo, the SIGNED transaction.
+btc_forward_*.json
 exitplan_*.json
 *.unsigned
 *.signed

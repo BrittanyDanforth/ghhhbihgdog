@@ -254,6 +254,7 @@ _NOT_ARTIFACTS = {
     # points in that same list do not match this scan's shape at all.
     "gs_wake_proto.py": "this repo's own source, named by the compile action",
     "gs_btc_watch.py": "this repo's own source, named by the compile action",
+    "gs_btc_tx.py": "this repo's own source, named by the compile action",
     "tumble.py": "JoinMarket's tumbler, named in a comment about a wrong path",
     "tumbler.py": "JoinMarket's tumbler script, an INPUT this tool executes",
     # The placeholder in the console's JoinMarket wallet field. JoinMarket
