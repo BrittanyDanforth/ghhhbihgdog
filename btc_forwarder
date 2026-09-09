@@ -158,6 +158,31 @@ def fee_band(rate, floor, ceiling):
     return rate
 
 
+def select_inputs(utxos, min_conf, rate):
+    """The outputs the forward spends, and why the rest are left.
+
+    SETTLED TO min_conf, output by output -- gs_btc_watch.summarize counts
+    settled_sat that way, and an input that is mined but shallower would be
+    spent while not counted, so its whole value would go to the miner as
+    fee. And WORTH SPENDING: each P2WPKH input costs about 69 vB, and an
+    output worth less than twice its own cost at this rate is dust someone
+    (perhaps deliberately) parked on the address; sweeping two hundred of
+    them would make the fee eat the deposit and strand the real payment.
+    Dust stays where it is; it is not money this forward can carry.
+    Returns (chosen, skipped_dust, unsettled)."""
+    marginal_vb = btx.INPUT_BASE + -(-btx.WITNESS_P2WPKH_MAX // 4)
+    floor = 2 * marginal_vb * rate
+    chosen, dust, unsettled = [], 0, 0
+    for u in utxos:
+        if u["confirmations"] < min_conf or u["confirmations"] < 1:
+            unsettled += 1
+        elif u["value"] <= floor:
+            dust += 1
+        else:
+            chosen.append(u)
+    return chosen, dust, unsettled
+
+
 def size_the_fee(n_inputs, op_return_limit, rate):
     """(vsize_upper_bound, fee_sat) for a transaction of `n_inputs` P2WPKH
     inputs, the largest inbound output and the largest OP_RETURN the policy
@@ -368,18 +393,23 @@ def account_for(words, passphrase, network, account_xpub):
     return account
 
 
-def build_and_sign(picture, inbound_spk, send_sat, memo_b, account, index,
-                   address, network, sign):
-    """The transaction, unsigned when `sign` is False. Returns (tx, txid,
-    vsize, real_rate, signed)."""
-    settled = [u for u in picture["utxos"] if u["confirmations"] > 0
-               and u["value"] > 0]
+def build_and_sign(chosen, tip, inbound_spk, send_sat, fee_sat, memo_b,
+                   account, index, address, network, sign):
+    """The transaction over the CHOSEN inputs, unsigned when `sign` is
+    False. Returns (tx, txid, vsize, real_rate, signed). Refuses unless the
+    built transaction's fee is EXACTLY the fee that was sized: inputs minus
+    outputs is what the miner keeps, and a stray input would make it more
+    than anyone decided."""
     inputs = [{"tx_hash": u["tx_hash"], "vout": u["vout"],
-               "value": u["value"]} for u in settled]
-    values = [u["value"] for u in settled]
+               "value": u["value"]} for u in chosen]
+    values = [u["value"] for u in chosen]
     tx = btx.build_unsigned(
         inputs, [(send_sat, inbound_spk), (0, btx.op_return_script(memo_b))],
-        locktime=int(picture["tip"]))
+        locktime=int(tip))
+    if btx.fee_of(tx, values) != fee_sat:
+        raise Refused("fee_mismatch",
+                      "the built transaction's fee is not the fee that was "
+                      "sized; refusing to let an input go to the miner")
     if not sign:
         return tx, btx.txid_hex(tx), None, None, False
     try:
@@ -510,16 +540,23 @@ def main(argv=None):
         raise SystemExit(EXIT_FAILED)
     if shutdown_requested():
         raise SystemExit(EXIT_FAILED)
-    settled_sat = picture["settled_sat"]
-    n_inputs = sum(1 for u in picture["utxos"] if u["confirmations"] > 0)
-    if settled_sat <= 0 or n_inputs == 0:
+    if picture["settled_sat"] <= 0:
         raise Refused("nothing_settled",
                       f"nothing is settled at this address to {args.min_conf} "
                       "confirmations; ask again later")
 
-    # 2. the fee, sized against the largest transaction the policy allows
+    # 2. the fee, sized against the largest transaction the policy allows,
+    #    over the inputs worth spending at that rate
     rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
                     args.feerate_floor, args.feerate_ceiling)
+    chosen, skipped_dust, unsettled = select_inputs(picture["utxos"],
+                                                    args.min_conf, rate)
+    if not chosen:
+        raise Refused("nothing_economic",
+                      "what is settled here is all dust at this fee rate: "
+                      "each output would cost more to spend than it carries")
+    settled_sat = sum(u["value"] for u in chosen)
+    n_inputs = len(chosen)
     vsize_bound, fee_sat = size_the_fee(n_inputs, args.op_return_max_bytes,
                                         rate)
     send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
@@ -552,8 +589,8 @@ def main(argv=None):
         account = account_for(words, passphrase, args.network, args.xpub)
         del words
     tx, txid, vsize, real_rate, signed = build_and_sign(
-        picture, inbound_spk, send_sat, memo_b, account, args.index, address,
-        args.network, sign=not args.plan_only)
+        chosen, picture["tip"], inbound_spk, send_sat, fee_sat, memo_b,
+        account, args.index, address, args.network, sign=not args.plan_only)
     if signed and real_rate < args.feerate_floor:
         raise Refused("fee_out_of_band", "the signed transaction's real "
                       "rate fell under the floor")
@@ -569,7 +606,9 @@ def main(argv=None):
         "address": address,
         "inputs": [{"tx_hash": u["tx_hash"], "vout": u["vout"],
                     "value": u["value"], "confirmations": u["confirmations"]}
-                   for u in picture["utxos"] if u["confirmations"] > 0],
+                   for u in chosen],
+        "skipped_dust": skipped_dust,
+        "unsettled_outputs": unsettled,
         "tip": picture["tip"],
         "inbound": inbound,
         "inbound_cross_checked": cross_checked,
@@ -598,7 +637,9 @@ def main(argv=None):
     print(f"  forward {'SIGNED' if signed else 'PLANNED (unsigned)'}, "
           f"NOT BROADCAST (dry run)")
     print(f"  from {scrub_address(address)} index {args.index}: "
-          f"{settled_sat} sat settled in {n_inputs} output(s)")
+          f"{settled_sat} sat in {n_inputs} spendable output(s)"
+          f"{f', {skipped_dust} dust left' if skipped_dust else ''}"
+          f"{f', {unsettled} not yet settled' if unsettled else ''}")
     print(f"  to   {scrub_address(inbound)}"
           f"{' (THORNode-verified)' if cross_checked else ''}: "
           f"{send_sat} sat, fee {fee_sat} sat at {rate} sat/vB "

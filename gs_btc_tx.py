@@ -65,6 +65,10 @@ WITNESS_P2WPKH_MAX = 1 + 1 + 73 + 1 + 33
 INPUT_BASE = 36 + 1 + 4
 #: The account level of BIP84: m/84'/coin'/0'.
 BIP84_PURPOSE = 84
+#: nLockTime at or above this is a UNIX timestamp, not a height.
+LOCKTIME_THRESHOLD = 500_000_000
+#: 21 million bitcoin in satoshis; no honest value is above it.
+MAX_MONEY = 21_000_000 * 100_000_000
 _HARDENED = 0x80000000
 
 _NETWORKS = {"main": "main", "mainnet": "main",
@@ -215,6 +219,13 @@ def _check_input(u):
             raise BtcTxError(f"input {name} must be a non-negative int")
     if value == 0:
         raise BtcTxError("input value is zero")
+    # Wire widths, so a hostile listunspent cannot make serialisation blow
+    # up far from the cause: vout is 4 bytes, value is 8 bytes and below
+    # the money supply.
+    if vout > 0xFFFFFFFF:
+        raise BtcTxError("input vout out of range")
+    if value > MAX_MONEY:
+        raise BtcTxError("input value exceeds the money supply")
     return txid.lower(), vout, value
 
 
@@ -230,9 +241,12 @@ def build_unsigned(inputs, outputs, locktime=0):
         raise BtcTxError("no inputs")
     if not outputs:
         raise BtcTxError("no outputs")
+    # A BLOCK HEIGHT, never a timestamp: Bitcoin reads nLockTime at or
+    # above 500,000,000 as UNIX time, so a "height" in that range would
+    # silently become a date decades away.
     if isinstance(locktime, bool) or not isinstance(locktime, int) \
-            or not 0 <= locktime <= 0xFFFFFFFF:
-        raise BtcTxError("locktime out of range")
+            or not 0 <= locktime < LOCKTIME_THRESHOLD:
+        raise BtcTxError("locktime must be a block height")
     seen = set()
     vin, total_in = [], 0
     for u in inputs:
@@ -243,7 +257,9 @@ def build_unsigned(inputs, outputs, locktime=0):
         vin.append(TransactionInput(bytes.fromhex(txid), vout,
                                     sequence=SEQUENCE_RBF))
         total_in += value
-    vout_list, total_out = [], 0
+    if total_in > MAX_MONEY:
+        raise BtcTxError("inputs exceed the money supply")
+    vout_list, total_out, data_outputs = [], 0, 0
     for value, spk in outputs:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise BtcTxError("output value must be a non-negative int")
@@ -254,8 +270,13 @@ def build_unsigned(inputs, outputs, locktime=0):
             raise BtcTxError("a zero-value output that is not OP_RETURN")
         if value != 0 and is_data:
             raise BtcTxError("an OP_RETURN output must carry zero")
+        data_outputs += is_data
         vout_list.append(TransactionOutput(value, spk))
         total_out += value
+    if data_outputs > 1:
+        # Relay policy: one data output per transaction. A second would be
+        # a valid, unrelayable transaction -- the worst kind.
+        raise BtcTxError("more than one OP_RETURN output")
     if total_out > total_in:
         raise BtcTxError("outputs exceed inputs")
     return Transaction(version=2, vin=vin, vout=vout_list, locktime=locktime)
@@ -375,6 +396,11 @@ def verify_signed(tx, input_values, pubkeys):
     if len(input_values) != len(tx.vin) or len(pubkeys) != len(tx.vin):
         raise BtcTxError("one value and one pubkey per input")
     from embit.ec import Signature
+    # INDEPENDENT OF THE SIGNER'S CACHE: embit memoises the sighash
+    # midstate and never invalidates it, so a verifier that reused it
+    # would pass a transaction mutated after signing. Re-derive from
+    # scratch.
+    tx.clear_cache()
     ok = True
     for i, (value, pub) in enumerate(zip(input_values, pubkeys)):
         items = tx.vin[i].witness.items
