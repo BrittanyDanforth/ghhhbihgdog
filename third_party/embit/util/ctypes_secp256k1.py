@@ -58,24 +58,18 @@ def _find_library():
     elif platform.system() == "Windows":
         extension = ".dll"
 
-    path = os.path.join(
-        os.path.dirname(__file__),
-        "prebuilt/libsecp256k1_%s_%s%s"
-        % (platform.system().lower(), platform.machine().lower(), extension),
-    )
-    if os.path.isfile(path):
-        return path
-    # try searching
-    if not library_path:
-        library_path = ctypes.util.find_library("libsecp256k1")
+    # VENDORED DEVIATION: upstream looked for a prebuilt blob INSIDE this
+    # package first ("prebuilt/libsecp256k1_<os>_<arch>.<ext>") and then for
+    # a hand-installed /usr/local/lib/libsecp256k1.so.0. Both are gone. The
+    # blobs were deleted at vendoring and the search that would have loaded
+    # one back is deleted too: a file dropped into this tree must never
+    # become the curve that signs. Only the SYSTEM library, found the way the
+    # dynamic linker finds it, is loaded -- the one the distro's signed
+    # package installed and the package manager can verify.
+    del extension
+    library_path = ctypes.util.find_library("libsecp256k1")
     if not library_path:
         library_path = ctypes.util.find_library("secp256k1")
-    # library search failed
-    if not library_path:
-        if platform.system() == "Linux" and os.path.isfile(
-            "/usr/local/lib/libsecp256k1.so.0"
-        ):
-            library_path = "/usr/local/lib/libsecp256k1.so.0"
     return library_path
 
 
