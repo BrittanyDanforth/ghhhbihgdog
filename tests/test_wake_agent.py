@@ -4545,8 +4545,14 @@ def _fwd_run(rec, key_extra=None, seed=_FWD_MNEMONIC, ledger=True):
         os.environ.pop("GS_BTC_SEED", None)
     else:
         os.environ["GS_BTC_SEED"] = seed
+    # A CRASH IS NOT A CATCH: a mutation that removes a guard can make the
+    # agent raise something other than Refused (a KeyError on the missing
+    # seed, say). That must read as a red check, not as this file dying
+    # with no RESULT line -- which mutation_sweep scores NO-RESULT.
     try:
         out, err, text = run(kk, dp)
+    except Exception as e:                                   # noqa: BLE001
+        out, err = None, e
     finally:
         os.environ.pop("GS_BTC_SEED", None)
     return out, err, dp["_ran"]
@@ -4558,23 +4564,23 @@ _o, _e, _ran = _fwd_run(_FWD_REC, {"allow_withdraw": True,
                                       if k != "allow_btc_forward"}})
 check("WITHOUT allow_btc_forward the forward is refused as "
       "forward_not_allowed -- and allow_withdraw being ON does not unlock it",
-      _o is None and _e.code == "forward_not_allowed" and _ran == [])
+      _o is None and getattr(_e, "code", None) == "forward_not_allowed" and _ran == [])
 _o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY, seed=None)
 check("with the switch on but no GS_BTC_SEED in the environment: refused "
       "btc_seed_unset before any child runs",
-      _o is None and _e.code == "btc_seed_unset" and _ran == [])
+      _o is None and getattr(_e, "code", None) == "btc_seed_unset" and _ran == [])
 _o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY)
 check("with the switch, the config and the seed: the job runs ONE child, "
       "btc_forwarder, and reports done with the handle it was asked about",
       _e is None and _o is not None and len(_ran) == 1
       and os.path.basename(_ran[0][0][1]) == "btc_forwarder"
       and _o[2] == "A3F1")
-_argv, _env = _ran[0]
+_argv, _env = _ran[0] if _ran else ([], {})    # no crash if the child never ran
 check("...the argv is composed from the KEYFILE and the LEDGER: --dry-run, "
       "the xpub, both servers, the network, min-conf, the OP_RETURN policy, "
       "THORNode, the handle's bundle as the destination, its BTC index, and "
       "an outfile named for the handle",
-      "--dry-run" in _argv
+      bool(_ran) and "--dry-run" in _argv
       and _argv[_argv.index("--xpub") + 1] == "xpub6FIXTUREACCOUNT"
       and _argv.count("--electrum") == 2 and "t.onion:50001" in _argv
       and _argv[_argv.index("--network") + 1] == "main"
@@ -4596,33 +4602,34 @@ try:
 finally:
     os.environ.pop("GS_BTC_SEED_PASSPHRASE", None)
 check("...and a passphrase, when set, rides alongside it",
-      _e is None and _ran[0][1].get("GS_BTC_SEED_PASSPHRASE") == "pp")
+      _e is None and bool(_ran)
+      and _ran[0][1].get("GS_BTC_SEED_PASSPHRASE") == "pp")
 _o, _e, _ran = _fwd_run(_FWD_REC, {"allow_btc_forward": True})
 check("the switch without the BTC config (no xpub, no server) is refused "
       "no_btc_config, and no child runs",
-      _o is None and _e.code == "no_btc_config" and _ran == [])
+      _o is None and getattr(_e, "code", None) == "no_btc_config" and _ran == [])
 _o, _e, _ran = _fwd_run({**_FWD_REC, "btc_index": None}, _FWD_KEY)
 check("a handle with no BTC deposit index (a client-paid quote) is refused "
-      "no_btc_deposit", _o is None and _e.code == "no_btc_deposit"
+      "no_btc_deposit", _o is None and getattr(_e, "code", None) == "no_btc_deposit"
       and _ran == [])
 _o, _e, _ran = _fwd_run({k: v for k, v in _FWD_REC.items()
                          if k != "btc_index"}, _FWD_KEY)
 check("...and so is one from before the field existed",
-      _o is None and _e.code == "no_btc_deposit")
+      _o is None and getattr(_e, "code", None) == "no_btc_deposit")
 _o, _e, _ran = _fwd_run({**_FWD_REC, "spent": True}, _FWD_KEY)
 check("a handle already paid out is refused already_moved",
-      _o is None and _e.code == "already_moved" and _ran == [])
+      _o is None and getattr(_e, "code", None) == "already_moved" and _ran == [])
 _o, _e, _ran = _fwd_run({**_FWD_REC, "owner": "f" * 16}, _FWD_KEY)
 check("ANOTHER OWNER'S handle is refused handle_not_yours at the vault, "
-      "whatever the note said", _o is None and _e.code == "handle_not_yours"
+      "whatever the note said", _o is None and getattr(_e, "code", None) == "handle_not_yours"
       and _ran == [])
 _o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
 check("a handle naming no single bundle has no destination: "
       "handle_not_forwardable", _o is None
-      and _e.code == "handle_not_forwardable")
+      and getattr(_e, "code", None) == "handle_not_forwardable")
 _o, _e, _ran = _fwd_run(None, _FWD_KEY, ledger=False)
 check("an unknown handle is refused unknown_handle",
-      _o is None and _e.code == "unknown_handle" and _ran == [])
+      _o is None and getattr(_e, "code", None) == "unknown_handle" and _ran == [])
 check("the forward's result budget fits the unit and sits between the "
       "probe's and the withdrawal's",
       P.result_budget_s("swap_status") < P.result_budget_s("forward_to_swap")
