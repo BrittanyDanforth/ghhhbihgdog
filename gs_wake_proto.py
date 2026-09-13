@@ -172,7 +172,16 @@ import time
 #: immediate failure the rest of this header promises. Update both boxes
 #: together. The job is in SPENDING_JOBS and its tool in GATED_TOOLS, gated
 #: on the keyfile's own `allow_btc_forward`, not on `allow_withdraw`.
-WIRE_VERSION = 4
+#:
+#: 5: two phase words, `sent` and `unsure`, for a forward that was handed to
+#: the Bitcoin network (stage 3). No record changes shape; what changes is
+#: the closed vocabulary the doorbell accepts on the `phase` field, so an
+#: OLD Pi refuses a new vault's M3 that carries either word -- the vault's
+#: report lands as "collected_no_result" there, loud and at the moment it
+#: matters. Update both boxes together. The forward SENDS only when the
+#: vault's keyfile also carries `allow_btc_broadcast`; without it the job is
+#: the stage-2 rehearsal and carries no phase.
+WIRE_VERSION = 5
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -375,8 +384,16 @@ PLAIN_FIELDS = {
 #:              Pi's own soft cap says the same words from memory; this is
 #:              the vault saying them when the Pi's memory was wrong (a
 #:              restart forgot who holds a place).
+#:   sent       a forward was handed to the Bitcoin network: a server took
+#:              it. ON A DONE FORWARD ONLY. Says nothing about depth.
+#:   unsure     a forward's bytes left and no server confirmed taking them:
+#:              the money MAY have moved. Reported as "unsure" rather than
+#:              as "failed" for the same reason not_yet exists -- a machine
+#:              that says "failed" about money in flight is telling a lie
+#:              the operator will act on. The signed transaction is kept
+#:              on the vault until the network shows it.
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
-          "more_locked", "moved", "partial", "full")
+          "more_locked", "moved", "partial", "full", "sent", "unsure")
 
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
@@ -835,6 +852,13 @@ PHASE_LINES = {
     "short": "arrived, but UNDER what was quoted, and it has stopped growing. "
              "Check before going further.",
     "stuck": "not scanning, so this says NOTHING about your money. Check.",
+    # A FORWARD THAT WENT OUT, and one that may have. Neither names the
+    # coin, the amount, the server or the machine; "ask again later" is
+    # the whole of what to do, as with not_yet.
+    "sent": "the forward went out. It confirms on its own — ask again "
+            "later.",
+    "unsure": "the forward may or may not have gone out. It will be checked "
+              "before anything else is done with it.",
     # NOT RENDERED ON ITS OWN. The pager acts on this one -- it starts the
     # next leg -- and says so in its own words, because "more left" is not
     # something the operator has to do anything about. The sentence is here

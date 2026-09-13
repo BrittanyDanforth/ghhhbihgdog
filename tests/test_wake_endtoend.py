@@ -395,12 +395,67 @@ try:
         "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
         key_extra=_BTC_KEY, env={"GS_BTC_SEED": _MNEMONIC},
         deps_over={"extend_deadman": lambda s: True})
-    check("a SECOND forward of the same handle is refused on the real path "
+    check("a SECOND rehearsal of the same handle is refused on the real path "
           "(already_forwarded) and the doorbell hears 'refused' -- no reason "
           "travels", out3 is None and err3 is not None
           and getattr(err3, "code", None) == "already_forwarded"
           and p3 is not None and p3.result
           and p3.result["status"] == "refused" and ran3 == [])
+
+    print("\n== forward_to_swap SENDS: the second switch, the word on the "
+          "wire, once ==")
+    _ran4 = []
+
+    def _sending_child(argv, env_extra, budget):
+        """The forwarder, faked: records its argv and writes the plan a
+        real --broadcast run writes when a server took the transaction."""
+        _ran4.append((list(argv), dict(env_extra or {})))
+        _of = argv[argv.index("--outfile") + 1]
+        Path(_of).write_text(json.dumps({"broadcast": True,
+                                         "broadcast_outcome": "accepted",
+                                         "seen": True}))
+        return 0, False
+
+    _SEND_KEY = {**_BTC_KEY, "allow_btc_broadcast": True}
+    p4, out4, err4, ran4, text4 = cycle(
+        "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
+        key_extra=_SEND_KEY, env={"GS_BTC_SEED": _MNEMONIC},
+        deps_over={"extend_deadman": lambda s: True,
+                   "run_child": _sending_child})
+    check("with allow_btc_broadcast paired, a sending run SUPERSEDES the "
+          "rehearsal on the real path: the child was composed with "
+          "--broadcast (not --dry-run), the agent reports done",
+          err4 is None and out4 and out4[0] == "done" and len(_ran4) == 1
+          and "--broadcast" in _ran4[0][0] and "--dry-run" not in _ran4[0][0])
+    check("...the M3 the doorbell heard carries the closed word 'sent' and "
+          "nothing else new -- no slip, no plain, the deposit's handle",
+          p4 is not None and p4.result and p4.result["status"] == "done"
+          and p4.result["phase"] == "sent" and p4.result["slip"] == ""
+          and p4.result["plain"] == {} and p4.result["handle"] == _h1)
+    _buf4 = io.StringIO()
+    with contextlib.redirect_stdout(_buf4):
+        _rc4 = DB.report(p4)
+    check("...and the doorbell renders the protocol's sentence for it, not "
+          "the rehearsal line", _rc4 == 0
+          and P.PHASE_LINES["sent"] in _buf4.getvalue()
+          and "rehearsal" not in _buf4.getvalue())
+    _led4 = json.loads(_lp.read_text())
+    _rec4 = (_led4.get("handles") or _led4)[_h1]
+    check("...the ledger marks the handle SENT (a boolean beside the bucket "
+          "and the path; no txid, no server)",
+          _rec4.get("forward_sent") is True
+          and not any(k in json.dumps(_rec4) for k in ("txid", "server",
+                                                        "accepted")))
+    p5, out5, err5, ran5, text5 = cycle(
+        "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
+        key_extra=_SEND_KEY, env={"GS_BTC_SEED": _MNEMONIC},
+        deps_over={"extend_deadman": lambda s: True})
+    check("ONCE: a second sending run on a SENT handle is refused "
+          "already_forwarded on the real path, no child runs, the doorbell "
+          "hears 'refused'", out5 is None
+          and getattr(err5, "code", None) == "already_forwarded"
+          and ran5 == [] and p5 is not None and p5.result
+          and p5.result["status"] == "refused")
 
     print("\n== the ceremony survives whatever else is on the switch ==")
     # FOUND BY DRIVING IT. A two-line readiness probe in this very file

@@ -3253,9 +3253,15 @@ class Pager:
             # renders nothing it might have been sent anyway. Rule 6: no
             # address, no amount, no memo, and no invitation to pay.
             if job == "forward_to_swap":
+                # WITH A WORD, THE WORD'S OWN SENTENCE (sent / unsure): the
+                # forward went out, or may have. Without one, a rehearsal.
+                if phase and phase in proto.PHASE_LINES:
+                    self.send(chat_id, f"{_cn}: {proto.PHASE_LINES[phase]}",
+                              buttons=self._handle_buttons(h, job, chat_id))
+                    return
                 self.send(chat_id,
                           f"{_cn}: forward signed on the machine. Nothing "
-                          f"was sent yet (stage 2).",
+                          f"was sent.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
             # SCOPED TO THE WATCHING JOBS, and it used to catch everything.

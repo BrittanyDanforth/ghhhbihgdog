@@ -939,6 +939,9 @@ check("...submit was given THIS address, the configured servers, the proxy, "
       and _net.seens[0]["address"] == _ADDR0
       and _net.seens[0]["wait_s"] == 90.0
       and _net.seens[0]["interval_s"] == 15.0)
+check("...and seen is told which server ACCEPTED, so its proof comes from "
+      "another one where there is one",
+      _net.seens[0]["avoid"] == "s.onion" == _plan["broadcast_server"])
 check("...THE HEX IS NOWHERE: not in the plan (the network has it), not on "
       "stdout", _plan["tx_hex"] is None and _plan["tx_hex_reason"] is None
       and _plan["signed_hex_written"] is False

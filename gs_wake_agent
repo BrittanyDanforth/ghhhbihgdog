@@ -1298,6 +1298,36 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
     return True
 
 
+def _btc_broadcast_on(key: dict) -> bool:
+    """Does this keyfile let a forward SEND? Both switches, as booleans:
+    `allow_btc_forward` (the forward may sign) and `allow_btc_broadcast`
+    (it may hand the result to the network). Absent means no -- every
+    keyfile from before the field existed is a rehearsal-only keyfile --
+    and a value present and not a boolean is refused, never coerced."""
+    v = key.get("allow_btc_broadcast", False)
+    if not isinstance(v, bool):
+        raise Refused("btc_config_malformed",
+                      "this machine's keyfile carries an allow_btc_broadcast "
+                      "that is not a boolean; re-pair.")
+    return bool(key.get("allow_btc_forward")) and v
+
+
+def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
+    """(moved, outcome) from the plan btc_forwarder wrote for `handle`:
+    moved is True only when the plan says broadcast and names an outcome
+    after which money may have moved (accepted, ambiguous). NEVER raises:
+    no plan, an unreadable one, a dry run -- all (False, None)."""
+    try:
+        plan = (reader or _read_json)(
+            Path(artifact_dir) / f"btc_forward_{handle}.json") or {}
+        outcome = plan.get("broadcast_outcome")
+        moved = (plan.get("broadcast") is True
+                 and outcome in ("accepted", "ambiguous"))
+        return moved, (outcome if moved else None)
+    except Exception:                                        # noqa: BLE001
+        return False, None
+
+
 def _btc_setting(key: dict, name: str, default: int, lo: int, hi: int) -> int:
     """A whole-number BTC-intake setting from the keyfile: the default only
     when the field is ABSENT (a keyfile from before it existed), refused
@@ -1549,7 +1579,10 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
         # Both ride in the environment of this one step, set by _dispatch,
         # like the seed and like GS_SWAP_AMOUNTS.
         argv = [sys.executable, _tool("btc_forwarder"),
-                "--dry-run",                       # stage 2: never broadcasts
+                # THE MODE IS THE KEYFILE'S SECOND SWITCH. A rehearsal --
+                # signed, printed, never sent -- unless the operator paired
+                # --allow-btc-broadcast as well; then the forward SENDS.
+                "--broadcast" if _btc_broadcast_on(key) else "--dry-run",
                 "--tor-proxy", proxy,
                 "--network", _net,
                 "--dest-from-receive-wallet", str(bundle),
@@ -2446,7 +2479,7 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     else:
         slip, plain = "", {}
     phase = _phase_of(job, artifact_dir, key=key, status=status,
-                      owner=params.get("owner"))
+                      owner=params.get("owner"), handle=handle)
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
                 plain=plain, phase=phase, poster=d.get("post_record"),
                 sleeper=d.get("sleep"))
@@ -2482,8 +2515,16 @@ _PHASE_OF_STATE = {
 
 
 def _phase_of(job: str, artifact_dir: Path, reader=None,
-              key: dict = None, status: str = "", owner=None) -> str:
+              key: dict = None, status: str = "", owner=None,
+              handle: str = "") -> str:
     """The one word a status probe earned, or "". NEVER raises.
+
+    A DONE FORWARD ANSWERS FROM ITS PLAN: `sent` when a server took the
+    transaction, `unsure` when the bytes left and nothing confirmed taking
+    them (the money MAY have moved -- "failed" would be the lie the
+    vocabulary exists to stop), and "" for a rehearsal or a run that never
+    got that far. The txid, the server and the outcome word itself stay in
+    the plan; only the closed word travels.
 
     BOTH WATCHING JOBS, not just the short one. `watch` used to be excluded
     here, so a 110-minute wait that ended with the money still in flight came
@@ -2492,6 +2533,13 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
     swap_status exists to stop saying. Both now write the same status file and
     both are read the same way.
     """
+    if job == "forward_to_swap":
+        if status != "done" or not handle:
+            return ""
+        moved, outcome = _forward_outcome(artifact_dir, handle, reader)
+        if not moved:
+            return ""
+        return "sent" if outcome == "accepted" else "unsure"
     # A FINISHED WITHDRAWAL ANSWERS A DIFFERENT QUESTION: is there another
     # arrival still sitting here?
     #
@@ -3123,16 +3171,37 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             raise Refused("already_moved",
                           f"handle {params['handle']} has already been paid "
                           "out; there is nothing left to forward.")
-        # ONCE. A done forward marks its record (a time bucket, no amount,
-        # no txid), and a second wake on the same handle is refused rather
-        # than re-quoting the same destination and amount on a fresh circuit
-        # and silently overwriting the plan the job log describes. Stage 3
-        # consumes the plan and clears the mark; a re-plan is explicit.
-        if rec.get("forwarded"):
+        # ONCE SENT, NEVER AGAIN. A forward that was handed to the network
+        # (or may have been: `forward_sent` covers the ambiguous outcome
+        # too) has moved the money; a second run would re-quote the same
+        # destination for an address that is empty, or -- if the first
+        # send never propagated -- sign a CONFLICTING spend of the same
+        # outputs. Stage 5 owns re-sending the same signed bytes.
+        # THE PLAN ON DISK IS CONSULTED TOO, not the ledger alone: a crash
+        # between the child's exit and the ledger mark would leave a plan
+        # saying "accepted" beside a record saying nothing, and the next
+        # wake would sign a CONFLICTING spend of outputs already in flight.
+        # The file the sending run wrote is the record of what it did.
+        _sent_before = (rec.get("forward_sent")
+                        or _forward_outcome(artifact_dir, params["handle"])[0])
+        if _sent_before:
+            integrity_log("wake", "forward_repeat")
+            raise Refused("already_forwarded",
+                          f"handle {params['handle']} has already been sent "
+                          "on from this machine.")
+        # A REHEARSAL MAY BE FOLLOWED BY THE REAL THING, and by nothing
+        # else. A done dry run marks its record (a time bucket, no amount,
+        # no txid); a second DRY RUN is refused rather than re-quoting the
+        # same destination on a fresh circuit and silently overwriting the
+        # plan the job log describes. A --broadcast run supersedes the
+        # rehearsal: it quotes and signs afresh and overwrites the plan
+        # with the one that was sent.
+        if rec.get("forwarded") and not _btc_broadcast_on(key):
             integrity_log("wake", "forward_repeat")
             raise Refused("already_forwarded",
                           f"handle {params['handle']} already has a forward "
-                          "planned on this machine.")
+                          "planned on this machine; only a sending run may "
+                          "follow a rehearsal.")
         bundle = rec.get("bundle")
         if not bundle:
             raise Refused("handle_not_forwardable",
@@ -3631,13 +3700,18 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # pointing at that (account, subaddress) is now a deposit that has been
     # paid out, and a /check on it is answered from here -- see the
     # watching branch above -- rather than from an emptied address.
-    # THE FORWARD IS MARKED ON ITS RECORD: when (a 600 s bucket) and where
-    # the plan is, so the wipe takes the plan with the handle and a repeat
-    # wake is refused (see the forward branch). No amount, no txid.
+    # THE FORWARD IS MARKED ON ITS RECORD: when (a 600 s bucket), where
+    # the plan is, and WHETHER IT WENT OUT (read from the plan the child
+    # wrote, never assumed from the mode: a sending run that was refused
+    # before sending exits non-zero and never reaches here), so the wipe
+    # takes the plan with the handle and a repeat wake is refused (see the
+    # forward branch). No amount, no txid, no outcome word.
     if job == "forward_to_swap" and handle in handles:
         handles[handle]["forwarded"] = int(time.time()) // 600 * 600
         handles[handle]["forward_plan"] = \
             str(artifact_dir / f"btc_forward_{handle}.json")
+        handles[handle]["forward_sent"] = bool(
+            _forward_outcome(artifact_dir, handle)[0])
     if _spent_pair is not None:
         for _rec in handles.values():
             if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:

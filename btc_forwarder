@@ -840,7 +840,8 @@ def main(argv=None):
             seen_r = bcast_seen(txid, address, servers, args.tor_proxy,
                                 network=args.network, timeout=args.timeout,
                                 wait_s=args.seen_wait,
-                                interval_s=args.seen_interval)
+                                interval_s=args.seen_interval,
+                                avoid=sub["server"])
         except watch.PinMismatch:
             seen_r = {"seen": False, "height": None, "server": None,
                       "cert_sha256": None, "polls": 0, "asked": False,

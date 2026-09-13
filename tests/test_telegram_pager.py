@@ -4354,13 +4354,21 @@ def _forward_done(result_extra=None):
 
 _ft = _forward_done()
 _last = _ft[-1] if _ft else ""
-check("a done forward is ONE sentence: signed on the machine, nothing sent "
-      "yet -- no address, no amount, no memo, no invitation to pay",
+check("a done forward with no phase is ONE sentence: signed on the machine, "
+      "nothing sent -- no address, no amount, no memo, no invitation to pay",
       "forward signed on the machine" in _last
-      and "Nothing was sent yet" in _last
+      and "Nothing was sent" in _last
       and not any(w in " ".join(_ft) for w in ("how to pay", "Send exactly",
                                               "To address", "quoted",
                                               "once you have paid")))
+for _fph in ("sent", "unsure"):
+    _ftp = _forward_done({"phase": _fph})
+    _lastp = _ftp[-1] if _ftp else ""
+    check(f"a done forward with the word {_fph!r} is the protocol's own "
+          "sentence for it, under the label, and NOT the rehearsal line",
+          P.PHASE_LINES[_fph] in _lastp and "signed on the machine" not in _lastp
+          and "forward" in _lastp.lower()
+          and not any(ch.isdigit() for ch in P.PHASE_LINES[_fph]))
 _ft2 = _forward_done({"plain": {"b": "0.05", "d": "bc1qxx", "m": "=:XMR", "x": "1",
                                 "h": "A3F1"}})
 check("...and even a payload the vault should never send is NOT rendered "

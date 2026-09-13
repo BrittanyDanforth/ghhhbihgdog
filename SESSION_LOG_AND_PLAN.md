@@ -219,6 +219,84 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### Stage 3: broadcast over Tor — the forward leaves the machine (`STAGE3_PLAN.md`)
+- Planned first (`ed6a087`), built against the plan in three commits.
+- `gs_btc_broadcast.py`: the ONE method that moves bitcoin, as a subclass
+  of the stage-1 watch client in its own file. The Pi's module still names
+  no such method and its three source tripwires are unchanged. `submit()`
+  hands the signed bytes to the configured servers in turn, on the
+  address's own broadcast circuit (`btcsend:`, never the look's), and
+  answers one of four words: `accepted` (our txid came back), `rejected`
+  (every answering server said no; numeric codes only, because ElectrumX
+  echoes the node's reason and for a refused OP_RETURN that reason carries
+  the memo), `ambiguous` (the bytes left and nothing accepted them: a
+  hang-up, a foreign txid — the money MAY have moved), `unreachable` (no
+  send completed). Across a list the word worse for money wins. A
+  `PinMismatch` before any bytes left is raised; after, it is reported
+  inside an `ambiguous` result so "may have moved" survives the signal.
+  `seen()` polls the deposit address's history for the txid and tells "not
+  listed" from "nobody could be asked". The watch client gained a
+  structured `ServerError` and a shared `server_order()`; nothing else in
+  stage 1 moved. test_btc_broadcast 72 (fake transport, and the real
+  transport + subclass through an in-process SOCKS5 + TLS Electrum server,
+  `tests/btcmock.py`).
+- `btc_forwarder --broadcast`, xor `--dry-run`, one required (neither is
+  still `not_dry_run`; both is a contradiction). A quote older than
+  `--quote-max-age` (300 s) is refused before sending; the broadcast sits
+  after every stage-2 guard including the real-rate floor; the outcome
+  table drives the exit code — rejected: refused, nothing moved;
+  unreachable: failed, nothing moved; accepted and ambiguous: exit 0,
+  because "may have moved" must never render as "failed". The signed hex is
+  kept in the plan only while the network has not shown it (`tx_hex_reason`
+  unseen / ambiguous), or under `--write-signed-hex`; a seen broadcast
+  keeps it nowhere. Plan schema v2. The relay strategy for the >80-byte
+  memo is failover across the operator's servers (`STAGE3_PLAN.md` 3.3).
+  test_btc_forwarder 162, including one forward through the REAL
+  transport, subclass and forwarder against the in-process server, which
+  computes the real txid of the hex it is handed.
+- The wire: `PHASES` gains `sent` and `unsure` with numberless,
+  machine-nameless sentences; `WIRE_VERSION` 5. `_phase_of` for a done
+  forward reads the plan through `_forward_outcome` (never raises; the two
+  plan fields must agree). The ledger marks `forward_sent`; a SENT handle is
+  refused `already_forwarded` in every mode, a rehearsed one may be followed
+  by a sending run and by nothing else. `allow_btc_broadcast` is the second
+  keyfile switch (validated as a boolean, never coerced; absent means
+  rehearsal), `--allow-btc-broadcast` at pairing is refused without
+  `--allow-btc-forward`. The doorbell and the pager render the word's own
+  sentence, or the rehearsal line without one.
+  Counts: test_wake_agent 641, test_wake_endtoend 64 (rehearsal, second
+  rehearsal refused, a sending run superseding it with `sent` on the wire,
+  a second sending run refused), doorbell 161, pager 653, plain_slip 225,
+  depo_wizard 432, multi_client 93, protocol 189, sealed_slip 125,
+  stability 50, chain_redaction 207.
+- `tests/real_btc_forward_testnet.py`: the real forwarder against real
+  testnet over real Tor with only the quote stubbed; skips without the
+  three environment variables, so this sandbox (no Tor, no egress) runs its
+  skip path only. Its header says what it cannot prove: that THORChain
+  takes the memo — only mainnet does.
+- **Self-doubt pass over the stage, after the first sweep:** (1) `seen()`
+  polled the same server that had just accepted the transaction first, so
+  a server lying about acceptance could also vouch for propagation; it now
+  takes `avoid=<accepting server>` and starts elsewhere when there is
+  anywhere else. (2) The once-sent rule trusted the ledger alone; a crash
+  between the child's exit and the ledger mark would have let the next
+  wake sign a conflicting spend. `_dispatch` now reads the plan on disk
+  too. One anchor had produced NO-RESULT (a test crashed on a None result
+  instead of going red); the test was hardened so the crash is a catch.
+  Final counts: test_btc_broadcast 75, test_btc_forwarder 163,
+  test_wake_agent 642.
+- 24 stage-3 anchors plus three stage-2 anchors re-pointed by the flag pair
+  and the plan fields, all caught.
+- Two hygiene tripwires the new files tripped, fixed: the console's
+  `compile` action names every shipped script and now names
+  `gs_btc_broadcast.py` (test_console 491); test_concurrency required
+  `--no-zmq` of every `real_*_testnet.py`, which assumed every such suite
+  launches monerod -- the rule is now scoped to suites that do, with a
+  non-vacuity check that it still covers them (52).
+- Not closed, on purpose: confirmation depth, a transaction dropped from
+  mempools, the fee bump, a reorg of the input, and re-sending a kept
+  transaction — stage 5. The custody window is now real money in flight.
+
 ### Stage 2: `forward_to_swap` — build and sign the forward, print it, spend nothing (`STAGE2_PLAN.md`)
 Planned first (`030adbb`, the plan file), then built in the plan's order.
 Three code-mapping passes preceded the plan and corrected four things the
@@ -586,7 +664,7 @@ rule-6 material).
 | 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
 | 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 213/213, 18 anchors all caught (`9f19781`, `2cc59ea`, and the third-round commit) |
 | 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only, reviewed** — `gs_btc_tx.py` (test_btc_tx 73/73, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 133/133; the memo's output limit is SET by the tool, never trusted), job wiring (test_wake_agent 621/621, test_wake_protocol 189/189, test_wake_endtoend 59/59 over real HTTP), 39 anchors all caught; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
-| 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
+| 3 | Broadcast over Tor; "seen" in the network as the proof; testnet end-to-end on a box with Tor; reorg edges and confirmation depth moved to stage 5 | **BUILT** — `gs_btc_broadcast.py` (test_btc_broadcast 75/75), `btc_forwarder --broadcast` (test_btc_forwarder 163/163, one forward through the real transport + real subclass + real forwarder against an in-process SOCKS5+TLS Electrum), wire v5 with `sent`/`unsure`, `allow_btc_broadcast`, the ledger's `forward_sent` and the once-sent rule (test_wake_agent 642, test_wake_endtoend 64, doorbell 161, pager 653), `tests/real_btc_forward_testnet.py` (skips here), 24 new anchors all caught; `STAGE3_PLAN.md` is the record |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
 | 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |
 

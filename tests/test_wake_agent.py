@@ -4508,6 +4508,13 @@ for _extra, _why in (
 check("pairing/btc: the keyfile carries the fee band and the affiliate cap",
       '"feerate_floor_sat_vb": int(args.feerate_floor_sat_vb)' in _kp_src
       and '"max_affiliate_bps": int(args.max_affiliate_bps)' in _kp_src)
+check("pairing/btc: --allow-btc-broadcast without --allow-btc-forward is "
+      "refused AT PAIRING, naming the switch it needs",
+      "--allow-btc-forward" in (_pairs_btc(["--allow-btc-broadcast"]) or ""))
+check("pairing/btc: with --allow-btc-forward the sending switch passes, and "
+      "the keyfile carries it as its own boolean field",
+      _pairs_btc(_BTC_OK + ["--allow-btc-broadcast"]) is None
+      and '"allow_btc_broadcast": bool(args.allow_btc_broadcast)' in _kp_src)
 check("pairing/fee: any one of the three without the others is refused",
       "go together" in (_pairs_fee(["--fee-rpc", "http://127.0.0.1:18085"]) or "")
       and "go together" in (_pairs_fee(["--fee-sweep-to", _FS_TO[0]]) or ""))
@@ -4719,10 +4726,162 @@ check("...but THE HOST (a hand-poked note, HOST_OWNER) may forward a "
       "and the reply reveals nothing but a status and a handle",
       _e is None and _o is not None and len(_ran) == 1)
 _o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000}, _FWD_KEY)
-check("a handle already forwarded is refused already_forwarded: no second "
-      "quote for the same destination and amount, no plan silently "
-      "overwritten", _o is None
+check("a handle already rehearsed is refused a second REHEARSAL, "
+      "already_forwarded: no second quote for the same destination and "
+      "amount, no plan silently overwritten", _o is None
       and getattr(_e, "code", None) == "already_forwarded" and _ran == [])
+
+print("\n== forward_to_swap: the SECOND switch, the mode, the mark, the word ==")
+_SEND_KEY = {**_FWD_KEY, "allow_btc_broadcast": True}
+_o, _e, _ran = _fwd_run(_FWD_REC, _SEND_KEY)
+_argv3 = _ran[0][0] if _ran else []
+check("with allow_btc_broadcast paired too, the forward is composed with "
+      "--broadcast and NOT --dry-run", _e is None and bool(_ran)
+      and "--broadcast" in _argv3 and "--dry-run" not in _argv3)
+_o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY)
+check("...without it (a keyfile from before the field, or one paired without "
+      "the flag) the forward is a rehearsal: --dry-run, never --broadcast",
+      _e is None and "--dry-run" in _ran[0][0] and "--broadcast" not in _ran[0][0])
+_o, _e, _ran = _fwd_run(_FWD_REC, {**_FWD_KEY, "allow_btc_broadcast": False})
+check("...and an explicit false is a rehearsal too",
+      _e is None and "--dry-run" in _ran[0][0])
+for _badb in ("yes", 1, "true"):
+    _o, _e, _ran = _fwd_run(_FWD_REC, {**_FWD_KEY, "allow_btc_broadcast": _badb})
+    check(f"allow_btc_broadcast present and not a boolean ({_badb!r}) is "
+          "refused btc_config_malformed, never coerced, no child",
+          _o is None and getattr(_e, "code", None) == "btc_config_malformed"
+          and _ran == [])
+_o, _e, _ran = _fwd_run(_FWD_REC, {**{k: v for k, v in _FWD_KEY.items()
+                                      if k != "allow_btc_forward"},
+                                   "allow_btc_broadcast": True,
+                                   "allow_withdraw": True,
+                                   "wallet_file": "/var/lib/gs/x.wallet"})
+check("allow_btc_broadcast WITHOUT allow_btc_forward unlocks nothing: "
+      "forward_not_allowed, no child",
+      _o is None and getattr(_e, "code", None) == "forward_not_allowed"
+      and _ran == [])
+_o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000}, _SEND_KEY)
+check("A REHEARSAL MAY BE FOLLOWED BY THE REAL THING: a handle with a dry-run "
+      "mark is forwarded again by a sending run, which supersedes the plan",
+      _e is None and bool(_ran) and "--broadcast" in _ran[0][0])
+for _mode, _mk in (("sending", _SEND_KEY), ("rehearsal", _FWD_KEY)):
+    _o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000,
+                             "forward_sent": True}, _mk)
+    check(f"...but a handle whose forward was SENT is refused already_forwarded "
+          f"in {_mode} mode: the money moved, and a second signature would "
+          "conflict with the first", _o is None
+          and getattr(_e, "code", None) == "already_forwarded" and _ran == [])
+
+
+def _fwd_run_plan(rec, key_extra, plan):
+    """A forward whose fake child WRITES the plan file the real one would,
+    so the mark and the phase word can be read from it. Returns
+    (out, err, ran, dir, bell)."""
+    dd, kk, bb = _fwd_env(rec, key_extra)
+    ran = []
+
+    def child(argv, env_extra, budget):
+        ran.append((list(argv), dict(env_extra or {})))
+        if plan is not None:
+            _of = argv[argv.index("--outfile") + 1]
+            Path(_of).write_text(plan if isinstance(plan, str)
+                                 else json.dumps(plan))
+        return 0, False
+
+    dp = deps_for(dd, bb, extend_deadman=lambda s: True, run_child=child)
+    os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+    try:
+        out, err, text = run(kk, dp)
+    except Exception as e:                                   # noqa: BLE001
+        out, err = None, e
+    finally:
+        os.environ.pop("GS_BTC_SEED", None)
+    return out, err, ran, dd, bb
+
+
+def _rec_of(dd):
+    _led = json.loads((dd / A.HANDLES_FILE).read_text())
+    return (_led.get("handles") or _led).get("A3F1") or {}
+
+
+_ACC = {"broadcast": True, "broadcast_outcome": "accepted", "seen": True}
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC)
+check("a sending run whose plan says accepted: done, the ledger marks "
+      "forward_sent TRUE beside the bucket and the path, and the M3 carries "
+      "the closed word 'sent' -- no txid, no server, no outcome word on the "
+      "record or the wire", _e is None and _o is not None
+      and _rec_of(_dd).get("forward_sent") is True
+      and isinstance(_rec_of(_dd).get("forwarded"), int)
+      and _bb.result is not None and _bb.result.get("phase") == "sent"
+      and _bb.result.get("status") == "done"
+      and not any(k in json.dumps(_rec_of(_dd))
+                  for k in ("txid", "accepted", "server")))
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "broadcast_outcome": "ambiguous",
+                          "seen": False})
+check("...a plan that says ambiguous: forward_sent TRUE (the money MAY have "
+      "moved) and the word 'unsure' -- never 'failed'",
+      _e is None and _rec_of(_dd).get("forward_sent") is True
+      and (_bb.result or {}).get("phase") == "unsure"
+      and (_bb.result or {}).get("status") == "done")
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(
+    _FWD_REC, _FWD_KEY, {"broadcast": False, "broadcast_outcome": None})
+check("...a rehearsal's plan: forward_sent FALSE and no word",
+      _e is None and _rec_of(_dd).get("forward_sent") is False
+      and (_bb.result or {}).get("phase") == "")
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {"broadcast": True, "broadcast_outcome": "rejected"})
+check("...a plan that contradicts itself (broadcast true, outcome rejected) "
+      "is read as NOT moved: the two fields must agree",
+      _e is None and _rec_of(_dd).get("forward_sent") is False
+      and (_bb.result or {}).get("phase") == "")
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, "not json {")
+check("...an unreadable plan never raises: not moved, no word, the job still "
+      "done", _e is None and _rec_of(_dd).get("forward_sent") is False
+      and (_bb.result or {}).get("phase") == "")
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, None)
+check("...no plan at all (the child wrote nothing): not moved, no word",
+      _e is None and _rec_of(_dd).get("forward_sent") is False
+      and (_bb.result or {}).get("phase") == "")
+# THE PLAN ON DISK IS THE RECORD TOO. A crash between the child's exit and
+# the ledger mark leaves a plan saying "accepted" beside a record saying
+# nothing; the next wake must not sign a conflicting spend.
+_dd, _kk, _bb = _fwd_env({**_FWD_REC, "forwarded": 1700000000}, _SEND_KEY)
+(_dd / "btc_forward_A3F1.json").write_text(json.dumps(_ACC))
+_ranx = []
+_dpx = deps_for(_dd, _bb, extend_deadman=lambda s: True,
+                run_child=lambda a, e, b: (_ranx.append(a), (0, False))[1])
+os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+try:
+    _o, _e, _t = run(_kk, _dpx)
+except Exception as _ex:                                     # noqa: BLE001
+    _o, _e = None, _ex
+finally:
+    os.environ.pop("GS_BTC_SEED", None)
+check("a record WITHOUT the forward_sent mark but with a plan on disk that "
+      "says accepted is refused already_forwarded (the file the sending run "
+      "wrote is consulted, not the ledger alone), no child runs",
+      _o is None and getattr(_e, "code", None) == "already_forwarded"
+      and _ranx == [])
+_pd = Path(tempfile.mkdtemp(prefix="gs_fwd_phase_"))
+(_pd / "btc_forward_A3F1.json").write_text(json.dumps(_ACC))
+check("_phase_of for a forward: 'sent' on a done run with an accepted plan; "
+      "'' when the status is not done, when no handle is given, and for any "
+      "other job's word", A._phase_of("forward_to_swap", _pd, status="done",
+                                      handle="A3F1") == "sent"
+      and A._phase_of("forward_to_swap", _pd, status="failed",
+                      handle="A3F1") == ""
+      and A._phase_of("forward_to_swap", _pd, status="done") == ""
+      and A._phase_of("forward_to_swap", _pd, status="done",
+                      handle="FFFF") == "")
+check("...and both words are in the protocol's closed set with a sentence "
+      "each, numberless, naming no machine",
+      all(P.phase_is_known(w) and P.PHASE_LINES[w]
+          and not any(ch.isdigit() for ch in P.PHASE_LINES[w])
+          and not any(m in P.PHASE_LINES[w].lower()
+                      for m in ("vault", "thinkpad", "keyfile", "pi ",
+                                "electrum", "server", "bitcoin", "btc"))
+          for w in ("sent", "unsure")))
 # A REAL PAIRS FILE ON THE RECORD, and a keyfile that asks for plaintext
 # slips. Without both, the slip builders swallow a missing file and return
 # empty -- and the check below would pass whether or not the vault guarded

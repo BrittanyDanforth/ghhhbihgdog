@@ -366,8 +366,15 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--allow-btc-forward", action="store_true",
                    help="let a wake sign a BTC forward into the swap. Off by "
                         "default, and SEPARATE from --allow-withdraw: "
-                        "enabling one never enables the other. Stage 2 signs "
-                        "and prints only; nothing is broadcast.")
+                        "enabling one never enables the other. On its own "
+                        "this is a REHEARSAL: the forward is signed and "
+                        "printed and nothing is sent.")
+    p.add_argument("--allow-btc-broadcast", action="store_true",
+                   help="let a forward SEND: hand the signed transaction to "
+                        "the network over Tor. Off by default; needs "
+                        "--allow-btc-forward. Money moves. The server list "
+                        "must contain one whose node relays a swap memo "
+                        "(STAGE3_PLAN.md 3.3).")
     p.add_argument("--feerate-floor-sat-vb", type=int, default=1,
                    help="the lowest fee rate a forward will pay (default 1)")
     p.add_argument("--feerate-ceiling-sat-vb", type=int, default=200,
@@ -565,6 +572,11 @@ def _validate_btc(args) -> None:
                  "--btc-electrum: the forward has to know which account to "
                  "watch\n    and where to look. Without them every forward "
                  "is refused after the wake.")
+    if args.allow_btc_broadcast and not args.allow_btc_forward:
+        sys.exit("[!] --allow-btc-broadcast needs --allow-btc-forward: a "
+                 "forward that may not sign has nothing to send.\n    The "
+                 "two are separate on purpose -- the first is a rehearsal, "
+                 "the second moves money.")
     if args.btc_network not in ("main", "testnet", "signet", "regtest"):
         sys.exit("[!] --btc-network must be main, testnet, signet or regtest.")
     if args.btc_min_conf < 1:
@@ -1004,6 +1016,7 @@ def do_pair(args) -> int:
         "op_return_max_bytes": int(args.op_return_max_bytes),
         "thornode_url": str(args.thornode or ""),
         "allow_btc_forward": bool(args.allow_btc_forward),
+        "allow_btc_broadcast": bool(args.allow_btc_broadcast),
         "feerate_floor_sat_vb": int(args.feerate_floor_sat_vb),
         "feerate_ceiling_sat_vb": int(args.feerate_ceiling_sat_vb),
         "max_affiliate_bps": int(args.max_affiliate_bps),

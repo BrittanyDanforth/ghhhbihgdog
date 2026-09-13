@@ -264,16 +264,24 @@ def _history_once(txid, scripthash, order, make):
 def seen(txid, address, servers, proxy_url, *, network="main",
          timeout=DEFAULT_TIMEOUT, wait_s=DEFAULT_SEEN_WAIT_S,
          interval_s=DEFAULT_SEEN_INTERVAL_S, sleeper=None, clock=None,
-         transport_factory=None):
+         transport_factory=None, avoid=None):
     """Is `txid` in the deposit address's history yet? Polls until it is
     or `wait_s` has passed (at least once; wait_s 0 is one look). Returns
         {seen, height, server, cert_sha256, polls, asked}
     `asked` is False when NO poll got an answer from any server -- the
     difference between "the network does not list it" and "nobody could be
-    asked", which the caller must not collapse."""
+    asked", which the caller must not collapse.
+
+    `avoid` names the server that ACCEPTED the transaction: with more than
+    one server configured the poll starts elsewhere, so the proof is a
+    SECOND server's word and a server that lied about accepting cannot
+    also be the one vouching that it propagated. With one server there is
+    nobody else to ask, and it is asked."""
     want = _check_txid(txid)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
+    if avoid and len(order) > 1 and order[0][0] == avoid:
+        order = order[1:] + order[:1]
     if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)) \
             or wait_s < 0 or isinstance(interval_s, bool) \
             or not isinstance(interval_s, (int, float)) or interval_s <= 0:

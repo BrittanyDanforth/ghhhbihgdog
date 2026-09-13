@@ -410,11 +410,21 @@ check("nobody binds monerod's default testnet ZMQ port (28082)",
 # "it must be in the helper" be an assumption.
 _lab_src = open(os.path.join(REPO, "tests", "monerolab.py")).read()
 check("the shared regtest lab disables ZMQ", "--no-zmq" in _lab_src)
+# ...FOR EVERY SUITE THAT LAUNCHES A DAEMON. A real_*_testnet suite that
+# never starts monerod (the BTC forward's, which speaks to the Bitcoin
+# testnet over Tor and runs no daemon at all) has no ZMQ port to disable;
+# requiring the flag of it would be a check on a word, not on a port.
 _no_zmq = [os.path.basename(f) for f in _suites
-           if "--no-zmq" not in open(f).read()
+           if "monerod" in open(f).read()
+           and "--no-zmq" not in open(f).read()
            and "monerolab" not in open(f).read()]
-check(f"every suite disables ZMQ, directly or via the lab (missing: {_no_zmq})",
-      not _no_zmq)
+check(f"every suite that launches monerod disables ZMQ, directly or via the "
+      f"lab (missing: {_no_zmq})", not _no_zmq)
+check("NON-VACUITY: that rule still covers the daemon suites (more than one "
+      "of them, and the BTC suite is not among them)",
+      sum("monerod" in open(f).read() for f in _suites) > 1
+      and not any("monerod" in open(f).read() for f in _suites
+                  if "btc_forward" in os.path.basename(f)))
 # The lab must not hardcode a port either, or two suites using it collide on
 # exactly the ports this block exists to keep apart.
 check("the shared lab takes its ports from the caller",

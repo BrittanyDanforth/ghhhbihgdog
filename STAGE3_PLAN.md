@@ -412,11 +412,50 @@ written.
 
 ## Status
 
-- [ ] 1. `gs_btc_broadcast.py` + `tests/test_btc_broadcast.py`
-- [ ] 2. `btc_forwarder --broadcast` + tests
-- [ ] 3. wire, ledger, switch, pairing
-- [ ] 4. rendering
-- [ ] 5. end to end over real HTTP
-- [ ] 6. testnet file (skips here)
-- [ ] 7. docs
-- [ ] 8. anchors, full suite, sweep, commit
+Built, in the order above, each step green before the next:
+
+- [x] 1. `gs_btc_broadcast.py` + `tests/test_btc_broadcast.py` (72). The watch
+      client gained a structured `ServerError` and a shared `server_order()`
+      so the two sides cannot disagree about the rotation; nothing else in
+      stage 1 moved (test_btc_watch 220, unchanged). One departure from 3.1:
+      a `PinMismatch` AFTER bytes have left is reported inside an
+      `ambiguous` result (`pin_mismatch: True`) rather than raised, so "may
+      have moved" is never lost to the interception signal.
+- [x] 2. `btc_forwarder --broadcast` (test_btc_forwarder 162, +29): the flag
+      pair, the quote clock (`_clock`, movable by a test), the guard order,
+      every row of 3.10, the hex rule of 3.2, plan schema v2, and one
+      forward driven through the REAL transport, subclass and forwarder
+      against an in-process SOCKS5 + TLS Electrum server that computes the
+      real txid of the hex it is handed (`tests/btcmock.py`).
+- [x] 3. wire v5 (`sent`, `unsure`), `_phase_of` for the forward reading the
+      plan through `_forward_outcome` (never raises; the two plan fields
+      must agree), the ledger's `forward_sent`, the once-sent rule and the
+      rehearsal-then-send rule, `allow_btc_broadcast` validated as a boolean,
+      `--allow-btc-broadcast` refused at pairing without `--allow-btc-forward`
+      (test_wake_agent 641, test_plain_slip 225, test_wake_protocol 189).
+- [x] 4. rendering: the doorbell and the pager print the protocol's own
+      sentence for a word and the rehearsal line without one (doorbell 161,
+      pager 653; the rule-6 scans in test_depo_wizard 432 and
+      test_multi_client 93 pass the two new sentences).
+- [x] 5. end to end over real HTTP (test_wake_endtoend 64): rehearsal, second
+      rehearsal refused, a sending run superseding it with `sent` on the
+      wire and the ledger marked, a second sending run refused.
+- [x] 6. `tests/real_btc_forward_testnet.py`, skipping here.
+- [x] 7. docs: `OPSEC_SETUP.md`, the unit file, `BTC_INTAKE_DESIGN.md`'s
+      stage table, `SESSION_LOG_AND_PLAN.md`.
+- [x] 8. 24 anchors over section 6 plus the three stage-2 anchors the flag
+      pair and the plan fields re-pointed; the sweep's verdict and the full
+      suite are in `SESSION_LOG_AND_PLAN.md`'s stage-3 entry.
+
+**Self-doubt pass over this stage (after the sweep):** two findings, both
+fixed and anchored. (1) `seen()` started its poll at the same server that
+had just accepted the transaction, so a server lying about acceptance could
+also be the one vouching for propagation -- against 3.4's own words ("a
+second server, asked read-only"). It now takes `avoid=<accepting server>`
+and starts elsewhere when more than one server is configured (with one,
+there is nobody else and it is asked). (2) The once-sent rule trusted the
+ledger alone: a crash between the child's exit and the ledger mark would
+leave a plan on disk saying "accepted" beside a record saying nothing, and
+the next wake would sign a CONFLICTING spend of outputs already in flight.
+`_dispatch` now consults the plan file too. Final counts: test_btc_broadcast
+75, test_btc_forwarder 163, test_wake_agent 642.

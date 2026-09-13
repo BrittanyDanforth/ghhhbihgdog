@@ -457,6 +457,23 @@ check("a PinMismatch while polling is raised at once", _pm == "raised")
 check("a bad txid is refused before connecting",
       _refused(B.seen, "zz" * 32, _A0, _SERVERS, _PROXY,
                transport_factory=_never))
+# A SECOND SERVER'S WORD. The poll starts away from the server that
+# accepted the transaction, so a server that lied about taking it cannot
+# also be the one vouching that it propagated.
+_first = W.server_order(_TWO, _SH)[0][0]
+_second = W.server_order(_TWO, _SH)[1][0]
+_r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[]), servers=_TWO, wait_s=0, avoid=_first)
+check("with two servers and avoid= naming the first in rotation, the SECOND "
+      "is asked first", _s["hosts"][0] == _second and _r["server"] == _second)
+_r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[]), servers=_TWO, wait_s=0, avoid=_second)
+check("...avoid= naming a server that is not first changes nothing",
+      _s["hosts"][0] == _first)
+_r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_SERVERS, wait_s=0, avoid="s1.onion")
+check("...and with ONE server there is nobody else: it is asked anyway",
+      _s["hosts"] == ["s1.onion"] and _r["seen"] is True)
 
 # ===========================================================================
 print("\n== END TO END: the real transport and the real subclass through an "

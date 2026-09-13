@@ -710,11 +710,23 @@ _buf5 = io.StringIO()
 with contextlib.redirect_stdout(_buf5):
     _rc5 = DB.report(_fw.pending)
 _t5 = _buf5.getvalue()
-check("a finished forward is reported as a SIGNED spend, stage 2, nothing "
-      "broadcast -- with no handle line, no slip line and no deposit "
-      "vocabulary", _rc5 == 0 and "SIGNED" in _t5 and "Nothing was broadcast"
+check("a finished forward with no phase is reported as a SIGNED rehearsal, "
+      "nothing sent -- with no handle line, no slip line and no deposit "
+      "vocabulary", _rc5 == 0 and "SIGNED" in _t5 and "Nothing was sent"
       in _t5 and "Handle" not in _t5 and "deposit address" not in _t5
       and "how to pay" not in _t5 and "stayed on the vault. Read" not in _t5)
+for _fph in ("sent", "unsure"):
+    _fw.pending.result = {"status": "done", "handle": "A3F1", "slip": "",
+                          "plain": {}, "phase": _fph}
+    _buf5 = io.StringIO()
+    with contextlib.redirect_stdout(_buf5):
+        _rc5 = DB.report(_fw.pending)
+    _t5 = _buf5.getvalue()
+    check(f"a finished forward with the word {_fph!r} prints the protocol's "
+          "own sentence for it -- the same one the chat shows -- and not the "
+          "rehearsal line", _rc5 == 0 and P.PHASE_LINES[_fph] in _t5
+          and "rehearsal" not in _t5 and "Handle" not in _t5
+          and "deposit address" not in _t5)
 
 # ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
 #

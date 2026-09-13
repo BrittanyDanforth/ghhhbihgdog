@@ -176,7 +176,17 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
    forwarder REFUSES on a default policy and stage 3 must choose the relay
    strategy before mainnet.
 3. **Broadcast over Tor**, testnet end-to-end: a real testnet BTC → testnet
-   ThorChain (or a stubbed inbound) → confirm the swap starts.
+   ThorChain (or a stubbed inbound) → confirm the swap starts. BUILT
+   (`STAGE3_PLAN.md` is its record): `gs_btc_broadcast` holds the one method
+   that moves bitcoin, in a file the Pi never imports; `btc_forwarder
+   --broadcast` signs and sends in one process, from memory; the outcome is
+   one of four words and drives the exit code so "may have moved" never
+   renders as "failed"; the phone hears `sent` or `unsure` (wire v5); a
+   second keyfile switch (`allow_btc_broadcast`) gates it. The testnet run
+   is `tests/real_btc_forward_testnet.py`, on a box with Tor; it proves the
+   relay and the seen-poll, and says in its header that only mainnet proves
+   THORChain takes the memo. Confirmation depth, reorg and the fee bump are
+   stage 5.
 4. **Deposit UX**: unique address, auto-received, per-owner balance; the note
    and phone warning gone from this mode.
 5. **Failure handling**: fee spikes, dust/minimum refusal, forward failure and

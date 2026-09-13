@@ -948,6 +948,17 @@ install -m 0400 -o root -g root /dev/null /etc/gs-wake-spend.env
 # signs with, the same way -- never on an argv, never in the keyfile. The
 # forward refuses to sign unless the distro's libsecp256k1 (libsecp256k1-1)
 # is installed: it is the constant-time curve; the pure-Python one is not.
+#    --allow-btc-forward ALONE IS A REHEARSAL: the forward is signed and
+#    printed to the job log and nothing is sent. Pair with
+#    --allow-btc-broadcast as well when you mean it -- that is the decision
+#    that a woken machine may hand a client's bitcoin to the network. Then
+#    the --btc-electrum list must hold at least one server whose node RELAYS
+#    a swap memo (over 80 bytes of OP_RETURN): your own electrs/Fulcrum over
+#    an onion on a Bitcoin Core >= 30 node is the right answer, for the same
+#    fingerprint reason the watch already prefers it; a server on an older
+#    relay policy answers "no" and the forward moves to the next one, and
+#    only every server saying no is a refusal (nothing moved, the codes in
+#    the job log). STAGE3_PLAN.md sections 3.3 and 3.10.
 # ( set +o history; umask 077; read -rs -p 'BTC seed (12/24 words): ' p; echo
 #   printf 'GS_BTC_SEED=%s\n' "$p" >> /etc/gs-wake-spend.env )
 # ( set +o history; umask 077; read -rs -p 'BTC seed passphrase (or empty): ' p; echo
@@ -2030,9 +2041,11 @@ value at rest on the mixing wallet.
 The wake channel can ask for five jobs and no others —
 `receive_and_quote`, `watch`, `swap_status`, `withdraw`, and
 `forward_to_swap` (the BTC-intake forward: it spends a client's settled
-Bitcoin deposit into the swap, is gated on its own `allow_btc_forward`
-keyfile switch rather than on `allow_withdraw`, and in stage 2 signs and
-prints without broadcasting — see `STAGE2_PLAN.md`).
+Bitcoin deposit into the swap and is gated on its own keyfile switches
+rather than on `allow_withdraw` — `allow_btc_forward` lets it sign and
+print, a rehearsal; `allow_btc_broadcast` as well lets it SEND, and then
+the phone hears one closed word, `sent` or `unsure`, never a txid or an
+amount — see `STAGE2_PLAN.md` and `STAGE3_PLAN.md`).
 
 **`receive_new` was the fifth and is gone.** It minted a Monero subaddress to
 be paid into directly — an entry point for somebody who already held XMR — and

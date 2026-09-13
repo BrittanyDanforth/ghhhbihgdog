@@ -1545,15 +1545,22 @@ def report(pending: Pending) -> int:
                 print(f"      {proto.WITHDRAW_NO_MORE_LINE}")
             return 0
         if pending.job == "forward_to_swap":
-            # A FORWARD IS A SPEND THAT WAS SIGNED, NOT A DEPOSIT THAT IS
-            # READY. Falling through printed deposit vocabulary ("the
-            # deposit address, the memo and the slip stayed on the vault")
-            # about a run that had just signed a spend of that deposit --
-            # the same wrong noun the withdraw branch above was added to
-            # stop. Stage 2 broadcasts nothing; the plan is on the vault.
-            print(f"  [+] Vault finished job {pending.job}: the forward was "
-                  f"built and SIGNED on the machine. Nothing was broadcast "
-                  f"(stage 2); the plan stayed on the vault.")
+            # A FORWARD IS A SPEND, NOT A DEPOSIT THAT IS READY. Falling
+            # through printed deposit vocabulary ("the deposit address, the
+            # memo and the slip stayed on the vault") about a run that had
+            # just signed a spend of that deposit -- the same wrong noun
+            # the withdraw branch above was added to stop. With a phase
+            # word (sent / unsure) the forward went out, or may have, and
+            # the line is the protocol's own sentence for it, the same one
+            # the chat shows; without one it was a rehearsal.
+            _ph = pending.result.get("phase") or ""
+            if _ph:
+                print(f"  [+] Vault finished job {pending.job}: "
+                      f"{proto.PHASE_LINES.get(_ph, _ph)}")
+            else:
+                print(f"  [+] Vault finished job {pending.job}: the forward "
+                      f"was built and SIGNED on the machine. Nothing was "
+                      f"sent (a rehearsal); the plan stayed on the vault.")
             return 0
         h = pending.result.get("handle") or "(none)"
         print(f"  [+] Vault finished job {pending.job}. Handle {h}.")

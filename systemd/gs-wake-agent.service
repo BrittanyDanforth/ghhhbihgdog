@@ -200,6 +200,13 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 # THE FORWARD SIGNS ONLY ON THE CONSTANT-TIME CURVE: btc_forwarder refuses to
 # sign unless the distro's libsecp256k1 (package libsecp256k1-1 on Debian and
 # Ubuntu) is installed. Install it with the rest of the box's packages.
+#
+# THE FORWARD SENDS ONLY WITH A SECOND SWITCH. --allow-btc-forward alone is a
+# rehearsal: signed, printed to the job log, nothing sent. Pairing with
+# --allow-btc-broadcast as well is the decision that a woken machine may hand
+# a client's bitcoin to the network (STAGE3_PLAN.md); the server list must
+# then contain one whose node relays a swap memo (Bitcoin Core >= 30, or
+# your own electrs over an onion). No environment variable turns this on.
 #EnvironmentFile=/etc/gs-wake-spend.env
 ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_wake_agent --key /etc/gs_wake_thinkpad.key
 
