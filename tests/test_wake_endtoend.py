@@ -340,6 +340,97 @@ try:
           and ran1[1][0][ran1[1][0].index("--dest-from-receive-wallet") + 1]
           .startswith(str(_bay)))
 
+    print("\n== the intake's deposit, both halves, real HTTP "
+          "(STAGE4_PLAN.md) ==")
+    # A deposit on a keyfile paired with --btc-xpub and --deposit-in-chat:
+    # the vault allocates the address index (the freshness look injected),
+    # the M3's plain slip carries the derived host address and NO memo, the
+    # doorbell accepts that shape and renders it without a note, and the
+    # record carries btc_index for the forward.
+    _ZPUB4 = ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r"
+              "1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
+    _ADDR4 = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"     # index 0
+    _XMR4 = "4" + "A" * 94
+    _ran4d, _asked4 = [], []
+
+    def _intake_child(argv, env_extra, budget):
+        _ran4d.append((list(argv), dict(env_extra or {})))
+        if "create_receive_wallet" in " ".join(argv):
+            _E2E_MINT[0] += 1
+            (_bay / f"wallet_e2e_{_E2E_MINT[0]}.json").write_text(json.dumps(
+                {"schema": "gs_receive_wallet_v1", "address": _XMR4,
+                 "account_index": 30 + _E2E_MINT[0], "subaddress_index": 1,
+                 "rpc_endpoint": "http://127.0.0.1:18083"}))
+        if "thor_swap_preparer" in " ".join(argv):
+            Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps([{
+                "schema": "thor_pairs_v1", "btc_in": "0.05",
+                "deposit": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                "memo": "=:XMR.XMR:" + _XMR4 + ":0/1/0", "dest_xmr": _XMR4,
+                "expected_xmr": "1.5", "min_out_xmr": "", "ts": 1700000000}]))
+        return 0, False
+
+    # The account reserve would refuse a second admitted deposit against the
+    # fresh keyfile's ceiling of 45 (the first cycle's is still unpaid); the
+    # ceiling is not what this cycle is about, so it is raised here.
+    _INTAKE_KEY = {"btc_account_xpub": _ZPUB4, "btc_electrum": ["s.onion"],
+                   "btc_network": "main", "deposit_in_chat": True,
+                   "account_ceiling": 500}
+    p4d, out4d, err4d, _r, text4d = cycle(
+        "receive_and_quote", {"amount_sat": 5000000, "owner": P.HOST_OWNER},
+        _bay, key_extra=_INTAKE_KEY,
+        deps_over={"run_child": _intake_child,
+                   "btc_unused": lambda a: (_asked4.append(a), True)[1]})
+    _h4 = (out4d or ("", "", ""))[2]
+    check("the intake deposit finished: done, the network was asked about "
+          "exactly the address at index 0, and the doorbell heard 'done'",
+          err4d is None and out4d and out4d[0] == "done"
+          and _asked4 == [_ADDR4] and p4d is not None and p4d.result
+          and p4d.result["status"] == "done")
+    _pl4 = (p4d.result or {}).get("plain") or {}
+    check("...the M3's plain slip is the SECOND shape: the amount, the host's "
+          "derived address, the expected figure, the label -- and NO memo; "
+          "the shared inbound and the memo from the pairs file are not in it",
+          set(_pl4) == {"b", "d", "x", "h"} and _pl4["d"] == _ADDR4
+          and _pl4["b"] == "0.05" and _pl4["x"] == "1.5" and _pl4["h"] == _h4
+          and "XMR.XMR" not in json.dumps(p4d.result)
+          and "bc1qw508" not in json.dumps(p4d.result))
+    _buf4d = io.StringIO()
+    with contextlib.redirect_stdout(_buf4d):
+        _rc4d = DB.report(p4d)
+    check("...and the doorbell's by-hand report prints it with no note line "
+          "and the intake's closing lines", _rc4d == 0
+          and _ADDR4 in _buf4d.getvalue()
+          and "Nothing else needs adding" in _buf4d.getvalue()
+          and "=:" not in _buf4d.getvalue()
+          and "CANNOT" not in _buf4d.getvalue())
+    _led4 = json.loads(_lp.read_text()) if False else json.loads(
+        (_bay / "gs_wake_handles.json").read_text())
+    _rec4d = (_led4.get("handles") or _led4).get(_h4) or {}
+    check("...the ledger's record carries btc_index 0 beside the bundle, "
+          "for the forward to find", _rec4d.get("btc_index") == 0
+          and _rec4d.get("bundle"))
+    _ran4f = []
+
+    def _intake_forward_child(argv, env_extra, budget):
+        _ran4f.append((list(argv), dict(env_extra or {})))
+        Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps(
+            {"broadcast": False, "broadcast_outcome": None, "signed": True}))
+        return 0, False
+
+    p4f, out4f, err4f, _r, text4f = cycle(
+        "forward_to_swap", {"handle": _h4, "owner": P.HOST_OWNER}, _bay,
+        key_extra={**_INTAKE_KEY, "allow_btc_forward": True,
+                   "btc_min_conf": 2, "op_return_max_bytes": 120},
+        env={"GS_BTC_SEED": "abandon abandon abandon abandon abandon abandon "
+                            "abandon abandon abandon abandon abandon about"},
+        deps_over={"extend_deadman": lambda s: True,
+                   "run_child": _intake_forward_child})
+    check("the forward of THAT handle finds the index the deposit recorded: "
+          "GS_BTC_INDEX 0 and the real xpub in its environment, done",
+          err4f is None and out4f and out4f[0] == "done" and len(_ran4f) == 1
+          and _ran4f[0][1].get("GS_BTC_INDEX") == "0"
+          and _ran4f[0][1].get("GS_BTC_XPUB") == _ZPUB4)
+
     print("\n== forward_to_swap, both halves, real HTTP ==")
     # THE FORWARD OF THE DEPOSIT THE FIRST CYCLE MINTED. The ledger in the
     # bay carries that handle; stage 4 will record a BTC index on it when
