@@ -94,8 +94,9 @@ _DEST = "8" + "A" + "1" * 93                                  # 95 chars
 _OTHER = "8" + "B" + "2" * 93
 _INBOUND = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"       # valid mainnet
 # {LIMIT} is filled by the fake aggregator at quote time with the worst-case
-# arrival in 1e8 base units -- the chain-enforced minimum output a real quote
-# carries. A literal 0 there is a swap at ANY price, and is refused.
+# arrival in 1e8 base units -- a chain-enforced minimum output a careful
+# quote would carry. A literal 0 there is a swap at ANY price: the tool does
+# not trust the field, it writes its own floor in (checked further down).
 _MEMO = "=:XMR.XMR:" + _DEST + ":{LIMIT}/1/0"
 _TIP = 850000
 _H1, _H2 = "ab" * 32, "cd" * 32
@@ -306,6 +307,12 @@ check("the memo is recorded with its byte count against the policy, and "
       and _plan["memo_limit_base_units"]
       == int(Decimal(_plan["worst_case_xmr"]) * 10 ** 8)
       and _plan["affiliate_bps"] == 0)
+check("a quote whose limit already sits at the worst case is laid out AS "
+      "QUOTED: memo_limit_set false, memo == memo_quoted, byte for byte",
+      _plan["memo_limit_set"] is False
+      and _plan["memo_quoted"] == _net.last_memo
+      and _plan["memo"] == _plan["memo_quoted"]
+      and "the quote's own" in _out)
 check("txid in the plan is the transaction's",
       _plan["txid"] == T.txid_hex(_tx))
 check("expected and worst-case Monero are recorded (worst = 90% of expected)",
@@ -543,21 +550,145 @@ check("without --dry-run: refused before anything is asked of the network",
 _r("memo_unbound", Net(memo="=:XMR.XMR:" + _OTHER + ":0/1/0"))
 _r("bad_memo", Net(memo=_MEMO + "\n:extra"))
 _r("no_memo", Net(memo=""))
-# THE MEMO'S OWN TERMS: the chain reads the limit and the affiliate fee;
-# the aggregator's expectedBuyAmount says nothing about either.
-_r("memo_no_limit", Net(memo="=:XMR.XMR:" + _DEST + ":0/1/0"))
-_r("memo_no_limit", Net(memo="=:XMR.XMR:" + _DEST))
-_r("memo_no_limit", Net(memo="=:XMR.XMR:" + _DEST + ":abc/1/0"))
-_r("memo_limit_low", Net(memo="=:XMR.XMR:" + _DEST + ":1/1/0"))
 _r("memo_affiliate_fee", Net(memo=_MEMO + ":thorname:1000"), policy=255)
 _r("memo_affiliate_fee", Net(memo=_MEMO + ":thorname:abc"), policy=255)
 check("...an affiliate fee within --max-affiliate-bps is accepted and "
       "recorded", (run(Net(memo=_MEMO + ":thorname:25"),
                        "--max-affiliate-bps", "25", policy=255)[2] or {})
       .get("affiliate_bps") == 25)
-check("a limit in scientific notation (the chain accepts 1e8) parses",
-      F.validate_memo_terms("=:XMR.XMR:x:1e8/1/0", Decimal("0.5"), 0)
-      == (100000000, 0))
+
+print("\n== THE LIMIT IS SET, NOT TRUSTED: the chain's only slippage guard ==")
+# THORChain's own example memo carries ":0/1/0" -- a swap at ANY price --
+# and aggregators quote it that way. The forwarder lays the OP_RETURN out
+# itself, so it writes its own floor (99% of the worst-case arrival, in
+# 1e8 base units) into the memo whenever the quote's limit is absent, zero
+# or lower. The limit is the ONLY field touched.
+
+
+def _floor_of(plan):
+    return int(Decimal(plan["worst_case_xmr"]) * 10 ** 8 * Decimal("0.99"))
+
+
+def _limit_case(memo_in, policy=255):
+    net = Net(memo=memo_in)
+    code, out, plan, _ = run(net, policy=policy)
+    return code, out, plan, net, _signed_tx(out)
+
+
+_code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
+check("a ZERO limit (THORChain's example) is SIGNED, with the floor written "
+      "into field 3 and interval/quantity kept: memo_limit_set true",
+      _code == 0 and _plan["memo_limit_set"] is True
+      and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan)}/1/0"
+      and _plan["memo_limit_base_units"] == _floor_of(_plan)
+      and _floor_of(_plan) > 0)
+check("...the floor is 99% of the worst case, which is 90% of expected",
+      _floor_of(_plan)
+      == int(Decimal(_plan["worst_case_xmr"]) * 10 ** 8 * Decimal("0.99"))
+      and Decimal(_plan["worst_case_xmr"])
+      < Decimal(_plan["expected_xmr"]))
+check("...the memo AS QUOTED is kept beside it, unchanged",
+      _plan["memo_quoted"] == "=:XMR.XMR:" + _DEST + ":0/1/0"
+      and _plan["memo_quoted"] != _plan["memo"])
+check("...and it is the REWRITTEN memo that sits in the OP_RETURN of the "
+      "signed transaction, with its byte count recorded",
+      _tx is not None
+      and _tx.vout[1].script_pubkey.data
+      == T.op_return_script(_plan["memo"].encode()).data
+      and _plan["memo_bytes"] == len(_plan["memo"].encode()))
+check("...the summary says the limit was SET by this tool",
+      "SET by this tool" in _out and str(_floor_of(_plan)) in _out)
+
+_code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST)
+check("a memo with NO limit field at all gets one appended: "
+      "=:XMR.XMR:<dest>:<floor>",
+      _code == 0 and _plan["memo_limit_set"] is True
+      and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan)}"
+      and _tx.vout[1].script_pubkey.data
+      == T.op_return_script(_plan["memo"].encode()).data)
+_code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":/1/0")
+check("an EMPTY limit field (legal on chain, executes at any price) is "
+      "filled in", _code == 0 and _plan["memo_limit_set"] is True
+      and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan)}/1/0")
+_code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":1/1/0")
+check("a limit UNDER the floor (1 base unit) is raised to the floor",
+      _code == 0 and _plan["memo_limit_set"] is True
+      and _plan["memo_limit_base_units"] == _floor_of(_plan)
+      and _plan["memo"].endswith(f":{_floor_of(_plan)}/1/0"))
+# a limit between the floor and the expected output: the aggregator was
+# stricter than us; kept as written, even its notation
+_code, _out, _plan, _net, _tx = _limit_case(
+    "=:XMR.XMR:" + _DEST + ":{LIMIT}/3/5:thorname:0")
+check("a limit at or over the floor is kept as written -- streaming 3/5 "
+      "and the affiliate fields untouched, memo_limit_set false",
+      _code == 0 and _plan["memo_limit_set"] is False
+      and _plan["memo"] == _net.last_memo
+      and _plan["memo"].endswith("/3/5:thorname:0")
+      and _plan["memo_limit_base_units"]
+      == int(_net.last_memo.split(":")[3].split("/")[0]))
+# ABOVE the expected output: that swap can only refund, minus fees
+_r("memo_bad_limit", Net(memo="=:XMR.XMR:" + _DEST + ":99999999999/1/0"),
+   policy=255)
+_r("memo_bad_limit", Net(memo="=:XMR.XMR:" + _DEST + ":abc/1/0"),
+   policy=255)
+_r("memo_bad_limit", Net(memo="=:XMR.XMR:" + _DEST + ":-5/1/0"),
+   policy=255)
+_r("memo_bad_limit", Net(memo="=:XMR.XMR:" + _DEST + ":1.5e8/1/0"),
+   policy=255)
+
+
+def _direct(fn, *a, **kw):
+    """Drive one piece alone: ("ok", result) or ("refused", kind)."""
+    net = Net().install()
+    try:
+        return "ok", fn(*a, **kw)
+    except SystemExit:
+        kinds = [k for s, k in net.kinds if k.startswith("refused:")]
+        return "refused", (kinds[-1][8:] if kinds else "")
+
+
+_E, _W = Decimal("1.5"), Decimal("0.5")                   # expected, worst
+check("a limit in scientific notation (the chain accepts 1e8) parses, is "
+      "over the floor, and is kept in ITS notation",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:1e8/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:1e8/1/0", 100000000, 0, False)))
+check("the floor is int(worst * 1e8 * 0.99), and 0 is raised to exactly it",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True)))
+check("one base unit under the floor is raised; the floor itself is kept",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:49499999/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:49500000/1/0",
+                  _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, False)))
+check("a limit of exactly the expected output is kept; one over is refused",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:150000000/1/0",
+              _E, _W, 0)[0] == "ok"
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:150000001/1/0",
+                  _E, _W, 0) == ("refused", "memo_bad_limit"))
+check("a worst case that rounds to nothing in base units is refused: no "
+      "floor can be written, so no swap at any price either",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", Decimal("1e-9"),
+              Decimal("1e-9"), 0) == ("refused", "memo_bad_limit"))
+check("the affiliate fields are read from positions 4-5 and the fee is "
+      "capped by the policy passed in",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:30", _E, _W, 30)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:30", 49500000, 30, True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:31",
+                  _E, _W, 30) == ("refused", "memo_affiliate_fee"))
+# THE SIZE CHECK IS ON THE FINAL BYTES, after the limit is written in
+_qlen = len(("=:XMR.XMR:" + _DEST + ":0/1/0").encode())
+check("a policy that fits the QUOTED memo but not the laid-out one refuses "
+      "as memo_overflow (the floor is longer than '0')",
+      _refusal(Net(memo="=:XMR.XMR:" + _DEST + ":0/1/0"), policy=_qlen)[3]
+      == "memo_overflow"
+      and run(Net(memo="=:XMR.XMR:" + _DEST + ":0/1/0"),
+              policy=_qlen + 9)[0] == 0)
+check("fit_memo re-checks the destination binding on the final text",
+      _direct(F.fit_memo, "=:XMR.XMR:" + _OTHER + ":1/1/0", _DEST, 255)
+      == ("refused", "memo_unbound")
+      and _direct(F.fit_memo, "=:XMR.XMR:" + _DEST + ":1/1/0", _DEST, 255)
+      == ("ok", ("=:XMR.XMR:" + _DEST + ":1/1/0").encode()))
 # HEX. memo_binds_destination accepts a memo that binds once hex-decoded;
 # this tool writes the OP_RETURN itself and must never embed the hex TEXT.
 _hexmemo = ("=:XMR.XMR:" + _DEST + ":40000000/1/0").encode().hex()

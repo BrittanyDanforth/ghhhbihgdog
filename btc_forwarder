@@ -274,9 +274,10 @@ def validate_inbound(inbound, network):
         raise Refused("bad_inbound", str(e))
 
 
-def validate_memo(memo, dest_xmr, op_return_limit):
-    """The memo must be printable, must name OUR destination, and must fit
-    the operator's OP_RETURN policy. Returns the memo's bytes."""
+def validate_memo(memo, dest_xmr):
+    """The quoted memo must be printable and must name OUR destination, on
+    its PLAIN form. Returns the memo's text; the size check comes after the
+    limit is written in (fit_memo), on the final bytes."""
     text = str(memo or "")
     if not text:
         raise Refused("no_memo", "the quote carried no memo; ThorChain "
@@ -297,52 +298,64 @@ def validate_memo(memo, dest_xmr, op_return_limit):
                       "the memo binds only when hex-decoded; this tool "
                       "writes the OP_RETURN itself and will not embed a "
                       "hex string as the memo")
-    if memo_will_overflow(text, op_return_limit):
-        raise Refused("memo_overflow",
-                      f"the memo is {memo_bytes(text)} bytes and this box's "
-                      f"OP_RETURN policy is {op_return_limit}; a Monero "
-                      "address alone is 95 characters, so no swap memo fits "
-                      f"the standard {OP_RETURN_STD_BYTES}. Raise "
-                      "--op-return-max-bytes ONLY for a node that will relay "
-                      "it (see STAGE2_PLAN.md section 2)")
-    return text.encode("utf-8")
+    return text
 
 
 _LIMIT_RE = re.compile(r"^[0-9]+(?:[eE][0-9]+)?\Z")
 _BPS_RE = re.compile(r"^[0-9]{1,4}\Z")
 
 
-def validate_memo_terms(memo_text, worst_xmr, max_affiliate_bps):
+def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
     """The memo's LIMIT and AFFILIATE FEE, the two fields the chain reads
     that the aggregator's expectedBuyAmount says nothing about.
 
         =:XMR.XMR:<dest>:<limit>/<interval>/<qty>:<affiliate>:<bps>
 
-    The limit is the only on-chain slippage protection a swap has -- the
-    minimum output, in 1e8 base units, under which ThorChain refunds
-    instead of executing. A zero or missing limit executes at ANY price.
-    It must be at least the worst-case arrival this tool already gates on
-    (less a 1% rounding margin). The affiliate fee, in basis points to a
-    THORName, is a skim of up to 10%; it is capped by policy, default 0.
-    Returns (limit_base_units, affiliate_bps)."""
+    THE LIMIT IS SET HERE, NOT TRUSTED. It is the only on-chain slippage
+    protection a swap has: the minimum output, in 1e8 base units, under
+    which ThorChain refunds instead of executing. Aggregators routinely
+    quote it as 0 (THORChain's own example memo is ":0/1/0"), and a zero or
+    empty limit executes at ANY price. This tool lays the OP_RETURN out
+    itself, so it writes its own floor into the memo -- the worst-case
+    arrival it already gates on, less a 1% rounding margin -- whenever the
+    quote's limit is absent, zero, or lower. A higher limit the aggregator
+    chose is kept as written (stricter is fine) UNLESS it is above the
+    quote's own expected output: that swap can only refund, minus the
+    outbound fee, so it is refused. A limit field that is not a number is
+    refused too: a memo this tool cannot read is not one it should rewrite.
+    Only the limit is ever touched -- the streaming interval/quantity and
+    every other field stay byte for byte -- so the destination binding
+    checked before still holds; it is checked AGAIN on the result anyway.
+    The affiliate fee, in basis points to a THORName, is a skim of up to
+    10%; it is capped by policy, default 0.
+    Returns (memo_text_out, limit_base_units, affiliate_bps, limit_set)."""
     parts = str(memo_text).strip().split(":")
-    lim_field = parts[3].strip() if len(parts) > 3 else ""
-    lim_text = lim_field.split("/")[0].strip()
-    if not lim_text or not _LIMIT_RE.match(lim_text):
-        raise Refused("memo_no_limit",
-                      "the memo carries no output limit, so the swap would "
-                      "execute at any price; refusing")
-    limit = int(Decimal(lim_text))
-    if limit <= 0:
-        raise Refused("memo_no_limit",
-                      "the memo's output limit is zero, so the swap would "
-                      "execute at any price; refusing")
+    while len(parts) < 4:
+        parts.append("")
+    lim_field = parts[3].strip()
+    sub = lim_field.split("/")
+    lim_text = sub[0].strip()
+    if lim_text and not _LIMIT_RE.match(lim_text):
+        raise Refused("memo_bad_limit",
+                      "the memo's output limit field is not a number; "
+                      "refusing to rewrite a memo this tool cannot read")
+    quoted = int(Decimal(lim_text)) if lim_text else 0
     floor = int(worst_xmr * Decimal(10 ** 8) * Decimal("0.99"))
-    if limit < floor:
-        raise Refused("memo_limit_low",
-                      "the memo's output limit is below the worst-case "
-                      "arrival this forward accepts; the chain would let "
-                      "the swap fill lower than the quote promised")
+    if floor < 1:
+        raise Refused("memo_bad_limit",
+                      "the worst-case arrival rounds to nothing in base "
+                      "units; no floor can be written")
+    ceiling = int(expected_xmr * Decimal(10 ** 8))
+    if quoted > ceiling:
+        raise Refused("memo_bad_limit",
+                      "the quote's own output limit is above its expected "
+                      "output; that swap can only refund, minus fees")
+    limit_set = quoted < floor
+    limit = floor if limit_set else quoted
+    if limit_set:
+        sub[0] = str(limit)
+        parts[3] = "/".join(sub)
+    out = ":".join(parts)
     bps = 0
     fee_field = parts[5].strip() if len(parts) > 5 else ""
     if fee_field:
@@ -355,7 +368,25 @@ def validate_memo_terms(memo_text, worst_xmr, max_affiliate_bps):
         raise Refused("memo_affiliate_fee",
                       f"the memo carries an affiliate fee of {bps} basis "
                       f"points, over the {max_affiliate_bps} this box allows")
-    return limit, bps
+    return out, limit, bps, limit_set
+
+
+def fit_memo(memo_text, dest_xmr, op_return_limit):
+    """The FINAL memo -- after the limit was written into it -- must still
+    name our destination and must fit the operator's OP_RETURN policy.
+    Returns its bytes."""
+    if not _memo_fields_bind(memo_text, dest_xmr):
+        raise Refused("memo_unbound", "the memo no longer names this "
+                      "deposit's destination after its limit was set")
+    if memo_will_overflow(memo_text, op_return_limit):
+        raise Refused("memo_overflow",
+                      f"the memo is {memo_bytes(memo_text)} bytes and this "
+                      f"box's OP_RETURN policy is {op_return_limit}; a Monero "
+                      "address alone is 95 characters, so no swap memo fits "
+                      f"the standard {OP_RETURN_STD_BYTES}. Raise "
+                      "--op-return-max-bytes ONLY for a node that will relay "
+                      "it (see STAGE2_PLAN.md section 2)")
+    return memo_text.encode("utf-8")
 
 
 def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
@@ -669,11 +700,12 @@ def main(argv=None):
                                 getter=safe_get)
     inbound, memo, expected = fetch_quote(send_sat, dest_xmr, args.tor_proxy)
     inbound_spk = validate_inbound(inbound, args.network)
-    memo_b = validate_memo(memo, dest_xmr, args.op_return_max_bytes)
+    memo_quoted = validate_memo(memo, dest_xmr)
     expected_xmr, worst_xmr = validate_expected(
         expected, send_sat, min_out, args.max_slippage, oracle)
-    memo_limit, affiliate_bps = validate_memo_terms(
-        memo_b.decode("utf-8"), worst_xmr, args.max_affiliate_bps)
+    memo_text, memo_limit, affiliate_bps, limit_set = enforce_memo_terms(
+        memo_quoted, expected_xmr, worst_xmr, args.max_affiliate_bps)
+    memo_b = fit_memo(memo_text, dest_xmr, args.op_return_max_bytes)
 
     # 4. THORNode's word on the inbound, when the operator named a node
     cross_checked = False
@@ -716,7 +748,9 @@ def main(argv=None):
         "tip": picture["tip"],
         "inbound": inbound,
         "inbound_cross_checked": cross_checked,
-        "memo": memo,
+        "memo": memo_text,                       # as laid out in the OP_RETURN
+        "memo_quoted": memo_quoted,              # as the aggregator returned it
+        "memo_limit_set": limit_set,             # True: the floor was written in
         "memo_bytes": len(memo_b),
         "op_return_max_bytes": args.op_return_max_bytes,
         "settled_sat": settled_sat,
@@ -757,9 +791,12 @@ def main(argv=None):
           f"{send_sat} sat, fee {fee_sat} sat at {rate} sat/vB "
           f"(bound {vsize_bound} vB"
           f"{f', real {vsize} vB at {real_rate} sat/vB' if signed else ''})")
+    whose = ("SET by this tool; the quote's was absent, zero or lower"
+             if limit_set else "the quote's own")
     print(f"  memo {len(memo_b)} bytes (policy {args.op_return_max_bytes}); "
           f"expected about {expected_xmr} XMR, worst case {worst_xmr}; "
-          f"chain limit {memo_limit} base units, affiliate {affiliate_bps} bps")
+          f"chain limit {memo_limit} base units ({whose}), "
+          f"affiliate {affiliate_bps} bps")
     print(f"  txid {txid}")
     if signed and not args.write_signed_hex:
         # To the job log, which the agent keeps at 0600 and truncates each

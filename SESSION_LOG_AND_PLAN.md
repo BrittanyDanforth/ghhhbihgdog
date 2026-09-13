@@ -325,6 +325,20 @@ dust constant, OP_RETURN builder or coin selection.
   test_wake_doorbell 159, test_telegram_pager 651, test_wake_endtoend 59.
 - 33 mutation anchors over the money guards and the OPSEC rules, all caught;
   two pre-existing anchors re-pointed.
+- **Self-doubt pass over the review's own fixes:** the "refuse a zero or
+  missing output limit" rule was wrong against the real world. THORChain's
+  own example memo is `:0/1/0` and aggregators quote the limit as 0 (or omit
+  it) routinely; the rule would have refused most real quotes. Replaced by
+  SETTING the limit: the forwarder lays the OP_RETURN out itself, so
+  `enforce_memo_terms` writes its own floor (99% of the worst-case arrival,
+  in 1e8 base units) into field 3 whenever the quote's limit is absent,
+  zero or lower; a higher quoted limit is kept as written; one above the
+  quote's own expected output (a certain refund, minus fees) or a
+  non-numeric one is refused (`memo_bad_limit`). Only the limit is touched;
+  `fit_memo` re-binds the destination and measures the FINAL bytes. The
+  plan records `memo` (as laid out), `memo_quoted` and `memo_limit_set`.
+  test_btc_forwarder 133; six new anchors (rewrite, ceiling, rounding
+  margin, re-bind) plus the re-pointed overflow anchor, all caught.
 - Deferred on purpose: no real handle carries `btc_index` until stage 4
   mints addresses (the job refuses `no_btc_deposit` on a live box); the
   pager has no command that starts a forward (stage 4 decides who may; the
@@ -571,7 +585,7 @@ rule-6 material).
 |---|-------|-------|
 | 0 | Vendor embit, trimmed to the used surface, constant-time system libsecp256k1 preferred (pure-Python fallback for watch-only), proven with BIP32/BIP84/BIP173 known-answer vectors | **DONE** — landed `8c86548`, reworked in the commit that follows |
 | 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 213/213, 18 anchors all caught (`9f19781`, `2cc59ea`, and the third-round commit) |
-| 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only, reviewed** — `gs_btc_tx.py` (test_btc_tx 73/73, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 116/116), job wiring (test_wake_agent 621/621, test_wake_protocol 189/189, test_wake_endtoend 59/59 over real HTTP), 33 anchors all caught; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
+| 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only, reviewed** — `gs_btc_tx.py` (test_btc_tx 73/73, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 133/133; the memo's output limit is SET by the tool, never trusted), job wiring (test_wake_agent 621/621, test_wake_protocol 189/189, test_wake_endtoend 59/59 over real HTTP), 39 anchors all caught; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
 | 3 | Broadcast over Tor; confirmation-wait; testnet end-to-end proving the swap starts; reorg edges | pending |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
 | 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |

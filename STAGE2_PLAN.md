@@ -23,12 +23,19 @@ What shipped, against the build order in section 7:
   depth AND worth (the dust-storm defence); the built fee must equal the
   sized fee. The memo is bound on its PLAIN form only (a hex-encoded memo is
   refused, never embedded as hex), and its own terms are read: the output
-  limit must be present, non-zero and at least the worst-case arrival in
-  base units, and the affiliate fee at most `--max-affiliate-bps` (default
-  0). The signed bytes go to stdout (the job log), not the plan file,
-  unless `--write-signed-hex` (stage 3's consumer flag).
-  `tests/test_btc_forwarder.py`: 116 checks through the real `main()`, plus
-  `build_and_sign`'s three money guards driven directly.
+  limit -- the chain's only slippage guard -- is SET by the tool, not
+  trusted: whenever the quote's is absent, zero or lower, the floor (99% of
+  the worst-case arrival, in 1e8 base units) is written into field 3 and
+  nothing else in the memo is touched; a higher quoted limit is kept as
+  written, one above the quote's own expected output (a certain refund) or
+  a non-numeric one is refused (`memo_bad_limit`); the affiliate fee is at
+  most `--max-affiliate-bps` (default 0). The plan records the memo as laid
+  out, the memo as quoted, and `memo_limit_set`. The signed bytes go to
+  stdout (the job log), not the plan file, unless `--write-signed-hex`
+  (stage 3's consumer flag).
+  `tests/test_btc_forwarder.py`: 133 checks through the real `main()`, plus
+  `build_and_sign`'s three money guards and `enforce_memo_terms` driven
+  directly.
 - The job: `forward_to_swap` in `JOBS`, `SPENDING_JOBS` and `GATED_TOOLS`,
   `WIRE_VERSION` 4; the agent's argv branch (keyfile settings validated,
   never coerced: `btc_config_malformed`), per-job spending switch
@@ -50,8 +57,21 @@ What shipped, against the build order in section 7:
   agent over real HTTP in `tests/test_wake_endtoend.py` (a done forward of
   the handle the first cycle minted, then `already_forwarded` on the
   repeat), plus the doorbell (159) and pager (651) rendering.
-- 33 mutation anchors over the money guards and the OPSEC rules (all
+- 38 mutation anchors over the money guards and the OPSEC rules (all
   caught).
+
+**Self-doubt pass (after the review):** the review's "refuse a zero or
+missing limit" was wrong against the real world. THORChain's own example
+memo is `=:XMR.XMR:<dest>:0/1/0` and aggregators quote the limit as 0 (or
+omit it) routinely, so that rule would have refused most real quotes -- and
+a forwarder that refuses everything is as useless as one that trusts
+everything. The right design does not depend on the aggregator's habits at
+all: the forwarder lays the OP_RETURN out itself, so it writes its own
+floor. `enforce_memo_terms` replaced `validate_memo_terms`; `fit_memo`
+re-binds the destination and measures the FINAL bytes (the floor is nine
+digits where the quote had one, so a policy sized to the quoted memo can
+overflow -- pinned). Six anchors cover the rewrite, the ceiling, the
+rounding margin and the re-bind.
 
 Deferred, on purpose: the deposit ledger does not yet carry `btc_index` for
 any real handle (stage 4 mints the addresses), so on a live box the job
