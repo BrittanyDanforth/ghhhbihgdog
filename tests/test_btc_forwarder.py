@@ -122,8 +122,15 @@ class Net:
     def __init__(self, *, utxos=None, fee=10, inbound=_INBOUND, memo=_MEMO,
                  expected=None, oracle=_ORACLE, thornode=None,
                  look_error=None, post_error=None, routes=None,
-                 factor=Decimal(1)):
+                 factor=Decimal(1), submit=None, seen=None, clock=None):
         self.factor = factor                     # quote vs oracle, x
+        self.clock = clock                       # the quote-age clock
+        # THE BROADCAST SIDE, canned: `submit` is the dict bcast.submit
+        # would return (or an exception to raise, or "real" to leave the
+        # real function in place); `seen` likewise. Every call is recorded.
+        self.submit_result = submit
+        self.seen_result = seen
+        self.submits, self.seens = [], []
         self.utxos = utxos if utxos is not None else [
             {"tx_hash": _H1, "vout": 0, "value": 200000, "confirmations": 5}]
         self.fee = fee
@@ -177,10 +184,33 @@ class Net:
             raise self.thornode
         return self.thornode
 
+    def _submit(self, raw_hex, expected_txid, address, servers, proxy_url,
+                **kw):
+        self.submits.append({"raw_hex": raw_hex, "txid": expected_txid,
+                             "address": address, "servers": servers,
+                             "proxy": proxy_url, **kw})
+        r = self.submit_result
+        if isinstance(r, Exception):
+            raise r
+        return dict(r) if r else _UNREACHABLE
+
+    def _seen(self, txid, address, servers, proxy_url, **kw):
+        self.seens.append({"txid": txid, "address": address,
+                           "servers": servers, "proxy": proxy_url, **kw})
+        r = self.seen_result
+        if isinstance(r, Exception):
+            raise r
+        return dict(r) if r else _NOT_SEEN
+
     def install(self):
         F.look = self.look
         F.safe_post = self.safe_post
         F.safe_get = self.safe_get
+        F.bcast_submit = (_REAL_SUBMIT if self.submit_result == "real"
+                          else self._submit)
+        F.bcast_seen = (_REAL_SEEN if self.seen_result == "real"
+                        else self._seen)
+        F._clock = self.clock or _REAL_CLOCK
         F.btc_per_xmr_oracle = lambda proxies=None, getter=None: self.oracle
         F.integrity_log = lambda stage, kind, *a, **k: self.kinds.append(
             (stage, kind)) or ""
@@ -193,17 +223,33 @@ class Net:
 
 
 _PROXY = "socks5h://127.0.0.1:9050"
+_REAL_SUBMIT, _REAL_SEEN, _REAL_CLOCK = F.bcast_submit, F.bcast_seen, F._clock
+_ACCEPTED = {"outcome": "accepted", "server": "s.onion", "cert_sha256": None,
+             "codes": [], "attempts": 1, "mismatched": 0,
+             "pin_mismatch": False}
+_AMBIGUOUS = {**_ACCEPTED, "outcome": "ambiguous", "server": None}
+_REJECTED = {**_AMBIGUOUS, "outcome": "rejected", "codes": [1, 1],
+             "attempts": 2}
+_UNREACHABLE = {**_AMBIGUOUS, "outcome": "unreachable", "attempts": 2}
+_SEEN0 = {"seen": True, "height": 0, "server": "s.onion", "cert_sha256": None,
+          "polls": 1, "asked": True}
+_NOT_SEEN = {**_SEEN0, "seen": False, "height": None, "polls": 7}
+_NOT_ASKED = {**_NOT_SEEN, "asked": False, "server": None}
 
 
 def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None,
-        ids="env", index="0"):
+        ids="env", index="0", broadcast=False, proxy=_PROXY):
     """Drive main(). Returns (exit_code, stdout, plan_or_None, outfile).
     `ids` says how the xpub and index reach the tool: "env" (the wake
-    agent's way), "argv" (a hand run), or None (neither)."""
+    agent's way), "argv" (a hand run), or None (neither). `broadcast`
+    passes --broadcast INSTEAD of --dry-run unless dry_run is forced."""
     net.install()
     out = outfile or os.path.join(_scratch, f"plan_{os.urandom(4).hex()}.json")
-    argv = ["--tor-proxy", _PROXY, "--electrum", "s.onion",
+    argv = ["--tor-proxy", proxy, "--electrum", "s.onion",
             "--dest-from-receive-wallet", _BUNDLE, "--outfile", out]
+    if broadcast:
+        argv.append("--broadcast")
+        dry_run = dry_run is True and "--dry-run" in extra
     os.environ.pop("GS_BTC_XPUB", None)
     os.environ.pop("GS_BTC_INDEX", None)
     if ids == "env":
@@ -236,12 +282,12 @@ def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None,
     return code, buf.getvalue(), plan, out
 
 
-_HEX_LINE = re.compile(r"signed hex \(stage 2: NOT broadcast, not persisted\): "
+_HEX_LINE = re.compile(r"signed hex \(dry run: NOT broadcast, not persisted\): "
                        r"([0-9a-f]+)")
 
 
 def _signed_tx(out):
-    """The signed transaction, from the ONE place stage 2 puts it: stdout
+    """The signed transaction, from the ONE place a dry run puts it: stdout
     (the job log), never the plan file."""
     m = _HEX_LINE.search(out)
     return Transaction.parse(bytes.fromhex(m.group(1))) if m else None
@@ -260,9 +306,14 @@ _code, _out, _plan, _outfile = run(_net)
 check("exit 0, a plan file exists, mode 0600",
       _code == 0 and _plan is not None
       and oct(os.stat(_outfile).st_mode & 0o777) == "0o600")
-check("the plan says: dry run, NOT broadcast, signed, schema v1",
+check("the plan says: dry run, NOT broadcast (no outcome, nothing seen), "
+      "signed, the current schema",
       _plan["dry_run"] is True and _plan["broadcast"] is False
-      and _plan["signed"] is True and _plan["schema"] == F.PLAN_SCHEMA)
+      and _plan["broadcast_outcome"] is None and _plan["seen"] is False
+      and _plan["signed"] is True and _plan["schema"] == F.PLAN_SCHEMA
+      and _plan["tx_hex_reason"] is None)
+check("A DRY RUN NEVER REACHES THE BROADCAST SIDE: neither submit nor "
+      "seen was called", _net.submits == [] and _net.seens == [])
 _tx = _signed_tx(_out)
 check("the transaction spends the settled output with RBF, locktime = tip, "
       "version 2", len(_tx.vin) == 1 and _tx.vin[0].txid.hex() == _H1
@@ -841,14 +892,247 @@ check("a look that fails is a FAILURE (exit 1, look_failed), not a refusal "
       and ("forward", "look_failed") in _net.kinds)
 _r("pin_mismatch", Net(look_error=W.PinMismatch("tls: pin")))
 
+# ===========================================================================
+print("\n== --broadcast: the forward leaves the machine (STAGE3_PLAN.md) ==")
+
+
+def _b(net, *extra, **kw):
+    """A broadcast run: (code, out, plan, net)."""
+    code, out, plan, _ = run(net, *extra, broadcast=True, **kw)
+    return code, out, plan, net
+
+
+check("both flags is a contradiction and neither is the old refusal, by the "
+      "same name; --plan-only cannot broadcast; a bad clock is refused",
+      _refusal(Net(), "--dry-run", broadcast=True)[3] == "not_dry_run"
+      and _refusal(Net(), dry_run=False)[3] == "not_dry_run"
+      and _refusal(Net(), "--plan-only", broadcast=True)[3] == "bad_args"
+      and _refusal(Net(), "--quote-max-age", "0", broadcast=True)[3]
+      == "bad_args"
+      and _refusal(Net(), "--seen-interval", "0", broadcast=True)[3]
+      == "bad_args"
+      and not Net().submits)
+
+_code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_SEEN0))
+check("ACCEPTED and SEEN: exit 0, the plan says broadcast true, outcome "
+      "accepted by the server, seen at height 0, dry_run false",
+      _code == 0 and _plan["broadcast"] is True and _plan["dry_run"] is False
+      and _plan["broadcast_outcome"] == "accepted"
+      and _plan["broadcast_server"] == "s.onion" and _plan["seen"] is True
+      and _plan["seen_height"] == 0 and _plan["seen_asked"] is True
+      and _plan["signed"] is True)
+_sent = Transaction.parse(bytes.fromhex(_net.submits[0]["raw_hex"]))
+check("...what was SENT is what was SIGNED: the submitted hex parses to the "
+      "plan's txid, verifies against the key at index 0, and pays the "
+      "inbound exactly send_sat", len(_net.submits) == 1
+      and T.txid_hex(_sent) == _plan["txid"] == _net.submits[0]["txid"]
+      and T.verify_signed(_sent, [200000], [_PUB0])
+      and _sent.vout[0].value == _plan["send_sat"])
+check("...submit was given THIS address, the configured servers, the proxy, "
+      "the network and the timeout -- and seen the same, with the txid and "
+      "the default wait", _net.submits[0]["address"] == _ADDR0
+      and _net.submits[0]["servers"] == [("s.onion", 50002, None)]
+      and _net.submits[0]["proxy"] == _PROXY
+      and _net.submits[0]["network"] == "main"
+      and _net.submits[0]["timeout"] == 30.0
+      and _net.seens[0]["txid"] == _plan["txid"]
+      and _net.seens[0]["address"] == _ADDR0
+      and _net.seens[0]["wait_s"] == 90.0
+      and _net.seens[0]["interval_s"] == 15.0)
+check("...THE HEX IS NOWHERE: not in the plan (the network has it), not on "
+      "stdout", _plan["tx_hex"] is None and _plan["tx_hex_reason"] is None
+      and _plan["signed_hex_written"] is False
+      and _HEX_LINE.search(_out) is None
+      and _net.submits[0]["raw_hex"] not in _out)
+check("...the summary says SENT, accepted, seen in the mempool, and NOT "
+      "'NOT BROADCAST'", "SENT: accepted by s.onion" in _out
+      and "seen: in the mempool" in _out and "NOT BROADCAST" not in _out)
+check("...the hash chain got kinds only: sending, broadcast_accepted, "
+      "broadcast_seen, and no not_broadcast; not one carries a digit",
+      [k for s, k in _net.kinds if s == "forward"]
+      == ["start", "quoted", "signed", "sending", "broadcast_accepted",
+          "broadcast_seen"]
+      and not any(re.search(r"\d", k) for _, k in _net.kinds))
+check("...the seed is gone from the environment and appears nowhere",
+      F.SEED_ENV not in os.environ and "abandon" not in _out
+      and "abandon" not in open(run(Net(submit=_ACCEPTED, seen=_SEEN0),
+                                    broadcast=True)[3]).read())
+
+_code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_NOT_SEEN))
+check("ACCEPTED but NOT SEEN within the wait: still exit 0 (a server took "
+      "it), the plan keeps the signed hex with reason 'unseen', and the "
+      "summary says so", _code == 0 and _plan["broadcast"] is True
+      and _plan["seen"] is False and _plan["seen_asked"] is True
+      and _plan["seen_polls"] == 7
+      and _plan["tx_hex_reason"] == "unseen" and _plan["signed_hex_written"]
+      and Transaction.parse(bytes.fromhex(_plan["tx_hex"])).is_segwit
+      and "KEPT in the plan file (unseen)" in _out
+      and "NOT yet listed" in _out
+      and [k for s, k in _net.kinds if s == "forward"][-1]
+      == "broadcast_unseen")
+_code, _out, _plan, _net = _b(Net(submit=_AMBIGUOUS, seen=_NOT_SEEN))
+check("AMBIGUOUS and not seen: exit 0 (the money MAY have moved -- never "
+      "'failed'), broadcast true, the hex kept with reason 'ambiguous', "
+      "the warning printed", _code == 0 and _plan["broadcast"] is True
+      and _plan["broadcast_outcome"] == "ambiguous"
+      and _plan["tx_hex_reason"] == "ambiguous" and _plan["tx_hex"]
+      and "[!] AMBIGUOUS" in _out
+      and "broadcast_ambiguous" in [k for s, k in _net.kinds])
+_code, _out, _plan, _net = _b(Net(submit=_AMBIGUOUS, seen=_SEEN0))
+check("AMBIGUOUS then SEEN by the poll: the network has it, so the hex is "
+      "NOT kept", _code == 0 and _plan["seen"] is True
+      and _plan["tx_hex"] is None and _plan["tx_hex_reason"] is None)
+_code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_NOT_ASKED))
+check("accepted, and nobody could be asked afterwards: seen false, "
+      "seen_asked false, the hex kept, 'UNKNOWN' said",
+      _code == 0 and _plan["seen_asked"] is False
+      and _plan["tx_hex_reason"] == "unseen" and "seen: UNKNOWN" in _out)
+
+_code, _out, _plan, _net = _b(Net(submit=_REJECTED))
+check("REJECTED by every server: refused broadcast_rejected, exit 2, NO plan "
+      "(nothing moved), seen never asked, the codes and the plan section "
+      "named", _code == 2 and _plan is None and _net.seens == []
+      and "refused:broadcast_rejected" in [k for s, k in _net.kinds]
+      and "codes [1, 1]" in _out and "STAGE3_PLAN" in _out
+      and "nothing moved" in _out)
+_code, _out, _plan, _net = _b(Net(submit=_UNREACHABLE))
+check("UNREACHABLE: exit 1 (a failure, nothing moved), no plan, seen never "
+      "asked, the kind logged", _code == 1 and _plan is None
+      and _net.seens == [] and "nothing moved" in _out
+      and "broadcast_unreachable" in [k for s, k in _net.kinds])
+_code, _out, _plan, _net = _b(Net(submit=W.PinMismatch("tls: pin")))
+check("a PinMismatch while sending (before any bytes left): refused "
+      "pin_mismatch, no plan, nothing sent", _code == 2 and _plan is None
+      and "refused:pin_mismatch" in [k for s, k in _net.kinds])
+_code, _out, _plan, _net = _b(Net(submit=_ACCEPTED,
+                                  seen=W.PinMismatch("tls: pin")))
+check("a PinMismatch while LOOKING (after acceptance): exit 0, seen false "
+      "and not asked, the kind logged, the hex kept, the certificate named "
+      "in the summary", _code == 0 and _plan["seen"] is False
+      and _plan["seen_asked"] is False and _plan["tx_hex_reason"] == "unseen"
+      and "seen_pin_mismatch" in [k for s, k in _net.kinds]
+      and "another certificate" in _out)
+_code, _out, _plan, _net = _b(Net(submit={**_AMBIGUOUS, "pin_mismatch": True,
+                                          "mismatched": 1}, seen=_NOT_SEEN))
+check("an ambiguous result carrying pin_mismatch and a foreign-txid count "
+      "logs both kinds", "send_pin_mismatch" in [k for s, k in _net.kinds]
+      and "txid_mismatch" in [k for s, k in _net.kinds]
+      and "1 foreign txid" in _out and _plan["broadcast_mismatched"] == 1)
+_code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_SEEN0),
+                              "--write-signed-hex")
+check("--write-signed-hex keeps the hex even when the network has it, with "
+      "its own reason", _code == 0 and _plan["tx_hex"]
+      and _plan["tx_hex_reason"] == "write_signed_hex")
+_code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_SEEN0),
+                              "--seen-wait", "0", "--seen-interval", "2.5",
+                              "--timeout", "12")
+check("--seen-wait, --seen-interval and --timeout reach the broadcast side",
+      _net.seens[0]["wait_s"] == 0.0 and _net.seens[0]["interval_s"] == 2.5
+      and _net.submits[0]["timeout"] == 12.0
+      and _net.seens[0]["timeout"] == 12.0)
+
+print("\n== the quote is bounded in time ==")
+_ticks = iter([0.0, 301.0, 1000.0, 1000.0])
+_net = Net(submit=_ACCEPTED, seen=_SEEN0, clock=lambda: next(_ticks))
+_code, _out, _plan, _ = run(_net, broadcast=True)
+_kinds = [k for s, k in _net.kinds if s == "forward"]
+check("301 s between the quote and the send on a 300 s allowance: refused "
+      "quote_stale AFTER signing (the seed was used, nothing was sent), no "
+      "plan, submit never called", _code == 2 and _plan is None
+      and _net.submits == [] and "refused:quote_stale" in _kinds
+      and "signed" in _kinds and F.SEED_ENV not in os.environ)
+_ticks = iter([0.0, 301.0, 1000.0, 1000.0])
+_net = Net(submit=_ACCEPTED, seen=_SEEN0, clock=lambda: next(_ticks))
+_code, _out, _plan, _ = run(_net, "--quote-max-age", "301", broadcast=True)
+check("...exactly the allowance is sent; --quote-max-age raises it",
+      _code == 0 and len(_net.submits) == 1)
+_ticks = iter([0.0, 300.0, 1000.0, 1000.0])
+_net = Net(submit=_ACCEPTED, seen=_SEEN0, clock=lambda: next(_ticks))
+check("...and 300 s on the default allowance is sent (the bound is 'over', "
+      "not 'at')", run(_net, broadcast=True)[0] == 0)
+
+print("\n== the order of the guards: nothing is sent before the last one ==")
+_orig_bas = F.build_and_sign
+
+
+def _low_rate(*a, **k):
+    tx, txid, vsize, real_rate, signed = _orig_bas(*a, **k)
+    return tx, txid, vsize, 0, signed
+
+
+F.build_and_sign = _low_rate
+try:
+    _code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_SEEN0))
+finally:
+    F.build_and_sign = _orig_bas
+check("a signed transaction whose real rate is under the floor is refused "
+      "fee_out_of_band BEFORE the broadcast: submit never called",
+      _code == 2 and _net.submits == []
+      and "refused:fee_out_of_band" in [k for s, k in _net.kinds])
+_net = Net(submit=_ACCEPTED, seen=_SEEN0, memo="=:XMR.XMR:" + _OTHER + ":0/1/0")
+_code, _out, _plan, _ = run(_net, broadcast=True)
+check("...and every stage-2 refusal (here: an unbound memo) still fires "
+      "first, with nothing sent", _code == 2 and _net.submits == [])
+
+print("\n== END TO END through the REAL broadcast module: sign, send, see ==")
+from btcmock import mock_socks, tls_server_context           # noqa: E402
+_sctx, _CERT_SHA = tls_server_context()
+_port, _cap, _srv = mock_socks("electrum", {"txid": "compute",
+                                            "history": "compute"},
+                               tls_ctx=_sctx, connections=2)
+try:
+    _code, _out, _plan, _net = _b(Net(submit="real", seen="real"),
+                                  proxy=f"socks5h://127.0.0.1:{_port}")
+finally:
+    _srv.close()
+check("the real transport, the real subclass and the real forwarder: the "
+      "in-process server received the signed hex, answered its real txid, "
+      "listed it, and the plan says accepted + seen at height 0",
+      _code == 0 and _plan["broadcast_outcome"] == "accepted"
+      and _plan["broadcast_server"] == "s.onion" and _plan["seen"] is True
+      and _plan["seen_height"] == 0 and _cap.get("hex")
+      and T.txid_hex(Transaction.parse(bytes.fromhex(_cap["hex"])))
+      == _plan["txid"] == _cap["txid_answered"]
+      and _plan["tx_hex"] is None
+      and _cap.get("tls_version") in ("TLSv1.2", "TLSv1.3"))
+check("...two sessions, both on the broadcast circuit credential for this "
+      "address (not the look's), the methods in order: version, broadcast; "
+      "version, get_history", _cap["sessions"] == 2
+      and _cap["methods_asked"] == ["server.version",
+                                    "blockchain.transaction.broadcast",
+                                    "server.version",
+                                    "blockchain.scripthash.get_history"]
+      and len(set(_cap["users"])) == 1
+      and _cap["users"][0] == W._socks_parts(
+          f"socks5h://127.0.0.1:{_port}", "btcsend:" + _ADDR0)[2]
+      and _cap["users"][0] != W._socks_parts(
+          f"socks5h://127.0.0.1:{_port}", "btcwatch:" + _ADDR0)[2])
+_port, _cap, _srv = mock_socks("electrum", {"reject": 1}, tls_ctx=_sctx,
+                               connections=1)
+try:
+    _code, _out, _plan, _net = _b(Net(submit="real", seen="real"),
+                                  proxy=f"socks5h://127.0.0.1:{_port}")
+finally:
+    _srv.close()
+check("...a real rejection whose message carries the hex: refused "
+      "broadcast_rejected with the code alone, the hex nowhere in the "
+      "output", _code == 2 and _plan is None and "codes [1]" in _out
+      and _cap["hex"] not in _out)
+
 print("\n== what the source must not be ==")
 _src = code_only(os.path.join(REPO, "btc_forwarder"))
 check("FORWARD_MIN_SAT is gs_wake_proto.DEPOSIT_MIN_SAT: the two floors are "
       "one figure", F.FORWARD_MIN_SAT == P.DEPOSIT_MIN_SAT == 10_000)
-check("the forwarder has no broadcast path: no Electrum broadcast method, no "
-      "sendrawtransaction, no HTTP submit",
+check("the forwarder names no Electrum method that spends: the broadcast is "
+      "reached through gs_btc_broadcast's submit, called exactly once, "
+      "inside the --broadcast branch, after the real-rate floor",
       "transaction.broadcast" not in _src and "sendrawtransaction" not in _src
-      and "broadcast_tx" not in _src)
+      and _src.count("bcast_submit(") == 1
+      and _src.index("rate fell under the floor")
+      < _src.index("if args.broadcast:\n") < _src.index("bcast_submit("))
+check("the forwarder never reads a transaction from a file to send it (no "
+      "--rebroadcast, no plan read)", "--rebroadcast" not in _src
+      and "json.load(" not in _src)
 check("the seed is never an argument: no --seed, no --mnemonic",
       "--seed" not in _src and "--mnemonic" not in _src
       and "add_argument(\"--seed" not in _src)

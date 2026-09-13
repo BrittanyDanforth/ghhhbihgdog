@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Forward a client's settled BTC deposit into the ThorChain swap. DRY RUN.
+"""Forward a client's settled BTC deposit into the ThorChain swap.
 
-STAGE 2 of the BTC-intake rework (STAGE2_PLAN.md). This is the vault-side
-tool the `forward_to_swap` job runs. It takes ONE deposit address the Pi
-has been watching, every settled output on it, and builds and signs the
-transaction that pays ThorChain's current inbound vault with the swap memo
-in an OP_RETURN -- then PRINTS it and writes it to a 0600 file. It does not
-broadcast. There is no broadcast code in this file, no flag to enable one,
-and the Electrum client it uses knows no method that could. Stage 3 adds
-the broadcast as a separate, gated step.
+STAGES 2 AND 3 of the BTC-intake rework (STAGE2_PLAN.md, STAGE3_PLAN.md).
+This is the vault-side tool the `forward_to_swap` job runs. It takes ONE
+deposit address the Pi has been watching, every settled output on it, and
+builds and signs the transaction that pays ThorChain's current inbound
+vault with the swap memo in an OP_RETURN. In DRY RUN it prints the result
+and writes it to a 0600 file and sends nothing; with --broadcast it hands
+the bytes it just signed to the network over Tor, from memory, and records
+what the network said. Exactly one of the two flags is required: neither
+is a refusal, so no mode is ever reached by omission.
+
+The broadcast lives in gs_btc_broadcast, a module the Pi never imports;
+the watch client this tool looks with still knows no method that could
+move money. The signed bytes are never read from a file: what is sent is
+what was signed a moment ago, in this process (STAGE3_PLAN.md 3.2).
 
 What it does, in order, and what it refuses at each step:
 
@@ -42,27 +48,43 @@ What it does, in order, and what it refuses at each step:
      address, refuses to sign unless the constant-time system libsecp256k1
      is the live backend, signs, verifies every signature, measures the
      real size and rate.
-  7. Writes the plan -- inputs, outputs, memo, fee, rate, txid, the signed
-     hex -- to the outfile, 0600, with `broadcast: false`, and prints a
-     summary. The hex and the memo reach the job log and the file, never
-     the hash chain, never a reply to the phone.
+  7. With --broadcast, and only then: refuses a quote older than
+     --quote-max-age (nothing is sent on a stale price), hands the signed
+     bytes to the configured Electrum servers in turn over Tor
+     (gs_btc_broadcast.submit), and then asks the deposit address's history
+     until the transaction is listed or --seen-wait runs out
+     (gs_btc_broadcast.seen). The outcome is one of four words --
+     accepted, rejected, ambiguous, unreachable -- and the word decides
+     everything after it (STAGE3_PLAN.md 3.10): rejected by every server
+     is a refusal (nothing moved); unreachable is a failure (nothing
+     moved); accepted and ambiguous exit 0 because the money may have
+     moved, and rendering that as "failed" is the false sentence the
+     phase vocabulary exists to stop.
+  8. Writes the plan -- inputs, outputs, memo, fee, rate, txid, the
+     broadcast's outcome -- to the outfile, 0600, and prints a summary.
+     The signed hex is in the plan ONLY when nothing consumes it yet and
+     the network has not shown it: an unsigned plan (--plan-only), an
+     explicit --write-signed-hex, or a broadcast whose transaction no
+     server has listed (ambiguous, or accepted but unseen). A dry run
+     prints the hex to stdout (the job log) and keeps it nowhere. The hex
+     and the memo reach the job log and the file, never the hash chain,
+     never a reply to the phone.
 
 THE MEMO DOES NOT FIT A STANDARD OP_RETURN, and this tool says so rather
 than hoping. A Monero subaddress is 95 characters; the shortest swap memo
 is 105 bytes; the standard relay limit is 80. --op-return-max-bytes is the
 operator's relay policy (a node run with a raised datacarrier limit can
 carry more) and defaults to the standard 80, so on a default configuration
-every real forward is REFUSED at step 3 with the byte count. That is the
-honest outcome of a dry-run stage: the constraint is measured, not
-theoretical, and the relay strategy is stage 3's decision.
+every real forward is REFUSED at step 3 with the byte count. The relay
+strategy (STAGE3_PLAN.md 3.3) is failover: a server whose node keeps the
+old policy rejects the memo, the next one relays it, and only every server
+saying no is a refusal -- with their codes, and nothing moved.
 
 What never reaches the hash chain: an address, an amount, a fee, a rate, a
-txid, a memo, an index, a token. Event kinds only, and the per-output loop
-logs nothing at all. What never reaches argv: the seed, the destination,
-the amount. What never reaches this file's output: the seed.
-
---dry-run is REQUIRED. There is no other mode in stage 2, and the flag is
-required so that a future broadcast mode cannot be reached by omission.
+txid, a memo, an index, a token, a server. Event kinds only, and the
+per-output loop logs nothing at all. What never reaches argv: the seed,
+the destination, the amount. What never reaches this file's output: the
+seed.
 """
 import argparse
 import json
@@ -88,6 +110,12 @@ from gs_common import (                                      # noqa: E402
 import gs_btc_tx as btx                                      # noqa: E402
 import gs_btc_watch as watch                                 # noqa: E402
 from gs_btc_watch import derive_receive_address, look, parse_server  # noqa
+# THE ONE IMPORT THAT CAN MOVE MONEY, bound to two names so a test can
+# stand in for either and the dry-run path can be proven never to reach
+# them. Nothing else in this file names a method that spends.
+import gs_btc_broadcast as bcast                             # noqa: E402
+bcast_submit = bcast.submit
+bcast_seen = bcast.seen
 
 #: The forward's floor, in satoshis, on what reaches ThorChain AFTER the
 #: fee. It equals gs_wake_proto.DEPOSIT_MIN_SAT (10,000 sat, 0.0001 BTC),
@@ -106,8 +134,15 @@ ARRIVAL_TOLERANCE = Decimal("0.10")
 #: The most bytes a scriptPubKey ThorChain could give us has: P2WSH or P2TR
 #: (1 + 1 + 32). The bound used before the quote is known.
 INBOUND_SPK_MAX = 34
-#: Version of the plan file this writes.
-PLAN_SCHEMA = "gs_btc_forward_v1"
+#: Version of the plan file this writes. v2: the broadcast fields.
+PLAN_SCHEMA = "gs_btc_forward_v2"
+#: The most seconds allowed between the quote and the broadcast. Inbound
+#: vaults churn on a scale of days and the memo's limit guards the price,
+#: so this is generous; it exists so the gap is a decision, not an
+#: accident of Tor's latency (STAGE3_PLAN.md 3.5).
+DEFAULT_QUOTE_MAX_AGE_S = 300
+#: The clock the quote's age is measured on; a name so a test can move it.
+_clock = time.monotonic
 #: The environment variable that carries the seed, and its optional
 #: passphrase. Never argv: /proc/<pid>/cmdline is 0444.
 SEED_ENV = "GS_BTC_SEED"
@@ -545,16 +580,34 @@ def write_plan(path, plan):
 
 def build_cli():
     ap = argparse.ArgumentParser(
-        description="Forward a settled BTC deposit into the ThorChain swap. "
-                    "DRY RUN ONLY in stage 2: builds, signs, prints, never "
-                    "broadcasts.")
+        description="Forward a settled BTC deposit into the ThorChain swap: "
+                    "build, sign, and either print (--dry-run) or send "
+                    "(--broadcast). Exactly one of the two is required.")
     ap.add_argument("--dry-run", action="store_true",
-                    help="REQUIRED. Stage 2 has no other mode; the flag is "
-                         "required so a future broadcast mode cannot be "
-                         "reached by omission.")
+                    help="build, sign, print, write the plan; send NOTHING. "
+                         "One of --dry-run / --broadcast is required so no "
+                         "mode is reached by omission.")
+    ap.add_argument("--broadcast", action="store_true",
+                    help="after signing, hand the transaction to the "
+                         "configured Electrum servers over Tor and wait to "
+                         "see it listed. Money moves.")
+    ap.add_argument("--quote-max-age", type=int,
+                    default=DEFAULT_QUOTE_MAX_AGE_S, metavar="S",
+                    help="refuse to send if this many seconds passed since "
+                         f"the quote (default {DEFAULT_QUOTE_MAX_AGE_S})")
+    ap.add_argument("--seen-wait", type=float,
+                    default=bcast.DEFAULT_SEEN_WAIT_S, metavar="S",
+                    help="after sending, how long to wait for a server to "
+                         "list the transaction (default "
+                         f"{bcast.DEFAULT_SEEN_WAIT_S:g})")
+    ap.add_argument("--seen-interval", type=float,
+                    default=bcast.DEFAULT_SEEN_INTERVAL_S, metavar="S",
+                    help="how often to ask while waiting (default "
+                         f"{bcast.DEFAULT_SEEN_INTERVAL_S:g})")
     ap.add_argument("--plan-only", action="store_true",
                     help="stop before signing: no seed needed. The plan "
-                         "file carries the unsigned transaction.")
+                         "file carries the unsigned transaction. Dry run "
+                         "only.")
     ap.add_argument("--tor-proxy", required=True, help="socks5h:// proxy")
     ap.add_argument("--electrum", action="append", default=[],
                     metavar="HOST[:PORT][,PIN]", required=True,
@@ -574,10 +627,10 @@ def build_cli():
                          "THORName) a quoted memo may carry (default 0: none)")
     ap.add_argument("--write-signed-hex", action="store_true",
                     help="also write the SIGNED transaction into the plan "
-                         "file. Off by default in stage 2: a signed forward "
-                         "is a bearer instrument, and nothing consumes the "
-                         "file yet; the hex goes to stdout (the job log) "
-                         "instead.")
+                         "file. Off by default: a signed forward is a bearer "
+                         "instrument. Without it a dry run prints the hex "
+                         "to stdout (the job log) and a broadcast keeps it "
+                         "only while no server has listed the transaction.")
     ap.add_argument("--dest-from-receive-wallet", required=True,
                     metavar="BUNDLE",
                     help="the gs_receive_wallet_v1 bundle this deposit was "
@@ -611,9 +664,19 @@ def build_cli():
 def main(argv=None):
     install_signal_handlers()
     args = build_cli().parse_args(argv)
-    if not args.dry_run:
-        raise Refused("not_dry_run", "--dry-run is required: stage 2 builds "
-                      "and signs and never broadcasts")
+    # EXACTLY ONE MODE. Neither is the stage-2 refusal (kept by name: an
+    # old caller that passes nothing still gets it); both is a contradiction.
+    if args.dry_run == args.broadcast:
+        raise Refused("not_dry_run", "exactly one of --dry-run and "
+                      "--broadcast is required: no mode is reached by "
+                      "omission, and a dry run cannot also send")
+    if args.broadcast and args.plan_only:
+        raise Refused("bad_args", "--plan-only writes an unsigned plan; "
+                      "there is nothing to broadcast")
+    if args.broadcast and (args.quote_max_age < 1 or args.seen_wait < 0
+                           or args.seen_interval <= 0):
+        raise Refused("bad_args", "--quote-max-age must be >= 1, "
+                      "--seen-wait >= 0, --seen-interval > 0")
     # THE XPUB AND THE INDEX, from the environment by preference (the wake
     # agent puts them there); argv still works for a hand run, with the
     # warning env_or_argv prints. Neither present is a refusal.
@@ -699,6 +762,7 @@ def main(argv=None):
                                                "forward:oracle"),
                                 getter=safe_get)
     inbound, memo, expected = fetch_quote(send_sat, dest_xmr, args.tor_proxy)
+    quoted_at = _clock()                   # the clock the broadcast reads
     inbound_spk = validate_inbound(inbound, args.network)
     memo_quoted = validate_memo(memo, dest_xmr)
     expected_xmr, worst_xmr = validate_expected(
@@ -730,13 +794,92 @@ def main(argv=None):
     if signed and real_rate < args.feerate_floor:
         raise Refused("fee_out_of_band", "the signed transaction's real "
                       "rate fell under the floor")
+    integrity_log("forward", "signed" if signed else "planned")
 
-    # 7. the plan file and the summary; NOT a broadcast
+    # 7. THE BROADCAST, and only with --broadcast: after every guard above,
+    #    from the bytes in memory, never from a file. See the header.
+    outcome, sub, seen_r = None, None, None
+    if args.broadcast:
+        age = _clock() - quoted_at
+        if age > args.quote_max_age:
+            raise Refused("quote_stale",
+                          f"{int(age)} s passed since the quote, over the "
+                          f"{args.quote_max_age} s this box allows between "
+                          "quoting and sending; nothing was sent")
+        integrity_log("forward", "sending")
+        try:
+            sub = bcast_submit(tx.serialize().hex(), txid, address, servers,
+                               args.tor_proxy, network=args.network,
+                               timeout=args.timeout)
+        except watch.PinMismatch:
+            raise Refused("pin_mismatch",
+                          "a pinned Electrum server presented another "
+                          "certificate while sending; nothing was sent")
+        except watch.BtcWatchError as e:
+            raise Refused("bad_args", str(e))
+        outcome = sub["outcome"]
+        integrity_log("forward", f"broadcast_{outcome}")
+        if sub.get("pin_mismatch"):
+            integrity_log("forward", "send_pin_mismatch")
+        if sub["mismatched"]:
+            integrity_log("forward", "txid_mismatch")
+        if outcome == bcast.OUTCOME_REJECTED:
+            raise Refused("broadcast_rejected",
+                          f"every Electrum server that answered "
+                          f"({len(sub['codes'])} of {sub['attempts']}) "
+                          f"rejected the transaction (codes {sub['codes']}); "
+                          "nothing moved. A node with the standard OP_RETURN "
+                          "relay policy refuses a swap memo: the server list "
+                          "needs one that relays it (STAGE3_PLAN.md 3.3)")
+        if outcome == bcast.OUTCOME_UNREACHABLE:
+            print(f"[!] no Electrum server could be reached to send "
+                  f"({sub['attempts']} tried); nothing moved")
+            raise SystemExit(EXIT_FAILED)
+        # ACCEPTED OR AMBIGUOUS: the money may have moved. Look for it.
+        try:
+            seen_r = bcast_seen(txid, address, servers, args.tor_proxy,
+                                network=args.network, timeout=args.timeout,
+                                wait_s=args.seen_wait,
+                                interval_s=args.seen_interval)
+        except watch.PinMismatch:
+            seen_r = {"seen": False, "height": None, "server": None,
+                      "cert_sha256": None, "polls": 0, "asked": False,
+                      "pin_mismatch": True}
+            integrity_log("forward", "seen_pin_mismatch")
+        integrity_log("forward",
+                      "broadcast_seen" if seen_r["seen"] else "broadcast_unseen")
+
+    # 8. the plan file and the summary
+    moved = outcome in bcast.MAYBE_MOVED
+    # THE SIGNED BYTES ARE KEPT ONLY WHERE NOTHING ELSE HOLDS THEM: an
+    # unsigned plan carries no power; --write-signed-hex is the caller's
+    # decision; and a broadcast the network has not shown is kept so the
+    # transaction is not lost (stage 5 consumes it). A dry run keeps them
+    # nowhere but the job log; a seen broadcast keeps them nowhere at all.
+    if not signed:
+        hex_reason = "unsigned"
+    elif args.write_signed_hex:
+        hex_reason = "write_signed_hex"
+    elif moved and not seen_r["seen"]:
+        hex_reason = "unseen" if outcome == bcast.OUTCOME_ACCEPTED \
+            else "ambiguous"
+    else:
+        hex_reason = None
     plan = {
         "schema": PLAN_SCHEMA,
         "network": args.network,
-        "dry_run": True,
-        "broadcast": False,
+        "dry_run": not args.broadcast,
+        "broadcast": moved,                      # True: the money may have moved
+        "broadcast_outcome": outcome,            # the four words, or None
+        "broadcast_server": sub["server"] if sub else None,
+        "broadcast_codes": sub["codes"] if sub else [],
+        "broadcast_attempts": sub["attempts"] if sub else 0,
+        "broadcast_mismatched": sub["mismatched"] if sub else 0,
+        "seen": bool(seen_r and seen_r["seen"]),
+        "seen_height": seen_r["height"] if seen_r else None,
+        "seen_server": seen_r["server"] if seen_r else None,
+        "seen_asked": bool(seen_r and seen_r["asked"]),
+        "seen_polls": seen_r["polls"] if seen_r else 0,
         "signed": signed,
         "index": index,
         "address": address,
@@ -766,22 +909,47 @@ def main(argv=None):
         "affiliate_bps": affiliate_bps,
         "dest_xmr": dest_xmr,
         "txid": txid,
-        # THE SIGNED BYTES ARE NOT KEPT ON DISK UNLESS ASKED. Nothing in
-        # stage 2 consumes the plan, and a signed, RBF, valid-until-spent
-        # transaction is a bearer instrument for whoever copies the file.
-        # Unsigned (plan-only) bytes carry no such power and are kept.
-        "tx_hex": (tx.serialize().hex()
-                   if (not signed or args.write_signed_hex) else None),
-        "signed_hex_written": bool(signed and args.write_signed_hex),
+        "tx_hex": tx.serialize().hex() if hex_reason else None,
+        "tx_hex_reason": hex_reason,
+        "signed_hex_written": bool(signed and hex_reason),
         "server": picture.get("server"),
         "cert_sha256": picture.get("cert_sha256"),
         "ts": int(time.time()) // 600 * 600,
     }
     write_plan(args.outfile, plan)
-    integrity_log("forward", "signed" if signed else "planned")
-    integrity_log("forward", "not_broadcast")
-    print(f"  forward {'SIGNED' if signed else 'PLANNED (unsigned)'}, "
-          f"NOT BROADCAST (dry run)")
+    if not args.broadcast:
+        integrity_log("forward", "not_broadcast")
+        print(f"  forward {'SIGNED' if signed else 'PLANNED (unsigned)'}, "
+              f"NOT BROADCAST (dry run)")
+    else:
+        by = f" by {sub['server']}" if sub["server"] else ""
+        rej = (f", {len(sub['codes'])} rejection(s) (codes {sub['codes']})"
+               if sub["codes"] else "")
+        mis = (f", {sub['mismatched']} foreign txid reply(ies)"
+               if sub["mismatched"] else "")
+        print(f"  forward SIGNED and SENT: {outcome}{by} after "
+              f"{sub['attempts']} server(s){rej}{mis}")
+        if outcome == bcast.OUTCOME_AMBIGUOUS:
+            print("  [!] AMBIGUOUS: the bytes left for a server and no "
+                  "acceptance came back. The transaction MAY be in the "
+                  "network.")
+        if seen_r["seen"]:
+            where = ("in the mempool" if seen_r["height"] <= 0
+                     else f"in a block at height {seen_r['height']}")
+            print(f"  seen: {where}, listed by {seen_r['server']} after "
+                  f"{seen_r['polls']} poll(s)")
+        elif seen_r["asked"]:
+            print(f"  seen: NOT yet listed by any server asked "
+                  f"({seen_r['polls']} poll(s) over {args.seen_wait:g} s)")
+        else:
+            print("  seen: UNKNOWN -- no server could be asked"
+                  + (" (a pinned server presented another certificate)"
+                     if seen_r.get("pin_mismatch") else ""))
+        if hex_reason in ("unseen", "ambiguous"):
+            print("  [!] the signed transaction is KEPT in the plan file "
+                  f"({hex_reason}): the network has not shown it yet, and "
+                  "losing it would lose the forward. It is a bearer "
+                  "instrument until it confirms.")
     print(f"  from {scrub_address(address)} index {index}: "
           f"{settled_sat} sat in {n_inputs} spendable output(s)"
           f"{f', {skipped_dust} dust left' if skipped_dust else ''}"
@@ -798,10 +966,10 @@ def main(argv=None):
           f"chain limit {memo_limit} base units ({whose}), "
           f"affiliate {affiliate_bps} bps")
     print(f"  txid {txid}")
-    if signed and not args.write_signed_hex:
+    if signed and not args.broadcast and not args.write_signed_hex:
         # To the job log, which the agent keeps at 0600 and truncates each
         # boot; not to the plan file. See --write-signed-hex.
-        print(f"  signed hex (stage 2: NOT broadcast, not persisted): "
+        print(f"  signed hex (dry run: NOT broadcast, not persisted): "
               f"{tx.serialize().hex()}")
     print(f"  plan written: {args.outfile}")
     return EXIT_OK

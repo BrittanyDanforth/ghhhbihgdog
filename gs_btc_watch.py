@@ -164,6 +164,18 @@ class PinMismatch(BtcWatchError):
     quietly failing over to the next server and hiding the signal."""
 
 
+class ServerError(BtcWatchError):
+    """The server ANSWERED, with an error. Carries the numeric code and
+    nothing else of the reply (see _error_code). A caller that needs to tell
+    "the server said no" from "the server never said" -- the broadcast side
+    does, because the first means nothing moved and the second means it
+    may have -- reads the class, never the text."""
+
+    def __init__(self, code, prefix="electrum error"):
+        super().__init__(f"{prefix} (code {code})")
+        self.code = code
+
+
 # --- derivation and scripthash: pure, no network, no secret -----------------
 
 def _network(name):
@@ -644,11 +656,17 @@ class Electrum:
     def __exit__(self, *_a):
         self._t.close()
 
-    def _rpc(self, method, params):
+    def _send(self, method, params):
+        """Write one request; returns its id. Split from _await so a
+        subclass can know that the bytes LEFT before the reply is waited
+        for (the broadcast side's "sent but unanswered" case)."""
         self._id += 1
         want = self._id
         self._t.send_line(json.dumps({"jsonrpc": "2.0", "id": want,
                                       "method": method, "params": params}))
+        return want
+
+    def _await(self, want):
         # Read lines until one carries our id, skipping subscription
         # notifications (no id) -- but only so many, so a server cannot
         # stall by streaming frames instead of answering.
@@ -665,17 +683,18 @@ class Electrum:
                 raise BtcWatchError("electrum: non-object frame")
             if obj.get("id") == want:
                 if obj.get("error") is not None:
-                    raise BtcWatchError(
-                        f"electrum error (code {_error_code(obj['error'])})")
+                    raise ServerError(_error_code(obj["error"]))
                 return obj.get("result")
             if obj.get("id") is None and obj.get("error") is not None:
                 # A request the server could not even parse comes back with
                 # a null id. That is our failure to hear about, not a
                 # notification to skip past.
-                raise BtcWatchError(
-                    "electrum rejected the request "
-                    f"(code {_error_code(obj['error'])})")
+                raise ServerError(_error_code(obj["error"]),
+                                  "electrum rejected the request")
         raise BtcWatchError("electrum: no matching reply")
+
+    def _rpc(self, method, params):
+        return self._await(self._send(method, params))
 
     def handshake(self):
         # Best effort: some servers require server.version first, some ignore
@@ -712,6 +731,27 @@ class Electrum:
 
 
 # --- the answer the caller wants --------------------------------------------
+
+def server_order(servers, scripthash):
+    """The configured servers, validated to (host, port, pin) and rotated to
+    start where THIS scripthash's own hash points, so with several servers
+    configured no one of them is handed the whole address set. Shared with
+    the broadcast side so the two cannot disagree about the rotation."""
+    if not servers:
+        raise BtcWatchError("no Electrum servers configured")
+    checked = []
+    for spec in servers:
+        if not isinstance(spec, (tuple, list)) or len(spec) not in (2, 3):
+            raise BtcWatchError("each server must be (host, port) or "
+                                "(host, port, pin)")
+        host, port = spec[0], spec[1]
+        pin = _check_pin(spec[2] if len(spec) == 3 else None)
+        host, port = _split_hostport(f"[{host}]:{port}" if ":" in str(host)
+                                     else f"{host}:{port}")
+        checked.append((host, port, pin))
+    start = int(scripthash[:8], 16) % len(checked)
+    return checked[start:] + checked[:start]
+
 
 def look(address, servers, proxy_url, *, min_conf=1, network="main",
          timeout=DEFAULT_TIMEOUT, transport_factory=None, fee_blocks=None):
@@ -750,22 +790,7 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
             or not math.isfinite(timeout) or timeout <= 0:
         raise BtcWatchError("timeout must be a finite, positive number of "
                             "seconds")
-    if not servers:
-        raise BtcWatchError("no Electrum servers configured")
-    checked = []
-    for spec in servers:
-        if not isinstance(spec, (tuple, list)) or len(spec) not in (2, 3):
-            raise BtcWatchError("each server must be (host, port) or "
-                                "(host, port, pin)")
-        host, port = spec[0], spec[1]
-        pin = _check_pin(spec[2] if len(spec) == 3 else None)
-        host, port = _split_hostport(f"[{host}]:{port}" if ":" in str(host)
-                                     else f"{host}:{port}")
-        checked.append((host, port, pin))
-    # Start where this address's own hash points, so with several servers
-    # configured no one of them is handed the whole address set.
-    start = int(scripthash[:8], 16) % len(checked)
-    order = checked[start:] + checked[:start]
+    order = server_order(servers, scripthash)
     tag = "btcwatch:" + address       # one circuit per address; see the header
     if transport_factory is None:
         # A proxy URL that can never work is ONE configuration refusal,
