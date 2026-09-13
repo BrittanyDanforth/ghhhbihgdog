@@ -319,6 +319,10 @@ BOT_COMMANDS = [
     # and the list says so because otherwise nobody would try it.
     ("check", "has my payment arrived — /check, or /check A3F1-9C2B7E01"),
     ("wait", "wait for it to arrive — /wait, or /wait A3F1-9C2B7E01"),
+    # WHAT THIS BOX SAW ARRIVE, FROM MEMORY: on the intake (a unique address
+    # per deposit) the Pi watches the address itself, so this answers with
+    # no wake at all. Empty on a pair that does not run the intake.
+    ("balance", "what has arrived on your open deposits, from here"),
     ("settings", "what this will do, and where each part is decided"),
     # THE THREE ANSWERS THAT WERE UNREACHABLE IN PRACTICE. /fee, /speed and
     # /exit have always been handled in parse_command and have always had
@@ -1398,6 +1402,8 @@ def parse_command(text: str) -> tuple:
         return "", {}, "speed"
     if cmd == "/exit":
         return "", {}, "exit"
+    if cmd == "/balance":
+        return "", {}, "balance"
     if cmd in ("/wait", "/watch", "/check"):
         _job = "swap_status" if cmd == "/check" else "watch"
         # NO ARGUMENT IS A QUESTION, NOT A MISTAKE.
@@ -1566,6 +1572,16 @@ def _confirm_question(rng):
 
 
 class Pager:
+    #: THE INTAKE'S SETTINGS, AS CLASS DEFAULTS: __init__ sets them from the
+    #: command line, and a Pager built without __init__ (every fixture in the
+    #: suites builds one that way) still answers with "watch nothing, the
+    #: wire's floor". The watch list itself is created on first use (_btc).
+    btc_servers = ()
+    btc_min_conf = 2
+    btc_network = "main"
+    btc_poll_s = 600
+    deposit_min_sat = proto.DEPOSIT_MIN_SAT
+
     def __init__(self, args, token: str, key: dict, proxies: dict):
         self.args = args
         self.token = token
@@ -1666,6 +1682,28 @@ class Pager:
         #: a getattr fallback in _end_convo, so a fresh process had no queue
         #: until a delete had already failed.
         self._wizard_retry = []
+        #: THE INTAKE'S WATCH LIST: handle -> {addr, chat, state, conf,
+        #: unconf, said} for every deposit this process handed a unique
+        #: address to (a plain slip without a memo, STAGE4_PLAN.md 3.3).
+        #: IN MEMORY, like handle_owner and for the same reason: an address
+        #: on the card is the leak this box is designed around. A restart
+        #: forgets it -- the automatic "received / confirmed / sending on"
+        #: stops for those deposits, and the button still wakes the vault,
+        #: which answers "not yet" / "still confirming" / sends it on.
+        self._btc()
+        #: The Electrum servers this Pi asks, its depth rule, its network and
+        #: how often it looks -- from the command line like the Tor proxy,
+        #: never from the card. Empty means: watch nothing.
+        self.btc_servers = list(getattr(args, "btc_servers", None) or [])
+        self.btc_min_conf = int(getattr(args, "btc_min_conf", 2) or 2)
+        self.btc_network = str(getattr(args, "btc_network", "main") or "main")
+        self.btc_poll_s = int(getattr(args, "btc_poll", 600) or 600)
+        #: The smallest deposit the wizard takes. The vault has its own floor
+        #: on the intake (what can be forwarded after the fee); set this to
+        #: it so the refusal happens here, with the number, and not after a
+        #: wake. The wire's floor by default.
+        self.deposit_min_sat = int(getattr(args, "deposit_min_sat", 0)
+                                   or proto.DEPOSIT_MIN_SAT)
         self.busy = threading.Lock()
         self.ignored = 0
         #: kind -> when that kind last reached the chain. See _log_ignored.
@@ -2455,6 +2493,17 @@ class Pager:
                 self.send(chat_id, f"no: {_e}. Cancelled — start again with "
                                    f"/deposit.")
                 return True
+            # THIS PAIR'S OWN FLOOR, when the operator set one: on the
+            # intake a deposit under what can be forwarded after its fee is
+            # refused by the vault after a wake; refused here first, with
+            # the number, so the wake is not spent.
+            if _amt < self.deposit_min_sat:
+                self._end_convo(chat_id)
+                self.send(chat_id,
+                          f"no: at least "
+                          f"{proto.btc_display(self.deposit_min_sat)} here. "
+                          f"Cancelled — start again with /deposit.")
+                return True
             c.amount = _amt
             # DEADLINE UNTOUCHED. See Convo: it is absolute from creation, so
             # answering slowly does not buy another full window.
@@ -3192,6 +3241,12 @@ class Pager:
         # closed table and does not tie it to the status, so a version skew or
         # a compromised vault is exactly the case that reaches here.
         _early = (pending.result or {}).get("phase") or ""
+        # THE WATCH LIST HEARS EVERY FORWARD'S OUTCOME, before any reply:
+        # a sent one closes the entry, a "not yet" reopens it, a refusal or
+        # a failure stops the automatic path and says so once.
+        if job == "forward_to_swap":
+            self._btc_forward_result(
+                (params or {}).get("handle") or "", out, _early, chat_id)
         if _early and out != "done" and job in ("watch", "swap_status"):
             # THE LABEL, NOT THE HANDLE. This one branch still printed the
             # raw four hex characters, so the one reply an operator gets while
@@ -3512,6 +3567,24 @@ class Pager:
                           f"a group, and they would go to everyone in it. "
                           f"Read them at the machine, or set up delivery and "
                           f"use a one-to-one chat.",
+                          buttons=self._handle_buttons(h, job, chat_id))
+                return
+            if plain and "m" not in plain:
+                # THE INTAKE: a unique address the host's own key controls,
+                # and NO note (gs_wake_proto.PLAIN_SHAPES). One message: the
+                # amount, the address, the label, and what happens next --
+                # this box watches the address itself and says "received"
+                # and "confirmed" here, and the confirmation sends it on by
+                # itself. Registered BEFORE the reply goes out, so a tap on
+                # the button a moment later already finds it.
+                self._btc_register(h, plain.get("d", ""), chat_id)
+                self.send(chat_id,
+                          f"{chat_name(job)}: here is how to pay.\n\n"
+                          + "\n".join(proto.plain_lines(
+                              plain, label=_cn)).rstrip()
+                          + "\n\nI will say here when it arrives and when it "
+                            "has confirmed. After that it moves on by itself "
+                            "— nothing more to do. Tap below to ask sooner.",
                           buttons=self._handle_buttons(h, job, chat_id))
                 return
             if plain:
@@ -4122,6 +4195,14 @@ class Pager:
                            "in this chat. /deposit is the way in.",
                       buttons=MENU_BUTTONS)
             return
+        if err == "balance":
+            # WHAT THIS BOX SAW ARRIVE, FROM MEMORY. Only the deposits this
+            # process handed a unique address to, only this chat's, and only
+            # what the last look at each address said. No wake. The figures
+            # are the ones this chat was already shown when it deposited;
+            # no currency word, no address.
+            self.send(cid, self._btc_balance_text(cid), buttons=MENU_BUTTONS)
+            return
         if err == "status":
             # WHETHER A COMMAND WILL BE ACCEPTED, and nothing else.
             #
@@ -4352,6 +4433,13 @@ class Pager:
                 self.send(cid, "no: I have no record of that confirmation "
                                "number in this chat.")
                 return
+            # A DEPOSIT THIS BOX IS WATCHING IS ASKED ABOUT ON THE INTAKE'S
+            # OWN JOB. The XMR-side probe would look at a subaddress nothing
+            # has reached yet; the forward looks at the address the client
+            # paid, sends it on if it has settled, and answers "not yet" or
+            # "still confirming" if it has not (STAGE4_PLAN.md 3.6).
+            if job in ("swap_status", "watch") and self._btc_watched(_h):
+                job = "forward_to_swap"
         self.start_job(cid, job, params)
 
     def handle_callback(self, cb: dict) -> None:
@@ -4816,6 +4904,183 @@ class Pager:
         except RuntimeError:
             pass
 
+    # -- the intake's watch list ----------------------------------------
+    #: What a watched deposit's state means to a reader, one word each and
+    #: no number. Rule 6: no coin, no address, no amount.
+    BTC_STATE_WORDS = {
+        "not_seen": "nothing yet",
+        "seen": "received, confirming",
+        "forwarding": "confirmed, sending on",
+        "stalled": "confirmed, but sending on did not go through",
+    }
+
+    def _btc(self):
+        """(lock, watch list), created on first use so a Pager built
+        without __init__ has them too."""
+        d = self.__dict__
+        if "_btc_lock" not in d:
+            d["_btc_lock"] = threading.Lock()
+        if "btc_open" not in d:
+            d["btc_open"] = {}
+        return d["_btc_lock"], d["btc_open"]
+
+    def _btc_register(self, h: str, addr: str, chat_id: int) -> None:
+        """Start watching `addr` for handle `h` on behalf of `chat_id`."""
+        if not (isinstance(h, str) and proto.HANDLE_RE.match(h)) or not addr:
+            return
+        lock, opened = self._btc()
+        with lock:
+            opened[h] = {"addr": str(addr), "chat": int(chat_id),
+                         "state": "not_seen", "conf": 0, "unconf": 0,
+                         "said": set()}
+
+    def _btc_watched(self, h: str) -> bool:
+        lock, opened = self._btc()
+        with lock:
+            return h in opened
+
+    def _btc_forward_result(self, h: str, out: str, phase: str,
+                            chat_id: int) -> None:
+        """A forward reported for a deposit on the watch list."""
+        lock, opened = self._btc()
+        with lock:
+            e = opened.get(h)
+            if not e:
+                return
+            if out == "done" and phase in ("sent", "unsure"):
+                # Gone from the address, or may be: the vault's word is the
+                # phase line the forward branch renders. Nothing to watch.
+                opened.pop(h, None)
+                return
+            if out == "done" and phase == "arriving":
+                e["state"] = "seen"
+                return
+            if out == "done" and phase == "not_yet":
+                e["state"] = "not_seen"
+                return
+            # A rehearsal (done, no word), a refusal or a failure: the
+            # automatic path stops here so it cannot spend a wake a tick,
+            # and the button still asks. Said once.
+            e["state"] = "stalled"
+            first = "stalled" not in e["said"]
+            e["said"].add("stalled")
+        if first and out != "done":
+            try:
+                _cn = self._label(chat_id, h)
+            except BaseException:                            # noqa: BLE001
+                _cn = h
+            self.send(chat_id,
+                      f"{_cn}: it is here, but sending it on did not go "
+                      f"through. Tap below to try again.",
+                      buttons=self._handle_buttons(h, "receive_and_quote",
+                                                   chat_id))
+
+    def btc_tick(self, look=None) -> None:
+        """One look at every watched address, on its own circuit, and the
+        transitions each look earned. A look that fails is not a state
+        change and is not said. `look` may be injected (a test)."""
+        if not self.btc_servers and look is None:
+            return
+        lock, opened = self._btc()
+        with lock:
+            snapshot = [(h, dict(e)) for h, e in opened.items()
+                        if e["state"] in ("not_seen", "seen")]
+        for h, e in snapshot:
+            try:
+                if look is None:
+                    import gs_btc_watch as _w
+                    look = _w.look
+                r = look(e["addr"], list(self.btc_servers),
+                         getattr(self.args, "tor_proxy", ""),
+                         min_conf=self.btc_min_conf, network=self.btc_network)
+            except Exception:                                # noqa: BLE001
+                continue
+            self._btc_apply(h, r)
+
+    def _btc_apply(self, h: str, r: dict) -> None:
+        """Apply one look's answer to one entry and say what changed."""
+        state = str(r.get("state") or "")
+        conf = int(r.get("confirmed_sat") or 0)
+        unconf = int(r.get("unconfirmed_sat") or 0)
+        say, start = None, False
+        lock, opened = self._btc()
+        with lock:
+            e = opened.get(h)
+            if not e or e["state"] not in ("not_seen", "seen"):
+                return
+            e["conf"], e["unconf"] = conf, unconf
+            chat = e["chat"]
+            if state == "confirmed":
+                e["state"] = "forwarding"
+                say, start = "confirmed", True
+            elif state == "seen" and e["state"] == "not_seen":
+                e["state"] = "seen"
+                say = "seen"
+            if say and say in e["said"]:
+                say = None
+            if say:
+                e["said"].add(say)
+        if not say:
+            return
+        try:
+            _cn = self._label(chat, h)
+        except BaseException:                                # noqa: BLE001
+            _cn = h
+        if say == "seen":
+            self.send(chat, f"{_cn}: received — waiting for it to confirm.",
+                      buttons=self._handle_buttons(h, "receive_and_quote",
+                                                   chat))
+        else:
+            self.send(chat, f"{_cn}: confirmed. Sending it on now.")
+        if start:
+            # THROUGH start_job LIKE EVERY WAKE: the rate limit, the one-job
+            # lock, the owner token and the restart hold all apply. If it
+            # refuses, it says so in its own words and the button remains.
+            try:
+                self.start_job(chat, "forward_to_swap", {"handle": h})
+            except BaseException as ex:                      # noqa: BLE001
+                print(f"  [!] the forward did not start: {_redact(ex)[:120]}")
+
+    def btc_watch_loop(self) -> None:
+        """The watcher thread: a tick, then a sleep of --btc-poll, until
+        shutdown. Sleeps in short steps so a stop is prompt."""
+        while True:
+            if shutdown_requested():
+                return
+            try:
+                self.btc_tick()
+            except BaseException as ex:                      # noqa: BLE001
+                print(f"  [!] watch tick failed: {_redact(ex)[:120]}")
+            for _ in range(max(1, int(self.btc_poll_s))):
+                if shutdown_requested():
+                    return
+                time.sleep(1)
+
+    def _btc_balance_text(self, cid: int) -> str:
+        """The chat's own watched deposits, one line each, and the totals
+        from the last looks -- figures only, no currency word."""
+        lock, opened = self._btc()
+        with lock:
+            mine = [(h, dict(e)) for h, e in opened.items()
+                    if e["chat"] == cid]
+        if not mine:
+            return ("nothing is in flight in this chat, or this end was "
+                    "restarted since it started. /deposit is the way in; "
+                    "the button under a deposit still asks about it.")
+        lines = []
+        conf = unconf = 0
+        for h, e in mine:
+            try:
+                _cn = self._label(cid, h)
+            except BaseException:                            # noqa: BLE001
+                _cn = h
+            lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(e['state'], e['state'])}")
+            conf += int(e.get("conf") or 0)
+            unconf += int(e.get("unconf") or 0)
+        lines.append(f"received so far: {proto.btc_display(conf + unconf)}, "
+                     f"confirmed: {proto.btc_display(conf)}")
+        return "\n".join(lines)
+
     def _working_line(self, job: str, params: dict, how: str) -> str:
         """The acknowledgement after a poke: what is being done, where the
         answer will land, and how long this box may refuse everything else.
@@ -5035,6 +5300,14 @@ class Pager:
         self.publish_commands()
         self._check_group_rights()
         self.announce_restart()
+        if self.btc_servers:
+            # THE WATCHER, on its own thread: a look over Tor takes up to a
+            # circuit's worth of time per address and must not hold the
+            # poll loop. It speaks through send() and start_job() like the
+            # poll thread does, under the same locks.
+            threading.Thread(target=self.btc_watch_loop, daemon=True).start()
+            print(f"  [+] watching the intake's open deposits every "
+                  f"{self.btc_poll_s}s over {len(self.btc_servers)} server(s).")
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
               + (f", {len(self.allow_users)} allowlisted sender(s)"
                  if self.allow_users else "")
@@ -5405,6 +5678,28 @@ def build_cli():
                          "written to say nothing.")
     ap.add_argument("--no-jitter", action="store_true",
                     help="passed through to the wake: skip the pre-WOL delay")
+    # THE INTAKE'S WATCH, configured HERE like the Tor proxy and never on the
+    # card (STAGE4_PLAN.md 3.3). Without --btc-electrum nothing is watched
+    # and an intake deposit behaves as any other: the button wakes the vault.
+    ap.add_argument("--btc-electrum", action="append", default=[],
+                    metavar="HOST[:PORT][,PIN]",
+                    help="Electrum server this Pi looks at the intake's "
+                         "deposit addresses through, over Tor on one circuit "
+                         "per address; repeatable. Prefer an .onion, or pin a "
+                         "clearnet server's certificate.")
+    ap.add_argument("--btc-min-conf", type=int, default=2,
+                    help="depth at which this Pi calls a deposit confirmed "
+                         "and sends it on (default 2; match the vault's)")
+    ap.add_argument("--btc-network", default="main",
+                    help="main, testnet, signet or regtest (default main)")
+    ap.add_argument("--btc-poll", type=int, default=600, metavar="SECONDS",
+                    help="how often the watched addresses are looked at "
+                         "(default 600)")
+    ap.add_argument("--deposit-min-sat", type=int, default=0,
+                    help="the smallest deposit the wizard takes, in satoshi; "
+                         "set it to the vault's intake floor so a deposit it "
+                         "would refuse is refused here, with the number, "
+                         "before a wake. Default: the wire's own floor.")
     return ap
 
 
@@ -5433,6 +5728,25 @@ def main(argv=None) -> int:
         proto.require_nacl()
     except proto.WakeError as e:
         sys.exit(f"[!] {e}")
+    # THE INTAKE'S SERVERS, CHECKED WHERE THE OPERATOR IS STANDING: a server
+    # spec or a network the watch side cannot use is refused at start, not
+    # discovered as a watcher that silently never says "received".
+    args.btc_servers = []
+    if getattr(args, "btc_electrum", None):
+        import gs_btc_watch as _w
+        try:
+            args.btc_servers = [_w.parse_server(s) for s in args.btc_electrum]
+            _w._network(args.btc_network)
+        except _w.BtcWatchError as e:
+            sys.exit(f"[!] --btc-electrum / --btc-network: {e}")
+        if args.btc_min_conf < 1:
+            sys.exit("[!] --btc-min-conf must be at least 1: an unconfirmed "
+                     "deposit is never settled money.")
+        if args.btc_poll < 60:
+            sys.exit("[!] --btc-poll under 60 s is a Tor circuit per address "
+                     "a minute; 600 is the default for a reason.")
+    if getattr(args, "deposit_min_sat", 0) < 0:
+        sys.exit("[!] --deposit-min-sat cannot be negative.")
 
     # FAIL CLOSED ON TOR, BEFORE ANYTHING ELSE. OPSEC_SETUP.md section 4: "If
     # Tor is down, the bot does not start."

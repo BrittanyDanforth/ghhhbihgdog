@@ -936,7 +936,33 @@ def plain_lines(plain: dict, label: str = "") -> list:
     chat, since the answer here reads "yes, last, on its own line".
     plain_slip_is_wellformed refuses a record carrying one; this renders no
     "m" whatever the dict holds.
+
+    TWO RENDERINGS, BY SHAPE. A record WITH a memo is the shared-inbound
+    flow and its closing lines say what the note is for and that the address
+    is not the reader's to keep. A record WITHOUT one (PLAIN_SHAPES, the BTC
+    intake) is a unique address the host's own key controls: nothing to
+    attach, any app that pays an address will do, and the address is for
+    this one payment.
     """
+    if "m" not in plain:
+        return [
+            f"Send exactly:  {plain.get('b', '')}",
+            f"To address:    {plain.get('d', '')}",
+            f"You get back:  ~{plain.get('x', '')}",
+            f"Confirmation:  {label}" if label else
+            f"Slip:          {plain.get('h', '')}",
+            "",
+            # NOTHING TO ATTACH, AND IT SAYS SO: the reader of the other
+            # rendering is told a note is needed, and a reader who has seen
+            # that once will look for one here.
+            "Pay it from any app that can pay an address. Nothing else "
+            "needs adding.",
+            # THIS ADDRESS IS FOR THIS PAYMENT. A later payment to it lands
+            # after this one has moved on and sits there until somebody
+            # notices; the reader is told to pay once, without the reason.
+            "This address is for this one payment. Pay it once; do not "
+            "use it again later.",
+        ]
     return [
         f"Send exactly:  {plain.get('b', '')}",
         f"To address:    {plain.get('d', '')}",

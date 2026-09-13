@@ -1799,6 +1799,27 @@ _COMPOSED = [
     ("_working_line_check",
      pg.Pager._working_line(_cs.p, "swap_status", {}, "30 min")),
 ]
+# THE INTAKE'S BALANCE REPLY, composed from the watch list: rendered here
+# with one entry in EVERY state it can be in, so each state word is scanned,
+# plus the empty rendering.
+_bal = types.SimpleNamespace()
+_bal.__dict__["btc_open"] = {
+    f"B{i:03X}": {"addr": "bc1qexample", "chat": 7, "state": _s,
+                  "conf": 1, "unconf": 2, "said": set()}
+    for i, _s in enumerate(pg.Pager.BTC_STATE_WORDS)}
+_bal._label = lambda cid, h: "A3F1-9C2B7E01"
+_bal._btc = pg.Pager._btc.__get__(_bal)
+_bal.BTC_STATE_WORDS = pg.Pager.BTC_STATE_WORDS
+_bal_empty = types.SimpleNamespace()
+_bal_empty._btc = pg.Pager._btc.__get__(_bal_empty)
+_COMPOSED += [("_btc_balance_text", pg.Pager._btc_balance_text(_bal, 7)),
+              ("_btc_balance_text_empty",
+               pg.Pager._btc_balance_text(_bal_empty, 7))]
+check("the balance reply renders every state word and the two figures",
+      all(w in dict(_COMPOSED)["_btc_balance_text"]
+          for w in pg.Pager.BTC_STATE_WORDS.values())
+      and "received so far" in dict(_COMPOSED)["_btc_balance_text"]
+      and "nothing is in flight" in dict(_COMPOSED)["_btc_balance_text_empty"])
 check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
       f"BUILT rather than written, which it used to miss entirely",
       all(len(t) > 40 for _n, t in _COMPOSED))
@@ -1825,6 +1846,9 @@ _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
                   # The working line is composed (scanned via _COMPOSED above);
                   # the note is a runtime value off the quote, sent alone.
                   | {"self._working_line(job, params, _how)", "_note"}
+                  # The intake's balance reply: composed, scanned via
+                  # _COMPOSED above with one entry in every state.
+                  | {"self._btc_balance_text(cid)"}
                   | _RUNTIME_SENDS)
 _uncovered = sorted(
     {_ast.unparse(a) for n in _ast.walk(_pg_tree)
@@ -1942,6 +1966,21 @@ check("the deposit-instruction fixture is exactly the wire's own field set, "
       and P.plain_slip_is_wellformed(_PLAIN_SAMPLE))
 _plain_authored = [_l for _l in P.plain_lines(_PLAIN_SAMPLE,
                                               label="A3F1-9C2B7E01") if _l]
+# ...AND THE INTAKE'S RENDERING (the second shape, no memo), whose closing
+# lines are authored too and land in the same chat.
+_PLAIN_BTC = {_k: _v for _k, _v in _PLAIN_SAMPLE.items() if _k != "m"}
+_plain_btc_authored = [_l for _l in P.plain_lines(_PLAIN_BTC,
+                                                  label="A3F1-9C2B7E01") if _l]
+check("the intake's rendering of the deposit instructions is the second "
+      "shape's: no note line, an address that is for one payment, and "
+      "nothing to attach", P.plain_slip_is_wellformed(_PLAIN_BTC)
+      and not any("note" in _l.lower() and "CANNOT" in _l
+                  for _l in _plain_btc_authored)
+      and any("one payment" in _l.lower() for _l in _plain_btc_authored)
+      and any("nothing else" in _l.lower() for _l in _plain_btc_authored)
+      and len(_plain_btc_authored) >= 5)
+_plain_authored += [_l for _l in _plain_btc_authored
+                    if _l not in _plain_authored]
 #: AND THE WITHDRAW QUESTION, which is the one place the reader has to know
 #: WHICH KIND of address to paste. "Send a Monero address" plus an example is
 #: the fastest this can be; the alternative is three sentences of reasoning

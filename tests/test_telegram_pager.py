@@ -1022,7 +1022,7 @@ check("polls: ...and it stops on the next poll once the wake finishes, so "
 # that does not work". A four-command blind spot survived a green suite.
 _HANDLED_ERRS = {"depo_wizard", "withdraw_wizard", "settings", "fee", "speed",
                  "exit", "cancel", "help", "welcome", "status",
-                 "whats_running"}
+                 "whats_running", "balance"}
 _unresolved = []
 for _c, _desc in pg.BOT_COMMANDS:
     _job, _params, _err = pg.parse_command(f"/{_c}")
@@ -4375,6 +4375,262 @@ check("...and even a payload the vault should never send is NOT rendered "
       "for this job", not any("bc1qxx" in t or "0.05" in t or "=:XMR" in t
                              for t in _ft2)
       and "forward signed on the machine" in (_ft2[-1] if _ft2 else ""))
+
+# ===========================================================================
+print("\n== the intake: a unique address, no note, and this end watches it "
+      "(STAGE4_PLAN.md) ==")
+_BTC_ADDR = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+_PLAIN_BTC = {"b": "0.05000000", "d": _BTC_ADDR, "x": "1.2345", "h": "B4A1"}
+_PLAIN_SHARED = {**_PLAIN_BTC, "h": "C7D2",
+                 "m": "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0"}
+
+
+def _depo_done(plain, chat=111):
+    """A deposit reported done with `plain`, through the REAL start_job and
+    poke with the doorbell stubbed. Returns (pager, [(text, buttons)])."""
+    _fp, _fs, _, _ = _tapper((chat,))
+    _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
+
+    class _Done:
+        def __init__(self):
+            self.result = {"status": "done", "handle": plain["h"], "slip": "",
+                           "plain": dict(plain), "phase": ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(
+            run_wake=lambda *a, **k: _Done())
+        _fp.start_job(chat, "receive_and_quote", {"amount_sat": 5000000})
+        for _ in range(600):
+            if not _fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _fp, _fs
+
+
+_bp, _bs = _depo_done(_PLAIN_BTC)
+_bt = [t for t, _b in _bs]
+_pay = [t for t in _bt if "here is how to pay" in t]
+check("a deposit slip WITHOUT a memo (the intake) is ONE message: how to "
+      "pay, with the amount, the address and the label -- no note message "
+      "first, no 'CANNOT', no 'withdraw'",
+      len(_pay) == 1 and _BTC_ADDR in _pay[0] and "0.05" in _pay[0]
+      and "Send exactly" in _pay[0]
+      and not any(t.startswith("=:") for t in _bt)
+      and "CANNOT" not in _pay[0] and "withdraw" not in _pay[0].lower()
+      and "note" not in _pay[0].lower())
+check("...it says what happens next -- received, confirmed, then it moves on "
+      "by itself -- and carries the ask-again button",
+      "when it arrives" in _pay[0] and "moves on by itself" in _pay[0]
+      and any(b for t, b in _bs if t == _pay[0]))
+check("...and the address is now on this end's watch list for that chat, "
+      "with the label bound to the chat", _bp.btc_open.get("B4A1", {}).get(
+          "addr") == _BTC_ADDR and _bp.btc_open["B4A1"]["chat"] == 111
+      and _bp.btc_open["B4A1"]["state"] == "not_seen"
+      and _bp.handle_owner.get("B4A1") == 111)
+_sp, _ss = _depo_done(_PLAIN_SHARED)
+_st = [t for t, _b in _ss]
+_note_i = [i for i, t in enumerate(_st) if t.startswith("=:XMR.XMR:")]
+_pay_i = [i for i, t in enumerate(_st) if "here is how to pay" in t]
+check("NON-VACUITY: a slip WITH a memo still gets the shared-inbound "
+      "rendering -- the note first, then the block -- and is NOT watched",
+      len(_note_i) == 1 and len(_pay_i) == 1 and _note_i[0] < _pay_i[0]
+      and "C7D2" not in _sp._btc()[1])
+
+print("\n-- the watcher: one look per address, the transitions said once --")
+
+
+def _watch_pager(addr=_BTC_ADDR, h="B4A1", chat=111):
+    p, seen, toasts, jobs = _tapper((chat,))
+    p._btc_register(h, addr, chat)
+    return p, seen, jobs
+
+
+def _look_returning(state, conf=0, unconf=0, calls=None):
+    def look(addr, servers, proxy, **kw):
+        if calls is not None:
+            calls.append((addr, list(servers), proxy, dict(kw)))
+        if isinstance(state, Exception):
+            raise state
+        return {"state": state, "confirmed_sat": conf,
+                "unconfirmed_sat": unconf, "settled_sat": conf if state
+                == "confirmed" else 0, "confirmations": 0, "utxos": [],
+                "tip": 1, "server": "s", "cert_sha256": None}
+    return look
+
+
+_wp, _ws, _wj = _watch_pager()
+_wp.btc_servers = [("s.onion", 50002, None)]
+_wp.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_calls = []
+_wp.btc_tick(look=_look_returning("not_seen", calls=_calls))
+check("a look that finds nothing: asked ONCE for the address with this "
+      "end's servers, proxy, depth rule and network; nothing said",
+      len(_calls) == 1 and _calls[0][0] == _BTC_ADDR
+      and _calls[0][1] == [("s.onion", 50002, None)]
+      and _calls[0][2] == "socks5h://127.0.0.1:9050"
+      and _calls[0][3] == {"min_conf": 2, "network": "main"}
+      and _ws == [] and _wj == [])
+_wp.btc_tick(look=_look_returning("seen", unconf=5000000))
+check("money seen, none settled: 'received — waiting for it to confirm' is "
+      "said ONCE, with the ask-again button, and the figures are kept",
+      len(_ws) == 1 and "received" in _ws[0][0] and "confirm" in _ws[0][0]
+      and _ws[0][1] and _wp.btc_open["B4A1"]["state"] == "seen"
+      and _wp.btc_open["B4A1"]["unconf"] == 5000000)
+_wp.btc_tick(look=_look_returning("seen", unconf=5000000))
+check("...and not twice", len(_ws) == 1)
+_wp.btc_tick(look=_look_returning(RuntimeError("tor down")))
+check("a look that FAILS is not a state change and is not said",
+      len(_ws) == 1 and _wp.btc_open["B4A1"]["state"] == "seen")
+_wp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("confirmed: 'confirmed. Sending it on now.' is said, the forward is "
+      "started through start_job for THIS chat and THIS handle, and the "
+      "entry is marked forwarding", len(_ws) == 2
+      and "confirmed" in _ws[1][0] and "Sending it on" in _ws[1][0]
+      and _wj == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and _wp.btc_open["B4A1"]["state"] == "forwarding")
+_calls2 = []
+_wp.btc_tick(look=_look_returning("confirmed", conf=5000000, calls=_calls2))
+check("...a forwarding entry is not looked at again, and nothing is said or "
+      "started twice", _calls2 == [] and len(_ws) == 2 and len(_wj) == 1)
+_wp2, _ws2, _wj2 = _watch_pager()
+_wp2.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("straight to confirmed (a look that missed the mempool phase): one "
+      "sentence, the forward started", len(_ws2) == 1
+      and "Sending it on" in _ws2[0][0] and len(_wj2) == 1)
+_np, _ns, _nj = _watch_pager()
+_np.btc_servers = ()
+_np.btc_tick()
+check("with no servers configured the tick watches nothing and touches "
+      "nothing", _ns == [] and _nj == []
+      and _np.btc_open["B4A1"]["state"] == "not_seen")
+check("every state has a reader's word, numberless and naming no coin",
+      set(pg.Pager.BTC_STATE_WORDS) >= {"not_seen", "seen", "forwarding",
+                                        "stalled"}
+      and not any(ch.isdigit() for w in pg.Pager.BTC_STATE_WORDS.values()
+                  for ch in w))
+
+print("\n-- what the forward's outcome does to the watch list --")
+for _out, _ph, _want, _msgs in (("done", "sent", None, 0),
+                                ("done", "unsure", None, 0),
+                                ("done", "not_yet", "not_seen", 0),
+                                ("done", "arriving", "seen", 0),
+                                ("done", "", "stalled", 0),
+                                ("refused", "", "stalled", 1),
+                                ("failed", "", "stalled", 1)):
+    _rp, _rs, _rj = _watch_pager()
+    _rp.btc_open["B4A1"]["state"] = "forwarding"
+    _rp._btc_forward_result("B4A1", _out, _ph, 111)
+    _rp._btc_forward_result("B4A1", _out, _ph, 111)
+    _e = _rp.btc_open.get("B4A1")
+    check(f"forward {_out}/{_ph or '-'}: "
+          + ("the entry is closed" if _want is None else f"state {_want}")
+          + (", said once" if _msgs else ", nothing said"),
+          (_e is None if _want is None else (_e or {}).get("state") == _want)
+          and len(_rs) == _msgs
+          and (not _msgs or ("did not go through" in _rs[0][0]
+                             and _rs[0][1])))
+_rp, _rs, _rj = _watch_pager()
+_rp._btc_forward_result("ZZZZ", "done", "sent", 111)
+check("a forward for a handle this end is not watching changes nothing",
+      "B4A1" in _rp.btc_open and _rs == [])
+
+print("\n-- the button and /check on a watched deposit ask the intake's job --")
+_cp, _cs, _ct, _cj = _tapper()
+_cp.handle_owner["B4A1"] = 111
+_cp.handle_job["B4A1"] = "receive_and_quote"
+_cp._btc_register("B4A1", _BTC_ADDR, 111)
+_cn4 = _cp._label(111, "B4A1")
+_cp.handle(_msg(111, 111, f"/check {_cn4}"))
+check("/check on a watched deposit becomes forward_to_swap (it forwards if "
+      "settled, else answers not yet / still confirming)",
+      _cj == [(111, "forward_to_swap", {"handle": "B4A1"})])
+_cp.handle(_msg(111, 111, f"/wait {_cn4}"))
+check("...and so does /wait", _cj[-1] == (111, "forward_to_swap",
+                                          {"handle": "B4A1"}))
+_up, _us, _ut, _uj = _tapper()
+_up.handle_owner["B4A1"] = 111
+_up.handle_job["B4A1"] = "receive_and_quote"
+_up.handle(_msg(111, 111, f"/check {_up._label(111, 'B4A1')}"))
+check("...while an UNWATCHED deposit (a shared-inbound one, or after a "
+      "restart) still asks swap_status", _uj == [(111, "swap_status",
+                                                 {"handle": "B4A1"})])
+
+print("\n-- /balance: from memory, this chat's deposits, figures only --")
+_bp2, _bs2, _bt2, _bj2 = _tapper((111, 222))
+_bp2._btc_register("B4A1", _BTC_ADDR, 111)
+_bp2.btc_open["B4A1"].update({"state": "seen", "conf": 1000000,
+                              "unconf": 4000000})
+_bp2._btc_register("B4A2", "bc1qother", 111)
+_bp2.btc_open["B4A2"].update({"state": "forwarding", "conf": 500000})
+_bp2._btc_register("C9C9", "bc1qtheirs", 222)
+_bp2.handle(_msg(111, 111, "/balance"))
+_bal = _bs2[-1][0]
+check("/balance lists this chat's watched deposits by label and state and "
+      "totals what the last looks saw -- received (all) and confirmed -- "
+      "as bare figures", "received, confirming" in _bal
+      and "confirmed, sending on" in _bal
+      and "received so far: 0.055" in _bal and "confirmed: 0.015" in _bal
+      and _bp2._label(111, "B4A1") in _bal and _bj2 == [])
+check("...another chat's deposit is not in it, and no address is",
+      "C9C9" not in _bal and _bp2._label(222, "C9C9") not in _bal
+      and "bc1q" not in _bal
+      and not re.search(r"\b(btc|bitcoin)\b", _bal, re.I))
+_bp2.handle(_msg(222, 222, "/balance"))
+check("...and the other chat sees only its own, with nothing seen yet",
+      "nothing yet" in _bs2[-1][0] and "0.055" not in _bs2[-1][0])
+_ep, _es, _et, _ej = _tapper()
+_ep.handle(_msg(111, 111, "/balance"))
+check("with nothing watched: one sentence saying so and pointing at "
+      "/deposit and the button; no wake", "nothing is in flight" in _es[-1][0]
+      and "/deposit" in _es[-1][0] and _ej == [])
+check("/balance is published and resolves without a wake",
+      any(c == "balance" for c, _d in pg.BOT_COMMANDS)
+      and pg.parse_command("/balance") == ("", {}, "balance"))
+
+print("\n-- the wizard's own floor --")
+
+
+def _floor_run(min_sat, typed):
+    p, seen = _room_pager((1,), ())
+    p.deposit_min_sat = min_sat
+    jobs = []
+    p.start_job = lambda c, j, pa, leg=0: jobs.append((j, pa))
+    for a in ("/depo", typed):
+        p.handle({"update_id": 1, "message": {"chat": {"id": 1}, "text": a}})
+    return seen, jobs
+
+
+_fs, _fj = _floor_run(60000, "0.0005")
+check("with --deposit-min-sat 60000, 0.0005 is refused HERE with the floor "
+      "as a figure, the conversation ends, and no wake is spent",
+      any("at least 0.0006" in t for t in _fs) and _fj == []
+      and any("Cancelled" in t for t in _fs))
+_fs, _fj = _floor_run(60000, "0.0006")
+check("...and exactly the floor goes on to the confirm question",
+      any("Confirm and it starts" in t for t in _fs))
+_fs, _fj = _floor_run(pg.proto.DEPOSIT_MIN_SAT, "0.0001")
+check("...the default floor is the wire's own, so nothing changes without "
+      "the flag", any("Confirm and it starts" in t for t in _fs))
+_cli = pg.build_cli()
+_a = _cli.parse_args(["--btc-electrum", "s.onion", "--btc-electrum",
+                      "t.onion:50001,ab", "--btc-min-conf", "3",
+                      "--btc-network", "testnet", "--btc-poll", "120",
+                      "--deposit-min-sat", "60000"])
+check("the intake's settings are command-line flags (never on the card): "
+      "servers, depth, network, poll, floor",
+      _a.btc_electrum == ["s.onion", "t.onion:50001,ab"] and _a.btc_min_conf == 3
+      and _a.btc_network == "testnet" and _a.btc_poll == 120
+      and _a.deposit_min_sat == 60000
+      and _cli.parse_args([]).btc_electrum == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
