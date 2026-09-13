@@ -131,9 +131,10 @@ MAX_FEE_FRACTION = Decimal("0.20")
 #: The slippage the arrival watcher accepts, mirrored from
 #: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
 ARRIVAL_TOLERANCE = Decimal("0.10")
-#: The most bytes a scriptPubKey ThorChain could give us has: P2WSH or P2TR
-#: (1 + 1 + 32). The bound used before the quote is known.
-INBOUND_SPK_MAX = 34
+#: The most bytes a scriptPubKey ThorChain could give us has (P2WSH or
+#: P2TR); declared in gs_btc_tx so the vault's deposit floor and this
+#: tool's fee bound are built from one figure.
+INBOUND_SPK_MAX = btx.INBOUND_SPK_MAX
 #: Version of the plan file this writes. v2: the broadcast fields.
 PLAN_SCHEMA = "gs_btc_forward_v2"
 #: The most seconds allowed between the quote and the broadcast. Inbound

@@ -63,6 +63,10 @@ WITNESS_P2WPKH_MAX = 1 + 1 + 73 + 1 + 33
 #: A P2WPKH input on the wire, without its witness: outpoint(36) +
 #: empty scriptSig length(1) + sequence(4).
 INPUT_BASE = 36 + 1 + 4
+#: The most bytes a scriptPubKey ThorChain could give us has: P2WSH or P2TR
+#: (1 + 1 + 32). The bound the forwarder sizes its fee against before the
+#: quote is known, and the bound the vault's deposit floor is built from.
+INBOUND_SPK_MAX = 34
 #: The account level of BIP84: m/84'/coin'/0'.
 BIP84_PURPOSE = 84
 #: nLockTime at or above this is a UNIX timestamp, not a height.

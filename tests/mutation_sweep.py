@@ -1425,16 +1425,16 @@ MUTATIONS = [
 
  ("the vault stops checking what the Pi will reject, so it powers off "
   "believing it delivered", "gs_wake_agent",
-  "        if not proto.plain_slip_is_wellformed(body):",
-  "        if False:",
+  "        if not proto.plain_slip_is_wellformed(body):\n            raise ValueError(\"the quoted pair does not fit the plaintext slip \"",
+  "        if False:\n            raise ValueError(\"the quoted pair does not fit the plaintext slip \"",
   ["test_plain_slip"]),
 
  # An EXACT key set, not a superset: a field this Pi has never heard of must
  # not be forwarded to Telegram unexamined.
  ("a field the Pi has never heard of rides along into the chat",
   "gs_wake_proto.py",
-  "    if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):",
-  "    if not isinstance(obj, dict):",
+  "    if not isinstance(obj, dict) or frozenset(obj) not in PLAIN_SHAPES:",
+  "    if not isinstance(obj, dict) or not set(obj) <= set(PLAIN_FIELDS):",
   ["test_plain_slip"]),
 
  # A probe reads whatever status file is on disk. Nothing else removes it, so
@@ -4443,7 +4443,7 @@ MUTATIONS = [
   'MAX_FEE_FRACTION = Decimal("0.99")',
   ['test_btc_forwarder']),
  ('the fee bound budgets a P2WPKH inbound, so a P2WSH/P2TR vault is paid under the target',
-  'btc_forwarder',
+  'gs_btc_tx.py',
   'INBOUND_SPK_MAX = 34',
   'INBOUND_SPK_MAX = 22',
   ['test_btc_forwarder']),

@@ -238,6 +238,36 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
             "pin_mismatch": pinned}
 
 
+def unused(address, servers, proxy_url, *, network="main",
+           timeout=DEFAULT_TIMEOUT, transport_factory=None):
+    """Has this address EVER been used? True iff a server, asked read-only
+    over Tor on the address's own circuit, lists no history for it at all
+    -- mempool or block, received or spent. Raises BtcWatchError when no
+    server answered: "could not ask" is never "unused", because the caller
+    is about to hand this address to a client and a reused address is two
+    clients' money on one line (STAGE4_PLAN.md 2). The vault calls this
+    before issuing a deposit address; the ledger's own counter is not
+    trusted for it, since paranoia_mode wipes the ledger."""
+    scripthash, order, make = _prepare(address, network, servers, proxy_url,
+                                       transport_factory, timeout)
+    last = None
+    for host, port, pin in order:
+        transport = make(host, port, pin)
+        try:
+            with Broadcaster(transport) as b:
+                b.handshake()
+                entries = b.history(scripthash)
+        except PinMismatch:
+            raise
+        except (BtcWatchError, OSError) as ex:
+            last = ex
+            continue
+        return not entries
+    why = str(last) if isinstance(last, BtcWatchError) \
+        else type(last).__name__
+    raise BtcWatchError(f"no Electrum server answered (last: {why})")
+
+
 def _history_once(txid, scripthash, order, make):
     """One pass over the servers: the first that answers decides. Returns
     (entry_or_None, host, cert_sha256); raises BtcWatchError when no

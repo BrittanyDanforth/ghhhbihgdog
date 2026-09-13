@@ -1230,7 +1230,13 @@ _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
       # The forward composes from these two the same way; without them it
       # refuses (no_btc_config) and the sweep-over-JOBS loop would raise.
       "btc_account_xpub": "xpub6FIXTUREACCOUNT", "btc_electrum": ["s.onion"]}
-_XMR_SAMPLE = "4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
+# ...AND THE SAME KEY WITHOUT THE BTC INTAKE, for the deposit dispatches
+# below: with an xpub paired, a deposit allocates a BTC address and asks the
+# network whether it is fresh (stage 4), which is its own block of checks
+# at the end of this file. The fixture xpub above composes an argv and
+# derives nothing.
+_k_plain = {k: v for k, v in _k.items() if not k.startswith("btc_")}
+_XMR_SAMPLE ="4AdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAdAd"
 _sample = {"receive_and_quote": {"amount_sat": 5000000},
            "watch": {"handle": "A3F1"}, "swap_status": {"handle": "A3F1"},
            "forward_to_swap": {"handle": "A3F1"},
@@ -1439,7 +1445,7 @@ try:
     A.integrity_log = lambda st, kind, *a, **k: _r_log.append(kind)
     with contextlib.redirect_stdout(io.StringIO()):
         _r_out = A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                             _k, _rd, "B0E1", _rrun, "job-r",
+                             _k_plain, _rd, "B0E1", _rrun, "job-r",
                              reuse_balance=lambda k, a, s: 0)
 finally:
     A.integrity_log = _saved_il_ld
@@ -1457,7 +1463,7 @@ try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
         A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                    _k, _rd2, "B0E1", _rrun2, "job-r2",
+                    _k_plain, _rd2, "B0E1", _rrun2, "job-r2",
                     reuse_balance=lambda k, a, s: 1)
 finally:
     A.integrity_log = _saved_il_ld
@@ -1471,7 +1477,7 @@ try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
         A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                    _k, _rd3, "B0E1", _rrun3, "job-r3",
+                    _k_plain, _rd3, "B0E1", _rrun3, "job-r3",
                     reuse_balance=lambda k, a, s: None)
 finally:
     A.integrity_log = _saved_il_ld
@@ -1485,7 +1491,7 @@ try:
     A.integrity_log = lambda *a, **k: None
     with contextlib.redirect_stdout(io.StringIO()):
         A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                    _k, _rd4, "B0E1", _rrun4, "job-r4",
+                    _k_plain, _rd4, "B0E1", _rrun4, "job-r4",
                     reuse_balance=lambda k, a, s: 1)
     _r4 = None
 except A.Refused as _e:
@@ -1513,7 +1519,7 @@ try:
     A.proto.new_handle = lambda: "C4D5"
     with contextlib.redirect_stdout(io.StringIO()):
         _r5 = A._dispatch("receive_and_quote", {"amount_sat": 5000000},
-                          _k, _rd5, "A3F1", _rrun5, "job-r5",
+                          _k_plain, _rd5, "A3F1", _rrun5, "job-r5",
                           reuse_balance=lambda k, a, s: 1)
 finally:
     A.proto.new_handle = _saved_nh
@@ -3336,7 +3342,8 @@ for _sat, _want_refusal in ((-1, True), (0, True),
                             (P.DEPOSIT_MIN_SAT, False), (5_000_000, False),
                             (P.DEPOSIT_MAX_SAT, False)):
     try:
-        A.build_argv("receive_and_quote", {"amount_sat": _sat}, _k, _wdir)
+        A.build_argv("receive_and_quote", {"amount_sat": _sat}, _k_plain,
+                     _wdir)
         _ref = False
     except A.Refused:
         _ref = True
@@ -4480,9 +4487,17 @@ def _pairs_btc(extra):
 
 _BTC_OK = ["--allow-btc-forward", "--btc-xpub", _BTC_XPUB_OK,
            "--btc-electrum", "s.onion", "--btc-electrum", "t.onion:50001,"
-           + "ab" * 32, "--thornode", "https://tn.example"]
+           + "ab" * 32, "--thornode", "https://tn.example",
+           "--deposit-in-chat"]
 check("pairing/btc: a complete BTC intake passes validation",
       _pairs_btc(_BTC_OK) is None)
+check("pairing/btc: --btc-xpub WITHOUT --deposit-in-chat is refused at "
+      "pairing, naming the mode it needs (the address reaches a phone "
+      "through the chat or not at all)",
+      "--deposit-in-chat" in (_pairs_btc(
+          [a for a in _BTC_OK if a != "--deposit-in-chat"]) or "")
+      and "--deposit-in-chat" in (_pairs_btc(
+          ["--btc-xpub", _BTC_XPUB_OK, "--btc-electrum", "s.onion"]) or ""))
 check("pairing/btc: --allow-btc-forward without an xpub or a server is "
       "refused AT PAIRING, naming both",
       "--btc-xpub" in (_pairs_btc(["--allow-btc-forward"]) or "")
@@ -4902,11 +4917,17 @@ try:
     _o, _e, _t = run(_kk, deps_for(_dd, _bb, extend_deadman=lambda s: True))
 finally:
     os.environ.pop("GS_BTC_SEED", None)
+# A BTC-INTAKE RECORD (it carries btc_index) builds the BTC-shaped slip,
+# which derives the address from a REAL xpub; the fixture xpub above composes
+# argv and derives nothing, so the real one is used for this one call.
+_ZPUB = ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r"
+         "1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
 check("NON-VACUITY: the same pairs file DOES produce a plain slip for the "
       "quoting job's reply (so the empty reply below is the guard, not a "
       "missing file)",
       bool(A.plain_slip_for_chat({**_FWD_KEY, "deposit_in_chat": True,
-                                  "artifact_dir": str(_dd)},
+                                  "artifact_dir": str(_dd),
+                                  "btc_account_xpub": _ZPUB},
                                  _dd, "done", "A3F1")))
 _led = json.loads((_dd / A.HANDLES_FILE).read_text())
 _rec_after = (_led.get("handles") or _led).get("A3F1") or {}
@@ -4938,6 +4959,183 @@ check("the forward's result budget fits the unit and sits between the "
       "probe's and the withdrawal's",
       P.result_budget_s("swap_status") < P.result_budget_s("forward_to_swap")
       < P.result_budget_s("withdraw"))
+
+# ===========================================================================
+print("\n== the BTC intake: a unique host-owned address per deposit "
+      "(STAGE4_PLAN.md) ==")
+# The deposit job, on a keyfile paired with --btc-xpub: the record gains a
+# BTC index allocated one past the ledger's highest, but ONLY once the
+# network has said the address is fresh (the ledger is wiped by
+# paranoia_mode, so its counter is never trusted alone); the plain slip
+# carries the host's own derived address and NO memo; nothing is sealed for
+# a delivery machine; and a deposit that could not be forwarded after its
+# own fee is refused before anything is minted. The look is injected.
+import gs_btc_tx as _BT                                      # noqa: E402
+_ZPUB = ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r"
+         "1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
+_ADDR = {0: "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",       # BIP84 vectors
+         1: "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g"}
+_, _, _k4, _ = new_env()
+_BK = {**_k4, "btc_account_xpub": _ZPUB, "btc_electrum": ["s.onion"],
+       "btc_network": "main", "deposit_in_chat": True,
+       "allow_btc_forward": True}
+_SHARED_IN = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+_MEMO4 = "=:XMR.XMR:" + _XMR_SAMPLE + ":0/1/0"
+
+
+def _btc_env(prefix, handles=None):
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    if handles is not None:
+        (d / A.HANDLES_FILE).write_text(json.dumps({"handles": handles,
+                                                     "owners": {}}))
+    runs = []
+
+    def runner(argv, env_extra, budget_s):
+        runs.append(list(argv))
+        if "create_receive_wallet" in " ".join(argv):
+            (d / f"wallet_new_{len(runs)}.json").write_text(json.dumps(
+                {"schema": "gs_receive_wallet_v1", "address": _XMR_SAMPLE,
+                 "account_index": 8, "subaddress_index": len(runs),
+                 "rpc_endpoint": "http://127.0.0.1:18083"}))
+        if "thor_swap_preparer" in " ".join(argv):
+            Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps([{
+                "schema": "thor_pairs_v1", "btc_in": "0.05",
+                "deposit": _SHARED_IN, "memo": _MEMO4,
+                "dest_xmr": _XMR_SAMPLE, "expected_xmr": "1.5",
+                "min_out_xmr": "", "ts": 1700000000}]))
+        return 0, False
+    return d, runs, runner
+
+
+def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
+                  job_id="job-b"):
+    """(out, refused_code, addresses_asked, kinds)."""
+    asked, kinds = [], []
+
+    def ask(addr):
+        asked.append(addr)
+        r = unused(addr) if callable(unused) else unused
+        if isinstance(r, Exception):
+            raise r
+        return r
+    try:
+        A.integrity_log = lambda st, kind, *a, **k: kinds.append(kind)
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = A._dispatch("receive_and_quote",
+                              {"amount_sat": amount, "owner": OWNER},
+                              key or _BK, d, handle, runner, job_id,
+                              reuse_balance=lambda k, a, s: 1,
+                              btc_unused=ask)
+        code = None
+    except A.Refused as e:
+        out, code = None, e.code
+    finally:
+        A.integrity_log = _saved_il_ld
+    return out, code, asked, kinds
+
+
+def _rec4(d, h):
+    return json.loads((d / A.HANDLES_FILE).read_text())["handles"].get(h) or {}
+
+
+_d4, _runs4, _run4 = _btc_env("btc4_")
+_o, _c, _asked, _kinds = _btc_dispatch(_d4, _run4, "B4A1", True)
+check("the first deposit on a BTC-intake keyfile: done, index 0 recorded on "
+      "the handle beside the bundle, the network asked about EXACTLY the "
+      "address at index 0 first, both children ran",
+      _o is not None and _o[1] == "done" and _c is None
+      and _rec4(_d4, "B4A1").get("btc_index") == 0
+      and _rec4(_d4, "B4A1").get("bundle") and _asked == [_ADDR[0]]
+      and len(_runs4) == 2)
+_body = A.plain_slip_for_chat(_BK, _d4, "done", "B4A1")
+check("...the plain slip carries the amount, the HOST'S OWN address at index "
+      "0, the expected figure and the label -- and NO memo: the second exact "
+      "shape", _body == {"b": "0.05", "d": _ADDR[0], "x": "1.5", "h": "B4A1"}
+      and P.plain_slip_is_wellformed(_body) and "m" not in _body)
+check("...neither the shared inbound nor the memo from the pairs file "
+      "reaches it", _SHARED_IN not in json.dumps(_body)
+      and "XMR.XMR" not in json.dumps(_body))
+_sealed = A.seal_slip_for_delivery({**_BK, "delivery_public": "ab" * 32},
+                                   _d4, "done", "B4A1")
+check("...and NOTHING is sealed for a delivery machine on a BTC-intake "
+      "record, even with a delivery key paired", _sealed == "")
+_o, _c, _asked, _ = _btc_dispatch(_d4, _run4, "B4A2", True, job_id="job-b2")
+check("the second deposit on the same ledger: index 1, asked about the "
+      "address at index 1", _c is None and _rec4(_d4, "B4A2")["btc_index"] == 1
+      and _asked == [_ADDR[1]]
+      and A.plain_slip_for_chat(_BK, _d4, "done", "B4A2")["d"] == _ADDR[1])
+
+_d5, _runs5, _run5 = _btc_env("btc5_")
+_o, _c, _asked, _ = _btc_dispatch(_d5, _run5, "B5A1",
+                                  lambda a: a != _ADDR[0])
+check("THE LEDGER IS NOT TRUSTED ALONE: a fresh ledger whose index 0 the "
+      "network says is USED steps to index 1 (asked about both, in order)",
+      _c is None and _rec4(_d5, "B5A1")["btc_index"] == 1
+      and _asked == [_ADDR[0], _ADDR[1]])
+_d6, _runs6, _run6 = _btc_env("btc6_")
+_o, _c, _asked, _kinds = _btc_dispatch(
+    _d6, _run6, "B6A1", W_ERR := __import__("gs_btc_watch").BtcWatchError("x"))
+check("a look nobody answered REFUSES the deposit (btc_lookup_failed): no "
+      "address issued, the quote never ran, and the minted bundle is kept "
+      "on the record with no slip so the next deposit reuses it",
+      _c == "btc_lookup_failed" and len(_runs6) == 1
+      and _rec4(_d6, "B6A1").get("bundle")
+      and not _rec4(_d6, "B6A1").get("btc_index")
+      and "btc_lookup_failed" in _kinds)
+_d7, _runs7, _run7 = _btc_env("btc7_")
+_o, _c, _asked, _kinds = _btc_dispatch(_d7, _run7, "B7A1", False)
+check(f"every address used for a whole recovery gap ({P.BTC_INDEX_GAP + 1} "
+      "asked): refused btc_index_exhausted, nothing issued",
+      _c == "btc_index_exhausted" and len(_asked) == P.BTC_INDEX_GAP + 1
+      and "btc_index_exhausted" in _kinds
+      and not _rec4(_d7, "B7A1").get("btc_index"))
+
+_floor = A.btc_deposit_min_sat(_BK)
+check("the deposit floor on the intake is the wire floor plus a one-input "
+      "forward's fee at the ceiling rate with the largest OP_RETURN the "
+      "policy allows -- computed from gs_btc_tx's own bounds",
+      _floor == P.DEPOSIT_MIN_SAT + _BT.vsize_upper_bound(
+          1, [_BT.INBOUND_SPK_MAX, _BT.op_return_script_len(80)]) * 200
+      and _floor > P.DEPOSIT_MIN_SAT
+      and A.btc_deposit_min_sat({**_BK, "op_return_max_bytes": 120,
+                                 "feerate_ceiling_sat_vb": 50}) < _floor)
+_d8, _runs8, _run8 = _btc_env("btc8_")
+_o, _c, _asked, _ = _btc_dispatch(_d8, _run8, "B8A1", True, amount=_floor - 1)
+check("a deposit ONE satoshi under the floor is refused deposit_too_small "
+      "BEFORE anything is minted or asked", _c == "deposit_too_small"
+      and _runs8 == [] and _asked == [])
+_o, _c, _asked, _ = _btc_dispatch(_d8, _run8, "B8A2", True, amount=_floor)
+check("...and exactly the floor is taken", _c is None and len(_runs8) == 2)
+try:
+    A.btc_deposit_min_sat({**_BK, "op_return_max_bytes": "80"})
+    _mf = None
+except A.Refused as _e:
+    _mf = _e.code
+check("...a malformed policy value is refused, never coerced, on the way to "
+      "the floor", _mf == "btc_config_malformed")
+
+_d9, _runs9, _run9 = _btc_env("btc9_")
+_o, _c, _asked, _ = _btc_dispatch(_d9, _run9, "B9A1", True, key=_k4)
+check("a keyfile WITHOUT --btc-xpub is untouched: no index, nothing asked, "
+      "the plain slip is the shared-inbound one with its memo",
+      _c is None and "btc_index" not in _rec4(_d9, "B9A1") and _asked == []
+      and A.plain_slip_for_chat({**_k4, "deposit_in_chat": True}, _d9,
+                                "done", "B9A1").get("m") == _MEMO4)
+_d10 = Path(tempfile.mkdtemp(prefix="btc10_"))
+(_d10 / "thor_pairs_BAD1.json").write_text(json.dumps([{
+    "btc_in": "0.05", "deposit": _SHARED_IN, "memo": _MEMO4,
+    "dest_xmr": _XMR_SAMPLE, "expected_xmr": "1.5", "ts": 1700000000}]))
+(_d10 / A.HANDLES_FILE).write_text(json.dumps({"handles": {"BAD1": {
+    "bundle": "/tmp/x", "slip": str(_d10 / "thor_pairs_BAD1.json"),
+    "btc_index": 0x80000000}}, "owners": {}}))
+with contextlib.redirect_stdout(io.StringIO()):
+    _bad_body = A.plain_slip_for_chat(_BK, _d10, "done", "BAD1")
+check("a record whose index cannot be derived (hardened) builds NO slip and "
+      "never raises", _bad_body == {})
+check("the forward finds what the deposit recorded: the BTC-intake record "
+      "carries btc_index and the same bundle the XMR side quoted",
+      isinstance(_rec4(_d4, "B4A1").get("btc_index"), int)
+      and _rec4(_d4, "B4A1")["bundle"].endswith("wallet_new_1.json"))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

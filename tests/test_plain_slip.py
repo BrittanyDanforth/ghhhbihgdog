@@ -225,11 +225,31 @@ check("the amount and the deposit address DO travel -- they are the payment",
 check("...and so does the memo, verbatim, because it is the only thing that "
       "routes the payment",
       PLAIN.get("m") == MEMO and "m" in P.PLAIN_FIELDS)
-check("...and a record from the turn it did not travel is REFUSED by the "
-      "doorbell's own shape check, so an address can never arrive without "
-      "its note",
-      not P.plain_slip_is_wellformed({k: v for k, v in PLAIN.items()
-                                      if k != "m"}))
+# TWO EXACT SHAPES, AND NO THIRD (stage 4, STAGE4_PLAN.md 3.2). The record
+# without the memo is no longer "the turn it did not travel by accident": it
+# is the BTC-intake flow, where the address is unique and the host's own and
+# the memo is attached by the host at forward time. What is still refused is
+# everything else: a record missing any OTHER field, one with a field the
+# Pi has never heard of, one that drops two.
+_BTC_SHAPE = {k: v for k, v in PLAIN.items() if k != "m"}
+check("the memo-less record is the SECOND exact shape (BTC intake) and is "
+      "accepted by the doorbell's own shape check",
+      P.plain_slip_is_wellformed(_BTC_SHAPE)
+      and frozenset(_BTC_SHAPE) in P.PLAIN_SHAPES)
+check("...and there are exactly two shapes: the full set and the full set "
+      "without 'm'", len(P.PLAIN_SHAPES) == 2
+      and frozenset(P.PLAIN_FIELDS) in P.PLAIN_SHAPES
+      and frozenset(P.PLAIN_FIELDS) - {"m"} in P.PLAIN_SHAPES)
+for _drop, _why in (("d", "the address"), ("b", "the amount"),
+                    ("x", "the expected figure"), ("h", "the handle")):
+    check(f"...a memo-less record missing {_why} too is refused (no third "
+          "shape)", not P.plain_slip_is_wellformed(
+              {k: v for k, v in _BTC_SHAPE.items() if k != _drop}))
+check("...a memo-less record with an extra field is refused",
+      not P.plain_slip_is_wellformed(dict(_BTC_SHAPE, z="x")))
+check("...and the bounds and the control-character gate apply to it too",
+      not P.plain_slip_is_wellformed(dict(_BTC_SHAPE, d="x" * 500))
+      and not P.plain_slip_is_wellformed(dict(_BTC_SHAPE, d=BTC + "\nX")))
 check("and the handle, so the operator can /check it later", PLAIN["h"] == "A3F1")
 
 # ---- THE MEMO MUST NAME THE VAULT'S OWN DESTINATION, CHECKED ON THE VAULT --
@@ -948,16 +968,19 @@ for _j in ("watch", "receive_and_quote", "swap_status"):
 # a memo naming the destination XMR address in full, to everyone in it.
 _GROUP = -1001999999999
 # THE FIXTURE IS THE WIRE'S OWN SHAPE, memo included: the record the vault
-# builds for a phone-only reader carries the note that routes the payment,
-# and one without it is refused at the gate (see section 2).
+# builds for a phone-only reader on the SHARED-inbound flow carries the note
+# that routes the payment. The memo-less record is the other exact shape
+# (BTC intake, section 2), and one missing anything else is refused.
 _PL_MEMO_V = "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0"
 _PL_OK = {"b": "0.05000000", "d": "bc1qdeposit0000000000000000000000",
           "m": _PL_MEMO_V, "x": "1.2345", "h": "A3F1"}
-check("plain: the wire accepts the record WITH its memo and refuses one "
-      "without, so an address cannot reach a chat unaccompanied",
+check("plain: the wire accepts the record WITH its memo, accepts the "
+      "BTC-intake shape without it, and refuses one missing the address",
       P.plain_slip_is_wellformed(_PL_OK)
+      and P.plain_slip_is_wellformed(
+          {k: v for k, v in _PL_OK.items() if k != "m"})
       and not P.plain_slip_is_wellformed(
-          {k: v for k, v in _PL_OK.items() if k != "m"}))
+          {k: v for k, v in _PL_OK.items() if k != "d"}))
 check("plain: ...and the authored lines never print the memo -- it travels "
       "as its own message, so a tap-and-hold copies it alone",
       not any("=:XMR.XMR:" in _l or "8" + "d" * 94 in _l

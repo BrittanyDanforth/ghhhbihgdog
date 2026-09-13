@@ -1312,6 +1312,93 @@ def _btc_broadcast_on(key: dict) -> bool:
     return bool(key.get("allow_btc_forward")) and v
 
 
+def btc_mode(key: dict) -> bool:
+    """Is this pair on the BTC intake (a unique host-owned deposit address
+    per deposit, no note)? A property of the vault's keyfile: the account
+    xpub paired with --btc-xpub. STAGE4_PLAN.md."""
+    return bool(key.get("btc_account_xpub"))
+
+
+def btc_deposit_min_sat(key: dict) -> int:
+    """The smallest deposit this pair can FORWARD: what must reach ThorChain
+    after the fee (the wire floor, which equals the forwarder's
+    FORWARD_MIN_SAT) plus a fee allowance for a one-input forward carrying
+    the largest OP_RETURN this pair's policy allows, at the ceiling rate.
+    STAGE2_PLAN.md found the wire floor alone can never be forwarded: a
+    deposit of exactly it is fee minus nothing."""
+    import gs_btc_tx as _btx
+    op_max = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)
+    ceiling = _btc_setting(key, "feerate_ceiling_sat_vb", 200, 1, 100000)
+    bound = _btx.vsize_upper_bound(
+        1, [_btx.INBOUND_SPK_MAX, _btx.op_return_script_len(op_max)])
+    return int(proto.DEPOSIT_MIN_SAT) + int(bound) * int(ceiling)
+
+
+def _btc_address(key: dict, index: int) -> str:
+    """The deposit address at `index` under this pair's account xpub, by
+    the same public derivation the watch side uses."""
+    import gs_btc_watch as _w
+    return _w.derive_receive_address(str(key["btc_account_xpub"]), int(index),
+                                     str(key.get("btc_network") or "main"))
+
+
+def _btc_unused_live(key: dict, address: str) -> bool:
+    """Ask the network, over Tor on the address's own circuit, whether this
+    address has ever been used. Raises when nobody answered."""
+    import gs_btc_broadcast as _b
+    import gs_btc_watch as _w
+    servers = [_w.parse_server(s) for s in (key.get("btc_electrum") or [])]
+    return _b.unused(address, servers, key["tor_proxy"],
+                     network=str(key.get("btc_network") or "main"))
+
+
+def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
+    """The next deposit index: one past the highest the ledger knows,
+    stepping past any address the NETWORK says has been used, up to
+    BTC_INDEX_GAP of them. The ledger's counter is never trusted alone --
+    paranoia_mode wipes the ledger, and a wiped ledger restarting at 0 would
+    hand a new client an address an earlier client paid. An address is
+    issued only once a server has said it is fresh; "could not ask" refuses
+    the deposit (fail closed) rather than guess. `unused` may be injected
+    (a test); by default the live look."""
+    from gs_common import integrity_log_once as _once
+    used = [r.get("btc_index") for r in handles.values()
+            if isinstance(r, dict) and isinstance(r.get("btc_index"), int)
+            and not isinstance(r.get("btc_index"), bool)]
+    nxt = (max(used) + 1) if used else 0
+    ask = unused or (lambda addr: _btc_unused_live(key, addr))
+    for step in range(int(proto.BTC_INDEX_GAP) + 1):
+        idx = nxt + step
+        try:
+            addr = _btc_address(key, idx)
+        except Exception as e:                               # noqa: BLE001
+            raise Refused("btc_config_malformed",
+                          "this machine's keyfile names an account xpub the "
+                          f"watch side cannot derive from ({type(e).__name__}); "
+                          "re-pair.")
+        try:
+            fresh = ask(addr)
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", "btc_lookup_failed")
+            raise Refused("btc_lookup_failed",
+                          "could not ask the network whether the next deposit "
+                          "address is fresh, so no address was issued: one "
+                          "that might have been used already is two people's "
+                          "money on one line. Nothing was published.")
+        if fresh:
+            if step:
+                # ONCE per run, never a count: how many were skipped is the
+                # number of deposits the ledger forgot.
+                _once("wake", "btc_index_skipped")
+            return idx
+    integrity_log("wake", "btc_index_exhausted")
+    raise Refused("btc_index_exhausted",
+                  f"the next {int(proto.BTC_INDEX_GAP) + 1} deposit addresses "
+                  "have all been used and the ledger knows none of them: the "
+                  "ledger and the chain disagree by more than a recovery gap. "
+                  "Nothing was published; check the ledger at the machine.")
+
+
 def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
     """(moved, outcome) from the plan btc_forwarder wrote for `handle`:
     moved is True only when the plan says broadcast and names an outcome
@@ -1374,6 +1461,17 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
             raise Refused("bad_amount",
                           f"the note's deposit amount is not one this "
                           f"machine will quote: {e}")
+        # ON THE BTC INTAKE, THE FLOOR IS WHAT CAN BE FORWARDED, not the
+        # wire's typo guard: the forward pays a network fee out of the
+        # deposit and must still reach ThorChain's own minimum. Refused
+        # HERE, before a mint, a look or a quote spends anything.
+        if btc_mode(key):
+            _floor = btc_deposit_min_sat(key)
+            if int(_amt) < _floor:
+                raise Refused("deposit_too_small",
+                              f"a deposit under {_floor} satoshi could not be "
+                              "forwarded after its own network fee at this "
+                              "machine's ceiling rate; nothing was minted.")
         return [
             [sys.executable, _tool("create_receive_wallet"),
              "--tor-proxy", proxy, "--rpc", rpc,
@@ -2457,7 +2555,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                 "will still power itself off.")
     code, status, handle = _dispatch(job, params, key, artifact_dir,
                                      handle, _child, job_id,
-                                     accounts=d.get("account_indices"))
+                                     accounts=d.get("account_indices"),
+                                     btc_unused=d.get("btc_unused"))
     # A STATUS PROBE REPORTS THE HANDLE IT WAS ASKED ABOUT, not the fresh one
     # _run_validated drew. See _dispatch: handles[] is written only for
     # receive_and_quote, and the collision loop guarantees the
@@ -2994,7 +3093,8 @@ def _handles_on_disk(d: Path) -> set:
 
 
 def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
-              funded=None, reuse_balance=None, accounts=None) -> tuple:
+              funded=None, reuse_balance=None, accounts=None,
+              btc_unused=None) -> tuple:
     """Run the job's tools in order. Returns (code, status, handle)."""
     budget = proto.JOBS[job]["budget_s"]
     led = _load_ledger(artifact_dir)
@@ -3408,6 +3508,20 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 _np = _bundle_pair({"bundle": new[0]})
                 if _np is not None:
                     _add_owner_accounts(led, _owner, {_np[0]})
+            # THE BTC DEPOSIT ADDRESS, on the intake: an index under this
+            # machine's account xpub, recorded on the handle beside the XMR
+            # bundle so the forward can find both. Allocated only once the
+            # network has said the address is fresh (see
+            # _allocate_btc_index); a refusal here leaves the record
+            # WITHOUT a slip, so its bundle is the next deposit's
+            # (_reusable_receive), and nothing was published.
+            if btc_mode(key):
+                try:
+                    handles[handle]["btc_index"] = _allocate_btc_index(
+                        key, handles, unused=btc_unused)
+                except Refused:
+                    _save_handles(artifact_dir, handles, led["owners"])
+                    raise
         if job == "forward_to_swap":
             # THE SEED, IN THE ENVIRONMENT OF THIS ONE STEP, NEVER ON THE
             # ARGV AND NEVER IN THE KEYFILE -- the wallet password's rule,
@@ -3911,6 +4025,15 @@ def seal_slip_for_delivery(key: dict, artifact_dir: Path, status: str,
             # A handle with no quote behind it has no deposit address to
             # deliver, and that is not a fault.
             return ""
+        # A BTC-INTAKE DEPOSIT IS NEVER SEALED FOR A DELIVERY MACHINE. The
+        # delivery path is the shared-inbound flow: an operator at a desktop
+        # pays ThorChain's vault with the memo. On the intake the client pays
+        # a plain address from a phone and the memo is the forward's; the
+        # pairs file's inbound and memo must not travel as instructions.
+        if isinstance(rec.get("btc_index"), int) \
+                and not isinstance(rec.get("btc_index"), bool):
+            integrity_log("wake", "slip_not_sealed_btc")
+            return ""
         pairs = (reader or _read_json)(Path(path))
         if not isinstance(pairs, list) or len(pairs) != 1:
             # ONE amount goes in (a single ladder slot), so one pair comes out.
@@ -4031,6 +4154,28 @@ def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
                 f"expected exactly one quoted pair, found "
                 f"{len(pairs) if isinstance(pairs, list) else 'a non-list'}")
         pair = pairs[0]
+        # THE BTC INTAKE: the amount, the host's OWN unique address derived
+        # for this handle, the expected figure and the label -- and NO memo.
+        # The pairs file's `deposit` is ThorChain's shared inbound and its
+        # `memo` names the destination: both are the forward's business at
+        # forward time, and neither may reach a phone as an instruction. The
+        # absence of `m` is how the Pi knows which flow this is
+        # (gs_wake_proto.PLAIN_SHAPES).
+        _bi = rec.get("btc_index")
+        if isinstance(_bi, int) and not isinstance(_bi, bool):
+            body = {}
+            for src, short in (("btc_in", "b"), ("expected_xmr", "x")):
+                v = pair.get(src)
+                if v is None:
+                    raise ValueError(f"the quoted pair has no {src!r}")
+                body[short] = str(v)
+            body["d"] = _btc_address(key, _bi)
+            body["h"] = handle
+            if not proto.plain_slip_is_wellformed(body):
+                raise ValueError("the deposit instructions do not fit the "
+                                 "plaintext slip format")
+            integrity_log("wake", "plain_slip_sent_btc")
+            return body
         body = {}
         for src, short in PLAIN_MAP:
             v = pair.get(src)

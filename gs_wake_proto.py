@@ -181,7 +181,13 @@ import time
 #: matters. Update both boxes together. The forward SENDS only when the
 #: vault's keyfile also carries `allow_btc_broadcast`; without it the job is
 #: the stage-2 rehearsal and carries no phase.
-WIRE_VERSION = 5
+#:
+#: 6: the plaintext slip has a SECOND exact shape, without the memo, for a
+#: deposit to a unique host-owned address (stage 4). An old Pi refuses such
+#: a slip as "not a set of deposit instructions" -- loud -- and an old vault
+#: never sends one. Update both boxes together. No record changes size and
+#: no job changes its key set.
+WIRE_VERSION = 6
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -343,11 +349,31 @@ if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
 #: reads the message's own timestamp.
 PLAIN_FIELDS = {
     "b": 24,      # btc_in, as a decimal string
-    "d": 90,      # the pooled inbound deposit address (bech32/bech32m <= 62)
+    "d": 90,      # the deposit address (bech32/bech32m <= 62)
     "m": 220,     # the swap memo: the ONLY thing that routes the payment
     "x": 32,      # expected_xmr
     "h": 4,       # the handle
 }
+
+#: THE TWO SHAPES A PLAINTEXT SLIP MAY HAVE, and no third.
+#:
+#: The full set is the shared-inbound flow: the address is ThorChain's pooled
+#: vault and the memo is the entire binding. The BTC-intake flow (stage 4,
+#: STAGE4_PLAN.md) hands the phone a UNIQUE address the host's own key
+#: controls, and the host attaches the memo itself at forward time -- so the
+#: memo does not travel, must not travel (it names the destination for
+#: nothing), and its absence is how the Pi knows which flow a slip belongs to.
+#: Still an exact-set test, twice: a field the Pi has never heard of is
+#: refused in either shape, and a record that drops any OTHER field is
+#: refused too.
+PLAIN_SHAPES = (frozenset(PLAIN_FIELDS), frozenset(PLAIN_FIELDS) - {"m"})
+
+#: How many consecutive USED addresses the vault may step past when it
+#: allocates the next deposit index (STAGE4_PLAN.md 3.1). BIP44's recovery
+#: gap: a standard wallet restoring from the seed stops looking after this
+#: many empty addresses, so an index this far past the last used one would
+#: be money a recovery cannot see.
+BTC_INDEX_GAP = 20
 
 #: The one word an M3 may carry about how a swap is going.
 #:
@@ -779,11 +805,16 @@ def plain_slip_is_wellformed(obj) -> bool:
     because this box cannot know the destination it must name; the vault
     checks that binding before the record is built (plain_slip_for_chat).
     The exact-key-set test is what refuses a record from the turn the memo
-    did not travel: an address can never arrive here without its note.
+    did not travel by accident: an address can never arrive here without its
+    note in the SHARED-INBOUND flow. In the BTC-intake flow (PLAIN_SHAPES)
+    the note is absent BY DESIGN -- the address is unique and the host's
+    own -- and that shape is the second exact set, not a relaxation of the
+    first.
     """
-    if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):
+    if not isinstance(obj, dict) or frozenset(obj) not in PLAIN_SHAPES:
         return False
-    for k, cap in PLAIN_FIELDS.items():
+    for k in obj:
+        cap = PLAIN_FIELDS[k]
         v = obj[k]
         if not isinstance(v, str) or not v or len(v) > cap:
             return False

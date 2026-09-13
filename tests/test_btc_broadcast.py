@@ -476,6 +476,50 @@ check("...and with ONE server there is nobody else: it is asked anyway",
       _s["hosts"] == ["s1.onion"] and _r["seen"] is True)
 
 # ===========================================================================
+print("\n== unused(): has this address ever been used? ==")
+
+
+def _unused(*fts, servers=None, **kw):
+    f = _factory(*fts)
+    r = B.unused(_A0, servers or _SERVERS[:len(fts)] or _SERVERS, _PROXY,
+                 transport_factory=f, **kw)
+    return r, f.seen
+
+
+_r, _s = _unused(_FT(history=[]))
+check("an empty history: unused, asked on the broadcast circuit with "
+      "get_history for this scripthash and nothing that could spend",
+      _r is True and _s["tags"] == ["btcsend:" + _A0])
+_r, _ = _unused(_FT(history=[{"tx_hash": _OTHER, "height": 850000}]))
+check("one entry in a block: USED", _r is False)
+_r, _ = _unused(_FT(history=[{"tx_hash": _OTHER, "height": 0}]))
+check("one entry in the mempool: USED (a payment in flight is a use)",
+      _r is False)
+check("no server answered: RAISED -- 'could not ask' is never 'unused'",
+      _refused(B.unused, _A0, _SERVERS, _PROXY,
+               transport_factory=_factory(_FT("down"))))
+_r, _s = _unused(_FT("down"), _FT(history=[]), servers=_TWO)
+check("a dead first server is routed around and the second decides",
+      _r is True and len(_s["hosts"]) == 2)
+_r, _ = _unused(_FT(history="junk"), _FT(history=[{"tx_hash": _OTHER,
+                                                   "height": 1}]),
+                servers=_TWO)
+check("a malformed answer is not an answer: the next server decides",
+      _r is False)
+_f = _factory(_FT(pin_mismatch=True), _FT(history=[]))
+try:
+    B.unused(_A0, _TWO, _PROXY, transport_factory=_f)
+    _pm = "returned"
+except W.PinMismatch:
+    _pm = "raised"
+check("a PinMismatch is raised at once", _pm == "raised")
+check("a bad address or network is refused before connecting",
+      _refused(B.unused, "1BitcoinEaterAddressDontSendf59kuE", _SERVERS,
+               _PROXY, transport_factory=_never)
+      and _refused(B.unused, _A0, _SERVERS, _PROXY, network="testnet",
+                   transport_factory=_never))
+
+# ===========================================================================
 print("\n== END TO END: the real transport and the real subclass through an "
       "in-process SOCKS5 proxy to an in-process Electrum server ==")
 

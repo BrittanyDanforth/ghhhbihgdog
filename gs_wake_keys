@@ -572,6 +572,13 @@ def _validate_btc(args) -> None:
                  "--btc-electrum: the forward has to know which account to "
                  "watch\n    and where to look. Without them every forward "
                  "is refused after the wake.")
+    if args.btc_xpub and not args.deposit_in_chat:
+        sys.exit("[!] --btc-xpub needs --deposit-in-chat: on the BTC intake "
+                 "the client pays a plain address from a phone, and the\n"
+                 "    only way that address reaches them is the chat "
+                 "(STAGE4_PLAN.md 2). A sealed slip goes to a desktop that\n"
+                 "    is not in this flow. Decide the plaintext mode "
+                 "knowingly, or pair without --btc-xpub.")
     if args.allow_btc_broadcast and not args.allow_btc_forward:
         sys.exit("[!] --allow-btc-broadcast needs --allow-btc-forward: a "
                  "forward that may not sign has nothing to send.\n    The "
