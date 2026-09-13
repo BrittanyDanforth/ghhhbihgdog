@@ -148,7 +148,8 @@ class Net:
             raise self.look_error
         settled = sum(u["value"] for u in self.utxos
                       if u["confirmations"] > 0)
-        pic = {"state": "confirmed" if settled else "not_seen",
+        pic = {"state": ("confirmed" if settled
+                         else "seen" if self.utxos else "not_seen"),
                "confirmed_sat": settled, "unconfirmed_sat": 0,
                "settled_sat": settled, "confirmations": 5,
                "utxos": list(self.utxos), "tip": _TIP, "server": "s.onion",
@@ -756,6 +757,31 @@ _r("quote_failed", Net(post_error=OSError("down")))
 _r("nothing_settled", Net(utxos=[]))
 _r("nothing_settled", Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 5,
                                    "confirmations": 0}]))
+# WHAT IT SAW, FOR THE PHONE (STAGE4_PLAN.md 3.6): on nothing_settled the
+# forwarder writes ONE word beside the plan path, and nothing else.
+_code, _out, _plan, _of = run(Net(utxos=[]))
+_sp = F.status_path(_of)
+check("nothing on the address: refused, no plan, and a status file beside "
+      "the plan path saying exactly {'state': 'not_seen'}",
+      _code == 2 and _plan is None and _sp.exists()
+      and json.load(open(_sp)) == {"state": "not_seen"}
+      and oct(os.stat(_sp).st_mode & 0o777) == "0o600")
+_code, _out, _plan, _of = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                          "value": 50000,
+                                          "confirmations": 0}]))
+check("money present but none settled: the word is 'seen' -- and the amount "
+      "is NOT in the file", json.load(open(F.status_path(_of)))
+      == {"state": "seen"} and "50000" not in open(F.status_path(_of)).read())
+_code, _out, _plan, _of = run(Net())
+check("a forward that signed writes NO status file", _code == 0
+      and not F.status_path(_of).exists())
+check("the status path sits under the plan's own wipe pattern "
+      "(btc_forward_*.json)", F.status_path("/x/btc_forward_A3F1.json").name
+      == "btc_forward_A3F1.status.json")
+F.write_status(_of, "confirmed")
+check("write_status never writes a word outside the two it may: anything "
+      "else becomes not_seen", json.load(open(F.status_path(_of)))
+      == {"state": "not_seen"})
 _r("no_fee_estimate", Net(fee=None))
 _r("fee_out_of_band", Net(fee=500))
 _r("fee_out_of_band", Net(fee=2), "--feerate-floor", "5")

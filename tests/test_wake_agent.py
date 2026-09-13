@@ -4855,8 +4855,11 @@ check("...an unreadable plan never raises: not moved, no word, the job still "
       "done", _e is None and _rec_of(_dd).get("forward_sent") is False
       and (_bb.result or {}).get("phase") == "")
 _o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, None)
-check("...no plan at all (the child wrote nothing): not moved, no word",
-      _e is None and _rec_of(_dd).get("forward_sent") is False
+check("...no plan at all (the child wrote nothing): not moved, no word, and "
+      "the record is NOT marked at all (a mark without a plan would refuse "
+      "the real forward later as a repeat)",
+      _e is None and not _rec_of(_dd).get("forward_sent")
+      and "forwarded" not in _rec_of(_dd)
       and (_bb.result or {}).get("phase") == "")
 # THE PLAN ON DISK IS THE RECORD TOO. A crash between the child's exit and
 # the ledger mark leaves a plan saying "accepted" beside a record saying
@@ -4878,6 +4881,74 @@ check("a record WITHOUT the forward_sent mark but with a plan on disk that "
       "wrote is consulted, not the ledger alone), no child runs",
       _o is None and getattr(_e, "code", None) == "already_forwarded"
       and _ranx == [])
+print("\n== a forward that found nothing settled says what it saw ==")
+
+
+def _fwd_run_rc(rec, key_extra, rc, state=None):
+    """A forward whose fake child exits `rc` and, with `state`, writes the
+    one-word status file the real forwarder writes on nothing_settled.
+    Returns (out, err, ran, dir, bell)."""
+    dd, kk, bb = _fwd_env(rec, key_extra)
+    ran = []
+
+    def child(argv, env_extra, budget):
+        ran.append((list(argv), dict(env_extra or {})))
+        if state is not None:
+            _of = Path(argv[argv.index("--outfile") + 1])
+            _of.with_suffix(".status.json").write_text(
+                state if isinstance(state, str) and state.startswith("{")
+                else json.dumps({"state": state}))
+        return rc, False
+
+    dp = deps_for(dd, bb, extend_deadman=lambda s: True, run_child=child)
+    os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+    try:
+        out, err, text = run(kk, dp)
+    except Exception as e:                                   # noqa: BLE001
+        out, err = None, e
+    finally:
+        os.environ.pop("GS_BTC_SEED", None)
+    return out, err, ran, dd, bb
+
+
+_o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, "not_seen")
+check("the forwarder refused nothing_settled (exit 2) and wrote 'not_seen': "
+      "the job reports DONE with the word 'not_yet' -- not 'the machine "
+      "FAILED' -- and the record is NOT marked forwarded (no plan was "
+      "written)", _e is None and _o is not None and _o[1] == "done"
+      and (_bb.result or {}).get("status") == "done"
+      and (_bb.result or {}).get("phase") == "not_yet"
+      and "forwarded" not in _rec_of(_dd) and "forward_sent" not in _rec_of(_dd))
+check("...and the status file is read once and gone",
+      not (_dd / "btc_forward_A3F1.status.json").exists())
+_o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, "seen")
+check("...'seen' (money present, not settled) is the word 'arriving'",
+      (_bb.result or {}).get("phase") == "arriving"
+      and (_bb.result or {}).get("status") == "done"
+      and "forwarded" not in _rec_of(_dd))
+_o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, None)
+check("...any OTHER exit 2 (no status file) is still a failed job with no "
+      "word", _o is not None and _o[1] == "failed"
+      and (_bb.result or {}).get("status") == "failed"
+      and (_bb.result or {}).get("phase") == "")
+_o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 1, "not_seen")
+check("...and a status file beside a hard failure (exit 1 here) is still "
+      "read as the word it carries: the forwarder writes it only when it "
+      "refused for that reason, and the word is what it saw",
+      (_bb.result or {}).get("phase") == "not_yet")
+for _junk in ('{"state": "confirmed"}', '{"state": "seen", "amount": 5}',
+              "junk {", '{"amount": 5}'):
+    _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _junk)
+    check(f"a status file the forwarder would never write ({_junk[:22]}) "
+          "earns no word: failed, no phase",
+          (_bb.result or {}).get("status") == "failed"
+          and (_bb.result or {}).get("phase") == "")
+_o, _e, _ran, _dd, _bb = _fwd_run_rc({**_FWD_REC, "forwarded": 1700000000},
+                                     _SEND_KEY, 2, "not_seen")
+check("a rehearsed handle asked again in sending mode and found nothing "
+      "settled: 'not_yet', and the rehearsal mark is left as it was",
+      (_bb.result or {}).get("phase") == "not_yet"
+      and _rec_of(_dd).get("forwarded") == 1700000000)
 _pd = Path(tempfile.mkdtemp(prefix="gs_fwd_phase_"))
 (_pd / "btc_forward_A3F1.json").write_text(json.dumps(_ACC))
 check("_phase_of for a forward: 'sent' on a done run with an accepted plan; "
@@ -4912,9 +4983,20 @@ _pairs_path.write_text(json.dumps([{
     "ts": 1700000000}]))
 _dd, _kk, _bb = _fwd_env({**_FWD_REC, "slip": str(_pairs_path)},
                          {**_FWD_KEY, "deposit_in_chat": True})
+
+
+def _rehearsal_child(argv, env_extra, budget):
+    """The forwarder, faked, writing the plan a dry run writes: the mark
+    below is made only when a plan exists."""
+    Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps(
+        {"broadcast": False, "broadcast_outcome": None, "signed": True}))
+    return 0, False
+
+
 os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
 try:
-    _o, _e, _t = run(_kk, deps_for(_dd, _bb, extend_deadman=lambda s: True))
+    _o, _e, _t = run(_kk, deps_for(_dd, _bb, extend_deadman=lambda s: True,
+                                   run_child=_rehearsal_child))
 finally:
     os.environ.pop("GS_BTC_SEED", None)
 # A BTC-INTAKE RECORD (it carries btc_index) builds the BTC-shaped slip,

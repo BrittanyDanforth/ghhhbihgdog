@@ -1399,6 +1399,29 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                   "Nothing was published; check the ledger at the machine.")
 
 
+#: The forwarder's one-word status when it found nothing settled -> the
+#: phase word. "seen" is money on the address, none of it deep enough yet.
+_FORWARD_STATUS_PHASE = {"not_seen": "not_yet", "seen": "arriving"}
+
+
+def _forward_status_path(artifact_dir, handle: str) -> Path:
+    return Path(artifact_dir) / f"btc_forward_{handle}.status.json"
+
+
+def _forward_status_word(artifact_dir, handle: str, reader=None) -> str:
+    """The phase a forward that FOUND NOTHING SETTLED earned, from the
+    status file btc_forwarder writes on that refusal, or "". NEVER raises.
+    A file carrying anything but the two words it may carry is ignored."""
+    try:
+        out = (reader or _read_json)(_forward_status_path(artifact_dir,
+                                                          handle)) or {}
+        if not isinstance(out, dict) or set(out) != {"state"}:
+            return ""
+        return _FORWARD_STATUS_PHASE.get(out.get("state"), "")
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
     """(moved, outcome) from the plan btc_forwarder wrote for `handle`:
     moved is True only when the plan says broadcast and names an outcome
@@ -2591,6 +2614,12 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
             (artifact_dir / STATUS_FILE).unlink()
         except OSError:
             pass
+    if job == "forward_to_swap":
+        # The forwarder's one-word status, likewise read once and gone.
+        try:
+            _forward_status_path(artifact_dir, handle).unlink()
+        except OSError:
+            pass
     return code, status, handle
 
 
@@ -2636,9 +2665,13 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
         if status != "done" or not handle:
             return ""
         moved, outcome = _forward_outcome(artifact_dir, handle, reader)
-        if not moved:
-            return ""
-        return "sent" if outcome == "accepted" else "unsure"
+        if moved:
+            return "sent" if outcome == "accepted" else "unsure"
+        # NOTHING WAS SENT. Either a rehearsal (a plan, no outcome: "") or
+        # a forward that found nothing settled and said what it saw
+        # (not_yet / arriving) -- the answer a tap on "Has it arrived?"
+        # gets on a deposit the Pi is not watching (STAGE4_PLAN.md 3.6).
+        return _forward_status_word(artifact_dir, handle, reader)
     # A FINISHED WITHDRAWAL ANSWERS A DIFFERENT QUESTION: is there another
     # arrival still sitting here?
     #
@@ -3768,6 +3801,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # closed table, and returns "" for every state that did not.
             if _phase_of(job, artifact_dir):
                 continue
+        # A FORWARD THAT FOUND NOTHING SETTLED HAS NOT FAILED EITHER. The
+        # forwarder refuses `nothing_settled` (exit 2) and writes what it
+        # saw -- not_seen or seen -- as one word; that is a status probe's
+        # answer and is reported as one, so "has it arrived?" on a deposit
+        # the Pi is not watching is answered "not yet" or "still confirming"
+        # rather than "the machine FAILED". Any other non-zero exit is a
+        # failure as before: no status file, no word.
+        if rc != 0 and job == "forward_to_swap" and not hard:
+            if _forward_status_word(artifact_dir, handle):
+                continue
         if rc != 0:
             if hard:
                 # agent_say, NOT print, AND THAT IS THE WHOLE FIX. The unit
@@ -3820,7 +3863,11 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # before sending exits non-zero and never reaches here), so the wipe
     # takes the plan with the handle and a repeat wake is refused (see the
     # forward branch). No amount, no txid, no outcome word.
-    if job == "forward_to_swap" and handle in handles:
+    # ...AND ONLY WHEN A PLAN WAS WRITTEN. A forward that found nothing
+    # settled reports done with a word and wrote no plan; marking it would
+    # refuse the real forward later as a repeat rehearsal.
+    if job == "forward_to_swap" and handle in handles \
+            and (artifact_dir / f"btc_forward_{handle}.json").is_file():
         handles[handle]["forwarded"] = int(time.time()) // 600 * 600
         handles[handle]["forward_plan"] = \
             str(artifact_dir / f"btc_forward_{handle}.json")

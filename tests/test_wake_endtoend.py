@@ -357,10 +357,22 @@ try:
                 "btc_min_conf": 2, "op_return_max_bytes": 120}
     _MNEMONIC = ("abandon abandon abandon abandon abandon abandon abandon "
                  "abandon abandon abandon abandon about")
-    p2, out2, err2, ran2, text2 = cycle(
+    _ran2x = []
+
+    def _rehearsal_child(argv, env_extra, budget):
+        """The forwarder, faked: records its argv and writes the plan a
+        dry run writes -- the ledger mark is made only when a plan exists."""
+        _ran2x.append((list(argv), dict(env_extra or {})))
+        Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps(
+            {"broadcast": False, "broadcast_outcome": None, "signed": True}))
+        return 0, False
+
+    p2, out2, err2, _unused_ran, text2 = cycle(
         "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
         key_extra=_BTC_KEY, env={"GS_BTC_SEED": _MNEMONIC},
-        deps_over={"extend_deadman": lambda s: True})
+        deps_over={"extend_deadman": lambda s: True,
+                   "run_child": _rehearsal_child})
+    ran2 = _ran2x
     check("the agent finished the forward (the host forwarding a deposit a "
           "pager minted), and the doorbell heard 'done'",
           err2 is None and out2 and out2[0] == "done"

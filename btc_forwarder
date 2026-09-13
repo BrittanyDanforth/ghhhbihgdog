@@ -579,6 +579,20 @@ def write_plan(path, plan):
     atomic_write_json(plan, Path(path))
 
 
+def status_path(outfile):
+    """Where the one-word status of a forward that found nothing settled
+    goes: beside the plan, under the same wipe pattern."""
+    return Path(outfile).with_suffix(".status.json")
+
+
+def write_status(outfile, state):
+    """{"state": not_seen | seen} and nothing else -- no amount, no depth,
+    no address. Read once by the wake agent and removed."""
+    if state not in (watch.STATE_NOT_SEEN, watch.STATE_SEEN):
+        state = watch.STATE_NOT_SEEN
+    atomic_write_json({"state": state}, status_path(outfile))
+
+
 def build_cli():
     ap = argparse.ArgumentParser(
         description="Forward a settled BTC deposit into the ThorChain swap: "
@@ -738,6 +752,11 @@ def main(argv=None):
     if shutdown_requested():
         raise SystemExit(EXIT_FAILED)
     if picture["settled_sat"] <= 0:
+        # WHAT WAS SEEN, FOR THE PHONE. A forward that found nothing settled
+        # is not a failed machine; it is "not yet" or "still confirming",
+        # and the wake agent maps this one word onto the phase vocabulary
+        # (STAGE4_PLAN.md 3.6). One word, no amount, no depth.
+        write_status(args.outfile, picture["state"])
         raise Refused("nothing_settled",
                       f"nothing is settled at this address to {args.min_conf} "
                       "confirmations; ask again later")
