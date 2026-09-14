@@ -553,12 +553,22 @@ try:
         "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
         key_extra=_SEND_KEY, env={"GS_BTC_SEED": _MNEMONIC},
         deps_over={"extend_deadman": lambda s: True})
-    check("ONCE: a second sending run on a SENT handle is refused "
-          "already_forwarded on the real path, no child runs, the doorbell "
-          "hears 'refused'", out5 is None
-          and getattr(err5, "code", None) == "already_forwarded"
-          and ran5 == [] and p5 is not None and p5.result
-          and p5.result["status"] == "refused")
+    # ONCE SENT, NEVER SIGNED AGAIN -- AND ANSWERED, NOT REFUSED. The wake
+    # after a forward is the client tapping "has it arrived?" (the Pi routes
+    # every ask about an intake deposit to this job); a refusal reached the
+    # phone as "refused" with no reason, about money sent on correctly.
+    check("ONCE: a second run on a SENT handle runs NO child (nothing is "
+          "signed or quoted again) and answers DONE with the word 'sent' "
+          "on the real path, read from the plan the sending run wrote",
+          err5 is None and out5 and out5[0] == "done" and ran5 == []
+          and p5 is not None and p5.result
+          and p5.result["status"] == "done" and p5.result["phase"] == "sent"
+          and p5.result["slip"] == "" and p5.result["plain"] == {})
+    _led5 = json.loads(_lp.read_text())
+    check("...and the ledger's mark is untouched by the repeat: same bucket, "
+          "still sent", (_led5.get("handles") or _led5)[_h1].get("forwarded")
+          == _rec4.get("forwarded")
+          and (_led5.get("handles") or _led5)[_h1].get("forward_sent") is True)
 
     print("\n== the ceremony survives whatever else is on the switch ==")
     # FOUND BY DRIVING IT. A two-line readiness probe in this very file

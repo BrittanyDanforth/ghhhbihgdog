@@ -579,6 +579,13 @@ def _validate_btc(args) -> None:
                  "(STAGE4_PLAN.md 2). A sealed slip goes to a desktop that\n"
                  "    is not in this flow. Decide the plaintext mode "
                  "knowingly, or pair without --btc-xpub.")
+    if args.btc_xpub and not args.allow_btc_forward:
+        sys.exit("[!] --btc-xpub needs --allow-btc-forward: the intake hands "
+                 "out addresses this machine must be able to send on from,\n"
+                 "    and without the forward every deposit would sit on the "
+                 "host's address with no job that can move it. Pair the\n"
+                 "    two together (a rehearsal until --allow-btc-broadcast "
+                 "is added), or pair without --btc-xpub.")
     if args.allow_btc_broadcast and not args.allow_btc_forward:
         sys.exit("[!] --allow-btc-broadcast needs --allow-btc-forward: a "
                  "forward that may not sign has nothing to send.\n    The "

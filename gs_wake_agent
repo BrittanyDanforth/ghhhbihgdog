@@ -1396,7 +1396,9 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                   f"the next {int(proto.BTC_INDEX_GAP) + 1} deposit addresses "
                   "have all been used and the ledger knows none of them: the "
                   "ledger and the chain disagree by more than a recovery gap. "
-                  "Nothing was published; check the ledger at the machine.")
+                  "Nothing was published. The intake stays closed until the "
+                  "ledger is restored at the machine; re-pairing the same "
+                  "account does not reopen it (same chain, same addresses).")
 
 
 #: The forwarder's one-word status when it found nothing settled -> the
@@ -3318,10 +3320,29 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         _sent_before = (rec.get("forward_sent")
                         or _forward_outcome(artifact_dir, params["handle"])[0])
         if _sent_before:
+            # ...AND ANSWERED, NOT REFUSED. The wake that reaches here is
+            # the client tapping "has it arrived?" AFTER the forward went
+            # out: the Pi routes every ask about an intake deposit to this
+            # job, and after a restart it cannot know which were sent. A
+            # refusal reached the phone as "refused" with no reason on it,
+            # about money that had been sent on correctly. So a sent
+            # handle's forward run is a no-op that reports DONE, and
+            # _phase_of reads the plan the sending run wrote: `sent`, or
+            # `unsure`. No child, no quote, no signature -- once sent,
+            # never signed again still holds, and the once-sent anchor
+            # proves no child runs. Stage 5 turns this run into the
+            # reconciliation: is the txid listed yet, re-send kept bytes.
             integrity_log("wake", "forward_repeat")
-            raise Refused("already_forwarded",
-                          f"handle {params['handle']} has already been sent "
-                          "on from this machine.")
+            # THE LEDGER CATCHES UP with the plan (a crash between the
+            # sending child's exit and the mark left it unmarked): sent,
+            # and where the plan is. The bucket is left as it was -- this
+            # run sent nothing -- and set only if the record never had one.
+            rec["forward_sent"] = True
+            rec["forward_plan"] = \
+                str(artifact_dir / f"btc_forward_{params['handle']}.json")
+            rec.setdefault("forwarded", int(time.time()) // 600 * 600)
+            _save_handles(artifact_dir, handles, led["owners"])
+            return "done", "done", params["handle"]
         # A REHEARSAL MAY BE FOLLOWED BY THE REAL THING, and by nothing
         # else. A done dry run marks its record (a time bucket, no amount,
         # no txid); a second DRY RUN is refused rather than re-quoting the
@@ -3868,7 +3889,11 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # refuse the real forward later as a repeat rehearsal.
     if job == "forward_to_swap" and handle in handles \
             and (artifact_dir / f"btc_forward_{handle}.json").is_file():
-        handles[handle]["forwarded"] = int(time.time()) // 600 * 600
+        # THE BUCKET IS THE SENDING RUN'S. A later ask on a sent handle is
+        # answered without a child (see the forward branch) and reaches
+        # here too; it must not move "when it went out" to "now".
+        if not handles[handle].get("forward_sent"):
+            handles[handle]["forwarded"] = int(time.time()) // 600 * 600
         handles[handle]["forward_plan"] = \
             str(artifact_dir / f"btc_forward_{handle}.json")
         handles[handle]["forward_sent"] = bool(

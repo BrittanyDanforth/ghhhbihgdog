@@ -219,6 +219,64 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### Stage 4: the deposit the client actually makes — a plain address, no note (`STAGE4_PLAN.md`)
+- Planned first, built against the plan in six commits plus the self-doubt
+  pass recorded in its section 8.
+- The vault in BTC mode (`btc_account_xpub` on the keyfile; pairing couples
+  it to `--deposit-in-chat`, because a phone-only client has nowhere else
+  to read the address from, and to `--allow-btc-forward`, because an
+  address nothing can send on from is stranded money by configuration):
+  `receive_and_quote` refuses a deposit under the forwardable floor
+  (`FORWARD_MIN_SAT` plus a one-input fee allowance at the ceiling rate)
+  before any mint or look; allocates the next index one past the ledger's
+  highest, asking the network over Tor whether each candidate has EVER been
+  used (`gs_btc_broadcast.unused`, read-only, on the address's own
+  circuit), stepping past a used one up to `BTC_INDEX_GAP` and refusing
+  outright when nobody could be asked; records `btc_index` on the handle;
+  builds a memo-less plain slip carrying the host's own derived address
+  (`PLAIN_SHAPES`: two exact key sets, a third refused; `WIRE_VERSION` 6);
+  seals nothing for a delivery machine in this mode. The xpub does NOT go on
+  the Pi (the design's first draft put it there): it is the generator of the
+  whole intake history, and a seized card would have yielded it in one
+  string. The Pi is handed each open deposit's address in the slip and
+  holds it in memory.
+- The forwarder writes a one-word status file (`not_seen`/`seen`, nothing
+  else in it) when it found nothing settled; the agent reports that run as
+  DONE with `not_yet`/`arriving` rather than "the machine failed", and the
+  record is not marked forwarded (no plan was written).
+- The pager: `--btc-electrum` (repeatable), `--btc-min-conf`,
+  `--btc-network`, `--btc-poll` (≥ 60 s), `--deposit-min-sat` on the command
+  line, never on the card. The intake reply is one message (amount,
+  address, label, "I will say here when it arrives and when it has
+  confirmed. After that it moves on by itself"), registered on the watch
+  list before it is sent. The watcher thread looks at every open address on
+  its own circuit each poll, says "received" and "confirmed" once each,
+  and starts `forward_to_swap` through `start_job` — only when the box can
+  wake (the lock, the day's budget and the restart hold are read first; a
+  confirmed deposit it cannot wake for stays `seen`, the chat hears why
+  once, and the next tick retries; `start_job` now returns whether a wake
+  started, and a refused start puts the entry back rather than leaving it
+  "forwarding" for ever). A forward's `sent`/`unsure` closes the entry;
+  `not_yet`/`arriving` reopen it; a refusal or failure marks it stalled and
+  is said once with the button. The button and `/check` on an intake
+  deposit ask the forward — on a watched handle, and after a restart on
+  every handle of a pager that declares the intake, because the XMR-side
+  probe cannot move bitcoin and would answer "nothing yet" for ever about
+  money on the host's address. Once the forward has gone out the ask is the
+  XMR side's again: the vault answers a sent handle's forward run with
+  DONE and the plan's word (`sent`/`unsure`) instead of refusing — no
+  child, nothing signed — and the pager learns the sent handles from those
+  answers and routes to `swap_status` from then on. `/balance` lists the
+  chat's own watched deposits by label and state with the figures the chat
+  already saw; every new sentence is in the banned-word scan. A deposit
+  nothing has reached for `DEPOSIT_PLACE_TTL_S` is dropped from the list
+  (the reserve's own window), so a never-paid address is not looked at for
+  ever.
+- Counts: test_wake_agent 669, test_telegram_pager 704, test_depo_wizard
+  434, test_plain_slip 232, test_btc_forwarder 168, test_btc_broadcast 83,
+  test_wake_doorbell 161, test_wake_endtoend 70. 36 new anchors (530–565),
+  all caught — the sweep tally is in the commit message.
+
 ### Stage 3: broadcast over Tor — the forward leaves the machine (`STAGE3_PLAN.md`)
 - Planned first (`ed6a087`), built against the plan in three commits.
 - `gs_btc_broadcast.py`: the ONE method that moves bitcoin, as a subclass
@@ -665,7 +723,7 @@ rule-6 material).
 | 1 | Watch-only derivation + Electrum-over-Tor detector: xpub → unique address per handle; per-address circuit isolation; per-OUTPUT settlement (`listunspent`, `settled_sat`, `utxos` with depth); fail-closed SOCKS5; one deadline; optional TLS pin; no keys, no money; tests | **DONE, REBUILT** — `gs_btc_watch.py`, `tests/test_btc_watch.py` 213/213, 18 anchors all caught (`9f19781`, `2cc59ea`, and the third-round commit) |
 | 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only, reviewed** — `gs_btc_tx.py` (test_btc_tx 73/73, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 133/133; the memo's output limit is SET by the tool, never trusted), job wiring (test_wake_agent 621/621, test_wake_protocol 189/189, test_wake_endtoend 59/59 over real HTTP), 39 anchors all caught; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
 | 3 | Broadcast over Tor; "seen" in the network as the proof; testnet end-to-end on a box with Tor; reorg edges and confirmation depth moved to stage 5 | **BUILT** — `gs_btc_broadcast.py` (test_btc_broadcast 75/75), `btc_forwarder --broadcast` (test_btc_forwarder 163/163, one forward through the real transport + real subclass + real forwarder against an in-process SOCKS5+TLS Electrum), wire v5 with `sent`/`unsure`, `allow_btc_broadcast`, the ledger's `forward_sent` and the once-sent rule (test_wake_agent 642, test_wake_endtoend 64, doorbell 161, pager 653), `tests/real_btc_forward_testnet.py` (skips here), 24 new anchors all caught; `STAGE3_PLAN.md` is the record |
-| 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc + artifact; banned-word and currency scans extended | pending |
+| 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc; banned-word and currency scans extended | **BUILT** — the vault mints a fresh, network-verified address per deposit and a memo-less plain slip (wire v6, two exact shapes); the Pi watches it in memory (the xpub never goes on the card), says received/confirmed once each and starts the forward through the one wake path when the box is free; the button and `/check` on an intake deposit ask the forward, after a restart too; `/balance`; pairing couples `--btc-xpub` to `--deposit-in-chat` and `--allow-btc-forward` (test_wake_agent 669, test_telegram_pager 704, test_depo_wizard 434, test_plain_slip 232, test_btc_forwarder 168, test_btc_broadcast 83, test_wake_endtoend 70), 36 anchors all caught; `STAGE4_PLAN.md` is the record, its section 8 the self-doubt findings |
 | 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |
 
 Each stage is validated before the next. Mainnet is not touched until every

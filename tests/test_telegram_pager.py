@@ -2465,7 +2465,9 @@ def _tapper(allow=(111,), users=()):
     seen, toasts, jobs = [], [], []
     p.send = lambda c, t, buttons=None: (seen.append((t, buttons)), True)[1]
     p.answer_callback = lambda i, text="": toasts.append(text)
-    p.start_job = lambda cid, job, params: jobs.append((cid, job, params))
+    # True, as the real start_job answers once the worker thread is running.
+    p.start_job = lambda cid, job, params: (jobs.append((cid, job, params)),
+                                            True)[1]
     return p, seen, toasts, jobs
 
 
@@ -4419,22 +4421,27 @@ def _depo_done(plain, chat=111):
 _bp, _bs = _depo_done(_PLAIN_BTC)
 _bt = [t for t, _b in _bs]
 _pay = [t for t in _bt if "here is how to pay" in t]
+# A MISSING MESSAGE IS A FAIL, NOT A CRASH: indexed unguarded, a mutation
+# that dropped the intake branch took this file down with an IndexError and
+# the sweep reported NO-RESULT -- which is not a catch.
+_pay0 = _pay[0] if _pay else ""
 check("a deposit slip WITHOUT a memo (the intake) is ONE message: how to "
       "pay, with the amount, the address and the label -- no note message "
       "first, no 'CANNOT', no 'withdraw'",
-      len(_pay) == 1 and _BTC_ADDR in _pay[0] and "0.05" in _pay[0]
-      and "Send exactly" in _pay[0]
+      len(_pay) == 1 and _BTC_ADDR in _pay0 and "0.05" in _pay0
+      and "Send exactly" in _pay0
       and not any(t.startswith("=:") for t in _bt)
-      and "CANNOT" not in _pay[0] and "withdraw" not in _pay[0].lower()
-      and "note" not in _pay[0].lower())
+      and "CANNOT" not in _pay0 and "withdraw" not in _pay0.lower()
+      and "note" not in _pay0.lower())
 check("...it says what happens next -- received, confirmed, then it moves on "
       "by itself -- and carries the ask-again button",
-      "when it arrives" in _pay[0] and "moves on by itself" in _pay[0]
-      and any(b for t, b in _bs if t == _pay[0]))
+      bool(_pay0) and "when it arrives" in _pay0
+      and "moves on by itself" in _pay0
+      and any(b for t, b in _bs if t == _pay0))
+_bo = _bp._btc()[1].get("B4A1") or {}
 check("...and the address is now on this end's watch list for that chat, "
-      "with the label bound to the chat", _bp.btc_open.get("B4A1", {}).get(
-          "addr") == _BTC_ADDR and _bp.btc_open["B4A1"]["chat"] == 111
-      and _bp.btc_open["B4A1"]["state"] == "not_seen"
+      "with the label bound to the chat", _bo.get("addr") == _BTC_ADDR
+      and _bo.get("chat") == 111 and _bo.get("state") == "not_seen"
       and _bp.handle_owner.get("B4A1") == 111)
 _sp, _ss = _depo_done(_PLAIN_SHARED)
 _st = [t for t, _b in _ss]
@@ -4481,10 +4488,11 @@ check("a look that finds nothing: asked ONCE for the address with this "
       and _ws == [] and _wj == [])
 _wp.btc_tick(look=_look_returning("seen", unconf=5000000))
 check("money seen, none settled: 'received — waiting for it to confirm' is "
-      "said ONCE, with the ask-again button, and the figures are kept",
-      len(_ws) == 1 and "received" in _ws[0][0] and "confirm" in _ws[0][0]
+      "said ONCE, with the ask-again button, the figures are kept, and "
+      "NOTHING is started", len(_ws) == 1 and "received" in _ws[0][0]
+      and "confirm" in _ws[0][0] and "Sending" not in _ws[0][0]
       and _ws[0][1] and _wp.btc_open["B4A1"]["state"] == "seen"
-      and _wp.btc_open["B4A1"]["unconf"] == 5000000)
+      and _wp.btc_open["B4A1"]["unconf"] == 5000000 and _wj == [])
 _wp.btc_tick(look=_look_returning("seen", unconf=5000000))
 check("...and not twice", len(_ws) == 1)
 _wp.btc_tick(look=_look_returning(RuntimeError("tor down")))
@@ -4506,12 +4514,108 @@ _wp2.btc_tick(look=_look_returning("confirmed", conf=5000000))
 check("straight to confirmed (a look that missed the mempool phase): one "
       "sentence, the forward started", len(_ws2) == 1
       and "Sending it on" in _ws2[0][0] and len(_wj2) == 1)
+
+# THE VAULT IS BUSY WHEN THE DEPOSIT CONFIRMS. A withdrawal chain holds the
+# one-job lock for hours and the day has twelve wakes; the watcher's start
+# went through start_job, which answered "no: busy" into the chat and
+# returned nothing -- and the entry, already marked "forwarding", was never
+# looked at again. The money sat settled on the host's address with the
+# chat told it was being sent on. Now: a confirmed deposit this end cannot
+# wake for stays on the list as money seen, the chat hears why ONCE in words
+# with nothing in them, and the next tick after the box frees sends it on.
+_hp, _hs, _hj = _watch_pager()
+_hp.busy.acquire()
+_hp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("confirmed while a job holds the lock: nothing is started, the entry "
+      "stays 'seen', and the chat hears once that it is sent on when this "
+      "end is free", _hj == [] and _hp.btc_open["B4A1"]["state"] == "seen"
+      and len(_hs) == 1 and "confirmed" in _hs[0][0]
+      and "as soon as this end is free" in _hs[0][0]
+      and "Sending it on now" not in _hs[0][0]
+      # the sentence after the label: no figure, no coin
+      and not any(ch.isdigit() for ch in _hs[0][0].split(": ", 1)[-1])
+      and not re.search(r"\b(btc|bitcoin|swap|memo)\b", _hs[0][0], re.I))
+_hp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...and not twice, and still nothing started while it is held",
+      len(_hs) == 1 and _hj == [])
+_hp.busy.release()
+_hp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...the tick after the lock frees: 'Sending it on now', the forward "
+      "started, the entry forwarding", len(_hs) == 2
+      and "Sending it on now" in _hs[1][0]
+      and _hj == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and _hp.btc_open["B4A1"]["state"] == "forwarding")
+_bp, _bs, _bj = _watch_pager()
+_bp.limits = types.SimpleNamespace(why_not=lambda: "the day's budget is "
+                                   "spent", record=lambda: None)
+_bp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("the day's wake budget spent: likewise held, nothing started",
+      _bj == [] and _bp.btc_open["B4A1"]["state"] == "seen"
+      and len(_bs) == 1 and "as soon as this end is free" in _bs[0][0])
+# A START THAT WAS REFUSED AFTER ALL (a tap took the lock between the check
+# and the call, the one-person rule): start_job says so in the chat and
+# answers False, and the entry goes back to "seen" so the next tick retries
+# rather than believing a forward that never ran.
+_xp, _xs, _xj = _watch_pager()
+_xp.start_job = lambda cid, job, params: (_xj.append((cid, job, params)),
+                                          False)[1]
+_xp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("a start start_job refused: the entry is NOT left as forwarding but "
+      "goes back to 'seen'", len(_xj) == 1
+      and _xp.btc_open["B4A1"]["state"] == "seen")
+_xp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...and the next tick tries again, without repeating the sentence",
+      len(_xj) == 2 and len(_xs) == 1)
+# start_job's own answer, on the real method: False on every refusal, True
+# once the worker is running (the source pins the True to the thread start).
+_sj, _sjs = _room_pager((111,), ())
+_sj.busy.acquire()
+_sj_r = pg.Pager.start_job(_sj, 111, "swap_status", {"handle": "A3F1"})
+check("start_job answers False when the one-job lock is held, having said "
+      "so in the chat", _sj_r is False and len(_sjs) == 1)
+_sj.busy.release()
+_sj.limits = types.SimpleNamespace(why_not=lambda: "twelve today already",
+                                   record=lambda: None)
+check("...and False when the rate limit refuses",
+      pg.Pager.start_job(_sj, 111, "swap_status", {"handle": "A3F1"}) is False)
+_src_sj = __import__("inspect").getsource(pg.Pager.start_job)
+check("...and True is returned on the line after the worker thread starts, "
+      "and nowhere else",
+      "daemon=True).start()\n            return True" in _src_sj
+      and _src_sj.count("return True") == 1)
 _np, _ns, _nj = _watch_pager()
 _np.btc_servers = ()
 _np.btc_tick()
 check("with no servers configured the tick watches nothing and touches "
       "nothing", _ns == [] and _nj == []
       and _np.btc_open["B4A1"]["state"] == "not_seen")
+
+# A NEVER-PAID DEPOSIT WAS WATCHED FOR EVER: nothing removed a not_seen
+# entry, so every tire-kicker's address got a fresh Tor circuit and a look
+# every ten minutes, indefinitely, and the list only grew. The reserve's own
+# window (DEPOSIT_PLACE_TTL_S, the clock _places uses) is the rule here too;
+# money already seen is kept at any age.
+_ep, _es, _ej = _watch_pager()
+_ep._btc_register("B4A2", "bc1qother", 111)
+_ttl = pg.proto.DEPOSIT_PLACE_TTL_S
+check("a watch entry records when it was registered, on the wall clock the "
+      "reserve uses", abs(_ep.btc_open["B4A1"]["since"] - time.time()) < 5)
+_ep.btc_open["B4A1"]["since"] = time.time() - _ttl - 1
+_ep.btc_open["B4A2"]["since"] = time.time() - _ttl - 1
+_ep.btc_open["B4A2"]["state"] = "seen"
+_ecalls = []
+_ep.btc_tick(look=_look_returning("not_seen", calls=_ecalls))
+check("a deposit nothing has reached for DEPOSIT_PLACE_TTL_S is dropped "
+      "before the looks -- not looked at, nothing said, nothing started -- "
+      "and one with money on it, however old, is kept and looked at",
+      "B4A1" not in _ep.btc_open and "B4A2" in _ep.btc_open
+      and [c[0] for c in _ecalls] == ["bc1qother"]
+      and _es == [] and _ej == [])
+_ep2, _es2, _ej2 = _watch_pager()
+_ep2.btc_open["B4A1"]["since"] = time.time() - _ttl + 60
+_ep2.btc_tick(look=_look_returning("not_seen"))
+check("...one a minute short of the window is still watched",
+      "B4A1" in _ep2.btc_open)
 check("every state has a reader's word, numberless and naming no coin",
       set(pg.Pager.BTC_STATE_WORDS) >= {"not_seen", "seen", "forwarding",
                                         "stalled"}
@@ -4560,9 +4664,68 @@ _up, _us, _ut, _uj = _tapper()
 _up.handle_owner["B4A1"] = 111
 _up.handle_job["B4A1"] = "receive_and_quote"
 _up.handle(_msg(111, 111, f"/check {_up._label(111, 'B4A1')}"))
-check("...while an UNWATCHED deposit (a shared-inbound one, or after a "
-      "restart) still asks swap_status", _uj == [(111, "swap_status",
-                                                 {"handle": "B4A1"})])
+check("...while an UNWATCHED deposit on a pager with no --btc-electrum (a "
+      "shared-inbound pair) still asks swap_status",
+      _uj == [(111, "swap_status", {"handle": "B4A1"})])
+# AFTER A RESTART THE WATCH LIST IS EMPTY -- it is memory, by rule 6 -- and
+# the money is still on the host's address. The XMR-side probe cannot move
+# it and would answer "nothing yet" for ever; on a pager that declares the
+# intake (--btc-electrum) every deposit is the intake's, so the button and
+# /check ask the forward, which sends it on if settled. Without this, a
+# reboot of the Pi stranded every confirmed deposit until the operator
+# intervened by hand.
+_rp2, _rs2, _rt2, _rj2 = _tapper()
+_rp2.btc_servers = [("s.onion", 50002, None)]
+_rp2.handle_owner["B4A1"] = 111
+_rp2.handle_job["B4A1"] = "receive_and_quote"
+_rp2.handle(_msg(111, 111, f"/check {_rp2._label(111, 'B4A1')}"))
+check("...but on a pager WITH --btc-electrum an unwatched deposit (after a "
+      "restart) asks forward_to_swap: the one job that can move money the "
+      "restart forgot", _rj2 == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and not _rp2._btc_watched("B4A1"))
+_tap(_rp2, "c:B4A1")
+check("...and so does the button under the deposit",
+      _rj2[-1] == (111, "forward_to_swap", {"handle": "B4A1"}))
+# UNTIL THE FORWARD HAS GONE OUT. Routing every intake ask to the forward
+# broke the tap the client most wants answered: after `sent`, "has it
+# arrived?" is the XMR side's question, and the forward's once-sent rule
+# answered it "refused" with no reason. The pager learns the sent handles
+# from the forward's own answers and asks swap_status from then on --
+# watched or not, so a first ask after a restart (which the vault answers
+# `sent` without signing anything) teaches it too.
+_sp3, _ss3, _st3, _sj3 = _tapper()
+_sp3.btc_servers = [("s.onion", 50002, None)]
+_sp3.handle_owner["B4A1"] = 111
+_sp3.handle_job["B4A1"] = "receive_and_quote"
+_sp3._btc_register("B4A1", _BTC_ADDR, 111)
+_sp3._btc_forward_result("B4A1", "done", "sent", 111)
+_sp3.handle(_msg(111, 111, f"/check {_sp3._label(111, 'B4A1')}"))
+check("after the forward reported SENT, /check on that deposit asks the XMR "
+      "side (swap_status): the forward has nothing more to say",
+      _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
+      and "B4A1" not in _sp3.btc_open)
+_tap(_sp3, "c:B4A1")
+check("...and so does the button", _sj3[-1] == (111, "swap_status",
+                                                 {"handle": "B4A1"}))
+_sp4, _ss4, _st4, _sj4 = _tapper()
+_sp4.btc_servers = [("s.onion", 50002, None)]
+_sp4.handle_owner["B4A1"] = 111
+_sp4.handle_job["B4A1"] = "receive_and_quote"
+_sp4._btc_forward_result("B4A1", "done", "unsure", 111)   # never watched
+_sp4.handle(_msg(111, 111, f"/check {_sp4._label(111, 'B4A1')}"))
+check("...a handle this end never watched (after a restart) whose forward "
+      "answered a word is learned from that answer: the next ask is "
+      "swap_status", _sj4 == [(111, "swap_status", {"handle": "B4A1"})])
+_sp5, _ss5, _st5, _sj5 = _tapper()
+_sp5.btc_servers = [("s.onion", 50002, None)]
+_sp5.handle_owner["B4A1"] = 111
+_sp5.handle_job["B4A1"] = "receive_and_quote"
+_sp5._btc_forward_result("B4A1", "done", "not_yet", 111)
+_sp5._btc_forward_result("B4A1", "refused", "", 111)
+_sp5.handle(_msg(111, 111, f"/check {_sp5._label(111, 'B4A1')}"))
+check("...while a forward that answered not_yet, or was refused, teaches "
+      "nothing: the next ask is still the forward",
+      _sj5 == [(111, "forward_to_swap", {"handle": "B4A1"})])
 
 print("\n-- /balance: from memory, this chat's deposits, figures only --")
 _bp2, _bs2, _bt2, _bj2 = _tapper((111, 222))

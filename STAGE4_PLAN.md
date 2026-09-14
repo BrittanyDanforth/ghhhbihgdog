@@ -1,9 +1,10 @@
 # Stage 4: the deposit the client actually makes — a plain address, no note
 
-Status: **PLANNED** (this commit); the build follows, and the status block at
-the end is updated as each step lands. This file is the whole context for
-stage 4 of the BTC-intake rework (`BTC_INTAKE_DESIGN.md`; stages 2 and 3 are
-`STAGE2_PLAN.md` and `STAGE3_PLAN.md`).
+Status: **BUILT** — planned first, built step by step against sections 3–4,
+then read back against the code (section 8: what the plan got wrong, and
+the fixes). The status block at the end is the tally. This file is the
+whole context for stage 4 of the BTC-intake rework (`BTC_INTAKE_DESIGN.md`;
+stages 2 and 3 are `STAGE2_PLAN.md` and `STAGE3_PLAN.md`).
 
 Stage 4 is the client-facing half of the rework. Until now every stage has
 been vault-side plumbing: a deposit still hands the phone the SHARED inbound
@@ -88,7 +89,9 @@ The cost is stated: a pager restart forgets the open deposits it was
 watching, so the automatic "received / confirmed / sending on" stops for
 them. The existing button still works -- it wakes the vault -- and stage 5
 may revisit persistence. Meanwhile `/check` on a BTC deposit gets a TRUE
-answer (below), not the XMR-side probe.
+answer (below), not the XMR-side probe. (As built this sentence was false
+for a forgotten deposit until section 8's first fix: the button woke the
+vault on the XMR-side probe, which cannot move bitcoin.)
 
 **The forward's refusals learn to say what they saw.** A `/check` on a BTC
 deposit after a restart, or a tap before the money settled, wakes
@@ -295,13 +298,94 @@ ceiling. The by-hand doorbell path shows what the chat shows.
 
 ---
 
+## 8. Self-doubt after the build (what the plan got wrong, and the fixes)
+
+Read against the code once every step was green, with the question "where
+does a client's money sit with nobody able to move it?":
+
+- **A pager restart stranded every open deposit.** Section 2 said "the
+  existing button still works — it wakes the vault", and it did: on
+  `swap_status`, the XMR-side probe, which cannot move bitcoin and answers
+  "nothing yet" for ever about an address the client has paid. The watch
+  list is memory by design, so after a reboot nothing on the Pi knew which
+  deposits were the intake's. FIXED: on a pager that declares the intake
+  (`--btc-electrum`) EVERY deposit is the intake's, so the button and
+  `/check` on a forgotten handle ask the forward, which sends a settled one
+  on and otherwise answers `not_yet`/`arriving`. `--btc-electrum` is no
+  longer optional on an intake pair and OPSEC_SETUP says so.
+- **The automatic path died silently whenever the box was busy.** The
+  watcher's `start_job` for a confirmed deposit went through the one wake
+  path, which is right — and that path answers "no: busy" into the chat and
+  returned nothing, so the entry, already marked `forwarding`, was never
+  looked at again. A withdrawal chain holds the lock for hours; with two
+  clients this was the common case, not the edge. FIXED: `start_job` now
+  returns whether a wake started; the watcher reads the same three gates
+  (lock, daily budget, restart hold) before it transitions, keeps a
+  confirmed deposit as `seen` while it cannot wake (the chat hears once, in
+  words with nothing in them, that it is sent on when this end is free),
+  retries next tick, and a start that was refused after all puts the entry
+  back to `seen` instead of trusting a forward that never ran.
+- **An xpub without the forward switch.** Pairing accepted `--btc-xpub`
+  with `--deposit-in-chat` and no `--allow-btc-forward`: an intake that hands
+  out addresses no job can send on from, with every automatic start refused
+  `not_allowed`. FIXED at pairing, where the operator is standing.
+- **The freshness look is a new thing the vault says to a server**: it
+  names an address moments before that address is paid, on its own circuit.
+  A third-party Electrum server can correlate the two; the operator's own
+  electrs cannot. Stated in OPSEC_SETUP; not closable by code.
+- **Exhaustion is permanent for that account.** A ledger wiped with more
+  than a gap of history behind it refuses `btc_index_exhausted` on every
+  deposit, and re-pairing the same xpub does not help (same chain); the
+  forwarder derives account 0 only, so a fresh account is not a re-pair
+  either. The refusal now says so. Recovery (restoring the ledger; a
+  per-pair account number) is stage 5. A subtler cousin lives in the same
+  place: after a wipe, an address issued to a client who has not paid YET
+  looks fresh to the network and could be reissued; a late payer and a new
+  client would then share one line. Bounded by the in-flight ceiling, and
+  stage 5's.
+- **The first fix broke the tap AFTER a forward.** Routing every intake
+  ask to the forward meant the client's "has it arrived?" after `sent` --
+  the moment they most want the XMR side's answer -- hit the once-sent
+  rule and came back "refused" with no reason. FIXED on both ends: the
+  vault answers a sent handle's forward run with DONE and the plan's own
+  word (`sent`/`unsure`) instead of refusing, running no child (once sent,
+  never signed again still holds and its anchor still proves no child
+  runs); the pager learns the sent handles from those answers and asks the
+  XMR side from then on. Stage 5 turns that no-op run into the
+  reconciliation (is the txid listed; re-send kept bytes).
+- **A never-paid deposit was watched for ever.** Nothing removed a
+  `not_seen` entry: every tire-kicker's address got a fresh Tor circuit and
+  a look every ten minutes, indefinitely, and the list only grew. FIXED:
+  an entry nothing has reached for `DEPOSIT_PLACE_TTL_S` (two days, the
+  vault's own reserve window for an unpaid deposit, on the same wall clock
+  the pager's places use) is dropped silently and logged by kind; a payment
+  landing later is still sent on by the button, which asks the forward.
+- Not a bug, but confirmed by reading rather than assumed: a forward that
+  found nothing settled reports DONE with the word (`_run_validated` skips
+  the failure path when the status file exists), so the pager's table for
+  `(done, not_yet)` and `(done, arriving)` is the real contract.
+
+---
+
 ## Status
 
-- [ ] 1. protocol + `unused`
-- [ ] 2. vault: floor, allocation, record, slips
-- [ ] 3. forwarder status file, `_phase_of` on refusal
-- [ ] 4. pairing
-- [ ] 5. pager: flags, reply, watcher, routing, `/balance`
-- [ ] 6. end to end
-- [ ] 7. docs
-- [ ] 8. anchors, full suite, sweep, commit
+- [x] 1. protocol + `unused` — test_wake_protocol, test_plain_slip 232,
+      test_btc_broadcast 83
+- [x] 2. vault: floor, allocation, record, slips — test_wake_agent
+- [x] 3. forwarder status file, `_phase_of` on refusal — test_btc_forwarder
+      168, test_wake_agent, test_wake_doorbell 161
+- [x] 4. pairing — test_wake_agent (`_pairs_btc`), now with the forward
+      coupling
+- [x] 5. pager: flags, reply, watcher, routing, `/balance` —
+      test_telegram_pager 704, test_depo_wizard 434
+- [x] 6. end to end — test_wake_endtoend 70 (the intake cycle over real HTTP;
+      the repeat run on a sent handle answering `sent` with no child)
+- [x] 7. docs — OPSEC_SETUP ("The intake" under the phone section, the
+      pairing recipe), BTC_INTAKE_DESIGN (stage 4 BUILT, the xpub departure),
+      SESSION_LOG
+- [x] 8. anchors 530–565 (36, the six from section 8 included), full suite,
+      sweep, commit — see the commit message for the tally. Two anchors
+      first came back NO-RESULT (the suite crashed on the mutated copy
+      instead of failing a check: an unguarded index and an unguarded key);
+      the checks were hardened so a missing message or entry is a FAIL, and
+      both are caught.

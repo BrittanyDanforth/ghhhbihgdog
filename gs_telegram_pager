@@ -4438,7 +4438,24 @@ class Pager:
             # has reached yet; the forward looks at the address the client
             # paid, sends it on if it has settled, and answers "not yet" or
             # "still confirming" if it has not (STAGE4_PLAN.md 3.6).
-            if job in ("swap_status", "watch") and self._btc_watched(_h):
+            #
+            # AND SO IS EVERY DEPOSIT ON AN INTAKE PAIR AFTER A RESTART. The
+            # watch list is memory (rule 6: no address on the card), so a
+            # restart forgets which deposits were the intake's -- but the
+            # operator declared the intake on this command line
+            # (--btc-electrum), and on that pair EVERY deposit is one. Asking
+            # the XMR side about a forgotten deposit would answer "nothing
+            # yet" for ever while the client's money sat on the host's
+            # address: the forward is the one job that can move it, and it
+            # is the client's own tap that starts it.
+            #
+            # UNTIL THE FORWARD HAS GONE OUT. A deposit whose forward
+            # reported sent has nothing more to hear from that job; the
+            # client is now waiting for the swap to land, and that is the
+            # XMR side's question (swap_status, as for any deposit).
+            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers)) \
+                and _h not in self._btc_sent_set()
+            if job in ("swap_status", "watch") and _ask_forward:
                 job = "forward_to_swap"
         self.start_job(cid, job, params)
 
@@ -4543,8 +4560,16 @@ class Pager:
                                  "text": _text}})
 
     def start_job(self, cid: int, job: str, params: dict, leg: int = 0,
-                  held: bool = False) -> None:
+                  held: bool = False) -> bool:
         """Every path to a wake goes through here. THE ONLY ONE.
+
+        RETURNS WHETHER A WAKE STARTED. Every refusal below says so in the
+        chat and returns False; True means the worker thread is running.
+        Nothing typed needs the answer -- the chat already heard it -- but
+        the intake's watcher does: it starts the forward for a confirmed
+        deposit from a thread, with nobody reading the "no: busy" that a
+        refusal sends, and a start it took for granted left the deposit
+        marked "sending on" for ever while nothing was.
 
         `held`: THE LOCK IS ALREADY THIS CALL'S. A chained leg is started by
         the worker that holds `busy`, which hands it over rather than
@@ -4614,14 +4639,14 @@ class Pager:
                           "no: more than one person is allowed in here, and "
                           "this is for one person per chat. Refusing every "
                           "job until that is fixed.")
-                return
+                return False
             # ...AND THE RESTART HOLD, which is a limit like the others: a
             # wake from before this process started may still be running.
             why = self.limits.why_not() or self._hold_why()
             if why:
                 _give_back()
                 self.send(cid, f"no: {why}")
-                return
+                return False
             # ...AND THE ROOM. A newcomer's deposit at capacity is refused
             # from memory, with no wake spent; a client with a deposit in
             # flight is never refused their own /check or /withdraw for this.
@@ -4629,7 +4654,7 @@ class Pager:
                 _give_back()
                 integrity_log("pager", "refused_full")
                 self.send(cid, FULL_ANSWER)
-                return
+                return False
             # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the
             # window, so a second concurrent wake cannot bind and would fail
             # confusingly -- and two vaults woken at once is not a thing this
@@ -4642,7 +4667,7 @@ class Pager:
                     if self._running != cid:
                         self.__dict__["_contended"] = True
                     self.send(cid, self._busy_answer(cid))
-                    return
+                    return False
                 _owned[0] = True
         except BaseException:                                # noqa: BLE001
             _give_back()
@@ -4782,6 +4807,7 @@ class Pager:
                 self.send(cid, self._working_line(job, params, _how))
             threading.Thread(target=self._worker, args=(cid, job, params),
                              daemon=True).start()
+            return True
         except BaseException as e:                           # noqa: BLE001
             self._running = None
             _give_back()
@@ -4797,6 +4823,7 @@ class Pager:
             print(f"  [!] {chat_name(job)} could not start: {_redact(e)[:200]}")
             self.send(cid, f"{chat_name(job)}: could not start — nothing ran. "
                            f"Try again later.")
+            return False
 
     def publish_commands(self) -> bool:
         """Register the command list with Telegram. Returns whether it landed.
@@ -4924,6 +4951,15 @@ class Pager:
             d["btc_open"] = {}
         return d["_btc_lock"], d["btc_open"]
 
+    def _btc_sent_set(self) -> set:
+        """The handles whose forward reported sent (or unsure) in this
+        process. An ask about one of them goes to the XMR side from then
+        on: the forward has nothing more to say, and the client is waiting
+        for the arrival. Memory, like the watch list; after a restart the
+        first ask goes to the forward, which answers `sent` without signing
+        anything, and the handle is learned from that answer."""
+        return self.__dict__.setdefault("btc_sent", set())
+
     def _btc_register(self, h: str, addr: str, chat_id: int) -> None:
         """Start watching `addr` for handle `h` on behalf of `chat_id`."""
         if not (isinstance(h, str) and proto.HANDLE_RE.match(h)) or not addr:
@@ -4932,7 +4968,7 @@ class Pager:
         with lock:
             opened[h] = {"addr": str(addr), "chat": int(chat_id),
                          "state": "not_seen", "conf": 0, "unconf": 0,
-                         "said": set()}
+                         "said": set(), "since": time.time()}
 
     def _btc_watched(self, h: str) -> bool:
         lock, opened = self._btc()
@@ -4944,6 +4980,10 @@ class Pager:
         """A forward reported for a deposit on the watch list."""
         lock, opened = self._btc()
         with lock:
+            if out == "done" and phase in ("sent", "unsure"):
+                # LEARNED FROM THE ANSWER, watched or not: the next ask
+                # about this deposit is for the XMR side.
+                self._btc_sent_set().add(h)
             e = opened.get(h)
             if not e:
                 return
@@ -4983,6 +5023,20 @@ class Pager:
             return
         lock, opened = self._btc()
         with lock:
+            # A DEPOSIT NOTHING HAS REACHED FOR THE RESERVE'S OWN WINDOW IS
+            # NOT COMING (proto.DEPOSIT_PLACE_TTL_S: the vault lets its place
+            # go on the same clock, and so does _places). Forgotten here
+            # too, or every never-paid address would get a fresh circuit and
+            # a look every poll for ever, and the list would only grow. A
+            # payment that lands later is still sent on: the button asks the
+            # forward. Money already seen is kept at any age.
+            _now = time.time()
+            for _h in [k for k, v in opened.items()
+                       if v["state"] == "not_seen"
+                       and _now - float(v.get("since") or _now)
+                       >= proto.DEPOSIT_PLACE_TTL_S]:
+                opened.pop(_h, None)
+                integrity_log("pager", "btc_watch_forgotten")
             snapshot = [(h, dict(e)) for h, e in opened.items()
                         if e["state"] in ("not_seen", "seen")]
         for h, e in snapshot:
@@ -4997,6 +5051,26 @@ class Pager:
                 continue
             self._btc_apply(h, r)
 
+    def _btc_can_start(self) -> bool:
+        """Whether a wake could start right now: nothing running, the day's
+        budget not spent, no restart hold. The same three gates start_job
+        applies, read WITHOUT spending anything -- a confirmed deposit the
+        watcher cannot send on yet stays on the list and is tried again next
+        tick, silently, instead of the chat hearing "no: busy" every ten
+        minutes for the hours a withdrawal holds this box."""
+        _b = getattr(self, "busy", None)
+        if _b is not None and _b.locked():
+            return False
+        try:
+            _l = getattr(self, "limits", None)
+            if _l is not None and _l.why_not():
+                return False
+            if self._hold_why():
+                return False
+        except BaseException:                                # noqa: BLE001
+            return False
+        return True
+
     def _btc_apply(self, h: str, r: dict) -> None:
         """Apply one look's answer to one entry and say what changed."""
         state = str(r.get("state") or "")
@@ -5010,9 +5084,16 @@ class Pager:
                 return
             e["conf"], e["unconf"] = conf, unconf
             chat = e["chat"]
-            if state == "confirmed":
+            if state == "confirmed" and self._btc_can_start():
                 e["state"] = "forwarding"
                 say, start = "confirmed", True
+            elif state == "confirmed":
+                # SETTLED, AND THIS END CANNOT WAKE YET (a job is running,
+                # the day's budget is spent, a restart hold). It stays on
+                # the list as money seen and the next tick tries again; the
+                # chat hears why once, in words with nothing in them.
+                e["state"] = "seen"
+                say = "held"
             elif state == "seen" and e["state"] == "not_seen":
                 e["state"] = "seen"
                 say = "seen"
@@ -5020,26 +5101,42 @@ class Pager:
                 say = None
             if say:
                 e["said"].add(say)
-        if not say:
-            return
-        try:
-            _cn = self._label(chat, h)
-        except BaseException:                                # noqa: BLE001
-            _cn = h
-        if say == "seen":
-            self.send(chat, f"{_cn}: received — waiting for it to confirm.",
-                      buttons=self._handle_buttons(h, "receive_and_quote",
-                                                   chat))
-        else:
-            self.send(chat, f"{_cn}: confirmed. Sending it on now.")
-        if start:
-            # THROUGH start_job LIKE EVERY WAKE: the rate limit, the one-job
-            # lock, the owner token and the restart hold all apply. If it
-            # refuses, it says so in its own words and the button remains.
+        if say:
             try:
-                self.start_job(chat, "forward_to_swap", {"handle": h})
-            except BaseException as ex:                      # noqa: BLE001
-                print(f"  [!] the forward did not start: {_redact(ex)[:120]}")
+                _cn = self._label(chat, h)
+            except BaseException:                            # noqa: BLE001
+                _cn = h
+            if say == "seen":
+                self.send(chat, f"{_cn}: received — waiting for it to "
+                                f"confirm.",
+                          buttons=self._handle_buttons(h, "receive_and_quote",
+                                                       chat))
+            elif say == "held":
+                self.send(chat, f"{_cn}: confirmed. Something else is running "
+                                f"here; it is sent on as soon as this end is "
+                                f"free — nothing to do.")
+            else:
+                self.send(chat, f"{_cn}: confirmed. Sending it on now.")
+        if not start:
+            return
+        # THROUGH start_job LIKE EVERY WAKE: the rate limit, the one-job
+        # lock, the owner token and the restart hold all apply. If it
+        # refuses -- a race with a tap, the one-person rule -- it says so in
+        # its own words, and the deposit goes BACK to "seen" so the next
+        # tick tries again: left as "forwarding" it would never be looked at
+        # again, with the money settled on the host's address and the chat
+        # told it was being sent on.
+        started = False
+        try:
+            started = bool(self.start_job(chat, "forward_to_swap",
+                                          {"handle": h}))
+        except BaseException as ex:                          # noqa: BLE001
+            print(f"  [!] the forward did not start: {_redact(ex)[:120]}")
+        if not started:
+            with lock:
+                e = opened.get(h)
+                if e and e["state"] == "forwarding":
+                    e["state"] = "seen"
 
     def btc_watch_loop(self) -> None:
         """The watcher thread: a tick, then a sleep of --btc-poll, until

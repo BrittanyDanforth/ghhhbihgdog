@@ -4669,6 +4669,105 @@ MUTATIONS = [
   '        if not isinstance(out, dict) or set(out) != {"state"}:',
   '        if not isinstance(out, dict):',
   ['test_wake_agent']),
+ # ---- stage 4, the pager: the reply, the watcher, the button, /balance ----
+ ('the intake shape is rendered with the shared-inbound closing lines',
+  'gs_wake_proto.py',
+  '    if "m" not in plain:\n        return [',
+  '    if False:\n        return [',
+  ['test_depo_wizard']),
+ ('the intake reply is rendered as the shared-inbound one (note first)',
+  'gs_telegram_pager',
+  '            if plain and "m" not in plain:',
+  '            if False:',
+  ['test_telegram_pager']),
+ ('the intake reply registers nothing on the watch list', 'gs_telegram_pager',
+  '                self._btc_register(h, plain.get("d", ""), chat_id)\n',
+  '',
+  ['test_telegram_pager']),
+ ('the watcher says "confirmed" on money merely seen', 'gs_telegram_pager',
+  '                e["state"] = "seen"\n                say = "seen"',
+  '                e["state"] = "seen"\n                say = "confirmed"',
+  ['test_telegram_pager']),
+ ('the watcher starts the forward on money merely seen', 'gs_telegram_pager',
+  '            if state == "confirmed" and self._btc_can_start():\n'
+  '                e["state"] = "forwarding"',
+  '            if state in ("confirmed", "seen") and self._btc_can_start():\n'
+  '                e["state"] = "forwarding"',
+  ['test_telegram_pager']),
+ ('the watcher repeats itself every tick', 'gs_telegram_pager',
+  '            if say and say in e["said"]:\n                say = None',
+  '            if False:\n                say = None',
+  ['test_telegram_pager']),
+ ('the watcher never starts the forward', 'gs_telegram_pager',
+  '        try:\n            started = bool(self.start_job(chat, "forward_to_swap",\n'
+  '                                          {"handle": h}))',
+  '        try:\n            started = True',
+  ['test_telegram_pager']),
+ ('the watcher keeps looking at a deposit already being sent on',
+  'gs_telegram_pager',
+  '                        if e["state"] in ("not_seen", "seen")]',
+  '                        if True]',
+  ['test_telegram_pager']),
+ ("a forward's outcome never closes the watch entry", 'gs_telegram_pager',
+  '            if out == "done" and phase in ("sent", "unsure"):\n'
+  '                # Gone from the address, or may be',
+  '            if False:\n'
+  '                # Gone from the address, or may be',
+  ['test_telegram_pager']),
+ ('the button on a watched deposit asks the XMR-side probe', 'gs_telegram_pager',
+  '            if job in ("swap_status", "watch") and _ask_forward:',
+  '            if False:',
+  ['test_telegram_pager']),
+ # A RESTART STRANDS THE INTAKE: the watch list is memory, so with only the
+ # watched-handle test the button on a forgotten deposit asks the XMR side,
+ # which cannot move the money sitting on the host's address.
+ ('after a restart the button on an intake deposit asks the XMR-side probe',
+  'gs_telegram_pager',
+  '            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers)) \\\n'
+  '                and _h not in self._btc_sent_set()',
+  '            _ask_forward = self._btc_watched(_h) \\\n'
+  '                and _h not in self._btc_sent_set()',
+  ['test_telegram_pager']),
+ # THE WATCHER STARTS THE FORWARD INTO A HELD LOCK: start_job answers "no:
+ # busy" into the chat and the entry, marked "forwarding", is never looked at
+ # again -- settled money on the host's address, the chat told it was sent.
+ ('the watcher starts the forward while a job holds the lock',
+  'gs_telegram_pager',
+  '        if _b is not None and _b.locked():\n            return False',
+  '        if False:\n            return False',
+  ['test_telegram_pager']),
+ ('a start that start_job refused leaves the deposit marked as sending on',
+  'gs_telegram_pager',
+  '                if e and e["state"] == "forwarding":\n'
+  '                    e["state"] = "seen"',
+  '                if e and e["state"] == "forwarding":\n'
+  '                    pass',
+  ['test_telegram_pager']),
+ ('pairing accepts --btc-xpub without --allow-btc-forward (addresses nothing '
+  'can send on from)', 'gs_wake_keys',
+  '    if args.btc_xpub and not args.allow_btc_forward:',
+  '    if False:',
+  ['test_wake_agent']),
+ # AFTER `sent` THE TAP IS THE XMR SIDE'S QUESTION: routed to the forward
+ # it hits the once-sent rule, and the client hears nothing useful.
+ ('after the forward went out the tap still asks the forward',
+  'gs_telegram_pager',
+  '            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers)) \\\n'
+  '                and _h not in self._btc_sent_set()',
+  '            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers))',
+  ['test_telegram_pager']),
+ ('a never-paid deposit is watched for ever', 'gs_telegram_pager',
+  '                       >= proto.DEPOSIT_PLACE_TTL_S]:',
+  '                       >= float("inf")]:',
+  ['test_telegram_pager']),
+ ("/balance shows every chat's deposits", 'gs_telegram_pager',
+  '                    if e["chat"] == cid]',
+  '                    if True]',
+  ['test_telegram_pager']),
+ ("the wizard's floor is not applied", 'gs_telegram_pager',
+  '            if _amt < self.deposit_min_sat:',
+  '            if False:',
+  ['test_telegram_pager']),
 ]
 
 

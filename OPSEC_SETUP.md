@@ -943,9 +943,11 @@ install -m 0400 -o root -g root /dev/null /etc/gs-wake-spend.env
 # and, only with a fee wallet paired (see 4c):
 # ( set +o history; umask 077; read -rs -p 'fee wallet password: ' p; echo
 #   printf 'GS_FEE_WALLET_PASSWORD=%s\n' "$p" >> /etc/gs-wake-spend.env )
-# and, only with the BTC intake paired (gs_wake_keys pair --allow-btc-forward
-# --btc-xpub <account xpub> --btc-electrum <host.onion>): the seed the forward
-# signs with, the same way -- never on an argv, never in the keyfile. The
+# and, only with the BTC intake paired (gs_wake_keys pair --deposit-in-chat
+# --allow-btc-forward --btc-xpub <account xpub> --btc-electrum <host.onion>;
+# --btc-xpub is refused without --deposit-in-chat, see 4b's "The intake"): the
+# seed the forward signs with, the same way -- never on an argv, never in the
+# keyfile. The
 # forward refuses to sign unless the distro's libsecp256k1 (libsecp256k1-1)
 # is installed: it is the constant-time curve; the pure-Python one is not.
 #    --allow-btc-forward ALONE IS A REHEARSAL: the forward is signed and
@@ -1904,7 +1906,9 @@ both: the ThorChain inbound address is a shared pooled vault, so the memo is
 the entire binding between your Bitcoin and your Monero. An address without
 its memo is not a partial delivery, it is a trap — BTC paid to that address
 with no memo is not routed to you. There is no configuration in which the
-chat carries one and not the other, deliberately.
+chat carries one and not the other, deliberately. (The one exception is a
+pair on the **BTC intake**, at the end of this section: there the address is
+the host's own and there is no memo to send at all.)
 
 So if the laptop that runs the vault is also the machine you send BTC from —
 which it is, unless you have a second one, because composing an OP_RETURN
@@ -2007,6 +2011,96 @@ vault*. Two things that look like ways round it and are not:
 * ThorChain's "memoless" swaps do not help — they move the routing into an
   exact-to-the-satoshi amount, still require the memo to be broadcast first
   from a funded RUNE account, and add a 6-hour single-use fuse.
+
+#### The intake: a plain address, no note (`--btc-xpub`)
+
+Everything above is the shared-inbound flow: the client pays ThorChain
+directly and has to carry the memo. The **BTC intake** (`BTC_INTAKE_DESIGN.md`;
+`STAGE4_PLAN.md` is the record of this mode) replaces it on a pair that opts
+in: the client pays a plain, unique address **the host's own key controls**,
+from any phone app, with nothing to add; the Pi watches that address; and
+the vault, once the deposit has confirmed, is woken to forward it into the
+swap and adds the memo itself (`forward_to_swap`, sections 4b step 2 above
+and `STAGE3_PLAN.md`). The note, the "phone apps CANNOT add a note" line and
+the "use a desktop" advice are gone from this mode because they are no
+longer true of it. The rule-6 bargain — an address and an amount in a
+transcript assumed readable — is unchanged and is still made at the vault.
+
+Pair it on the vault. `--btc-xpub` is refused without `--deposit-in-chat`:
+a phone-only client has nothing else to read the address from, so the
+plaintext trade is decided knowingly, in the same command, or not at all.
+
+```bash
+python3 gs_wake_keys pair --deposit-in-chat \
+    --btc-xpub <account xpub> --btc-electrum <host.onion> \
+    --allow-btc-forward [--allow-btc-broadcast] ...       # ON THE VAULT
+```
+
+What the vault does with it, per `/deposit`: refuses the amount below the
+intake floor before anything is minted (`deposit_too_small`; the floor is
+the forward's 10,000-sat minimum plus a fee allowance at the ceiling rate for
+a one-input transaction, so the deposit can actually be sent on); derives
+the next address from the xpub; asks the network over Tor, on that
+address's own circuit, whether it has EVER been used, and steps past one
+that has (up to a gap of 20, then `btc_index_exhausted`); refuses outright
+when nobody could be asked (`btc_lookup_failed` — an address is issued only
+once a second party has said it is fresh, because the ledger that hands out
+indices is one of the things `paranoia_mode` wipes); records the index on
+the handle. The chat gets one message: the amount, the address, the label,
+and "I will say here when it arrives and when it has confirmed. After that
+it moves on by itself." That freshness look is a new thing the vault says
+to a server: it names an address moments before that address is paid, on
+its own circuit. A third-party Electrum server can correlate the two; your
+own electrs over an onion cannot, which is one more reason the `--btc-electrum`
+list should be yours.
+
+**The xpub does not go on the Pi.** `BTC_INTAKE_DESIGN.md` first put it
+there; an xpub is the generator of every address the host has ever minted
+and ever will, so a seized card would yield the whole intake history, past
+and future, in one string. The Pi is handed the address of each OPEN deposit
+in the same slip the phone gets, holds it in memory, and never holds the
+generator. A seized Pi learns the currently open deposits and nothing
+before or after them. The cost is stated: **a pager restart forgets the
+deposits it was watching**, so the automatic "received / confirmed /
+sending on" stops for them; the button under the deposit still wakes the
+vault, which forwards if the money has settled and otherwise answers with
+what it saw. Start the pager with its chain source on the command line,
+like its Tor proxy, never on the card:
+
+```bash
+python3 gs_telegram_pager ... \
+    --btc-electrum <host.onion>[:PORT][,PIN]   # repeatable; your own electrs
+                                              # over an onion, for the same
+                                              # reason the vault's is
+    --btc-min-conf 2       # depth at which this Pi says "confirmed" and
+                           # sends it on; match the vault's
+    --btc-network main     # main, testnet, signet or regtest
+    --btc-poll 600         # seconds between looks; under 60 is refused
+    --deposit-min-sat N    # the vault's intake floor, so the wizard refuses
+                           # a too-small deposit HERE, with the number,
+                           # instead of spending a wake on the vault's refusal
+```
+
+`--btc-electrum` is not optional on an intake pair. It is also how the
+pager knows, after a restart, that every deposit it is asked about is the
+intake's and must be asked about on the forward: without it a forgotten
+deposit is asked about on the swap side, which cannot move money sitting on
+the host's address and answers "nothing yet" for ever. With it, the chat hears
+"received — waiting for it to confirm" when the payment is seen, "confirmed.
+Sending it on now." at the configured depth, and then the forward's own
+word (`sent`, or `unsure` when the network was not seen to take it); a
+forward that did not go through is said once, with the button to try again.
+Once the forward has gone out, the button asks the swap side, as for any
+deposit; after a restart the first tap goes to the vault's forward, which
+answers that it went out without signing anything, and the taps after that
+ask the swap side.
+`/balance` lists this chat's watched deposits by label and state, with the
+figures the chat already saw. Every one of those sentences is in the pager's
+banned-word scan; none carries a number the chat did not already have. A
+deposit nothing has reached after two days — the window the vault's own
+reserve gives an unpaid deposit — is dropped from the watch list, so a
+never-paid address is not looked at, on a fresh circuit, every ten minutes
+for ever; a payment that lands later is still sent on by the button.
 
 Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
 a slip, so an old doorbell rejects a new record **on length, before any

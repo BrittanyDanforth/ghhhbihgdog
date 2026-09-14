@@ -4498,6 +4498,14 @@ check("pairing/btc: --btc-xpub WITHOUT --deposit-in-chat is refused at "
           [a for a in _BTC_OK if a != "--deposit-in-chat"]) or "")
       and "--deposit-in-chat" in (_pairs_btc(
           ["--btc-xpub", _BTC_XPUB_OK, "--btc-electrum", "s.onion"]) or ""))
+# AN XPUB WITHOUT THE FORWARD is an intake that hands out addresses no job
+# can send on from: every deposit would settle on the host's address and the
+# watcher's automatic start would be refused `not_allowed` for ever. Refused
+# where the operator is standing.
+check("pairing/btc: --btc-xpub WITHOUT --allow-btc-forward is refused at "
+      "pairing, naming the switch (addresses nothing could send on from)",
+      "--allow-btc-forward" in (_pairs_btc(
+          [a for a in _BTC_OK if a != "--allow-btc-forward"]) or ""))
 check("pairing/btc: --allow-btc-forward without an xpub or a server is "
       "refused AT PAIRING, naming both",
       "--btc-xpub" in (_pairs_btc(["--allow-btc-forward"]) or "")
@@ -4782,10 +4790,15 @@ check("A REHEARSAL MAY BE FOLLOWED BY THE REAL THING: a handle with a dry-run "
 for _mode, _mk in (("sending", _SEND_KEY), ("rehearsal", _FWD_KEY)):
     _o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000,
                              "forward_sent": True}, _mk)
-    check(f"...but a handle whose forward was SENT is refused already_forwarded "
-          f"in {_mode} mode: the money moved, and a second signature would "
-          "conflict with the first", _o is None
-          and getattr(_e, "code", None) == "already_forwarded" and _ran == [])
+    # ONCE SENT, NEVER SIGNED AGAIN: no child. AND ANSWERED, NOT REFUSED: the
+    # wake after a forward is the client asking "has it arrived?", and a
+    # refusal reached the phone as "refused" with no reason about money sent
+    # on correctly. The word (sent / unsure) is read from the plan; the
+    # end-to-end suite pins it on the wire.
+    check(f"...but a handle whose forward was SENT runs NO child in {_mode} "
+          "mode (a second signature would conflict with the first) and "
+          "answers done, not refused", _o is not None and _e is None
+          and _ran == [])
 
 
 def _fwd_run_plan(rec, key_extra, plan):
@@ -4877,10 +4890,13 @@ except Exception as _ex:                                     # noqa: BLE001
 finally:
     os.environ.pop("GS_BTC_SEED", None)
 check("a record WITHOUT the forward_sent mark but with a plan on disk that "
-      "says accepted is refused already_forwarded (the file the sending run "
-      "wrote is consulted, not the ledger alone), no child runs",
-      _o is None and getattr(_e, "code", None) == "already_forwarded"
-      and _ranx == [])
+      "says accepted runs NO child (the file the sending run wrote is "
+      "consulted, not the ledger alone) and answers done with the plan's "
+      "word 'sent'; the record is now marked sent",
+      _e is None and _o is not None and _ranx == []
+      and (_bb.result or {}).get("status") == "done"
+      and (_bb.result or {}).get("phase") == "sent"
+      and _rec_of(_dd).get("forward_sent") is True)
 print("\n== a forward that found nothing settled says what it saw ==")
 
 

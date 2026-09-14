@@ -30,10 +30,18 @@ The vault is OFF by default: it boots on a wake, does one job, powers off, disk
 resealed. An always-on "receive and auto-forward" daemon is the opposite of
 that. So the work splits across the two boxes the way everything else here does:
 
-- **Pi — watch-only.** Holds a Bitcoin **xpub only** (no spend key). Derives a
-  fresh address per deposit (BIP32 public derivation; index bound to the
-  handle). Watches the chain for a payment to that one address. A seized Pi can
-  watch, never spend. The Pi is always on, so it is where watching belongs.
+- **Pi — watch-only.** Watches the chain for a payment to each OPEN deposit's
+  address. A seized Pi can watch, never spend. The Pi is always on, so it is
+  where watching belongs. **Stage 4 departed from the first draft of this
+  line, which put the xpub on the Pi:** an xpub is the generator of every
+  address the host has ever minted and ever will, so a seized card would have
+  yielded the whole intake history, past and future, in one string. The
+  vault derives the address (it holds the xpub beside the seed it already
+  holds) and hands it to the Pi in the same plain slip the phone gets; the
+  Pi keeps it in memory and never holds the generator. A seized Pi learns the
+  currently open deposits and nothing before or after them. The cost: a
+  pager restart forgets the open deposits (the button still asks the vault,
+  on the forward, which sends a settled one on).
 - **Vault — the seed and the signing.** Holds the BTC seed. Forwarding is a new
   **job** (`forward_to_swap`), run when woken, exactly like a withdrawal: sign
   one BTC tx paying ThorChain's current inbound with the memo in an OP_RETURN,
@@ -188,7 +196,20 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
    THORChain takes the memo. Confirmation depth, reorg and the fee bump are
    stage 5.
 4. **Deposit UX**: unique address, auto-received, per-owner balance; the note
-   and phone warning gone from this mode.
+   and phone warning gone from this mode. BUILT (`STAGE4_PLAN.md` is its
+   record): the vault in BTC mode (`btc_account_xpub` + `deposit_in_chat`,
+   coupled at pairing with `allow_btc_forward`) refuses a deposit under the
+   forwardable floor before any mint, allocates the next index only after the
+   network has said the address is fresh (a bounded gap past used ones, fail
+   closed when nobody could be asked), and builds a memo-less plain slip
+   carrying its own derived address (wire v6: two exact slip shapes); the
+   pager registers the address in memory, watches it over Tor, says
+   "received" and "confirmed" once each, starts the forward through the one
+   wake path when the box is free (held silently while a job runs), and
+   closes the entry on `sent`/`unsure`; `/balance` lists the chat's own
+   deposits in figures it already saw; the button and `/check` on an intake
+   deposit ask the forward, which sends a settled one on and otherwise
+   answers `not_yet`/`arriving` from the forwarder's one-word status file.
 5. **Failure handling**: fee spikes, dust/minimum refusal, forward failure and
    retry, reorg/confirmation edge cases, floating-rate reconciliation.
 
