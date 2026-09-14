@@ -2086,6 +2086,27 @@ not run, less its outbound fee; a route that keeps refunding would
 otherwise be paid for again every recheck until the deposit was gone. 0
 keeps the first return.
 
+**A refund or a second payment?** Both are money on the address that no
+forward of the vault's consumed, and both are sent on (or kept) the same
+way — the bound counts every return, because a refund whose memo ThorChain
+has since changed the shape of must still be bounded. They differ in the
+record: a refunded forward's swap never happened, and the XMR side, told to
+expect its output, sat on "partial" for ever about a deposit whose
+re-forward had fully landed. So the reconciliation reads what paid the
+address: an output whose transaction's memo is `REFUND:<txid>` naming a
+forward of the vault's, carrying less than that forward sent, is a refund;
+it is VERIFIED when its money came from ThorChain's own vault — the address
+that forward paid, or THORNode's current inbound address (asked over its
+own circuit, only when some output claims to be a refund). Kerckhoffs: the
+memo is a public convention anyone can put in a transaction of their own
+to the address, and the amount can be matched; only the source cannot be
+forged, since only ThorChain's signers spend from ThorChain's vault. A
+verified refund's forward drops out of what the XMR side expects; a claim
+is recorded as one (`refunds` on the plan, `refund_claimed` on the chain)
+and changes nothing, so a forged memo cannot tell a client their swap is
+complete. The one trust this adds is THORNode's word on its own vault
+address — the same word the cross-check already sends the money on.
+
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its
 `--feerate-ceiling-sat-vb` under both of the forwarder's guards — and the

@@ -306,8 +306,41 @@ def unused(address, servers, proxy_url, *, network="main",
     return not entries
 
 
+#: The memo ThorChain puts on a transaction that REFUNDS an inbound it
+#: would not swap: "REFUND:" and the refunded transaction's id. A public
+#: convention anyone can write into an OP_RETURN of their own, so a memo
+#: alone is a claim; the SOURCE of the money (the input's previous output,
+#: fetched here for a claim) is what a caller verifies against.
+REFUND_MEMO_PREFIX = "REFUND:"
+
+
+def _memo_of(tx):
+    """The first OP_RETURN's data as text, or None."""
+    for o in tx.vout:
+        data = btx.op_return_data(o.script_pubkey.data)
+        if data is not None:
+            try:
+                return data.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+    return None
+
+
+def _prev_address(raw, vout, net):
+    """The address the `vout`-th output of the raw transaction pays, or
+    None (no transaction, no such output, not an address)."""
+    if not raw:
+        return None
+    try:
+        tx = Transaction.parse(bytes.fromhex(raw))
+        return str(tx.vout[int(vout)].script_pubkey.address(net)).lower()
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def spends_of(address, servers, proxy_url, *, network="main",
-              timeout=DEFAULT_TIMEOUT, transport_factory=None):
+              timeout=DEFAULT_TIMEOUT, transport_factory=None,
+              with_funding=False):
     """Every transaction in the address's history that SPENDS an output
     paying it, oldest first, with what each spend carried.
 
@@ -318,6 +351,17 @@ def spends_of(address, servers, proxy_url, *, network="main",
     carried (STAGE5_PLAN.md 3.1: a forward that went out and whose plan was
     never written is found here, not answered "not yet" for ever).
 
+    With `with_funding`, (spends, paid): `paid` is every output in the
+    history that PAYS the address, oldest first -- [{txid, height, vout,
+    value, memo, from_address}] -- its transaction's OP_RETURN as text (or
+    None), and, for a transaction whose memo claims to be a ThorChain
+    REFUND (REFUND_MEMO_PREFIX), the address its FIRST input was paid
+    from, read off that input's previous transaction, fetched in the same
+    session (None when it could not be). That is how a refund is told
+    from a second payment (third self-doubt pass): the memo is a public
+    convention anyone can write, the source is not -- only ThorChain's
+    vault can spend from ThorChain's vault.
+
     One server's session: the history, then blockchain.transaction.get for
     each entry, each transaction parsed and its txid recomputed (a server
     cannot hand back a different transaction under a listed id). Read-only.
@@ -326,6 +370,7 @@ def spends_of(address, servers, proxy_url, *, network="main",
     transactions contradict each other is not one to reason from). Raises
     BtcWatchError when no server answered."""
     spk = btx.address_script(address, network).data
+    net = btx.network_of(network)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
     last = None
@@ -339,6 +384,30 @@ def spends_of(address, servers, proxy_url, *, network="main",
                     raise BtcWatchError("electrum: history too long to be "
                                         "a deposit address's")
                 txs = [(e, b.transaction(e["tx_hash"])) for e in entries]
+                prevs = {}
+                if with_funding:
+                    # THE SOURCE OF A CLAIMED REFUND: its first input's
+                    # previous transaction, in the same session, only for
+                    # a transaction that pays the address and claims one
+                    # (at most MAX_HISTORY fetches). A fetch that fails
+                    # leaves the claim unverified; it does not fail over.
+                    for _e, _raw in txs:
+                        _tx = Transaction.parse(bytes.fromhex(_raw))
+                        if not any(o.script_pubkey.data == spk
+                                   for o in _tx.vout) or not _tx.vin:
+                            continue
+                        _m = _memo_of(_tx)
+                        if not isinstance(_m, str) \
+                                or not _m.upper().startswith(
+                                    REFUND_MEMO_PREFIX):
+                            continue
+                        _prev = _tx.vin[0].txid.hex()
+                        if _prev in prevs or set(_prev) <= {"0"}:
+                            continue
+                        try:
+                            prevs[_prev] = b.transaction(_prev)
+                        except (BtcWatchError, OSError):
+                            prevs[_prev] = None
         except PinMismatch:
             raise
         except (BtcWatchError, OSError) as ex:
@@ -351,7 +420,7 @@ def spends_of(address, servers, proxy_url, *, network="main",
             for n, o in enumerate(tx.vout):
                 if o.script_pubkey.data == spk:
                     funding[(e["tx_hash"], n)] = int(o.value)
-        out = []
+        out, paid = [], []
         for e, raw, tx in parsed:
             spent = [{"tx_hash": i.txid.hex(), "vout": int(i.vout),
                       "value": funding[(i.txid.hex(), int(i.vout))]}
@@ -365,7 +434,21 @@ def spends_of(address, servers, proxy_url, *, network="main",
             if spent:
                 out.append({"txid": e["tx_hash"], "height": e["height"],
                             "hex": raw, "inputs": spent, "server": host})
-        return out
+            if pays and with_funding:
+                memo = _memo_of(tx)
+                src = None
+                if isinstance(memo, str) \
+                        and memo.upper().startswith(REFUND_MEMO_PREFIX) \
+                        and tx.vin:
+                    src = _prev_address(prevs.get(tx.vin[0].txid.hex()),
+                                        int(tx.vin[0].vout), net)
+                for n, o in enumerate(tx.vout):
+                    if o.script_pubkey.data == spk:
+                        paid.append({"txid": e["tx_hash"],
+                                     "height": e["height"], "vout": n,
+                                     "value": int(o.value), "memo": memo,
+                                     "from_address": src})
+        return (out, paid) if with_funding else out
     why = str(last) if isinstance(last, BtcWatchError) \
         else type(last).__name__
     raise BtcWatchError(f"no Electrum server answered (last: {why})")

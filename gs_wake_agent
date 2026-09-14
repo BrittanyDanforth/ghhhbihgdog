@@ -1675,6 +1675,21 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
         # says it was superseded in turn -- a rotated plan is never
         # rewritten, so its mark can be stale; the current plan's is not.
         _record = str(plan.get("superseded_by") or "").lower()
+        # A FORWARD THORCHAIN REFUNDED DOES NOT COUNT (third self-doubt
+        # pass): its swap did not happen, and expecting its output kept
+        # the watcher on "partial" for ever about a deposit whose
+        # re-forward had fully landed. Only a VERIFIED refund lowers what
+        # is expected -- one whose money came from ThorChain's own vault,
+        # which nobody else can spend from (btc_forwarder.classify_returns).
+        # A claim is a memo anyone can write into a transaction of their
+        # own (Kerckhoffs: the convention is public); a forged one must not
+        # be able to tell the client their swap is complete, so it changes
+        # nothing here.
+        _refunded = {str(r.get("of") or "").lower()
+                     for p in [plan] + list(chain or ()) if isinstance(p, dict)
+                     for r in (p.get("refunds") or [])
+                     if isinstance(r, dict) and r.get("verified") is True
+                     and r.get("of")}
 
         def _counts(p):
             return (isinstance(p, dict) and p.get("broadcast") is True
@@ -1684,7 +1699,8 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
                          or (_record and str(p.get("txid") or "").lower()
                              == _record))
                     and p.get("expected_xmr") not in (None, "")
-                    and p.get("dest_xmr") == plan.get("dest_xmr"))
+                    and p.get("dest_xmr") == plan.get("dest_xmr")
+                    and str(p.get("txid") or "").lower() not in _refunded)
         counted = [p for p in [plan] + list(chain or ()) if _counts(p)]
         # A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP (stage 6). A
         # bump spends the same outpoints again at today's rate, and the

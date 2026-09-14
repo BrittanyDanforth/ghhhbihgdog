@@ -597,6 +597,64 @@ _r, _, _ = _spends(_FT(history=_HIST[:1], transactions=_TXS))
 check("a history of the funding alone: no spend", _r == [])
 _r, _, _ = _spends(_FT(history=[], transactions={}))
 check("an empty history: no spend, nothing fetched", _r == [])
+# WHAT PAID THE ADDRESS, WITH MEMOS AND SOURCES (third self-doubt pass): a
+# ThorChain refund names the forward it refunds in its memo, and its source
+# -- the previous output of its first input -- is what tells a refund from
+# a memo anyone could have written.
+_VAULT_ADDR = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+_VAULT = T.build_unsigned([{"tx_hash": "44" * 32, "vout": 0, "value": 500000}],
+                          [(400000, _OTHER_SPK)])
+_VAULT_ID, _VAULT_HEX = _VAULT.txid().hex(), _VAULT.serialize().hex()
+_REFUND = T.build_unsigned([{"tx_hash": _VAULT_ID, "vout": 0,
+                             "value": 400000}],
+                           [(280000, _SPK0),
+                            (0, T.op_return_script(
+                                b"REFUND:" + _SPEND1_ID.upper().encode()))])
+_REFUND_ID, _REFUND_HEX = _REFUND.txid().hex(), _REFUND.serialize().hex()
+_HIST_R = _HIST + [{"tx_hash": _REFUND_ID, "height": 850002}]
+_TXS_R = {**_TXS, _REFUND_ID: _REFUND_HEX, _VAULT_ID: _VAULT_HEX}
+_rr, _sr, _ftr = _spends(_FT(history=_HIST_R, transactions=_TXS_R),
+                         with_funding=True)
+_spr, _pdr = _rr
+check("with_funding: (spends, paid) -- the spends as before, and every "
+      "output that pays the address oldest first with its memo; the one "
+      "whose memo claims a REFUND carries the address its first input was "
+      "paid from, read off that input's previous transaction",
+      [x["txid"] for x in _spr] == [_SPEND1_ID, _SPEND2_ID]
+      and _pdr == [{"txid": _FUND_ID, "height": 850000, "vout": 0,
+                    "value": 300000, "memo": None, "from_address": None},
+                   {"txid": _FUND_ID, "height": 850000, "vout": 2,
+                    "value": 250000, "memo": None, "from_address": None},
+                   {"txid": _REFUND_ID, "height": 850002, "vout": 0,
+                    "value": 280000,
+                    "memo": "REFUND:" + _SPEND1_ID.upper(),
+                    "from_address": _VAULT_ADDR}])
+check("...the previous transaction is fetched in the SAME session, once, "
+      "and only for the claim: four history entries and one source",
+      _ftr[0].methods.count("blockchain.transaction.get") == 5
+      and _ftr[0].methods[:2] == ["server.version",
+                                  "blockchain.scripthash.get_history"])
+_rn, _, _ftn = _spends(_FT(history=_HIST_R, transactions=_TXS_R))
+check("...without with_funding the answer is the list it always was, and "
+      "no source is fetched",
+      isinstance(_rn, list) and [x["txid"] for x in _rn]
+      == [_SPEND1_ID, _SPEND2_ID]
+      and _ftn[0].methods.count("blockchain.transaction.get") == 4)
+_rm, _, _ = _spends(_FT(history=_HIST_R,
+                        transactions={**_TXS, _REFUND_ID: _REFUND_HEX}),
+                    with_funding=True)
+check("a claim whose source the server cannot produce is still listed, "
+      "unverifiable (from_address None) -- the session is not failed over "
+      "for it", _rm[1][2]["from_address"] is None
+      and _rm[1][2]["memo"] == "REFUND:" + _SPEND1_ID.upper()
+      and [x["txid"] for x in _rm[0]] == [_SPEND1_ID, _SPEND2_ID])
+check("op_return_data reads what op_return_script writes, direct and "
+      "PUSHDATA1, and nothing else",
+      T.op_return_data(T.op_return_script(b"REFUND:x").data) == b"REFUND:x"
+      and T.op_return_data(T.op_return_script(b"y" * 100).data) == b"y" * 100
+      and T.op_return_data(_SPK0.data) is None
+      and T.op_return_data(b"") is None and T.op_return_data(None) is None
+      and T.op_return_data(b"\x6a\x05abc") is None)
 check("a listed transaction that does not touch the address is a "
       "contradiction: refused, not reasoned from",
       _refused(B.spends_of, _A0, _SERVERS, _PROXY, transport_factory=_factory(

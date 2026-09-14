@@ -123,9 +123,12 @@ class Net:
                  expected=None, oracle=_ORACLE, thornode=None,
                  look_error=None, post_error=None, routes=None,
                  factor=Decimal(1), submit=None, seen=None, clock=None,
-                 spends=None):
+                 spends=None, funding=None):
         self.factor = factor                     # quote vs oracle, x
         self.clock = clock                       # the quote-age clock
+        # WHAT PAID THE ADDRESS (third self-doubt pass): the `paid` half
+        # bcast.spends_of returns with_funding -- memos and sources.
+        self.funding_result = funding
         # THE BROADCAST SIDE, canned: `submit` is the dict bcast.submit
         # would return (or an exception to raise, or "real" to leave the
         # real function in place); `seen` likewise. Every call is recorded.
@@ -223,6 +226,8 @@ class Net:
         r = self.spends_result
         if isinstance(r, Exception):
             raise r
+        if kw.get("with_funding"):
+            return list(r or []), list(self.funding_result or [])
         return list(r or [])
 
     def install(self):
@@ -2178,7 +2183,8 @@ check("a THIRD return is KEPT: done, nothing quoted or sent, the current "
       and _p is not None and _p["txid"] == _pK3["txid"]
       and _p.get("returned_kept") == {"outputs": 1, "sat": 130000,
                                       "settled": True,
-                                      "forwards_of_returned": 2}
+                                      "forwards_of_returned": 2,
+                                      "refunds": 0}
       and ("forward", "returned_kept") in _nK3.kinds
       and ("forward", "returned_settled") not in _nK3.kinds
       and len(F._plan_chain(_ofK)) == 3)
@@ -2222,6 +2228,150 @@ check("returned_forwards counts forwards of returned money once per txid, "
 check("a negative --returns-max is refused before anything runs",
       _refusal(Net(), "--reconcile", *_TN, "--returns-max", "-1",
                dry_run=False, outfile=_ofK)[3] == "bad_args")
+
+print("\n== THIRD SELF-DOUBT PASS: a refund is told from a second payment ==")
+# The memo ThorChain puts on a refund is a public convention anyone can
+# write into a transaction of their own to the address, and the amount can
+# be matched; only the SOURCE cannot be forged -- nobody but ThorChain's
+# signers spend from ThorChain's vault. A refund is verified by its source
+# alone; a claim is recorded as one and nothing rests on it.
+_HRF = "88" * 32
+# A valid mainnet address that is NOT the inbound the fixtures pay.
+_OTHER_ADDR = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+
+
+def _paid(txid, value, memo, src, vout=0):
+    return {"txid": txid, "height": 850003, "vout": vout, "value": value,
+            "memo": memo, "from_address": src}
+
+
+_pR, _ofR, _hxR = _first_send()
+check("(setup) the first forward sent more than the return below carries",
+      int(_pR["send_sat"]) > 150000 and _pR["inbound"] == _INBOUND)
+_RF = [{"tx_hash": _HRF, "vout": 0, "value": 150000, "confirmations": 5}]
+_nR1 = Net(utxos=_RF, spends=[_listed(_pR, _hxR)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0,
+           funding=[_paid(_HRF, 150000, "REFUND:" + _pR["txid"].upper(),
+                          _INBOUND)])
+_c, _o, _p, _ = _reconcile(_nR1, _ofR)
+_oldR = json.load(open(F._plan_chain(_ofR)[1]))
+check("a return whose memo names our forward, carrying LESS than it sent, "
+      "from the vault that forward PAID: a VERIFIED refund -- recorded on "
+      "the plan (which the chain keeps when it is rotated aside), the kind "
+      "on the chain, THORNode asked for its current inbound, and forwarded "
+      "again like any first return",
+      _c == F.EXIT_OK and len(_nR1.posts) == 1
+      and _p["reconcile_reason"] == "returned"
+      and _oldR.get("refunds") == [{"txid": _HRF, "vout": 0, "value": 150000,
+                                    "of": _pR["txid"].lower(),
+                                    "verified": True}]
+      and ("forward", "refund_seen") in _nR1.kinds
+      and sum("inbound_addresses" in u for u, _ in _nR1.gets) == 2)
+_pU2, _ofU2, _hxU2 = _first_send()
+_nR2 = Net(utxos=_RF, spends=[_listed(_pU2, _hxU2)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0,
+           funding=[_paid(_HRF, 150000, "refund:" + _pU2["txid"],
+                          _OTHER_ADDR)])
+_c, _o, _p, _ = _reconcile(_nR2, _ofU2)
+_oldU2 = json.load(open(F._plan_chain(_ofU2)[1]))
+check("the same memo (any case) from an address that is NOT a vault this "
+      "run knows: a CLAIM -- recorded as unverified, its own kind, and "
+      "otherwise handled as a payment",
+      _c == F.EXIT_OK and len(_nR2.posts) == 1
+      and (_oldU2.get("refunds") or [{}])[0].get("verified") is False
+      and ("forward", "refund_claimed") in _nR2.kinds
+      and ("forward", "refund_seen") not in _nR2.kinds)
+_pV, _ofV, _hxV = _first_send()
+_nR3 = Net(utxos=_RF, spends=[_listed(_pV, _hxV)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0, inbound=_OTHER_ADDR,
+           funding=[_paid(_HRF, 150000, "REFUND:" + _pV["txid"].upper(),
+                          _OTHER_ADDR)])
+_c, _o, _p, _ = _reconcile(_nR3, _ofV)
+check("...a source that is THORNode's CURRENT inbound (the vault churned "
+      "since the forward paid the old one) verifies it too",
+      _c == F.EXIT_OK
+      and (json.load(open(F._plan_chain(_ofV)[1])).get("refunds")
+           or [{}])[0].get("verified") is True)
+for _why, _fund in (
+        ("a memo naming a forward that is not ours",
+         _paid(_HRF, 150000, "REFUND:" + "ab" * 32, _INBOUND)),
+        ("a memo naming ours but carrying MORE than it sent (a refund is "
+         "the inbound less a fee, never more)",
+         _paid(_HRF, 150000, "REFUND:{TXID}", _INBOUND)),
+        ("no memo at all (a second payment)",
+         _paid(_HRF, 150000, None, None)),
+        ("an OUT memo (a swap output, not a refund)",
+         _paid(_HRF, 150000, "OUT:{TXID}", _INBOUND))):
+    _pX, _ofX, _hxX = _first_send()
+    _fx = dict(_fund)
+    if _fx["memo"] and "{TXID}" in _fx["memo"]:
+        _fx["memo"] = _fx["memo"].replace("{TXID}", _pX["txid"].upper())
+    _ux = [{"tx_hash": _HRF, "vout": 0,
+            "value": 150000 if "MORE" not in _why else int(_pX["send_sat"]),
+            "confirmations": 5}]
+    if "MORE" in _why:
+        _fx["value"] = int(_pX["send_sat"])
+    _nX = Net(utxos=_ux, spends=[_listed(_pX, _hxX)], fee=10,
+              submit=_ACCEPTED, seen=_SEEN0, funding=[_fx])
+    _c, _o, _p, _ = _reconcile(_nX, _ofX)
+    check(f"{_why}: not a refund -- nothing recorded, no THORNode ask for "
+          "it, forwarded as a payment",
+          _c == F.EXIT_OK and len(_nX.posts) == 1
+          and "refunds" not in json.load(open(F._plan_chain(_ofX)[1]))
+          and ("forward", "refund_seen") not in _nX.kinds
+          and ("forward", "refund_claimed") not in _nX.kinds
+          and sum("inbound_addresses" in u for u, _ in _nX.gets)
+          == (2 if _fx["memo"] and _fx["memo"].upper().startswith("REFUND:")
+              else 1))
+_pKR, _ofKR, _hxKR = _first_send()
+_nKR = Net(utxos=_RF, spends=[_listed(_pKR, _hxKR)], fee=10,
+           funding=[_paid(_HRF, 150000, "REFUND:" + _pKR["txid"].upper(),
+                          _INBOUND)])
+_c, _o, _p, _ = _reconcile(_nKR, _ofKR, "--returns-max", "0")
+check("a return kept (--returns-max) says how many of its outputs are "
+      "verified refunds, and the refund is on the same plan",
+      _c == F.EXIT_OK and (_p.get("returned_kept") or {}).get("refunds") == 1
+      and (_p.get("refunds") or [{}])[0].get("verified") is True)
+_nL = Net(utxos=[], spends=[_listed(_pKR, _hxKR)]).install()
+F.bcast_spends = lambda *a, **k: [_listed(_pKR, _hxKR)]
+_c, _o, _p, _ = run(_nL, "--reconcile", *_TN, dry_run=False, outfile=_ofKR)
+check("a spends reader of the stage-5 shape (a list, no funding) is taken "
+      "as knowing of no memo: the reconciliation still runs, nothing "
+      "recorded", _c == F.EXIT_OK and _p is not None)
+check("classify_returns is pure and tolerant: junk entries, a memo in any "
+      "case, a plan without send_sat, a source in any case; verified by the "
+      "plan's own inbound OR THORNode's current one",
+      F.classify_returns(
+          ["junk", None, {"memo": 7},
+           {"txid": "AA" * 32, "vout": 1, "value": 5, "memo": "Refund:" + "BB" * 32,
+            "from_address": _INBOUND.upper()},
+           {"txid": "cc" * 32, "vout": 0, "value": 5, "memo": "REFUND:" + "bb" * 32,
+            "from_address": _OTHER_ADDR},
+           {"txid": "dd" * 32, "vout": 0, "value": 5, "memo": "REFUND:" + "ee" * 32,
+            "from_address": _INBOUND},
+           {"txid": "ee" * 32, "vout": 2, "value": 5,
+            "memo": "REFUND:" + "BB" * 32 + ":something-later",
+            "from_address": _INBOUND}],
+          [{"txid": "bb" * 32, "send_sat": 10, "inbound": _INBOUND},
+           {"txid": "ee" * 32, "inbound": _INBOUND}, "junk"],
+          thor_inbound=_OTHER_ADDR.upper())
+      == [{"txid": "aa" * 32, "vout": 1, "value": 5, "of": "bb" * 32,
+           "verified": True},
+          {"txid": "cc" * 32, "vout": 0, "value": 5, "of": "bb" * 32,
+           "verified": True},
+          {"txid": "ee" * 32, "vout": 2, "value": 5, "of": "bb" * 32,
+           "verified": True}]
+      and F.classify_returns([], []) == [] and F.classify_returns(None, None) == [])
+check("thor_inbound_address never raises and answers None for no THORNode, "
+      "a failed fetch, or a list with no single BTC entry",
+      F.thor_inbound_address("", _PROXY) is None
+      and Net(thornode=RuntimeError("down")).install() is not None
+      and F.thor_inbound_address("https://tn.example", _PROXY) is None
+      and Net(thornode=[]).install() is not None
+      and F.thor_inbound_address("https://tn.example", _PROXY) is None
+      and Net(thornode=[{"chain": "BTC", "address": " X1 "}]).install()
+      is not None
+      and F.thor_inbound_address("https://tn.example", _PROXY) == "x1")
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

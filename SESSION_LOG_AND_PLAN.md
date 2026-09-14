@@ -310,6 +310,29 @@ refuters per finding) found real defects, all fixed in the rewrite:
   payment when it settles, and kept by the vault past --returns-max. An
   entry learned after a restart has no address and is not looked at.
   test_telegram_pager 818; two anchors.
+- ASKED (the user): can a refund be told from a re-deposit? It could not,
+  and the difference mattered in one place: a refunded forward's swap
+  never happened, yet `_reconcile_pairs` summed its quote into what the
+  XMR watcher expects, so a deposit whose re-forward fully landed read
+  "partial" for ever. Now `spends_of(with_funding=True)` also returns
+  what PAID the address, each output with its transaction's memo and --
+  for one whose memo claims `REFUND:` -- the address its first input was
+  paid from (the previous transaction, fetched in the same session);
+  `classify_returns` calls an output a refund when the memo names a
+  forward of ours and it carries less than that forward sent, and
+  VERIFIED when its source is the vault that forward paid or THORNode's
+  current inbound (fetched only when something claims). Kerckhoffs
+  throughout: the memo is a public convention anyone can write, the
+  amount can be matched, only the source cannot be forged; a claim is
+  recorded (`refunds` on the plan, kept on rotation) and changes nothing,
+  a verified refund's forward drops out of the pairs sums, and when every
+  forward was refunded nothing is rewritten (the deposit-time quote
+  stands, never an expectation of nothing). The bound still counts every
+  return (a refund whose memo shape changed must stay bounded); the kept
+  mark says how many are verified refunds; the job log names each. The
+  one new trust is THORNode's word on its own vault address, which the
+  cross-check already sends the money on. test_btc_broadcast, forwarder,
+  agent; six anchors.
 - Checked and left alone: the forward's worst case over Tor (look,
   history, quote, oracle, THORNode, submit, seen, each bounded) fits its
   900 s budget; the quote-age bound (300 s) covers the cross-check's own

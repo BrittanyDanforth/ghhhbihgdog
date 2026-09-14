@@ -5070,6 +5070,50 @@ check("...a returned deposit's second swap still SUMS with the first (no "
                          {**_NEW, "replaces": None},
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.56")
+# A FORWARD THORCHAIN REFUNDED DOES NOT COUNT (third self-doubt pass): its
+# swap never happened, and expecting its output kept the watcher on
+# "partial" for ever. Only a VERIFIED refund (its money from ThorChain's
+# own vault) lowers the expectation; a claim -- a memo anyone can write --
+# never does.
+_RFV = {"txid": "77" * 32, "vout": 0, "value": 4900000, "of": "ab" * 32,
+        "verified": True}
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("a forward a VERIFIED refund names drops out of what the watcher "
+      "expects: the re-forward counts alone",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None, "refunds": [_RFV]},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ef" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...an UNVERIFIED claim changes nothing: both still sum (a memo anyone "
+      "can write must not be able to tell the client the swap is complete)",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None,
+                          "refunds": [{**_RFV, "verified": False},
+                                      {**_RFV, "verified": "yes"}]},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.56")
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...a refund recorded on a ROTATED plan counts too, and junk in a "
+      "refunds list is ignored",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None,
+                          "refunds": ["junk", None, 7, {}]},
+                         chain=[{**_PLAN_Q, "refunds": [_RFV]}]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25")
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...and when EVERY forward was refunded nothing is rewritten: the "
+      "deposit-time quote stands rather than an expectation of nothing",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None,
+                          "refunds": [_RFV, {**_RFV, "of": "ef" * 32}]},
+                         chain=[_PLAN_Q]) is False
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5")
 # ONE SWAP PER OUTPOINT (stage 6, self-doubt pass). An evicted forward's
 # re-sign and a rejected re-send's fresh forward name nothing in
 # `replaces` -- the original was NOT in the network -- yet the original's

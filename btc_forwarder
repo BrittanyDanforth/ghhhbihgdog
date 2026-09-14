@@ -587,6 +587,85 @@ def cross_check_inbound(inbound, thornode_url, proxy_url):
     return int(dust) if dust is not None and dust > 0 else None
 
 
+def thor_inbound_address(thornode_url, proxy_url):
+    """THORNode's CURRENT BTC inbound vault address, best effort: None when
+    there is no THORNode, it could not be fetched, or it does not name one
+    address. On a circuit of its own. Read to VERIFY a claimed refund's
+    source (classify_returns) and for nothing else: a miss leaves a claim
+    unverified, so nothing here refuses."""
+    if not thornode_url:
+        return None
+    try:
+        entries = safe_get(f"{str(thornode_url).rstrip('/')}/thorchain/"
+                           "inbound_addresses",
+                           isolated_proxy(proxy_url, "forward:refund"))
+        btc = [e for e in entries if isinstance(e, dict)
+               and e.get("chain") == _THOR_BTC_CHAIN]
+        if len(btc) != 1:
+            return None
+        a = str(btc[0].get("address") or "").strip().lower()
+        return a or None
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def classify_returns(paid, plans, thor_inbound=None):
+    """Which outputs paying the address are ThorChain REFUNDS of a forward
+    of ours, and which of those are VERIFIED (third self-doubt pass).
+
+    A refund and a second payment look alike to the look -- money on the
+    address that no forward of ours consumed -- and were handled alike.
+    They differ in what the record should say: a refunded forward's swap
+    never happened, and expecting its output kept the XMR side on
+    "partial" for ever about a deposit whose re-forward had fully landed.
+
+    A refund is an output whose transaction's memo is REFUND:<txid> naming
+    a forward in `plans`, carrying LESS than that forward sent (a refund
+    is the inbound less ThorChain's outbound fee, never more). It is
+    VERIFIED when its money came from ThorChain's own vault: the address
+    that forward paid (`inbound` on its plan), or THORNode's current
+    inbound address (`thor_inbound`, fetched by the caller). Kerckhoffs:
+    the memo is a public convention anyone can put in a transaction of
+    their own to the address, and the amount can be matched; only the
+    source cannot be forged, since only ThorChain's signers spend from
+    ThorChain's vault. Nothing that lowers what a client is told to expect
+    may rest on a claim; a claim is recorded as one and changes nothing.
+    Everything else on the address is a payment. Pure.
+
+    Returns [{txid, vout, value, of, verified}], one per refund output."""
+    by_txid = {str(p.get("txid") or "").lower(): p for p in plans or ()
+               if isinstance(p, dict) and p.get("txid")}
+    vault = {str(thor_inbound or "").strip().lower()} - {""}
+    out = []
+    for f in paid or ():
+        if not isinstance(f, dict):
+            continue
+        memo = f.get("memo")
+        if not isinstance(memo, str) \
+                or not memo.upper().startswith(bcast.REFUND_MEMO_PREFIX):
+            continue
+        # The id, and nothing a later convention might append after it.
+        of = re.split(r"[^0-9a-fA-F]",
+                      memo[len(bcast.REFUND_MEMO_PREFIX):].strip())[0].lower()
+        p = by_txid.get(of)
+        if p is None:
+            continue
+        try:
+            value = int(f.get("value") or 0)
+            sent = int(p.get("send_sat") or 0)
+            vout = int(f.get("vout") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sent <= 0 or value >= sent:
+            continue
+        src = str(f.get("from_address") or "").strip().lower()
+        ok = bool(src) and (src == str(p.get("inbound") or "").strip().lower()
+                            or src in vault)
+        out.append({"txid": str(f.get("txid") or "").lower(), "vout": vout,
+                    "value": value, "of": of, "verified": bool(ok)})
+    return out
+
+
 def take_seed():
     """The mnemonic from the environment, and nothing from anywhere else.
     Removed from this process's environment once read so it is not
@@ -1153,8 +1232,9 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     the chain -- nothing is signed. Money come back but not yet settled is
     the word `returned` and a refusal: sent on when it settles."""
     try:
-        spends = bcast_spends(address, servers, args.tor_proxy,
-                              network=args.network, timeout=args.timeout)
+        _res = bcast_spends(address, servers, args.tor_proxy,
+                            network=args.network, timeout=args.timeout,
+                            with_funding=True)
     except watch.PinMismatch as e:
         raise Refused("pin_mismatch", str(e))
     except watch.BtcWatchError as e:
@@ -1162,6 +1242,10 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         print(f"[!] the address's history could not be read ({e}); a "
               "reconciliation cannot decide without it")
         raise SystemExit(EXIT_FAILED)
+    # (spends, what paid the address); a reader that answers the spends
+    # alone -- the stage-5 shape -- is taken as knowing of no memo.
+    spends, paid = (_res if isinstance(_res, tuple) and len(_res) == 2
+                    else (_res, []))
     chain = []
     for f in _plan_chain(args.outfile):
         # _plan_file, not _read_plan: a rotated file that is not ours is
@@ -1176,6 +1260,43 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     ours = {str(p.get("txid") or "").lower() for p in chain
             if p.get("txid")}
     ours.add(str(plan.get("txid") or "").lower())
+    # A REFUND OR A PAYMENT? (third self-doubt pass; classify_returns says
+    # what is verified and why). THORNode's current inbound address is
+    # fetched only when some output CLAIMS to be a refund, so a plain
+    # reconciliation costs no extra circuit. Recorded on the plan as
+    # `refunds` -- the file that is current now, which the chain keeps
+    # when it is rotated aside -- for the pairs rewrite on the vault (a
+    # verified refund's forward drops out of what the XMR side expects)
+    # and for the operator's reading. Recomputed every run from the
+    # history, so a run that never writes the plan loses nothing.
+    _claims = [f for f in paid if isinstance(f, dict)
+               and isinstance(f.get("memo"), str)
+               and f["memo"].upper().startswith(bcast.REFUND_MEMO_PREFIX)]
+    _thor = (thor_inbound_address(args.thornode, args.tor_proxy)
+             if _claims else None)
+    _refunds = classify_returns(paid, [plan] + chain, _thor)
+    _refund_ops = {(r["txid"], r["vout"]) for r in _refunds if r["verified"]}
+    if _refunds:
+        _merged = [r for r in (plan.get("refunds") or [])
+                   if isinstance(r, dict)]
+        for r in _refunds:
+            for m in _merged:
+                if (m.get("txid"), m.get("vout")) == (r["txid"], r["vout"]):
+                    if r["verified"] and m.get("verified") is not True:
+                        m["verified"] = True
+                    break
+            else:
+                _merged.append(dict(r))
+                integrity_log("forward", "refund_seen" if r["verified"]
+                              else "refund_claimed")
+                print(f"  reconcile: output {r['txid']}:{r['vout']} "
+                      f"({r['value']} sat) is a ThorChain REFUND of our "
+                      f"forward {r['of']}, "
+                      + ("from ThorChain's own vault (verified)."
+                         if r["verified"] else
+                         "NOT from a vault this run knows: a claim only, "
+                         "and nothing rests on it."))
+        plan["refunds"] = _merged
     listed = {s["txid"]: s for s in spends}
     for s in spends:
         if s["txid"] in ours:
@@ -1255,7 +1376,12 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             "outputs": len(outputs),
             "sat": sum(int(u["value"]) for u in outputs),
             "settled": bool(settled),
-            "forwards_of_returned": _returned_n}
+            "forwards_of_returned": _returned_n,
+            # ...how many of them are VERIFIED ThorChain refunds; the
+            # rest are payments, or claims nothing rests on.
+            "refunds": sum(1 for u in outputs
+                           if (str(u.get("tx_hash") or "").lower(),
+                               int(u.get("vout") or 0)) in _refund_ops)}
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         write_plan(args.outfile, plan)
         integrity_log("forward", "returned_kept")
@@ -1312,9 +1438,13 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             if _k is not None:
                 return _k
             integrity_log("forward", "returned_settled")
+            _nr = sum(1 for u in settled_new
+                      if (str(u.get("tx_hash") or "").lower(),
+                          int(u.get("vout") or 0)) in _refund_ops)
             print(f"  reconcile: {len(settled_new)} new settled output(s) on "
-                  "the address that no forward of ours consumed (a refund, "
-                  "or a second payment): forwarding them.")
+                  f"the address that no forward of ours consumed ({_nr} "
+                  f"verified ThorChain refund(s), {len(settled_new) - _nr} "
+                  "payment(s) or unverified): forwarding them.")
             return "forward", sorted(consumed), "returned"
         if unsettled_new:
             _k = _kept(unsettled_new, False)

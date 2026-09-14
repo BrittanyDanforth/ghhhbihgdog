@@ -4967,6 +4967,44 @@ MUTATIONS = [
   '            if not e or e["state"] not in ("not_seen", "seen", "forwarded"):',
   '            if not e or e["state"] not in ("not_seen", "seen"):',
   ['test_telegram_pager']),
+ # A REFUND IS TOLD FROM A SECOND PAYMENT BY ITS SOURCE, never by a memo
+ # anyone can write (third self-doubt pass).
+ ('a claimed refund is verified without its source (a forged memo verifies)',
+  'btc_forwarder',
+  '        ok = bool(src) and (src == str(p.get("inbound") or "").strip().lower()\n'
+  '                            or src in vault)',
+  '        ok = True',
+  ['test_btc_forwarder']),
+ ('a return carrying MORE than the forward sent passes as its refund',
+  'btc_forwarder',
+  '        if sent <= 0 or value >= sent:\n'
+  '            continue',
+  '        if sent <= 0:\n'
+  '            continue',
+  ['test_btc_forwarder']),
+ ('the refund record is not written on the plan',
+  'btc_forwarder',
+  '        plan["refunds"] = _merged',
+  '        pass',
+  ['test_btc_forwarder']),
+ ('a refunded forward still counts in what the XMR side expects',
+  'gs_wake_agent',
+  '                    and str(p.get("txid") or "").lower() not in _refunded)',
+  '                    and True)',
+  ['test_wake_agent']),
+ ('an unverified refund claim lowers what the XMR side expects',
+  'gs_wake_agent',
+  '                     if isinstance(r, dict) and r.get("verified") is True\n'
+  '                     and r.get("of")}',
+  '                     if isinstance(r, dict) and r.get("verified") is not None\n'
+  '                     and r.get("of")}',
+  ['test_wake_agent']),
+ ("a claimed refund's source is never read (every claim unverifiable)",
+  'gs_btc_broadcast.py',
+  '                    src = _prev_address(prevs.get(tx.vin[0].txid.hex()),\n'
+  '                                        int(tx.vin[0].vout), net)',
+  '                    src = None',
+  ['test_btc_broadcast']),
  ('a payment that vanished before confirming is watched as seen for ever',
   'gs_telegram_pager',
   '            elif state == "not_seen" and e["state"] == "seen":\n',

@@ -193,6 +193,23 @@ def op_return_script_len(data_len):
     return 2 + data_len if data_len <= 75 else 3 + data_len
 
 
+def op_return_data(script):
+    """The data of an OP_RETURN script laid out as op_return_script lays
+    one out (one push, direct or OP_PUSHDATA1), or None for any other
+    script. What the address's history carries is read with this
+    (gs_btc_broadcast.spends_of: a ThorChain refund names the forward it
+    refunds in its memo); the forwarder keeps its own copy for the memos
+    it writes, and the two must agree."""
+    b = bytes(script or b"")
+    if not b or b[0] != 0x6a:
+        return None
+    if len(b) >= 2 and 1 <= b[1] <= 75 and len(b) == 2 + b[1]:
+        return b[2:]
+    if len(b) >= 3 and b[1] == 0x4c and len(b) == 3 + b[2]:
+        return b[3:]
+    return None
+
+
 def measure(tx):
     """(vsize, weight, base_size, total_size) of a serialised transaction.
 
