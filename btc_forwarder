@@ -198,10 +198,23 @@ def sat_to_btc_text(sat):
 
 
 def fee_band(rate, floor, ceiling):
-    """The fee rate, or a refusal when it is outside the operator's band.
-    Outside is REFUSED, not clamped: a server saying 5000 sat/vB is broken
-    or hostile, and silently paying the ceiling instead would still be a
-    decision made for money on a number nobody trusts."""
+    """The fee rate this forward pays, from the server's estimate and the
+    operator's band.
+
+    ABOVE THE CEILING IS REFUSED, not clamped: a server saying 5000 sat/vB
+    is broken or hostile, and silently paying the ceiling instead would
+    still be a decision made for money on a number nobody trusts.
+
+    BELOW THE FLOOR PAYS THE FLOOR. The floor is the operator's "never
+    less than this" (a rate under which their own node will not relay, or
+    one they chose so a forward does not sit for hours); an estimate under
+    it is a cheap network, the best day to forward. The first version
+    refused it as out of band -- and once a fee refusal became `delayed`
+    (stage 5), an operator who raised the floor above 1 had every forward
+    on a cheap day wait an hour and try again, for as long as the network
+    stayed cheap: the floor turned the good days into the days nothing
+    moved. Paying MORE than an estimate is never the failure mode that
+    strands money; paying less is."""
     if rate is None:
         raise Refused("no_fee_estimate",
                       "the server has no fee estimate for that target; "
@@ -209,11 +222,16 @@ def fee_band(rate, floor, ceiling):
     if not isinstance(rate, int) or isinstance(rate, bool) or rate < 1:
         raise Refused("bad_fee_estimate", "the fee estimate is not a "
                       "positive whole number of sat/vB")
-    if rate < floor or rate > ceiling:
+    if rate > ceiling:
         raise Refused("fee_out_of_band",
-                      f"the fee estimate is outside the {floor}-{ceiling} "
-                      "sat/vB band this box accepts; widen the band only if "
+                      f"the fee estimate is above the {ceiling} sat/vB "
+                      "ceiling this box accepts; raise the ceiling only if "
                       "the network really is there")
+    if rate < floor:
+        integrity_log("forward", "fee_floor_applied")
+        print(f"  fee estimate {rate} sat/vB is under this box's floor; "
+              f"paying the floor ({floor} sat/vB)")
+        return floor
     return rate
 
 

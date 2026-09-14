@@ -2040,7 +2040,26 @@ python3 gs_wake_keys pair --deposit-in-chat \
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its
 `--feerate-ceiling-sat-vb` under both of the forwarder's guards — and the
-pager flag to set (`--deposit-min-sat`).
+pager flag to set (`--deposit-min-sat`). It also prints the account's
+FIRST address: compare it with your wallet's first native-segwit receiving
+address while the wallet is open in front of you. An xpub's prefix does
+not say which purpose it was derived under, and a BIP44 or BIP49 account
+key would hand out addresses the seed's m/84' account never signs for.
+The guard that does not depend on your eyes is on the vault: at the first
+`/deposit` the agent proves that the seed in its environment derives the
+paired xpub (the account number and the passphrase included) BEFORE it
+mints or publishes anything, and refuses the deposit otherwise
+(`btc_seed_xpub_mismatch`; `btc_seed_unset` when no seed is configured, and
+`btc_seed_invalid` for words that are not a mnemonic). The reason it is
+there and not in the forward: a forward takes the seed only after
+something has settled, so on its own it could prove the mismatch only
+once a client's money was already on an address nobody could sign for.
+
+The fee band: a server estimate ABOVE `--feerate-ceiling-sat-vb` is
+refused (a number nobody trusts is not clamped down to money), and one
+BELOW `--feerate-floor-sat-vb` pays the floor — the floor is your "never
+less than this", and a cheap network is the best day to forward, not one
+to wait out.
 
 What the vault does with it, per `/deposit`: refuses the amount below the
 intake floor before anything is minted (`deposit_too_small`; the floor is

@@ -375,9 +375,28 @@ try:
     _INTAKE_KEY = {"btc_account_xpub": _ZPUB4, "btc_electrum": ["s.onion"],
                    "btc_network": "main", "deposit_in_chat": True,
                    "account_ceiling": 500}
-    p4d, out4d, err4d, _r, text4d = cycle(
+    # THE SEED IS PROVEN AGAINST THE XPUB BEFORE AN ADDRESS IS ISSUED, on
+    # the machine that holds both: _ZPUB4 is account 0 of this mnemonic.
+    # Without it the deposit is refused before any child, over the real
+    # wire, and the doorbell hears "refused" with no address in it.
+    _MNEMONIC4 = ("abandon abandon abandon abandon abandon abandon abandon "
+                  "abandon abandon abandon abandon about")
+    os.environ.pop("GS_BTC_SEED", None)
+    p4n, out4n, err4n, _rn, text4n = cycle(
         "receive_and_quote", {"amount_sat": 5000000, "owner": P.HOST_OWNER},
         _bay, key_extra=_INTAKE_KEY,
+        deps_over={"run_child": _intake_child,
+                   "btc_unused": lambda a: (_asked4.append(a), True)[1]})
+    check("an intake deposit with NO seed in the vault's environment is "
+          "refused btc_seed_unset before any child runs, nothing is asked "
+          "about, and the doorbell hears 'refused'",
+          out4n is None and getattr(err4n, "code", None) == "btc_seed_unset"
+          and _ran4d == [] and _asked4 == [] and p4n is not None
+          and p4n.result and p4n.result["status"] == "refused"
+          and not (p4n.result.get("plain") or {}))
+    p4d, out4d, err4d, _r, text4d = cycle(
+        "receive_and_quote", {"amount_sat": 5000000, "owner": P.HOST_OWNER},
+        _bay, key_extra=_INTAKE_KEY, env={"GS_BTC_SEED": _MNEMONIC4},
         deps_over={"run_child": _intake_child,
                    "btc_unused": lambda a: (_asked4.append(a), True)[1]})
     _h4 = (out4d or ("", "", ""))[2]

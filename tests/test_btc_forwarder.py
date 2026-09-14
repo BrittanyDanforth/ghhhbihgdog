@@ -819,7 +819,25 @@ check("write_status never writes a word outside the two it may: anything "
       == {"state": "not_seen"})
 _r("no_fee_estimate", Net(fee=None))
 _r("fee_out_of_band", Net(fee=500))
-_r("fee_out_of_band", Net(fee=2), "--feerate-floor", "5")
+# BELOW THE FLOOR PAYS THE FLOOR. Refusing a cheap estimate as "out of band"
+# made an operator's floor turn every cheap day into a day nothing moved
+# (a refusal became `delayed`, retried hourly, for as long as the network
+# stayed cheap). Paying more than an estimate never strands money.
+_nf = Net(fee=2)
+_c, _o, _p, _ = run(_nf, "--feerate-floor", "5")
+check("an estimate UNDER the floor is not refused: the forward pays the "
+      "floor, says so, and the kind is on the chain",
+      _c == 0 and _p is not None and _p["feerate_target_sat_vb"] == 5
+      and ("forward", "fee_floor_applied") in _nf.kinds
+      and "paying the floor" in _o)
+_nf2 = Net(fee=7)
+_c, _o, _p, _ = run(_nf2, "--feerate-floor", "5")
+check("...an estimate inside the band is paid as estimated",
+      _c == 0 and _p["feerate_target_sat_vb"] == 7
+      and ("forward", "fee_floor_applied") not in _nf2.kinds)
+check("...and --feerate-sat-vb under the floor is likewise lifted to it",
+      run(Net(fee=50), "--feerate-floor", "5", "--feerate-sat-vb", "2")[2]
+      ["feerate_target_sat_vb"] == 5)
 # THE FRACTION GUARD MUST BE THE DECIDING CHECK. A 20,000-sat fixture at
 # 100 sat/vB was refused by every guard downstream (the fee exceeded the
 # whole deposit), so the 20% rule was never what refused it. 100,000 sat at

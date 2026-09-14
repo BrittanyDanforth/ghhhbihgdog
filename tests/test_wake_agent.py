@@ -4548,6 +4548,16 @@ check("pairing/btc: the operator is told the intake floor at pairing -- the "
       and any(f"--deposit-min-sat {_fl_want}" in ln for ln in _fl_lines)
       and any("--feerate-ceiling-sat-vb" in ln for ln in _fl_lines)
       and "for _line in intake_floor_lines(args):" in _kp_src)
+# THE FIRST ADDRESS, FOR THE OPERATOR'S EYES: an xpub's version bytes do not
+# say which purpose it was derived under, and a BIP44 account key would hand
+# out addresses the seed's m/84' account never signs for.
+_a0_want = __import__("gs_btc_watch").derive_receive_address(
+    _BTC_XPUB_OK, 0, "main")
+check("...and the account's FIRST address, with the path to compare it "
+      "against in the operator's wallet (a wrong-purpose xpub is caught by "
+      "eye before any client pays)",
+      any(_a0_want in ln for ln in _fl_lines)
+      and any("m/84'/coin'/0'/0/0" in ln for ln in _fl_lines))
 _nf_args = _K.build_cli().parse_args(
     ["pair", "--out", os.path.join(_fw_dir2, "k.key"), "--artifact-dir",
      _fw_dir2])
@@ -5320,8 +5330,11 @@ def _btc_env(prefix, handles=None):
 
 
 def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
-                  job_id="job-b"):
-    """(out, refused_code, addresses_asked, kinds)."""
+                  job_id="job-b", seed=_FWD_MNEMONIC, passphrase=None):
+    """(out, refused_code, addresses_asked, kinds). The seed rides in the
+    environment as the unit's EnvironmentFile puts it there: the deposit
+    proves it against the pair's xpub before it issues an address, so the
+    default is the mnemonic _ZPUB is account 0 of; None leaves it unset."""
     asked, kinds = [], []
 
     def ask(addr):
@@ -5330,6 +5343,13 @@ def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
         if isinstance(r, Exception):
             raise r
         return r
+    _env_was = {k: os.environ.get(k)
+                for k in ("GS_BTC_SEED", "GS_BTC_SEED_PASSPHRASE")}
+    for k, v in (("GS_BTC_SEED", seed), ("GS_BTC_SEED_PASSPHRASE", passphrase)):
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
     try:
         A.integrity_log = lambda st, kind, *a, **k: kinds.append(kind)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -5343,6 +5363,11 @@ def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
         out, code = None, e.code
     finally:
         A.integrity_log = _saved_il_ld
+        for k, v in _env_was.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return out, code, asked, kinds
 
 
@@ -5376,6 +5401,69 @@ check("the second deposit on the same ledger: index 1, asked about the "
       "address at index 1", _c is None and _rec4(_d4, "B4A2")["btc_index"] == 1
       and _asked == [_ADDR[1]]
       and A.plain_slip_for_chat(_BK, _d4, "done", "B4A2")["d"] == _ADDR[1])
+
+# THE SEED IS PROVEN AGAINST THE XPUB BEFORE AN ADDRESS IS ISSUED. Every
+# check before this one runs on the xpub ALONE -- the pairing derives address
+# 0 from it, the Pi watches under it, the agent allocates indexes under it --
+# so a BIP44/BIP49 account key (the same "xpub" prefix; P2WPKH addresses
+# derive from it just as well) passed them all, and the first client's money
+# settled on an address the forward refuses to sign for. The vault holds
+# both halves and proves them before anything is minted or published.
+_d4s, _runs4s, _run4s = _btc_env("btc4s_")
+_o, _c, _asked, _kinds = _btc_dispatch(_d4s, _run4s, "B4S1", True, seed=None)
+check("a BTC-intake deposit with NO seed in the environment: refused "
+      "btc_seed_unset before ANY child runs -- no subaddress minted, no "
+      "quote, no address asked about, nothing recorded, kind on the chain",
+      _c == "btc_seed_unset" and _runs4s == [] and _asked == []
+      and "btc_seed_unset" in _kinds
+      and not (_d4s / A.HANDLES_FILE).exists())
+_o, _c, _asked, _kinds = _btc_dispatch(
+    _d4s, _run4s, "B4S2", True,
+    seed="zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong")
+check("...a VALID seed whose m/84'/0'/0' is not the paired xpub: refused "
+      "btc_seed_xpub_mismatch before any child, nothing asked, kind on the "
+      "chain", _c == "btc_seed_xpub_mismatch" and _runs4s == []
+      and _asked == [] and "btc_seed_xpub_mismatch" in _kinds
+      and not (_d4s / A.HANDLES_FILE).exists())
+_o, _c, _asked, _kinds = _btc_dispatch(_d4s, _run4s, "B4S3", True,
+                                       seed="abandon " * 11 + "abandon")
+check("...words that are not a valid mnemonic (bad checksum): refused "
+      "btc_seed_invalid before any child",
+      _c == "btc_seed_invalid" and _runs4s == [] and _asked == []
+      and "btc_seed_invalid" in _kinds)
+_o, _c, _asked, _kinds = _btc_dispatch(_d4s, _run4s, "B4S4", True,
+                                       passphrase="pp")
+check("...the passphrase is part of the proof: the right words under a "
+      "passphrase the xpub was not derived with are a mismatch, no child",
+      _c == "btc_seed_xpub_mismatch" and _runs4s == [])
+_o, _c, _asked, _kinds = _btc_dispatch(_d4s, _run4s, "B4S5", True,
+                                       key={**_BK, "btc_account": 1})
+check("...and the account number is: the pair on account 1 with account "
+      "0's xpub is a mismatch, no child",
+      _c == "btc_seed_xpub_mismatch" and _runs4s == [])
+_btx_s = __import__("gs_btc_tx")
+_zpub1 = _btx_s.account_from_mnemonic(_FWD_MNEMONIC, "main", "", 1) \
+    .to_public().to_base58(version=__import__(
+        "embit.networks", fromlist=["NETWORKS"]).NETWORKS["main"]["zpub"])
+_addr1_0 = __import__("gs_btc_watch").derive_receive_address(_zpub1, 0, "main")
+_o, _c, _asked, _kinds = _btc_dispatch(
+    _d4s, _run4s, "B4S6", True,
+    key={**_BK, "btc_account": 1, "btc_account_xpub": _zpub1})
+check("...while account 1's OWN xpub on account 1 passes the proof: done, "
+      "index 0 of that chain issued, the network asked about its address 0, "
+      "both children ran",
+      _c is None and _rec4(_d4s, "B4S6").get("btc_index") == 0
+      and _asked == [_addr1_0] and len(_runs4s) == 2
+      and "btc_seed_xpub_mismatch" not in _kinds
+      and "btc_seed_unset" not in _kinds)
+# (find, not index: on a copy with the call removed this must read RED,
+# not die with no RESULT line -- which the sweep scores as no verdict)
+_pos_prove = _A_SRC.find('if job == "receive_and_quote" and btc_mode(key):\n'
+                         '        _prove_btc_seed(key)')
+check("...the proof is made BEFORE the mint (source): the call sits ahead "
+      "of build_argv in _dispatch, guarded by the intake mode",
+      0 <= _pos_prove
+      < _A_SRC.find("    steps = build_argv(job, params, key, artifact_dir"))
 
 # THE LEDGER IS NOT TRUSTED ALONE, and an EMPTY ledger behind a USED chain
 # is refused outright (STAGE5_PLAN.md 3.6): every address the gap search

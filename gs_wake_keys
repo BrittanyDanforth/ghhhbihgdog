@@ -651,10 +651,32 @@ def intake_floor_lines(args) -> list:
     if not getattr(args, "btc_xpub", ""):
         return []
     import gs_btc_tx as _btx
+    import gs_btc_watch as _w
     _floor = _btx.forward_floor_sat(int(args.op_return_max_bytes),
                                     int(args.feerate_ceiling_sat_vb))
     _btc = f"{_floor / 100_000_000:.8f}".rstrip("0").rstrip(".")
+    # THE FIRST ADDRESS, FOR THE OPERATOR'S EYES. An xpub's version bytes do
+    # not say which purpose it was derived under: a BIP44 or BIP49 account
+    # key carries the same "xpub" prefix, derives P2WPKH addresses here just
+    # as well, and the seed's m/84' account will never match it -- every
+    # deposit would settle on an address the forward refuses to sign for
+    # (seed_xpub_mismatch), until someone recovers it by hand with the right
+    # path. The seed is not here to check (it lives in the agent unit's
+    # environment, on the vault); the VAULT proves it derives this xpub at
+    # the first deposit, before an address is issued (gs_wake_agent
+    # _prove_btc_seed, btc_seed_xpub_mismatch), and that is the guard. This
+    # line is the operator's own check at the moment the wallet is open in
+    # front of them, and the one that costs no wake: a forward on its own
+    # never proves anything before a client has paid, since it takes the
+    # seed only after something has settled.
+    _a0 = _w.derive_receive_address(str(args.btc_xpub), 0,
+                                    str(args.btc_network or "main"))
     return [
+        f"      First address: {_a0}",
+        f"      Compare it with the wallet's first native-segwit receiving "
+        f"address (m/84'/coin'/{int(getattr(args, 'btc_account', 0))}'/0/0)",
+        f"      before any client pays; a different one means the seed will "
+        f"never sign for these deposits.",
         f"      Intake floor: {_floor} sat ({_btc} BTC) -- the smallest "
         f"deposit this pair can send on",
         f"      when fees are at its {int(args.feerate_ceiling_sat_vb)} "

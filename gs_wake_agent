@@ -1354,6 +1354,69 @@ def _btc_unused_live(key: dict, address: str) -> bool:
                      network=str(key.get("btc_network") or "main"))
 
 
+def _prove_btc_seed(key: dict) -> None:
+    """The seed in this machine's environment DERIVES the account xpub the
+    Pi watches -- proven before a deposit address is issued, never after a
+    client's money is on it.
+
+    An xpub's version bytes do not say which purpose it was derived under:
+    a BIP44 or BIP49 account key carries the same prefix, derives P2WPKH
+    addresses here just as well, and the seed's m/84' account never
+    matches it. Every check before this one ran on the xpub ALONE -- the
+    pairing derives address 0 from it, the Pi watches under it, this file
+    allocates indexes under it -- so a wrong-purpose xpub passed them all
+    and the first client's payment settled on an address the forward
+    refuses to sign for (btc_forwarder: seed_xpub_mismatch), to be
+    recovered by hand with the right path. The forwarder's proof is the
+    last line and stays; this is the FIRST, on the one machine that holds
+    both halves, at the one moment before which nothing is published. The
+    account key is derived and dropped; nothing is signed, logged or
+    written. An absent seed refuses the deposit for the reason the forward
+    refuses it (btc_seed_unset): an address for money this machine cannot
+    sign for is not an address to hand a client."""
+    import gs_btc_tx as _btx
+    if "GS_BTC_SEED" not in os.environ:
+        integrity_log("wake", "btc_seed_unset")
+        raise Refused(
+            "btc_seed_unset",
+            "the machine has no BTC seed configured, so no deposit address "
+            "was issued: the forward could never sign for it. Nothing was "
+            "published. Set GS_BTC_SEED in the agent unit's EnvironmentFile, "
+            "at the machine.")
+    account_no = _btc_setting(key, "btc_account", 0, 0, 2 ** 31 - 1)
+    account = None
+    try:
+        try:
+            account = _btx.account_from_mnemonic(
+                os.environ["GS_BTC_SEED"],
+                str(key.get("btc_network") or "main"),
+                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),
+                account=account_no)
+        except _btx.BtcTxError:
+            integrity_log("wake", "btc_seed_invalid")
+            raise Refused(
+                "btc_seed_invalid",
+                "the BTC seed in the agent unit's environment is not a valid "
+                "mnemonic, so no deposit address was issued: the forward "
+                "could never sign for it. Nothing was published. Fix "
+                "GS_BTC_SEED at the machine.")
+        ok = _btx.account_matches_xpub(account, str(key["btc_account_xpub"]))
+    finally:
+        del account
+    if not ok:
+        integrity_log("wake", "btc_seed_xpub_mismatch")
+        raise Refused(
+            "btc_seed_xpub_mismatch",
+            "the BTC seed in the agent unit's environment does not derive "
+            f"the account xpub this pair watches (m/84'/coin'/{account_no}'), "
+            "so no deposit address was issued: every deposit would settle "
+            "on an address the forward refuses to sign for. Nothing was "
+            "published. The xpub was exported under another purpose or "
+            "account, or with another passphrase: re-pair with the wallet's "
+            "native-segwit account xpub (gs_wake_keys prints its first "
+            "address to compare), or fix the seed at the machine.")
+
+
 def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
     """The next deposit index: one past the highest the ledger knows,
     stepping past any address the NETWORK says has been used, up to
@@ -3618,6 +3681,12 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # wallet is asked a single time rather than once per consultation.
     _owned_fee = (wallet_owned_fee_addresses(key)
                   if job == "withdraw" else [])
+    # ON THE INTAKE, THE SEED IS PROVEN BEFORE ANYTHING IS MINTED OR
+    # PUBLISHED (see _prove_btc_seed): a deposit address this machine could
+    # never sign for is not one to hand a client, and the refusal costs no
+    # child -- no XMR subaddress minted, no quote, no address asked about.
+    if job == "receive_and_quote" and btc_mode(key):
+        _prove_btc_seed(key)
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
                        slip=slip, handle=handle, owned_fee=_owned_fee,
                        btc_index=_btc_index, reconcile=_reconcile)

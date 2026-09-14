@@ -4371,7 +4371,7 @@ MUTATIONS = [
   '    if False:',
   ['test_btc_forwarder']),
  ('a fee estimate outside the band is paid', 'btc_forwarder',
-  '    if rate < floor or rate > ceiling:',
+  '    if rate > ceiling:',
   '    if False:',
   ['test_btc_forwarder']),
  ("an inbound address of another network is paid", 'btc_forwarder',
@@ -4861,6 +4861,33 @@ MUTATIONS = [
   '        _others = [k for k in h if k not in _intake]',
   '        _others = list(h)',
   ['test_wake_agent']),
+ ('the seed is not proven before a deposit address is issued',
+  'gs_wake_agent',
+  '    if job == "receive_and_quote" and btc_mode(key):\n'
+  '        _prove_btc_seed(key)',
+  '    if job == "receive_and_quote" and btc_mode(key):\n'
+  '        pass',
+  ['test_wake_agent']),
+ ('a seed that derives another account passes the proof', 'gs_wake_agent',
+  '    if not ok:\n        integrity_log("wake", "btc_seed_xpub_mismatch")',
+  '    if False:\n        integrity_log("wake", "btc_seed_xpub_mismatch")',
+  ['test_wake_agent']),
+ ('the passphrase is left out of the seed proof', 'gs_wake_agent',
+  '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
+  '                account=account_no)',
+  '                "",\n'
+  '                account=account_no)',
+  ['test_wake_agent']),
+ ('the account number is left out of the seed proof', 'gs_wake_agent',
+  '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
+  '                account=account_no)\n'
+  '        except _btx.BtcTxError:\n'
+  '            integrity_log("wake", "btc_seed_invalid")',
+  '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
+  '                account=0)\n'
+  '        except _btx.BtcTxError:\n'
+  '            integrity_log("wake", "btc_seed_invalid")',
+  ['test_wake_agent']),
  ('--reconcile re-signs when the bytes were kept', 'btc_forwarder',
   '        if plan.get("tx_hex"):\n            integrity_log("forward", "resend")',
   '        if False:\n            integrity_log("forward", "resend")',
@@ -4891,6 +4918,16 @@ MUTATIONS = [
   '        return "forward", [], "rejected"',
   '        raise SystemExit(EXIT_FAILED)',
   ['test_btc_forwarder']),
+ # The stages 1-2 self-doubt pass (STAGE5_PLAN.md section 9).
+ ('a cheap network is refused as out of band (the floor strands the good '
+  'days)', 'btc_forwarder',
+  '    if rate < floor:\n        integrity_log("forward", "fee_floor_applied")',
+  '    if rate < floor:\n        raise Refused("fee_out_of_band", "under")',
+  ['test_btc_forwarder']),
+ ('pairing prints no first address to compare', 'gs_wake_keys',
+  '        f"      First address: {_a0}",',
+  '        f"      First address: ",',
+  ['test_wake_agent']),
  ('a never-paid deposit is watched for ever', 'gs_telegram_pager',
   '                       if (v["state"] == "not_seen"\n'
   '                           and _now - float(v.get("since") or _now)\n'

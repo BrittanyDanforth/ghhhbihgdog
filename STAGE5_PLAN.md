@@ -399,6 +399,75 @@ Read back against the code once every step was green, asking again
 
 ---
 
+## 9. The stages 1–2 pass: the watcher, the builder, the signer, read again
+
+Asked for after this stage landed, because the end-to-end read before it
+had found nine gaps the tests missed. `gs_btc_watch.py` (derivation,
+scripthash, the SOCKS5 and TLS transport, the framing caps, the Electrum
+client, `summarize`/`classify`, the server rotation, the fee-estimate
+conversion), `gs_btc_tx.py` (scripts, sizing, building, the account and
+key derivation, BIP143 signing and the independent verifier, the backend
+gate) and the forwarder's stage-2 guards were read top to bottom with the
+question "what would a real server, a real network, a real operator do
+here?", not "does a test cover it?".
+
+**Real, and fixed:**
+
+- **The fee floor turned cheap days into the days nothing moved.** An
+  estimate under `--feerate-floor` was refused as out of band -- the same
+  refusal as an estimate over the ceiling -- and since step 4 that refusal
+  is `delayed`, retried every hour for as long as the network stays cheap.
+  An operator who raised the floor above 1 (so a forward never sits for
+  hours) had every forward on a cheap day wait. Paying MORE than an
+  estimate never strands money; the floor now pays the floor, with a kind
+  on the chain, and only the ceiling refuses.
+- **A wrong-purpose xpub was caught only at forward time.** `derive_receive_address`
+  accepts an "xpub"-prefixed key of the right network and depth; a BIP44
+  or BIP49 account key carries the same prefix, derives P2WPKH addresses
+  just as well, and the seed's m/84' account never matches it -- every
+  deposit would settle on an address the forward refuses to sign for.
+  The first version of this fix printed the account's first address at
+  pairing for the operator to compare against their wallet, and called
+  the rehearsal the proof. Re-read with the question "when does the
+  forward take the seed?": after something has settled -- so the
+  rehearsal proves a mismatch only once a client's money is already on
+  the wrong address. That was a half fix. The guard is now on the VAULT,
+  the one machine holding both halves: `_prove_btc_seed` derives the
+  account from the seed in the agent's environment (account number and
+  passphrase included) and proves it against the paired xpub at the first
+  `/deposit`, before anything is minted or published; a mismatch, an
+  absent seed or invalid words refuse the deposit with the kind on the
+  chain and no child run. The pairing-time first address stays as the
+  operator's own check; the forwarder's proof stays as the last line.
+
+**Read and found sound** (recorded so the next reader need not re-derive
+them): the BTC/kB → sat/vB conversion (×1e5, rounded up, never 0); the
+SOCKS5 handshake fails closed on a proxy that will not take the isolation
+credential, resolves at the proxy, reads the bound address properly; the
+per-address credential is a salted hash of the tag with a constant
+password (Tor isolates on the pair); TLS 1.2+ with SNI, unverified, pinned
+by SHA-256 when a pin is given, the mismatch ending the look; the line and
+session byte caps are checked before the next read; height 0 and -1 are
+both "in the mempool", depth is never under 1 for a mined output even when
+the tip lags; `summarize` counts each output on its own; the server order
+is deterministic per scripthash so no one server sees every address; the
+BIP143 script code is the P2PKH form, SIGHASH_ALL, the witness is
+[sig, pubkey], the verifier re-derives from scratch; locktime is the tip
+height (valid from the next block), every input opts into RBF, one
+OP_RETURN, outputs never exceed inputs; the quote payload is byte for byte
+the production quote tool's; the memo's destination is read positionally
+and exactly, control characters refused, the hex-only binding refused.
+
+**Considered and left:** the dry run prints the signed hex of a real spend
+to the job log -- on a disk that already holds the seed, it adds nothing;
+a deposit paid in two parts is forwarded as two swaps (waiting for
+unconfirmed money would let a 1-satoshi griefing payment stall every
+forward); the sizing pays for the policy's largest OP_RETURN rather than
+the memo's real size, a few thousand satoshis at the ceiling, stated in
+the forwarder.
+
+---
+
 ## Status
 
 - [x] 1. floor and cap — test_btc_tx 101, test_btc_forwarder, test_wake_agent
@@ -418,3 +487,9 @@ Read back against the code once every step was green, asking again
 - [x] 9. anchors (41 for stage 5, 595 total), the sweep (39 caught first
       pass, the two non-verdicts fixed and re-swept), the full suite, this
       section, commit
+- [x] 10. the stages 1-2 pass (section 9): the fee floor pays the floor,
+      the seed proven against the xpub on the vault before an address is
+      issued, the first address at pairing -- 6 anchors (601 total, all
+      caught; one test-side crash on a mutated copy turned into a red
+      check and re-swept), test_btc_forwarder 221, test_wake_agent 700,
+      test_wake_endtoend 71, the full suite
