@@ -715,7 +715,13 @@ check("a finished forward with no phase is reported as a SIGNED rehearsal, "
       "vocabulary", _rc5 == 0 and "SIGNED" in _t5 and "Nothing was sent"
       in _t5 and "Handle" not in _t5 and "deposit address" not in _t5
       and "how to pay" not in _t5 and "stayed on the vault. Read" not in _t5)
-for _fph in ("sent", "unsure"):
+# ...AND `forwarded` (stage 6: the forward's transaction is in a block),
+# which the doorbell must accept on the wire (phase_is_known) and print as
+# the protocol's sentence, numberless, like the other two.
+for _fph in ("sent", "unsure", "forwarded"):
+    check(f"the doorbell knows the word {_fph!r} and its sentence carries "
+          "no digit", P.phase_is_known(_fph) and _fph in P.PHASE_LINES
+          and not any(ch.isdigit() for ch in P.PHASE_LINES[_fph]))
     _fw.pending.result = {"status": "done", "handle": "A3F1", "slip": "",
                           "plain": {}, "phase": _fph}
     _buf5 = io.StringIO()

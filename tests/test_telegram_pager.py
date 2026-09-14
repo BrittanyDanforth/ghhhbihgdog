@@ -4906,6 +4906,240 @@ check("after the forward reported SENT, /check on that deposit asks the XMR "
       "side (swap_status): the forward has nothing more to say; the entry "
       "is kept as sent", _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
       and (_sp3.btc_open.get("B4A1") or {}).get("state") == "sent")
+
+print("\n-- stage 6: the forward's question again, on a clock and on a "
+      "word --")
+# STAGE6_PLAN.md 1(a): after `sent` or `unsure` every tap went to the XMR
+# side and nothing ever asked the forward again, so the re-send, the
+# re-sign and the bump were unreachable until a restart. Past
+# --btc-recheck (or at once after `unsure`) the tap asks the forward; when
+# nobody taps, the tick starts that run itself; `forwarded` ends it.
+_q, _qs, _qt, _qj = _tapper()
+_q.btc_servers = [("s.onion", 50002, None)]
+_q.handle_owner["B4A1"] = 111
+_q.handle_job["B4A1"] = "receive_and_quote"
+_q._btc_register("B4A1", _BTC_ADDR, 111)
+_q._btc_forward_result("B4A1", "done", "sent", 111)
+_qlab = _q._label(111, "B4A1")
+_q.handle(_msg(111, 111, f"/check {_qlab}"))
+check("inside the recheck window a tap on a SENT deposit still asks the XMR "
+      "side, and the entry remembers the word",
+      _qj[-1][1] == "swap_status" and _q.btc_open.get("B4A1", {}).get("word") == "sent")
+_q.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q.btc_recheck_s - 1
+_q.handle(_msg(111, 111, f"/check {_qlab}"))
+check("...past --btc-recheck the same tap asks the FORWARD (the "
+      "reconciliation), the handle still on the sent list",
+      _qj[-1] == (111, "forward_to_swap", {"handle": "B4A1"})
+      and "B4A1" in _q._btc_sent_set())
+_q._btc_forward_result("B4A1", "done", "sent", 111)
+_q.handle(_msg(111, 111, f"/check {_qlab}"))
+check("...and the forward's answer (`sent` again, a bump or a listed one) "
+      "starts a fresh window: the next tap is the XMR side's again",
+      abs(_q.btc_open.get("B4A1", {}).get("sent_at", 0) - time.time()) < 5
+      and _qj[-1][1] == "swap_status")
+_q._btc_forward_result("B4A1", "done", "unsure", 111)
+_q.handle(_msg(111, 111, f"/check {_qlab}"))
+check("`unsure` makes the recheck due AT ONCE: the tap asks the forward, and "
+      "the handle is NOT learned as sent (an unsure forward is the forward's "
+      "question until it is sure, after a restart too)",
+      _qj[-1][1] == "forward_to_swap" and "B4A1" not in _q._btc_sent_set()
+      and _q._btc_recheck_due("B4A1"))
+_q._btc_forward_result("B4A1", "done", "forwarded", 111)
+_q.btc_open.get("B4A1", {})["sent_at"] = time.time() - 10 * _q.btc_recheck_s
+_q.handle(_msg(111, 111, f"/check {_qlab}"))
+check("`forwarded` ENDS the rechecks: however old, the tap asks the XMR "
+      "side; the entry is kept as forwarded with a reader's word of its own",
+      _qj[-1][1] == "swap_status" and _q.btc_open.get("B4A1", {}).get("state") == "forwarded"
+      and _q.btc_open.get("B4A1", {}).get("word") == "forwarded"
+      and pg.Pager.BTC_STATE_WORDS.get("forwarded")
+      and not _q._btc_recheck_due("B4A1"))
+_q2, _qs2, _qj2 = _watch_pager()
+_q2.btc_fee_retry_s = 3600
+_q2._btc_forward_result("B4A1", "done", "sent", 111)
+_q2.btc_open.get("B4A1", {})["sent_at"] = time.time() - 4 * 3600
+check("(setup) a sent entry past the window is due a recheck",
+      _q2._btc_recheck_due("B4A1"))
+_q2._btc_forward_result("B4A1", "done", "delayed", 111)
+check("a replacement the vault would not pay for today (`delayed` on a SENT "
+      "entry): the entry stays sent (the original stands), nothing said, and "
+      "the recheck is not due until --btc-fee-retry has passed",
+      _q2.btc_open.get("B4A1", {}).get("state") == "sent"
+      and not _q2._btc_recheck_due("B4A1") and _qs2 == []
+      and abs(_q2.btc_open.get("B4A1", {}).get("retry_after", 0) - (time.time() + 3600)) < 5)
+_q2.btc_open.get("B4A1", {})["retry_after"] = time.time() - 1
+check("...and due again once it has", _q2._btc_recheck_due("B4A1"))
+_q3, _qs3, _qj3 = _watch_pager()
+_q3._btc_forward_result("B4A1", "done", "sent", 111)
+_q3._btc_forward_result("B4A1", "failed", "", 111)
+_q3._btc_forward_result("B4A1", "refused", "", 111)
+check("a recheck that did not finish (failed, refused) leaves a SENT entry "
+      "sent -- not 'stalled', no 'it is here' line, nothing is here -- and "
+      "stamps it so the next window asks again",
+      _q3.btc_open.get("B4A1", {}).get("state") == "sent" and _qs3 == []
+      and "rechecked_at" in _q3.btc_open.get("B4A1", {}))
+# THE AUTOMATIC RECHECK, when nobody taps.
+_q4, _qs4, _qj4 = _watch_pager()
+_q4.btc_servers = [("s.onion", 50002, None)]
+_q4.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_q4._btc_forward_result("B4A1", "done", "sent", 111)
+_q4.btc_tick(look=_look_returning("not_seen"))
+check("the tick starts nothing for a sent forward inside the window",
+      _qj4 == [] and _qs4 == [])
+_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q4.btc_recheck_s - 1
+_q4.btc_tick(look=_look_returning("not_seen"))
+check("...past the window, with the box free, the tick starts the forward "
+      "itself (the recheck), ONCE, for the deposit's own chat, and stamps it",
+      _qj4 == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and "rechecked_at" in _q4.btc_open.get("B4A1", {}) and _qs4 == [])
+_q4.btc_tick(look=_look_returning("not_seen"))
+check("...and not again inside the same window", len(_qj4) == 1)
+_q4._btc_forward_result("B4A1", "done", "sent", 111)
+check("...the forward's answer does NOT clear the start stamp: the automatic "
+      "path starts one per window whatever word came back",
+      "rechecked_at" in _q4.btc_open.get("B4A1", {}))
+# Time passes for both stamps: the answer came after the start.
+_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q4.btc_recheck_s - 1
+_q4.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - _q4.btc_recheck_s - 2
+_q4.btc_tick(look=_look_returning("not_seen"))
+check("...the forward's answer opens a new window, and the next one past it "
+      "starts another", len(_qj4) == 2)
+_q4._btc_forward_result("B4A1", "done", "forwarded", 111)
+_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - 10 * _q4.btc_recheck_s
+_q4.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - 10 * _q4.btc_recheck_s
+_q4.btc_tick(look=_look_returning("not_seen"))
+check("...`forwarded` ends it: nothing more is started however old",
+      len(_qj4) == 2)
+# A NETWORK THAT KEEPS ANSWERING `unsure` costs one wake a window, not one
+# a tick: the word makes the recheck due at once, and the start stamp
+# holds the automatic path to once per window.
+_q7, _qs7, _qj7 = _watch_pager()
+_q7.btc_servers = [("s.onion", 50002, None)]
+_q7.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_q7._btc_forward_result("B4A1", "done", "unsure", 111)
+_q7.btc_tick(look=_look_returning("not_seen"))
+_q7._btc_forward_result("B4A1", "done", "unsure", 111)
+_q7.btc_tick(look=_look_returning("not_seen"))
+_q7.btc_tick(look=_look_returning("not_seen"))
+check("an `unsure` answer to the automatic recheck does not start another "
+      "at the next tick: once per window, whatever the word",
+      len(_qj7) == 1 and _q7._btc_recheck_due("B4A1")
+      and "B4A1" not in _q7._btc_sent_set())
+_q7.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - _q7.btc_recheck_s - 1
+_q7.btc_tick(look=_look_returning("not_seen"))
+check("...and a window after the last start it is asked again",
+      len(_qj7) == 2)
+# AFTER A RESTART the forward's answer is all this end has: it is learned
+# back onto the list as the entry it would have been, so the window and
+# the automatic recheck apply to it too. Before: the answer was learned
+# into the sent set alone, and with no entry the recheck was never due --
+# every later tap went to the XMR side for ever, the gap of 1(a) again.
+_q8, _qs8, _qt8, _qj8 = _tapper()
+_q8.btc_servers = [("s.onion", 50002, None)]
+_q8.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_q8.handle_owner["B4A1"] = 111
+_q8.handle_job["B4A1"] = "receive_and_quote"
+_q8._btc_forward_result("B4A1", "done", "sent", 111)      # never watched
+_q8e = _q8.btc_open.get("B4A1") or {}
+check("a `sent` answer about a forward this end never watched (a restart) "
+      "creates the entry: sent, the word, the clock, the chat, no address, "
+      "a `said` set", _q8e.get("state") == "sent" and _q8e.get("word") == "sent"
+      and abs(_q8e.get("sent_at", 0) - time.time()) < 5
+      and _q8e.get("chat") == 111 and _q8e.get("addr") == ""
+      and isinstance(_q8e.get("said"), set) and _q8._btc_watched("B4A1"))
+_q8.handle(_msg(111, 111, f"/check {_q8._label(111, 'B4A1')}"))
+check("...inside the window the tap asks the XMR side, as for any sent one",
+      _qj8[-1][1] == "swap_status")
+_q8.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q8.btc_recheck_s - 1
+_q8.handle(_msg(111, 111, f"/check {_q8._label(111, 'B4A1')}"))
+check("...past the window the tap asks the FORWARD again (the recheck "
+      "applies after a restart)",
+      _qj8[-1] == (111, "forward_to_swap", {"handle": "B4A1"}))
+_q8._btc_forward_result("B4A1", "done", "sent", 111)
+_q8.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q8.btc_recheck_s - 1
+_q8_n = len(_qj8)
+_q8.btc_tick(look=_look_returning("not_seen"))
+check("...and the tick starts the automatic recheck for it, for its own "
+      "chat, without looking at any address (there is none)",
+      _qj8[-1] == (111, "forward_to_swap", {"handle": "B4A1"})
+      and len(_qj8) == _q8_n + 1)
+_q8.handle(_msg(111, 111, "/balance"))
+check("...and /balance names it by its state word, in figures the chat "
+      "already had (none from this end)",
+      "sent on" in _qs8[-1][0] and "received so far: 0" in _qs8[-1][0])
+_q8._btc_forward_result("B4A1", "done", "returned", 111)
+check("money that came back to a forward learned after a restart: no "
+      "address to watch it on, so the entry is forgotten again and the "
+      "handle unlearned as sent (the tap asks the forward)",
+      "B4A1" not in _q8.btc_open and "B4A1" not in _q8._btc_sent_set())
+_q9, _qs9, _qt9, _qj9 = _tapper()
+_q9.btc_servers = [("s.onion", 50002, None)]
+_q9._btc_forward_result("B4A1", "done", "forwarded", 111)
+_q9._btc_forward_result("B4A4", "done", "not_yet", 111)
+_q9._btc_forward_result("zzzz", "done", "sent", 111)
+_q9._btc_forward_result("B4A2", "done", "sent", True)
+_q9._btc_forward_result("B4A3", "failed", "", 111)
+check("`forwarded` after a restart is learned the same way (terminal, "
+      "expiring on the same clock); not_yet, a bad handle, a bool chat and "
+      "a failure create nothing",
+      (_q9.btc_open.get("B4A1") or {}).get("state") == "forwarded"
+      and set(_q9.btc_open) == {"B4A1"})
+for _q9w in ("not_yet", "arriving"):
+    _q9._btc_forward_result("B4A5", "done", "sent", 111)
+    _q9._btc_forward_result("B4A5", "done", _q9w, 111)
+    check(f"a `{_q9w}` answer about a recovered entry (the vault no longer "
+          "says it went out) forgets it rather than leaving a looked-at "
+          "state with no address to look at",
+          "B4A5" not in _q9.btc_open)
+_q9.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_q9.btc_open.get("B4A1", {})["sent_at"] = time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1
+_q9.btc_tick(look=_look_returning("not_seen"))
+check("the recovered entry is dropped from the list and the sent set after "
+      "DEPOSIT_PLACE_TTL_S, like any sent one",
+      "B4A1" not in _q9.btc_open and "B4A1" not in _q9._btc_sent_set())
+_q5, _qs5, _qj5 = _watch_pager()
+_q5.btc_servers = [("s.onion", 50002, None)]
+_q5.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_q5._btc_forward_result("B4A1", "done", "unsure", 111)
+_q5.busy.acquire()
+_q5.btc_tick(look=_look_returning("not_seen"))
+check("`unsure` is due at once; with the box busy the recheck waits "
+      "silently, unstamped, for the next tick",
+      _qj5 == [] and _qs5 == [] and "rechecked_at" not in _q5.btc_open.get("B4A1", {}))
+_q5.busy.release()
+_q5.btc_tick(look=_look_returning("not_seen"))
+check("...and starts when the box is free",
+      _qj5 == [(111, "forward_to_swap", {"handle": "B4A1"})])
+_q6, _qs6, _qt6, _qj6 = _tapper()
+_q6.btc_servers = [("s.onion", 50002, None)]
+_q6.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_q6.handle_owner["B4A1"] = 111
+_q6.handle_job["B4A1"] = "receive_and_quote"
+_q6._btc_register("B4A1", _BTC_ADDR, 111)
+_q6._btc_forward_result("B4A1", "done", "forwarded", 111)
+_q6.btc_open.get("B4A1", {})["sent_at"] = time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1
+_q6.btc_tick(look=_look_returning("not_seen"))
+_q6.handle(_msg(111, 111, f"/check {_q6._label(111, 'B4A1')}"))
+check("a sent or forwarded entry forgotten after DEPOSIT_PLACE_TTL_S is "
+      "dropped from the sent set too: the next tap is the forward's question "
+      "again (it answers truthfully at every stage)",
+      "B4A1" not in _q6.btc_open and "B4A1" not in _q6._btc_sent_set()
+      and _qj6[-1] == (111, "forward_to_swap", {"handle": "B4A1"}))
+check("--btc-recheck defaults to three hours, has a floor of 600 s refused "
+      "at startup, and the startup line says to set it at or above the "
+      "vault's bump window",
+      pg.Pager.btc_recheck_s == 10800 and "btc_recheck" in _src_main
+      and "--btc-recheck" in __import__("inspect").getsource(pg.build_cli)
+      and "--btc-bump-after" in __import__("inspect").getsource(pg.Pager.run))
+check("_recheck_due_entry is pure: no entry, a seen entry, a pending fee "
+      "retry, a young sent one -- all False; unsure -- True",
+      pg.Pager._recheck_due_entry(_q6, None, 0) is False
+      and pg.Pager._recheck_due_entry(_q6, {"state": "seen"}, 0) is False
+      and pg.Pager._recheck_due_entry(_q6, {"state": "sent", "word": "unsure",
+                                            "retry_after": 10}, 5) is False
+      and pg.Pager._recheck_due_entry(_q6, {"state": "sent", "word": "sent",
+                                            "sent_at": 0}, 100) is False
+      and pg.Pager._recheck_due_entry(_q6, {"state": "sent", "word": "unsure",
+                                            "sent_at": 0}, 1) is True)
 _tap(_sp3, "c:B4A1")
 check("...and so does the button", _sj3[-1] == (111, "swap_status",
                                                  {"handle": "B4A1"}))
@@ -4913,11 +5147,20 @@ _sp4, _ss4, _st4, _sj4 = _tapper()
 _sp4.btc_servers = [("s.onion", 50002, None)]
 _sp4.handle_owner["B4A1"] = 111
 _sp4.handle_job["B4A1"] = "receive_and_quote"
-_sp4._btc_forward_result("B4A1", "done", "unsure", 111)   # never watched
+_sp4._btc_forward_result("B4A1", "done", "sent", 111)     # never watched
 _sp4.handle(_msg(111, 111, f"/check {_sp4._label(111, 'B4A1')}"))
 check("...a handle this end never watched (after a restart) whose forward "
-      "answered a word is learned from that answer: the next ask is "
+      "answered `sent` is learned from that answer: the next ask is "
       "swap_status", _sj4 == [(111, "swap_status", {"handle": "B4A1"})])
+# ...BUT NOT `unsure` (stage 6): a forward the vault was not sure went out
+# is the forward's question until it is sure -- unwatched, after a
+# restart, too. Learning it as sent routed every later tap to an XMR side
+# that could only answer "nothing yet", with the re-send unreachable.
+_sp4._btc_forward_result("B4A1", "done", "unsure", 111)
+_sp4.handle(_msg(111, 111, f"/check {_sp4._label(111, 'B4A1')}"))
+check("...and one whose forward answered `unsure` is asked of the forward "
+      "again, watched or not",
+      _sj4[-1] == (111, "forward_to_swap", {"handle": "B4A1"}))
 _sp5, _ss5, _st5, _sj5 = _tapper()
 _sp5.btc_servers = [("s.onion", 50002, None)]
 _sp5.handle_owner["B4A1"] = 111

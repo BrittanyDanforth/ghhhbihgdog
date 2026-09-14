@@ -2040,8 +2040,13 @@ plaintext trade is decided knowingly, in the same command, or not at all.
 python3 gs_wake_keys pair --deposit-in-chat \
     --btc-xpub <account xpub> --btc-electrum <host.onion> \
     --allow-btc-forward [--allow-btc-broadcast --thornode <url>] \
-    [--btc-account N] ...                                  # ON THE VAULT
+    [--btc-account N] [--btc-bump-after SECONDS] ...       # ON THE VAULT
 ```
+
+`--btc-bump-after` (default 7200, at most a week) is how long a forward may
+sit in the mempool before a run of the forward replaces it at today's rate
+(the bump, below); the pager's `--btc-recheck` must be at least this, or
+its rechecks never find one due.
 
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its
@@ -2121,6 +2126,10 @@ python3 gs_telegram_pager ... \
     --btc-fee-retry 3600   # how long after the vault would not pay today's
                            # fee for a forward this end tries again, by
                            # itself (floor 600)
+    --btc-recheck 10800    # how long after a forward went out this end asks
+                           # the forward about it again, by itself, once per
+                           # window (floor 600); at or above the vault's
+                           # --btc-bump-after, or a bump is never found due
     --deposit-min-sat N    # the vault's intake floor (printed at pairing),
                            # so the wizard refuses
                            # a too-small deposit HERE, with the number,
@@ -2137,9 +2146,16 @@ Sending it on now." at the configured depth, and then the forward's own
 word (`sent`, or `unsure` when the network was not seen to take it); a
 forward that did not go through is said once, with the button to try again.
 Once the forward has gone out, the button asks the swap side, as for any
-deposit; after a restart the first tap goes to the vault's forward, which
-answers that it went out without signing anything, and the taps after that
-ask the swap side.
+deposit — until `--btc-recheck` has passed since it went out (at once when
+the word was `unsure`), when the next tap, or the watcher itself if nobody
+taps, asks the forward again (the reconciliation, below), once per window,
+until the forward's transaction is in a block: the word `forwarded` ("the
+forward has confirmed. Nothing more to check on this side — ask again later
+for the arrival"), after which every tap asks the swap side. After a
+restart the first tap goes to the vault's forward, which answers what
+became of it without signing anything, and that answer puts the deposit
+back on this end's list with its word and its clock, so the same windows
+apply to it.
 `/balance` lists this chat's watched deposits by label and state, with the
 figures the chat already saw. Every one of those sentences is in the pager's
 banned-word scan; none carries a number the chat did not already have. A
@@ -2155,20 +2171,35 @@ the deposit, or the estimate is outside your band — is the word `delayed`:
 itself", and the pager tries again after `--btc-fee-retry`, through the
 same gates as any wake, without a tap. Money that can never be sent on at
 any rate this pair allows — under what was quoted — is `short`; the client
-can pay more to the same address. Once a forward has gone out, every tap
-runs the RECONCILIATION on the vault: it reads the address's history from
-your Electrum server and confirms the transaction is listed, re-sends the
-kept bytes if it is not, re-signs a fresh forward if the network dropped
-it, and — the case nobody plans for — sends on money that CAME BACK to the
-address (ThorChain refunds a swap it will not run to the paying address,
-and a client may pay twice): "some of it came back to where it was paid
-and is being sent on again". A spend of the address that is not the
-vault's own fails the run with `foreign_spend` on the chain: only a leaked
-seed does that, and the job log at the machine names the transaction.
-Never two signatures over one output while a spend of it may be in the
-network: that is the rule the reconciliation keeps, and the plan chain
-beside the ledger (`btc_forward_<handle>.json`, `.1.json`, …) is the record
-of every forward a deposit had. `--allow-btc-broadcast` needs `--thornode`:
+can pay more to the same address. Once a forward has gone out, a tap past
+the recheck window — and the watcher's own recheck, once per window — runs
+the RECONCILIATION on the vault (`STAGE6_PLAN.md`): it reads the address's
+history from your Electrum server and confirms the transaction is listed,
+re-sends the kept bytes if it is not, re-signs a fresh forward if the
+network dropped it, REPLACES a forward that has sat in the mempool past
+`--btc-bump-after` at a rate under today's estimate (the bump: the same
+outpoints signed again, whole, at today's rate, priced to beat every
+earlier signature of ours over them so any node takes it, quoted afresh,
+the new plan naming the one it replaces and carrying any money that came
+back and settled meanwhile — a forward that fell behind a later plan is
+found on the whole plan chain, not the current plan alone), and — the case
+nobody plans for — sends on money that CAME BACK to the address (ThorChain
+refunds a swap it will not run to the paying address, and a client may pay
+twice): "some of it came back to where it was paid and is being sent on
+again". A replacement the vault would not pay for today is `delayed` like a
+first forward, and the original stands. A spend of the address that is not
+the vault's own fails the run with `foreign_spend` on the chain: only a
+leaked seed does that, and the job log at the machine names the
+transaction. One signature per output while a spend of it may be in the
+network — a replacement is the one exception, and it is built to beat every
+earlier one, so whichever the network mines swaps once — is the rule the
+reconciliation keeps; the plan chain beside the ledger
+(`btc_forward_<handle>.json`, `.1.json`, …) is the record of every forward a
+deposit had, and the pairs file the XMR side judges the swap by counts one
+swap per outpoint, the one the reconciliation found in the network. The
+phone hears `sent` for a bump — never a fee, a rate, a txid or a count of
+attempts — and `forwarded` once the forward that is the record is in a
+block. `--allow-btc-broadcast` needs `--thornode`:
 money does not move on the aggregator's word alone. `--btc-account N`
 retires a chain: a vault whose ledger was wiped behind a used account, or
 paired to an account used before, refuses every deposit (`ledger_wiped`)

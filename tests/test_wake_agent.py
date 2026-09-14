@@ -4525,9 +4525,19 @@ for _extra, _why in (
         (_BTC_OK + ["--feerate-floor-sat-vb", "50",
                     "--feerate-ceiling-sat-vb", "10"], "an inverted fee band"),
         (_BTC_OK + ["--max-affiliate-bps", "5000"], "an affiliate cap over 10%"),
+        (_BTC_OK + ["--btc-bump-after", "-1"], "a negative bump window"),
+        (_BTC_OK + ["--btc-bump-after", "700000"], "a bump window over a week"),
         (_BTC_OK + ["--thornode", "ftp:/x"], "a THORNode URL that is not http")):
     check(f"pairing/btc: {_why} is refused at pairing",
           _pairs_btc(_extra) is not None)
+check("pairing/btc: the bump window pairs (a drill's 0 and a week both "
+      "pass) and is written to the keyfile as btc_bump_after_s, the name "
+      "the agent reads",
+      _pairs_btc(_BTC_OK + ["--btc-bump-after", "0"]) is None
+      and _pairs_btc(_BTC_OK + ["--btc-bump-after", "604800"]) is None
+      and '"btc_bump_after_s": int(args.btc_bump_after)' in _kp_src
+      and '_btc_setting(key, "btc_bump_after_s", 7200, 0, 7 * 86400)'
+      in _A_SRC)
 check("pairing/btc: the keyfile carries the fee band and the affiliate cap",
       '"feerate_floor_sat_vb": int(args.feerate_floor_sat_vb)' in _kp_src
       and '"max_affiliate_bps": int(args.max_affiliate_bps)' in _kp_src)
@@ -4981,6 +4991,77 @@ check("...a later forward (a returned deposit) rewrites again SUMMING what "
       == ["cd" * 32, "ab" * 32]
       and json.loads(_pp.read_text())[0]["quoted_at_deposit"]
       == {"btc_in": "0.05", "expected_xmr": "1.5"})
+# STAGE 6: A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP. A bump spends
+# the same outpoints again at today's rate and names the old plan in
+# `replaces`; counting both would tell the watcher to expect two arrivals
+# of one payment.
+_ppb = _pd / "thor_pairs_bump.json"
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+_NEW = {**_PLAN_Q, "txid": "ef" * 32, "replaces": "ab" * 32,
+        "expected_xmr": "1.25", "send_sat": 4960000}
+check("a bumped plan that names the one it replaces counts ALONE: the "
+      "pairs file carries the replacement's figures, not the sum",
+      A._reconcile_pairs({"slip": str(_ppb)}, _NEW, chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25"
+      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.0496"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ef" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...and when the network mined the ORIGINAL instead (the replacement "
+      "superseded by it), the original counts alone -- never both, never "
+      "neither",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "superseded_by": "ab" * 32},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.31"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ab" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...a returned deposit's second swap still SUMS with the first (no "
+      "`replaces`): the rule is about replacements only",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.56")
+# ONE SWAP PER OUTPOINT (stage 6, self-doubt pass). An evicted forward's
+# re-sign and a rejected re-send's fresh forward name nothing in
+# `replaces` -- the original was NOT in the network -- yet the original's
+# file still says sent and seen once, and it was summed beside the plan
+# that carries the money: the watcher expected two arrivals of one.
+_IN_A = [{"tx_hash": "ab" * 32, "vout": 0}]
+_P_E1 = {**_PLAN_Q, "txid": "11" * 32, "ts": 100, "inputs": _IN_A}
+_P_E2 = {**_PLAN_Q, "txid": "22" * 32, "ts": 200, "inputs": _IN_A,
+         "expected_xmr": "1.20", "send_sat": 4970000}
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("an evicted original and its re-sign spend the same outpoint: the "
+      "NEWEST counts alone (no `replaces` needed)",
+      A._reconcile_pairs({"slip": str(_ppb)}, _P_E2, chain=[_P_E1]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.20"
+      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.0497"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["22" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+_P_E3 = {**_PLAN_Q, "txid": "33" * 32, "ts": 300, "inputs": _IN_A,
+         "superseded_by": "22" * 32, "expected_xmr": "1.10"}
+check("three signatures over one outpoint and the MIDDLE one mined: the "
+      "current plan names it as the record and it counts alone, even "
+      "though its own rotated file still carries a stale superseded mark",
+      A._reconcile_pairs({"slip": str(_ppb)}, _P_E3,
+                         chain=[{**_P_E2, "superseded_by": "11" * 32},
+                                _P_E1]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.20"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["22" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...plans over DIFFERENT outpoints (a returned deposit's second "
+      "swap) still sum",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_P_E2, "inputs": [{"tx_hash": "cd" * 32,
+                                               "vout": 1}]},
+                         chain=[_P_E1]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.51")
 _pp2 = _pd / "thor_pairs_B.json"
 _pp2.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
@@ -5166,6 +5247,105 @@ check("the status-word table maps exactly the five words the forwarder "
                                   "delayed": "delayed", "short": "short",
                                   "returned": "returned"}
       and all(v in P.PHASES for v in A._FORWARD_STATUS_PHASE.values()))
+# STAGE 6: IN A BLOCK IS ITS OWN WORD. A forward whose plan says the network
+# kept it (seen at a height above 0 -- a reconciliation brings the plan up
+# to date with the height it was listed at) is `forwarded`: the Pi's
+# rechecks of it end there. Only an ACCEPTED forward can be; an ambiguous
+# one the network listed is made accepted by the reconciliation first.
+_om, _em, _ranm, _ddm, _bbm = _fwd_run_plan(_FWD_REC, _SEND_KEY,
+                                            {**_ACC, "seen_height": 850002})
+check("a done forward whose plan is seen IN A BLOCK is the word 'forwarded', "
+      "and its record is marked sent like any forward that went out",
+      _em is None and (_bbm.result or {}).get("phase") == "forwarded"
+      and (_bbm.result or {}).get("status") == "done"
+      and _rec_of(_ddm).get("forward_sent") is True)
+_o0, _e0, _ran0, _dd0, _bb0 = _fwd_run_plan(_FWD_REC, _SEND_KEY,
+                                            {**_ACC, "seen_height": 0})
+_oa, _ea, _rana, _dda, _bba = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "broadcast_outcome": "ambiguous",
+                          "seen_height": 850002})
+_ou, _eu, _ranu, _ddu, _bbu = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "seen": False, "seen_height": 850002})
+check("...seen in the mempool (height 0) is still 'sent'; an ambiguous "
+      "outcome is still 'unsure' whatever the height; a plan not seen at "
+      "all is 'sent' whatever height it carries",
+      (_bb0.result or {}).get("phase") == "sent"
+      and (_bba.result or {}).get("phase") == "unsure"
+      and (_bbu.result or {}).get("phase") == "sent")
+check("_forward_mined never raises: no plan, junk, a bool height, a height "
+      "of zero -- all False",
+      A._forward_mined(_ddm, "ZZZZ") is False
+      and A._forward_mined(_ddm, "A3F1", reader=lambda p: "junk") is False
+      and A._forward_mined(_ddm, "A3F1", reader=lambda p: {
+          "seen": True, "seen_height": True}) is False
+      and A._forward_mined(_ddm, "A3F1", reader=lambda p: {
+          "seen": True, "seen_height": 0}) is False
+      and A._forward_mined(_ddm, "A3F1", reader=lambda p: {
+          "seen": True, "seen_height": 5}) is True)
+check("the wire knows 'forwarded' and its sentence carries no digit",
+      "forwarded" in P.PHASES
+      and not any(ch.isdigit() for ch in P.PHASE_LINES["forwarded"]))
+# A PLAN SUPERSEDED BY ANOTHER FORWARD OF OURS THAT MINED (stage 6,
+# self-doubt pass): its own txid never mines, so reading its own height
+# alone kept the Pi asking after a forward whose money had long moved.
+# The reconciliation records the superseder's height; that is the word.
+_os1, _es1, _rans1, _dds1, _bbs1 = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "seen_height": 0,
+                          "superseded_by": "cd" * 32,
+                          "superseded_height": 850003})
+_os2, _es2, _rans2, _dds2, _bbs2 = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "broadcast_outcome": "ambiguous",
+                          "seen_height": 0, "superseded_by": "cd" * 32,
+                          "superseded_height": 850003})
+_os3, _es3, _rans3, _dds3, _bbs3 = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "seen_height": 0,
+                          "superseded_by": "cd" * 32,
+                          "superseded_height": 0})
+check("a plan superseded by a forward of ours IN A BLOCK is 'forwarded' -- "
+      "whatever its own outcome was (the record moved); one whose "
+      "superseder is still in the mempool is 'sent'",
+      (_bbs1.result or {}).get("phase") == "forwarded"
+      and (_bbs2.result or {}).get("phase") == "forwarded"
+      and (_bbs3.result or {}).get("phase") == "sent")
+check("_forward_mined reads the superseder's height only beside a "
+      "superseder, and never raises on junk there",
+      A._forward_mined(_ddm, "A3F1", reader=lambda p: {
+          "seen": True, "seen_height": 0, "superseded_by": "x",
+          "superseded_height": 5}) is True
+      and A._forward_mined(_ddm, "A3F1", reader=lambda p: {
+          "seen": True, "seen_height": 0, "superseded_height": 5}) is False
+      and A._forward_mined(_ddm, "A3F1", reader=lambda p: {
+          "seen": True, "seen_height": 0, "superseded_by": "x",
+          "superseded_height": True}) is False
+      and A._forward_superseded(_ddm, "A3F1", reader=lambda p: {
+          "superseded_by": "x"}) is True
+      and A._forward_superseded(_ddm, "ZZZZ") is False)
+# THE BUMP WINDOW RIDES ON THE ARGV FROM THE KEYFILE (STAGE6_PLAN.md 3.5):
+# two hours for a keyfile from before the field, the paired number
+# otherwise, and a present-but-wrong one refused, never coerced.
+
+
+def _flag_value(argv, flag):
+    """The value after `flag` on an argv, or None when the flag is absent
+    -- so a copy with the flag removed reads RED, not as a ValueError out
+    of list.index that ends the file with no RESULT line."""
+    return argv[argv.index(flag) + 1] if flag in argv else None
+
+
+check("the forwarder is handed --bump-after 7200 for a keyfile without the "
+      "field", bool(_ranm) and _flag_value(_ranm[0][0], "--bump-after") == "7200")
+_ob, _eb, _ranb, _ddb, _bbb = _fwd_run_plan(
+    _FWD_REC, {**_SEND_KEY, "btc_bump_after_s": 600}, _ACC)
+check("...and the keyfile's own number when it carries one",
+      _eb is None and bool(_ranb)
+      and _flag_value(_ranb[0][0], "--bump-after") == "600")
+for _bad in ("soon", -1, 10 ** 9, True):
+    _ox, _ex, _ranx, _ddx, _bbx = _fwd_run_plan(
+        _FWD_REC, {**_SEND_KEY, "btc_bump_after_s": _bad}, _ACC)
+    check(f"...a keyfile bump window of {_bad!r} is refused as malformed "
+          "before any child runs",
+          _ox is None and getattr(_ex, "code", None) == "btc_config_malformed"
+          and _ranx == [])
 _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, None)
 check("...any OTHER exit 2 (no status file) is still a failed job with no "
       "word", _o is not None and _o[1] == "failed"

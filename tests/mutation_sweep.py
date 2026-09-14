@@ -4358,7 +4358,7 @@ MUTATIONS = [
   '        if u["confirmations"] < 1:',
   ['test_btc_forwarder']),
  ('dust outputs are swept, so a dust storm strands the deposit', 'btc_forwarder',
-  '        elif u["value"] <= floor:',
+  '        elif u["value"] <= floor and not u.get("must"):',
   '        elif False:',
   ['test_btc_forwarder']),
  ("verify_signed trusts the signer's sighash cache", 'gs_btc_tx.py',
@@ -4576,8 +4576,10 @@ MUTATIONS = [
   '        return "sent"',
   ['test_wake_agent']),
  ('a rehearsal is reported with a word', 'gs_wake_agent',
-  '        if moved:\n            return "sent" if outcome == "accepted" else "unsure"',
-  '        if True:\n            return "sent" if outcome == "accepted" else "unsure"',
+  '        moved, outcome = _forward_outcome(artifact_dir, handle, reader)\n'
+  '        if moved:',
+  '        moved, outcome = _forward_outcome(artifact_dir, handle, reader)\n'
+  '        if True:',
   ['test_wake_agent']),
  ('a non-boolean allow_btc_broadcast is coerced', 'gs_wake_agent',
   '    if not isinstance(v, bool):',
@@ -4589,10 +4591,212 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the two forward words leave the closed vocabulary', 'gs_wake_proto.py',
   '          "more_locked", "moved", "partial", "full", "sent", "unsure",\n'
-  '          "delayed", "returned")',
+  '          "delayed", "returned", "forwarded")',
   '          "more_locked", "moved", "partial", "full",\n'
-  '          "delayed", "returned")',
+  '          "delayed", "returned", "forwarded")',
   ['test_wake_agent']),
+ ('the old plan is rotated aside before the fresh forward runs (the no_plan '
+  'trap)', 'btc_forwarder',
+  '        integrity_log("forward", f"reconcile_{why}")\n',
+  '        integrity_log("forward", f"reconcile_{why}")\n'
+  '        _rotate_plan(args.outfile)\n',
+  ['test_btc_forwarder']),
+ ('a missing current plan is not recovered from the chain', 'btc_forwarder',
+  '            plan0 = _recover_plan(args.outfile)',
+  '            plan0 = None',
+  ['test_btc_forwarder']),
+ ('a recovered plan is copied, not moved back', 'btc_forwarder',
+  '        if plan is not None:\n            os.replace(f, outfile)\n            return plan',
+  '        if plan is not None:\n            return plan',
+  ['test_btc_forwarder']),
+ ('a forward stuck in the mempool is never bumped', 'btc_forwarder',
+  '        hit = listed.get(t)\n        if hit is None or hit["height"] > 0:\n            continue',
+  '        hit = listed.get(t)\n        if True:\n            continue',
+  ['test_btc_forwarder']),
+ ('a mined forward is bumped too', 'btc_forwarder',
+  '        if hit is None or hit["height"] > 0:\n            continue',
+  '        if hit is None:\n            continue',
+  ['test_btc_forwarder']),
+ ('the bump does not raise the floor to what a node will take',
+  'btc_forwarder',
+  '            args.feerate_floor = replacement_floor(\n'
+  '                plan_b, _conflicts, args.op_return_max_bytes,\n'
+  '                args.feerate_floor)',
+  '            args.feerate_floor = args.feerate_floor',
+  ['test_btc_forwarder']),
+ ("the plan's inputs are not added to the look for the replacement",
+  'btc_forwarder',
+  '            with_plan_inputs(picture, plan_b, args.min_conf)',
+  '            pass',
+  ['test_btc_forwarder']),
+ ('a stuck predecessor is never bumped (the current plan alone is read)',
+  'btc_forwarder',
+  '        [plan] + [p for p in chain\n'
+  '                  if str(p.get("txid") or "").lower() != txid],',
+  '        [plan],',
+  ['test_btc_forwarder']),
+ ('money that came back is forwarded beside a stuck forward, not in its replacement',
+  'btc_forwarder',
+  '        if stuck is not None:\n'
+  '            return _bump(stuck)\n'
+  '        if settled_new:\n'
+  '            integrity_log("forward", "returned_settled")',
+  '        if stuck is not None and not settled_new:\n'
+  '            return _bump(stuck)\n'
+  '        if settled_new:\n'
+  '            integrity_log("forward", "returned_settled")',
+  ['test_btc_forwarder']),
+ ('the superseded path never bumps a stuck predecessor', 'btc_forwarder',
+  '        if stuck is not None:\n'
+  '            return _bump(stuck)\n'
+  '        if settled_new:\n'
+  '            return "forward", sorted(consumed), "returned"',
+  '        if settled_new:\n'
+  '            return "forward", sorted(consumed), "returned"',
+  ['test_btc_forwarder']),
+ ('the replacement outbids only the plan it replaces, not the forwards that conflict with it',
+  'btc_forwarder',
+  '    return max([bump_floor(stuck, op_return_limit, floor, n_inputs=n)]\n'
+  '               + [bump_floor(p, op_return_limit, floor, n_inputs=n)\n'
+  '                  for p in conflicts])',
+  '    return bump_floor(stuck, op_return_limit, floor, n_inputs=n)',
+  ['test_btc_forwarder']),
+ ('the bump window is measured from the replaced plan alone, not the newest attempt',
+  'btc_forwarder',
+  '                  "ts": max(stamps) if stamps else None}',
+  '                  "ts": min(stamps) if stamps else None}',
+  ['test_btc_forwarder']),
+ ('a must-spend outpoint is left out as dust at today\'s rate', 'btc_forwarder',
+  '        elif u["value"] <= floor and not u.get("must"):',
+  '        elif u["value"] <= floor:',
+  ['test_btc_forwarder']),
+ ("the replaced plan's inputs are not marked must-spend", 'btc_forwarder',
+  '             "confirmations": max(int(min_conf), conf), "must": True}',
+  '             "confirmations": max(int(min_conf), conf)}',
+  ['test_btc_forwarder']),
+ ('a bumped plan does not name what it replaces', 'btc_forwarder',
+  '        "replaces": _replaces,',
+  '        "replaces": None,',
+  ['test_btc_forwarder']),
+ ('a replacement over the ceiling is not the word delayed', 'btc_forwarder',
+  '                write_status(args.outfile, STATUS_DELAYED)\n'
+  '                raise Refused("bump_over_ceiling",',
+  '                raise Refused("bump_over_ceiling",',
+  ['test_btc_forwarder']),
+ ('the bump is due at any age', 'btc_forwarder',
+  '    return age >= float(bump_after_s) and fee_sat_vb > paid',
+  '    return fee_sat_vb > paid',
+  ['test_btc_forwarder']),
+ ('a mined forward is still the word sent', 'gs_wake_agent',
+  '            if _forward_mined(artifact_dir, handle, reader) and (\n'
+  '                    outcome == "accepted"\n'
+  '                    or _forward_superseded(artifact_dir, handle, reader)):\n'
+  '                return "forwarded"',
+  '            if False:\n'
+  '                return "forwarded"',
+  ['test_wake_agent']),
+ ('a replaced plan is counted beside its replacement', 'gs_wake_agent',
+  '        counted = [p for p in counted\n'
+  '                   if str(p.get("txid") or "").lower() not in _replaced]',
+  '        counted = list(counted)',
+  ['test_wake_agent']),
+ ('two forwards over one outpoint are both counted (an evicted original beside its re-sign)',
+  'gs_wake_agent',
+  '            if ops & spent:\n                continue',
+  '            if False:\n                continue',
+  ['test_wake_agent']),
+ ("the record's stale superseded mark drops it from the count", 'gs_wake_agent',
+  '                    and (not p.get("superseded_by")\n'
+  '                         or (_record and str(p.get("txid") or "").lower()\n'
+  '                             == _record))',
+  '                    and not p.get("superseded_by")',
+  ['test_wake_agent']),
+ ('a superseded plan whose superseder mined is still the word sent', 'gs_wake_agent',
+  '        return (bool(plan.get("superseded_by"))\n'
+  '                and _pos_int(plan.get("superseded_height")))',
+  '        return False',
+  ['test_wake_agent']),
+ ("the superseder's height is not recorded on the superseded plan", 'btc_forwarder',
+  '        plan["superseded_height"] = int(newest["height"])\n',
+  '',
+  ['test_btc_forwarder']),
+ ('the bump window is not handed to the forwarder', 'gs_wake_agent',
+  '                "--bump-after", str(_bump),\n',
+  '',
+  ['test_wake_agent']),
+ ('the pairing does not write the bump window', 'gs_wake_keys',
+  '        "btc_bump_after_s": int(args.btc_bump_after),\n',
+  '',
+  ['test_wake_agent']),
+ ('the recheck is never due', 'gs_telegram_pager',
+  '        if e.get("word") == "unsure":\n'
+  '            return True\n'
+  '        return now - float(e.get("sent_at") or now) >= float(self.btc_recheck_s)',
+  '        return False',
+  ['test_telegram_pager']),
+ ('a due recheck still asks the XMR side', 'gs_telegram_pager',
+  '                                 or self._btc_recheck_due(_h)))',
+  '                                 or False))',
+  ['test_telegram_pager']),
+ ('the automatic recheck starts every tick', 'gs_telegram_pager',
+  '                    if e is not None:\n                        e["rechecked_at"] = _now',
+  '                    if e is not None:\n                        pass',
+  ['test_telegram_pager']),
+ ('the forgotten entry keeps routing to the XMR side', 'gs_telegram_pager',
+  '                self._btc_sent_set().discard(_h)\n'
+  '                integrity_log("pager", "btc_watch_forgotten")',
+  '                integrity_log("pager", "btc_watch_forgotten")',
+  ['test_telegram_pager']),
+ ('forwarded does not end the rechecks', 'gs_telegram_pager',
+  '                e["state"] = "forwarded"\n'
+  '                e["word"] = phase',
+  '                e["state"] = "sent"\n'
+  '                e["word"] = phase',
+  ['test_telegram_pager']),
+ ('a delayed replacement re-watches a sent deposit', 'gs_telegram_pager',
+  '                if e["state"] in ("sent", "forwarded"):\n'
+  '                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY',
+  '                if False:\n'
+  '                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY',
+  ['test_telegram_pager']),
+ ('an unsure answer restarts the automatic recheck at the next tick (a wake a tick)',
+  'gs_telegram_pager',
+  '                e["state"] = "sent"\n'
+  '                e["word"] = phase\n'
+  '                e["sent_at"] = time.time()\n'
+  '                e.pop("retry_after", None)\n'
+  '                return',
+  '                e["state"] = "sent"\n'
+  '                e["word"] = phase\n'
+  '                e["sent_at"] = time.time()\n'
+  '                e.pop("retry_after", None)\n'
+  '                e.pop("rechecked_at", None)\n'
+  '                return',
+  ['test_telegram_pager']),
+ ('a forward learned after a restart is not put back on the list', 'gs_telegram_pager',
+  '            if (not e and out == "done"\n'
+  '                    and phase in ("sent", "unsure", "forwarded")',
+  '            if (False and out == "done"\n'
+  '                    and phase in ("sent", "unsure", "forwarded")',
+  ['test_telegram_pager']),
+ ('returned money on a recovered entry leaves a looked-at entry with no address',
+  'gs_telegram_pager',
+  '            if out == "done" and phase == "returned":\n'
+  '                if not e.get("addr"):',
+  '            if out == "done" and phase == "returned":\n'
+  '                if False:',
+  ['test_telegram_pager']),
+ ('not_yet on a recovered entry leaves a looked-at entry with no address',
+  'gs_telegram_pager',
+  '            if out == "done" and phase in ("arriving", "not_yet"):\n'
+  '                if not e.get("addr"):',
+  '            if out == "done" and phase in ("arriving", "not_yet"):\n'
+  '                if False:',
+  ['test_telegram_pager']),
+ ('the mined-forward word leaves the closed vocabulary', 'gs_wake_proto.py',
+  '          "delayed", "returned", "forwarded")',
+  '          "delayed", "returned")',
+  ['test_wake_doorbell', 'test_wake_agent']),
  ('the "sent" sentence names a machine and a number', 'gs_wake_proto.py',
   '    "sent": "the forward went out. It confirms on its own — ask again "\n            "later.",',
   '    "sent": "the forward went out from the vault. It confirms in 10 minutes.",',
@@ -4733,10 +4937,10 @@ MUTATIONS = [
  # which cannot move the money sitting on the host's address.
  ('after a restart the button on an intake deposit asks the XMR-side probe',
   'gs_telegram_pager',
-  '            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers)) \\\n'
-  '                and _h not in self._btc_sent_set()',
-  '            _ask_forward = self._btc_watched(_h) \\\n'
-  '                and _h not in self._btc_sent_set()',
+  '            _ask_forward = ((self._btc_watched(_h) or bool(self.btc_servers))\n'
+  '                            and (_h not in self._btc_sent_set()',
+  '            _ask_forward = (self._btc_watched(_h)\n'
+  '                            and (_h not in self._btc_sent_set()',
   ['test_telegram_pager']),
  # THE WATCHER STARTS THE FORWARD INTO A HELD LOCK: start_job answers "no:
  # busy" into the chat and the entry, marked "forwarding", is never looked at
@@ -4762,9 +4966,9 @@ MUTATIONS = [
  # it hits the once-sent rule, and the client hears nothing useful.
  ('after the forward went out the tap still asks the forward',
   'gs_telegram_pager',
-  '            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers)) \\\n'
-  '                and _h not in self._btc_sent_set()',
-  '            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers))',
+  '                            and (_h not in self._btc_sent_set()\n'
+  '                                 or self._btc_recheck_due(_h)))',
+  '                            and True)',
   ['test_telegram_pager']),
  # STAGE 5 (STAGE5_PLAN.md). Step 2: money does not move on the
  # aggregator's word alone, and the account number reaches the signer.
@@ -4928,8 +5132,8 @@ MUTATIONS = [
   ['test_btc_forwarder']),
  ('a fresh forward overwrites the earlier plan instead of rotating it',
   'btc_forwarder',
-  '        _rotate_plan(args.outfile)\n    if picture["settled_sat"] <= 0:',
-  '        pass\n    if picture["settled_sat"] <= 0:',
+  "    if why:\n        # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,",
+  "    if False:\n        # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,",
   ['test_btc_forwarder']),
  ('a rejected re-send is a dead end', 'btc_forwarder',
   '        return "forward", [], "rejected"',
@@ -4966,14 +5170,14 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('a sent deposit is dropped from the list (its address forgotten)',
   'gs_telegram_pager',
-  '                e["state"] = "sent"\n                e["sent_at"] = time.time()',
-  '                opened.pop(h, None)\n                e["sent_at"] = time.time()',
+  '                e["state"] = "sent"\n                e["word"] = phase',
+  '                opened.pop(h, None)\n                e["word"] = phase',
   ['test_telegram_pager']),
  ('a sent deposit is watched for ever', 'gs_telegram_pager',
-  '                       or (v["state"] == "sent"\n'
+  '                       or (v["state"] in ("sent", "forwarded")\n'
   '                           and _now - float(v.get("sent_at") or _now)\n'
   '                           >= proto.DEPOSIT_PLACE_TTL_S)]:',
-  '                       or (v["state"] == "sent"\n'
+  '                       or (v["state"] in ("sent", "forwarded")\n'
   '                           and _now - float(v.get("sent_at") or _now)\n'
   '                           >= float("inf"))]:',
   ['test_telegram_pager']),

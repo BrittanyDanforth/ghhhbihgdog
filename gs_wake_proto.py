@@ -194,7 +194,13 @@ import time
 #: being sent on again), for stage 5's failure handling. As with 5: no
 #: record changes shape, the closed vocabulary grows, an old Pi refuses a
 #: new vault's M3 carrying either word, loud. Update both boxes together.
-WIRE_VERSION = 7
+#:
+#: 8: one phase word, `forwarded` (a forward's transaction is in a block;
+#: the Pi's rechecks of it end, and what arrives is the XMR side's
+#: question), for stage 6's tracking after the send. As with 5 and 7: no
+#: record changes shape, the closed vocabulary grows, an old Pi refuses a
+#: new vault's M3 carrying it, loud. Update both boxes together.
+WIRE_VERSION = 8
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -425,9 +431,13 @@ BTC_INDEX_GAP = 20
 #:              that says "failed" about money in flight is telling a lie
 #:              the operator will act on. The signed transaction is kept
 #:              on the vault until the network shows it.
+#:   forwarded  a forward's transaction is IN A BLOCK (stage 6): the Pi's
+#:              rechecks of it end and the arrival is the XMR side's
+#:              question. `sent` says a server took it; this says the
+#:              network kept it. Says nothing about depth.
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
           "more_locked", "moved", "partial", "full", "sent", "unsure",
-          "delayed", "returned")
+          "delayed", "returned", "forwarded")
 
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
@@ -909,6 +919,11 @@ PHASE_LINES = {
     # know only that it is handled.
     "returned": "some of it came back to where it was paid and is being sent "
                 "on again — nothing to do.",
+    # THE FORWARD IS IN A BLOCK (stage 6). The Pi stops asking the forward
+    # about it; the arrival is the other side's question. No depth, no
+    # coin, no count.
+    "forwarded": "the forward has confirmed. Nothing more to check on this "
+                 "side — ask again later for the arrival.",
     # NOT RENDERED ON ITS OWN. The pager acts on this one -- it starts the
     # next leg -- and says so in its own words, because "more left" is not
     # something the operator has to do anything about. The sentence is here

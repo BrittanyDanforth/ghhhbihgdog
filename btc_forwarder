@@ -165,6 +165,11 @@ PLAN_SCHEMA = "gs_btc_forward_v2"
 DEFAULT_QUOTE_MAX_AGE_S = 300
 #: The clock the quote's age is measured on; a name so a test can move it.
 _clock = time.monotonic
+#: How long a forward may sit in the mempool, at a rate under today's
+#: estimate, before --reconcile replaces it (stage 6). Two hours: a target
+#: of three blocks that has not landed in twelve is not a slow day, and
+#: ThorChain's inbound vault churns on a scale of days.
+DEFAULT_BUMP_AFTER_S = 7200
 #: The environment variable that carries the seed, and its optional
 #: passphrase. Never argv: /proc/<pid>/cmdline is 0444.
 SEED_ENV = "GS_BTC_SEED"
@@ -249,6 +254,16 @@ def select_inputs(utxos, min_conf, rate, exclude=()):
     NEVER TWICE: an outpoint in `exclude` -- consumed by a forward of ours
     the network lists (--reconcile) -- is not spendable money whatever a
     server says, and is left out before anything else is decided.
+    AND ONE MORE RULE (stage 6): an output marked `must` -- one a forward
+    of ours in the mempool already spends, that its REPLACEMENT is being
+    built over (with_plan_inputs) -- is spent whether or not it is worth
+    spending at today's rate. It is committed either way: the stuck
+    transaction spends it, and the replacement conflicts with the stuck
+    one by spending the same outpoints, so the floor a node takes
+    (bump_floor) is sized over the SAME number of inputs; leave one out
+    as dust and the replacement pays less than that floor was computed
+    for and is refused. Settlement is still required: a `must` output the
+    server now shows shallow (a reorg) is not spent.
     Returns (chosen, skipped_dust, unsettled)."""
     marginal_vb = btx.INPUT_BASE + -(-btx.WITNESS_P2WPKH_MAX // 4)
     floor = 2 * marginal_vb * rate
@@ -259,7 +274,7 @@ def select_inputs(utxos, min_conf, rate, exclude=()):
             continue
         if u["confirmations"] < min_conf or u["confirmations"] < 1:
             unsettled += 1
-        elif u["value"] <= floor:
+        elif u["value"] <= floor and not u.get("must"):
             dust += 1
         else:
             chosen.append(u)
@@ -847,11 +862,192 @@ def _rotate_plan(outfile):
 
 
 def _read_plan(path):
+    plan = _plan_file(path)
+    if plan is None:
+        raise Refused("no_plan", "the plan file is not one this tool wrote")
+    return plan
+
+
+def _plan_file(path):
+    """THE ONE PLACE A PLAN IS READ FROM DISK: the JSON at `path`, or None
+    when it is not a plan this tool wrote (the schema). A missing or
+    malformed file raises (OSError, ValueError) as it always did. One read
+    site, so the tripwire "a transaction is read from a file only from the
+    tool's own plan, schema checked" stays a count of one."""
     with open(path, encoding="utf-8") as fh:
         plan = json.load(fh)
     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
-        raise Refused("no_plan", "the plan file is not one this tool wrote")
+        return None
     return plan
+
+
+def _recover_plan(outfile):
+    """The plan a reconciliation reads when the CURRENT file is gone: the
+    newest rotated predecessor that is one of ours, MOVED BACK to be the
+    current plan, or None (stage 6, STAGE6_PLAN.md 3.2).
+
+    The chain could be left without a current plan: the fresh forward a
+    verdict called for used to rotate the current plan aside FIRST and then
+    refuse (a fee over the ceiling, a quote that failed, a memo that would
+    not fit), and the next run answered `no_plan` about a forward whose
+    whole record sat one file over, for ever. Rotation now happens when the
+    fresh plan is written; this repairs a chain already in that state.
+    RESTORED, not copied: a reconciliation brings its plan up to date at
+    the outfile, and a copy left at `<stem>.<n>.json` would be the same
+    forward counted twice by the pairs rewrite. No Refused is constructed
+    for a rotated file that is not ours -- that would put a refusal on the
+    chain for a file being skipped."""
+    for f in _plan_chain(outfile):
+        if Path(f) == Path(outfile):
+            continue
+        try:
+            plan = _plan_file(f)
+        except (OSError, ValueError):
+            continue
+        if plan is not None:
+            os.replace(f, outfile)
+            return plan
+    return None
+
+
+def bump_due(plan, fee_sat_vb, bump_after_s, now=None):
+    """Is a forward LISTED IN THE MEMPOOL worth replacing at today's rate
+    (stage 6, STAGE6_PLAN.md 3.1)? Yes when it has sat there at least
+    `bump_after_s` seconds (from the plan's own send stamp) AND the
+    estimate is above the rate it pays. A plan that does not know its rate
+    (one reconstructed from the chain) is never bumped: nothing here would
+    know what to pay more than. Pure; the clock may be injected."""
+    paid = plan.get("feerate_target_sat_vb")
+    ts = plan.get("ts")
+    if isinstance(paid, bool) or not isinstance(paid, int) or paid < 1:
+        return False
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False
+    if isinstance(fee_sat_vb, bool) or not isinstance(fee_sat_vb, int):
+        return False
+    age = (now if now is not None else time.time()) - float(ts)
+    return age >= float(bump_after_s) and fee_sat_vb > paid
+
+
+def _outpoints(items):
+    return {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in items or []}
+
+
+def stuck_forward(candidates, spends, ours, fee_sat_vb, bump_after_s,
+                  now=None):
+    """(the plan to replace, the plans that conflict with it) or (None, []).
+
+    The plan of ours -- the CURRENT one first, then the chain's rotated
+    predecessors -- whose transaction is listed in the mempool and is due
+    a bump: today's estimate above the rate IT pays, and the NEWEST forward
+    of ours over its outpoints (itself, or a later plan that conflicts with
+    it) sent at least `bump_after_s` ago (bump_due).
+
+    Why the whole chain and not the current plan alone (stage 6, self-doubt
+    pass): a forward left in the mempool can fall BEHIND a later plan --
+    money came back and was forwarded beside it (`returned`), and the
+    fresh plan became the current one. Read the current plan only and the
+    stuck one is never seen again: it waits at its old rate for ever while
+    ThorChain's inbound vault churns under it.
+
+    Why the conflicts come back with it: a chain can hold more than one
+    signature over the same outpoints already -- a replacement the server
+    asked does not list beside the original it does, an evicted re-sign
+    beside an original that came back. Each of those may be alive on some
+    node. The replacement is priced to beat EVERY one of them
+    (replacement_floor), so any node takes it, and whichever of them mines
+    swaps once; and the window is measured from the newest, so a
+    replacement sent minutes ago that the server has not seen yet is not
+    replaced again at once. Pure; the clock may be injected."""
+    listed = {s["txid"]: s for s in spends if s["txid"] in ours}
+    for c in candidates:
+        t = str(c.get("txid") or "").lower()
+        hit = listed.get(t)
+        if hit is None or hit["height"] > 0:
+            continue
+        mine = _outpoints(c.get("inputs"))
+        if not mine:
+            continue
+        conflicts = [p for p in candidates
+                     if str(p.get("txid") or "").lower() != t
+                     and mine & _outpoints(p.get("inputs"))]
+        stamps = [p.get("ts") for p in [c] + conflicts
+                  if isinstance(p.get("ts"), (int, float))
+                  and not isinstance(p.get("ts"), bool)]
+        newest = {"feerate_target_sat_vb": c.get("feerate_target_sat_vb"),
+                  "ts": max(stamps) if stamps else None}
+        if not bump_due(newest, fee_sat_vb, bump_after_s, now=now):
+            continue
+        return c, conflicts
+    return None, []
+
+
+def bump_floor(plan, op_return_limit, floor, n_inputs=None):
+    """The lowest rate a REPLACEMENT of `plan` may pay, so a node holding
+    the original takes it (BIP125): more absolute fee than the original by
+    at least the incremental relay fee (one sat per vB of the replacement).
+    Sized against the replacement's own bound over `n_inputs` inputs (the
+    plan's own count when not given): ceil((old fee + bound) / bound), and
+    never under the paid rate plus one or the operator's floor. A
+    replacement with MORE inputs than that (money that came back rides in
+    it) pays more absolute fee still at the same rate, so the count of the
+    replaced plan's inputs is a safe lower bound."""
+    n = len(plan.get("inputs") or []) if n_inputs is None else int(n_inputs)
+    bound = btx.vsize_upper_bound(
+        max(1, n), [INBOUND_SPK_MAX, btx.op_return_script_len(op_return_limit)])
+    old_fee = int(plan.get("fee_sat") or 0)
+    by_fee = -(-(old_fee + bound) // bound)
+    paid = plan.get("feerate_target_sat_vb")
+    paid = int(paid) if isinstance(paid, int) and not isinstance(paid, bool) \
+        else 0
+    return max(int(floor), paid + 1, by_fee)
+
+
+def replacement_floor(stuck, conflicts, op_return_limit, floor):
+    """The rate a replacement of `stuck` pays at least: bump_floor over
+    the stuck plan AND every plan that conflicts with it, each sized over
+    the replacement's own input count, so a node holding any of them takes
+    the replacement in its place."""
+    n = len(stuck.get("inputs") or [])
+    return max([bump_floor(stuck, op_return_limit, floor, n_inputs=n)]
+               + [bump_floor(p, op_return_limit, floor, n_inputs=n)
+                  for p in conflicts])
+
+
+def with_plan_inputs(picture, plan, min_conf):
+    """The look's picture with the plan's inputs added as settled money:
+    an Electrum server's listunspent HIDES an output that a mempool
+    transaction spends, so the outputs a stuck forward spends are not in
+    the look, and the replacement has to be built from the plan's own
+    record of them. Deduplicated by outpoint against what the look did
+    return (a server whose mempool never saw our transaction lists them
+    still). They were settled to `min_conf` when they were chosen and depth
+    only grows, so each carries at least that depth. Each is marked `must`
+    (select_inputs): the replacement spends every outpoint the stuck
+    transaction spends, dust at today's rate or not. Returns the sat
+    added."""
+    have = {(str(u["tx_hash"]).lower(), int(u["vout"])): u
+            for u in picture["utxos"]}
+    added = 0
+    for i in plan.get("inputs") or []:
+        key = (str(i["tx_hash"]).lower(), int(i["vout"]))
+        if key in have:
+            have[key]["must"] = True
+            continue
+        conf = i.get("confirmations")
+        conf = (int(conf) if isinstance(conf, int)
+                and not isinstance(conf, bool) else 0)
+        value = int(i["value"])
+        u = {"tx_hash": key[0], "vout": key[1], "value": value,
+             "confirmations": max(int(min_conf), conf), "must": True}
+        picture["utxos"].append(u)
+        have[key] = u
+        added += value
+    picture["settled_sat"] = int(picture.get("settled_sat") or 0) + added
+    picture["confirmed_sat"] = int(picture.get("confirmed_sat") or 0) + added
+    if picture["settled_sat"] > 0:
+        picture["state"] = watch.STATE_CONFIRMED
+    return added
 
 
 def _memo_is_ours(tx_hex, dest_xmr):
@@ -887,10 +1083,18 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         ("forward", exclude, why) money to send on that no listed forward
                                   of ours consumed: `evicted` (our unlisted
                                   transaction's own inputs, re-signed --
-                                  every input opts into RBF), or `returned`
-                                  (new outputs: a refund, a second payment).
-                                  The caller runs the ordinary forward with
-                                  `exclude` left out, after rotating the plan.
+                                  every input opts into RBF), `returned`
+                                  (new outputs: a refund, a second payment),
+                                  or `bumped` (stage 6: a forward of ours --
+                                  the current plan or a rotated predecessor,
+                                  handed back as a FOURTH element -- has sat
+                                  in the mempool past --bump-after at a rate
+                                  under today's estimate; the SAME outpoints,
+                                  replaced at today's rate, with whatever
+                                  settled since). The caller runs the
+                                  ordinary forward with `exclude` left out
+                                  and rotates the plan when it writes the
+                                  new one.
 
     A spend of the address that is not in our plan chain is examined: an
     OP_RETURN naming this destination is a forward of ours the chain
@@ -909,10 +1113,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         raise SystemExit(EXIT_FAILED)
     chain = []
     for f in _plan_chain(args.outfile):
+        # _plan_file, not _read_plan: a rotated file that is not ours is
+        # skipped, and skipping it must not construct a Refused (which
+        # puts a refusal on the chain and a line in the log).
         try:
-            chain.append(_read_plan(f))
-        except (OSError, ValueError, Refused):
+            _p = _plan_file(f)
+        except (OSError, ValueError):
             continue
+        if _p is not None:
+            chain.append(_p)
     ours = {str(p.get("txid") or "").lower() for p in chain
             if p.get("txid")}
     ours.add(str(plan.get("txid") or "").lower())
@@ -943,6 +1152,42 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                    and u["confirmations"] >= 1]
     unsettled_new = [u for u in fresh.values() if u not in settled_new]
     txid = str(plan.get("txid") or "").lower()
+    plan_inputs = {(str(i["tx_hash"]).lower(), int(i["vout"]))
+                   for i in plan.get("inputs") or []}
+    # STAGE 6: A FORWARD OF OURS LISTED IN THE MEMPOOL, AND SITTING THERE.
+    # A forward at a rate the network stopped confirming waited for ever
+    # ("nothing to send"), while ThorChain's inbound vault churns under it
+    # and the memo's limit protects the price of a swap that never happens.
+    # Every input opts into RBF: when it has sat for --bump-after and
+    # today's estimate is above the rate it pays, it is REPLACED -- a fresh
+    # forward over the SAME outpoints at today's rate, quoted afresh for
+    # the amount and the current inbound. The caller builds it from that
+    # plan's inputs (the look hides outputs a mempool transaction spends)
+    # with a floor a node holding the original will take (bump_floor), and
+    # the new plan names the replaced one in `replaces`. The exclusion list
+    # leaves out every outpoint a LISTED forward of ours consumed except
+    # the replaced transaction's own -- so money that came back to the
+    # address and settled rides in the replacement, one transaction, one
+    # fee, instead of a second forward beside a stuck one. The current
+    # plan is the first candidate and the chain's predecessors the rest
+    # (stuck_forward says why).
+    _est = (args.feerate_sat_vb if args.feerate_sat_vb
+            else picture.get("fee_sat_vb"))
+    stuck, conflicts = stuck_forward(
+        [plan] + [p for p in chain
+                  if str(p.get("txid") or "").lower() != txid],
+        spends, ours, _est, args.bump_after)
+
+    def _bump(stuck):
+        integrity_log("forward", "stuck_predecessor" if stuck is not plan
+                      else "stuck_current")
+        print("  reconcile: a forward of ours has sat in the mempool past "
+              "the bump window and today's estimate is above the rate it "
+              "pays. Replacing it at today's rate"
+              + (", with what settled since" if settled_new else "") + ".")
+        return ("forward", sorted(consumed - _outpoints(stuck.get("inputs"))),
+                "bumped", stuck, conflicts)
+
     if txid in listed:
         hit = listed[txid]
         plan["seen"] = True
@@ -960,6 +1205,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                  else f"in a block at height {hit['height']}")
         print(f"  reconcile: our transaction is listed {where}. Nothing to "
               "send.")
+        if stuck is not None:
+            return _bump(stuck)
         if settled_new:
             integrity_log("forward", "returned_settled")
             print(f"  reconcile: {len(settled_new)} new settled output(s) on "
@@ -976,8 +1223,6 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         print(f"  plan updated: {args.outfile}")
         return "done", EXIT_OK
     # NOT LISTED. Where are the inputs it spent?
-    plan_inputs = {(str(i["tx_hash"]).lower(), int(i["vout"]))
-                   for i in plan.get("inputs") or []}
     if plan_inputs and plan_inputs <= set(unspent):
         if plan.get("tx_hex"):
             integrity_log("forward", "resend")
@@ -997,11 +1242,18 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         newest = max((s for s in spends if s["txid"] in ours),
                      key=lambda s: (s["height"] <= 0, s["height"]))
         plan["superseded_by"] = newest["txid"]
+        # ...AND WHERE THAT ONE IS (stage 6): its height, so the agent can
+        # say `forwarded` once the forward that IS the record is in a
+        # block -- this plan's own txid never will be. Rewritten on every
+        # run, so a superseder that was in the mempool is caught mined.
+        plan["superseded_height"] = int(newest["height"])
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_superseded")
         print(f"  reconcile: this plan's inputs were spent by our listed "
               f"transaction {newest['txid']}; recorded.")
+        if stuck is not None:
+            return _bump(stuck)
         if settled_new:
             return "forward", sorted(consumed), "returned"
         return "done", EXIT_OK
@@ -1132,6 +1384,12 @@ def build_cli():
                     default=bcast.DEFAULT_SEEN_INTERVAL_S, metavar="S",
                     help="how often to ask while waiting (default "
                          f"{bcast.DEFAULT_SEEN_INTERVAL_S:g})")
+    ap.add_argument("--bump-after", type=int, default=DEFAULT_BUMP_AFTER_S,
+                    metavar="S",
+                    help="under --reconcile: a forward listed in the mempool "
+                         "for at least this many seconds, at a rate under "
+                         "today's estimate, is REPLACED at today's rate "
+                         f"(RBF; default {DEFAULT_BUMP_AFTER_S})")
     ap.add_argument("--plan-only", action="store_true",
                     help="stop before signing: no seed needed. The plan "
                          "file carries the unsigned transaction. Dry run "
@@ -1216,6 +1474,8 @@ def main(argv=None):
                            or args.seen_interval <= 0):
         raise Refused("bad_args", "--quote-max-age must be >= 1, "
                       "--seen-wait >= 0, --seen-interval > 0")
+    if args.bump_after < 0:
+        raise Refused("bad_args", "--bump-after cannot be negative")
     # MONEY DOES NOT MOVE ON THE AGGREGATOR'S WORD ALONE (STAGE5_PLAN.md
     # 3.5). The THORNode cross-check of the inbound address was optional,
     # so a sending forward could pay whatever address a compromised
@@ -1304,23 +1564,66 @@ def main(argv=None):
     # What became of it decides everything after this point; a fresh
     # forward, when one follows, leaves out every outpoint a listed forward
     # of ours consumed and does not overwrite the earlier plan.
-    exclude, why = (), None
+    exclude, why, _replaces = (), None, None
     if args.reconcile:
         try:
             plan0 = _read_plan(args.outfile)
         except (OSError, ValueError):
-            raise Refused("no_plan", "--reconcile needs the plan of the "
-                          "forward that went out, at --outfile")
+            # NO CURRENT PLAN. A chain whose current plan was rotated aside
+            # by a fresh forward that then refused (stage 5's ordering) is
+            # read from its newest predecessor rather than refused for
+            # ever (STAGE6_PLAN.md 1(b), 3.2); only a chain with no plan
+            # anywhere is `no_plan`.
+            plan0 = _recover_plan(args.outfile)
+            if plan0 is None:
+                raise Refused("no_plan", "--reconcile needs the plan of the "
+                              "forward that went out, at --outfile")
+            integrity_log("forward", "plan_recovered")
+            print("  [!] no current plan at the outfile; reading the newest "
+                  "rotated one (a fresh forward was refused after the "
+                  "rotation)")
         verdict = reconcile(args, plan0, picture, address, index, servers,
                             dest_xmr)
         if verdict[0] == "resend":
             verdict = resend(args, plan0, verdict[1], address, servers)
         if verdict[0] == "done":
             return verdict[1]
-        _, exclude, why = verdict
+        _, exclude, why = verdict[:3]
         exclude = [tuple(x) for x in exclude]
         integrity_log("forward", f"reconcile_{why}")
-        _rotate_plan(args.outfile)
+        if why == "bumped":
+            # THE REPLACEMENT SPENDS WHAT THE STUCK TRANSACTION SPENDS
+            # (stage 6, STAGE6_PLAN.md 3.1): that plan's inputs join the
+            # picture as settled money that MUST be spent, and the run's
+            # floor rises to what a node holding the original will take
+            # in its place -- and any node holding another forward of ours
+            # over the same outpoints (replacement_floor). The stuck plan
+            # is the current one or a rotated predecessor (stuck_forward);
+            # either way the new plan names it in `replaces` and the
+            # current plan is rotated aside when the new one is written.
+            plan_b, _conflicts = verdict[3], verdict[4]
+            _replaces = str(plan_b.get("txid") or "").lower()
+            with_plan_inputs(picture, plan_b, args.min_conf)
+            args.feerate_floor = replacement_floor(
+                plan_b, _conflicts, args.op_return_max_bytes,
+                args.feerate_floor)
+            if args.feerate_floor > args.feerate_ceiling:
+                # The original already pays what this box allows; more
+                # would be over the ceiling. It stands, and the Pi asks
+                # again after the fee window.
+                write_status(args.outfile, STATUS_DELAYED)
+                raise Refused("bump_over_ceiling",
+                              "replacing the forward would have to pay "
+                              f"over the {args.feerate_ceiling} sat/vB "
+                              "ceiling this box accepts; the original "
+                              "stands")
+        # THE OLD PLAN IS NOT ROTATED HERE. It stays the current plan until
+        # the fresh forward below has a plan to write (see write_plan at
+        # the end): every refusal between here and there -- a fee over the
+        # ceiling (`delayed`), a quote that fails, a memo that will not fit
+        # -- used to leave the chain with no current plan, and the next
+        # run refused `no_plan` about a forward whose record sat one file
+        # over (STAGE6_PLAN.md 1(b)).
     if picture["settled_sat"] <= 0:
         # NOTHING UNSPENT AT ALL: was it ever paid, and where did it go? A
         # forward that went out and died before its plan was written is
@@ -1540,7 +1843,17 @@ def main(argv=None):
         "reconcile_reason": why,
         "excluded_outpoints": len(exclude),
         "resends": 0,
+        # THE TRANSACTION THIS ONE REPLACES (a bump, stage 6), or None. The
+        # pairs rewrite counts a replaced plan and its replacement as ONE
+        # swap; the reconciliation marks whichever the network did not
+        # take as superseded.
+        "replaces": _replaces,
     }
+    if why:
+        # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,
+        # with a plan in hand to take its place; the chain is the record of
+        # every forward the deposit had, and it never lacks a current one.
+        _rotate_plan(args.outfile)
     write_plan(args.outfile, plan)
     if not args.broadcast:
         integrity_log("forward", "not_broadcast")

@@ -229,5 +229,31 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
    behind a used chain is refused with the next account named
    (`--btc-account`). What only mainnet proves is unchanged: that THORChain
    takes the memo.
+6. **The forward after the send**: a stuck forward found and replaced, the
+   reconciliation driven, a word for a mined forward. BUILT
+   (`STAGE6_PLAN.md` is its record, section 1 the end-to-end read that found
+   what stage 5 left half-wired, section 8 the self-doubt pass). The gaps:
+   the reconciliation was reachable only after a pager restart (every ask
+   after `sent` went to the XMR side, so the re-send, the re-sign and the
+   returned money were never invoked); a fresh forward refused after the
+   plan rotation left the chain with no current plan (`no_plan` for ever);
+   nothing bumped a forward the network stopped confirming; and the phone
+   could not tell a mined forward from one still waiting. Now: the Pi asks
+   the forward again past `--btc-recheck` (at once after `unsure`), by
+   itself once per window when nobody taps, and stops on `forwarded` (wire
+   v8); the forwarder REPLACES a forward of ours listed in the mempool past
+   `--bump-after` (keyfile `btc_bump_after_s`, paired with
+   `--btc-bump-after`) at a rate under today's estimate -- the same
+   outpoints, spent whole, at today's rate, priced to beat every earlier
+   signature of ours over them, quoted afresh, carrying money that came
+   back meanwhile, found on the whole plan chain and not the current plan
+   alone, the window measured from the newest attempt; rotation happens
+   when the fresh plan is written and a chain left without a current plan
+   is recovered; the pairs file counts one swap per outpoint, the record
+   the reconciliation named; a superseded plan whose superseder mined is
+   `forwarded`. A forward learned after a pager restart is put back on the
+   Pi's list with its word and clock, so the windows apply after a restart
+   too. The testnet drill gains act F (a replacement, `--bump-after 0`).
+   What only mainnet proves is unchanged.
 
 Mainnet only after every stage above is green on testnet and reviewed.

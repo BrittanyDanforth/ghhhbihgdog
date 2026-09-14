@@ -26,7 +26,13 @@ WHAT IT PROVES, on the box that can run it:
      money as unconfirmed when looked at;
   E. (stage 5) --reconcile against the real history: every listed
      transaction fetched from the server and re-hashed, our forward found
-     listed, the plan brought up to date, nothing sent again.
+     listed, the plan brought up to date, nothing sent again;
+  F. (stage 6) the bump: --reconcile with --bump-after 0 and the estimate
+     forced one above the rate the first send paid, while the forward still
+     sits in the mempool -- a REAL server takes a BIP125 replacement of a
+     transaction it holds (the same outpoints, today's rate, a fresh
+     quote), lists it, and the old plan is rotated aside naming what it
+     replaces. Skipped when act E found the forward already in a block.
 
 WHAT IT CANNOT PROVE, said plainly: that THORChain accepts the memo. There
 is no testnet THORChain and no testnet XMR quote, so the aggregator is
@@ -271,6 +277,67 @@ check("...it asked for no quote and rotated no plan: nothing was sent again",
           f for f in os.listdir(_scratch)
           if f.startswith("plan.") and f.endswith(".json") and f != "plan.json"
           and f[5:-5].isdigit()])
+
+# --- F. the bump, against the real mempool -----------------------------------
+print("\n== F. --reconcile --bump-after 0: the forward replaced while it sits ==")
+# Stage 6 (STAGE6_PLAN.md 3.1): a forward of ours listed in the mempool past
+# --bump-after at a rate under today's estimate is REPLACED -- the same
+# outpoints at today's rate, quoted afresh, the new plan naming the old.
+# The drill cannot wait two hours or move the market, so the window is zero
+# and the estimate is forced one above the rate the first send paid
+# (--feerate-sat-vb): the replacement is due at once, and pays the floor a
+# node holding the original takes (the original's fee plus its own size).
+# What it proves: a real server over Tor accepts a BIP125 replacement of a
+# transaction it holds, and lists it. What it cannot: a stuck predecessor
+# behind a later plan, or a replacement priced over several earlier
+# signatures -- those are driven against the mock in test_btc_forwarder.
+_paid = int((plan_r or {}).get("feerate_target_sat_vb") or 0)
+_mined = int((plan_r or {}).get("seen_height") or 0) > 0
+if plan_r is None or _mined or not _paid:
+    print("      skipped: the forward is already in a block, or act E left "
+          "no plan with a rate; there is nothing to replace")
+else:
+    _before_f = len(_posts)
+    argv_f = argv_r + ["--bump-after", "0", "--feerate-sat-vb",
+                       str(_paid + 1)]
+    buf_f = io.StringIO()
+    os.environ[F.SEED_ENV] = _SEED
+    os.environ["GS_BTC_XPUB"] = _XPUB
+    os.environ["GS_BTC_INDEX"] = "0"
+    try:
+        with redirect_stdout(buf_f):
+            code_f = F.main(argv_f)
+    except SystemExit as e:
+        code_f = e.code
+    finally:
+        os.environ.pop("GS_BTC_XPUB", None)
+        os.environ.pop("GS_BTC_INDEX", None)
+        os.environ.pop(F.SEED_ENV, None)
+    print("      " + "\n      ".join(buf_f.getvalue().strip().splitlines()))
+    plan_f = json.load(open(_out)) if os.path.exists(_out) else None
+    _chain_f = F._plan_chain(_out)
+    _old_f = json.load(open(_chain_f[1])) if len(_chain_f) > 1 else {}
+    check("with the window at zero and the estimate one above the rate paid, "
+          "--reconcile REPLACED the forward: a NEW transaction over the SAME "
+          "outpoints, accepted by a real server and seen, the plan saying "
+          "`bumped` and naming the one it replaces",
+          code_f == 0 and plan_f is not None
+          and plan_f.get("reconcile_reason") == "bumped"
+          and plan_f.get("replaces") == plan_r["txid"]
+          and plan_f.get("txid") != plan_r["txid"]
+          and plan_f.get("broadcast_outcome") == "accepted"
+          and plan_f.get("seen") is True
+          and {(i["tx_hash"], i["vout"]) for i in plan_f.get("inputs") or []}
+          == {(i["tx_hash"], i["vout"]) for i in plan_r.get("inputs") or []})
+    check("...at a higher real rate, paying the original's fee plus its own "
+          "size (BIP125), quoted afresh for the smaller amount",
+          plan_f is not None
+          and plan_f.get("fee_sat", 0) >= plan_r["fee_sat"] + plan_f.get("vsize_bound", 0)
+          and plan_f.get("feerate_real_sat_vb", 0) > plan_r["feerate_real_sat_vb"]
+          and plan_f.get("send_sat", 0) < plan_r["send_sat"]
+          and len(_posts) == _before_f + 1)
+    check("...and the original plan is rotated aside, the chain two",
+          len(_chain_f) == 2 and _old_f.get("txid") == plan_r["txid"])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

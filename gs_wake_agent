@@ -1549,6 +1549,45 @@ def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
         return False, None
 
 
+def _pos_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _forward_mined(artifact_dir, handle: str, reader=None) -> bool:
+    """Whether the plan btc_forwarder wrote for `handle` says the forward
+    that IS the record is IN A BLOCK (stage 6): its own transaction at
+    `seen_height` above 0, or -- for a plan the reconciliation marked
+    superseded by another forward of ours over the same outpoints (an
+    original that mined after its replacement, an evicted original that
+    came back) -- that forward at `superseded_height` above 0. This plan's
+    own txid never mines in the second case, and reading its height alone
+    kept the Pi asking after a forward whose money had long moved. A plan
+    the reconciliation brought up to date carries the height it was listed
+    at; a first send usually saw it in the mempool (0). NEVER raises: no
+    plan, an unreadable one -- False."""
+    try:
+        plan = (reader or _read_json)(
+            Path(artifact_dir) / f"btc_forward_{handle}.json") or {}
+        if plan.get("seen") is True and _pos_int(plan.get("seen_height")):
+            return True
+        return (bool(plan.get("superseded_by"))
+                and _pos_int(plan.get("superseded_height")))
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def _forward_superseded(artifact_dir, handle: str, reader=None) -> bool:
+    """Whether the plan for `handle` was marked superseded by another
+    forward of ours (the reconciliation found that one listed spending
+    this one's inputs). NEVER raises."""
+    try:
+        plan = (reader or _read_json)(
+            Path(artifact_dir) / f"btc_forward_{handle}.json") or {}
+        return bool(plan.get("superseded_by"))
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def _forward_chain(artifact_dir, handle: str) -> list:
     """The rotated predecessors of this handle's plan (a reconciliation's
     fresh forward moves the earlier plan aside as <stem>.<n>.json), newest
@@ -1591,15 +1630,61 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
     Returns whether the file was rewritten. Never raises."""
     try:
         path = rec.get("slip")
+        # THE RECORD: the forward of ours the reconciliation found listed
+        # spending the current plan's inputs, when it marked the current
+        # plan superseded. That one counts even if its own (older) file
+        # says it was superseded in turn -- a rotated plan is never
+        # rewritten, so its mark can be stale; the current plan's is not.
+        _record = str(plan.get("superseded_by") or "").lower()
 
         def _counts(p):
             return (isinstance(p, dict) and p.get("broadcast") is True
                     and p.get("broadcast_outcome") in ("accepted",
                                                        "ambiguous")
-                    and not p.get("superseded_by")
+                    and (not p.get("superseded_by")
+                         or (_record and str(p.get("txid") or "").lower()
+                             == _record))
                     and p.get("expected_xmr") not in (None, "")
                     and p.get("dest_xmr") == plan.get("dest_xmr"))
         counted = [p for p in [plan] + list(chain or ()) if _counts(p)]
+        # A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP (stage 6). A
+        # bump spends the same outpoints again at today's rate, and the
+        # new plan names the old in `replaces`; counting both would tell
+        # the XMR watcher to expect two arrivals of one payment. The
+        # replacement counts and the original does not -- unless the
+        # network mined the original after all, in which case the
+        # reconciliation has marked the replacement superseded (so it is
+        # not in `counted`) and the original counts. Never both, never
+        # neither.
+        _replaced = {str(p.get("replaces") or "").lower()
+                     for p in counted if p.get("replaces")}
+        counted = [p for p in counted
+                   if str(p.get("txid") or "").lower() not in _replaced]
+        # ...AND, MORE GENERALLY, ONE SWAP PER OUTPOINT (stage 6, self-doubt
+        # pass). An evicted forward's re-sign and a rejected re-send's
+        # fresh forward name nothing in `replaces` -- they were built
+        # because the original was NOT in the network -- yet the original's
+        # file still says it was sent and seen once, and it was summed
+        # beside the plan that actually carries the money. Two plans that
+        # spend a common outpoint are one payment: the record counts if
+        # the reconciliation named one, else the newest, and the other is
+        # dropped. Plans over different outpoints (a returned deposit's
+        # second swap) are two payments and still sum.
+
+        def _rank(p):
+            _ts = p.get("ts")
+            return (str(p.get("txid") or "").lower() == _record,
+                    float(_ts) if isinstance(_ts, (int, float))
+                    and not isinstance(_ts, bool) else 0.0)
+        kept, spent = [], set()
+        for p in sorted(counted, key=_rank, reverse=True):
+            ops = {(str(i.get("tx_hash") or "").lower(), int(i.get("vout") or 0))
+                   for i in (p.get("inputs") or []) if isinstance(i, dict)}
+            if ops & spent:
+                continue
+            kept.append(p)
+            spent |= ops
+        counted = [p for p in counted if any(p is k for k in kept)]
         if not path or not counted or not plan.get("dest_xmr"):
             return False
         pairs = _read_json(Path(path))
@@ -1880,6 +1965,10 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                           "this machine's keyfile puts the fee-rate floor "
                           "above the ceiling; re-pair.")
         _aff = _btc_setting(key, "max_affiliate_bps", 0, 0, 1000)
+        # HOW LONG A FORWARD MAY SIT IN THE MEMPOOL under today's rate
+        # before a reconciliation replaces it (stage 6): the keyfile's
+        # word, absent means the two hours it was before the field.
+        _bump = _btc_setting(key, "btc_bump_after_s", 7200, 0, 7 * 86400)
         _net = str(key.get("btc_network") or "main")
         if _net not in ("main", "testnet", "signet", "regtest"):
             raise Refused("btc_config_malformed",
@@ -1921,6 +2010,7 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                 "--feerate-floor", str(_floor),
                 "--feerate-ceiling", str(_ceiling),
                 "--max-affiliate-bps", str(_aff),
+                "--bump-after", str(_bump),
                 # THE SAME MIX FLOOR the quote step is given, so a deposit
                 # that could not be mixed is not forwarded into the swap.
                 "--min-out-xmr", str(live_min_out_xmr(key)),
@@ -2875,6 +2965,17 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             return ""
         moved, outcome = _forward_outcome(artifact_dir, handle, reader)
         if moved:
+            # IN A BLOCK IS ITS OWN WORD (stage 6): the Pi's rechecks of
+            # this forward end on it, and the arrival is the XMR side's
+            # question. Only an ACCEPTED forward can be mined; an
+            # ambiguous one that the network later listed was made
+            # accepted by the reconciliation before this reads it. A plan
+            # SUPERSEDED by another forward of ours that mined is the
+            # word too, whatever its own outcome was: the record moved.
+            if _forward_mined(artifact_dir, handle, reader) and (
+                    outcome == "accepted"
+                    or _forward_superseded(artifact_dir, handle, reader)):
+                return "forwarded"
             return "sent" if outcome == "accepted" else "unsure"
         # NOTHING WAS SENT. Either a rehearsal (a plan, no outcome: "") or
         # a forward that found nothing settled and said what it saw

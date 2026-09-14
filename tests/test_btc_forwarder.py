@@ -1210,6 +1210,440 @@ check("the plan chain: the current plan first, then the rotated ones newest "
       == [os.path.basename(_of4), os.path.basename(_of4)[:-5] + ".1.json"]
       and not any(".status." in p.name for p in F._plan_chain(_of7)))
 
+print("\n== STAGE 6: the chain never lacks a current plan ==")
+# STAGE6_PLAN.md 1(b): the fresh forward a verdict called for used to
+# rotate the current plan aside FIRST and then refuse -- a fee over the
+# ceiling on the day a refund came back was enough -- and every later run
+# read `--outfile`, found nothing, and refused `no_plan`, for ever.
+_pB, _ofB, _hxB = _first_send()
+_RET = [{"tx_hash": _H2, "vout": 0, "value": 150000, "confirmations": 5}]
+_nB = Net(utxos=_RET, spends=[_listed(_pB, _hxB)], fee=500)
+_c, _o, _p, _ = _reconcile(_nB, _ofB)
+check("(setup) returned money on a day the estimate is over the ceiling: "
+      "delayed, nothing sent", _c == F.EXIT_REFUSED
+      and _status_of(_ofB) == "delayed" and _nB.submits == [])
+check("a fresh forward that was REFUSED after the verdict leaves the old "
+      "plan where it was: the current plan still stands, the chain is one, "
+      "nothing rotated", os.path.exists(_ofB) and len(F._plan_chain(_ofB)) == 1
+      and _p is not None and _p["txid"] == _pB["txid"]
+      and ("forward", "plan_recovered") not in _nB.kinds)
+_nB2 = Net(utxos=_RET, spends=[_listed(_pB, _hxB)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB2, _ofB)
+check("...and the next reconcile, with the fee inside the band, forwards the "
+      "returned money: rotated at the WRITE, the chain is two, the new plan "
+      "says why", _c == F.EXIT_OK and _p is not None
+      and _p["reconcile_reason"] == "returned"
+      and len(F._plan_chain(_ofB)) == 2
+      and json.load(open(F._plan_chain(_ofB)[1]))["txid"] == _pB["txid"]
+      and ("forward", "plan_recovered") not in _nB2.kinds)
+# A chain ALREADY in the old state (a deployment that hit the trap before
+# this fix): no current plan, the record one file over. Restored, not
+# refused -- and restored by MOVING it back, so the reconciliation's
+# in-place update does not leave the same forward as two files.
+_pR, _ofR, _hxR = _first_send()
+F._rotate_plan(_ofR)
+check("(setup) a chain with no current plan and one rotated predecessor",
+      not os.path.exists(_ofR) and len(F._plan_chain(_ofR)) == 1)
+_nR = Net(utxos=[], spends=[_listed(_pR, _hxR)])
+_c, _o, _p, _ = _reconcile(_nR, _ofR)
+check("a chain with no current plan is read from its newest rotated one, "
+      "moved back into place: listed, done, the kind on the chain, and the "
+      "chain is ONE file again (no duplicate to count twice)",
+      _c == F.EXIT_OK and os.path.exists(_ofR)
+      and len(F._plan_chain(_ofR)) == 1 and _p is not None
+      and _p["txid"] == _pR["txid"] and _p["seen"] is True
+      and ("forward", "plan_recovered") in _nR.kinds
+      and ("forward", "reconciled_listed") in _nR.kinds)
+check("NON-VACUITY: a chain with NO plan anywhere is still refused no_plan",
+      _refusal(Net(utxos=_UNSPENT0), "--reconcile", *_TN, dry_run=False)[3]
+      == "no_plan")
+_pX, _ofX, _hxX = _first_send()
+F._rotate_plan(_ofX)
+with open(F._plan_chain(_ofX)[0], "w") as _fh:
+    json.dump({"schema": "somebody_elses", "txid": "00" * 32}, _fh)
+check("...and a rotated file that is not one of ours is skipped without a "
+      "refusal on the chain: no plan of ours anywhere means no_plan",
+      _refusal(Net(utxos=_UNSPENT0), "--reconcile", *_TN, dry_run=False,
+               outfile=_ofX)[3] == "no_plan")
+
+print("\n== STAGE 6: a forward sitting in the mempool is bumped ==")
+# STAGE6_PLAN.md 1(c), 3.1: listed in the mempool was answered "nothing to
+# send" however long it sat and however far fees rose. Every input opts
+# into RBF; past --bump-after, with today's estimate above the rate paid,
+# the forward is REPLACED: the same outpoints, a fresh quote for the
+# smaller amount, today's rate, the new plan naming the old.
+_time = __import__("time")
+
+
+def _age_plan(of, seconds):
+    """Move the plan's send stamp back, as if it had sat that long."""
+    _pl = json.load(open(of))
+    _pl["ts"] = int(_time.time()) - int(seconds)
+    with open(of, "w") as _fh:
+        json.dump(_pl, _fh)
+
+
+_pS, _ofS, _hxS = _first_send()            # accepted, seen in the mempool
+check("(setup) the first send paid the estimate and knows it",
+      _pS["feerate_target_sat_vb"] == 10 and _pS["seen_height"] == 0
+      and isinstance(_pS["ts"], int))
+_age_plan(_ofS, 3 * 3600)
+_nS0 = Net(utxos=[], spends=[_listed(_pS, _hxS, height=0)], fee=10)
+_c, _o, _p, _ = _reconcile(_nS0, _ofS)
+check("listed in the mempool past the window, but today's estimate is NOT "
+      "above the rate paid: done, nothing quoted, nothing sent, the chain "
+      "one", _c == F.EXIT_OK and _nS0.posts == [] and _nS0.submits == []
+      and ("forward", "reconcile_bumped") not in _nS0.kinds
+      and len(F._plan_chain(_ofS)) == 1)
+_nS1 = Net(utxos=[], spends=[_listed(_pS, _hxS, height=0)], fee=None)
+_c, _o, _p, _ = _reconcile(_nS1, _ofS)
+check("...no estimate from the server: done, not bumped (nothing to compare)",
+      _c == F.EXIT_OK and _nS1.submits == [] and _p["replaces"] is None
+      and ("forward", "reconcile_bumped") not in _nS1.kinds)
+_nS2 = Net(utxos=[], spends=[_listed(_pS, _hxS, height=850002)], fee=30)
+_c, _o, _p, _ = _reconcile(_nS2, _ofS)
+check("...MINED (height > 0): done, never bumped, whatever the estimate",
+      _c == F.EXIT_OK and _nS2.submits == [] and _nS2.posts == []
+      and ("forward", "reconcile_bumped") not in _nS2.kinds)
+_nS3 = Net(utxos=[], spends=[_listed(_pS, _hxS, height=0)], fee=30,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nS3, _ofS)
+_chainS = F._plan_chain(_ofS)
+_oldS = json.load(open(_chainS[1])) if len(_chainS) > 1 else {}
+check("...in the mempool, past the window, estimate above the rate: "
+      "REPLACED -- one fresh quote for the SMALLER amount, one NEW "
+      "transaction over the SAME outpoints at today's rate, accepted and "
+      "seen; the new plan says `bumped` and names the one it replaces; the "
+      "old is rotated aside; the kind on the chain",
+      _c == F.EXIT_OK and len(_nS3.posts) == 1 and len(_nS3.submits) == 1
+      and _nS3.submits[0]["raw_hex"] != _hxS
+      and _nS3.submits[0]["txid"] != _pS["txid"]
+      and _p is not None and _p["reconcile_reason"] == "bumped"
+      and _p["replaces"] == _pS["txid"]
+      and [(i["tx_hash"], i["vout"]) for i in _p["inputs"]]
+      == [(i["tx_hash"], i["vout"]) for i in _pS["inputs"]]
+      and _p["feerate_target_sat_vb"] == 30
+      and _p["send_sat"] < _pS["send_sat"]
+      and Decimal(_nS3.posts[0][1]["sellAmount"])
+      == Decimal(_p["send_sat"]) / Decimal(10 ** 8)
+      and len(_chainS) == 2 and _oldS.get("txid") == _pS["txid"]
+      and _p["excluded_outpoints"] == 0
+      and ("forward", "reconcile_bumped") in _nS3.kinds)
+check("...the replacement pays MORE absolute fee than the original by at "
+      "least its own size (BIP125), at a higher real rate, so a node "
+      "holding the original takes it in its place",
+      _p["fee_sat"] >= _pS["fee_sat"] + _p["vsize_bound"]
+      and _p["feerate_real_sat_vb"] > _pS["feerate_real_sat_vb"]
+      and _p["memo"] != _pS["memo"])
+check("...and a bumped plan's inputs carry at least --min-conf of depth "
+      "(they were settled when chosen; the look could not show them)",
+      all(i["confirmations"] >= 2 for i in _p["inputs"]))
+# TOO YOUNG: a forward listed for less than --bump-after is left alone.
+_pY, _ofY, _hxY = _first_send()
+_nY = Net(utxos=[], spends=[_listed(_pY, _hxY, height=0)], fee=30,
+          submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nY, _ofY)
+check("a forward listed in the mempool for LESS than --bump-after is left "
+      "alone whatever the estimate (the default window is two hours)",
+      _c == F.EXIT_OK and _nY.submits == [] and _nY.posts == []
+      and F.DEFAULT_BUMP_AFTER_S == 7200
+      and ("forward", "reconcile_bumped") not in _nY.kinds)
+_nY2 = Net(utxos=[], spends=[_listed(_pY, _hxY, height=0)], fee=30,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nY2, _ofY, "--bump-after", "0")
+check("...and --bump-after 0 (the testnet drill's setting) replaces it at "
+      "once", _c == F.EXIT_OK and len(_nY2.submits) == 1
+      and _p["replaces"] == _pY["txid"])
+check("...a negative --bump-after is refused",
+      _refusal(Net(), "--reconcile", *_TN, "--bump-after", "-1",
+               dry_run=False, outfile=_ofY)[3] == "bad_args")
+# THE LOOK STILL LISTS THE INPUTS (a server whose mempool never saw the
+# original): not duplicated -- one input, not two of the same outpoint.
+_pD, _ofD, _hxD = _first_send()
+_age_plan(_ofD, 3 * 3600)
+_nD = Net(utxos=_UNSPENT0, spends=[_listed(_pD, _hxD, height=0)], fee=30,
+          submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nD, _ofD)
+check("a server that still lists the original's inputs as unspent: the "
+      "replacement spends each outpoint ONCE (deduplicated), and is sent",
+      _c == F.EXIT_OK and len(_p["inputs"]) == 1
+      and _p["settled_sat"] == 200000 and len(_nD.submits) == 1)
+# THE ESTIMATE OVER THE CEILING: the replacement is `delayed` like a first
+# forward would be; the original stands, the plan is not rotated.
+_pE, _ofE, _hxE = _first_send()
+_age_plan(_ofE, 3 * 3600)
+_nE = Net(utxos=[], spends=[_listed(_pE, _hxE, height=0)], fee=500,
+          submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nE, _ofE)
+check("today's estimate over the ceiling: the replacement is `delayed` (the "
+      "status word, nothing sent), the original stands, the plan not "
+      "rotated, the chain one",
+      _c == F.EXIT_REFUSED and _status_of(_ofE) == "delayed"
+      and _nE.submits == [] and _nE.posts == []
+      and len(F._plan_chain(_ofE)) == 1 and _p["txid"] == _pE["txid"])
+# THE ORIGINAL ALREADY PAYS THE CEILING: more would be over it.
+_nC0 = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 2_000_000,
+                   "confirmations": 5}], fee=200, submit=_ACCEPTED,
+           seen=_SEEN0)
+_cC, _oC, _pC, _ofC = run(_nC0, broadcast=True)
+check("(setup) a first send at the ceiling rate", _cC == F.EXIT_OK
+      and _pC["feerate_target_sat_vb"] == 200)
+_age_plan(_ofC, 3 * 3600)
+_nC = Net(utxos=[], spends=[_listed(_pC, _nC0.submits[0]["raw_hex"],
+                                    height=0,
+                                    inputs=[{"tx_hash": _H1, "vout": 0,
+                                             "value": 2_000_000}])],
+          fee=210, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nC, _ofC)
+check("a forward already paying the ceiling cannot be replaced within the "
+      "band: refused bump_over_ceiling with the word `delayed`, nothing "
+      "quoted or sent, the original stands",
+      _c == F.EXIT_REFUSED and _status_of(_ofC) == "delayed"
+      and _nC.posts == [] and _nC.submits == []
+      and ("forward", "refused:bump_over_ceiling") in _nC.kinds
+      and len(F._plan_chain(_ofC)) == 1)
+# A REJECTED REPLACEMENT: the original stands, nothing rotated.
+_pR2, _ofR2, _hxR2 = _first_send()
+_age_plan(_ofR2, 3 * 3600)
+_nR2 = Net(utxos=[], spends=[_listed(_pR2, _hxR2, height=0)], fee=30,
+           submit=_REJECTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nR2, _ofR2)
+check("every server rejects the replacement: refused broadcast_rejected, "
+      "the original stands as the current plan, the chain one",
+      _c == F.EXIT_REFUSED and len(_nR2.submits) == 1
+      and ("forward", "refused:broadcast_rejected") in _nR2.kinds
+      and len(F._plan_chain(_ofR2)) == 1 and _p["txid"] == _pR2["txid"])
+# THE FLOOR A NODE HOLDING THE ORIGINAL WILL TAKE. With the same policy the
+# estimate-above-the-rate test already guarantees it; with a policy that
+# shrank the bound between the two runs (the operator lowered
+# --op-return-max-bytes by one), an estimate one above the old rate would
+# pay LESS absolute fee than the original plus the replacement's size, and
+# a node would refuse it. bump_floor raises the rate until it does not.
+_pF, _ofF, _hxF = _first_send()
+check("(setup) the memo fits a policy one byte smaller", _pF["memo_bytes"]
+      <= 119)
+_age_plan(_ofF, 3 * 3600)
+_nF = Net(utxos=[], spends=[_listed(_pF, _hxF, height=0)], fee=30,
+          submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nF, _ofF, "--op-return-max-bytes", "119",
+                           "--feerate-sat-vb", "11")
+check("an explicit rate one above the original's, under a policy one byte "
+      "smaller: the floor is raised so the replacement's fee still exceeds "
+      "the original's by its own size, and that floor is what is paid",
+      _c == F.EXIT_OK and _p["feerate_target_sat_vb"] == 12
+      and _p["fee_sat"] >= _pF["fee_sat"] + _p["vsize_bound"]
+      and _p["vsize_bound"] == _pF["vsize_bound"] - 1
+      and ("forward", "fee_floor_applied") in _nF.kinds)
+_nF2 = Net(utxos=[], spends=[_listed(_pF, _hxF, height=0)], fee=30)
+_c, _o, _p, _ = _reconcile(_nF2, _ofF, "--feerate-sat-vb", "12")
+check("...an explicit rate EQUAL to what the replacement pays is not above "
+      "it: not due, done", _c == F.EXIT_OK and _nF2.submits == [])
+check("bump_due is pure and refuses what it cannot compare: a reconstructed "
+      "plan (no rate), a plan with no stamp, a bool, a young plan",
+      F.bump_due({"feerate_target_sat_vb": None, "ts": 0}, 30, 0) is False
+      and F.bump_due({"feerate_target_sat_vb": 10}, 30, 0) is False
+      and F.bump_due({"feerate_target_sat_vb": 10, "ts": 0}, True, 0) is False
+      and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1000}, 30, 7200,
+                     now=5000) is False
+      and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1000}, 30, 7200,
+                     now=8200) is True
+      and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1000}, 10, 7200,
+                     now=8200) is False)
+_bnd1 = F.btx.vsize_upper_bound(1, [F.INBOUND_SPK_MAX,
+                                     F.btx.op_return_script_len(120)])
+check("bump_floor never goes under the paid rate plus one, the operator's "
+      "floor, or the fee the original paid plus the replacement's size",
+      F.bump_floor({"inputs": [{}], "fee_sat": 10 * _bnd1,
+                    "feerate_target_sat_vb": 10}, 120, 1) == 11
+      and F.bump_floor({"inputs": [{}], "fee_sat": 10 * _bnd1,
+                        "feerate_target_sat_vb": 10}, 120, 40) == 40
+      and F.bump_floor({"inputs": [{}], "fee_sat": 30 * _bnd1,
+                        "feerate_target_sat_vb": 10}, 120, 1) == 31)
+
+# THE WHOLE CHAIN, NOT THE CURRENT PLAN ALONE (stage 6, self-doubt pass).
+# A forward left in the mempool falls BEHIND a later plan when money came
+# back and was forwarded beside it: the fresh plan is the current one, and
+# a reconciliation that read the current plan alone never saw the stuck
+# one again. And money that came back while a forward is stuck rides in
+# the replacement -- one transaction, one fee -- instead of a second
+# forward beside a stuck one.
+_H2U = [{"tx_hash": _H2, "vout": 0, "value": 300000, "confirmations": 5}]
+_pQ, _ofQ, _hxQ = _first_send()
+_age_plan(_ofQ, 3 * 3600)
+_nQ = Net(utxos=_H2U, spends=[_listed(_pQ, _hxQ, height=0)], fee=30,
+          submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nQ, _ofQ)
+check("a stuck forward AND money that came back and settled: ONE "
+      "replacement, spending the stuck one's outpoints and the new money "
+      "together, quoted for the whole, naming the stuck one; not a "
+      "`returned` forward beside it",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "bumped"
+      and _p["replaces"] == _pQ["txid"]
+      and {(i["tx_hash"], i["vout"]) for i in _p["inputs"]}
+      == {(_H1, 0), (_H2, 0)} and _p["settled_sat"] == 500000
+      and _p["excluded_outpoints"] == 0 and len(_nQ.submits) == 1
+      and ("forward", "stuck_current") in _nQ.kinds
+      and ("forward", "returned_settled") not in _nQ.kinds
+      and len(F._plan_chain(_ofQ)) == 2
+      and "with what settled since" in _o)
+_pP, _ofP, _hxP = _first_send()                         # plan 1, 10 sat/vB
+_nP1 = Net(utxos=_H2U, spends=[_listed(_pP, _hxP, height=0)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p2, _ = _reconcile(_nP1, _ofP)
+check("(setup) money came back while the first forward sat at today's rate "
+      "(not due): forwarded beside it, the first plan rotated behind",
+      _c == F.EXIT_OK and _p2["reconcile_reason"] == "returned"
+      and _p2["replaces"] is None and len(F._plan_chain(_ofP)) == 2
+      and _p2["txid"] != _pP["txid"])
+_chainP = F._plan_chain(_ofP)
+_age_plan(str(_chainP[1]), 3 * 3600)                    # the rotated plan 1
+_hxP2 = _nP1.submits[0]["raw_hex"]
+_nP2 = Net(utxos=[], spends=[_listed(_pP, _hxP, height=0),
+                             _listed(_p2, _hxP2, height=0,
+                                     inputs=[{"tx_hash": _H2, "vout": 0,
+                                              "value": 300000}])],
+           fee=30, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p3, _ = _reconcile(_nP2, _ofP)
+_txsP = {json.load(open(f)).get("txid") for f in F._plan_chain(_ofP)}
+check("...fees rose: the ROTATED first forward, stuck behind the current "
+      "plan, is found and replaced -- its own outpoints, the current plan's "
+      "consumed ones left out, `replaces` naming it, the kind on the chain; "
+      "the chain is three, every plan kept",
+      _c == F.EXIT_OK and _p3["reconcile_reason"] == "bumped"
+      and _p3["replaces"] == _pP["txid"]
+      and [(i["tx_hash"], i["vout"]) for i in _p3["inputs"]] == [(_H1, 0)]
+      and _p3["excluded_outpoints"] == 1
+      and _p3["fee_sat"] >= _pP["fee_sat"] + _p3["vsize_bound"]
+      and ("forward", "stuck_predecessor") in _nP2.kinds
+      and len(_nP2.submits) == 1
+      and _txsP == {_pP["txid"], _p2["txid"], _p3["txid"]})
+# MORE THAN ONE SIGNATURE OVER THE SAME OUTPOINTS ALREADY: a replacement
+# the server asked does not list beside the original it does. The next
+# replacement is priced to beat EVERY one of them, and the window is
+# measured from the newest attempt.
+_pV, _ofV, _hxV = _first_send()                          # F at 10
+_age_plan(_ofV, 3 * 3600)
+_nV1 = Net(utxos=[], spends=[_listed(_pV, _hxV, height=0)], fee=12,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pV2, _ = _reconcile(_nV1, _ofV)
+check("(setup) replaced once at 12", _c == F.EXIT_OK
+      and _pV2["replaces"] == _pV["txid"]
+      and _pV2["feerate_target_sat_vb"] == 12)
+_nV2 = Net(utxos=[], spends=[_listed(_pV, _hxV, height=0)], fee=13,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nV2, _ofV)
+check("the server lists the ORIGINAL and not the replacement sent minutes "
+      "ago: the window is measured from the newest attempt, so nothing is "
+      "replaced again yet (the replacement is recorded as superseded, the "
+      "original the record)",
+      _c == F.EXIT_OK and _nV2.submits == [] and _nV2.posts == []
+      and _p["superseded_by"] == _pV["txid"]
+      and ("forward", "reconcile_bumped") not in _nV2.kinds)
+_age_plan(_ofV, 3 * 3600)                                # the replacement too
+_nV3 = Net(utxos=[], spends=[_listed(_pV, _hxV, height=0)], fee=11,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pV3, _ = _reconcile(_nV3, _ofV)
+check("...both past the window and the estimate above the original's rate: "
+      "the original is replaced again at a rate that beats the FIRST "
+      "replacement too (13, over an estimate of 11), so a node holding "
+      "either takes it; the new plan names the original",
+      _c == F.EXIT_OK and _pV3["reconcile_reason"] == "bumped"
+      and _pV3["replaces"] == _pV["txid"]
+      and _pV3["feerate_target_sat_vb"] == 13
+      and _pV3["fee_sat"] >= _pV2["fee_sat"] + _pV3["vsize_bound"]
+      and _pV3["fee_sat"] >= _pV["fee_sat"] + _pV3["vsize_bound"]
+      and ("forward", "fee_floor_applied") in _nV3.kinds
+      and len(F._plan_chain(_ofV)) == 3)
+check("(and) a superseded plan records WHERE its superseder is: in the "
+      "mempool (0) when it was listed there",
+      _p.get("superseded_height") == 0)
+_nV4 = Net(utxos=[], spends=[_listed(_pV, _hxV, height=850010)], fee=11,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nV4, _ofV)
+check("...the ORIGINAL mined after all: the current plan (the second "
+      "replacement) is superseded by it at that height -- so the agent can "
+      "say `forwarded` for a forward whose own txid never mines -- and "
+      "nothing is bumped or sent",
+      _c == F.EXIT_OK and _p["superseded_by"] == _pV["txid"]
+      and _p["superseded_height"] == 850010 and _p["txid"] == _pV3["txid"]
+      and _nV4.submits == [] and _nV4.posts == []
+      and ("forward", "reconcile_bumped") not in _nV4.kinds)
+# THE REPLACED OUTPOINTS ARE SPENT WHOLE: an input worth spending at the
+# original's rate but dust at today's is still spent by the replacement --
+# it is committed either way, and the floor was sized over the same count.
+_nM0 = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
+                   "confirmations": 5},
+                  {"tx_hash": _H2, "vout": 1, "value": 1500,
+                   "confirmations": 5}], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_cM, _oM, _pM, _ofM = run(_nM0, broadcast=True)
+check("(setup) a first send over two inputs, the small one worth spending "
+      "at 10 sat/vB", _cM == F.EXIT_OK and len(_pM["inputs"]) == 2)
+_age_plan(_ofM, 3 * 3600)
+_nM = Net(utxos=[], spends=[_listed(_pM, _nM0.submits[0]["raw_hex"], height=0,
+                                    inputs=[{"tx_hash": _H1, "vout": 0,
+                                             "value": 200000},
+                                            {"tx_hash": _H2, "vout": 1,
+                                             "value": 1500}])],
+          fee=30, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nM, _ofM)
+check("the replacement at 30 sat/vB spends BOTH outpoints, the small one "
+      "dust at that rate or not, and pays the original's fee plus its own "
+      "size; the plan's input records carry no `must` mark",
+      _c == F.EXIT_OK and len(_p["inputs"]) == 2
+      and _p["replaces"] == _pM["txid"]
+      and _p["fee_sat"] >= _pM["fee_sat"] + _p["vsize_bound"]
+      and all("must" not in i for i in _p["inputs"]))
+check("select_inputs: a `must` output is spent whatever its value, but "
+      "never while unsettled (a reorg)",
+      F.select_inputs([{"tx_hash": _H1, "vout": 0, "value": 100,
+                        "confirmations": 5, "must": True},
+                       {"tx_hash": _H2, "vout": 0, "value": 100,
+                        "confirmations": 0, "must": True},
+                       {"tx_hash": _H2, "vout": 1, "value": 100,
+                        "confirmations": 5}], 2, 30)
+      == ([{"tx_hash": _H1, "vout": 0, "value": 100, "confirmations": 5,
+            "must": True}], 1, 1))
+_cS = {"txid": "aa", "feerate_target_sat_vb": 10, "ts": 0,
+       "inputs": [{"tx_hash": _H1, "vout": 0}]}
+_cR = {"txid": "bb", "feerate_target_sat_vb": 12, "ts": 7000,
+       "inputs": [{"tx_hash": _H1, "vout": 0}]}
+_cO = {"txid": "cc", "feerate_target_sat_vb": 10, "ts": 0,
+       "inputs": [{"tx_hash": _H2, "vout": 0}]}
+_spS = [{"txid": "aa", "height": 0, "inputs": [{"tx_hash": _H1, "vout": 0}]}]
+check("stuck_forward is pure: listed in the mempool, due -> (it, its "
+      "conflicts); the window from the NEWEST conflicting attempt; mined, "
+      "not due, no inputs, not listed -> nothing; the current plan first",
+      F.stuck_forward([_cS], _spS, {"aa"}, 30, 7200, now=8000) == (_cS, [])
+      and F.stuck_forward([_cS, _cR], _spS, {"aa", "bb"}, 30, 7200,
+                          now=8000) == (None, [])
+      and F.stuck_forward([_cS, _cR], _spS, {"aa", "bb"}, 30, 7200,
+                          now=15000) == (_cS, [_cR])
+      and F.stuck_forward([_cS], [{**_spS[0], "height": 5}], {"aa"}, 30,
+                          7200, now=8000) == (None, [])
+      and F.stuck_forward([_cS], _spS, {"aa"}, 10, 7200, now=8000)
+      == (None, [])
+      and F.stuck_forward([{**_cS, "inputs": []}], _spS, {"aa"}, 30, 7200,
+                          now=8000) == (None, [])
+      and F.stuck_forward([_cO], _spS, {"aa"}, 30, 7200, now=8000)
+      == (None, [])
+      and F.stuck_forward([_cO, _cS], _spS + [{"txid": "cc", "height": 0,
+                                               "inputs": []}],
+                          {"aa", "cc"}, 30, 7200, now=8000) == (_cO, []))
+check("replacement_floor beats the stuck plan AND every conflicting one, "
+      "each sized over the replacement's own input count",
+      F.replacement_floor({"inputs": [{}], "fee_sat": 10 * _bnd1,
+                           "feerate_target_sat_vb": 10},
+                          [{"inputs": [{}], "fee_sat": 12 * _bnd1,
+                            "feerate_target_sat_vb": 12}], 120, 1) == 13
+      and F.replacement_floor({"inputs": [{}], "fee_sat": 10 * _bnd1,
+                               "feerate_target_sat_vb": 10}, [], 120, 1)
+      == 11
+      and F.bump_floor({"inputs": [{}, {}], "fee_sat": 10 * _bnd1,
+                        "feerate_target_sat_vb": None}, 120, 1, n_inputs=1)
+      == 11)
+
 print("\n== THORNode's word on the inbound ==")
 _ok_node = [{"chain": "BTC", "address": _INBOUND, "halted": False,
              "dust_threshold": "10000"},

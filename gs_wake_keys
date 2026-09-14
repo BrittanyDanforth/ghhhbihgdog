@@ -392,6 +392,14 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--max-affiliate-bps", type=int, default=0,
                    help="the largest affiliate fee (basis points) a quoted "
                         "swap memo may carry (default 0)")
+    p.add_argument("--btc-bump-after", type=int, default=7200,
+                   metavar="SECONDS",
+                   help="how long a forward may sit in the mempool at a rate "
+                        "under today's estimate before a reconciliation "
+                        "replaces it at today's rate (RBF; default 7200). "
+                        "The pager's --btc-recheck must be at least this "
+                        "for the recheck to find a bump due. 0 replaces at "
+                        "once (a drill), up to seven days.")
     # WHERE THE OPERATOR'S CUT GOES, and the default is deliberately nowhere.
     #
     # gs_wake_agent reads key["usage_fee_address"] and there was NO WAY TO SET
@@ -623,6 +631,8 @@ def _validate_btc(args) -> None:
                  "<= --feerate-ceiling-sat-vb.")
     if not 0 <= args.max_affiliate_bps <= 1000:
         sys.exit("[!] --max-affiliate-bps must be 0..1000.")
+    if not 0 <= int(getattr(args, "btc_bump_after", 7200)) <= 7 * 86400:
+        sys.exit("[!] --btc-bump-after must be 0..604800 seconds (a week).")
     if args.thornode and not str(args.thornode).lower().startswith(
             ("http://", "https://")):
         sys.exit("[!] --thornode must be an http(s):// base URL.")
@@ -1105,6 +1115,10 @@ def do_pair(args) -> int:
         "feerate_floor_sat_vb": int(args.feerate_floor_sat_vb),
         "feerate_ceiling_sat_vb": int(args.feerate_ceiling_sat_vb),
         "max_affiliate_bps": int(args.max_affiliate_bps),
+        # HOW LONG A FORWARD MAY SIT IN THE MEMPOOL before a reconciliation
+        # replaces it at today's rate (stage 6). Written always; a keyfile
+        # from before the field reads as the same two hours.
+        "btc_bump_after_s": int(args.btc_bump_after),
         "fee_rpc": str(args.fee_rpc or ""),
         "fee_wallet_file": str(args.fee_wallet_file or ""),
         "fee_address": fee_address,

@@ -219,6 +219,53 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### Stage 6: the forward after the send — a stuck forward is found and bumped, the reconcile is driven (`STAGE6_PLAN.md`)
+- Planned first, after an end-to-end read of what stage 5 built, without
+  trusting its tests (section 1 of the plan: four things left half-wired);
+  built in six steps against the plan; section 8 is the self-doubt pass,
+  which found six more and fixed them before the commit.
+- The reconciliation is now DRIVEN: the Pi routes an ask about a sent
+  deposit to the forward again past `--btc-recheck` (default three hours,
+  floor 600) or at once after `unsure`, and when nobody taps the watcher
+  starts that run itself, once per window per deposit, through the same
+  gates as every wake (`forward_recheck` on the chain); `forwarded` (wire
+  v8: the forward's transaction is in a block) ends the rechecks. An
+  `unsure` answer no longer clears the once-per-window stamp (a network
+  that keeps answering ambiguously cost a wake a tick), and a forward
+  learned after a restart is put back on the list with its word and
+  clock (before, the answer was learned into the sent set alone and the
+  recheck was never due again — the original gap, reopened by a restart).
+- The BUMP: a forward of ours listed in the mempool past `--bump-after`
+  (keyfile `btc_bump_after_s`, `gs_wake_keys pair --btc-bump-after`,
+  default two hours) at a rate under today's estimate is replaced — the
+  same outpoints (spent whole: `must` inputs), added to the look from the
+  plan (a server's listunspent hides what a mempool transaction spends),
+  at today's rate over a floor that beats EVERY earlier signature of ours
+  over those outpoints (`replacement_floor`, BIP125), quoted afresh for
+  the amount and the current inbound, carrying money that came back and
+  settled meanwhile, the new plan naming the old in `replaces`. The whole
+  plan chain is scanned (`stuck_forward`), not the current plan alone: a
+  forward can fall behind a later `returned` plan. The window is measured
+  from the newest attempt over the outpoints. Over the ceiling:
+  `bump_over_ceiling`, the word `delayed`, the original stands; rejected:
+  the original stands.
+- The rotation made safe: the old plan is rotated when the fresh plan is
+  written, never before; a chain left without a current plan (stage 5's
+  ordering: a refusal after the rotation) is recovered from its newest
+  rotated predecessor (`plan_recovered`), moved back, not copied.
+- The accounting: one swap per outpoint. The pairs rewrite drops a plan
+  named in a counted plan's `replaces`, and — found in the self-doubt pass,
+  a stage-5 bug — two plans that spend a common outpoint (an evicted
+  original beside its re-sign, a rejected re-send beside its fresh forward)
+  count once: the record the reconciliation named (`superseded_by` on the
+  current plan, which counts even under a stale mark on its own rotated
+  file), else the newest. A superseded plan records the superseder's
+  height (`superseded_height`) and is `forwarded` once that one mines.
+- Counts: test_btc_forwarder 261, test_wake_agent 721, test_telegram_pager
+  761, test_wake_doorbell 165, test_wake_protocol 189; 641 anchors. The
+  testnet drill gains act F (a replacement with `--bump-after 0` and the
+  estimate forced one above the rate paid).
+
 ### Stage 5: what happens when it does not go to plan (`STAGE5_PLAN.md`)
 - Planned first, after an end-to-end read of the whole money path done
   without trusting the tests (section 1 of the plan: what is real, what is
@@ -772,6 +819,7 @@ rule-6 material).
 | 3 | Broadcast over Tor; "seen" in the network as the proof; testnet end-to-end on a box with Tor; reorg edges and confirmation depth moved to stage 5 | **BUILT** — `gs_btc_broadcast.py` (test_btc_broadcast 75/75), `btc_forwarder --broadcast` (test_btc_forwarder 163/163, one forward through the real transport + real subclass + real forwarder against an in-process SOCKS5+TLS Electrum), wire v5 with `sent`/`unsure`, `allow_btc_broadcast`, the ledger's `forward_sent` and the once-sent rule (test_wake_agent 642, test_wake_endtoend 64, doorbell 161, pager 653), `tests/real_btc_forward_testnet.py` (skips here), 24 new anchors all caught; `STAGE3_PLAN.md` is the record |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc; banned-word and currency scans extended | **BUILT** — the vault mints a fresh, network-verified address per deposit and a memo-less plain slip (wire v6, two exact shapes); the Pi watches it in memory (the xpub never goes on the card), says received/confirmed once each and starts the forward through the one wake path when the box is free; the button and `/check` on an intake deposit ask the forward, after a restart too; `/balance`; pairing couples `--btc-xpub` to `--deposit-in-chat` and `--allow-btc-forward` (test_wake_agent 669, test_telegram_pager 704, test_depo_wizard 434, test_plain_slip 232, test_btc_forwarder 168, test_btc_broadcast 83, test_wake_endtoend 70), 36 anchors all caught; `STAGE4_PLAN.md` is the record, its section 8 the self-doubt findings |
 | 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | **BUILT** — `btc_forwarder --reconcile` (listed / re-send / re-sign evicted / forward returned money / foreign spend fails; the plan chain; one signature per outpoint), fee refusals as `delayed`/`short` with the Pi retrying, an emptied address read for our own forward, the pairs file rewritten to the real swap, the honest floor, `--thornode` required to send, `--btc-account`, `ledger_wiped`; test_btc_forwarder 219, test_btc_broadcast 96, test_btc_tx 101, test_wake_agent 691, test_telegram_pager 716, test_wake_endtoend 70; `STAGE5_PLAN.md` is the record |
+| 6 | The forward after the send: the reconciliation driven by the Pi (a recheck window, an automatic recheck once per window, `forwarded` ending it), a stuck forward found on the whole plan chain and replaced (RBF) at today's rate over a floor that beats every earlier signature, the rotation made safe and a chain without a current plan recovered, one swap per outpoint in the pairs file | **BUILT** — `btc_forwarder` (`stuck_forward`, `replacement_floor`, `with_plan_inputs`, `_recover_plan`, `--bump-after`), `gs_wake_agent` (`forwarded`, `_forward_mined` over the superseder too, the pairs rewrite one-swap-per-outpoint, `--bump-after` from the keyfile), `gs_wake_keys pair --btc-bump-after`, `gs_telegram_pager` (`--btc-recheck`, `_recheck_due_entry`, the recheck in `btc_tick`, the entry learned back after a restart); wire v8; test_btc_forwarder 261, test_wake_agent 721, test_telegram_pager 761; 641 anchors; `STAGE6_PLAN.md` is the record, its section 8 the self-doubt findings |
 
 Each stage is validated before the next. Mainnet is not touched until every
 stage is green on testnet and reviewed.
@@ -793,7 +841,12 @@ stage is green on testnet and reviewed.
   (`NODE_PATH=$(npm root -g)`, Chromium at `/opt/pw-browsers`) to check for
   JS errors and that the simulation walks the wizard.
 - Do not run the mutation sweep and a full suite run at the same time (port
-  collision, see section 2).
+  collision, see section 2). The sweep copies the whole repository once per
+  mutation (`shutil.copytree`), so do not edit any file in the repository
+  while a sweep is running: a half-written file lands in the copy and the
+  verdict is about nothing. A test on a mutated copy must read RED, never
+  die: a crash is NO-RESULT, so tests read with `.get`/`getattr`/`str.find`
+  rather than indexing what the mutation may have removed.
 
 ## 6. Standing rules for this branch (do not drift)
 

@@ -1700,6 +1700,11 @@ class Pager:
         self.btc_poll_s = int(getattr(args, "btc_poll", 600) or 600)
         self.btc_fee_retry_s = int(getattr(args, "btc_fee_retry", 3600)
                                    or 3600)
+        #: How long after a forward went out this end asks the forward about
+        #: it again (stage 6): the recheck that finds a dropped, unpropagated
+        #: or stuck forward. At least the vault's --btc-bump-after.
+        self.btc_recheck_s = int(getattr(args, "btc_recheck", 10800)
+                                 or 10800)
         #: The smallest deposit the wizard takes. The vault has its own floor
         #: on the intake (what can be forwarded after the fee); set this to
         #: it so the refusal happens here, with the number, and not after a
@@ -4501,8 +4506,14 @@ class Pager:
             # reported sent has nothing more to hear from that job; the
             # client is now waiting for the swap to land, and that is the
             # XMR side's question (swap_status, as for any deposit).
-            _ask_forward = (self._btc_watched(_h) or bool(self.btc_servers)) \
-                and _h not in self._btc_sent_set()
+            # ...AND THE FORWARD'S QUESTION AGAIN ONCE THE RECHECK IS DUE
+            # (stage 6): the vault was not sure it went out (`unsure`), or
+            # --btc-recheck has passed since it did. The reconciliation
+            # re-sends, re-signs, bumps, or answers `forwarded`, and that
+            # word ends the rechecks.
+            _ask_forward = ((self._btc_watched(_h) or bool(self.btc_servers))
+                            and (_h not in self._btc_sent_set()
+                                 or self._btc_recheck_due(_h)))
             if job in ("swap_status", "watch") and _ask_forward:
                 job = "forward_to_swap"
         self.start_job(cid, job, params)
@@ -5010,6 +5021,7 @@ class Pager:
         "forwarding": "confirmed, sending on",
         "stalled": "confirmed, but sending on did not go through",
         "sent": "sent on",
+        "forwarded": "sent on, confirmed",
     }
     #: How long after a forward the vault would not pay for at today's fee
     #: (`delayed`) the watcher tries again, in seconds: --btc-fee-retry.
@@ -5079,15 +5091,38 @@ class Pager:
         """A forward reported for a deposit on the watch list."""
         lock, opened = self._btc()
         with lock:
-            if out == "done" and phase in ("sent", "unsure"):
+            if out == "done" and phase in ("sent", "forwarded"):
                 # LEARNED FROM THE ANSWER, watched or not: the next ask
-                # about this deposit is for the XMR side.
+                # about this deposit is for the XMR side -- until the
+                # recheck is due (stage 6, _btc_recheck_due).
                 self._btc_sent_set().add(h)
-            if out == "done" and phase == "returned":
+            if out == "done" and phase in ("returned", "unsure"):
                 # MONEY CAME BACK (stage 5): the next ask is the forward's
-                # again, whatever this end had learned before.
+                # again, whatever this end had learned before. And so is
+                # a forward the vault was NOT SURE went out (stage 6): an
+                # unsure forward is the forward's question until it is
+                # sure, watched or not -- after a restart too.
                 self._btc_sent_set().discard(h)
             e = opened.get(h)
+            if (not e and out == "done"
+                    and phase in ("sent", "unsure", "forwarded")
+                    and isinstance(h, str) and proto.HANDLE_RE.match(h)
+                    and isinstance(chat_id, int)
+                    and not isinstance(chat_id, bool)):
+                # A FORWARD THIS END DID NOT REMEMBER (stage 6): the pager
+                # was restarted since the deposit was opened, the first ask
+                # went to the forward, and its answer says what went out.
+                # Learned back onto the list as the entry it would have
+                # been -- the state, the word, the clock -- so the recheck
+                # window and the automatic recheck apply to it as to any
+                # sent forward, instead of every later ask going to the
+                # XMR side for ever (the gap of STAGE6_PLAN.md 1(a),
+                # reopened by a restart). No address: it is never looked
+                # at (only not_seen and seen entries are), and money that
+                # comes back to it is the forward's question by the tap.
+                e = opened[h] = {"addr": "", "chat": int(chat_id),
+                                 "state": "sent", "conf": 0, "unconf": 0,
+                                 "said": set(), "since": time.time()}
             if not e:
                 return
             if out == "done" and phase in ("sent", "unsure"):
@@ -5095,20 +5130,53 @@ class Pager:
                 # phase line the forward branch renders. KEPT on the list as
                 # `sent` -- not looked at, but its address remembered, so
                 # money that comes back to it (a refund, a second payment)
-                # can be watched again without a fresh slip.
+                # can be watched again without a fresh slip. THE WORD IS
+                # KEPT TOO (stage 6): `unsure` makes the recheck due at
+                # once, `sent` after --btc-recheck; the stamp is the start
+                # of that window, and a fresh answer starts a fresh one.
+                # `rechecked_at` -- when this end last STARTED a recheck by
+                # itself -- is kept: the automatic path starts one per
+                # window whatever the word came back, or a network that
+                # keeps answering `unsure` would cost a wake a tick.
                 e["state"] = "sent"
+                e["word"] = phase
                 e["sent_at"] = time.time()
                 e.pop("retry_after", None)
                 return
+            if out == "done" and phase == "forwarded":
+                # IN A BLOCK (stage 6): the rechecks end here. Kept on the
+                # list, like sent, for the same reasons, and expiring on
+                # the same clock; the arrival is the XMR side's question.
+                e["state"] = "forwarded"
+                e["word"] = phase
+                e["sent_at"] = time.time()
+                e.pop("retry_after", None)
+                e.pop("rechecked_at", None)
+                return
             if out == "done" and phase == "returned":
+                if not e.get("addr"):
+                    # Money came back to a forward learned after a restart:
+                    # there is no address here to watch it on. Forgotten
+                    # again, and unlearned as sent above, so the tap asks
+                    # the forward, which sends it on once it has settled.
+                    opened.pop(h, None)
+                    return
                 # Watched again from here: when it settles the forward is
                 # started as for a first payment, and said as such.
                 e["state"] = "seen"
                 e["said"].discard("confirmed")
                 e["said"].discard("held")
                 e.pop("retry_after", None)
+                e.pop("rechecked_at", None)
                 return
             if out == "done" and phase == "delayed":
+                if e["state"] in ("sent", "forwarded"):
+                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY
+                    # (stage 6): the original stands, listed, and the
+                    # recheck is not due again until --btc-fee-retry has
+                    # passed. The entry stays as it was.
+                    e["retry_after"] = time.time() + float(self.btc_fee_retry_s)
+                    return
                 # THE VAULT WOULD NOT PAY TODAY'S FEE. Fees fall in hours:
                 # the deposit stays on the list as money seen and the
                 # watcher starts the forward again after --btc-fee-retry,
@@ -5117,11 +5185,26 @@ class Pager:
                 e["state"] = "seen"
                 e["retry_after"] = time.time() + float(self.btc_fee_retry_s)
                 return
-            if out == "done" and phase == "arriving":
-                e["state"] = "seen"
+            if out == "done" and phase in ("arriving", "not_yet"):
+                if not e.get("addr"):
+                    # A looked-at state needs an address to look at. An
+                    # entry learned back after a restart has none: the
+                    # vault's ledger no longer says the forward went out
+                    # (a wipe), so this end forgets the entry too, and
+                    # the tap asks the forward, as for any deposit a
+                    # restart forgot.
+                    opened.pop(h, None)
+                    return
+                e["state"] = "seen" if phase == "arriving" else "not_seen"
                 return
-            if out == "done" and phase == "not_yet":
-                e["state"] = "not_seen"
+            if e["state"] in ("sent", "forwarded"):
+                # A RECHECK THAT DID NOT FINISH (stage 6): the history could
+                # not be read, the box refused, the run failed. The forward
+                # that went out still stands; nothing here is "here" to
+                # send on, so the stalled sentence below would be false.
+                # The poke has told the chat what happened in its own
+                # words; this end waits a window and asks again.
+                e["rechecked_at"] = time.time()
                 return
             # A rehearsal (done, no word), a refusal or a failure: the
             # automatic path stops here so it cannot spend a wake a tick,
@@ -5140,10 +5223,37 @@ class Pager:
                       buttons=self._handle_buttons(h, "receive_and_quote",
                                                    chat_id))
 
+    #: How long after a forward went out this end asks the forward about
+    #: it again (stage 6): --btc-recheck. At least the vault's
+    #: --btc-bump-after, or the recheck finds no bump due.
+    btc_recheck_s = 10800
+
+    def _recheck_due_entry(self, e, now) -> bool:
+        """Whether a watch entry's forward is the forward's question again
+        (stage 6, STAGE6_PLAN.md 3.6): it went out (`sent`), no fee retry is
+        pending, and either the vault was not sure it went out (`unsure`:
+        at once) or --btc-recheck has passed since. Pure; no lock."""
+        if not e or e.get("state") != "sent":
+            return False
+        if now < float(e.get("retry_after") or 0.0):
+            return False
+        if e.get("word") == "unsure":
+            return True
+        return now - float(e.get("sent_at") or now) >= float(self.btc_recheck_s)
+
+    def _btc_recheck_due(self, h: str, now=None) -> bool:
+        """_recheck_due_entry for handle `h`, under the lock."""
+        lock, opened = self._btc()
+        with lock:
+            return self._recheck_due_entry(
+                opened.get(h), time.time() if now is None else float(now))
+
     def btc_tick(self, look=None) -> None:
         """One look at every watched address, on its own circuit, and the
         transitions each look earned. A look that fails is not a state
-        change and is not said. `look` may be injected (a test)."""
+        change and is not said. `look` may be injected (a test). And, stage
+        6, ONE recheck of a forward that went out and is due one, started
+        through the same gates as every wake."""
         if not self.btc_servers and look is None:
             return
         lock, opened = self._btc()
@@ -5163,13 +5273,24 @@ class Pager:
                        if (v["state"] == "not_seen"
                            and _now - float(v.get("since") or _now)
                            >= proto.DEPOSIT_PLACE_TTL_S)
-                       or (v["state"] == "sent"
+                       or (v["state"] in ("sent", "forwarded")
                            and _now - float(v.get("sent_at") or _now)
                            >= proto.DEPOSIT_PLACE_TTL_S)]:
                 opened.pop(_h, None)
+                # ...AND FORGOTTEN AS SENT (stage 6): an ask about a
+                # forward this end no longer remembers is the forward's
+                # question again, which answers truthfully at every stage.
+                self._btc_sent_set().discard(_h)
                 integrity_log("pager", "btc_watch_forgotten")
             snapshot = [(h, dict(e)) for h, e in opened.items()
                         if e["state"] in ("not_seen", "seen")]
+            # THE FORWARDS THAT WENT OUT AND ARE DUE A RECHECK (stage 6),
+            # not yet started this window. Read here, started below the
+            # looks -- one per tick, since one job is all the box runs.
+            _due = [h for h, e in opened.items()
+                    if self._recheck_due_entry(e, _now)
+                    and _now - float(e.get("rechecked_at") or 0.0)
+                    >= float(self.btc_recheck_s)]
         for h, e in snapshot:
             try:
                 if look is None:
@@ -5181,6 +5302,32 @@ class Pager:
             except Exception:                                # noqa: BLE001
                 continue
             self._btc_apply(h, r)
+        # THE RECHECK, WHEN NOBODY TAPPED (stage 6). A forward the network
+        # dropped, never propagated, or stopped confirming was invisible:
+        # every tap after `sent` went to the XMR side, which answered
+        # "nothing yet" for ever. The vault's reconciliation answers
+        # truthfully -- re-sends, re-signs, bumps, or says `forwarded` --
+        # and this is what runs it when the client is not asking: once per
+        # window, through the same gates as every wake, silently held
+        # while the box is busy. The forward's answer starts a new window
+        # or ends the rechecks.
+        for h in _due:
+            if not self._btc_can_start():
+                break
+            started = False
+            try:
+                started = bool(self.start_job(
+                    (opened.get(h) or {}).get("chat"), "forward_to_swap",
+                    {"handle": h}))
+            except BaseException as ex:                      # noqa: BLE001
+                print(f"  [!] the recheck did not start: {_redact(ex)[:120]}")
+            if started:
+                with lock:
+                    e = opened.get(h)
+                    if e is not None:
+                        e["rechecked_at"] = _now
+                integrity_log("pager", "forward_recheck")
+                break
 
     def _btc_can_start(self) -> bool:
         """Whether a wake could start right now: nothing running, the day's
@@ -5542,7 +5689,10 @@ class Pager:
             # poll thread does, under the same locks.
             threading.Thread(target=self.btc_watch_loop, daemon=True).start()
             print(f"  [+] watching the intake's open deposits every "
-                  f"{self.btc_poll_s}s over {len(self.btc_servers)} server(s).")
+                  f"{self.btc_poll_s}s over {len(self.btc_servers)} server(s); "
+                  f"a forward that went out is asked about again after "
+                  f"{self.btc_recheck_s}s (set it at or above the vault's "
+                  f"--btc-bump-after).")
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
               + (f", {len(self.allow_users)} allowlisted sender(s)"
                  if self.allow_users else "")
@@ -5935,6 +6085,15 @@ def build_cli():
                     help="how long after the vault would not pay today's fee "
                          "for a forward this end tries again, by itself "
                          "(default 3600, floor 600)")
+    ap.add_argument("--btc-recheck", type=int, default=10800,
+                    metavar="SECONDS",
+                    help="how long after a forward went out this end asks "
+                         "the forward about it again -- by itself when nobody "
+                         "taps -- so one the network dropped, never "
+                         "propagated or stopped confirming is re-sent, "
+                         "re-signed or replaced at today's rate (default "
+                         "10800, floor 600). At least the vault's "
+                         "--btc-bump-after, or the recheck finds no bump due.")
     ap.add_argument("--deposit-min-sat", type=int, default=0,
                     help="the smallest deposit the wizard takes, in satoshi; "
                          "set it to the vault's intake floor so a deposit it "
@@ -5995,6 +6154,10 @@ def main(argv=None) -> int:
         if getattr(args, "btc_fee_retry", 3600) < 600:
             sys.exit("[!] --btc-fee-retry under 600 s would spend the day's "
                      "wakes on a fee that has not had time to fall.")
+        if getattr(args, "btc_recheck", 10800) < 600:
+            sys.exit("[!] --btc-recheck under 600 s would spend the day's "
+                     "wakes asking about a forward that has not had time "
+                     "to confirm.")
     if getattr(args, "deposit_min_sat", 0) < 0:
         sys.exit("[!] --deposit-min-sat cannot be negative.")
 
