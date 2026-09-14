@@ -4452,6 +4452,139 @@ check("NON-VACUITY: a slip WITH a memo still gets the shared-inbound "
       len(_note_i) == 1 and len(_pay_i) == 1 and _note_i[0] < _pay_i[0]
       and "C7D2" not in _sp._btc()[1])
 
+print("\n-- the payment details outlive the timed burn until the payment "
+      "is seen --")
+
+
+def _depo_done_with_mid(plain, mid=4321, chat=111, burn_after=900):
+    """_depo_done, with a send that hands back a message id the way the
+    real one does (through _LAST_MID), so the intake's pay message can be
+    recorded on the watch list -- on an install that burns (the default
+    fifteen minutes), since the sentence about staying is only said then."""
+    _fp, _fs, _, _ = _tapper((chat,))
+    _fp.burn_after = burn_after
+    _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
+
+    def _send(c, t, buttons=None):
+        _fs.append((t, buttons))
+        pg._LAST_MID.mid = mid if "here is how to pay" in t else None
+        return True
+    _fp.send = _send
+
+    class _Done:
+        def __init__(self):
+            self.result = {"status": "done", "handle": plain["h"], "slip": "",
+                           "plain": dict(plain), "phase": ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(
+            run_wake=lambda *a, **k: _Done())
+        _fp.start_job(chat, "receive_and_quote", {"amount_sat": 5000000})
+        for _ in range(600):
+            if not _fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _fp, _fs
+
+
+# --burn-after deleted the address fifteen minutes after it landed; a client
+# who went to buy the coin and came back had no address and no way to get it
+# again (/check said "not yet" about an address it would not show; a fresh
+# /deposit minted a second one with the first still holding its place). The
+# details have not served their purpose until the money is on the address.
+_hp, _hs = _depo_done_with_mid(_PLAIN_BTC)
+_he = _hp._btc()[1].get("B4A1") or {}
+_hpay = [t for t, _b in _hs if "here is how to pay" in t]
+check("the intake's pay message is recorded on the watch entry by its id, "
+      "and says it stays until the payment is seen",
+      _he.get("pay_mid") == 4321 and len(_hpay) == 1
+      and "stays until the payment is seen" in _hpay[0])
+check("...and it is on the burn hold while the deposit is not_seen",
+      _hp._btc_held_messages() == {(111, 4321)})
+_hp0, _hs0 = _depo_done_with_mid(_PLAIN_BTC, burn_after=0)
+_hpay0 = [t for t, _b in _hs0 if "here is how to pay" in t]
+check("NON-VACUITY: with --burn-after 0 nothing is ever deleted, so the "
+      "message does not promise a deletion -- the sentence is left out",
+      len(_hpay0) == 1 and "stays until the payment is seen" not in _hpay0[0]
+      and "deleted" not in _hpay0[0])
+_bh = _BurnPager(burn_after=60)
+_bh.p._btc_register("B4A1", _BTC_ADDR, 111)
+_bh.p._btc_pay_message("B4A1", 5)
+_bnow = time.time()
+_bh.p.burn = [(111, 5, _bnow - 3600), (111, 6, _bnow - 3600)]
+_bg = _bh.p.burn_expired(60)
+check("burn: the pay message of an UNPAID deposit is held past the deadline "
+      "while any other message that old goes",
+      _bg == 1 and _bh.deleted == [(111, 6)]
+      and [m for _c, m, _t in _bh.p.burn] == [5])
+_bh.p._btc()[1]["B4A1"]["state"] = "seen"
+_bg2 = _bh.p.burn_expired(60)
+check("...the moment the deposit is seen paid, the hold ends and the next "
+      "tick takes it like any other", _bg2 == 1 and (111, 5) in _bh.deleted
+      and _bh.p.burn == [])
+_bh2 = _BurnPager(burn_after=60)
+_bh2.p._btc_register("B4A2", "bc1qother", 111)
+_bh2.p._btc_pay_message("B4A2", 7)
+_bh2.p.burn = [(111, 7, _bnow - pg.PAY_HOLD_MAX_S - 10)]
+check("...an unpaid deposit's message is still deleted an hour inside "
+      "Telegram's window, so a deposit nobody pays does not leave one a bot "
+      "can no longer delete", _bh2.p.burn_expired(60) == 1
+      and _bh2.deleted == [(111, 7)]
+      and pg.PAY_HOLD_MAX_S < pg.TG_DELETE_WINDOW_S
+      and pg.PAY_HOLD_MAX_S < P.DEPOSIT_PLACE_TTL_S)
+_bh3 = _BurnPager(burn_after=60)
+_bh3.p._btc_register("B4A3", "bc1qthird", 111)
+_bh3.p._btc_pay_message("B4A3", 8)
+_bh3.p.burn = [(111, 8, _bnow - 3600)]
+check("...and the operator's own burn signal (burn_all) ignores the hold: "
+      "a wipe is a wipe", _bh3.p.burn_all() == (1, 1)
+      and _bh3.deleted == [(111, 8)])
+check("NON-VACUITY: a message id that is not an int is not recorded, and a "
+      "handle nothing watches records nothing",
+      (_bh3.p._btc_pay_message("B4A3", "8"), _bh3.p._btc_pay_message("ZZZZ", 9),
+       _bh3.p._btc()[1]["B4A3"].get("pay_mid"))[2] == 8
+      and "ZZZZ" not in _bh3.p._btc()[1])
+
+print("\n-- a flooding chat is answered with silence --")
+# Every message an allowlisted chat sends costs a reply over Tor on the one
+# thread that reads every chat, and a burn-list entry; nothing bounded
+# either, so a client sending a thousand lines held the loop for everyone.
+_fl, _fls, _flt, _flj = _tapper((111, 222))
+for _i in range(pg.Pager.INBOUND_MAX):
+    _fl.handle({"update_id": _i, "message": {"chat": {"id": 111},
+                                             "message_id": 100 + _i,
+                                             "text": "hello"}})
+_fl_before, _fl_ign = len(_fls), _fl.ignored
+_fl.handle({"update_id": 999, "message": {"chat": {"id": 111},
+                                          "message_id": 999,
+                                          "text": "hello"}})
+check("flood: the first INBOUND_MAX messages in a minute are answered; the "
+      "next is dropped -- no reply, not tracked for deletion, counted",
+      _fl_before == pg.Pager.INBOUND_MAX and len(_fls) == _fl_before
+      and not any(m == 999 for _c, m, _t in _fl.burn)
+      and _fl.ignored == _fl_ign + 1)
+_fl.handle(_msg(222, 222, "hello"))
+check("...another chat is not slowed by it", len(_fls) == _fl_before + 1)
+_tap(_fl, "m:status")
+check("...and a tap is a message too: the flooding chat's button does "
+      "nothing more", len(_fls) == _fl_before + 1 and _flj == [])
+# (getattr: on a copy with the guard removed nothing records a stamp, and
+# this must read RED, not die with no RESULT line)
+_fl_stamps = getattr(_fl, "_inbound", {}).get(111, [])
+check("flood: the window is real time, not the harness clock: the stamps "
+      "are monotonic seconds", bool(_fl_stamps)
+      and all(t > 0 for t in _fl_stamps)
+      and len(_fl_stamps) == pg.Pager.INBOUND_MAX)
+
 print("\n-- the watcher: one look per address, the transitions said once --")
 
 

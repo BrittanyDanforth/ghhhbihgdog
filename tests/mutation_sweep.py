@@ -4878,6 +4878,23 @@ MUTATIONS = [
   '                "",\n'
   '                account=account_no)',
   ['test_wake_agent']),
+ ('a flooding chat is answered for ever', 'gs_telegram_pager',
+  '        if self._inbound_flooded(cid):\n            return\n',
+  '        if False:\n            return\n',
+  ['test_telegram_pager']),
+ ('the payment details burn before the payment is seen', 'gs_telegram_pager',
+  '                    or ((cid, mid) in held and now - sent < PAY_HOLD_MAX_S):',
+  '                    or False:',
+  ['test_telegram_pager']),
+ ('unpaid payment details are held past the delete window',
+  'gs_telegram_pager',
+  '                    or ((cid, mid) in held and now - sent < PAY_HOLD_MAX_S):',
+  '                    or ((cid, mid) in held):',
+  ['test_telegram_pager']),
+ ('the pay message is not recorded on the watch list', 'gs_telegram_pager',
+  '                    self._btc_pay_message(h, getattr(_LAST_MID, "mid", None))',
+  '                    pass',
+  ['test_telegram_pager']),
  ('the account number is left out of the seed proof', 'gs_wake_agent',
   '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
   '                account=account_no)\n'

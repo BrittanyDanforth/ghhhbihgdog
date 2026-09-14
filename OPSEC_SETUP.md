@@ -740,7 +740,9 @@ pocket-dial — and a tap is a pocket-dial.
    starts; the pager deletes the operator's own messages after
    `--burn-after` seconds — **fifteen minutes by default; `0` turns it
    off** — and deletes every question and reply of a `/deposit` or
-   `/withdraw` the moment that exchange ends, whatever the setting; and the
+   `/withdraw` the moment that exchange ends, whatever the setting (the one
+   exception is the intake's payment details, which stay until the payment
+   is seen — see 4b); and the
    thing the Pi still cannot do — name the destination subaddress, which is
    minted inside the job on the vault — was always the half that mattered.
 
@@ -1368,7 +1370,11 @@ first two on the vault where they cannot be talked around from a phone:
   `--daily-cap` (12 pokes a day for the whole bot) and `--min-interval`
   (300 s between *any* two pokes). Raise `--daily-cap` with the places — the
   pager says so at startup when it is too small — and expect "wait Ns" when
-  two people poke within five minutes of each other.
+  two people poke within five minutes of each other. What is NOT shared is
+  the reading of the chats: a chat that sends more than twenty messages in a
+  minute is answered with silence past that, and nobody else is slowed by
+  it. A client who spends the shared wake budget on taps is a client to
+  take off the allowlist; nothing here can tell them from an anxious one.
 - **Wall clock, which is what actually binds once the first two are sized.**
   One vault drains one withdrawal at a time; eight people withdrawing at ten
   hops is three days of queue nobody can shorten. Three or four people in
@@ -2078,7 +2084,13 @@ once a second party has said it is fresh, because the ledger that hands out
 indices is one of the things `paranoia_mode` wipes); records the index on
 the handle. The chat gets one message: the amount, the address, the label,
 and "I will say here when it arrives and when it has confirmed. After that
-it moves on by itself." That freshness look is a new thing the vault says
+it moves on by itself." **That one message outlives `--burn-after`** until
+the pager sees money on the address: the details have not served their
+purpose before then, and a client who read them, went to buy the coin and
+came back twenty minutes later used to find no address and no way to get it
+again. It is still deleted an hour inside Telegram's 48-hour window if
+nobody ever pays, and a pager restart forgets the hold with the rest of the
+watch list. That freshness look is a new thing the vault says
 to a server: it names an address moments before that address is paid, on
 its own circuit. A third-party Electrum server can correlate the two; your
 own electrs over an onion cannot, which is one more reason the `--btc-electrum`

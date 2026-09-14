@@ -2910,6 +2910,14 @@ class Pager:
         now = time.time()
         with _BURN_LOCK:
             snapshot = list(self.burn)
+        # THE PAYMENT DETAILS OF A DEPOSIT NOT YET PAID STAY, whatever their
+        # age -- up to PAY_HOLD_MAX_S, inside Telegram's window, so a deposit
+        # nobody ever pays is still deleted while a bot still can. The
+        # moment the watcher sees money on the address the hold ends and the
+        # next tick takes the message like any other. See poke's intake
+        # branch for why. burn_all (the operator's signal) ignores the hold:
+        # a wipe is a wipe.
+        held = self._btc_held_messages()
         keep, gone, tried, dead = [], 0, 0, False
         for cid, mid, sent in snapshot:
             # AT MOST max_deletes PER TICK, AND ONE TIMEOUT. Each delete is
@@ -2917,7 +2925,8 @@ class Pager:
             # circuit stalled the loop for minutes, and every button tapped
             # meanwhile died. The first request that never completes ends
             # the tick -- the rest stay due for the next one.
-            if now - sent < older_than or tried >= max_deletes or dead:
+            if now - sent < older_than or tried >= max_deletes or dead \
+                    or ((cid, mid) in held and now - sent < PAY_HOLD_MAX_S):
                 keep.append((cid, mid, sent))
                 continue
             tried += 1
@@ -3580,14 +3589,34 @@ class Pager:
                 # itself. Registered BEFORE the reply goes out, so a tap on
                 # the button a moment later already finds it.
                 self._btc_register(h, plain.get("d", ""), chat_id)
-                self.send(chat_id,
-                          f"{chat_name(job)}: here is how to pay.\n\n"
-                          + "\n".join(proto.plain_lines(
-                              plain, label=_cn)).rstrip()
-                          + "\n\nI will say here when it arrives and when it "
-                            "has confirmed. After that it moves on by itself "
-                            "— nothing more to do. Tap below to ask sooner.",
-                          buttons=self._handle_buttons(h, job, chat_id))
+                # THIS MESSAGE OUTLIVES THE TIMED BURN, until the payment
+                # is seen (burn_expired, _btc_held_messages). --burn-after
+                # deleted it fifteen minutes after it landed, and a client
+                # who read it, went to buy the coin and came back found no
+                # address and no way to get it again: /check answered "not
+                # yet" about an address it would not show, and a fresh
+                # /deposit minted a second address with the first still
+                # holding its place. The details are the one thing here
+                # that has not served its purpose until the money is on
+                # the address; the moment this end sees it, they go like
+                # everything else. Told in the message, in the same words
+                # the welcome uses for the rest -- and only on an install
+                # that deletes at all: with --burn-after 0 nothing goes,
+                # and a sentence promising a deletion would be false.
+                _stay = ("\nThis message stays until the payment is seen, "
+                         "then it is deleted like the rest."
+                         if int(getattr(self, "burn_after", 0) or 0) > 0
+                         else "")
+                if self.send(chat_id,
+                             f"{chat_name(job)}: here is how to pay.\n\n"
+                             + "\n".join(proto.plain_lines(
+                                 plain, label=_cn)).rstrip()
+                             + "\n\nI will say here when it arrives and "
+                               "when it has confirmed. After that it moves "
+                               "on by itself — nothing more to do. Tap "
+                               "below to ask sooner." + _stay,
+                             buttons=self._handle_buttons(h, job, chat_id)):
+                    self._btc_pay_message(h, getattr(_LAST_MID, "mid", None))
                 return
             if plain:
                 # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
@@ -4060,6 +4089,23 @@ class Pager:
         # noise in the one channel that is supposed to be almost silent, and
         # a reply to something nobody typed.
         if not isinstance(msg.get("text"), str):
+            return
+        # A CHAT THAT FLOODS IS ANSWERED WITH SILENCE, past a rate no thumb
+        # reaches. Every message an allowlisted chat sends costs this box a
+        # reply -- one POST over Tor, on the ONE thread that reads every
+        # chat -- and a line on the burn list. Nothing bounded either: a
+        # client (or whoever holds their phone) sending a thousand lines held
+        # the poll loop for the better part of an hour answering them, with
+        # every other client's tap queued behind, and the list grew by a
+        # thousand entries drained eight a tick. The /status cooldown already
+        # argues the rule for one button; this is the same rule for the chat.
+        # DROPPED, NOT RECORDED: a line this end never answers is not one it
+        # spends a delete on, and the list is what bounds the memory. A tap
+        # is a message here too (handle_callback synthesises one), so a thumb
+        # on a button is rationed the same way. Counted, once per streak on
+        # the chain (_log_ignored), never a reply -- a "slow down" line is a
+        # message, which is the thing being rationed.
+        if self._inbound_flooded(cid):
             return
         # THE OPERATOR'S OWN MESSAGE IS TRACKED TOO, and it is the half that
         # matters more. The bot's replies are deliberately boring; the COMMANDS
@@ -4894,6 +4940,28 @@ class Pager:
     #: most once a window, which is what an audit of the card needs to know.
     IGNORED_LOG_EVERY_S = 600
 
+    #: How many messages ONE chat may send in INBOUND_WINDOW_S before the
+    #: rest are dropped unanswered (handle()). A wizard is four lines and a
+    #: confused minute is a dozen; twenty a minute is nobody's thumb.
+    INBOUND_WINDOW_S = 60
+    INBOUND_MAX = 20
+
+    def _inbound_flooded(self, cid: int) -> bool:
+        """Whether this chat has sent more than INBOUND_MAX messages in the
+        last INBOUND_WINDOW_S. The wall clock's monotonic reading, not
+        self.clock: the window is a fact about real time. Bounded by the
+        allowlist: at most INBOUND_MAX stamps per allowed chat."""
+        now = time.monotonic()
+        d = self.__dict__.setdefault("_inbound", {})
+        stamps = [t for t in d.get(cid, ()) if now - t < self.INBOUND_WINDOW_S]
+        if len(stamps) >= self.INBOUND_MAX:
+            d[cid] = stamps
+            self._log_ignored("chat_flooded")
+            return True
+        stamps.append(now)
+        d[cid] = stamps
+        return False
+
     def _log_ignored(self, kind: str) -> None:
         """Count a silently ignored update, and put its kind on the chain
         at most once per IGNORED_LOG_EVERY_S."""
@@ -4980,6 +5048,31 @@ class Pager:
         lock, opened = self._btc()
         with lock:
             return h in opened
+
+    def _btc_pay_message(self, h: str, mid) -> None:
+        """The message carrying handle `h`'s payment details, by id, so the
+        timed burn can leave it standing until the payment is seen (see
+        burn_expired). Memory, with the watch entry it belongs to."""
+        if not (isinstance(mid, int) and not isinstance(mid, bool)):
+            return
+        lock, opened = self._btc()
+        with lock:
+            e = opened.get(h)
+            if e is not None:
+                e["pay_mid"] = int(mid)
+
+    def _btc_held_messages(self) -> set:
+        """(chat, message_id) of every payment-details message whose deposit
+        this end has not yet seen paid: the ones the timed burn leaves
+        standing. Empty once the money is seen, sent, or the deposit is
+        forgotten."""
+        lock, opened = self._btc()
+        with lock:
+            return {(int(e["chat"]), int(e["pay_mid"]))
+                    for e in opened.values()
+                    if e.get("state") == "not_seen"
+                    and isinstance(e.get("pay_mid"), int)
+                    and not isinstance(e.get("pay_mid"), bool)}
 
     def _btc_forward_result(self, h: str, out: str, phase: str,
                             chat_id: int) -> None:
@@ -5854,6 +5947,13 @@ def build_cli():
 #: --burn-after above it is a setting that silently never fires, which reads as
 #: "messages are being burned" while nothing is.
 TG_DELETE_WINDOW_S = 172800
+#: The longest the intake's payment details stay while the deposit is unpaid
+#: (burn_expired): an hour inside Telegram's window, so the message is still
+#: one a bot can delete when the hold ends. The watch list forgets a deposit
+#: nothing has reached after proto.DEPOSIT_PLACE_TTL_S, which is the whole
+#: window -- by then a message that old is past deleting, so the hold ends
+#: first.
+PAY_HOLD_MAX_S = TG_DELETE_WINDOW_S - 3600
 
 
 def main(argv=None) -> int:

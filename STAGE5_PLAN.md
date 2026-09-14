@@ -468,6 +468,68 @@ the forwarder.
 
 ---
 
+## 10. The doorbell and wizard pass
+
+The same read, over `gs_doorbell` (the keyfile, the one-job state machine,
+the handler, the pairing, `run_wake`, the report) and the pager's command
+parser, wizard, callbacks, `start_job`, the limits, the poke and its
+outcome branches, the worker, the poll loop, the places and `main` -- with
+three questions asked of every line: what does a second client see, what
+does a hostile allowlisted client do to this, and what reaches the
+transcript or the card.
+
+**Real, and fixed:**
+
+- **The payment details were deleted before the client had paid.**
+  `--burn-after` (fifteen minutes by default) took the intake's "here is
+  how to pay" message with every other, and nothing could show the address
+  again: /check answered "not yet" about an address it would not name, a
+  fresh /deposit minted a second address with the first still holding its
+  place. That message is the one thing in the chat that has not served its
+  purpose until the money is on the address. It now outlives the timed burn
+  while the watch list has the deposit as `not_seen`, capped an hour inside
+  Telegram's delete window so a deposit nobody pays still leaves nothing a
+  bot can no longer delete; the moment money is seen the hold ends and the
+  next tick takes it. The operator's burn signal ignores the hold. The
+  message says so in the welcome's own words.
+- **One allowlisted chat could hold the poll loop for everyone.** Every
+  message from an allowlisted chat cost a reply over Tor on the one thread
+  that reads every chat, and a burn-list entry, with nothing bounding
+  either; a client sending a thousand lines held the loop for the better
+  part of an hour with every other client's tap queued behind. A chat is
+  now answered up to INBOUND_MAX times a minute and silently dropped past
+  that (not recorded, not answered, counted once per streak on the chain);
+  a tap counts as a message. Strangers were already silent.
+
+**Read and found sound:** the doorbell answers 204 to every refusal so a
+prober learns nothing by status code; a record of any length but
+RECORD_LEN is refused before the AEAD; eight connections with an
+eight-second deadline bound a LAN flood to eight threads; the per-window
+nonce makes a captured M1 useless in any later window; the at-most-once
+handover and the at-most-one result are under one lock; the plain and
+sealed slips are shape-checked and never both; the phase word is a closed
+set. On the pager: an unallowlisted chat or sender is never answered; the
+sender is checked on a tap as on a message; a label is a MAC over (chat,
+handle) so a guessed handle is refused and a wrong one backs off per chat;
+a bare handle is accepted only while this process remembers minting it
+for that chat; the wizard holds one int and one address list and burns
+its own messages the moment it ends; a depth button is only a depth while
+a question is asking for one; the confirm sum is one attempt; every wake
+goes through `start_job` and its four gates; a chained withdrawal yields
+when another chat is waiting; `/status` answers from memory with a per-chat
+cooldown; a full card, a dead circuit or a stopped process are each told
+to the chat whose job it is and to nobody else's.
+
+**Considered and left:** the daily wake budget and the interval are shared
+by every chat, so one client's taps can spend the day for the others --
+documented, warned about at start (`--daily-cap` against
+`--max-clients`), and the allowlist is the remedy: a client who does that
+is a client the operator removes. A client can send dust to their own
+address to spend one wake per dust payment on a refused forward, after
+which the deposit is parked (`stalled`) and costs nothing more.
+
+---
+
 ## Status
 
 - [x] 1. floor and cap — test_btc_tx 101, test_btc_forwarder, test_wake_agent
@@ -493,3 +555,8 @@ the forwarder.
       caught; one test-side crash on a mutated copy turned into a red
       check and re-swept), test_btc_forwarder 221, test_wake_agent 700,
       test_wake_endtoend 71, the full suite
+- [x] 11. the doorbell and wizard pass (section 10): the payment details
+      outlive the timed burn until paid, a flooding chat is answered with
+      silence -- 4 anchors (605 total, all caught; one test-side crash on
+      a mutated copy turned red and re-swept), test_telegram_pager 728,
+      test_depo_wizard 434, test_opsec_doc 92, the full suite
