@@ -51,10 +51,15 @@ def check(name, cond):
         print("  FAIL:", name)
 
 
-# Real, checksum-valid mainnet addresses.
+# Checksum-valid mainnet addresses that are PROVABLY NOBODY'S: A1 is the
+# getmonero.org documentation address; A2 and A3 are derived from spend keys
+# of thirty-two 0x01 and 0x02 bytes (monero.seed.Seed("01" * 32) and
+# ("02" * 32)), so anyone can reproduce them and nobody can claim them. This
+# repository is public: a fixture that was some wallet's real address would
+# tie that wallet to this toolchain.
 A1 = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
-A2 = "43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2FuaqXMqLrVtED1kV2Z77b6NGE6FFTCm"
-A3 = "47BDEBFVTx8DwkcmD3isorD69HXCwxk8WU56eb9dp9k9hE1sjbYgFHV2rtXChvDWDFhhYYxBGWqxRZz4g7BBFCVqHUhQ5Fe"
+A2 = "42Lxp5b63YJ8mVZTzcioVnCk9WQCPAMk4RH7e7ygPTkzEiHB86MJkRbb9c4uyE3bV8fuu7ggU2XUYDFT4SxB7pbNC6PwL6c"
+A3 = "42Wz2Zm75sf8u5PXzAzCPDViDAyJnBL5u5mc5QVGBZXFELDdPS88cmA9tbFA7UYwiw1XnsMix9ToSBja8Lfq8fA7VakABjr"
 
 
 def _resolve(dests):

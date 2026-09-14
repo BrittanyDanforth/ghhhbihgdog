@@ -622,13 +622,17 @@ check("with_funding: (spends, paid) -- the spends as before, and every "
       "paid from, read off that input's previous transaction",
       [x["txid"] for x in _spr] == [_SPEND1_ID, _SPEND2_ID]
       and _pdr == [{"txid": _FUND_ID, "height": 850000, "vout": 0,
-                    "value": 300000, "memo": None, "from_address": None},
+                    "value": 300000, "memo": None, "from_address": None,
+                    "from_addresses": []},
                    {"txid": _FUND_ID, "height": 850000, "vout": 2,
-                    "value": 250000, "memo": None, "from_address": None},
+                    "value": 250000, "memo": None, "from_address": None,
+                    "from_addresses": []},
                    {"txid": _REFUND_ID, "height": 850002, "vout": 0,
                     "value": 280000,
                     "memo": "REFUND:" + _SPEND1_ID.upper(),
-                    "from_address": _VAULT_ADDR}])
+                    "from_address": _VAULT_ADDR,
+                    "from_addresses": [_VAULT_ADDR]}]
+      and B.REFUND_SOURCE_INPUTS == 4)
 check("...the previous transaction is fetched in the SAME session, once, "
       "and only for the claim: four history entries and one source",
       _ftr[0].methods.count("blockchain.transaction.get") == 5

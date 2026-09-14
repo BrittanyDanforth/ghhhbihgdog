@@ -5076,7 +5076,7 @@ check("...a returned deposit's second swap still SUMS with the first (no "
 # own vault) lowers the expectation; a claim -- a memo anyone can write --
 # never does.
 _RFV = {"txid": "77" * 32, "vout": 0, "value": 4900000, "of": "ab" * 32,
-        "verified": True}
+        "verified": True, "full": True}
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 check("a forward a VERIFIED refund names drops out of what the watcher "
@@ -5107,13 +5107,55 @@ check("...a refund recorded on a ROTATED plan counts too, and junk in a "
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25")
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
-check("...and when EVERY forward was refunded nothing is rewritten: the "
-      "deposit-time quote stands rather than an expectation of nothing",
+check("...a verified refund that is NOT full (a streaming swap filled part "
+      "of the way) lowers nothing: both still sum",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None,
+                          "refunds": [{**_RFV, "full": False},
+                                      {**_RFV, "full": "yes"}]},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.56")
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...and when EVERY forward was refunded in full the DEPOSIT-time "
+      "quote is put back and no forward is named: the watcher waits for "
+      "what the client is owed, never for less",
       A._reconcile_pairs({"slip": str(_ppb)},
                          {**_NEW, "replaces": None,
                           "refunds": [_RFV, {**_RFV, "of": "ef" * 32}]},
-                         chain=[_PLAN_Q]) is False
-      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5")
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == []
+      and json.loads(_ppb.read_text())[0]["forwarded_txid"] is None)
+# THE REAL SEQUENCE: the sending run's rewrite put the FORWARD-time quote
+# in first; only then was the forward refunded. The deposit-time figures
+# the first rewrite stashed are what come back.
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+A._reconcile_pairs({"slip": str(_ppb)}, _PLAN_Q)
+check("(setup) the sending run's rewrite: the forward-time quote is in, "
+      "the deposit-time one stashed",
+      json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.31"
+      and json.loads(_ppb.read_text())[0]["quoted_at_deposit"]
+      == {"btc_in": "0.05", "expected_xmr": "1.5"})
+check("...refunded in full afterwards: the deposit-time quote is restored "
+      "over the forward-time one, and the record names no forward",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_PLAN_Q, "refunds": [_RFV]}) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5"
+      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.05"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == [])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("the singular forwarded_txid names the RECORD the plural counts, not "
+      "the current file: a refunded current plan beside a counted "
+      "predecessor names the predecessor",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None,
+                          "refunds": [{**_RFV, "of": "ef" * 32}]},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ab" * 32]
+      and json.loads(_ppb.read_text())[0]["forwarded_txid"] == "ab" * 32)
 # ONE SWAP PER OUTPOINT (stage 6, self-doubt pass). An evicted forward's
 # re-sign and a rejected re-send's fresh forward name nothing in
 # `replaces` -- the original was NOT in the network -- yet the original's

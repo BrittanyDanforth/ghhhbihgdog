@@ -4785,8 +4785,8 @@ MUTATIONS = [
   '        return False',
   ['test_telegram_pager']),
  ('a due recheck still asks the XMR side', 'gs_telegram_pager',
-  '                                 or self._btc_recheck_due(_h)))',
-  '                                 or False))',
+  '                                 or self._btc_recheck_due(_h)\n',
+  '                                 or False\n',
   ['test_telegram_pager']),
  ('the automatic recheck starts every tick', 'gs_telegram_pager',
   '                    if e is not None:\n                        e["rechecked_at"] = _now',
@@ -4857,10 +4857,10 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('a fee retry is started like a first forward (the reserve ignored)',
   'gs_telegram_pager',
-  '            elif state == "confirmed" and self._btc_can_start(\n'
-  '                    background=_retry):',
-  '            elif state == "confirmed" and self._btc_can_start(\n'
-  '                    background=False):',
+  '                elif state == "confirmed" and self._btc_can_start(\n'
+  '                        background=_retry):',
+  '                elif state == "confirmed" and self._btc_can_start(\n'
+  '                        background=False):',
   ['test_telegram_pager']),
  ('a held fee retry is said as if it were a first forward', 'gs_telegram_pager',
   '                say = None if _retry else "held"',
@@ -4882,9 +4882,9 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('the wait after an early forward is a foreground start (the reserve ignored)',
   'gs_telegram_pager',
-  '                      or int(e.get("stall_tries") or 0) > 0\n'
-  '                      or int(e.get("early_tries") or 0) > 0)',
-  '                      or int(e.get("stall_tries") or 0) > 0)',
+  '                          or int(e.get("stall_tries") or 0) > 0\n'
+  '                          or int(e.get("early_tries") or 0) > 0)',
+  '                          or int(e.get("stall_tries") or 0) > 0)',
   ['test_telegram_pager']),
  # THIRD SELF-DOUBT PASS: money that came back AGAIN is kept, not forwarded
  # into a route that keeps refunding until the deposit is gone.
@@ -4924,8 +4924,10 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('a kept forward leaves the entry sent (rechecked every window for ever)',
   'gs_telegram_pager',
-  '            if out == "done" and phase == "kept":',
-  '            if out == "done" and phase == "kept_":',
+  '            if out == "done" and phase == "kept":\n'
+  '                # MONEY CAME BACK AGAIN AND THE VAULT KEEPS IT (third',
+  '            if out == "done" and phase == "kept_":\n'
+  '                # MONEY CAME BACK AGAIN AND THE VAULT KEEPS IT (third',
   ['test_telegram_pager']),
  ('the operator is not told a forward was stopped',
   'gs_telegram_pager',
@@ -4959,9 +4961,117 @@ MUTATIONS = [
  ('money that comes back after the forward mined is never seen (a forwarded entry is not looked at)',
   'gs_telegram_pager',
   '                        if e["state"] in ("not_seen", "seen")\n'
-  '                        or (e["state"] == "forwarded" and e.get("addr"))]',
+  '                        or (e["state"] == "forwarded" and e.get("addr")\n'
+  '                            and _now - float(e.get("looked_at") or 0.0)\n'
+  '                            >= float(self.btc_recheck_s))]',
   '                        if e["state"] in ("not_seen", "seen")]',
   ['test_telegram_pager']),
+ ('a forwarded address is looked at every tick (a circuit per tick announcing a spent address)',
+  'gs_telegram_pager',
+  '                        if e["state"] in ("not_seen", "seen")\n'
+  '                        or (e["state"] == "forwarded" and e.get("addr")\n'
+  '                            and _now - float(e.get("looked_at") or 0.0)\n'
+  '                            >= float(self.btc_recheck_s))]',
+  '                        if e["state"] in ("not_seen", "seen")\n'
+  '                        or (e["state"] == "forwarded" and e.get("addr"))]',
+  ['test_telegram_pager']),
+ ('dust on a forwarded address starts a forward (a wake for a stranger\'s sat)',
+  'gs_telegram_pager',
+  '                        or conf < int(self.deposit_min_sat or 0)):',
+  '                        or False):',
+  ['test_telegram_pager']),
+ ('money back on a forwarded address is a foreground start (the reserve ignored)',
+  'gs_telegram_pager',
+  '                if not self._btc_can_start(background=True):\n'
+  '                    return',
+  '                if not self._btc_can_start(background=False):\n'
+  '                    return',
+  ['test_telegram_pager']),
+ ("a kept deposit's taps go to the forward for ever (the arrival unaskable)",
+  'gs_telegram_pager',
+  '                # who raised the bound or moved the money is heard.\n'
+  '                self._btc_sent_set().add(h)',
+  '                # who raised the bound or moved the money is heard.\n'
+  '                self._btc_sent_set().discard(h)',
+  ['test_telegram_pager']),
+ ('a kept deposit never asks the forward again (the operator\'s remedy unheard)',
+  'gs_telegram_pager',
+  '            if not e or e.get("state") != "kept":\n'
+  '                return False',
+  '            if True:\n'
+  '                return False',
+  ['test_telegram_pager']),
+ ('a kept answer is not learned back after a restart',
+  'gs_telegram_pager',
+  '                    and phase in ("sent", "unsure", "forwarded", "kept")',
+  '                    and phase in ("sent", "unsure", "forwarded")',
+  ['test_telegram_pager']),
+ ('the early wait is dropped before the start is known to have happened',
+  'gs_telegram_pager',
+  '                    e["state"] = "forwarding"\n'
+  '                    say, start = "confirmed", True',
+  '                    e["state"] = "forwarding"\n'
+  '                    e.pop("retry_after", None)\n'
+  '                    say, start = "confirmed", True',
+  ['test_telegram_pager']),
+ ('a payment that vanishes keeps the early count',
+  'gs_telegram_pager',
+  '                    e["state"] = "not_seen"\n'
+  '                    e.pop("early_tries", None)',
+  '                    e["state"] = "not_seen"',
+  ['test_telegram_pager']),
+ ('a refusal shortens an early wait the doubling had grown',
+  'gs_telegram_pager',
+  '                        _early_w)',
+  '                        0.0)',
+  ['test_telegram_pager']),
+ ('a return past the bound rides in an evicted re-sign',
+  'btc_forwarder',
+  '        return "forward", sorted(consumed | set(_kept_ex)), "evicted"',
+  '        return "forward", sorted(consumed), "evicted"',
+  ['test_btc_forwarder']),
+ ('a return past the bound rides in the fresh forward after a rejected re-send',
+  'btc_forwarder',
+  'sorted(tuple(x) for x in (kept_exclude or ()))',
+  '[]',
+  ['test_btc_forwarder']),
+ ('a bump or re-sign that carried returned money is not counted by the bound',
+  'btc_forwarder',
+  '    return isinstance(c, int) and not isinstance(c, bool) and c > 0',
+  '    return isinstance(c, int) and not isinstance(c, bool) and c > 10 ** 9',
+  ['test_btc_forwarder']),
+ ('a claimed refund still in the mempool is recorded',
+  'btc_forwarder',
+  '        if sent <= 0 or value >= sent or height < 1:',
+  '        if sent <= 0 or value >= sent:',
+  ['test_btc_forwarder']),
+ ('any refund reads as full (a partial fill undone whole)',
+  'btc_forwarder',
+  '                    "full": bool(value >= max(sent - slack, sent // 2))})',
+  '                    "full": True})',
+  ['test_btc_forwarder']),
+ ('the operator moving kept money by hand raises the seed-leak alarm',
+  'btc_forwarder',
+  '        if _kept_ops and _ins and _ins <= _kept_ops:',
+  '        if False:',
+  ['test_btc_forwarder']),
+ ("a stranger's forged claims write a chain line each (countable)",
+  'btc_forwarder',
+  '                    _claimed = True',
+  '                    integrity_log("forward", "refund_claimed")',
+  ['test_btc_forwarder']),
+ ('a partial refund lowers what the XMR side expects',
+  'gs_wake_agent',
+  '                     if isinstance(r, dict) and r.get("verified") is True\n'
+  '                     and r.get("full") is True and r.get("of")}',
+  '                     if isinstance(r, dict) and r.get("verified") is True\n'
+  '                     and r.get("of")}',
+  ['test_wake_agent']),
+ ('every forward refunded leaves the forward-time quote in the pair',
+  'gs_wake_agent',
+  '        _all_refunded = bool(_refunded) and not counted',
+  '        _all_refunded = False',
+  ['test_wake_agent']),
  ('a look at a forwarded entry changes nothing (money that came back is not watched)',
   'gs_telegram_pager',
   '            if not e or e["state"] not in ("not_seen", "seen", "forwarded"):',
@@ -4971,15 +5081,14 @@ MUTATIONS = [
  # anyone can write (third self-doubt pass).
  ('a claimed refund is verified without its source (a forged memo verifies)',
   'btc_forwarder',
-  '        ok = bool(src) and (src == str(p.get("inbound") or "").strip().lower()\n'
-  '                            or src in vault)',
+  '        ok = bool(srcs & vaults)',
   '        ok = True',
   ['test_btc_forwarder']),
  ('a return carrying MORE than the forward sent passes as its refund',
   'btc_forwarder',
-  '        if sent <= 0 or value >= sent:\n'
+  '        if sent <= 0 or value >= sent or height < 1:\n'
   '            continue',
-  '        if sent <= 0:\n'
+  '        if sent <= 0 or height < 1:\n'
   '            continue',
   ['test_btc_forwarder']),
  ('the refund record is not written on the plan',
@@ -4995,15 +5104,16 @@ MUTATIONS = [
  ('an unverified refund claim lowers what the XMR side expects',
   'gs_wake_agent',
   '                     if isinstance(r, dict) and r.get("verified") is True\n'
-  '                     and r.get("of")}',
+  '                     and r.get("full") is True and r.get("of")}',
   '                     if isinstance(r, dict) and r.get("verified") is not None\n'
-  '                     and r.get("of")}',
+  '                     and r.get("full") is True and r.get("of")}',
   ['test_wake_agent']),
  ("a claimed refund's source is never read (every claim unverifiable)",
   'gs_btc_broadcast.py',
-  '                    src = _prev_address(prevs.get(tx.vin[0].txid.hex()),\n'
-  '                                        int(tx.vin[0].vout), net)',
-  '                    src = None',
+  '                    srcs = [_prev_address(prevs.get(i.txid.hex()),\n'
+  '                                          int(i.vout), net)\n'
+  '                            for i in tx.vin[:REFUND_SOURCE_INPUTS]]',
+  '                    srcs = [None]',
   ['test_btc_broadcast']),
  ('a payment that vanished before confirming is watched as seen for ever',
   'gs_telegram_pager',
@@ -5027,11 +5137,11 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('the retry of a refused forward is a foreground start (the reserve ignored)',
   'gs_telegram_pager',
-  '            _retry = (int(e.get("fee_tries") or 0) > 0\n'
-  '                      or int(e.get("stall_tries") or 0) > 0\n'
-  '                      or int(e.get("early_tries") or 0) > 0)',
-  '            _retry = (int(e.get("fee_tries") or 0) > 0\n'
-  '                      or int(e.get("early_tries") or 0) > 0)',
+  '                _retry = (int(e.get("fee_tries") or 0) > 0\n'
+  '                          or int(e.get("stall_tries") or 0) > 0\n'
+  '                          or int(e.get("early_tries") or 0) > 0)',
+  '                _retry = (int(e.get("fee_tries") or 0) > 0\n'
+  '                          or int(e.get("early_tries") or 0) > 0)',
   ['test_telegram_pager']),
  ('the operator alert repeats every failure', 'gs_telegram_pager',
   '            if _last and _now - _last < float(self.ALERT_MIN_GAP_S):\n'
@@ -5053,9 +5163,9 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('a forward learned after a restart is not put back on the list', 'gs_telegram_pager',
   '            if (not e and out == "done"\n'
-  '                    and phase in ("sent", "unsure", "forwarded")',
+  '                    and phase in ("sent", "unsure", "forwarded", "kept")',
   '            if (False and out == "done"\n'
-  '                    and phase in ("sent", "unsure", "forwarded")',
+  '                    and phase in ("sent", "unsure", "forwarded", "kept")',
   ['test_telegram_pager']),
  ('returned money on a recovered entry leaves a looked-at entry with no address',
   'gs_telegram_pager',
@@ -5177,15 +5287,14 @@ MUTATIONS = [
   '',
   ['test_telegram_pager']),
  ('the watcher says "confirmed" on money merely seen', 'gs_telegram_pager',
-  '                e["state"] = "seen"\n                say = "seen"',
-  '                e["state"] = "seen"\n                say = "confirmed"',
+  '                    e["state"] = "seen"\n                    say = "seen"',
+  '                    e["state"] = "seen"\n                    say = "confirmed"',
   ['test_telegram_pager']),
  ('the watcher starts the forward on money merely seen', 'gs_telegram_pager',
-  '            elif state == "confirmed" and self._btc_can_start(\n'
-  '                    background=_retry):\n'
-  '                e["state"] = "forwarding"',
-  '            elif state in ("confirmed", "seen") and self._btc_can_start():\n'
-  '                e["state"] = "forwarding"',
+  '                elif state == "confirmed" and self._btc_can_start(\n'
+  '                        background=_retry):',
+  '                elif state in ("confirmed", "seen") and self._btc_can_start(\n'
+  '                        background=_retry):',
   ['test_telegram_pager']),
  ('the watcher repeats itself every tick', 'gs_telegram_pager',
   '            if say and say in e["said"]:\n                say = None',
@@ -5199,7 +5308,9 @@ MUTATIONS = [
  ('the watcher keeps looking at a deposit already being sent on',
   'gs_telegram_pager',
   '                        if e["state"] in ("not_seen", "seen")\n'
-  '                        or (e["state"] == "forwarded" and e.get("addr"))]',
+  '                        or (e["state"] == "forwarded" and e.get("addr")\n'
+  '                            and _now - float(e.get("looked_at") or 0.0)\n'
+  '                            >= float(self.btc_recheck_s))]',
   '                        if True]',
   ['test_telegram_pager']),
  ("a forward's outcome never closes the watch entry", 'gs_telegram_pager',
@@ -5232,10 +5343,10 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('a start that start_job refused leaves the deposit marked as sending on',
   'gs_telegram_pager',
-  '                if e and e["state"] == "forwarding":\n'
-  '                    e["state"] = "seen"',
-  '                if e and e["state"] == "forwarding":\n'
-  '                    pass',
+  '            elif e and e["state"] == "forwarding":\n'
+  '                e["state"] = "seen"',
+  '            elif e and e["state"] == "forwarding":\n'
+  '                pass',
   ['test_telegram_pager']),
  ('pairing accepts --btc-xpub without --allow-btc-forward (addresses nothing '
   'can send on from)', 'gs_wake_keys',
@@ -5247,7 +5358,8 @@ MUTATIONS = [
  ('after the forward went out the tap still asks the forward',
   'gs_telegram_pager',
   '                            and (_h not in self._btc_sent_set()\n'
-  '                                 or self._btc_recheck_due(_h)))',
+  '                                 or self._btc_recheck_due(_h)\n'
+  '                                 or self._btc_kept_due(_h)))',
   '                            and True)',
   ['test_telegram_pager']),
  # STAGE 5 (STAGE5_PLAN.md). Step 2: money does not move on the
@@ -5416,7 +5528,8 @@ MUTATIONS = [
   "    if False:\n        # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,",
   ['test_btc_forwarder']),
  ('a rejected re-send is a dead end', 'btc_forwarder',
-  '        return "forward", [], "rejected"',
+  '        return "forward", sorted(tuple(x) for x in (kept_exclude or ())), \\\n'
+  '            "rejected"',
   '        raise SystemExit(EXIT_FAILED)',
   ['test_btc_forwarder']),
  # The stages 1-2 self-doubt pass (STAGE5_PLAN.md section 9).

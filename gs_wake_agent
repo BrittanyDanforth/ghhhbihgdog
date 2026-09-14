@@ -1685,11 +1685,17 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
         # own (Kerckhoffs: the convention is public); a forged one must not
         # be able to tell the client their swap is complete, so it changes
         # nothing here.
+        # ...AND ONLY A FULL ONE: a streaming swap that filled part of the
+        # way refunds only the rest, and its forward's output is still
+        # coming in part. A partial refund lowers nothing (the watcher
+        # then waits for more than will come and says "short", the safe
+        # direction) rather than telling the client a partial fill was
+        # the whole payment.
         _refunded = {str(r.get("of") or "").lower()
                      for p in [plan] + list(chain or ()) if isinstance(p, dict)
                      for r in (p.get("refunds") or [])
                      if isinstance(r, dict) and r.get("verified") is True
-                     and r.get("of")}
+                     and r.get("full") is True and r.get("of")}
 
         def _counts(p):
             return (isinstance(p, dict) and p.get("broadcast") is True
@@ -1740,7 +1746,16 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
             kept.append(p)
             spent |= ops
         counted = [p for p in counted if any(p is k for k in kept)]
-        if not path or not counted or not plan.get("dest_xmr"):
+        if not path or not plan.get("dest_xmr"):
+            return False
+        # EVERY FORWARD REFUNDED IN FULL: nothing moved, and the pair must
+        # say so -- not keep the forward-time figures an earlier rewrite
+        # put there for a swap that then never happened. The DEPOSIT-time
+        # quote is put back (the watcher waits for it, and says "not yet",
+        # rather than for less than the client is owed), and the record
+        # names no forward.
+        _all_refunded = bool(_refunded) and not counted
+        if not counted and not _all_refunded:
             return False
         pairs = _read_json(Path(path))
         if not isinstance(pairs, list):
@@ -1756,10 +1771,23 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
             pair.setdefault("quoted_at_deposit",
                             {"btc_in": pair.get("btc_in"),
                              "expected_xmr": pair.get("expected_xmr")})
-            pair["btc_in"] = _fmt(Decimal(_sent) / Decimal(10 ** 8))
-            pair["expected_xmr"] = str(_exp)
-            pair["forwarded_txids"] = [p.get("txid") for p in counted]
-            pair["forwarded_txid"] = plan.get("txid")
+            if _all_refunded:
+                _q = pair.get("quoted_at_deposit") or {}
+                if not isinstance(_q, dict):
+                    _q = {}
+                pair["btc_in"] = _q.get("btc_in", pair.get("btc_in"))
+                pair["expected_xmr"] = _q.get("expected_xmr",
+                                              pair.get("expected_xmr"))
+                pair["forwarded_txids"] = []
+                pair["forwarded_txid"] = None
+            else:
+                pair["btc_in"] = _fmt(Decimal(_sent) / Decimal(10 ** 8))
+                pair["expected_xmr"] = str(_exp)
+                pair["forwarded_txids"] = [p.get("txid") for p in counted]
+                # THE RECORD, not the current file: the current plan may
+                # be the refunded or superseded one, and a singular that
+                # names a forward the plural left out contradicts itself.
+                pair["forwarded_txid"] = kept[0].get("txid")
             changed = True
         if changed:
             atomic_write_json(pairs, Path(path), perms=0o600)

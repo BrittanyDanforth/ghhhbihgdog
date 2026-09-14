@@ -3278,15 +3278,18 @@ class Pager:
         # a sent one closes the entry, a "not yet" reopens it, a refusal or
         # a failure stops the automatic path and says so once.
         if job == "forward_to_swap":
-            self._btc_forward_result(
-                (params or {}).get("handle") or "", out, _early, chat_id)
             if out == "failed" or _early == "kept":
                 # THE RUN DIED -- or the vault KEEPS money that came back
                 # again, which needs a hand at the machine -- and on a bot
                 # serving several people the deposit's own chat is not the
-                # operator's.
+                # operator's. BEFORE the watch list hears it: a failure
+                # that also spends the last automatic retry would
+                # otherwise reach the alert chat as "stopped", the word
+                # for a vault that kept money on purpose.
                 self._alert_operator(
                     chat_id, job, "failed" if out == "failed" else "stopped")
+            self._btc_forward_result(
+                (params or {}).get("handle") or "", out, _early, chat_id)
         if _early and out != "done" and job in ("watch", "swap_status"):
             # THE LABEL, NOT THE HANDLE. This one branch still printed the
             # raw four hex characters, so the one reply an operator gets while
@@ -4537,7 +4540,8 @@ class Pager:
             # word ends the rechecks.
             _ask_forward = ((self._btc_watched(_h) or bool(self.btc_servers))
                             and (_h not in self._btc_sent_set()
-                                 or self._btc_recheck_due(_h)))
+                                 or self._btc_recheck_due(_h)
+                                 or self._btc_kept_due(_h)))
             if job in ("swap_status", "watch") and _ask_forward:
                 job = "forward_to_swap"
         self.start_job(cid, job, params)
@@ -5121,19 +5125,25 @@ class Pager:
                 # about this deposit is for the XMR side -- until the
                 # recheck is due (stage 6, _btc_recheck_due).
                 self._btc_sent_set().add(h)
-            if out == "done" and phase in ("returned", "unsure", "kept"):
+            if out == "done" and phase in ("returned", "unsure"):
                 # MONEY CAME BACK (stage 5): the next ask is the forward's
                 # again, whatever this end had learned before. And so is
                 # a forward the vault was NOT SURE went out (stage 6): an
                 # unsure forward is the forward's question until it is
-                # sure, watched or not -- after a restart too. And money
-                # the vault KEEPS (third self-doubt pass): the tap asks the
-                # forward, which says so again until the operator has
-                # moved it or raised the bound.
+                # sure, watched or not -- after a restart too.
                 self._btc_sent_set().discard(h)
+            if out == "done" and phase == "kept":
+                # MONEY THE VAULT KEEPS (third self-doubt pass): the next
+                # ask is the XMR side's -- the money that DID swap is what
+                # the client is waiting for, and a word that routed every
+                # tap to the forward for as long as the mark stood made
+                # that arrival unaskable. The forward is asked again once
+                # per --btc-recheck window (_btc_kept_due), so an operator
+                # who raised the bound or moved the money is heard.
+                self._btc_sent_set().add(h)
             e = opened.get(h)
             if (not e and out == "done"
-                    and phase in ("sent", "unsure", "forwarded")
+                    and phase in ("sent", "unsure", "forwarded", "kept")
                     and isinstance(h, str) and proto.HANDLE_RE.match(h)
                     and isinstance(chat_id, int)
                     and not isinstance(chat_id, bool)):
@@ -5197,14 +5207,15 @@ class Pager:
                 # self-doubt pass): nothing here is tried by itself -- no
                 # look, no recheck, no retry -- so a route that keeps
                 # refunding costs no further wake and no further fee. The
-                # tap still asks the forward. The forward branch renders
+                # tap asks the XMR side, and the forward once a window
+                # (the stamp below starts it). The forward branch renders
                 # the word's sentence to the chat; this end says nothing
                 # more. Expires with the sent ones.
                 e["state"] = "kept"
                 e["word"] = phase
                 e["sent_at"] = time.time()
+                e["rechecked_at"] = time.time()
                 e.pop("retry_after", None)
-                e.pop("rechecked_at", None)
                 e.pop("fee_tries", None)
                 return
             if out == "done" and phase == "returned":
@@ -5319,8 +5330,19 @@ class Pager:
                 if _tries <= int(self.STALL_RETRIES):
                     e["state"] = "seen"
                     e["stall_tries"] = _tries
-                    e["retry_after"] = time.time() + float(
-                        self.btc_fee_retry_s) * float(2 ** (_tries - 1))
+                    # ...never SHORTER than the early wait the entry is
+                    # already on: a refusal interleaved with `arriving`
+                    # answers used to reset a wait the doubling had grown.
+                    try:
+                        _en = int(e.get("early_tries") or 0)
+                    except (TypeError, ValueError):
+                        _en = 0
+                    _early_w = (float(self.EARLY_WAIT_S)
+                                * float(2 ** min(max(_en, 1) - 1, 3))
+                                if _en > 0 else 0.0)
+                    e["retry_after"] = time.time() + max(
+                        float(self.btc_fee_retry_s) * float(2 ** (_tries - 1)),
+                        _early_w)
                     first = "stall_retry" not in e["said"]
                     e["said"].add("stall_retry")
                     _say = "retry" if first else None
@@ -5419,6 +5441,22 @@ class Pager:
             return self._recheck_due_entry(
                 opened.get(h), time.time() if now is None else float(now))
 
+    def _btc_kept_due(self, h: str, now=None) -> bool:
+        """Whether a TAP on a kept deposit asks the forward this time
+        (third self-doubt pass): once per --btc-recheck window since the
+        forward last answered, so an operator who raised the bound or
+        moved the money by hand is heard, and every other tap asks the
+        XMR side about the money that did swap. Never a start of this
+        end's own: a kept deposit costs no automatic wake."""
+        lock, opened = self._btc()
+        with lock:
+            e = opened.get(h)
+            if not e or e.get("state") != "kept":
+                return False
+            _now = time.time() if now is None else float(now)
+            return (_now - float(e.get("rechecked_at") or 0.0)
+                    >= float(self.btc_recheck_s))
+
     def btc_tick(self, look=None) -> None:
         """One look at every watched address, on its own circuit, and the
         transitions each look earned. A look that fails is not a state
@@ -5464,7 +5502,17 @@ class Pager:
             # has no address and is not looked at.
             snapshot = [(h, dict(e)) for h, e in opened.items()
                         if e["state"] in ("not_seen", "seen")
-                        or (e["state"] == "forwarded" and e.get("addr"))]
+                        or (e["state"] == "forwarded" and e.get("addr")
+                            and _now - float(e.get("looked_at") or 0.0)
+                            >= float(self.btc_recheck_s))]
+            # ...ONCE PER --btc-recheck WINDOW for the forwarded ones: a
+            # look is a fresh circuit announcing a spent address to a
+            # server, and every ten minutes for two days was two hundred
+            # and eighty-eight of them per deposit. A refund lands in
+            # hours; a window's delay costs nothing.
+            for _h, _e in snapshot:
+                if _e["state"] == "forwarded" and _h in opened:
+                    opened[_h]["looked_at"] = _now
             # THE FORWARDS THAT WENT OUT AND ARE DUE A RECHECK (stage 6),
             # not yet started this window. Read here, started below the
             # looks -- one per tick, since one job is all the box runs.
@@ -5554,63 +5602,83 @@ class Pager:
             e = opened.get(h)
             if not e or e["state"] not in ("not_seen", "seen", "forwarded"):
                 return
+            chat = e["chat"]
             if e["state"] == "forwarded":
-                if state not in ("seen", "confirmed"):
-                    # Still empty after the forward: still forwarded.
+                # MONEY BACK AFTER THE FORWARD MINED (third self-doubt
+                # pass, reworked after its own review). The look comes
+                # once per --btc-recheck window (btc_tick), and only
+                # SETTLED money at or above this pair's floor is acted on:
+                # the dust a sweep leaves behind, or a stranger sends to a
+                # spent address, is not -- it would have made the entry
+                # money to send on, spent a wake to learn it was dust, and
+                # ended in the stall sentence about money that WAS sent
+                # on. The start is a background one (the reserve holds:
+                # a stranger's dust must not cost the day's last wake),
+                # the entry stays forwarded until it can be started, and
+                # its figures are the deposit's, not what came back.
+                # What starts is said as a first payment is; the vault's
+                # answer (sent, kept, ...) takes it from there.
+                if (state != "confirmed" or conf <= 0
+                        or conf < int(self.deposit_min_sat or 0)):
                     return
-                # MONEY CAME BACK AFTER THE FORWARD MINED (third self-doubt
-                # pass): watched again from here exactly as the vault's
-                # `returned` word is handled -- money seen, the forward
-                # the next ask, said and started as for a first payment
-                # when it settles (and kept by the vault past its bound).
-                e["state"] = "seen"
-                for _w in ("confirmed", "held", "seen"):
-                    e["said"].discard(_w)
-                e.pop("retry_after", None)
-                e.pop("rechecked_at", None)
-                e.pop("fee_tries", None)
+                if not self._btc_can_start(background=True):
+                    return
+                e["state"] = "forwarding"
+                e["said"].discard("confirmed")
                 self._btc_sent_set().discard(h)
                 integrity_log("pager", "btc_returned_seen")
-            e["conf"], e["unconf"] = conf, unconf
-            chat = e["chat"]
-            _waiting = time.time() < float(e.get("retry_after") or 0.0)
-            # A FEE RETRY, or the retry of a refused or failed forward, is
-            # a start nobody asked for: it leaves the reserve for taps
-            # (_btc_can_start), and it is not said -- the chat heard the
-            # vault's own `delayed` sentence, or the retry sentence.
-            _retry = (int(e.get("fee_tries") or 0) > 0
-                      or int(e.get("stall_tries") or 0) > 0
-                      or int(e.get("early_tries") or 0) > 0)
-            if state == "confirmed" and _waiting:
-                # A `delayed` forward's retry is not due yet: the vault
-                # said so once, in its own words; nothing is said or
-                # started until --btc-fee-retry has passed.
-                e["state"] = "seen"
-            elif state == "confirmed" and self._btc_can_start(
-                    background=_retry):
-                e["state"] = "forwarding"
-                e.pop("retry_after", None)
                 say, start = "confirmed", True
-            elif state == "confirmed":
-                # SETTLED, AND THIS END CANNOT WAKE YET (a job is running,
-                # the day's budget is spent, a restart hold). It stays on
-                # the list as money seen and the next tick tries again; the
-                # chat hears why once, in words with nothing in them.
-                e["state"] = "seen"
-                say = None if _retry else "held"
-            elif state == "seen" and e["state"] == "not_seen":
-                e["state"] = "seen"
-                say = "seen"
-            elif state == "not_seen" and e["state"] == "seen":
-                # THE MONEY LEFT BEFORE IT CONFIRMED: a payment seen in the
-                # mempool and then replaced or dropped. Back to waiting --
-                # the address is looked at on the same clock as any unpaid
-                # deposit and forgotten on it, instead of "received" for
-                # ever about money that is not there. Nothing said: the
-                # chat heard "received" once, and hears "received" again
-                # only if it lands again (a fee retry's or a stall retry's
-                # count is left alone; both are cleared by the next answer).
-                e["state"] = "not_seen"
+            else:
+                e["conf"], e["unconf"] = conf, unconf
+                _waiting = time.time() < float(e.get("retry_after") or 0.0)
+                # A FEE RETRY, or the retry of a refused or failed forward,
+                # is a start nobody asked for: it leaves the reserve for
+                # taps (_btc_can_start), and it is not said -- the chat
+                # heard the vault's own `delayed` sentence, or the retry
+                # sentence.
+                _retry = (int(e.get("fee_tries") or 0) > 0
+                          or int(e.get("stall_tries") or 0) > 0
+                          or int(e.get("early_tries") or 0) > 0)
+                if state == "confirmed" and _waiting:
+                    # A `delayed` forward's retry is not due yet: the vault
+                    # said so once, in its own words; nothing is said or
+                    # started until --btc-fee-retry has passed.
+                    e["state"] = "seen"
+                elif state == "confirmed" and self._btc_can_start(
+                        background=_retry):
+                    # THE WAIT IS NOT DROPPED HERE: start_job below may
+                    # still refuse (a tap took the lock, the budget went),
+                    # and the entry then goes back to seen WITH its wait,
+                    # so a lost race does not cost a wake at the next
+                    # tick. Every answer to the run rewrites or pops it.
+                    e["state"] = "forwarding"
+                    say, start = "confirmed", True
+                elif state == "confirmed":
+                    # SETTLED, AND THIS END CANNOT WAKE YET (a job is
+                    # running, the day's budget is spent, a restart hold).
+                    # It stays on the list as money seen and the next tick
+                    # tries again; the chat hears why once, in words with
+                    # nothing in them.
+                    e["state"] = "seen"
+                    say = None if _retry else "held"
+                elif state == "seen" and e["state"] == "not_seen":
+                    e["state"] = "seen"
+                    say = "seen"
+                elif state == "not_seen" and e["state"] == "seen":
+                    # THE MONEY LEFT BEFORE IT CONFIRMED: a payment seen in
+                    # the mempool and then replaced or dropped. Back to
+                    # waiting -- the address is looked at on the same clock
+                    # as any unpaid deposit and forgotten on it, instead of
+                    # "received" for ever about money that is not there.
+                    # Nothing said: the chat heard "received" once, and
+                    # hears "received" again only if it lands again (a fee
+                    # retry's or a stall retry's count is left alone; both
+                    # are cleared by the next answer). The EARLY count goes:
+                    # it was about money that is no longer here, and left
+                    # alone it made the next payment's first forward a
+                    # silent, reserve-gated start.
+                    e["state"] = "not_seen"
+                    e.pop("early_tries", None)
             if say and say in e["said"]:
                 say = None
             if say:
@@ -5646,11 +5714,13 @@ class Pager:
                                           {"handle": h}))
         except BaseException as ex:                          # noqa: BLE001
             print(f"  [!] the forward did not start: {_redact(ex)[:120]}")
-        if not started:
-            with lock:
-                e = opened.get(h)
-                if e and e["state"] == "forwarding":
-                    e["state"] = "seen"
+        with lock:
+            e = opened.get(h)
+            if e and started:
+                # THE START HAPPENED: the wait it was due is spent.
+                e.pop("retry_after", None)
+            elif e and e["state"] == "forwarding":
+                e["state"] = "seen"
 
     def btc_watch_loop(self) -> None:
         """The watcher thread: a tick, then a sleep of --btc-poll, until

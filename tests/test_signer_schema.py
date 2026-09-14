@@ -361,8 +361,10 @@ ck("...and the refusal says the erase is unrecoverable",
 # its output is a decoder we already have. Cross-checking it against the
 # fingerprint-covered plan closes the loop the hash cannot.
 # ===========================================================================
+# Provably nobody's: the getmonero.org documentation address, and the
+# address of a spend key of thirty-two 0x02 bytes (see test_exit_withdraw).
 _HON = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
-_EVIL = "47BDEBFVTx8DwkcmD3isorD69HXCwxk8WU56eb9dp9k9hE1sjbYgFHV2rtXChvDWDFhhYYxBGWqxRZz4g7BBFCVqHUhQ5Fe"
+_EVIL = "42Wz2Zm75sf8u5PXzAzCPDViDAyJnBL5u5mc5QVGBZXFELDdPS88cmA9tbFA7UYwiw1XnsMix9ToSBja8Lfq8fA7VakABjr"
 _plan1 = [{"src_index": 3, "dst": _HON, "amt": "1.5"}]
 
 ck("the full destination is taken from the PLAN, not the scrubbed manifest",

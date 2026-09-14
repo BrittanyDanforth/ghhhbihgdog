@@ -312,6 +312,11 @@ def unused(address, servers, proxy_url, *, network="main",
 #: alone is a claim; the SOURCE of the money (the input's previous output,
 #: fetched here for a claim) is what a caller verifies against.
 REFUND_MEMO_PREFIX = "REFUND:"
+#: How many of a claimed refund's inputs have their source read: a
+#: ThorChain outbound may consolidate several vault outputs, and one input
+#: from the vault is proof enough; the bound keeps a claim from costing
+#: more than this many fetches.
+REFUND_SOURCE_INPUTS = 4
 
 
 def _memo_of(tx):
@@ -353,14 +358,16 @@ def spends_of(address, servers, proxy_url, *, network="main",
 
     With `with_funding`, (spends, paid): `paid` is every output in the
     history that PAYS the address, oldest first -- [{txid, height, vout,
-    value, memo, from_address}] -- its transaction's OP_RETURN as text (or
-    None), and, for a transaction whose memo claims to be a ThorChain
-    REFUND (REFUND_MEMO_PREFIX), the address its FIRST input was paid
-    from, read off that input's previous transaction, fetched in the same
-    session (None when it could not be). That is how a refund is told
-    from a second payment (third self-doubt pass): the memo is a public
-    convention anyone can write, the source is not -- only ThorChain's
-    vault can spend from ThorChain's vault.
+    value, memo, from_address, from_addresses}] -- its transaction's
+    OP_RETURN as text (or None), and, for a transaction whose memo claims
+    to be a ThorChain REFUND (REFUND_MEMO_PREFIX), the addresses its first
+    REFUND_SOURCE_INPUTS inputs were paid from, read off those inputs'
+    previous transactions, fetched in the same session (None for one that
+    could not be; `from_address` is the first). That is how a refund is
+    told from a second payment (third self-doubt pass): the memo is a
+    public convention anyone can write, the source is not -- a
+    transaction with ANY input from ThorChain's vault was signed by
+    ThorChain, since only its signers spend from its vault.
 
     One server's session: the history, then blockchain.transaction.get for
     each entry, each transaction parsed and its txid recomputed (a server
@@ -401,13 +408,14 @@ def spends_of(address, servers, proxy_url, *, network="main",
                                 or not _m.upper().startswith(
                                     REFUND_MEMO_PREFIX):
                             continue
-                        _prev = _tx.vin[0].txid.hex()
-                        if _prev in prevs or set(_prev) <= {"0"}:
-                            continue
-                        try:
-                            prevs[_prev] = b.transaction(_prev)
-                        except (BtcWatchError, OSError):
-                            prevs[_prev] = None
+                        for _vin in _tx.vin[:REFUND_SOURCE_INPUTS]:
+                            _prev = _vin.txid.hex()
+                            if _prev in prevs or set(_prev) <= {"0"}:
+                                continue
+                            try:
+                                prevs[_prev] = b.transaction(_prev)
+                            except (BtcWatchError, OSError):
+                                prevs[_prev] = None
         except PinMismatch:
             raise
         except (BtcWatchError, OSError) as ex:
@@ -436,18 +444,20 @@ def spends_of(address, servers, proxy_url, *, network="main",
                             "hex": raw, "inputs": spent, "server": host})
             if pays and with_funding:
                 memo = _memo_of(tx)
-                src = None
+                srcs = []
                 if isinstance(memo, str) \
-                        and memo.upper().startswith(REFUND_MEMO_PREFIX) \
-                        and tx.vin:
-                    src = _prev_address(prevs.get(tx.vin[0].txid.hex()),
-                                        int(tx.vin[0].vout), net)
+                        and memo.upper().startswith(REFUND_MEMO_PREFIX):
+                    srcs = [_prev_address(prevs.get(i.txid.hex()),
+                                          int(i.vout), net)
+                            for i in tx.vin[:REFUND_SOURCE_INPUTS]]
                 for n, o in enumerate(tx.vout):
                     if o.script_pubkey.data == spk:
                         paid.append({"txid": e["tx_hash"],
                                      "height": e["height"], "vout": n,
                                      "value": int(o.value), "memo": memo,
-                                     "from_address": src})
+                                     "from_address": (srcs[0] if srcs
+                                                      else None),
+                                     "from_addresses": list(srcs)})
         return (out, paid) if with_funding else out
     why = str(last) if isinstance(last, BtcWatchError) \
         else type(last).__name__

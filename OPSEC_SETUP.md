@@ -2093,19 +2093,26 @@ has since changed the shape of must still be bounded. They differ in the
 record: a refunded forward's swap never happened, and the XMR side, told to
 expect its output, sat on "partial" for ever about a deposit whose
 re-forward had fully landed. So the reconciliation reads what paid the
-address: an output whose transaction's memo is `REFUND:<txid>` naming a
-forward of the vault's, carrying less than that forward sent, is a refund;
-it is VERIFIED when its money came from ThorChain's own vault — the address
-that forward paid, or THORNode's current inbound address (asked over its
-own circuit, only when some output claims to be a refund). Kerckhoffs: the
-memo is a public convention anyone can put in a transaction of their own
-to the address, and the amount can be matched; only the source cannot be
-forged, since only ThorChain's signers spend from ThorChain's vault. A
-verified refund's forward drops out of what the XMR side expects; a claim
-is recorded as one (`refunds` on the plan, `refund_claimed` on the chain)
-and changes nothing, so a forged memo cannot tell a client their swap is
-complete. The one trust this adds is THORNode's word on its own vault
-address — the same word the cross-check already sends the money on.
+address: a CONFIRMED output whose transaction's memo is `REFUND:<txid>`
+naming a forward of the vault's, carrying less than that forward sent, is
+a refund; it is VERIFIED when any of its inputs was paid from a vault a
+forward of the vault's PAID — the `inbound` of any plan in the chain, each
+cross-checked against THORNode when that forward was built. No live
+lookup: one party's word at reconcile time would let a lying THORNode name
+an attacker's address and an attacker's dust verify. It is FULL when it
+carries at least what was sent less a slack (the larger of a twentieth and
+0.001 BTC) and at least half; a streaming swap that filled part of the way
+refunds only the rest, and that must not read as the whole swap undone.
+Kerckhoffs: the memo is a public convention anyone can put in a
+transaction of their own to the address, and the amount can be matched;
+only the source cannot be forged, since only ThorChain's signers spend
+from ThorChain's vault. A verified FULL refund's forward drops out of what
+the XMR side expects (and when every forward was refunded, the deposit-time
+quote is put back — the watcher waits for what the client is owed, never
+for less); a claim, or a refund in part, is recorded (`refunds` on the
+plan; `refund_claimed` once a run on the chain, however many outputs a
+stranger sends) and changes nothing, so a forged memo cannot tell a client
+their swap is complete.
 
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its
@@ -2222,11 +2229,15 @@ taps, asks the forward again (the reconciliation, below), once per window,
 until the forward's transaction is in a block: the word `forwarded` ("the
 forward has confirmed. Nothing more to check on this side — ask again later
 for the arrival"), after which every tap asks the swap side. A forwarded
-deposit's address is still looked at while the entry is kept (two days; a
-look is not a wake): money that comes back to it after the forward
-confirmed — a refund, which ThorChain issues only once the inbound has
-confirmed; a second payment — is seen, said and sent on as a first payment
-is, and the next tap asks the forward again. After a
+deposit's address is still looked at while the entry is kept (two days),
+once per `--btc-recheck` window — a look is a fresh circuit announcing a
+spent address to a server, so not one a tick — and only SETTLED money at
+or above this pair's floor is acted on (the dust a sweep leaves behind, or
+a stranger sends to a spent address, is ignored): money that comes back
+after the forward confirmed — a refund, which ThorChain issues only once
+the inbound has confirmed; a second payment — is sent on as a first
+payment is, as a background start that leaves the reserve for taps, and
+the next tap asks the forward again. After a
 restart the first tap goes to the vault's forward, which answers what
 became of it without signing anything, and that answer puts the deposit
 back on this end's list with its word and its clock, so the same windows
@@ -2285,8 +2296,15 @@ a forward was stopped for another chat. A route that keeps refunding (an
 asset ThorChain has stopped routing, a memo it will not take) was
 otherwise paid for again every recheck — the network fee and ThorChain's
 outbound fee per round, "sent" in the chat each time — until the deposit
-was gone. Move the money by hand at the vault (the job log names the
-outputs), or re-pair with a higher bound and tap. A replacement the vault
+was gone. The bound holds on every path: an evicted re-sign, and the fresh
+forward after a re-send every server rejected, leave the kept money out;
+a bump or a re-sign that carried returned money under the bound counts
+toward it. After `kept`, the client's taps ask the swap side (the money
+that DID swap is what they are waiting for), and once per `--btc-recheck`
+window a tap asks the forward again. Move the money by hand at the vault
+(the job log names the outputs; a spend of exactly those is recognised as
+your hand, `kept_moved`, not as a leaked seed), or re-pair with a higher
+bound and let the next window's tap send it on. A replacement the vault
 would not pay for today is `delayed` like a
 first forward, and the original stands. A spend of the address that is not
 the vault's own fails the run with `foreign_spend` on the chain: only a

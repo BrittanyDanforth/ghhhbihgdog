@@ -2184,7 +2184,8 @@ check("a THIRD return is KEPT: done, nothing quoted or sent, the current "
       and _p.get("returned_kept") == {"outputs": 1, "sat": 130000,
                                       "settled": True,
                                       "forwards_of_returned": 2,
-                                      "refunds": 0}
+                                      "refunds": 0,
+                                      "outpoints": [[_HK3, 0]]}
       and ("forward", "returned_kept") in _nK3.kinds
       and ("forward", "returned_settled") not in _nK3.kinds
       and len(F._plan_chain(_ofK)) == 3)
@@ -2255,18 +2256,19 @@ _nR1 = Net(utxos=_RF, spends=[_listed(_pR, _hxR)], fee=10, submit=_ACCEPTED,
                           _INBOUND)])
 _c, _o, _p, _ = _reconcile(_nR1, _ofR)
 _oldR = json.load(open(F._plan_chain(_ofR)[1]))
-check("a return whose memo names our forward, carrying LESS than it sent, "
-      "from the vault that forward PAID: a VERIFIED refund -- recorded on "
-      "the plan (which the chain keeps when it is rotated aside), the kind "
-      "on the chain, THORNode asked for its current inbound, and forwarded "
-      "again like any first return",
+check("a CONFIRMED return whose memo names our forward, carrying LESS than "
+      "it sent but within the fee slack, from the vault that forward PAID: "
+      "a VERIFIED, FULL refund -- recorded on the plan (which the chain "
+      "keeps when it is rotated aside), the kind on the chain, NO live "
+      "lookup (one THORNode ask: the fresh forward's own cross-check), and "
+      "forwarded again like any first return",
       _c == F.EXIT_OK and len(_nR1.posts) == 1
       and _p["reconcile_reason"] == "returned"
       and _oldR.get("refunds") == [{"txid": _HRF, "vout": 0, "value": 150000,
                                     "of": _pR["txid"].lower(),
-                                    "verified": True}]
+                                    "verified": True, "full": True}]
       and ("forward", "refund_seen") in _nR1.kinds
-      and sum("inbound_addresses" in u for u, _ in _nR1.gets) == 2)
+      and sum("inbound_addresses" in u for u, _ in _nR1.gets) == 1)
 _pU2, _ofU2, _hxU2 = _first_send()
 _nR2 = Net(utxos=_RF, spends=[_listed(_pU2, _hxU2)], fee=10, submit=_ACCEPTED,
            seen=_SEEN0,
@@ -2287,11 +2289,55 @@ _nR3 = Net(utxos=_RF, spends=[_listed(_pV, _hxV)], fee=10, submit=_ACCEPTED,
            funding=[_paid(_HRF, 150000, "REFUND:" + _pV["txid"].upper(),
                           _OTHER_ADDR)])
 _c, _o, _p, _ = _reconcile(_nR3, _ofV)
-check("...a source that is THORNode's CURRENT inbound (the vault churned "
-      "since the forward paid the old one) verifies it too",
+check("...a source that is only THORNode's CURRENT inbound (a vault no "
+      "forward of ours paid) stays a CLAIM: one party's word at reconcile "
+      "time verifies nothing, so a lying node cannot make an attacker's "
+      "dust lower what the client is told to expect",
       _c == F.EXIT_OK
       and (json.load(open(F._plan_chain(_ofV)[1])).get("refunds")
+           or [{}])[0].get("verified") is False
+      and ("forward", "refund_claimed") in _nR3.kinds)
+_pW, _ofW, _hxW = _first_send()
+_nRW = Net(utxos=_RF, spends=[_listed(_pW, _hxW)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0,
+           funding=[{**_paid(_HRF, 150000, "REFUND:" + _pW["txid"].upper(),
+                             _OTHER_ADDR),
+                     "from_addresses": [_OTHER_ADDR, _INBOUND]}])
+_c, _o, _p, _ = _reconcile(_nRW, _ofW)
+check("...ANY input from a vault a forward of ours paid verifies it (a "
+      "ThorChain outbound consolidates several vault outputs; one is "
+      "proof, since only its signers spend from it)",
+      _c == F.EXIT_OK
+      and (json.load(open(F._plan_chain(_ofW)[1])).get("refunds")
            or [{}])[0].get("verified") is True)
+_pP, _ofP, _hxP = _first_send()
+_RP = [{"tx_hash": _HRF, "vout": 0, "value": 40000, "confirmations": 5}]
+_nRP = Net(utxos=_RP, spends=[_listed(_pP, _hxP)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0,
+           funding=[_paid(_HRF, 40000, "REFUND:" + _pP["txid"].upper(),
+                          _INBOUND)])
+_c, _o, _p, _ = _reconcile(_nRP, _ofP)
+check("a verified refund carrying much LESS than what was sent, past the "
+      "fee slack (a streaming swap that filled part of the way), is a "
+      "refund IN PART: recorded verified but not full -- it must not read "
+      "as 'the swap never happened'",
+      _c == F.EXIT_OK
+      and (json.load(open(F._plan_chain(_ofP)[1])).get("refunds")
+           or [{}])[0].get("verified") is True
+      and (json.load(open(F._plan_chain(_ofP)[1])).get("refunds")
+           or [{}])[0].get("full") is False)
+_pM, _ofM, _hxM = _first_send()
+_nRM = Net(utxos=_RF, spends=[_listed(_pM, _hxM)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0,
+           funding=[{**_paid(_HRF, 150000, "REFUND:" + _pM["txid"].upper(),
+                             _INBOUND), "height": 0}])
+_c, _o, _p, _ = _reconcile(_nRM, _ofM)
+check("a claimed refund still in the MEMPOOL decides nothing: not recorded "
+      "until it is in a block (a record that only ever upgrades must not "
+      "be written from a transaction that can still vanish)",
+      _c == F.EXIT_OK
+      and "refunds" not in json.load(open(F._plan_chain(_ofM)[1]))
+      and ("forward", "refund_seen") not in _nRM.kinds)
 for _why, _fund in (
         ("a memo naming a forward that is not ours",
          _paid(_HRF, 150000, "REFUND:" + "ab" * 32, _INBOUND)),
@@ -2320,9 +2366,7 @@ for _why, _fund in (
           and "refunds" not in json.load(open(F._plan_chain(_ofX)[1]))
           and ("forward", "refund_seen") not in _nX.kinds
           and ("forward", "refund_claimed") not in _nX.kinds
-          and sum("inbound_addresses" in u for u, _ in _nX.gets)
-          == (2 if _fx["memo"] and _fx["memo"].upper().startswith("REFUND:")
-              else 1))
+          and sum("inbound_addresses" in u for u, _ in _nX.gets) == 1)
 _pKR, _ofKR, _hxKR = _first_send()
 _nKR = Net(utxos=_RF, spends=[_listed(_pKR, _hxKR)], fee=10,
            funding=[_paid(_HRF, 150000, "REFUND:" + _pKR["txid"].upper(),
@@ -2339,39 +2383,207 @@ check("a spends reader of the stage-5 shape (a list, no funding) is taken "
       "as knowing of no memo: the reconciliation still runs, nothing "
       "recorded", _c == F.EXIT_OK and _p is not None)
 check("classify_returns is pure and tolerant: junk entries, a memo in any "
-      "case, a plan without send_sat, a source in any case; verified by the "
-      "plan's own inbound OR THORNode's current one",
+      "case, a plan without send_sat, a source in any case, an unconfirmed "
+      "output skipped; verified by ANY input from the inbound of ANY plan "
+      "in the chain (each cross-checked when its forward was built), "
+      "never by a live lookup; full within the slack",
       F.classify_returns(
           ["junk", None, {"memo": 7},
-           {"txid": "AA" * 32, "vout": 1, "value": 5, "memo": "Refund:" + "BB" * 32,
+           {"txid": "AA" * 32, "vout": 1, "value": 4, "height": 7,
+            "memo": "Refund:" + "BB" * 32,
             "from_address": _INBOUND.upper()},
-           {"txid": "cc" * 32, "vout": 0, "value": 5, "memo": "REFUND:" + "bb" * 32,
-            "from_address": _OTHER_ADDR},
-           {"txid": "dd" * 32, "vout": 0, "value": 5, "memo": "REFUND:" + "ee" * 32,
-            "from_address": _INBOUND},
-           {"txid": "ee" * 32, "vout": 2, "value": 5,
+           {"txid": "cc" * 32, "vout": 0, "value": 4, "height": 7,
+            "memo": "REFUND:" + "bb" * 32,
+            "from_addresses": [_OTHER_ADDR, _OTHER_ADDR.upper()]},
+           {"txid": "dd" * 32, "vout": 0, "value": 4, "height": 7,
+            "memo": "REFUND:" + "ee" * 32, "from_address": _INBOUND},
+           {"txid": "ee" * 32, "vout": 2, "value": 4, "height": 7,
             "memo": "REFUND:" + "BB" * 32 + ":something-later",
-            "from_address": _INBOUND}],
+            "from_addresses": [_OTHER_ADDR, _INBOUND]},
+           {"txid": "ff" * 32, "vout": 0, "value": 5, "height": 0,
+            "memo": "REFUND:" + "BB" * 32, "from_address": _INBOUND},
+           {"txid": "11" * 32, "vout": 0, "value": 4900000, "height": 9,
+            "memo": "REFUND:" + "99" * 32, "from_address": _OTHER_ADDR}],
           [{"txid": "bb" * 32, "send_sat": 10, "inbound": _INBOUND},
-           {"txid": "ee" * 32, "inbound": _INBOUND}, "junk"],
-          thor_inbound=_OTHER_ADDR.upper())
-      == [{"txid": "aa" * 32, "vout": 1, "value": 5, "of": "bb" * 32,
-           "verified": True},
-          {"txid": "cc" * 32, "vout": 0, "value": 5, "of": "bb" * 32,
-           "verified": True},
-          {"txid": "ee" * 32, "vout": 2, "value": 5, "of": "bb" * 32,
-           "verified": True}]
+           {"txid": "ee" * 32, "inbound": _INBOUND},
+           {"txid": "99" * 32, "send_sat": 5000000, "inbound": _OTHER_ADDR},
+           "junk"])
+      == [{"txid": "aa" * 32, "vout": 1, "value": 4, "of": "bb" * 32,
+           "verified": True, "full": False},
+          {"txid": "cc" * 32, "vout": 0, "value": 4, "of": "bb" * 32,
+           "verified": True, "full": False},
+          {"txid": "ee" * 32, "vout": 2, "value": 4, "of": "bb" * 32,
+           "verified": True, "full": False},
+          {"txid": "11" * 32, "vout": 0, "value": 4900000, "of": "99" * 32,
+           "verified": True, "full": True}]
       and F.classify_returns([], []) == [] and F.classify_returns(None, None) == [])
-check("thor_inbound_address never raises and answers None for no THORNode, "
-      "a failed fetch, or a list with no single BTC entry",
-      F.thor_inbound_address("", _PROXY) is None
-      and Net(thornode=RuntimeError("down")).install() is not None
-      and F.thor_inbound_address("https://tn.example", _PROXY) is None
-      and Net(thornode=[]).install() is not None
-      and F.thor_inbound_address("https://tn.example", _PROXY) is None
-      and Net(thornode=[{"chain": "BTC", "address": " X1 "}]).install()
-      is not None
-      and F.thor_inbound_address("https://tn.example", _PROXY) == "x1")
+check("the refund slack is the larger of a twentieth and a fixed floor: a "
+      "5 BTC forward refunded 0.05 short is full, 0.26 short is not; a "
+      "0.001 BTC forward refunded as 1 sat is not",
+      F.classify_returns(
+          [{"txid": "11" * 32, "vout": 0, "value": 495000000, "height": 9,
+            "memo": "REFUND:" + "99" * 32, "from_address": _INBOUND},
+           {"txid": "22" * 32, "vout": 0, "value": 474000000, "height": 9,
+            "memo": "REFUND:" + "99" * 32, "from_address": _INBOUND},
+           {"txid": "33" * 32, "vout": 0, "value": 1, "height": 9,
+            "memo": "REFUND:" + "88" * 32, "from_address": _INBOUND}],
+          [{"txid": "99" * 32, "send_sat": 500000000, "inbound": _INBOUND},
+           {"txid": "88" * 32, "send_sat": 100000, "inbound": _INBOUND}])
+      == [{"txid": "11" * 32, "vout": 0, "value": 495000000, "of": "99" * 32,
+           "verified": True, "full": True},
+          {"txid": "22" * 32, "vout": 0, "value": 474000000, "of": "99" * 32,
+           "verified": True, "full": False},
+          {"txid": "33" * 32, "vout": 0, "value": 1, "of": "88" * 32,
+           "verified": True, "full": False}]
+      and F.REFUND_FEE_SLACK_SAT == 100000
+      and not hasattr(F, "thor_inbound_address"))
+check("the forwarder's memo reader IS gs_btc_tx's (one reader for what it "
+      "writes, what it recognises as its own, and what it reads back)",
+      F._op_return_data is F.btx.op_return_data)
+
+print("\n== THE BOUND HOLDS ON EVERY PATH (after the review of the third pass) ==")
+# The evicted re-sign and the rejected re-send's fresh forward used to
+# leave the kept money in: their exclusion was the listed forwards' inputs
+# alone, and the kept outputs are not those. And a bump or a re-sign that
+# carried returned money was never counted, so the bound could be over-run
+# by rounds it never saw.
+
+
+def _two_returns(seen2=_SEEN0):
+    """A chain at the bound: a first forward, then two forwards of money
+    that came back. Returns (first plan, its hex, chain listings, the
+    current plan, its hex)."""
+    p1, of, hx1 = _first_send()
+    n1 = Net(utxos=_RET, spends=[_listed(p1, hx1)], fee=10, submit=_ACCEPTED,
+             seen=_SEEN0)
+    _c, _o, p2, _ = _reconcile(n1, of)
+    assert _c == F.EXIT_OK, _o
+    hx2 = n1.submits[0]["raw_hex"]
+    l2 = _listed(p2, hx2, inputs=[{"tx_hash": _H2, "vout": 0,
+                                   "value": 150000}])
+    n2 = Net(utxos=_RET2, spends=[_listed(p1, hx1), l2], fee=10,
+             submit=_ACCEPTED, seen=seen2)
+    _c, _o, p3, _ = _reconcile(n2, of)
+    assert _c == F.EXIT_OK, _o
+    hx3 = n2.submits[0]["raw_hex"]
+    return of, [_listed(p1, hx1), l2], p3, hx3
+
+
+_ofE, _lE, _pE3, _hxE3 = _two_returns()
+_UNSPENT_E = [{"tx_hash": _H2, "vout": 1, "value": 140000, "confirmations": 5}]
+_nE = Net(utxos=_UNSPENT_E + _RET3, spends=_lE, fee=10, submit=_ACCEPTED,
+          seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nE, _ofE)
+check("AT THE BOUND, the current forward evicted (not listed, its input "
+      "unspent again, no bytes kept) beside a return that came back: the "
+      "re-sign spends ITS OWN input only, the returned output is left out "
+      "(excluded with the listed forwards' inputs), and it carried nothing "
+      "that came back",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "evicted"
+      and [(i["tx_hash"], i["vout"]) for i in _p["inputs"]] == [(_H2, 1)]
+      and _p["excluded_outpoints"] == 3 and _p["carried_returned"] == 0
+      and ("forward", "evicted") in _nE.kinds)
+_ofR, _lR, _pR3, _hxR3 = _two_returns(seen2=_NOT_SEEN)
+check("(setup) the current forward at the bound kept its bytes (unseen)",
+      _pR3["tx_hex"] == _hxR3)
+_nRj = Net(utxos=_UNSPENT_E + _RET3, spends=_lR, fee=10,
+           submit=[_REJECTED, _ACCEPTED], seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nRj, _ofR)
+check("...and when the kept bytes are RE-SENT and every server rejects "
+      "them, the fresh forward that follows leaves the returned output out "
+      "too (the reconciliation handed the exclusion over with the bytes)",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "rejected"
+      and _nRj.submits[0]["raw_hex"] == _hxR3
+      and [(i["tx_hash"], i["vout"]) for i in _p["inputs"]] == [(_H2, 1)]
+      and _p["excluded_outpoints"] == 1 and _p["carried_returned"] == 0)
+# UNDER the bound, a re-sign that carries returned money is COUNTED.
+_pC1, _ofC, _hxC1 = _first_send()
+_nC1 = Net(utxos=_RET, spends=[_listed(_pC1, _hxC1)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pC2, _ = _reconcile(_nC1, _ofC)
+check("(setup) one forward of returned money in the chain",
+      _c == F.EXIT_OK and _pC2["reconcile_reason"] == "returned")
+_nC2 = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 150000,
+                   "confirmations": 5}] + _RET2,
+           spends=[_listed(_pC1, _hxC1)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _pC3, _ = _reconcile(_nC2, _ofC)
+_chainC = [json.load(open(f)) for f in F._plan_chain(_ofC)]
+check("under the bound, the evicted re-sign carries the returned output "
+      "beside its own input, records how many inputs came back "
+      "(carried_returned), and the bound counts it as a forward of returned "
+      "money: two now, so the next return is kept",
+      _c == F.EXIT_OK and _pC3["reconcile_reason"] == "evicted"
+      and sorted((i["tx_hash"], i["vout"]) for i in _pC3["inputs"])
+      == [(_H2, 0), (_H2, 1)]
+      and _pC3["carried_returned"] == 1
+      and F.returned_forwards(_chainC) == 2)
+_hxC3 = _nC2.submits[0]["raw_hex"]
+_nC3 = Net(utxos=_RET3, spends=[_listed(_pC1, _hxC1),
+                                _listed(_pC3, _hxC3, inputs=[
+                                    {"tx_hash": _H2, "vout": 0,
+                                     "value": 150000},
+                                    {"tx_hash": _H2, "vout": 1,
+                                     "value": 140000}])],
+           fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nC3, _ofC)
+check("...kept indeed", _c == F.EXIT_OK and _nC3.posts == []
+      and (_p.get("returned_kept") or {}).get("forwards_of_returned") == 2)
+check("_carried_returned / returned_forwards: a plan with reason "
+      "'returned', or any reason with carried_returned above zero, counts; "
+      "zero, None, a bool or junk does not",
+      F.returned_forwards([
+          {"reconcile_reason": "bumped", "txid": "a" * 64, "carried_returned": 1},
+          {"reconcile_reason": "evicted", "txid": "b" * 64, "carried_returned": 0},
+          {"reconcile_reason": "rejected", "txid": "c" * 64,
+           "carried_returned": None},
+          {"reconcile_reason": "bumped", "txid": "d" * 64, "carried_returned": True},
+          {"reconcile_reason": "returned", "txid": "e" * 64},
+          {"reconcile_reason": None, "txid": "f" * 64, "carried_returned": "2"}])
+      == 2)
+# MONEY THE VAULT KEPT, MOVED BY HAND: the documented remedy, and it used
+# to raise the seed-leak alarm on every later reconciliation.
+_ofM, _lM, _pM3, _hxM3 = _two_returns()
+_lM3 = _listed(_pM3, _hxM3, inputs=[{"tx_hash": _H2, "vout": 1,
+                                     "value": 140000}])
+_nM1 = Net(utxos=_RET3, spends=_lM + [_lM3], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nM1, _ofM)
+check("(setup) the third return is kept, and the mark names its outpoints",
+      _c == F.EXIT_OK
+      and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
+_moved = {**_spend_tx(None, send=120000), "inputs": [{"tx_hash": _HK3,
+                                                       "vout": 0,
+                                                       "value": 130000}]}
+_nM2 = Net(utxos=[], spends=_lM + [_lM3, _moved], fee=10)
+_c, _o, _p, _ = _reconcile(_nM2, _ofM)
+check("a later spend of EXACTLY the kept outputs by a transaction this tool "
+      "did not sign is the operator's hand: done, the kind kept_moved, no "
+      "seed-leak alarm, the mark cleared",
+      _c == F.EXIT_OK and ("forward", "kept_moved") in _nM2.kinds
+      and ("forward", "foreign_spend") not in _nM2.kinds
+      and "returned_kept" not in _p)
+_moved2 = {**_spend_tx(None, send=120000),
+           "inputs": [{"tx_hash": _HK3, "vout": 0, "value": 130000},
+                      {"tx_hash": _H2, "vout": 1, "value": 140000}]}
+_nM3 = Net(utxos=[], spends=_lM + [_moved2], fee=10)
+_c, _o, _p, _ = _reconcile(_nM3, _ofM)
+check("...a spend that takes MORE than the kept outputs is still the alarm",
+      _c == F.EXIT_FAILED and ("forward", "foreign_spend") in _nM3.kinds)
+# A STRANGER'S CLAIMS WRITE ONE LINE, not one per output.
+_pS, _ofS, _hxS = _first_send()
+_nS = Net(utxos=[{"tx_hash": _HRF, "vout": i, "value": 600,
+                  "confirmations": 5} for i in range(5)],
+          spends=[_listed(_pS, _hxS)], fee=10, submit=_ACCEPTED, seen=_SEEN0,
+          funding=[_paid(_HRF, 600, "REFUND:" + _pS["txid"].upper(),
+                         _OTHER_ADDR, vout=i) for i in range(5)])
+_c, _o, _p, _ = _reconcile(_nS, _ofS)
+check("five dust outputs with a forged REFUND memo: five claims recorded, "
+      "ONE refund_claimed line on the chain (a stranger cannot write a "
+      "countable line per output)",
+      sum(1 for k in _nS.kinds if k == ("forward", "refund_claimed")) == 1
+      and len(json.load(open(F._plan_chain(_ofS)[-1])).get("refunds") or [])
+      == 5)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

@@ -3452,8 +3452,10 @@ check("min: a cut of zero or None leaves the mixing minimum untouched",
 # ===========================================================================
 print("\n-- the operator's usage fee --")
 import contextlib as _ctx_c                                  # noqa: E402
+# Provably nobody's: the getmonero.org documentation address, and the
+# address of a spend key of thirty-two 0x01 bytes (see test_exit_withdraw).
 _FEE_A1 = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
-_FEE_A2 = "43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2FuaqXMqLrVtED1kV2Z77b6NGE6FFTCm"
+_FEE_A2 = "42Lxp5b63YJ8mVZTzcioVnCk9WQCPAMk4RH7e7ygPTkzEiHB86MJkRbb9c4uyE3bV8fuu7ggU2XUYDFT4SxB7pbNC6PwL6c"
 
 
 class _FeeArgs:

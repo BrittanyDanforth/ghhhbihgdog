@@ -587,31 +587,24 @@ def cross_check_inbound(inbound, thornode_url, proxy_url):
     return int(dust) if dust is not None and dust > 0 else None
 
 
-def thor_inbound_address(thornode_url, proxy_url):
-    """THORNode's CURRENT BTC inbound vault address, best effort: None when
-    there is no THORNode, it could not be fetched, or it does not name one
-    address. On a circuit of its own. Read to VERIFY a claimed refund's
-    source (classify_returns) and for nothing else: a miss leaves a claim
-    unverified, so nothing here refuses."""
-    if not thornode_url:
-        return None
-    try:
-        entries = safe_get(f"{str(thornode_url).rstrip('/')}/thorchain/"
-                           "inbound_addresses",
-                           isolated_proxy(proxy_url, "forward:refund"))
-        btc = [e for e in entries if isinstance(e, dict)
-               and e.get("chain") == _THOR_BTC_CHAIN]
-        if len(btc) != 1:
-            return None
-        a = str(btc[0].get("address") or "").strip().lower()
-        return a or None
-    except Exception:                                        # noqa: BLE001
-        return None
+#: A refund is the inbound less ThorChain's outbound fee. It is FULL -- the
+#: whole swap undone, so the forward drops out of what the XMR side
+#: expects -- only when it carries at least what was sent less this slack
+#: (the larger of a twentieth of the amount and REFUND_FEE_SLACK_SAT), and
+#: at least half of what was sent (a small forward is under the slack). A
+#: streaming swap that filled part of the way refunds only the rest, and
+#: that must NOT read as "the swap never happened": the XMR side would
+#: then call the payment complete when only part had landed. A refund
+#: under the slack is recorded, verified or not, and lowers nothing --
+#: the safe direction (the watcher waits for more than will come, which
+#: it says as "short", rather than for less).
+REFUND_FEE_SLACK_SAT = 100_000
 
 
-def classify_returns(paid, plans, thor_inbound=None):
+def classify_returns(paid, plans):
     """Which outputs paying the address are ThorChain REFUNDS of a forward
-    of ours, and which of those are VERIFIED (third self-doubt pass).
+    of ours, which of those are VERIFIED, and which are FULL (third
+    self-doubt pass).
 
     A refund and a second payment look alike to the look -- money on the
     address that no forward of ours consumed -- and were handled alike.
@@ -619,23 +612,32 @@ def classify_returns(paid, plans, thor_inbound=None):
     never happened, and expecting its output kept the XMR side on
     "partial" for ever about a deposit whose re-forward had fully landed.
 
-    A refund is an output whose transaction's memo is REFUND:<txid> naming
-    a forward in `plans`, carrying LESS than that forward sent (a refund
-    is the inbound less ThorChain's outbound fee, never more). It is
-    VERIFIED when its money came from ThorChain's own vault: the address
-    that forward paid (`inbound` on its plan), or THORNode's current
-    inbound address (`thor_inbound`, fetched by the caller). Kerckhoffs:
-    the memo is a public convention anyone can put in a transaction of
-    their own to the address, and the amount can be matched; only the
-    source cannot be forged, since only ThorChain's signers spend from
-    ThorChain's vault. Nothing that lowers what a client is told to expect
-    may rest on a claim; a claim is recorded as one and changes nothing.
-    Everything else on the address is a payment. Pure.
+    A refund is a CONFIRMED output (a mempool one decides nothing until it
+    is in a block: it can be replaced or dropped, and a record that only
+    ever upgrades must not be written from it) whose transaction's memo is
+    REFUND:<txid> naming a forward in `plans`, carrying LESS than that
+    forward sent. It is VERIFIED when any of its inputs was paid from a
+    vault a forward of ours PAID -- the `inbound` of any plan in the
+    chain, each cross-checked against THORNode when that forward was
+    built. No live lookup: a single source asked at reconcile time would
+    be one party's word (a lying THORNode could name an attacker's
+    address, and an attacker's dust with a REFUND memo would then verify
+    -- and lower what the client is told to expect); a refund from a
+    vault no forward of ours paid stays a claim, the safe direction. It is
+    FULL when it carries at least what was sent less REFUND_FEE_SLACK_SAT
+    (see there). Kerckhoffs: the memo is a public convention anyone can put
+    in a transaction of their own to the address, and the amount can be
+    matched; only the source cannot be forged, since only ThorChain's
+    signers spend from ThorChain's vault. Nothing that lowers what a
+    client is told to expect may rest on a claim; a claim is recorded as
+    one and changes nothing. Everything else on the address is a payment.
+    Pure.
 
-    Returns [{txid, vout, value, of, verified}], one per refund output."""
+    Returns [{txid, vout, value, of, verified, full}], one per refund."""
     by_txid = {str(p.get("txid") or "").lower(): p for p in plans or ()
                if isinstance(p, dict) and p.get("txid")}
-    vault = {str(thor_inbound or "").strip().lower()} - {""}
+    vaults = {str(p.get("inbound") or "").strip().lower()
+              for p in plans or () if isinstance(p, dict)} - {""}
     out = []
     for f in paid or ():
         if not isinstance(f, dict):
@@ -654,15 +656,24 @@ def classify_returns(paid, plans, thor_inbound=None):
             value = int(f.get("value") or 0)
             sent = int(p.get("send_sat") or 0)
             vout = int(f.get("vout") or 0)
+            height = int(f.get("height") or 0)
         except (TypeError, ValueError):
             continue
-        if sent <= 0 or value >= sent:
+        if sent <= 0 or value >= sent or height < 1:
             continue
-        src = str(f.get("from_address") or "").strip().lower()
-        ok = bool(src) and (src == str(p.get("inbound") or "").strip().lower()
-                            or src in vault)
+        srcs = f.get("from_addresses")
+        if not isinstance(srcs, list):
+            srcs = [f.get("from_address")]
+        srcs = {str(s or "").strip().lower() for s in srcs} - {""}
+        ok = bool(srcs & vaults)
+        # FULL: within the slack of what was sent, AND at least half of
+        # it -- the slack's fixed floor is more than a small forward, and
+        # without the second bound a single sat back from one would have
+        # read as the whole swap undone.
+        slack = max(int(REFUND_FEE_SLACK_SAT), sent // 20)
         out.append({"txid": str(f.get("txid") or "").lower(), "vout": vout,
-                    "value": value, "of": of, "verified": bool(ok)})
+                    "value": value, "of": of, "verified": bool(ok),
+                    "full": bool(value >= max(sent - slack, sent // 2))})
     return out
 
 
@@ -783,17 +794,13 @@ def write_status(outfile, state):
     atomic_write_json({"state": state}, status_path(outfile))
 
 
-def _op_return_data(script_bytes):
-    """The data of an OP_RETURN script laid out as this tool lays one out
-    (one push, direct or OP_PUSHDATA1), or None for any other script."""
-    b = bytes(script_bytes or b"")
-    if not b or b[0] != 0x6a:
-        return None
-    if len(b) >= 2 and 1 <= b[1] <= 75 and len(b) == 2 + b[1]:
-        return b[2:]
-    if len(b) >= 3 and b[1] == 0x4c and len(b) == 3 + b[2]:
-        return b[3:]
-    return None
+#: The data of an OP_RETURN script laid out as this tool lays one out (one
+#: push, direct or OP_PUSHDATA1), or None for any other script: ONE reader,
+#: gs_btc_tx's, shared with the history reader (gs_btc_broadcast), so the
+#: memo this tool writes, the memo it recognises as its own on an emptied
+#: address, and the refund memo it reads cannot disagree about what a memo
+#: is.
+_op_return_data = btx.op_return_data
 
 
 def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
@@ -1046,14 +1053,29 @@ def _outpoints(items):
     return {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in items or []}
 
 
+def _carried_returned(p):
+    """Whether plan `p` was built for money that came back: its reason is
+    "returned", or -- a bump, an evicted or rejected re-sign built while
+    such money sat settled -- it carried inputs the plan it replaced or
+    re-signed did not have (`carried_returned`, written by main). Without
+    the second half a refund that rode in a replacement was never counted,
+    and the bound could be over-run by rounds it never saw."""
+    if not isinstance(p, dict):
+        return False
+    if p.get("reconcile_reason") == "returned":
+        return True
+    c = p.get("carried_returned")
+    return isinstance(c, int) and not isinstance(c, bool) and c > 0
+
+
 def returned_forwards(plans):
     """How many of `plans` are forwards of money that came back to the
-    address (reconcile_reason "returned"), each transaction counted once:
-    the current plan is in the chain too, and a recovered one IS a rotated
+    address (_carried_returned), each transaction counted once: the
+    current plan is in the chain too, and a recovered one IS a rotated
     file. Anything that is not a plan counts for nothing. Pure."""
     seen, n = set(), 0
     for p in plans or ():
-        if not isinstance(p, dict) or p.get("reconcile_reason") != "returned":
+        if not _carried_returned(p):
             continue
         t = str(p.get("txid") or "").lower()
         if t and t in seen:
@@ -1261,42 +1283,57 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             if p.get("txid")}
     ours.add(str(plan.get("txid") or "").lower())
     # A REFUND OR A PAYMENT? (third self-doubt pass; classify_returns says
-    # what is verified and why). THORNode's current inbound address is
-    # fetched only when some output CLAIMS to be a refund, so a plain
-    # reconciliation costs no extra circuit. Recorded on the plan as
+    # what is verified, what is full, and why -- against the vaults our
+    # own forwards paid, no live lookup.) Recorded on the plan as
     # `refunds` -- the file that is current now, which the chain keeps
     # when it is rotated aside -- for the pairs rewrite on the vault (a
-    # verified refund's forward drops out of what the XMR side expects)
-    # and for the operator's reading. Recomputed every run from the
-    # history, so a run that never writes the plan loses nothing.
-    _claims = [f for f in paid if isinstance(f, dict)
-               and isinstance(f.get("memo"), str)
-               and f["memo"].upper().startswith(bcast.REFUND_MEMO_PREFIX)]
-    _thor = (thor_inbound_address(args.thornode, args.tor_proxy)
-             if _claims else None)
-    _refunds = classify_returns(paid, [plan] + chain, _thor)
+    # verified FULL refund's forward drops out of what the XMR side
+    # expects) and for the operator's reading. Recomputed every run from
+    # the history, so a run that never writes the plan loses nothing. A
+    # claim is logged ONCE a run, whatever its count: a stranger's dust
+    # with a REFUND memo must not write a line per output to the chain.
+    _refunds = classify_returns(paid, [plan] + chain)
     _refund_ops = {(r["txid"], r["vout"]) for r in _refunds if r["verified"]}
     if _refunds:
         _merged = [r for r in (plan.get("refunds") or [])
                    if isinstance(r, dict)]
+        _claimed = False
         for r in _refunds:
             for m in _merged:
                 if (m.get("txid"), m.get("vout")) == (r["txid"], r["vout"]):
                     if r["verified"] and m.get("verified") is not True:
                         m["verified"] = True
+                    if r["full"] and m.get("full") is not True:
+                        m["full"] = True
                     break
             else:
                 _merged.append(dict(r))
-                integrity_log("forward", "refund_seen" if r["verified"]
-                              else "refund_claimed")
+                if r["verified"]:
+                    integrity_log("forward", "refund_seen")
+                else:
+                    _claimed = True
                 print(f"  reconcile: output {r['txid']}:{r['vout']} "
                       f"({r['value']} sat) is a ThorChain REFUND of our "
-                      f"forward {r['of']}, "
-                      + ("from ThorChain's own vault (verified)."
+                      f"forward {r['of']}"
+                      + (" in full" if r["full"] else " in part")
+                      + (", from a vault a forward of ours paid (verified)."
                          if r["verified"] else
-                         "NOT from a vault this run knows: a claim only, "
-                         "and nothing rests on it."))
+                         ", NOT from a vault any forward of ours paid: a "
+                         "claim only, and nothing rests on it."))
+        if _claimed:
+            integrity_log("forward", "refund_claimed")
         plan["refunds"] = _merged
+    # THE OUTPUTS THE VAULT KEEPS (returned past --returns-max), from every
+    # plan in the chain: a spend of exactly those is the operator moving
+    # them by hand -- the documented remedy -- and not a leaked seed.
+    _kept_ops = set()
+    for _p in [plan] + chain:
+        _rk = _p.get("returned_kept") if isinstance(_p, dict) else None
+        for _o in ((_rk or {}).get("outpoints") or []):
+            try:
+                _kept_ops.add((str(_o[0]).lower(), int(_o[1])))
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
     listed = {s["txid"]: s for s in spends}
     for s in spends:
         if s["txid"] in ours:
@@ -1307,6 +1344,19 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # made whose plan was lost. It is ours; its inputs are gone.
             integrity_log("forward", "adopted_spend")
             ours.add(s["txid"])
+            continue
+        _ins = {(str(i.get("tx_hash") or "").lower(), int(i.get("vout") or 0))
+                for i in (s.get("inputs") or []) if isinstance(i, dict)}
+        if _kept_ops and _ins and _ins <= _kept_ops:
+            # MONEY THE VAULT KEPT, MOVED BY HAND (the documented remedy
+            # for a return past the bound): expected, not an alarm. Only
+            # a seed holder can spend from the address, and a leaked seed
+            # that took ONLY the kept outputs took what the operator was
+            # about to move anyway; one that took more fails below.
+            integrity_log("forward", "kept_moved")
+            print(f"  reconcile: the kept outputs were moved by a spend "
+                  f"this tool did not sign (txid {s['txid']}): the "
+                  "operator's hand, as documented. Nothing to send.")
             continue
         integrity_log("forward", "foreign_spend")
         print("[!] the deposit address was spent by a transaction this "
@@ -1366,6 +1416,17 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # higher bound and taps.
     _returned_n = returned_forwards([plan] + chain)
     _at_limit = _returned_n >= int(args.returns_max)
+    # THE OUTPUTS THAT CAME BACK, whatever branch follows: everything
+    # unspent that is not the current plan's own inputs (an evicted
+    # forward's inputs are unspent again and are NOT returned money). At
+    # the bound these are left out of EVERY fresh forward -- the evicted
+    # re-sign and the rejected re-send's fresh forward included, which
+    # used to sweep the kept money back into the swap the bound exists to
+    # stop paying for.
+    _plan_ins = {(str(i.get("tx_hash") or "").lower(), int(i.get("vout") or 0))
+                 for i in (plan.get("inputs") or []) if isinstance(i, dict)}
+    _kept_ex = (sorted(set(unspent) - _plan_ins - consumed)
+                if _at_limit else [])
 
     def _kept(outputs, settled):
         """The verdict when money that came back is NOT sent on again
@@ -1381,7 +1442,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # rest are payments, or claims nothing rests on.
             "refunds": sum(1 for u in outputs
                            if (str(u.get("tx_hash") or "").lower(),
-                               int(u.get("vout") or 0)) in _refund_ops)}
+                               int(u.get("vout") or 0)) in _refund_ops),
+            # ...and WHICH, so a later spend of exactly these reads as the
+            # operator's hand (kept_moved) and not a leaked seed.
+            "outpoints": [[str(u.get("tx_hash") or "").lower(),
+                           int(u.get("vout") or 0)] for u in outputs]}
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         write_plan(args.outfile, plan)
         integrity_log("forward", "returned_kept")
@@ -1465,12 +1530,16 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             print("  reconcile: our transaction is not listed and its inputs "
                   "are still unspent; the signed bytes were kept. Sending "
                   "the same transaction again.")
-            return "resend", plan["tx_hex"]
+            # ...and, should every server refuse them, the fresh forward
+            # that follows leaves the kept money out (third element).
+            return "resend", plan["tx_hex"], list(_kept_ex)
         integrity_log("forward", "evicted")
         print("  reconcile: our transaction is not listed and its inputs are "
               "still unspent, and no bytes were kept (it was listed once). "
-              "Re-signing a fresh forward of the same money.")
-        return "forward", sorted(consumed), "evicted"
+              "Re-signing a fresh forward of the same money"
+              + (", leaving out what came back past the bound" if _kept_ex
+                 else "") + ".")
+        return "forward", sorted(consumed | set(_kept_ex)), "evicted"
     if plan_inputs and plan_inputs & consumed:
         # Its inputs were consumed by a listed forward of ours under
         # another txid (an earlier reconciliation re-signed). That one is
@@ -1504,7 +1573,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     raise SystemExit(EXIT_FAILED)
 
 
-def resend(args, plan, tx_hex, address, servers):
+def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     """Hand the SAME signed bytes to the network again (--reconcile found
     our transaction unlisted with its inputs still unspent). The plan is
     updated with this attempt. Returns ("done", exit_code) after an
@@ -1550,7 +1619,10 @@ def resend(args, plan, tx_hex, address, servers):
               f"of {sub['attempts']}) rejected the kept transaction (codes "
               f"{sub['codes']}); re-signing a fresh forward of the same "
               "money.")
-        return "forward", [], "rejected"
+        # ...leaving out what came back past --returns-max (the
+        # reconciliation handed the list over with the bytes).
+        return "forward", sorted(tuple(x) for x in (kept_exclude or ())), \
+            "rejected"
     try:
         seen_r = bcast_seen(txid, address, servers, args.tor_proxy,
                             network=args.network, timeout=args.timeout,
@@ -1815,7 +1887,7 @@ def main(argv=None):
     # What became of it decides everything after this point; a fresh
     # forward, when one follows, leaves out every outpoint a listed forward
     # of ours consumed and does not overwrite the earlier plan.
-    exclude, why, _replaces = (), None, None
+    exclude, why, _replaces, _prev_ins = (), None, None, None
     if args.reconcile:
         try:
             plan0 = _read_plan(args.outfile)
@@ -1836,12 +1908,18 @@ def main(argv=None):
         verdict = reconcile(args, plan0, picture, address, index, servers,
                             dest_xmr)
         if verdict[0] == "resend":
-            verdict = resend(args, plan0, verdict[1], address, servers)
+            verdict = resend(args, plan0, verdict[1], address, servers,
+                             kept_exclude=(verdict[2] if len(verdict) > 2
+                                           else ()))
         if verdict[0] == "done":
             return verdict[1]
         _, exclude, why = verdict[:3]
         exclude = [tuple(x) for x in exclude]
         integrity_log("forward", f"reconcile_{why}")
+        if why in ("evicted", "rejected"):
+            # THE INPUTS THE RE-SIGN IS FOR: anything else it carries came
+            # back meanwhile, and the bound counts it (carried_returned).
+            _prev_ins = _outpoints(plan0.get("inputs"))
         if why == "bumped":
             # THE REPLACEMENT SPENDS WHAT THE STUCK TRANSACTION SPENDS
             # (stage 6, STAGE6_PLAN.md 3.1): that plan's inputs join the
@@ -1854,6 +1932,7 @@ def main(argv=None):
             # current plan is rotated aside when the new one is written.
             plan_b, _conflicts = verdict[3], verdict[4]
             _replaces = str(plan_b.get("txid") or "").lower()
+            _prev_ins = _outpoints(plan_b.get("inputs"))
             with_plan_inputs(picture, plan_b, args.min_conf)
             args.feerate_floor = replacement_floor(
                 plan_b, _conflicts, args.op_return_max_bytes,
@@ -2099,6 +2178,16 @@ def main(argv=None):
         # swap; the reconciliation marks whichever the network did not
         # take as superseded.
         "replaces": _replaces,
+        # HOW MANY OF THIS FORWARD'S INPUTS CAME BACK MEANWHILE (a bump, an
+        # evicted or rejected re-sign built while returned money sat
+        # settled): the bound counts such a plan as a forward of returned
+        # money (_carried_returned). None for a first forward and for a
+        # plan whose reason already says so.
+        "carried_returned": (
+            sum(1 for u in chosen
+                if (str(u["tx_hash"]).lower(), int(u["vout"]))
+                not in _prev_ins)
+            if _prev_ins is not None else None),
     }
     if why:
         # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,

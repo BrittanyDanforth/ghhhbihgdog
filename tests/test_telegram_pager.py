@@ -5588,13 +5588,21 @@ _kp._btc_forward_result("B4A1", "done", "sent", 111)
 _kp._btc_forward_result("B4A1", "done", "kept", 111)
 _ke = _kp.btc_open.get("B4A1") or {}
 check("kept: the entry is 'kept' with the word and a fresh stamp, the waits "
-      "and counts dropped, and the routing learns the forward is the next "
-      "ask again (a tap asks it, and it answers kept until the operator "
-      "has acted)",
+      "and counts dropped, the window stamped, and the routing learns the "
+      "XMR side is the next ask (the money that DID swap is what the "
+      "client waits for; the forward is asked again once a window)",
       _ke.get("state") == "kept" and _ke.get("word") == "kept"
       and abs(float(_ke.get("sent_at") or 0) - time.time()) < 5
-      and "fee_tries" not in _ke and "rechecked_at" not in _ke
-      and "B4A1" not in _kp._btc_sent_set())
+      and "fee_tries" not in _ke
+      and abs(float(_ke.get("rechecked_at") or 0) - time.time()) < 5
+      and "B4A1" in _kp._btc_sent_set())
+check("...a tap inside the window asks the XMR side; past --btc-recheck "
+      "since the forward last answered it asks the forward again; a "
+      "non-kept entry never does through this rule",
+      _kp._btc_kept_due("B4A1") is False
+      and _kp._btc_kept_due("B4A1", now=time.time() + _kp.btc_recheck_s + 1)
+      is True
+      and _kp._btc_kept_due("ZZZZ") is False)
 _kcalls = []
 (_kp.btc_open.get("B4A1") or {})["sent_at"] = time.time() - _kp.btc_recheck_s - 1
 _kp.limits.headroom = lambda: 9
@@ -5691,17 +5699,53 @@ check("a forwarded entry IS looked at, with its address; an empty address "
       "started)", len(_rfcalls) == 1 and _rfcalls[0][0] == _BTC_ADDR
       and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarded"
       and "B4A1" in _rf._btc_sent_set() and _rfs == [] and _rfj == [])
-_rf.btc_tick(look=_look_returning("seen", unconf=100000))
-check("money seen on it again: watched as money seen, the forward is the "
-      "next ask again, nothing said yet",
-      (_rf.btc_open.get("B4A1") or {}).get("state") == "seen"
-      and "B4A1" not in _rf._btc_sent_set() and _rfs == [] and _rfj == [])
+_rf.btc_tick(look=_look_returning("confirmed", conf=100000, calls=_rfcalls))
+check("...and NOT again inside the --btc-recheck window (a look is a fresh "
+      "circuit announcing a spent address to a server; once a window, not "
+      "once a tick)", len(_rfcalls) == 1 and _rfj == [])
+
+
+def _rf_window_open():
+    (_rf.btc_open.get("B4A1") or {})["looked_at"] = (
+        time.time() - _rf.btc_recheck_s - 1)
+
+
+_rf_window_open()
+_rf.btc_tick(look=_look_returning("seen", unconf=100000, calls=_rfcalls))
+check("money merely SEEN on it (unconfirmed) changes nothing: still "
+      "forwarded, its figures untouched, nothing said or started",
+      len(_rfcalls) == 2
+      and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarded"
+      and (_rf.btc_open.get("B4A1") or {}).get("unconf") == 0
+      and _rfs == [] and _rfj == [])
+_rf_window_open()
 _rf.limits.headroom = lambda: 9
-_rf.btc_tick(look=_look_returning("confirmed", conf=100000))
-check("...and when it settles the forward is started and 'confirmed. "
-      "Sending it on now.' is said, as for a first payment",
+_rf.btc_tick(look=_look_returning("confirmed", conf=5000, calls=_rfcalls))
+check("settled DUST under this pair's floor (a sweep's leftover, a "
+      "stranger's) is ignored: still forwarded, no wake, nothing said",
+      len(_rfcalls) == 3
+      and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarded"
+      and _rfs == [] and _rfj == []
+      and 5000 < pg.Pager.deposit_min_sat)
+_rf_window_open()
+_rf.limits.headroom = lambda: 2
+_rf.btc_tick(look=_look_returning("confirmed", conf=100000, calls=_rfcalls))
+check("settled money above the floor is a BACKGROUND start: with only the "
+      "reserve left nothing starts, and the entry stays forwarded to try "
+      "again next window (a stranger's money must not cost the day's last "
+      "wake)", len(_rfcalls) == 4
+      and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarded"
+      and _rfs == [] and _rfj == [])
+_rf_window_open()
+_rf.limits.headroom = lambda: 9
+_rf.btc_tick(look=_look_returning("confirmed", conf=100000, calls=_rfcalls))
+check("...with headroom the forward is started, 'confirmed. Sending it on "
+      "now.' is said as for a first payment, and the forward is the next "
+      "ask",
       _rfj == [(111, "forward_to_swap", {"handle": "B4A1"})]
-      and len(_rfs) == 1 and "Sending it on now" in _rfs[0][0])
+      and len(_rfs) == 1 and "Sending it on now" in _rfs[0][0]
+      and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarding"
+      and "B4A1" not in _rf._btc_sent_set())
 _rg, _rgs, _rgj = _watch_pager()
 _rg.btc_servers = [("s.onion", 50002, None)]
 _rg.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
@@ -5712,6 +5756,43 @@ _rg.btc_tick(look=_look_returning("confirmed", conf=100000, calls=_rgcalls))
 check("...a forwarded entry learned after a restart has no address and is "
       "not looked at", (_rg.btc_open.get("B4A1") or {}).get("addr") == ""
       and _rgcalls == [] and _rgj == [])
+_rg._btc_forward_result("B4A2", "done", "kept", 111)
+check("a KEPT answer after a restart is learned back too (state kept, no "
+      "address, the XMR side the next ask), so /balance can name it",
+      (_rg.btc_open.get("B4A2") or {}).get("state") == "kept"
+      and (_rg.btc_open.get("B4A2") or {}).get("addr") == ""
+      and "B4A2" in _rg._btc_sent_set())
+# THE EARLY WAIT SURVIVES A START THAT WAS REFUSED AT THE LAST MOMENT, and a
+# payment that vanishes takes the early count with it; a refusal never
+# shortens the wait the doubling had grown.
+_ew, _ews, _ewj = _watch_pager()
+_ew.btc_servers = [("s.onion", 50002, None)]
+_ew.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_ew.limits.headroom = lambda: 9
+_ew.btc_open["B4A1"]["state"] = "seen"
+_ew.btc_open["B4A1"]["early_tries"] = 2
+_ew.btc_open["B4A1"]["retry_after"] = time.time() - 1
+_ew.start_job = lambda *a, **k: False
+_ew.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("a start refused at the last moment (a tap took the lock) puts the "
+      "entry back to seen WITH its wait, so the lost race does not cost a "
+      "wake at the next tick",
+      (_ew.btc_open.get("B4A1") or {}).get("state") == "seen"
+      and "retry_after" in (_ew.btc_open.get("B4A1") or {})
+      and (_ew.btc_open.get("B4A1") or {}).get("early_tries") == 2)
+_ew.btc_tick(look=_look_returning("not_seen"))
+check("...a payment that vanishes before it confirms takes the early count "
+      "with it: the next payment's first forward is a first forward again",
+      (_ew.btc_open.get("B4A1") or {}).get("state") == "not_seen"
+      and "early_tries" not in (_ew.btc_open.get("B4A1") or {}))
+_ew.btc_open["B4A1"]["state"] = "forwarding"
+_ew.btc_open["B4A1"]["early_tries"] = 4
+_ew.btc_fee_retry_s = 3600
+_ew._btc_forward_result("B4A1", "refused", "", 111)
+check("a refusal on an entry whose early wait had doubled to its cap keeps "
+      "at least that wait (never the shorter stall wait)",
+      (_ew.btc_open.get("B4A1") or {}).get("retry_after", 0) - time.time()
+      >= pg.Pager.EARLY_WAIT_S * 8 - 5)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

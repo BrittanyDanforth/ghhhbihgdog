@@ -333,6 +333,76 @@ refuters per finding) found real defects, all fixed in the rewrite:
   one new trust is THORNode's word on its own vault address, which the
   cross-check already sends the money on. test_btc_broadcast, forwarder,
   agent; six anchors.
+
+### The review of the third pass: ten agents over the four commits and the whole public tree
+- Four tracers, one per pushed commit, told to refute "fully wired"; six
+  audit lenses (static identifiers, network, on-chain, the seized Pi
+  with the source, the vault's disk and logs, docs and tests) told to
+  find anything that identifies or clusters the host. What they found
+  that was real, and what changed:
+- The returns bound (`74a163b`) held on the listed and superseded paths
+  only: an EVICTED re-sign, and the fresh forward after a re-send every
+  server rejected, excluded the listed forwards' inputs alone, so the
+  kept money rode back into the swap the bound exists to stop paying
+  for; and a bump or re-sign that carried returned money under the bound
+  was never counted, so the bound could be over-run by rounds it never
+  saw. Now the reconciliation computes the returned outpoints up front
+  (`_kept_ex`: unspent, not the plan's own inputs, not consumed) and
+  every fresh-forward verdict at the bound leaves them out (the re-send
+  hands them over with the bytes); a plan built after a bump, eviction
+  or rejection records how many of its inputs the replaced plan did not
+  have (`carried_returned`), and `returned_forwards` counts it. `kept`
+  outranked `forwarded` and routed every tap to the forward, so the
+  arrival of the money that DID swap was unaskable: now a kept deposit's
+  taps ask the XMR side, and once per `--btc-recheck` window a tap asks
+  the forward again (`_btc_kept_due`), so a raised bound or a hand move
+  is heard; the documented remedy -- move the kept money by hand -- was
+  the seed-leak alarm on every later run: the kept mark names its
+  outpoints and a spend of exactly those is `kept_moved`, not
+  `foreign_spend`. A `kept` answer is learned back after a restart; the
+  operator's "failed" alert goes out before the watch list can turn it
+  into "stopped".
+- The forwarded look (`414f553`) was found wanting on four counts and
+  rebuilt: it converted the entry to `seen` (so it escaped the two-day
+  sweep and lived for ever), acted on any settled sat (a sweep's dust
+  leftover, or a stranger's, made "money to send on", a wake, and the
+  stall sentence about money that WAS sent on), started in the
+  foreground (a stranger's dust could spend the day's last wake), and
+  looked every tick (two hundred and eighty-eight circuits per deposit
+  announcing a spent address). Now: once per window (`looked_at`), only
+  settled money at or above `--deposit-min-sat`, a background start, the
+  entry stays `forwarded` until it can start, its figures untouched.
+- The early wait (`2d24e26`): a start refused at the last moment (a tap
+  took the lock) dropped the wait; a payment that vanished kept the
+  early count so the next payment's first forward was a silent
+  reserve-gated start; a refusal reset a wait the doubling had grown.
+  All three closed (the wait is popped only once the start happened; the
+  count goes with the money; the stall wait is never shorter than the
+  early wait).
+- The refund classification (`dd5d5cf`): a refund of ONE sat verified
+  erased the whole forward's expectation (a streaming swap refunds only
+  the unfilled part) -- now `full` requires at least what was sent less
+  a slack and at least half; a refund still in the mempool decided an
+  irreversible record -- now confirmed only; the source was verified
+  against THORNode's current inbound alone (one party's word: a lying
+  node plus an attacker's dust would have lowered a client's
+  expectation) -- now against the inbounds of the chain's own plans, each
+  cross-checked when built, and any of the first four inputs; "the
+  deposit-time quote stands" was false (the forward-time rewrite stayed)
+  -- now restored when every forward was refunded in full; the singular
+  `forwarded_txid` names the record the plural counts; a stranger's
+  forged claims wrote a countable chain line each -- now one a run; the
+  duplicate memo reader is one reader (gs_btc_tx). The THORNode fetch on
+  a claim is gone with its 1-of-1 trust.
+- Test fixtures: two Monero addresses asserted "real" in the tests
+  (43ZYYZ…, 47BDEB…) were not attributable to any published vector; a
+  fixture that was some wallet's address would tie that wallet to this
+  toolchain in a public repository. Replaced by addresses derived from
+  spend keys of thirty-two 0x01 / 0x02 bytes -- reproducible by anyone,
+  claimable by nobody.
+- Counts after this round: test_btc_broadcast 101, test_btc_forwarder
+  301, test_wake_agent 748, test_telegram_pager 826; the anchors added or
+  re-pointed are listed in the sweep and were all caught.
 - Checked and left alone: the forward's worst case over Tor (look,
   history, quote, oracle, THORNode, submit, seen, each bounded) fits its
   900 s budget; the quote-age bound (300 s) covers the cross-check's own
