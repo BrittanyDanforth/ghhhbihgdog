@@ -1698,6 +1698,8 @@ class Pager:
         self.btc_min_conf = int(getattr(args, "btc_min_conf", 2) or 2)
         self.btc_network = str(getattr(args, "btc_network", "main") or "main")
         self.btc_poll_s = int(getattr(args, "btc_poll", 600) or 600)
+        self.btc_fee_retry_s = int(getattr(args, "btc_fee_retry", 3600)
+                                   or 3600)
         #: The smallest deposit the wizard takes. The vault has its own floor
         #: on the intake (what can be forwarded after the fee); set this to
         #: it so the refusal happens here, with the number, and not after a
@@ -4939,7 +4941,11 @@ class Pager:
         "seen": "received, confirming",
         "forwarding": "confirmed, sending on",
         "stalled": "confirmed, but sending on did not go through",
+        "sent": "sent on",
     }
+    #: How long after a forward the vault would not pay for at today's fee
+    #: (`delayed`) the watcher tries again, in seconds: --btc-fee-retry.
+    btc_fee_retry_s = 3600
 
     def _btc(self):
         """(lock, watch list), created on first use so a Pager built
@@ -4984,13 +4990,39 @@ class Pager:
                 # LEARNED FROM THE ANSWER, watched or not: the next ask
                 # about this deposit is for the XMR side.
                 self._btc_sent_set().add(h)
+            if out == "done" and phase == "returned":
+                # MONEY CAME BACK (stage 5): the next ask is the forward's
+                # again, whatever this end had learned before.
+                self._btc_sent_set().discard(h)
             e = opened.get(h)
             if not e:
                 return
             if out == "done" and phase in ("sent", "unsure"):
                 # Gone from the address, or may be: the vault's word is the
-                # phase line the forward branch renders. Nothing to watch.
-                opened.pop(h, None)
+                # phase line the forward branch renders. KEPT on the list as
+                # `sent` -- not looked at, but its address remembered, so
+                # money that comes back to it (a refund, a second payment)
+                # can be watched again without a fresh slip.
+                e["state"] = "sent"
+                e["sent_at"] = time.time()
+                e.pop("retry_after", None)
+                return
+            if out == "done" and phase == "returned":
+                # Watched again from here: when it settles the forward is
+                # started as for a first payment, and said as such.
+                e["state"] = "seen"
+                e["said"].discard("confirmed")
+                e["said"].discard("held")
+                e.pop("retry_after", None)
+                return
+            if out == "done" and phase == "delayed":
+                # THE VAULT WOULD NOT PAY TODAY'S FEE. Fees fall in hours:
+                # the deposit stays on the list as money seen and the
+                # watcher starts the forward again after --btc-fee-retry,
+                # through the same gates, without a word here (the forward
+                # branch has already rendered the vault's own sentence).
+                e["state"] = "seen"
+                e["retry_after"] = time.time() + float(self.btc_fee_retry_s)
                 return
             if out == "done" and phase == "arriving":
                 e["state"] = "seen"
@@ -5031,10 +5063,16 @@ class Pager:
             # payment that lands later is still sent on: the button asks the
             # forward. Money already seen is kept at any age.
             _now = time.time()
+            # ...AND A SENT ONE, the same window after it went out: a refund
+            # comes back within hours, and one that has not come back by
+            # then is not coming.
             for _h in [k for k, v in opened.items()
-                       if v["state"] == "not_seen"
-                       and _now - float(v.get("since") or _now)
-                       >= proto.DEPOSIT_PLACE_TTL_S]:
+                       if (v["state"] == "not_seen"
+                           and _now - float(v.get("since") or _now)
+                           >= proto.DEPOSIT_PLACE_TTL_S)
+                       or (v["state"] == "sent"
+                           and _now - float(v.get("sent_at") or _now)
+                           >= proto.DEPOSIT_PLACE_TTL_S)]:
                 opened.pop(_h, None)
                 integrity_log("pager", "btc_watch_forgotten")
             snapshot = [(h, dict(e)) for h, e in opened.items()
@@ -5084,8 +5122,15 @@ class Pager:
                 return
             e["conf"], e["unconf"] = conf, unconf
             chat = e["chat"]
-            if state == "confirmed" and self._btc_can_start():
+            _waiting = time.time() < float(e.get("retry_after") or 0.0)
+            if state == "confirmed" and _waiting:
+                # A `delayed` forward's retry is not due yet: the vault
+                # said so once, in its own words; nothing is said or
+                # started until --btc-fee-retry has passed.
+                e["state"] = "seen"
+            elif state == "confirmed" and self._btc_can_start():
                 e["state"] = "forwarding"
+                e.pop("retry_after", None)
                 say, start = "confirmed", True
             elif state == "confirmed":
                 # SETTLED, AND THIS END CANNOT WAKE YET (a job is running,
@@ -5792,6 +5837,11 @@ def build_cli():
     ap.add_argument("--btc-poll", type=int, default=600, metavar="SECONDS",
                     help="how often the watched addresses are looked at "
                          "(default 600)")
+    ap.add_argument("--btc-fee-retry", type=int, default=3600,
+                    metavar="SECONDS",
+                    help="how long after the vault would not pay today's fee "
+                         "for a forward this end tries again, by itself "
+                         "(default 3600, floor 600)")
     ap.add_argument("--deposit-min-sat", type=int, default=0,
                     help="the smallest deposit the wizard takes, in satoshi; "
                          "set it to the vault's intake floor so a deposit it "
@@ -5842,6 +5892,9 @@ def main(argv=None) -> int:
         if args.btc_poll < 60:
             sys.exit("[!] --btc-poll under 60 s is a Tor circuit per address "
                      "a minute; 600 is the default for a reason.")
+        if getattr(args, "btc_fee_retry", 3600) < 600:
+            sys.exit("[!] --btc-fee-retry under 600 s would spend the day's "
+                     "wakes on a fee that has not had time to fall.")
     if getattr(args, "deposit_min_sat", 0) < 0:
         sys.exit("[!] --deposit-min-sat cannot be negative.")
 

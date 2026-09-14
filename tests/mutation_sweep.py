@@ -4366,7 +4366,8 @@ MUTATIONS = [
   '    ok = True',
   ['test_btc_tx']),
  ('the forwarder runs with neither flag, or with both', 'btc_forwarder',
-  '    if args.dry_run == args.broadcast:',
+  '    if sum(1 for m in (args.dry_run, args.broadcast, args.reconcile) if m) \\\n'
+  '            != 1:',
   '    if False:',
   ['test_btc_forwarder']),
  ('a fee estimate outside the band is paid', 'btc_forwarder',
@@ -4395,7 +4396,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the agent composes the forward to SEND without the broadcast switch',
   'gs_wake_agent',
-  '                "--broadcast" if _btc_broadcast_on(key) else "--dry-run",',
+  '                ("--broadcast" if _btc_broadcast_on(key) else "--dry-run"),',
   '                "--broadcast",',
   ['test_wake_agent']),
  ('the xpub goes back onto the argv', 'gs_wake_agent',
@@ -4619,7 +4620,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('an unanswered look issues an address anyway', 'gs_wake_agent',
   '            integrity_log("wake", "btc_lookup_failed")\n            raise Refused("btc_lookup_failed",',
-  '            return idx\n            raise Refused("btc_lookup_failed",',
+  '            return True\n            raise Refused("btc_lookup_failed",',
   ['test_wake_agent']),
  ('the recovery gap is one wider than declared', 'gs_wake_agent',
   '    for step in range(int(proto.BTC_INDEX_GAP) + 1):',
@@ -4698,9 +4699,9 @@ MUTATIONS = [
   '                e["state"] = "seen"\n                say = "confirmed"',
   ['test_telegram_pager']),
  ('the watcher starts the forward on money merely seen', 'gs_telegram_pager',
-  '            if state == "confirmed" and self._btc_can_start():\n'
+  '            elif state == "confirmed" and self._btc_can_start():\n'
   '                e["state"] = "forwarding"',
-  '            if state in ("confirmed", "seen") and self._btc_can_start():\n'
+  '            elif state in ("confirmed", "seen") and self._btc_can_start():\n'
   '                e["state"] = "forwarding"',
   ['test_telegram_pager']),
  ('the watcher repeats itself every tick', 'gs_telegram_pager',
@@ -4807,8 +4808,8 @@ MUTATIONS = [
   '    if False:\n        integrity_log("forward", "foreign_spend")',
   ['test_btc_forwarder']),
  ('the agent maps delayed to not_yet', 'gs_wake_agent',
-  '                         "delayed": "delayed", "short": "short"}',
-  '                         "delayed": "not_yet", "short": "short"}',
+  '                         "delayed": "delayed", "short": "short",',
+  '                         "delayed": "not_yet", "short": "short",',
   ['test_wake_agent']),
  ('spends_of reports a funding transaction as a spend', 'gs_btc_broadcast.py',
   '            if spent:\n                out.append({"txid": e["tx_hash"],',
@@ -4892,8 +4893,36 @@ MUTATIONS = [
   '        raise SystemExit(EXIT_FAILED)',
   ['test_btc_forwarder']),
  ('a never-paid deposit is watched for ever', 'gs_telegram_pager',
-  '                       >= proto.DEPOSIT_PLACE_TTL_S]:',
-  '                       >= float("inf")]:',
+  '                       if (v["state"] == "not_seen"\n'
+  '                           and _now - float(v.get("since") or _now)\n'
+  '                           >= proto.DEPOSIT_PLACE_TTL_S)',
+  '                       if (v["state"] == "not_seen"\n'
+  '                           and _now - float(v.get("since") or _now)\n'
+  '                           >= float("inf"))',
+  ['test_telegram_pager']),
+ # Step 7: the pager on the new words.
+ ('a delayed forward is retried on the very next tick', 'gs_telegram_pager',
+  '            _waiting = time.time() < float(e.get("retry_after") or 0.0)',
+  '            _waiting = False',
+  ['test_telegram_pager']),
+ ('a returned deposit is not watched again', 'gs_telegram_pager',
+  '                e["state"] = "seen"\n'
+  '                e["said"].discard("confirmed")',
+  '                e["state"] = "sent"\n'
+  '                e["said"].discard("confirmed")',
+  ['test_telegram_pager']),
+ ('a sent deposit is dropped from the list (its address forgotten)',
+  'gs_telegram_pager',
+  '                e["state"] = "sent"\n                e["sent_at"] = time.time()',
+  '                opened.pop(h, None)\n                e["sent_at"] = time.time()',
+  ['test_telegram_pager']),
+ ('a sent deposit is watched for ever', 'gs_telegram_pager',
+  '                       or (v["state"] == "sent"\n'
+  '                           and _now - float(v.get("sent_at") or _now)\n'
+  '                           >= proto.DEPOSIT_PLACE_TTL_S)]:',
+  '                       or (v["state"] == "sent"\n'
+  '                           and _now - float(v.get("sent_at") or _now)\n'
+  '                           >= float("inf"))]:',
   ['test_telegram_pager']),
  ("/balance shows every chat's deposits", 'gs_telegram_pager',
   '                    if e["chat"] == cid]',

@@ -1368,7 +1368,21 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
             if isinstance(r, dict) and isinstance(r.get("btc_index"), int)
             and not isinstance(r.get("btc_index"), bool)]
     nxt = (max(used) + 1) if used else 0
-    ask = unused or (lambda addr: _btc_unused_live(key, addr))
+    _live = unused or (lambda addr: _btc_unused_live(key, addr))
+
+    def ask(addr):
+        """Fresh or not -- and "could not ask" is a REFUSAL of the deposit,
+        never a guess: an address that might have been used already is two
+        people's money on one line."""
+        try:
+            return _live(addr)
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", "btc_lookup_failed")
+            raise Refused("btc_lookup_failed",
+                          "could not ask the network whether the next deposit "
+                          "address is fresh, so no address was issued: one "
+                          "that might have been used already is two people's "
+                          "money on one line. Nothing was published.")
     if not used:
         # THE LEDGER KNOWS NO INDEX: a fresh pair, or a WIPED ledger behind
         # a used chain (STAGE5_PLAN.md 3.6). The two are told apart by
@@ -1387,15 +1401,7 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                           "this machine's keyfile names an account xpub the "
                           f"watch side cannot derive from ({type(e).__name__}); "
                           "re-pair.")
-        try:
-            fresh0 = ask(addr0)
-        except Exception:                                    # noqa: BLE001
-            integrity_log("wake", "btc_lookup_failed")
-            raise Refused("btc_lookup_failed",
-                          "could not ask the network whether the next deposit "
-                          "address is fresh, so no address was issued: one "
-                          "that might have been used already is two people's "
-                          "money on one line. Nothing was published.")
+        fresh0 = ask(addr0)
         if fresh0:
             return 0
         integrity_log("wake", "ledger_wiped")
@@ -1417,15 +1423,7 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                           "this machine's keyfile names an account xpub the "
                           f"watch side cannot derive from ({type(e).__name__}); "
                           "re-pair.")
-        try:
-            fresh = ask(addr)
-        except Exception:                                    # noqa: BLE001
-            integrity_log("wake", "btc_lookup_failed")
-            raise Refused("btc_lookup_failed",
-                          "could not ask the network whether the next deposit "
-                          "address is fresh, so no address was issued: one "
-                          "that might have been used already is two people's "
-                          "money on one line. Nothing was published.")
+        fresh = ask(addr)
         if fresh:
             if step:
                 # ONCE per run, never a count: how many were skipped is the

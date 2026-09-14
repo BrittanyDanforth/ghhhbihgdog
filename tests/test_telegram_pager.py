@@ -4566,6 +4566,70 @@ check("a start start_job refused: the entry is NOT left as forwarding but "
 _xp.btc_tick(look=_look_returning("confirmed", conf=5000000))
 check("...and the next tick tries again, without repeating the sentence",
       len(_xj) == 2 and len(_xs) == 1)
+
+print("\n-- stage 5: delayed, returned, sent on the watch list --")
+# THE VAULT WOULD NOT PAY TODAY'S FEE (`delayed`): the deposit stays on the
+# list as money seen and the forward is started again after --btc-fee-retry
+# -- not on the very next tick, which would spend the day's wakes on a fee
+# that has not had time to fall. The vault's own sentence was rendered by
+# the forward branch; the watcher adds nothing.
+_dp, _ds, _dj = _watch_pager()
+_dp.btc_fee_retry_s = 3600
+_dp.btc_open["B4A1"]["state"] = "forwarding"
+_dp.btc_open["B4A1"]["said"].add("confirmed")
+_dp._btc_forward_result("B4A1", "done", "delayed", 111)
+check("delayed: the entry goes back to 'seen' with a retry time one "
+      "--btc-fee-retry ahead, nothing said by the watcher",
+      _dp.btc_open["B4A1"]["state"] == "seen"
+      and abs(_dp.btc_open["B4A1"]["retry_after"] - (time.time() + 3600)) < 5
+      and _ds == [])
+_dp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...a tick before the retry time: confirmed money is NOT sent on yet, "
+      "nothing said, the entry still seen",
+      _dj == [] and _ds == [] and _dp.btc_open["B4A1"]["state"] == "seen")
+_dp.btc_open["B4A1"]["retry_after"] = time.time() - 1
+_dp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...a tick after it: the forward is started again through the same "
+      "gates, the retry time cleared, the sentence not repeated",
+      _dj == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and _dp.btc_open["B4A1"]["state"] == "forwarding"
+      and "retry_after" not in _dp.btc_open["B4A1"] and _ds == [])
+# MONEY CAME BACK (`returned`): watched again from here, and when it
+# settles the forward is started and said as for a first payment.
+_rp9, _rs9, _rj9 = _watch_pager()
+_rp9._btc_forward_result("B4A1", "done", "sent", 111)
+check("(setup) sent: kept on the list as sent, and learned for routing",
+      _rp9.btc_open["B4A1"]["state"] == "sent"
+      and "B4A1" in _rp9._btc_sent_set())
+_calls9 = []
+_rp9.btc_tick(look=_look_returning("confirmed", conf=5000000, calls=_calls9))
+check("...a sent entry is not looked at", _calls9 == [] and _rj9 == [])
+_rp9._btc_forward_result("B4A1", "done", "returned", 111)
+check("returned: the entry is watched again ('seen'), the routing learns "
+      "the forward is the next ask again",
+      _rp9.btc_open["B4A1"]["state"] == "seen"
+      and "B4A1" not in _rp9._btc_sent_set())
+_rp9.btc_tick(look=_look_returning("confirmed", conf=3000000))
+check("...and when the returned money settles the forward is started and "
+      "'confirmed. Sending it on now.' is said again for it",
+      _rj9 == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and len(_rs9) == 1 and "Sending it on now" in _rs9[0][0])
+# A SENT ENTRY IS FORGOTTEN after the reserve's window, like a never-paid
+# one; /balance names it while it is kept.
+_sp9, _ss9, _sj9 = _watch_pager()
+_sp9._btc_forward_result("B4A1", "done", "sent", 111)
+_sp9.handle_owner["B4A1"] = 111
+_sp9.handle(_msg(111, 111, "/balance"))
+check("/balance names a sent deposit as 'sent on'",
+      "sent on" in _ss9[-1][0] and "sent" in pg.Pager.BTC_STATE_WORDS)
+_sp9.btc_open["B4A1"]["sent_at"] = time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1
+_sp9.btc_tick(look=_look_returning("not_seen"))
+check("...and is dropped from the list after DEPOSIT_PLACE_TTL_S since it "
+      "went out", "B4A1" not in _sp9.btc_open)
+_src_main = __import__("inspect").getsource(pg.main)
+check("--btc-fee-retry has a floor of 600 s, refused at startup",
+      "--btc-fee-retry" in _src_main and "< 600" in _src_main
+      and pg.Pager.btc_fee_retry_s == 3600)
 # start_job's own answer, on the real method: False on every refusal, True
 # once the worker is running (the source pins the True to the thread start).
 _sj, _sjs = _room_pager((111,), ())
@@ -4623,10 +4687,14 @@ check("every state has a reader's word, numberless and naming no coin",
                   for ch in w))
 
 print("\n-- what the forward's outcome does to the watch list --")
-for _out, _ph, _want, _msgs in (("done", "sent", None, 0),
-                                ("done", "unsure", None, 0),
+# A SENT ONE IS KEPT, as `sent` (stage 5): not looked at, but its address
+# remembered, so money that comes back to it can be watched again.
+for _out, _ph, _want, _msgs in (("done", "sent", "sent", 0),
+                                ("done", "unsure", "sent", 0),
                                 ("done", "not_yet", "not_seen", 0),
                                 ("done", "arriving", "seen", 0),
+                                ("done", "delayed", "seen", 0),
+                                ("done", "returned", "seen", 0),
                                 ("done", "", "stalled", 0),
                                 ("refused", "", "stalled", 1),
                                 ("failed", "", "stalled", 1)):
@@ -4635,10 +4703,9 @@ for _out, _ph, _want, _msgs in (("done", "sent", None, 0),
     _rp._btc_forward_result("B4A1", _out, _ph, 111)
     _rp._btc_forward_result("B4A1", _out, _ph, 111)
     _e = _rp.btc_open.get("B4A1")
-    check(f"forward {_out}/{_ph or '-'}: "
-          + ("the entry is closed" if _want is None else f"state {_want}")
+    check(f"forward {_out}/{_ph or '-'}: state {_want}"
           + (", said once" if _msgs else ", nothing said"),
-          (_e is None if _want is None else (_e or {}).get("state") == _want)
+          (_e or {}).get("state") == _want
           and len(_rs) == _msgs
           and (not _msgs or ("did not go through" in _rs[0][0]
                              and _rs[0][1])))
@@ -4701,9 +4768,9 @@ _sp3._btc_register("B4A1", _BTC_ADDR, 111)
 _sp3._btc_forward_result("B4A1", "done", "sent", 111)
 _sp3.handle(_msg(111, 111, f"/check {_sp3._label(111, 'B4A1')}"))
 check("after the forward reported SENT, /check on that deposit asks the XMR "
-      "side (swap_status): the forward has nothing more to say",
-      _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
-      and "B4A1" not in _sp3.btc_open)
+      "side (swap_status): the forward has nothing more to say; the entry "
+      "is kept as sent", _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
+      and _sp3.btc_open["B4A1"]["state"] == "sent")
 _tap(_sp3, "c:B4A1")
 check("...and so does the button", _sj3[-1] == (111, "swap_status",
                                                  {"handle": "B4A1"}))
