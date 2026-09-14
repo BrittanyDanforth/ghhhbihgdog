@@ -200,7 +200,14 @@ import time
 #: question), for stage 6's tracking after the send. As with 5 and 7: no
 #: record changes shape, the closed vocabulary grows, an old Pi refuses a
 #: new vault's M3 carrying it, loud. Update both boxes together.
-WIRE_VERSION = 8
+#:
+#: 9: one phase word, `kept` (money came back to the deposit address again,
+#: past the vault's --btc-returns-max, and is NOT sent on by itself -- a
+#: route that keeps refunding would eat the deposit in fees), for the third
+#: self-doubt pass. As with 5, 7 and 8: no record changes shape, the closed
+#: vocabulary grows, an old Pi refuses a new vault's M3 carrying it, loud.
+#: Update both boxes together.
+WIRE_VERSION = 9
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -435,9 +442,14 @@ BTC_INDEX_GAP = 20
 #:              rechecks of it end and the arrival is the XMR side's
 #:              question. `sent` says a server took it; this says the
 #:              network kept it. Says nothing about depth.
+#:   kept       money came back to the deposit address AGAIN (past the
+#:              vault's --btc-returns-max) and is NOT sent on by itself: a
+#:              route that keeps refunding would eat the deposit in fees,
+#:              a round per recheck. It waits where it is for the
+#:              operator. Says nothing about how much, or why it came back.
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
           "more_locked", "moved", "partial", "full", "sent", "unsure",
-          "delayed", "returned", "forwarded")
+          "delayed", "returned", "forwarded", "kept")
 
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
@@ -924,6 +936,11 @@ PHASE_LINES = {
     # coin, no count.
     "forwarded": "the forward has confirmed. Nothing more to check on this "
                  "side — ask again later for the arrival.",
+    # MONEY CAME BACK AGAIN AND IS KEPT (third self-doubt pass): a route
+    # that keeps refunding is not paid for once more. No amount, no count,
+    # no coin, no reason; "check" is the whole of what to do.
+    "kept": "some of it came back to where it was paid, again, and is kept "
+            "there — not sent on again by itself. Check.",
     # NOT RENDERED ON ITS OWN. The pager acts on this one -- it starts the
     # next leg -- and says so in its own words, because "more left" is not
     # something the operator has to do anything about. The sentence is here

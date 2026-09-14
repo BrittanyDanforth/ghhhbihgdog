@@ -1379,8 +1379,10 @@ first two on the vault where they cannot be talked around from a phone:
   out) leave `--btc-reserve` pokes (2) for taps, and a fee retry's wait
   doubles with every `delayed` in a row. On a bot serving several people
   the operator is not in every chat: `--alert-chat` names the one that
-  hears, at most hourly, that a forward for some other chat FAILED — one
-  line, no deposit, no reason (the job log at the vault has both).
+  hears, at most hourly, that a forward for some other chat FAILED, or
+  STOPPED (its automatic retries spent, or money that came back kept at
+  the vault) — one line, no deposit, no reason (the job log at the vault
+  has both).
 - **Wall clock, which is what actually binds once the first two are sized.**
   One vault drains one withdrawal at a time; eight people withdrawing at ten
   hops is three days of queue nobody can shorten. Three or four people in
@@ -2052,7 +2054,7 @@ python3 gs_wake_keys pair --deposit-in-chat \
     --btc-xpub <account xpub> --btc-electrum <host.onion> \
     --allow-btc-forward [--allow-btc-broadcast --thornode <url>] \
     --op-return-max-bytes 140 \
-    [--btc-account N] [--btc-bump-after SECONDS] ...       # ON THE VAULT
+    [--btc-account N] [--btc-bump-after SECONDS] [--btc-returns-max N] ...  # ON THE VAULT
 ```
 
 `--op-return-max-bytes` is not optional on an intake pair, and the pairing
@@ -2075,6 +2077,14 @@ decoration cannot push a memo past the policy.
 sit in the mempool before a run of the forward replaces it at today's rate
 (the bump, below); the pager's `--btc-recheck` must be at least this, or
 its rechecks never find one due.
+
+`--btc-returns-max` (default 2, up to 1000) is how many forwards of money
+that CAME BACK to a deposit address — a refund, a second payment — one
+deposit may have before the next return is kept on the address for you
+instead of sent on again (`kept`, below). ThorChain refunds a swap it will
+not run, less its outbound fee; a route that keeps refunding would
+otherwise be paid for again every recheck until the deposit was gone. 0
+keeps the first return.
 
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its
@@ -2170,7 +2180,9 @@ python3 gs_telegram_pager ... \
                            # fewer remain (0 disables; under --daily-cap)
     --alert-chat <id>      # optional, an allowlisted chat: one line, at most
                            # hourly, when a forward for some OTHER chat
-                           # failed -- for a bot serving several people
+                           # failed, or stopped (its automatic retries
+                           # spent; money the vault keeps) -- for a bot
+                           # serving several people
 ```
 
 `--btc-electrum` is not optional on an intake pair. It is also how the
@@ -2237,7 +2249,19 @@ found on the whole plan chain, not the current plan alone), and — the case
 nobody plans for — sends on money that CAME BACK to the address (ThorChain
 refunds a swap it will not run to the paying address, and a client may pay
 twice): "some of it came back to where it was paid and is being sent on
-again". A replacement the vault would not pay for today is `delayed` like a
+again" — but not for ever. Past `--btc-returns-max` such forwards in the
+deposit's record (two), the next return is KEPT on the address: the run is
+done, nothing is quoted or signed, the plan carries `returned_kept`, the
+phone hears "some of it came back to where it was paid, again, and is kept
+there — not sent on again by itself. Check.", the Pi looks at nothing,
+rechecks nothing and retries nothing for it, and `--alert-chat` hears that
+a forward was stopped for another chat. A route that keeps refunding (an
+asset ThorChain has stopped routing, a memo it will not take) was
+otherwise paid for again every recheck — the network fee and ThorChain's
+outbound fee per round, "sent" in the chat each time — until the deposit
+was gone. Move the money by hand at the vault (the job log names the
+outputs), or re-pair with a higher bound and tap. A replacement the vault
+would not pay for today is `delayed` like a
 first forward, and the original stands. A spend of the address that is not
 the vault's own fails the run with `foreign_spend` on the chain: only a
 leaked seed does that, and the job log at the machine names the

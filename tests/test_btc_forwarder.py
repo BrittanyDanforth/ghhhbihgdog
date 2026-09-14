@@ -2133,6 +2133,96 @@ check("the stage-1 client it uses still knows no method that could spend",
       "transaction.broadcast" not in code_only(os.path.join(REPO,
                                                             "gs_btc_watch.py")))
 
+print("\n== THIRD SELF-DOUBT PASS: money that comes back AGAIN is kept ==")
+# A refund was sent on again at a fresh quote -- right once (a limit the
+# price moved past while the forward confirmed), ruinous for ever: ThorChain
+# refunds what it will not swap less its outbound fee, the refund settled by
+# the next recheck, and the reconciliation forwarded it into the same swap,
+# a network fee and an outbound fee per round, a round per recheck, until
+# the deposit was gone. Past --returns-max forwards of returned money in the
+# chain, the next return is KEPT: written on the plan, done, nothing quoted
+# or sent, and the vault's word is `kept`.
+_HK3 = "77" * 32
+_pK, _ofK, _hxK = _first_send()
+_nK1 = Net(utxos=_RET, spends=[_listed(_pK, _hxK)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nK1, _ofK)
+check("(setup) the first return is forwarded: one forward of returned money "
+      "in the chain, counted once though the current plan is read twice",
+      _c == F.EXIT_OK and len(_nK1.posts) == 1
+      and _p["reconcile_reason"] == "returned"
+      and F.returned_forwards(
+          [_p] + [json.load(open(f)) for f in F._plan_chain(_ofK)]) == 1)
+_pK2, _hxK2 = _p, _nK1.submits[0]["raw_hex"]
+_LK2 = _listed(_pK2, _hxK2, inputs=[{"tx_hash": _H2, "vout": 0,
+                                     "value": 150000}])
+_RET2 = [{"tx_hash": _H2, "vout": 1, "value": 140000, "confirmations": 5}]
+_nK2 = Net(utxos=_RET2, spends=[_listed(_pK, _hxK), _LK2], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nK2, _ofK)
+check("a SECOND return under the default bound (two) is still forwarded",
+      _c == F.EXIT_OK and len(_nK2.posts) == 1
+      and _p["reconcile_reason"] == "returned"
+      and len(F._plan_chain(_ofK)) == 3 and F.DEFAULT_RETURNS_MAX == 2)
+_pK3, _hxK3 = _p, _nK2.submits[0]["raw_hex"]
+_LK3 = _listed(_pK3, _hxK3, inputs=[{"tx_hash": _H2, "vout": 1,
+                                     "value": 140000}])
+_RET3 = [{"tx_hash": _HK3, "vout": 0, "value": 130000, "confirmations": 5}]
+_nK3 = Net(utxos=_RET3, spends=[_listed(_pK, _hxK), _LK2, _LK3], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nK3, _ofK)
+check("a THIRD return is KEPT: done, nothing quoted or sent, the current "
+      "plan (the second returned forward, listed) marked returned_kept with "
+      "the count and what waits, the kind on the chain, nothing rotated",
+      _c == F.EXIT_OK and _nK3.posts == [] and _nK3.submits == []
+      and _p is not None and _p["txid"] == _pK3["txid"]
+      and _p.get("returned_kept") == {"outputs": 1, "sat": 130000,
+                                      "settled": True,
+                                      "forwards_of_returned": 2}
+      and ("forward", "returned_kept") in _nK3.kinds
+      and ("forward", "returned_settled") not in _nK3.kinds
+      and len(F._plan_chain(_ofK)) == 3)
+_nK4 = Net(utxos=_RET3, spends=[_listed(_pK, _hxK), _LK2, _LK3], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nK4, _ofK)
+check("...asked again (a tap): kept again, the same answer, no wake spent "
+      "on a quote", _c == F.EXIT_OK and _nK4.posts == []
+      and _nK4.submits == [] and _p.get("returned_kept") is not None
+      and len(F._plan_chain(_ofK)) == 3)
+_nK5 = Net(utxos=_RET3, spends=[_listed(_pK, _hxK), _LK2, _LK3], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nK5, _ofK, "--returns-max", "3")
+check("...re-paired with a higher bound (--returns-max 3) the same ask "
+      "forwards it, and the fresh plan carries no kept mark",
+      _c == F.EXIT_OK and len(_nK5.posts) == 1
+      and _p["reconcile_reason"] == "returned"
+      and "returned_kept" not in _p and len(F._plan_chain(_ofK)) == 4)
+_pU, _ofU, _hxU = _first_send()
+_nU = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 150000,
+                  "confirmations": 0}], spends=[_listed(_pU, _hxU)])
+_c, _o, _p, _ = _reconcile(_nU, _ofU, "--returns-max", "0")
+check("--returns-max 0: even the FIRST return is kept, settled or not -- "
+      "done, and NO `returned` status word (the Pi would watch the address "
+      "and start the forward when it settled); the mark says unsettled",
+      _c == F.EXIT_OK and _status_of(_ofU) is None and _nU.posts == []
+      and (_p.get("returned_kept") or {}).get("settled") is False
+      and (_p.get("returned_kept") or {}).get("sat") == 150000
+      and ("forward", "returned_kept") in _nU.kinds
+      and ("forward", "refused:returned_unsettled") not in _nU.kinds)
+check("returned_forwards counts forwards of returned money once per txid, "
+      "whatever the case, and nothing else",
+      F.returned_forwards([
+          {"reconcile_reason": "returned", "txid": "AA" * 32},
+          {"reconcile_reason": "returned", "txid": "aa" * 32},
+          {"reconcile_reason": "returned", "txid": "bb" * 32},
+          {"reconcile_reason": "bumped", "txid": "cc" * 32},
+          {"reconcile_reason": "evicted"}, "junk", None, 7,
+          {"reconcile_reason": "returned"}]) == 3
+      and F.returned_forwards([]) == 0 and F.returned_forwards(None) == 0)
+check("a negative --returns-max is refused before anything runs",
+      _refusal(Net(), "--reconcile", *_TN, "--returns-max", "-1",
+               dry_run=False, outfile=_ofK)[3] == "bad_args")
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

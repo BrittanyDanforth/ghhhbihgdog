@@ -4591,9 +4591,9 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the two forward words leave the closed vocabulary', 'gs_wake_proto.py',
   '          "more_locked", "moved", "partial", "full", "sent", "unsure",\n'
-  '          "delayed", "returned", "forwarded")',
+  '          "delayed", "returned", "forwarded", "kept")',
   '          "more_locked", "moved", "partial", "full",\n'
-  '          "delayed", "returned", "forwarded")',
+  '          "delayed", "returned", "forwarded", "kept")',
   ['test_wake_agent']),
  ('the old plan is rotated aside before the fresh forward runs (the no_plan '
   'trap)', 'btc_forwarder',
@@ -4645,18 +4645,30 @@ MUTATIONS = [
   '        if stuck is not None:\n'
   '            return _bump(stuck)\n'
   '        if settled_new:\n'
+  '            _k = _kept(settled_new, True)\n'
+  '            if _k is not None:\n'
+  '                return _k\n'
   '            integrity_log("forward", "returned_settled")',
   '        if stuck is not None and not settled_new:\n'
   '            return _bump(stuck)\n'
   '        if settled_new:\n'
+  '            _k = _kept(settled_new, True)\n'
+  '            if _k is not None:\n'
+  '                return _k\n'
   '            integrity_log("forward", "returned_settled")',
   ['test_btc_forwarder']),
  ('the superseded path never bumps a stuck predecessor', 'btc_forwarder',
   '        if stuck is not None:\n'
   '            return _bump(stuck)\n'
   '        if settled_new:\n'
+  '            _k = _kept(settled_new, True)\n'
+  '            if _k is not None:\n'
+  '                return _k\n'
   '            return "forward", sorted(consumed), "returned"',
   '        if settled_new:\n'
+  '            _k = _kept(settled_new, True)\n'
+  '            if _k is not None:\n'
+  '                return _k\n'
   '            return "forward", sorted(consumed), "returned"',
   ['test_btc_forwarder']),
  ('the replacement outbids only the plan it replaces, not the forwards that conflict with it',
@@ -4792,7 +4804,7 @@ MUTATIONS = [
   '                e["word"] = phase',
   ['test_telegram_pager']),
  ('a delayed replacement re-watches a sent deposit', 'gs_telegram_pager',
-  '                if e["state"] in ("sent", "forwarded"):\n'
+  '                if e["state"] in ("sent", "forwarded", "kept"):\n'
   '                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY',
   '                if False:\n'
   '                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY',
@@ -4874,6 +4886,76 @@ MUTATIONS = [
   '                      or int(e.get("early_tries") or 0) > 0)',
   '                      or int(e.get("stall_tries") or 0) > 0)',
   ['test_telegram_pager']),
+ # THIRD SELF-DOUBT PASS: money that came back AGAIN is kept, not forwarded
+ # into a route that keeps refunding until the deposit is gone.
+ ('money that came back is forwarded again for ever (the returns bound never applies)',
+  'btc_forwarder',
+  '        if not _at_limit:\n'
+  '            return None',
+  '        if True:\n'
+  '            return None',
+  ['test_btc_forwarder']),
+ ('the returns bound counts the current plan alone, not the chain',
+  'btc_forwarder',
+  '    _returned_n = returned_forwards([plan] + chain)',
+  '    _returned_n = returned_forwards([plan])',
+  ['test_btc_forwarder']),
+ ('a kept return is reported forwarded (the Pi ends its rechecks on money sitting here)',
+  'gs_wake_agent',
+  '            if _forward_kept(artifact_dir, handle, reader):\n'
+  '                return "kept"',
+  '            if False:\n'
+  '                return "kept"',
+  ['test_wake_agent']),
+ ('the forwarder is handed a fixed returns bound, not the keyfile\'s',
+  'gs_wake_agent',
+  '                "--returns-max", str(_returns),',
+  '                "--returns-max", "2",',
+  ['test_wake_agent']),
+ ('pairing takes a negative returns bound',
+  'gs_wake_keys',
+  '    if not 0 <= int(getattr(args, "btc_returns_max", 2)) <= 1000:',
+  '    if not -10 <= int(getattr(args, "btc_returns_max", 2)) <= 1000:',
+  ['test_wake_agent']),
+ ('the wire does not know `kept` (the doorbell refuses the vault\'s report)',
+  'gs_wake_proto.py',
+  '          "delayed", "returned", "forwarded", "kept")',
+  '          "delayed", "returned", "forwarded")',
+  ['test_wake_agent']),
+ ('a kept forward leaves the entry sent (rechecked every window for ever)',
+  'gs_telegram_pager',
+  '            if out == "done" and phase == "kept":',
+  '            if out == "done" and phase == "kept_":',
+  ['test_telegram_pager']),
+ ('the operator is not told a forward was stopped',
+  'gs_telegram_pager',
+  '            if out == "failed" or _early == "kept":',
+  '            if out == "failed":',
+  ['test_telegram_pager']),
+ ('a kept entry never expires',
+  'gs_telegram_pager',
+  '                       or (v["state"] in ("sent", "forwarded", "kept")',
+  '                       or (v["state"] in ("sent", "forwarded")',
+  ['test_telegram_pager']),
+ ('a refused tap puts a kept entry back on the list as money to send on',
+  'gs_telegram_pager',
+  '            if e["state"] in ("sent", "forwarded", "kept"):\n'
+  '                # A RECHECK THAT DID NOT FINISH (stage 6)',
+  '            if e["state"] in ("sent", "forwarded"):\n'
+  '                # A RECHECK THAT DID NOT FINISH (stage 6)',
+  ['test_telegram_pager']),
+ ('a `delayed` puts a kept entry back on the list as money to send on',
+  'gs_telegram_pager',
+  '                if e["state"] in ("sent", "forwarded", "kept"):\n'
+  '                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY',
+  '                if e["state"] in ("sent", "forwarded"):\n'
+  '                    # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY',
+  ['test_telegram_pager']),
+ ('the operator is not told the automatic retries of a forward are spent',
+  'gs_telegram_pager',
+  '                self._alert_operator(chat_id, "forward_to_swap", "stopped")',
+  '                pass',
+  ['test_telegram_pager']),
  ('a payment that vanished before confirming is watched as seen for ever',
   'gs_telegram_pager',
   '            elif state == "not_seen" and e["state"] == "seen":\n',
@@ -4915,9 +4997,9 @@ MUTATIONS = [
   '                                             or ()):',
   ['test_telegram_pager']),
  ('a failed forward never alerts the operator', 'gs_telegram_pager',
-  '            if out == "failed":\n'
+  '            if out == "failed" or _early == "kept":\n'
   '                # THE RUN DIED',
-  '            if False:\n'
+  '            if _early == "kept":\n'
   '                # THE RUN DIED',
   ['test_telegram_pager']),
  ('a forward learned after a restart is not put back on the list', 'gs_telegram_pager',
@@ -4941,8 +5023,8 @@ MUTATIONS = [
   '                if False:',
   ['test_telegram_pager']),
  ('the mined-forward word leaves the closed vocabulary', 'gs_wake_proto.py',
-  '          "delayed", "returned", "forwarded")',
-  '          "delayed", "returned")',
+  '          "delayed", "returned", "forwarded", "kept")',
+  '          "delayed", "returned", "kept")',
   ['test_wake_doorbell', 'test_wake_agent']),
  ('the "sent" sentence names a machine and a number', 'gs_wake_proto.py',
   '    "sent": "the forward went out. It confirms on its own — ask again "\n            "later.",',
@@ -5322,10 +5404,10 @@ MUTATIONS = [
   '                opened.pop(h, None)\n                e["word"] = phase',
   ['test_telegram_pager']),
  ('a sent deposit is watched for ever', 'gs_telegram_pager',
-  '                       or (v["state"] in ("sent", "forwarded")\n'
+  '                       or (v["state"] in ("sent", "forwarded", "kept")\n'
   '                           and _now - float(v.get("sent_at") or _now)\n'
   '                           >= proto.DEPOSIT_PLACE_TTL_S)]:',
-  '                       or (v["state"] in ("sent", "forwarded")\n'
+  '                       or (v["state"] in ("sent", "forwarded", "kept")\n'
   '                           and _now - float(v.get("sent_at") or _now)\n'
   '                           >= float("inf"))]:',
   ['test_telegram_pager']),

@@ -170,6 +170,17 @@ _clock = time.monotonic
 #: of three blocks that has not landed in twelve is not a slow day, and
 #: ThorChain's inbound vault churns on a scale of days.
 DEFAULT_BUMP_AFTER_S = 7200
+#: How many forwards of money that CAME BACK to the address (a refund, a
+#: second payment) one deposit's record may hold before --reconcile stops
+#: building another by itself (--returns-max; third self-doubt pass). Two:
+#: a second payment and one refund re-sent at a fresh quote go through. A
+#: third return is a route that is refusing -- ThorChain refunds what it
+#: will not swap, less its outbound fee -- and every further round cost the
+#: deposit a network fee and that outbound fee for a swap that does not
+#: happen, once per recheck, until the deposit was gone. The money stays on
+#: the address (`returned_kept` on the plan, the word `kept` on the wire)
+#: for the operator, who moves it by hand or re-pairs with a higher bound.
+DEFAULT_RETURNS_MAX = 2
 #: The environment variable that carries the seed, and its optional
 #: passphrase. Never argv: /proc/<pid>/cmdline is 0444.
 SEED_ENV = "GS_BTC_SEED"
@@ -956,6 +967,23 @@ def _outpoints(items):
     return {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in items or []}
 
 
+def returned_forwards(plans):
+    """How many of `plans` are forwards of money that came back to the
+    address (reconcile_reason "returned"), each transaction counted once:
+    the current plan is in the chain too, and a recovered one IS a rotated
+    file. Anything that is not a plan counts for nothing. Pure."""
+    seen, n = set(), 0
+    for p in plans or ():
+        if not isinstance(p, dict) or p.get("reconcile_reason") != "returned":
+            continue
+        t = str(p.get("txid") or "").lower()
+        if t and t in seen:
+            continue
+        seen.add(t)
+        n += 1
+    return n
+
+
 def stuck_forward(candidates, spends, ours, fee_sat_vb, bump_after_s,
                   now=None):
     """(the plan to replace, the plans that conflict with it) or (None, []).
@@ -1201,6 +1229,46 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                   if str(p.get("txid") or "").lower() != txid],
         spends, ours, _est, args.bump_after)
 
+    # MONEY THAT CAME BACK AGAIN IS KEPT (third self-doubt pass). A refund
+    # was sent on again at a fresh quote, which is right the first time (a
+    # limit the price moved past while the forward confirmed) and ruinous
+    # for ever: ThorChain refunds what it will not swap, less its outbound
+    # fee, the refund settled by the next recheck, and this returned it
+    # into the same swap -- a network fee and that outbound fee per round,
+    # a round per recheck, "sent" in the chat each time, until the deposit
+    # was gone. Nothing proves ThorChain routes XMR before mainnet does, so
+    # the FIRST mainnet deposit could have gone this way. Past --returns-max
+    # forwards of returned money in this deposit's record, the next return
+    # is written on the plan as `returned_kept`, the run is done (nothing
+    # failed), the vault's word is `kept`, and the money waits on the
+    # address for the operator -- who moves it by hand, or re-pairs with a
+    # higher bound and taps.
+    _returned_n = returned_forwards([plan] + chain)
+    _at_limit = _returned_n >= int(args.returns_max)
+
+    def _kept(outputs, settled):
+        """The verdict when money that came back is NOT sent on again
+        (--returns-max), or None when it is."""
+        if not _at_limit:
+            return None
+        plan["returned_kept"] = {
+            "outputs": len(outputs),
+            "sat": sum(int(u["value"]) for u in outputs),
+            "settled": bool(settled),
+            "forwards_of_returned": _returned_n}
+        plan["reconciled_ts"] = int(time.time()) // 600 * 600
+        write_plan(args.outfile, plan)
+        integrity_log("forward", "returned_kept")
+        print(f"  reconcile: money came back to the address AGAIN -- this "
+              f"deposit's record already holds {_returned_n} forward(s) of "
+              f"returned money (--returns-max {int(args.returns_max)}). It "
+              "is KEPT here, not sent on by itself: a route that keeps "
+              "refunding costs a network fee and ThorChain's outbound fee "
+              "per round. Move it by hand, or re-pair with a higher "
+              "--btc-returns-max and ask again.")
+        print(f"  plan updated: {args.outfile}")
+        return "done", EXIT_OK
+
     def _bump(stuck):
         integrity_log("forward", "stuck_predecessor" if stuck is not plan
                       else "stuck_current")
@@ -1208,8 +1276,13 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
               "the bump window and today's estimate is above the rate it "
               "pays. Replacing it at today's rate"
               + (", with what settled since" if settled_new else "") + ".")
-        return ("forward", sorted(consumed - _outpoints(stuck.get("inputs"))),
-                "bumped", stuck, conflicts)
+        _ex = consumed - _outpoints(stuck.get("inputs"))
+        if settled_new and _at_limit:
+            # ...NOT with money that came back past --returns-max: that
+            # does not ride in a replacement either. The next
+            # reconciliation writes it kept.
+            _ex |= _outpoints(settled_new)
+        return "forward", sorted(_ex), "bumped", stuck, conflicts
 
     if txid in listed:
         hit = listed[txid]
@@ -1222,6 +1295,10 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         plan["broadcast"] = True
         plan["tx_hex"], plan["tx_hex_reason"] = None, None
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
+        # A KEPT MARK IS THIS RUN'S TO MAKE, not a stale one's: money the
+        # operator moved by hand is a foreign spend (failed above), and
+        # money still here is written kept again below.
+        plan.pop("returned_kept", None)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_listed")
         where = ("in the mempool" if hit["height"] <= 0
@@ -1231,12 +1308,18 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         if stuck is not None:
             return _bump(stuck)
         if settled_new:
+            _k = _kept(settled_new, True)
+            if _k is not None:
+                return _k
             integrity_log("forward", "returned_settled")
             print(f"  reconcile: {len(settled_new)} new settled output(s) on "
                   "the address that no forward of ours consumed (a refund, "
                   "or a second payment): forwarding them.")
             return "forward", sorted(consumed), "returned"
         if unsettled_new:
+            _k = _kept(unsettled_new, False)
+            if _k is not None:
+                return _k
             integrity_log("forward", "returned_unsettled")
             write_status(args.outfile, STATUS_RETURNED)
             raise Refused("returned_unsettled",
@@ -1271,6 +1354,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # run, so a superseder that was in the mempool is caught mined.
         plan["superseded_height"] = int(newest["height"])
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
+        plan.pop("returned_kept", None)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_superseded")
         print(f"  reconcile: this plan's inputs were spent by our listed "
@@ -1278,6 +1362,9 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         if stuck is not None:
             return _bump(stuck)
         if settled_new:
+            _k = _kept(settled_new, True)
+            if _k is not None:
+                return _k
             return "forward", sorted(consumed), "returned"
         return "done", EXIT_OK
     integrity_log("forward", "history_inconsistent")
@@ -1413,6 +1500,15 @@ def build_cli():
                          "for at least this many seconds, at a rate under "
                          "today's estimate, is REPLACED at today's rate "
                          f"(RBF; default {DEFAULT_BUMP_AFTER_S})")
+    ap.add_argument("--returns-max", type=int, default=DEFAULT_RETURNS_MAX,
+                    metavar="N",
+                    help="under --reconcile: how many forwards of money that "
+                         "came back to the address (a refund, a second "
+                         "payment) this deposit's record may hold before "
+                         "the next return is NOT sent on by itself -- it "
+                         "is kept on the address for the operator "
+                         f"(default {DEFAULT_RETURNS_MAX}; 0 keeps the "
+                         "first return)")
     ap.add_argument("--plan-only", action="store_true",
                     help="stop before signing: no seed needed. The plan "
                          "file carries the unsigned transaction. Dry run "
@@ -1499,6 +1595,8 @@ def main(argv=None):
                       "--seen-wait >= 0, --seen-interval > 0")
     if args.bump_after < 0:
         raise Refused("bad_args", "--bump-after cannot be negative")
+    if args.returns_max < 0:
+        raise Refused("bad_args", "--returns-max cannot be negative")
     # MONEY DOES NOT MOVE ON THE AGGREGATOR'S WORD ALONE (STAGE5_PLAN.md
     # 3.5). The THORNode cross-check of the inbound address was optional,
     # so a sending forward could pay whatever address a compromised

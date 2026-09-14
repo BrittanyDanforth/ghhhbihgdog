@@ -1614,6 +1614,19 @@ def _forward_superseded(artifact_dir, handle: str, reader=None) -> bool:
         return False
 
 
+def _forward_kept(artifact_dir, handle: str, reader=None) -> bool:
+    """Whether the plan for `handle` says money that came back to the
+    address is KEPT there (the reconciliation's --returns-max, third
+    self-doubt pass: a route that keeps refunding is not paid for once
+    more). NEVER raises."""
+    try:
+        plan = (reader or _read_json)(
+            Path(artifact_dir) / f"btc_forward_{handle}.json") or {}
+        return isinstance(plan.get("returned_kept"), dict)
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def _forward_chain(artifact_dir, handle: str) -> list:
     """The rotated predecessors of this handle's plan (a reconciliation's
     fresh forward moves the earlier plan aside as <stem>.<n>.json), newest
@@ -1998,6 +2011,10 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
         # before a reconciliation replaces it (stage 6): the keyfile's
         # word, absent means the two hours it was before the field.
         _bump = _btc_setting(key, "btc_bump_after_s", 7200, 0, 7 * 86400)
+        # HOW MANY FORWARDS OF RETURNED MONEY a deposit's record may hold
+        # before the reconciliation keeps the next return for the operator
+        # (third self-doubt pass): the keyfile's word, absent means two.
+        _returns = _btc_setting(key, "btc_returns_max", 2, 0, 1000)
         _net = str(key.get("btc_network") or "main")
         if _net not in ("main", "testnet", "signet", "regtest"):
             raise Refused("btc_config_malformed",
@@ -2040,6 +2057,7 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                 "--feerate-ceiling", str(_ceiling),
                 "--max-affiliate-bps", str(_aff),
                 "--bump-after", str(_bump),
+                "--returns-max", str(_returns),
                 # THE SAME MIX FLOOR the quote step is given, so a deposit
                 # that could not be mixed is not forwarded into the swap.
                 "--min-out-xmr", str(live_min_out_xmr(key)),
@@ -2994,6 +3012,12 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             return ""
         moved, outcome = _forward_outcome(artifact_dir, handle, reader)
         if moved:
+            # MONEY CAME BACK AGAIN AND IS KEPT (third self-doubt pass):
+            # this word BEFORE `forwarded`, or the Pi would end its
+            # rechecks on a deposit whose money is sitting here, and the
+            # chat would hear "confirmed" about it.
+            if _forward_kept(artifact_dir, handle, reader):
+                return "kept"
             # IN A BLOCK IS ITS OWN WORD (stage 6): the Pi's rechecks of
             # this forward end on it, and the arrival is the XMR side's
             # question. Only an ACCEPTED forward can be mined; an

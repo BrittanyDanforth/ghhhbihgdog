@@ -400,6 +400,14 @@ def build_cli() -> argparse.ArgumentParser:
                         "The pager's --btc-recheck must be at least this "
                         "for the recheck to find a bump due. 0 replaces at "
                         "once (a drill), up to seven days.")
+    p.add_argument("--btc-returns-max", type=int, default=2, metavar="N",
+                   help="how many forwards of money that came back to a "
+                        "deposit address (a refund, a second payment) one "
+                        "deposit may have before the next return is KEPT on "
+                        "the address for you instead of sent on again "
+                        "(default 2). A route that keeps refunding would "
+                        "otherwise eat the deposit in fees, a round per "
+                        "recheck. 0 keeps the first return; up to 1000.")
     # WHERE THE OPERATOR'S CUT GOES, and the default is deliberately nowhere.
     #
     # gs_wake_agent reads key["usage_fee_address"] and there was NO WAY TO SET
@@ -650,6 +658,8 @@ def _validate_btc(args) -> None:
         sys.exit("[!] --max-affiliate-bps must be 0..1000.")
     if not 0 <= int(getattr(args, "btc_bump_after", 7200)) <= 7 * 86400:
         sys.exit("[!] --btc-bump-after must be 0..604800 seconds (a week).")
+    if not 0 <= int(getattr(args, "btc_returns_max", 2)) <= 1000:
+        sys.exit("[!] --btc-returns-max must be 0..1000.")
     if args.thornode and not str(args.thornode).lower().startswith(
             ("http://", "https://")):
         sys.exit("[!] --thornode must be an http(s):// base URL.")
@@ -1136,6 +1146,10 @@ def do_pair(args) -> int:
         # replaces it at today's rate (stage 6). Written always; a keyfile
         # from before the field reads as the same two hours.
         "btc_bump_after_s": int(args.btc_bump_after),
+        # HOW MANY FORWARDS OF RETURNED MONEY one deposit may have before
+        # the next return is kept for the operator (third self-doubt pass).
+        # Written always; a keyfile from before the field reads as two.
+        "btc_returns_max": int(args.btc_returns_max),
         "fee_rpc": str(args.fee_rpc or ""),
         "fee_wallet_file": str(args.fee_wallet_file or ""),
         "fee_address": fee_address,

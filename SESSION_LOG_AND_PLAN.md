@@ -265,6 +265,37 @@ refuters per finding) found real defects, all fixed in the rewrite:
   wait (`EARLY_WAIT_S`, twenty minutes, doubling to eight times) that the
   tick honours as a background start; a done run clears it; a tap sets no
   wait. test_telegram_pager 804; three anchors.
+- FOUND on the third read, the worst of the pass: money that CAME BACK to
+  the deposit address was sent on again with no bound. Right once -- a
+  limit the price moved past while the forward confirmed, re-quoted -- and
+  ruinous for a route that refuses: ThorChain refunds a swap it will not
+  run, less its outbound fee, the refund is settled by the next recheck
+  (three hours), the reconciliation forwarded it into the same swap, and
+  the chat heard "sent" each time, a network fee and an outbound fee per
+  round, until the deposit was gone. Nothing proves ThorChain routes XMR
+  before mainnet does, so the FIRST mainnet deposit could have gone this
+  way, automatically. Now `--returns-max` (paired as `--btc-returns-max`,
+  default 2, on the keyfile like the bump window): past that many forwards
+  of returned money in the deposit's plan chain (`reconcile_reason`,
+  counted once per txid), the next return is written on the plan as
+  `returned_kept` and the run is done -- nothing quoted, nothing signed --
+  and the vault's word is a new phase, `kept` (WIRE_VERSION 9), read
+  before `forwarded` so the Pi does not end its rechecks on "confirmed"
+  about money sitting on the host's address. The Pi's entry becomes
+  `kept`: not looked at, not rechecked, not retried, expiring with the
+  sent ones; the tap asks the forward, which answers kept until the
+  operator has moved the money by hand or re-paired with a higher bound;
+  the chat hears the word's own sentence (no amount, no count, no coin, no
+  reason), and `--alert-chat` hears once that a forward was stopped for
+  another chat. Money returned past the bound does not ride in a bump's
+  replacement either. Tests at all four ends; anchors; OPSEC_SETUP.
+- Beside it: a refusal or a `delayed` on a kept entry leaves it kept (the
+  retry branch put it back on the list as money to send on, a wake spent
+  learning it is kept); and the operator's chat hears once when a refused
+  forward's five automatic retries are spent (`stalled`) -- a refusal is
+  not a failure, so nothing had told them the automatic path stopped on
+  a confirmed deposit. test_btc_forwarder 274, test_wake_agent 740,
+  test_telegram_pager 814; 679 anchors, 22 swept this pass.
 - Checked and left alone: the forward's worst case over Tor (look,
   history, quote, oracle, THORNode, submit, seen, each bounded) fits its
   900 s budget; the quote-age bound (300 s) covers the cross-check's own

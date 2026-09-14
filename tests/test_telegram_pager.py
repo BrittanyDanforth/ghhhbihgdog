@@ -5576,6 +5576,106 @@ check("the intake's settings are command-line flags (never on the card): "
       and _a.deposit_min_sat == 60000
       and _cli.parse_args([]).btc_electrum == [])
 
+# THIRD SELF-DOUBT PASS: MONEY THAT CAME BACK AGAIN IS KEPT BY THE VAULT.
+# Nothing here is tried by itself for it: no look, no recheck, no retry --
+# a route that keeps refunding costs no further wake and no further fee.
+_kp, _ks, _kj = _watch_pager()
+_kp.btc_servers = [("s.onion", 50002, None)]
+_kp.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_kp._btc_forward_result("B4A1", "done", "sent", 111)
+(_kp.btc_open.get("B4A1") or {})["fee_tries"] = 2
+(_kp.btc_open.get("B4A1") or {})["rechecked_at"] = time.time() - 99999
+_kp._btc_forward_result("B4A1", "done", "kept", 111)
+_ke = _kp.btc_open.get("B4A1") or {}
+check("kept: the entry is 'kept' with the word and a fresh stamp, the waits "
+      "and counts dropped, and the routing learns the forward is the next "
+      "ask again (a tap asks it, and it answers kept until the operator "
+      "has acted)",
+      _ke.get("state") == "kept" and _ke.get("word") == "kept"
+      and abs(float(_ke.get("sent_at") or 0) - time.time()) < 5
+      and "fee_tries" not in _ke and "rechecked_at" not in _ke
+      and "B4A1" not in _kp._btc_sent_set())
+_kcalls = []
+(_kp.btc_open.get("B4A1") or {})["sent_at"] = time.time() - _kp.btc_recheck_s - 1
+_kp.limits.headroom = lambda: 9
+_kp.btc_tick(look=_look_returning("confirmed", conf=3000000, calls=_kcalls))
+check("...a kept entry is not looked at, not rechecked and not retried: no "
+      "look, nothing started, nothing said",
+      _kcalls == [] and _kj == [] and _ks == []
+      and (_kp.btc_open.get("B4A1") or {}).get("state") == "kept")
+check("/balance has a word for it",
+      "kept" in pg.Pager.BTC_STATE_WORDS
+      and "came back" in pg.Pager.BTC_STATE_WORDS["kept"]
+      and not any(ch.isdigit() for ch in pg.Pager.BTC_STATE_WORDS["kept"]))
+(_kp.btc_open.get("B4A1") or {})["sent_at"] = (
+    time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1)
+_kp.btc_tick(look=_look_returning("not_seen"))
+check("...and it is dropped from the list after DEPOSIT_PLACE_TTL_S, like a "
+      "sent one", "B4A1" not in _kp.btc_open)
+# THE CHAT HEARS THE WORD'S OWN SENTENCE, and the operator's chat one
+# numberless line: the money needs a hand at the machine.
+_kfp, _kfs = _forward_outcome_pager("done", alert_chat=222, phase="kept")
+check("a kept forward: the deposit's chat hears the protocol's sentence, the "
+      "operator's chat hears once that a forward was stopped for another "
+      "chat, and neither line carries a digit after the label",
+      any(c == 111 and pg.proto.PHASE_LINES["kept"] in t for c, t in _kfs)
+      and any(c == 222 and "stopped for a deposit in another chat" in t
+              for c, t in _kfs)
+      and not any(c == 222 and any(ch.isdigit() for ch in t)
+                  for c, t in _kfs)
+      and not any(c == 111 and pg.proto.PHASE_LINES["kept"] in t
+                  and any(ch.isdigit() for ch in t.split(":", 1)[-1])
+                  for c, t in _kfs))
+_kfp2, _kfs2 = _forward_outcome_pager("done", alert_chat=222,
+                                      phase="forwarded")
+check("...and a forwarded one alerts nobody",
+      not any(c == 222 for c, t in _kfs2))
+# A TAP THE VAULT REFUSED, OR WOULD NOT PAY FOR TODAY, LEAVES A KEPT ENTRY
+# KEPT: the retry branch would have put it back on the list as money to
+# send on and spent a wake learning it is kept.
+_kq, _kqs, _kqj = _watch_pager()
+_kq.btc_servers = [("s.onion", 50002, None)]
+_kq.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_kq._btc_forward_result("B4A1", "done", "sent", 111)
+_kq._btc_forward_result("B4A1", "done", "kept", 111)
+_kq._btc_forward_result("B4A1", "refused", "", 111)
+_kqe = _kq.btc_open.get("B4A1") or {}
+check("a refusal on a kept entry leaves it kept: no retry count, no wait, "
+      "nothing said", _kqe.get("state") == "kept"
+      and "stall_tries" not in _kqe and "retry_after" not in _kqe
+      and _kqs == [])
+_kq._btc_forward_result("B4A1", "done", "delayed", 111)
+_kqe = _kq.btc_open.get("B4A1") or {}
+check("...and so does a `delayed` (a bump the vault would not pay for): "
+      "kept, not 'seen'", _kqe.get("state") == "kept")
+_kqcalls = []
+_kq.limits.headroom = lambda: 9
+_kq.btc_tick(look=_look_returning("confirmed", conf=3000000, calls=_kqcalls))
+check("...and the tick after either looks at nothing and starts nothing",
+      _kqcalls == [] and _kqj == [])
+# THE OPERATOR HEARS WHEN THE AUTOMATIC RETRIES OF A REFUSED FORWARD ARE
+# SPENT: a refusal is not a failure, so nothing told them before.
+_ka, _kas0, _kaj = _watch_pager()
+_kasends = []
+_ka.alert_chat = 222
+_ka.allow = {111, 222}
+_ka.send = lambda c, t, buttons=None: (_kasends.append((c, t)), True)[1]
+_ka.btc_fee_retry_s = 3600
+for _i in range(int(pg.Pager.STALL_RETRIES) + 2):
+    (_ka.btc_open.get("B4A1") or {})["state"] = "forwarding"
+    _ka._btc_forward_result("B4A1", "refused", "", 111)
+_kalines = [t for c, t in _kasends if c == 222]
+check("when the automatic retries are spent (stalled) the operator's chat "
+      "hears ONCE that a forward was stopped for another chat -- not on "
+      "the retries before, not again after -- and the deposit's chat "
+      "hears its own sentence",
+      (_ka.btc_open.get("B4A1") or {}).get("state") == "stalled"
+      and len(_kalines) == 1
+      and "stopped for a deposit in another chat" in _kalines[0]
+      and not any(ch.isdigit() for ch in _kalines[0])
+      and any(c == 111 and "did not go through, again" in t
+              for c, t in _kasends))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

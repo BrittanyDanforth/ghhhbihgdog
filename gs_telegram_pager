@@ -3280,10 +3280,13 @@ class Pager:
         if job == "forward_to_swap":
             self._btc_forward_result(
                 (params or {}).get("handle") or "", out, _early, chat_id)
-            if out == "failed":
-                # THE RUN DIED, and on a bot serving several people the
-                # deposit's own chat is not the operator's.
-                self._alert_operator(chat_id, job)
+            if out == "failed" or _early == "kept":
+                # THE RUN DIED -- or the vault KEEPS money that came back
+                # again, which needs a hand at the machine -- and on a bot
+                # serving several people the deposit's own chat is not the
+                # operator's.
+                self._alert_operator(
+                    chat_id, job, "failed" if out == "failed" else "stopped")
         if _early and out != "done" and job in ("watch", "swap_status"):
             # THE LABEL, NOT THE HANDLE. This one branch still printed the
             # raw four hex characters, so the one reply an operator gets while
@@ -5043,6 +5046,7 @@ class Pager:
         "stalled": "confirmed, but sending on did not go through",
         "sent": "sent on",
         "forwarded": "sent on, confirmed",
+        "kept": "came back again, kept there",
     }
     #: How long after a forward the vault would not pay for at today's fee
     #: (`delayed`) the watcher tries again, in seconds: --btc-fee-retry.
@@ -5117,12 +5121,15 @@ class Pager:
                 # about this deposit is for the XMR side -- until the
                 # recheck is due (stage 6, _btc_recheck_due).
                 self._btc_sent_set().add(h)
-            if out == "done" and phase in ("returned", "unsure"):
+            if out == "done" and phase in ("returned", "unsure", "kept"):
                 # MONEY CAME BACK (stage 5): the next ask is the forward's
                 # again, whatever this end had learned before. And so is
                 # a forward the vault was NOT SURE went out (stage 6): an
                 # unsure forward is the forward's question until it is
-                # sure, watched or not -- after a restart too.
+                # sure, watched or not -- after a restart too. And money
+                # the vault KEEPS (third self-doubt pass): the tap asks the
+                # forward, which says so again until the operator has
+                # moved it or raised the bound.
                 self._btc_sent_set().discard(h)
             e = opened.get(h)
             if (not e and out == "done"
@@ -5185,6 +5192,21 @@ class Pager:
                 e.pop("rechecked_at", None)
                 e.pop("fee_tries", None)
                 return
+            if out == "done" and phase == "kept":
+                # MONEY CAME BACK AGAIN AND THE VAULT KEEPS IT (third
+                # self-doubt pass): nothing here is tried by itself -- no
+                # look, no recheck, no retry -- so a route that keeps
+                # refunding costs no further wake and no further fee. The
+                # tap still asks the forward. The forward branch renders
+                # the word's sentence to the chat; this end says nothing
+                # more. Expires with the sent ones.
+                e["state"] = "kept"
+                e["word"] = phase
+                e["sent_at"] = time.time()
+                e.pop("retry_after", None)
+                e.pop("rechecked_at", None)
+                e.pop("fee_tries", None)
+                return
             if out == "done" and phase == "returned":
                 if not e.get("addr"):
                     # Money came back to a forward learned after a restart:
@@ -5208,11 +5230,12 @@ class Pager:
                 # wake an hour per deposit, which with two deposits was the
                 # whole day's budget on retries alone.
                 _wait = self.fee_retry_wait(e)
-                if e["state"] in ("sent", "forwarded"):
+                if e["state"] in ("sent", "forwarded", "kept"):
                     # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY
                     # (stage 6): the original stands, listed, and the
                     # recheck is not due again until --btc-fee-retry has
-                    # passed. The entry stays as it was.
+                    # passed. The entry stays as it was -- a kept one too:
+                    # its money is not this end's to start on.
                     e["retry_after"] = time.time() + _wait
                     return
                 # THE VAULT WOULD NOT PAY TODAY'S FEE. Fees fall in hours:
@@ -5253,13 +5276,16 @@ class Pager:
                     e["retry_after"] = time.time() + float(
                         self.EARLY_WAIT_S) * float(2 ** min(_n - 1, 3))
                 return
-            if e["state"] in ("sent", "forwarded"):
+            if e["state"] in ("sent", "forwarded", "kept"):
                 # A RECHECK THAT DID NOT FINISH (stage 6): the history could
                 # not be read, the box refused, the run failed. The forward
                 # that went out still stands; nothing here is "here" to
                 # send on, so the stalled sentence below would be false.
                 # The poke has told the chat what happened in its own
-                # words; this end waits a window and asks again.
+                # words; this end waits a window and asks again. A KEPT
+                # entry stays kept (a tap the vault refused): the retry
+                # branch below would have put it back on the list as money
+                # to send on, and spent a wake learning it is kept.
                 e["rechecked_at"] = time.time()
                 return
             if e["state"] == "not_seen":
@@ -5328,6 +5354,12 @@ class Pager:
                           f"through, again. Tap below to try again.",
                           buttons=self._handle_buttons(h, "receive_and_quote",
                                                        chat_id))
+                # ...AND THE OPERATOR, ONCE (third self-doubt pass): the
+                # automatic path has stopped on a confirmed deposit, and on
+                # a bot serving several people the deposit's own chat is
+                # not theirs. A refusal is not a failure, so nothing else
+                # told them. One numberless line, at most hourly.
+                self._alert_operator(chat_id, "forward_to_swap", "stopped")
 
     #: The wait after a forward this end started that the vault found early
     #: (`arriving`, `not_yet`): two blocks' worth, doubling per repeat up
@@ -5412,7 +5444,7 @@ class Pager:
                        if (v["state"] == "not_seen"
                            and _now - float(v.get("since") or _now)
                            >= proto.DEPOSIT_PLACE_TTL_S)
-                       or (v["state"] in ("sent", "forwarded")
+                       or (v["state"] in ("sent", "forwarded", "kept")
                            and _now - float(v.get("sent_at") or _now)
                            >= proto.DEPOSIT_PLACE_TTL_S)]:
                 opened.pop(_h, None)
@@ -5615,12 +5647,15 @@ class Pager:
     #: --alert-chat, or None (the instance reads its own).
     alert_chat = None
 
-    def _alert_operator(self, chat_id: int, job: str) -> None:
+    def _alert_operator(self, chat_id: int, job: str,
+                        word: str = "failed") -> None:
         """One numberless line to --alert-chat when a forward FAILED for
         some OTHER chat: the run died (the history unreadable, a look that
         failed, a spend that is not ours) and only the deposit's own chat
         was told, which on a bot serving several people is not the
-        operator. Nothing about which deposit, whose, or why -- the job log
+        operator. Or, `word` "stopped": the vault KEEPS money that came
+        back again (third self-doubt pass), which needs a hand at the
+        machine. Nothing about which deposit, whose, or why -- the job log
         at the machine has that -- and at most one an hour. Never raises."""
         try:
             _to = getattr(self, "alert_chat", None)
@@ -5635,7 +5670,8 @@ class Pager:
                 return
             self.__dict__["_alert_last"] = _now
             integrity_log("pager", "operator_alerted")
-            self.send(_to, f"{chat_name(job)}: failed for a deposit in "
+            _w = "stopped" if word == "stopped" else "failed"
+            self.send(_to, f"{chat_name(job)}: {_w} for a deposit in "
                            f"another chat. It needs someone at the other "
                            f"end.")
         except BaseException as ex:                          # noqa: BLE001

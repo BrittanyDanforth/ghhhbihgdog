@@ -5828,6 +5828,62 @@ check("the forward finds what the deposit recorded: the BTC-intake record "
       isinstance(_rec4(_d4, "B4A1").get("btc_index"), int)
       and _rec4(_d4, "B4A1")["bundle"].endswith("wallet_new_1.json"))
 
+# THIRD SELF-DOUBT PASS: MONEY THAT CAME BACK AGAIN IS KEPT. The plan's
+# `returned_kept` mark is the word `kept`, read BEFORE `forwarded`: the
+# money is sitting on the address, and the Pi must not end its rechecks on
+# "confirmed" about it.
+_KEPT = {"outputs": 1, "sat": 130000, "settled": True,
+         "forwards_of_returned": 2}
+_ok1, _ek1, _rank1, _ddk1, _bbk1 = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "seen_height": 850002,
+                          "returned_kept": _KEPT})
+_ok2, _ek2, _rank2, _ddk2, _bbk2 = _fwd_run_plan(
+    _FWD_REC, _SEND_KEY, {**_ACC, "seen_height": 0, "returned_kept": _KEPT})
+check("a done forward whose plan says money that came back is KEPT is the "
+      "word 'kept' -- mined or still in the mempool -- and the run is done",
+      _ek1 is None and (_bbk1.result or {}).get("phase") == "kept"
+      and (_bbk1.result or {}).get("status") == "done"
+      and _ek2 is None and (_bbk2.result or {}).get("phase") == "kept")
+check("_forward_kept never raises and reads only a dict mark",
+      A._forward_kept(_ddk1, "ZZZZ") is False
+      and A._forward_kept(_ddk1, "A3F1", reader=lambda p: "junk") is False
+      and A._forward_kept(_ddk1, "A3F1",
+                          reader=lambda p: {"returned_kept": True}) is False
+      and A._forward_kept(_ddk1, "A3F1",
+                          reader=lambda p: {"returned_kept": {}}) is True)
+check("the wire knows 'kept'; its sentence carries no digit and names no "
+      "coin, refund or reason",
+      "kept" in P.PHASES
+      and not any(ch.isdigit() for ch in P.PHASE_LINES["kept"])
+      and not any(w in P.PHASE_LINES["kept"].lower()
+                  for w in ("refund", "fee", "btc", "bitcoin", "swap")))
+_ok5, _ek5, _rank5, _ddk5, _bbk5 = _fwd_run_plan(
+    _FWD_REC, {**_SEND_KEY, "btc_returns_max": 5}, _ACC)
+check("the forwarder is handed --returns-max 2 for a keyfile without the "
+      "field, and the keyfile's own number otherwise",
+      bool(_rank1) and _flag_value(_rank1[0][0], "--returns-max") == "2"
+      and _ek5 is None and bool(_rank5)
+      and _flag_value(_rank5[0][0], "--returns-max") == "5")
+for _bad in ("two", -1, 1001, True):
+    _ox, _ex, _ranx, _ddx, _bbx = _fwd_run_plan(
+        _FWD_REC, {**_SEND_KEY, "btc_returns_max": _bad}, _ACC)
+    check(f"...a keyfile returns bound of {_bad!r} is refused as malformed "
+          "before any child runs",
+          _ox is None and getattr(_ex, "code", None) == "btc_config_malformed"
+          and _ranx == [])
+for _extra, _why in (
+        (_BTC_OK + ["--btc-returns-max", "-1"], "a negative returns bound"),
+        (_BTC_OK + ["--btc-returns-max", "1001"],
+         "a returns bound over a thousand")):
+    check(f"pairing/btc: {_why} is refused at pairing",
+          _pairs_btc(_extra) is not None)
+check("pairing/btc: the returns bound pairs (0 and 1000 both pass) and is "
+      "written to the keyfile as btc_returns_max, the name the agent reads",
+      _pairs_btc(_BTC_OK + ["--btc-returns-max", "0"]) is None
+      and _pairs_btc(_BTC_OK + ["--btc-returns-max", "1000"]) is None
+      and '"btc_returns_max": int(args.btc_returns_max)' in _kp_src
+      and '_btc_setting(key, "btc_returns_max", 2, 0, 1000)' in _A_SRC)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)
