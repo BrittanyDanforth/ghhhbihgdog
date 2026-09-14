@@ -2148,7 +2148,9 @@ python3 gs_telegram_pager ... \
                                               # over an onion, for the same
                                               # reason the vault's is
     --btc-min-conf 2       # depth at which this Pi says "confirmed" and
-                           # sends it on; match the vault's
+                           # sends it on; match the vault's (a forward the
+                           # vault finds early is tried again after twenty
+                           # minutes, doubling -- not every tick)
     --btc-network main     # main, testnet, signet or regtest
     --btc-poll 600         # seconds between looks; under 60 is refused
     --btc-fee-retry 3600   # how long after the vault would not pay today's

@@ -4861,6 +4861,19 @@ MUTATIONS = [
   '            if False:\n'
   '                # NOTHING HAS LANDED. A refusal or a failure about an UNPAID',
   ['test_telegram_pager']),
+ ('a forward the vault found early is started again the very next tick',
+  'gs_telegram_pager',
+  '                if _was_forwarding:\n'
+  '                    # THIS END STARTED THE FORWARD AND THE VAULT FOUND THE',
+  '                if False:\n'
+  '                    # THIS END STARTED THE FORWARD AND THE VAULT FOUND THE',
+  ['test_telegram_pager']),
+ ('the wait after an early forward is a foreground start (the reserve ignored)',
+  'gs_telegram_pager',
+  '                      or int(e.get("stall_tries") or 0) > 0\n'
+  '                      or int(e.get("early_tries") or 0) > 0)',
+  '                      or int(e.get("stall_tries") or 0) > 0)',
+  ['test_telegram_pager']),
  ('a payment that vanished before confirming is watched as seen for ever',
   'gs_telegram_pager',
   '            elif state == "not_seen" and e["state"] == "seen":\n',
@@ -4884,8 +4897,10 @@ MUTATIONS = [
  ('the retry of a refused forward is a foreground start (the reserve ignored)',
   'gs_telegram_pager',
   '            _retry = (int(e.get("fee_tries") or 0) > 0\n'
-  '                      or int(e.get("stall_tries") or 0) > 0)',
-  '            _retry = int(e.get("fee_tries") or 0) > 0',
+  '                      or int(e.get("stall_tries") or 0) > 0\n'
+  '                      or int(e.get("early_tries") or 0) > 0)',
+  '            _retry = (int(e.get("fee_tries") or 0) > 0\n'
+  '                      or int(e.get("early_tries") or 0) > 0)',
   ['test_telegram_pager']),
  ('the operator alert repeats every failure', 'gs_telegram_pager',
   '            if _last and _now - _last < float(self.ALERT_MIN_GAP_S):\n'

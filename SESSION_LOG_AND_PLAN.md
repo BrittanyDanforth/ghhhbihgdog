@@ -256,6 +256,15 @@ refuters per finding) found real defects, all fixed in the rewrite:
   UNPAID deposit changes nothing (found on the second read: it had
   entered the retry branch and ended the hold on the payment details).
   test_telegram_pager 796; six anchors.
+- FOUND on the third read: a forward the vault reached EARLY -- the Pi
+  saw the deposit at its confirmation count, the vault's own server (a
+  different one, over Tor) still had it `arriving` or `not_yet` -- came
+  back with the entry `seen` and no wait, so `_btc_apply` started it again
+  the very next tick, and the next, each a wake off the day's budget,
+  until the two servers agreed. Now such a return sets `early_tries` and a
+  wait (`EARLY_WAIT_S`, twenty minutes, doubling to eight times) that the
+  tick honours as a background start; a done run clears it; a tap sets no
+  wait. test_telegram_pager 804; three anchors.
 - Checked and left alone: the forward's worst case over Tor (look,
   history, quote, oracle, THORNode, submit, seen, each bounded) fits its
   900 s budget; the quote-age bound (300 s) covers the cross-check's own

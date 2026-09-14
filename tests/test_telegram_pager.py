@@ -5110,6 +5110,57 @@ check("a refusal, a failure or a wordless answer about a deposit nothing "
       and "stall_tries" not in _st4.btc_open["B4A1"]
       and "retry_after" not in _st4.btc_open["B4A1"]
       and _st4._btc_held_messages() == {(111, 777)})
+# THE VAULT FOUND THE MONEY EARLY. This end's depth rule is meant to match
+# the vault's and nothing enforces it; its server may also be a block
+# behind. `arriving` / `not_yet` after a start this end made used to be
+# followed by another start the very next tick -- a wake every ten minutes
+# until the depths agreed.
+_ea, _eas, _eaj = _watch_pager()
+_ea.btc_servers = [("s.onion", 50002, None)]
+_ea.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_ea.btc_open["B4A1"]["state"] = "forwarding"
+_ea.btc_open["B4A1"]["said"].add("confirmed")
+_ea._btc_forward_result("B4A1", "done", "arriving", 111)
+_ea_e = _ea.btc_open["B4A1"]
+check("`arriving` after a start this end made: the entry goes back to seen "
+      "with a wait of two blocks' worth, nothing said",
+      _ea_e["state"] == "seen" and _ea_e.get("early_tries") == 1
+      and abs(_ea_e.get("retry_after", 0) - time.time() - 1200) < 5
+      and _eas == [] and pg.Pager.EARLY_WAIT_S == 1200)
+_ea.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...a tick inside the wait sees the same confirmed money and starts "
+      "NOTHING", _eaj == [] and _ea_e["state"] == "seen")
+_ea_e["retry_after"] = time.time() - 1
+_ea.limits.headroom = lambda: 2
+_ea.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...past it the start is a BACKGROUND one (the reserve left), silent",
+      _eaj == [] and _eas == [])
+_ea.limits.headroom = lambda: 9
+_ea.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...and starts once there is room", len(_eaj) == 1
+      and _ea_e["state"] == "forwarding")
+_ea._btc_forward_result("B4A1", "done", "not_yet", 111)
+check("`not_yet` after a start doubles the wait (forty minutes) and goes "
+      "back to waiting", _ea_e["state"] == "not_seen"
+      and _ea_e.get("early_tries") == 2
+      and abs(_ea_e.get("retry_after", 0) - time.time() - 2400) < 5)
+_ea_e["state"] = "forwarding"
+for _i in range(4):
+    _ea._btc_forward_result("B4A1", "done", "arriving", 111)
+    _ea_e["state"] = "forwarding"
+check("...capped at eight times two blocks' worth",
+      abs(_ea_e.get("retry_after", 0) - time.time() - 9600) < 5
+      and _ea_e.get("early_tries") == 6)
+_ea._btc_forward_result("B4A1", "done", "sent", 111)
+check("a run that got past the look clears the count",
+      "early_tries" not in _ea_e)
+_ea2, _eas2, _eaj2 = _watch_pager()
+_ea2._btc_forward_result("B4A1", "done", "arriving", 111)
+check("`arriving` from a TAP (no start by this end) sets no wait: the "
+      "watcher starts the forward on its own rule as before",
+      _ea2.btc_open["B4A1"]["state"] == "seen"
+      and "retry_after" not in _ea2.btc_open["B4A1"]
+      and "early_tries" not in _ea2.btc_open["B4A1"])
 # THE MONEY LEFT BEFORE IT CONFIRMED (a payment seen in the mempool, then
 # replaced or dropped): back to waiting, not "received" for ever.
 _st5, _sts5, _stj5 = _watch_pager()
