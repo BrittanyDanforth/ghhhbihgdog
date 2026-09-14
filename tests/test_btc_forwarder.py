@@ -122,7 +122,8 @@ class Net:
     def __init__(self, *, utxos=None, fee=10, inbound=_INBOUND, memo=_MEMO,
                  expected=None, oracle=_ORACLE, thornode=None,
                  look_error=None, post_error=None, routes=None,
-                 factor=Decimal(1), submit=None, seen=None, clock=None):
+                 factor=Decimal(1), submit=None, seen=None, clock=None,
+                 spends=None):
         self.factor = factor                     # quote vs oracle, x
         self.clock = clock                       # the quote-age clock
         # THE BROADCAST SIDE, canned: `submit` is the dict bcast.submit
@@ -131,6 +132,10 @@ class Net:
         self.submit_result = submit
         self.seen_result = seen
         self.submits, self.seens = [], []
+        # THE ADDRESS'S SPENDS (stage 5): what bcast.spends_of would return
+        # (a list), an exception to raise, or "real"; every call recorded.
+        self.spends_result = spends
+        self.spend_calls = []
         self.utxos = utxos if utxos is not None else [
             {"tx_hash": _H1, "vout": 0, "value": 200000, "confirmations": 5}]
         self.fee = fee
@@ -209,6 +214,14 @@ class Net:
             raise r
         return dict(r) if r else _NOT_SEEN
 
+    def _spends(self, address, servers, proxy_url, **kw):
+        self.spend_calls.append({"address": address, "servers": servers,
+                                 "proxy": proxy_url, **kw})
+        r = self.spends_result
+        if isinstance(r, Exception):
+            raise r
+        return list(r or [])
+
     def install(self):
         F.look = self.look
         F.safe_post = self.safe_post
@@ -217,6 +230,8 @@ class Net:
                           else self._submit)
         F.bcast_seen = (_REAL_SEEN if self.seen_result == "real"
                         else self._seen)
+        F.bcast_spends = (_REAL_SPENDS if self.spends_result == "real"
+                          else self._spends)
         F._clock = self.clock or _REAL_CLOCK
         F.btc_per_xmr_oracle = lambda proxies=None, getter=None: self.oracle
         F.integrity_log = lambda stage, kind, *a, **k: self.kinds.append(
@@ -231,6 +246,7 @@ class Net:
 
 _PROXY = "socks5h://127.0.0.1:9050"
 _REAL_SUBMIT, _REAL_SEEN, _REAL_CLOCK = F.bcast_submit, F.bcast_seen, F._clock
+_REAL_SPENDS = F.bcast_spends
 _ACCEPTED = {"outcome": "accepted", "server": "s.onion", "cert_sha256": None,
              "codes": [], "attempts": 1, "mismatched": 0,
              "pin_mismatch": False}
@@ -842,6 +858,154 @@ check("no oracle: the forward proceeds, says the quote is NOT cross-checked, "
       "and the chain records oracle_unavailable",
       _code == 0 and "NOT cross-checked" in _out
       and ("forward", "oracle_unavailable") in _net.kinds)
+
+print("\n== STAGE 5: a fee refusal is a word; an emptied address is read ==")
+
+
+def _status_of(outfile):
+    p = F.status_path(outfile)
+    return json.load(open(p))["state"] if os.path.exists(p) else None
+
+
+# TODAY'S FEE, NOT THE DEPOSIT: `delayed` -- the same deposit forwards with
+# cheaper blocks, and the Pi tries again by itself (STAGE5_PLAN.md 3.2).
+for _why, _net, _kind in (
+        ("an estimate above the ceiling", Net(fee=500), "fee_out_of_band"),
+        ("no estimate from the server", Net(fee=None), "no_fee_estimate"),
+        ("a fee over a fifth of the deposit at this rate",
+         Net(fee=200, utxos=[{"tx_hash": _H1, "vout": 0, "value": 60000,
+                              "confirmations": 5}]), "fee_eats_deposit"),
+        ("what is left after THIS fee is under the dust floor, though a "
+         "cheaper block would clear it",
+         Net(fee=4, utxos=[{"tx_hash": _H1, "vout": 0, "value": 11000,
+                            "confirmations": 5}]), "below_minimum")):
+    _c, _o, _p, _of = run(_net)
+    check(f"{_why}: refused {_kind}, nothing signed, and the status word is "
+          "'delayed'", _c == F.EXIT_REFUSED
+          and ("forward", f"refused:{_kind}") in _net.kinds
+          and _p is None and _status_of(_of) == "delayed")
+# NEVER AT ANY RATE THIS PAIR ALLOWS: `short` -- what settled is under the
+# one-input floor even at the FLOOR rate, so no waiting changes it.
+for _why, _net, _kind in (
+        ("what settled is under the one-input floor even at the floor rate",
+         Net(fee=10, utxos=[{"tx_hash": _H1, "vout": 0, "value": 9000,
+                             "confirmations": 5}]), "fee_eats_deposit"),
+        ("what settled is all dust at this rate and under the floor",
+         Net(fee=10, utxos=[{"tx_hash": _H1, "vout": 0, "value": 500,
+                             "confirmations": 5}]), "nothing_economic")):
+    _c, _o, _p, _of = run(_net)
+    check(f"{_why}: refused {_kind} and the status word is 'short'",
+          _c == F.EXIT_REFUSED and ("forward", f"refused:{_kind}") in _net.kinds
+          and _p is None and _status_of(_of) == "short")
+_nm = Net(memo="=:XMR.XMR:" + _OTHER + ":0/1/0")
+_c, _o, _p, _of = run(_nm)
+check("a refusal that is not about the fee (memo_unbound) writes NO status "
+      "word: it is a refusal, and the phone hears that",
+      _c == F.EXIT_REFUSED and _status_of(_of) is None)
+check("the four words the status file may carry, and the six fee kinds that "
+      "earn one", set(F.STATUS_WORDS) == {"not_seen", "seen", "delayed",
+                                          "short"}
+      and set(F.DELAY_KINDS) == {"no_fee_estimate", "bad_fee_estimate",
+                                 "fee_out_of_band", "fee_eats_deposit",
+                                 "nothing_economic", "below_minimum"})
+
+# THE ADDRESS HOLDS NOTHING UNSPENT. Was it paid and emptied? A forward that
+# went out and died before its plan was written used to be "not yet" for
+# ever (STAGE5_PLAN.md section 1, case 1).
+_IN_SPK = T.address_script(_INBOUND, "main")
+
+
+def _spend_tx(memo_text=None, send=190000):
+    outs = [(send, _IN_SPK)]
+    if memo_text is not None:
+        outs.append((0, T.op_return_script(memo_text.encode("utf-8"))))
+    tx = T.build_unsigned([{"tx_hash": _H1, "vout": 0, "value": 200000}],
+                          outs, locktime=_TIP)
+    return {"txid": tx.txid().hex(), "height": 850001,
+            "hex": tx.serialize().hex(),
+            "inputs": [{"tx_hash": _H1, "vout": 0, "value": 200000}],
+            "server": "s.onion"}
+
+
+_OURS = _spend_tx("=:XMR.XMR:" + _DEST + ":123456/1/0")
+_nr = Net(utxos=[], spends=[_OURS])
+_c, _o, _p, _of = run(_nr)
+check("EMPTIED BY OUR OWN FORWARD (the memo names this deposit's "
+      "destination): the run reports done, no quote is asked, nothing is "
+      "signed or sent, and the plan is RECONSTRUCTED from the chain",
+      _c == F.EXIT_OK and _p is not None and _p.get("reconstructed") is True
+      and _nr.posts == [] and _nr.submits == [] and _nr.seens == []
+      and ("forward", "reconstructed") in _nr.kinds
+      and _status_of(_of) is None)
+check("...the reconstructed plan reads as SENT to the agent (broadcast, "
+      "accepted, seen) and carries what the chain shows: the txid, the "
+      "inputs and their values, what reached the inbound, the fee, the "
+      "memo, the destination -- and no hex, no quote",
+      _p is not None and _p["broadcast"] is True
+      and _p["broadcast_outcome"] == "accepted" and _p["seen"] is True
+      and _p["txid"] == _OURS["txid"] and _p["seen_height"] == 850001
+      and _p["inputs"][0]["tx_hash"] == _H1 and _p["inputs"][0]["value"]
+      == 200000 and _p["send_sat"] == 190000 and _p["fee_sat"] == 10000
+      and _p["inbound"] == _INBOUND and _p["memo"] == "=:XMR.XMR:" + _DEST
+      + ":123456/1/0" and _p["dest_xmr"] == _DEST and _p["tx_hex"] is None
+      and _p["expected_xmr"] is None and _p["schema"] == F.PLAN_SCHEMA)
+check("...the history was asked for THIS address with the pair's servers, "
+      "over the proxy", len(_nr.spend_calls) == 1
+      and _nr.spend_calls[0]["address"] == F.derive_receive_address(
+          _XPUB, 0, "main")
+      and _nr.spend_calls[0]["servers"] == [("s.onion", 50002, None)]
+      and _nr.spend_calls[0]["proxy"] == _PROXY)
+for _why, _sp in (("a memo naming another destination",
+                   _spend_tx("=:XMR.XMR:" + _OTHER + ":0/1/0")),
+                  ("no memo at all", _spend_tx(None)),
+                  ("a memo that is not text", {**_spend_tx(None), "hex": None})):
+    if _sp["hex"] is None:
+        _tx = T.build_unsigned([{"tx_hash": _H1, "vout": 0, "value": 200000}],
+                               [(190000, _IN_SPK),
+                                (0, T.op_return_script(b"\xff\xfe" * 20))],
+                               locktime=_TIP)
+        _sp = {**_sp, "hex": _tx.serialize().hex(), "txid": _tx.txid().hex()}
+    _nf = Net(utxos=[], spends=[_sp])
+    _c, _o, _p, _of = run(_nf)
+    check(f"EMPTIED BY A SPEND THIS TOOL DID NOT SIGN ({_why}): the run FAILS "
+          "(not refused, not done), nothing is signed, no plan, no status "
+          "word, the kind on the chain",
+          _c == F.EXIT_FAILED and _p is None and _status_of(_of) is None
+          and ("forward", "foreign_spend") in _nf.kinds
+          and _nf.posts == [] and _nf.submits == [])
+_nu = Net(utxos=[], spends=F.watch.BtcWatchError("no server answered"))
+_c, _o, _p, _of = run(_nu)
+check("the history could not be read: answered from what is unspent alone "
+      "-- nothing_settled with 'not_seen', the kind on the chain",
+      _c == F.EXIT_REFUSED and _status_of(_of) == "not_seen"
+      and ("forward", "history_unavailable") in _nu.kinds
+      and ("forward", "refused:nothing_settled") in _nu.kinds)
+_nn = Net(utxos=[], spends=[])
+_c, _o, _p, _of = run(_nn)
+check("never paid (no spend in the history): nothing_settled with "
+      "'not_seen', as before", _c == F.EXIT_REFUSED
+      and _status_of(_of) == "not_seen" and len(_nn.spend_calls) == 1)
+_ns = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 200000,
+                  "confirmations": 0}], spends=[_OURS])
+_c, _o, _p, _of = run(_ns)
+check("money on the address (unconfirmed): the history is NOT read -- that "
+      "is 'seen', still confirming, not an emptied address",
+      _c == F.EXIT_REFUSED and _status_of(_of) == "seen"
+      and _ns.spend_calls == [])
+_two = Net(utxos=[], spends=[_spend_tx("=:XMR.XMR:" + _OTHER + ":0/1/0"),
+                             _OURS])
+_c, _o, _p, _of = run(_two)
+check("with several spends the LAST one decides (the newest state of the "
+      "address)", _c == F.EXIT_OK and _p is not None
+      and _p["txid"] == _OURS["txid"])
+check("an OP_RETURN is read exactly as this tool lays one out -- one push, "
+      "direct or PUSHDATA1 -- and nothing else is mistaken for one",
+      F._op_return_data(bytes([0x6a, 3]) + b"abc") == b"abc"
+      and F._op_return_data(bytes([0x6a, 0x4c, 3]) + b"abc") == b"abc"
+      and F._op_return_data(bytes([0x6a, 3]) + b"ab") is None
+      and F._op_return_data(bytes([0x6a, 0x4c, 3]) + b"abcd") is None
+      and F._op_return_data(_IN_SPK.data) is None
+      and F._op_return_data(b"") is None and F._op_return_data(None) is None)
 
 print("\n== THORNode's word on the inbound ==")
 _ok_node = [{"chain": "BTC", "address": _INBOUND, "halted": False,

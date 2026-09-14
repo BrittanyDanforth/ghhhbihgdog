@@ -1405,9 +1405,13 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                   "not reopen it: same chain, same addresses).")
 
 
-#: The forwarder's one-word status when it found nothing settled -> the
-#: phase word. "seen" is money on the address, none of it deep enough yet.
-_FORWARD_STATUS_PHASE = {"not_seen": "not_yet", "seen": "arriving"}
+#: The forwarder's one-word status when it did not send -> the phase word.
+#: "seen" is money on the address, none of it deep enough yet; "delayed" a
+#: fee the forward would not pay today (the Pi tries again by itself);
+#: "short" money that can never be sent on at any rate this pair allows
+#: (under what was quoted) -- stage 5.
+_FORWARD_STATUS_PHASE = {"not_seen": "not_yet", "seen": "arriving",
+                         "delayed": "delayed", "short": "short"}
 
 
 def _forward_status_path(artifact_dir, handle: str) -> Path:

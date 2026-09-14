@@ -104,6 +104,17 @@ def mock_socks(behaviour, scenario, tls_ctx=None, connections=1):
             if res == "compute":
                 res = ([{"tx_hash": _txid_of(cap["hex"]), "height": 0}]
                        if cap.get("hex") else [])
+        elif m == "blockchain.transaction.get":
+            # The raw transactions the scenario knows, by txid; a broadcast
+            # this session took is known too ("compute" scenarios). An
+            # unknown id is the server's error, as ElectrumX answers.
+            txs = dict(scenario.get("transactions") or {})
+            if cap.get("hex"):
+                txs.setdefault(_txid_of(cap["hex"]), cap["hex"])
+            res = txs.get(req["params"][0])
+            if res is None:
+                return json.dumps({"jsonrpc": "2.0", "id": i, "error": {
+                    "code": -32603, "message": "no such transaction"}}) + "\n"
         else:
             return json.dumps({"jsonrpc": "2.0", "id": i, "error": {
                 "code": -32601, "message": "unknown method"}}) + "\n"

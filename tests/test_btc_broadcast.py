@@ -129,9 +129,13 @@ class _FT:
     a callable returning one per call)."""
 
     def __init__(self, mode="accept", *, code=1, history=(), pin_mismatch=False,
-                 version_error=False, message="SECRET-MEMO-TEXT"):
+                 version_error=False, message="SECRET-MEMO-TEXT",
+                 transactions=None):
         self.mode, self.code, self.message = mode, code, message
         self.history = history
+        # blockchain.transaction.get, by txid (stage 5): a hex string, or
+        # an Exception to hang up on; an unknown id is the server's error.
+        self.transactions = dict(transactions or {})
         self.pin_mismatch = pin_mismatch
         self.version_error = version_error
         self.queue, self.methods, self.requests = [], [], []
@@ -188,6 +192,19 @@ class _FT:
                 return
             self.queue.append(json.dumps({"jsonrpc": "2.0", "id": i,
                                           "result": h}))
+            return
+        if m == "blockchain.transaction.get":
+            t = self.transactions.get(req["params"][0])
+            if isinstance(t, Exception):
+                self.dead = True
+                return
+            if t is None:
+                self.queue.append(json.dumps(
+                    {"jsonrpc": "2.0", "id": i,
+                     "error": {"code": -32603, "message": "no such tx"}}))
+                return
+            self.queue.append(json.dumps({"jsonrpc": "2.0", "id": i,
+                                          "result": t}))
             return
         self.queue.append(json.dumps({"jsonrpc": "2.0", "id": i,
                                       "error": {"code": -32601,
@@ -520,6 +537,111 @@ check("a bad address or network is refused before connecting",
                    transport_factory=_never))
 
 # ===========================================================================
+print("\n== spends_of(): what the address's history spent (stage 5) ==")
+
+import gs_btc_tx as T                                        # noqa: E402
+
+_SPK0 = T.address_script(_A0, "main")
+_OTHER_SPK = T.address_script("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                              "main")
+# A funding transaction paying the address twice, a spend of one of those
+# outputs, and a spend of the other by a transaction with a memo.
+_FUND = T.build_unsigned([{"tx_hash": "11" * 32, "vout": 0, "value": 900000}],
+                         [(300000, _SPK0), (100000, _OTHER_SPK),
+                          (250000, _SPK0)])
+_FUND_ID, _FUND_HEX = _FUND.txid().hex(), _FUND.serialize().hex()
+_SPEND1 = T.build_unsigned([{"tx_hash": _FUND_ID, "vout": 0,
+                             "value": 300000}], [(290000, _OTHER_SPK)])
+_SPEND1_ID, _SPEND1_HEX = _SPEND1.txid().hex(), _SPEND1.serialize().hex()
+_SPEND2 = T.build_unsigned([{"tx_hash": _FUND_ID, "vout": 2,
+                             "value": 250000},
+                            {"tx_hash": "22" * 32, "vout": 1,
+                             "value": 50000}],
+                           [(280000, _OTHER_SPK),
+                            (0, T.op_return_script(b"=:XMR.XMR:x:0/1/0"))])
+_SPEND2_ID, _SPEND2_HEX = _SPEND2.txid().hex(), _SPEND2.serialize().hex()
+_HIST = [{"tx_hash": _FUND_ID, "height": 850000},
+         {"tx_hash": _SPEND1_ID, "height": 850001},
+         {"tx_hash": _SPEND2_ID, "height": 0}]
+_TXS = {_FUND_ID: _FUND_HEX, _SPEND1_ID: _SPEND1_HEX, _SPEND2_ID: _SPEND2_HEX}
+
+
+def _spends(*fts, servers=None, **kw):
+    f = _factory(*fts)
+    r = B.spends_of(_A0, servers or _SERVERS[:len(fts)] or _SERVERS, _PROXY,
+                    transport_factory=f, **kw)
+    return r, f.seen, fts
+
+
+_r, _s, _fts = _spends(_FT(history=_HIST, transactions=_TXS))
+check("a funding transaction and two spends: exactly the two spends come "
+      "back, oldest first, each with the address's own outputs it consumed "
+      "and their values read off the funding transaction",
+      [x["txid"] for x in _r] == [_SPEND1_ID, _SPEND2_ID]
+      and _r[0]["inputs"] == [{"tx_hash": _FUND_ID, "vout": 0,
+                               "value": 300000}]
+      and _r[1]["inputs"] == [{"tx_hash": _FUND_ID, "vout": 2,
+                               "value": 250000}]
+      and _r[0]["height"] == 850001 and _r[1]["height"] == 0
+      and _r[0]["hex"] == _SPEND1_HEX and _r[1]["hex"] == _SPEND2_HEX
+      and _r[1]["server"] == "s1.onion")
+check("...in ONE session: the history, then transaction.get for each entry, "
+      "on the broadcast circuit; the foreign input of the second spend is "
+      "not listed as ours",
+      _fts[0].methods == ["server.version",
+                          "blockchain.scripthash.get_history"]
+      + ["blockchain.transaction.get"] * 3
+      and _s["tags"] == ["btcsend:" + _A0]
+      and all(i["tx_hash"] == _FUND_ID for i in _r[1]["inputs"]))
+_r, _, _ = _spends(_FT(history=_HIST[:1], transactions=_TXS))
+check("a history of the funding alone: no spend", _r == [])
+_r, _, _ = _spends(_FT(history=[], transactions={}))
+check("an empty history: no spend, nothing fetched", _r == [])
+check("a listed transaction that does not touch the address is a "
+      "contradiction: refused, not reasoned from",
+      _refused(B.spends_of, _A0, _SERVERS, _PROXY, transport_factory=_factory(
+          _FT(history=[{"tx_hash": "33" * 32, "height": 1}],
+              transactions={"33" * 32: _SPEND1_HEX}))))
+check("a transaction that is not the one asked for (its txid does not "
+      "match) is refused", _refused(
+          B.spends_of, _A0, _SERVERS, _PROXY, transport_factory=_factory(
+              _FT(history=_HIST[:1], transactions={_FUND_ID: _SPEND1_HEX}))))
+check("a history longer than a deposit address could have is refused "
+      "before anything is fetched",
+      _refused(B.spends_of, _A0, _SERVERS, _PROXY, transport_factory=_factory(
+          _FT(history=[{"tx_hash": _FUND_ID, "height": 1}]
+              * (B.MAX_HISTORY + 1), transactions=_TXS))))
+check("a server that has no such transaction, or hangs up mid-fetch, is "
+      "routed around and the next decides",
+      _spends(_FT(history=_HIST, transactions={}),
+              _FT(history=_HIST, transactions=_TXS), servers=_TWO)[0][1]["txid"]
+      == _SPEND2_ID
+      and _spends(_FT(history=_HIST, transactions={
+          **_TXS, _SPEND1_ID: OSError("cut")}),
+          _FT(history=_HIST, transactions=_TXS), servers=_TWO)[0][0]["txid"]
+      == _SPEND1_ID)
+check("no server answered: RAISED",
+      _refused(B.spends_of, _A0, _SERVERS, _PROXY,
+               transport_factory=_factory(_FT("down"))))
+_f = _factory(_FT(pin_mismatch=True), _FT(history=[]))
+try:
+    B.spends_of(_A0, _TWO, _PROXY, transport_factory=_f)
+    _pm = "returned"
+except W.PinMismatch:
+    _pm = "raised"
+check("a PinMismatch is raised at once", _pm == "raised")
+_bt = B.Broadcaster(_FT(transactions={_FUND_ID: "zz", _SPEND1_ID: _FUND_HEX}))
+_bt.__enter__()
+check("Broadcaster.transaction refuses a bad id, non-hex, and a transaction "
+      "that is not the one asked for",
+      _refused(_bt.transaction, "nope")
+      and _refused(_bt.transaction, _FUND_ID)
+      and _refused(_bt.transaction, _SPEND1_ID))
+check("history_of() is what unused() reads: (entries, host)",
+      B.history_of(_A0, _SERVERS, _PROXY, transport_factory=_factory(
+          _FT(history=_HIST)))[0] == _HIST)
+
+# ===========================================================================
 print("\n== END TO END: the real transport and the real subclass through an "
       "in-process SOCKS5 proxy to an in-process Electrum server ==")
 
@@ -580,6 +702,13 @@ _r, _cap = _e2e(lambda s, p, **k: B.seen(_TXID, _A0, s, p, wait_s=0, **k),
 check("seen() end to end: get_history for this scripthash, the txid found in "
       "the mempool", _r["seen"] is True and _r["height"] == 0
       and _cap["requests"][-1]["params"] == [_SH])
+_r, _cap = _e2e(lambda s, p, **k: B.spends_of(_A0, s, p, **k),
+                {"history": _HIST, "transactions": _TXS})
+check("spends_of() end to end: the history, then each transaction fetched "
+      "from the server, the two spends found with their values",
+      [x["txid"] for x in _r] == [_SPEND1_ID, _SPEND2_ID]
+      and _r[0]["inputs"][0]["value"] == 300000
+      and _cap["methods_asked"].count("blockchain.transaction.get") == 3)
 
 from btcmock import tls_server_context                       # noqa: E402
 _sctx, _CERT_SHA256 = tls_server_context()

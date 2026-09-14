@@ -62,6 +62,14 @@ import gs_btc_watch as watch                                 # noqa: E402
 from gs_btc_watch import (                                   # noqa: E402
     BtcWatchError, PinMismatch, ServerError, DEFAULT_TIMEOUT,
 )
+import gs_btc_tx as btx                                      # noqa: E402
+from embit.transaction import Transaction                    # noqa: E402
+
+#: A history longer than this is refused before any transaction is fetched:
+#: a deposit address is paid once or twice and spent once, and a server
+#: listing hundreds of entries is either wrong about the address or trying
+#: to make this side fetch for ever.
+MAX_HISTORY = 200
 
 #: A serialized transaction over this many BYTES is refused before any
 #: connection: the standard weight limit (400,000 WU) bounds a relayable
@@ -143,6 +151,24 @@ class Broadcaster(watch.Electrum):
                 raise BtcWatchError("electrum: bad history entry")
             out.append({"tx_hash": tx.lower(), "height": h})
         return out
+
+    def transaction(self, txid):
+        """blockchain.transaction.get: the raw transaction, lower-case hex,
+        bounded like a broadcast and checked to be the transaction it was
+        asked for (its txid recomputed here). Read-only."""
+        want = _check_txid(txid)
+        r = self._rpc("blockchain.transaction.get", [want])
+        if not isinstance(r, str) or not _HEX_RE.match(r) \
+                or len(r) // 2 > MAX_TX_BYTES:
+            raise BtcWatchError("electrum: bad transaction")
+        try:
+            tx = Transaction.parse(bytes.fromhex(r))
+        except Exception:                                    # noqa: BLE001
+            raise BtcWatchError("electrum: unparseable transaction")
+        if tx.txid().hex() != want:
+            raise BtcWatchError("electrum: transaction does not match its "
+                                "txid")
+        return r.lower()
 
 
 def _tag_for(address):
@@ -238,16 +264,12 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
             "pin_mismatch": pinned}
 
 
-def unused(address, servers, proxy_url, *, network="main",
-           timeout=DEFAULT_TIMEOUT, transport_factory=None):
-    """Has this address EVER been used? True iff a server, asked read-only
-    over Tor on the address's own circuit, lists no history for it at all
-    -- mempool or block, received or spent. Raises BtcWatchError when no
-    server answered: "could not ask" is never "unused", because the caller
-    is about to hand this address to a client and a reused address is two
-    clients' money on one line (STAGE4_PLAN.md 2). The vault calls this
-    before issuing a deposit address; the ledger's own counter is not
-    trusted for it, since paranoia_mode wipes the ledger."""
+def history_of(address, servers, proxy_url, *, network="main",
+               timeout=DEFAULT_TIMEOUT, transport_factory=None):
+    """The address's history -- [{tx_hash, height}, ...], oldest first,
+    mempool last -- from the first server that answers, read-only over Tor
+    on the address's own circuit, as (entries, host). Raises BtcWatchError
+    when no server answered."""
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
     last = None
@@ -262,7 +284,88 @@ def unused(address, servers, proxy_url, *, network="main",
         except (BtcWatchError, OSError) as ex:
             last = ex
             continue
-        return not entries
+        return entries, host
+    why = str(last) if isinstance(last, BtcWatchError) \
+        else type(last).__name__
+    raise BtcWatchError(f"no Electrum server answered (last: {why})")
+
+
+def unused(address, servers, proxy_url, *, network="main",
+           timeout=DEFAULT_TIMEOUT, transport_factory=None):
+    """Has this address EVER been used? True iff a server, asked read-only
+    over Tor on the address's own circuit, lists no history for it at all
+    -- mempool or block, received or spent. Raises BtcWatchError when no
+    server answered: "could not ask" is never "unused", because the caller
+    is about to hand this address to a client and a reused address is two
+    clients' money on one line (STAGE4_PLAN.md 2). The vault calls this
+    before issuing a deposit address; the ledger's own counter is not
+    trusted for it, since paranoia_mode wipes the ledger."""
+    entries, _host = history_of(address, servers, proxy_url, network=network,
+                                timeout=timeout,
+                                transport_factory=transport_factory)
+    return not entries
+
+
+def spends_of(address, servers, proxy_url, *, network="main",
+              timeout=DEFAULT_TIMEOUT, transport_factory=None):
+    """Every transaction in the address's history that SPENDS an output
+    paying it, oldest first, with what each spend carried.
+
+    Returns [{txid, height, hex, inputs: [{tx_hash, vout, value}],
+    server}], the inputs being the address's own outputs that transaction
+    consumed, their values read off the FUNDING transactions in the same
+    history -- so a caller can tell what a spend it never recorded
+    carried (STAGE5_PLAN.md 3.1: a forward that went out and whose plan was
+    never written is found here, not answered "not yet" for ever).
+
+    One server's session: the history, then blockchain.transaction.get for
+    each entry, each transaction parsed and its txid recomputed (a server
+    cannot hand back a different transaction under a listed id). Read-only.
+    Refuses a history longer than MAX_HISTORY, and a listed transaction
+    that neither pays nor spends the address (a server whose history and
+    transactions contradict each other is not one to reason from). Raises
+    BtcWatchError when no server answered."""
+    spk = btx.address_script(address, network).data
+    scripthash, order, make = _prepare(address, network, servers, proxy_url,
+                                       transport_factory, timeout)
+    last = None
+    for host, port, pin in order:
+        transport = make(host, port, pin)
+        try:
+            with Broadcaster(transport) as b:
+                b.handshake()
+                entries = b.history(scripthash)
+                if len(entries) > MAX_HISTORY:
+                    raise BtcWatchError("electrum: history too long to be "
+                                        "a deposit address's")
+                txs = [(e, b.transaction(e["tx_hash"])) for e in entries]
+        except PinMismatch:
+            raise
+        except (BtcWatchError, OSError) as ex:
+            last = ex
+            continue
+        parsed = [(e, raw, Transaction.parse(bytes.fromhex(raw)))
+                  for e, raw in txs]
+        funding = {}
+        for e, _raw, tx in parsed:
+            for n, o in enumerate(tx.vout):
+                if o.script_pubkey.data == spk:
+                    funding[(e["tx_hash"], n)] = int(o.value)
+        out = []
+        for e, raw, tx in parsed:
+            spent = [{"tx_hash": i.txid.hex(), "vout": int(i.vout),
+                      "value": funding[(i.txid.hex(), int(i.vout))]}
+                     for i in tx.vin
+                     if (i.txid.hex(), int(i.vout)) in funding]
+            pays = any(o.script_pubkey.data == spk for o in tx.vout)
+            if not spent and not pays:
+                raise BtcWatchError("electrum: the history lists a "
+                                    "transaction that does not touch the "
+                                    "address")
+            if spent:
+                out.append({"txid": e["tx_hash"], "height": e["height"],
+                            "hex": raw, "inputs": spent, "server": host})
+        return out
     why = str(last) if isinstance(last, BtcWatchError) \
         else type(last).__name__
     raise BtcWatchError(f"no Electrum server answered (last: {why})")

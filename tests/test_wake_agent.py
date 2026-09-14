@@ -5002,6 +5002,23 @@ check("...'seen' (money present, not settled) is the word 'arriving'",
       (_bb.result or {}).get("phase") == "arriving"
       and (_bb.result or {}).get("status") == "done"
       and "forwarded" not in _rec_of(_dd))
+# STAGE 5: a forward the machine would not send at TODAY'S fee is `delayed`
+# (the Pi tries again by itself), and one that can never be sent on at any
+# rate this pair allows is `short` -- each reported DONE with its word,
+# neither "the machine FAILED", neither marking the record.
+for _st, _ph in (("delayed", "delayed"), ("short", "short")):
+    _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _st)
+    check(f"...the forwarder's '{_st}' (exit 2, no plan) is the word "
+          f"'{_ph}', done, the record untouched",
+          (_bb.result or {}).get("phase") == _ph
+          and (_bb.result or {}).get("status") == "done"
+          and "forwarded" not in _rec_of(_dd)
+          and not _rec_of(_dd).get("forward_sent"))
+check("the status-word table maps exactly the four words the forwarder "
+      "writes, to words the wire knows",
+      A._FORWARD_STATUS_PHASE == {"not_seen": "not_yet", "seen": "arriving",
+                                  "delayed": "delayed", "short": "short"}
+      and all(v in P.PHASES for v in A._FORWARD_STATUS_PHASE.values()))
 _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, None)
 check("...any OTHER exit 2 (no status file) is still a failed job with no "
       "word", _o is not None and _o[1] == "failed"

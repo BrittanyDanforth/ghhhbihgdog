@@ -116,6 +116,9 @@ from gs_btc_watch import derive_receive_address, look, parse_server  # noqa
 import gs_btc_broadcast as bcast                             # noqa: E402
 bcast_submit = bcast.submit
 bcast_seen = bcast.seen
+# READ-ONLY, in the same module: the address's spends, for a forward that
+# went out and whose plan was never written (stage 5).
+bcast_spends = bcast.spends_of
 
 #: The forward's floor, in satoshis, on what reaches ThorChain AFTER the
 #: fee. It equals gs_wake_proto.DEPOSIT_MIN_SAT (10,000 sat, 0.0001 BTC),
@@ -166,6 +169,7 @@ class Refused(SystemExit):
     message to the terminal (and so to the job log), never the reverse."""
 
     def __init__(self, kind, message):
+        self.kind = kind
         integrity_log("forward", f"refused:{kind}")
         print(f"[!] refused ({kind}): {message}")
         super().__init__(EXIT_REFUSED)
@@ -587,17 +591,189 @@ def write_plan(path, plan):
 
 
 def status_path(outfile):
-    """Where the one-word status of a forward that found nothing settled
-    goes: beside the plan, under the same wipe pattern."""
+    """Where the one-word status of a forward that did not send goes:
+    beside the plan, under the same wipe pattern."""
     return Path(outfile).with_suffix(".status.json")
 
 
+#: The forward did not send, and one word says why, for the phone: money
+#: not yet there / not yet deep enough (stage 4), or -- stage 5 -- a fee
+#: the forward would not pay TODAY (`delayed`: the Pi tries again by
+#: itself), or money that can never be sent on at any rate this pair allows
+#: (`short`: under what was quoted). Nothing else is ever in the file.
+STATUS_DELAYED = "delayed"
+STATUS_SHORT = "short"
+STATUS_WORDS = (watch.STATE_NOT_SEEN, watch.STATE_SEEN, STATUS_DELAYED,
+                STATUS_SHORT)
+#: The refusals that are about TODAY'S FEE, not about the deposit: with
+#: cheaper blocks the same deposit forwards. Each becomes `delayed` (or
+#: `short`, when even the floor rate could not carry it) rather than a
+#: refusal with no word, which the Pi read as "did not go through" and
+#: stopped trying (STAGE5_PLAN.md 3.2).
+DELAY_KINDS = ("no_fee_estimate", "bad_fee_estimate", "fee_out_of_band",
+               "fee_eats_deposit", "nothing_economic", "below_minimum")
+
+
 def write_status(outfile, state):
-    """{"state": not_seen | seen} and nothing else -- no amount, no depth,
-    no address. Read once by the wake agent and removed."""
-    if state not in (watch.STATE_NOT_SEEN, watch.STATE_SEEN):
+    """{"state": <one of STATUS_WORDS>} and nothing else -- no amount, no
+    depth, no address. Read once by the wake agent and removed. An unknown
+    word is written as not_seen: the safe word, "ask again"."""
+    if state not in STATUS_WORDS:
         state = watch.STATE_NOT_SEEN
     atomic_write_json({"state": state}, status_path(outfile))
+
+
+def _op_return_data(script_bytes):
+    """The data of an OP_RETURN script laid out as this tool lays one out
+    (one push, direct or OP_PUSHDATA1), or None for any other script."""
+    b = bytes(script_bytes or b"")
+    if not b or b[0] != 0x6a:
+        return None
+    if len(b) >= 2 and 1 <= b[1] <= 75 and len(b) == 2 + b[1]:
+        return b[2:]
+    if len(b) >= 3 and b[1] == 0x4c and len(b) == 3 + b[2]:
+        return b[3:]
+    return None
+
+
+def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
+                      dest_xmr, outfile, tip):
+    """The address holds nothing unspent. Was it ever paid, and where did
+    the money go? (STAGE5_PLAN.md section 1, case 1; 3.1.)
+
+    A forward that was broadcast and then died -- power cut, deadman, a
+    crash -- before its plan was written leaves the outputs spent and no
+    record; the look sees nothing unspent and this tool used to answer
+    `nothing_settled` → "not yet", for ever, about a swap that went
+    through. So the address's history is read (read-only) and its LAST
+    spend examined:
+
+      - its OP_RETURN carries a memo naming THIS deposit's destination:
+        it is our forward. The plan is reconstructed from the transaction
+        itself (txid, inputs and their values, what reached the inbound,
+        the fee, the memo), marked `reconstructed`, and the run reports
+        done -- the agent reads `sent` off it and the ledger catches up;
+      - anything else emptied the address: a spend this tool did not
+        sign. Nothing is signed; the run FAILS with the kind on the chain,
+        and the operator reads the job log at the machine. Only a leaked
+        seed does this.
+      - no spend at all (never paid): None, and the caller answers as it
+        always did. "Could not ask" is likewise None, with a kind.
+
+    Returns EXIT_OK after writing the plan, None when there is nothing to
+    say, and raises SystemExit(EXIT_FAILED) for a foreign spend."""
+    try:
+        spends = bcast_spends(address, servers, proxy_url, network=network,
+                              timeout=timeout)
+    except watch.PinMismatch as e:
+        raise Refused("pin_mismatch", str(e))
+    except watch.BtcWatchError as e:
+        integrity_log("forward", "history_unavailable")
+        print(f"  [!] the address's history could not be read ({e}); "
+              "answering from what is unspent alone")
+        return None
+    if not spends:
+        return None
+    last = spends[-1]
+    from embit.transaction import Transaction as _Tx
+    tx = _Tx.parse(bytes.fromhex(last["hex"]))
+    memo = None
+    for o in tx.vout:
+        data = _op_return_data(o.script_pubkey.data)
+        if data is not None:
+            try:
+                memo = data.decode("utf-8")
+            except UnicodeDecodeError:
+                memo = None
+            break
+    ours = bool(memo) and instruction_field_safe(memo) \
+        and _memo_fields_bind(memo, dest_xmr)
+    if not ours:
+        integrity_log("forward", "foreign_spend")
+        print("[!] the deposit address was EMPTIED by a transaction this "
+              "tool did not sign: its memo does not name this deposit's "
+              f"destination (txid {last['txid']}). Nothing is signed. If "
+              "no operator moved it by hand, the seed has leaked.")
+        raise SystemExit(EXIT_FAILED)
+    net = btx.network_of(network)
+    paid = [o for o in tx.vout if _op_return_data(o.script_pubkey.data)
+            is None]
+    send_sat = int(paid[0].value) if paid else 0
+    try:
+        inbound = paid[0].script_pubkey.address(net) if paid else None
+    except Exception:                                        # noqa: BLE001
+        inbound = None
+    in_sat = sum(int(i["value"]) for i in last["inputs"])
+    fee_sat = in_sat - sum(int(o.value) for o in tx.vout)
+    vsize = btx.measure(tx)[0]
+    plan = {
+        "schema": PLAN_SCHEMA,
+        "network": network,
+        "dry_run": False,
+        "broadcast": True,                       # the network shows it
+        "broadcast_outcome": bcast.OUTCOME_ACCEPTED,
+        "broadcast_server": None,
+        "broadcast_codes": [],
+        "broadcast_attempts": 0,
+        "broadcast_mismatched": 0,
+        "seen": True,
+        "seen_height": last["height"],
+        "seen_server": last["server"],
+        "seen_asked": True,
+        "seen_polls": 0,
+        "signed": True,
+        "reconstructed": True,                   # from the chain, not a run
+        "index": index,
+        "address": address,
+        "inputs": [{"tx_hash": i["tx_hash"], "vout": i["vout"],
+                    "value": i["value"], "confirmations": None}
+                   for i in last["inputs"]],
+        "skipped_dust": 0,
+        "unsettled_outputs": 0,
+        "tip": tip,
+        "inbound": inbound,
+        "inbound_cross_checked": False,
+        "memo": memo,
+        "memo_quoted": None,
+        "memo_limit_set": None,
+        "memo_bytes": len(memo.encode("utf-8")),
+        "op_return_max_bytes": None,
+        "settled_sat": in_sat,
+        "send_sat": send_sat,
+        "fee_sat": fee_sat,
+        "feerate_target_sat_vb": None,
+        "vsize_bound": None,
+        "vsize": vsize,
+        "feerate_real_sat_vb": fee_sat // vsize if vsize else None,
+        "expected_xmr": None,                    # no quote survives a crash
+        "worst_case_xmr": None,
+        "memo_limit_base_units": None,
+        "affiliate_bps": None,
+        "dest_xmr": dest_xmr,
+        "txid": last["txid"],
+        "tx_hex": None,
+        "tx_hex_reason": None,
+        "signed_hex_written": False,
+        "server": last["server"],
+        "cert_sha256": None,
+        "ts": int(time.time()) // 600 * 600,
+    }
+    write_plan(outfile, plan)
+    integrity_log("forward", "reconstructed")
+    where = ("in the mempool" if last["height"] <= 0
+             else f"in a block at height {last['height']}")
+    print(f"  forward FOUND ON CHAIN, {where}: this address was emptied by "
+          f"a transaction carrying this deposit's own swap memo, and no plan "
+          f"had been written for it (the sending run did not live to write "
+          f"one). The plan is reconstructed from the chain.")
+    print(f"  from {scrub_address(address)} index {index}: {in_sat} sat in "
+          f"{len(last['inputs'])} output(s)")
+    print(f"  to   {scrub_address(inbound or '?')}: {send_sat} sat, fee "
+          f"{fee_sat} sat, {vsize} vB")
+    print(f"  memo {len(memo.encode('utf-8'))} bytes")
+    print(f"  txid {last['txid']}")
+    print(f"  plan written: {outfile}")
+    return EXIT_OK
 
 
 def build_cli():
@@ -789,6 +965,16 @@ def main(argv=None):
     if shutdown_requested():
         raise SystemExit(EXIT_FAILED)
     if picture["settled_sat"] <= 0:
+        # NOTHING UNSPENT AT ALL: was it ever paid, and where did it go? A
+        # forward that went out and died before its plan was written is
+        # found here and reconstructed (stage 5); a spend this tool did
+        # not sign fails the run; a never-paid address falls through.
+        if picture["state"] == watch.STATE_NOT_SEEN:
+            found = reconcile_emptied(address, index, servers, args.tor_proxy,
+                                      args.network, args.timeout, dest_xmr,
+                                      args.outfile, picture["tip"])
+            if found is not None:
+                return found
         # WHAT WAS SEEN, FOR THE PHONE. A forward that found nothing settled
         # is not a failed machine; it is "not yet" or "still confirming",
         # and the wake agent maps this one word onto the phase vocabulary
@@ -800,19 +986,36 @@ def main(argv=None):
 
     # 2. the fee, sized against the largest transaction the policy allows,
     #    over the inputs worth spending at that rate
-    rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
-                    args.feerate_floor, args.feerate_ceiling)
-    chosen, skipped_dust, unsettled = select_inputs(picture["utxos"],
-                                                    args.min_conf, rate)
-    if not chosen:
-        raise Refused("nothing_economic",
-                      "what is settled here is all dust at this fee rate: "
-                      "each output would cost more to spend than it carries")
-    settled_sat = sum(u["value"] for u in chosen)
-    n_inputs = len(chosen)
-    vsize_bound, fee_sat = size_the_fee(n_inputs, args.op_return_max_bytes,
-                                        rate)
-    send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
+    try:
+        rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
+                        args.feerate_floor, args.feerate_ceiling)
+        chosen, skipped_dust, unsettled = select_inputs(picture["utxos"],
+                                                        args.min_conf, rate)
+        if not chosen:
+            raise Refused("nothing_economic",
+                          "what is settled here is all dust at this fee "
+                          "rate: each output would cost more to spend than "
+                          "it carries")
+        settled_sat = sum(u["value"] for u in chosen)
+        n_inputs = len(chosen)
+        vsize_bound, fee_sat = size_the_fee(n_inputs,
+                                            args.op_return_max_bytes, rate)
+        send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
+    except Refused as e:
+        # A REFUSAL ABOUT TODAY'S FEE IS A WORD, NOT A DEAD END (STAGE5_PLAN.md
+        # 3.2). `delayed`: with cheaper blocks this same deposit forwards,
+        # and the Pi tries again by itself. `short`: even at the floor rate
+        # this pair allows, what settled cannot carry a forward -- under
+        # what was quoted -- and no waiting changes that. Decided on the
+        # one-input floor at the FLOOR rate, the same arithmetic the vault
+        # accepts a deposit by.
+        if e.kind in DELAY_KINDS:
+            hopeless = picture["settled_sat"] < btx.forward_floor_sat(
+                args.op_return_max_bytes, args.feerate_floor,
+                args.min_send_sat)
+            write_status(args.outfile,
+                         STATUS_SHORT if hopeless else STATUS_DELAYED)
+        raise
 
     # 3. the quote, for exactly that amount, to exactly this destination
     oracle = btc_per_xmr_oracle(isolated_proxy(args.tor_proxy,
