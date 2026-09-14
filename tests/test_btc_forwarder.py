@@ -137,7 +137,13 @@ class Net:
         self.inbound, self.memo = inbound, memo
         self.expected = expected                 # None: derived from oracle
         self.oracle = oracle
-        self.thornode = thornode
+        # THORNode's inbound list, canned. A broadcast now REQUIRES the
+        # cross-check (STAGE5_PLAN.md 3.5), so the default agrees with the
+        # quote's inbound; a test that wants the check to refuse passes its
+        # own list, as the checks further down do.
+        self.thornode = (thornode if thornode is not None else
+                         [{"chain": "BTC", "address": inbound,
+                           "halted": False}])
         self.look_error, self.post_error = look_error, post_error
         self.routes = routes
         self.look_calls, self.posts, self.gets, self.kinds = [], [], [], []
@@ -239,11 +245,15 @@ _NOT_ASKED = {**_NOT_SEEN, "asked": False, "server": None}
 
 
 def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None,
-        ids="env", index="0", broadcast=False, proxy=_PROXY):
+        ids="env", index="0", broadcast=False, proxy=_PROXY, thornode=True,
+        account=None, xpub=_XPUB):
     """Drive main(). Returns (exit_code, stdout, plan_or_None, outfile).
     `ids` says how the xpub and index reach the tool: "env" (the wake
     agent's way), "argv" (a hand run), or None (neither). `broadcast`
-    passes --broadcast INSTEAD of --dry-run unless dry_run is forced."""
+    passes --broadcast INSTEAD of --dry-run unless dry_run is forced, and
+    names a THORNode (a broadcast requires the cross-check) unless
+    `thornode` is False or the caller passed --thornode. `account`, when
+    given, rides in GS_BTC_ACCOUNT like the xpub."""
     net.install()
     out = outfile or os.path.join(_scratch, f"plan_{os.urandom(4).hex()}.json")
     argv = ["--tor-proxy", proxy, "--electrum", "s.onion",
@@ -251,13 +261,18 @@ def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None,
     if broadcast:
         argv.append("--broadcast")
         dry_run = dry_run is True and "--dry-run" in extra
+        if thornode and "--thornode" not in extra:
+            argv += ["--thornode", "https://tn.example"]
     os.environ.pop("GS_BTC_XPUB", None)
     os.environ.pop("GS_BTC_INDEX", None)
+    os.environ.pop("GS_BTC_ACCOUNT", None)
+    if account is not None:
+        os.environ["GS_BTC_ACCOUNT"] = str(account)
     if ids == "env":
-        os.environ["GS_BTC_XPUB"] = _XPUB
+        os.environ["GS_BTC_XPUB"] = xpub
         os.environ["GS_BTC_INDEX"] = str(index)
     elif ids == "argv":
-        argv += ["--xpub", _XPUB, "--index", str(index)]
+        argv += ["--xpub", xpub, "--index", str(index)]
     if dry_run:
         argv.append("--dry-run")
     if policy is not None:
@@ -276,6 +291,7 @@ def run(net, *extra, seed=_MNEMONIC, dry_run=True, policy=120, outfile=None,
     finally:
         os.environ.pop("GS_BTC_XPUB", None)
         os.environ.pop("GS_BTC_INDEX", None)
+        os.environ.pop("GS_BTC_ACCOUNT", None)
     plan = None
     if os.path.exists(out):
         with open(out) as fh:
@@ -938,6 +954,34 @@ check("both flags is a contradiction and neither is the old refusal, by the "
       and _refusal(Net(), "--seen-interval", "0", broadcast=True)[3]
       == "bad_args"
       and not Net().submits)
+# MONEY DOES NOT MOVE ON THE AGGREGATOR'S WORD ALONE (STAGE5_PLAN.md 3.5).
+_nt = Net(submit=_ACCEPTED, seen=_SEEN0)
+check("--broadcast WITHOUT --thornode is refused bad_args before anything is "
+      "asked of the network: the cross-check is mandatory where money moves",
+      _refusal(_nt, broadcast=True, thornode=False)[3] == "bad_args"
+      and _nt.look_calls == [] and _nt.submits == [])
+_nt2 = Net()
+check("...a rehearsal still runs without one",
+      run(_nt2)[0] == 0 and _nt2.gets == [])
+# THE ACCOUNT NUMBER (STAGE5_PLAN.md 3.5): the signer derives the account it
+# is told and proves it against the xpub, so a wrong number signs for
+# nothing; the right number with that account's xpub signs for its address.
+_ACCT1 = T.account_from_mnemonic(_MNEMONIC, account=1)
+_XPUB1 = _ACCT1.to_public().to_base58()
+_ADDR1_0 = F.derive_receive_address(_XPUB1, 0, "main")
+_na = Net()
+check("GS_BTC_ACCOUNT=1 with account 0's xpub: refused seed_xpub_mismatch, "
+      "nothing signed", _refusal(_na, account=1)[3] == "seed_xpub_mismatch")
+_code_a, _out_a, _plan_a, _ = run(Net(), account=1, xpub=_XPUB1)
+check("...GS_BTC_ACCOUNT=1 with account 1's xpub: the forward signs for "
+      "account 1's address 0, proven on the plan",
+      _code_a == 0 and _plan_a is not None and _plan_a["address"] == _ADDR1_0
+      and _plan_a["signed"] is True)
+check("...absent means account 0 (every pair before the field), and a "
+      "number that is not one is refused bad_args",
+      run(Net())[0] == 0
+      and _refusal(Net(), account="x")[3] == "bad_args"
+      and _refusal(Net(), account=-1)[3] == "bad_args")
 
 _code, _out, _plan, _net = _b(Net(submit=_ACCEPTED, seen=_SEEN0))
 check("ACCEPTED and SEEN: exit 0, the plan says broadcast true, outcome "
@@ -1152,6 +1196,47 @@ print("\n== what the source must not be ==")
 _src = code_only(os.path.join(REPO, "btc_forwarder"))
 check("FORWARD_MIN_SAT is gs_wake_proto.DEPOSIT_MIN_SAT: the two floors are "
       "one figure", F.FORWARD_MIN_SAT == P.DEPOSIT_MIN_SAT == 10_000)
+# ONE DECLARATION, in gs_btc_tx, for the floor and the fee fraction: the
+# vault's deposit floor is built from both (forward_floor_sat), and two
+# copies is how the floor and this tool's guards came to disagree
+# (STAGE5_PLAN.md section 1, item 7).
+check("...and both guards are gs_btc_tx's own objects, not copies",
+      F.FORWARD_MIN_SAT is T.FORWARD_MIN_SAT
+      and F.MAX_FEE_FRACTION is T.FORWARD_MAX_FEE_FRACTION
+      and "FORWARD_MIN_SAT = btx.FORWARD_MIN_SAT" in _src
+      and "MAX_FEE_FRACTION = btx.FORWARD_MAX_FEE_FRACTION" in _src)
+# A DEPOSIT AT THE FLOOR IS FORWARDABLE AT THE CEILING under every guard
+# that does not need a quote: it is not dust at that rate, the fee sized
+# against the largest transaction the policy allows is within the cap, and
+# what is left clears the dust floor. Both policies the vault can pair.
+for _opm, _ceil in ((80, 200), (130, 200), (80, 40), (255, 100000), (1, 1)):
+    _fl = T.forward_floor_sat(_opm, _ceil)
+    _ch, _du, _un = F.select_inputs([{"tx_hash": "aa" * 32, "vout": 0,
+                                      "value": _fl, "confirmations": 6}],
+                                    2, _ceil)
+    _bound, _fee = F.size_the_fee(1, _opm, _ceil)
+    try:
+        _send = F.amount_to_send(_fl, _fee, F.FORWARD_MIN_SAT)
+        _why = None
+    except SystemExit as _e:
+        _send, _why = None, getattr(_e, "code", _e)
+    check(f"a deposit of exactly the floor ({_fl} sat at policy {_opm}, "
+          f"ceiling {_ceil}) is chosen, its fee is within the cap, and it "
+          "clears the dust floor",
+          len(_ch) == 1 and _du == 0 and _why is None
+          and _send == _fl - _fee and _send >= F.FORWARD_MIN_SAT
+          and _fee <= _fl * F.MAX_FEE_FRACTION)
+    try:
+        F.amount_to_send(_fl - 1, _fee, F.FORWARD_MIN_SAT)
+        _under = None
+    except SystemExit as _e:
+        _under = getattr(_e, "code", _e)
+    # Refused is a SystemExit whose .code is the exit status; the kind goes
+    # to the chain and the terminal. Refused is what matters here; which of
+    # the two guards is test_btc_tx's arithmetic check.
+    check(f"...and one satoshi under it is REFUSED by one of the two guards "
+          f"at that ceiling ({_opm}/{_ceil}) -- the floor is minimal, not "
+          "padded", _under == F.EXIT_REFUSED)
 check("the forwarder names no Electrum method that spends: the broadcast is "
       "reached through gs_btc_broadcast's submit, called exactly once, "
       "inside the --broadcast branch, after the real-rate floor",

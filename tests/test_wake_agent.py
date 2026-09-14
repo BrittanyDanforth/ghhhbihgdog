@@ -4531,6 +4531,28 @@ for _extra, _why in (
 check("pairing/btc: the keyfile carries the fee band and the affiliate cap",
       '"feerate_floor_sat_vb": int(args.feerate_floor_sat_vb)' in _kp_src
       and '"max_affiliate_bps": int(args.max_affiliate_bps)' in _kp_src)
+# THE FLOOR IS TOLD AT PAIRING, beside the ceiling it follows from, with
+# the two things the operator can do about it (STAGE5_PLAN.md 3.3).
+_fl_args = _K.build_cli().parse_args(
+    ["pair", "--out", os.path.join(_fw_dir2, "k.key"), "--artifact-dir",
+     _fw_dir2] + _BTC_OK)
+_fl_lines = _K.intake_floor_lines(_fl_args)
+_fl_want = __import__("gs_btc_tx").forward_floor_sat(
+    int(_fl_args.op_return_max_bytes), int(_fl_args.feerate_ceiling_sat_vb))
+check("pairing/btc: the operator is told the intake floor at pairing -- the "
+      "number the vault refuses under, the ceiling it follows from, the "
+      "pager flag to set and the way to lower it",
+      any(str(_fl_want) in ln for ln in _fl_lines)
+      and any(f"{int(_fl_args.feerate_ceiling_sat_vb)} sat/vB" in ln
+              for ln in _fl_lines)
+      and any(f"--deposit-min-sat {_fl_want}" in ln for ln in _fl_lines)
+      and any("--feerate-ceiling-sat-vb" in ln for ln in _fl_lines)
+      and "for _line in intake_floor_lines(args):" in _kp_src)
+_nf_args = _K.build_cli().parse_args(
+    ["pair", "--out", os.path.join(_fw_dir2, "k.key"), "--artifact-dir",
+     _fw_dir2])
+check("...and a pair without the intake is told nothing about it",
+      _K.intake_floor_lines(_nf_args) == [])
 check("pairing/btc: --allow-btc-broadcast without --allow-btc-forward is "
       "refused AT PAIRING, naming the switch it needs",
       "--allow-btc-forward" in (_pairs_btc(["--allow-btc-broadcast"]) or ""))
@@ -4538,6 +4560,24 @@ check("pairing/btc: with --allow-btc-forward the sending switch passes, and "
       "the keyfile carries it as its own boolean field",
       _pairs_btc(_BTC_OK + ["--allow-btc-broadcast"]) is None
       and '"allow_btc_broadcast": bool(args.allow_btc_broadcast)' in _kp_src)
+# MONEY DOES NOT MOVE ON THE AGGREGATOR'S WORD ALONE (STAGE5_PLAN.md 3.5):
+# the THORNode cross-check was optional, so a sending pair could be written
+# with the one check against a compromised aggregator switched off.
+check("pairing/btc: --allow-btc-broadcast WITHOUT --thornode is refused at "
+      "pairing, naming it; a rehearsal pair without it still passes",
+      "--thornode" in (_pairs_btc(
+          [a for a in _BTC_OK if a not in ("--thornode", "https://tn.example")]
+          + ["--allow-btc-broadcast"]) or "")
+      and _pairs_btc([a for a in _BTC_OK
+                      if a not in ("--thornode", "https://tn.example")]) is None)
+# THE ACCOUNT NUMBER: written always (absent reads as 0, which it was),
+# bounded, and handed to the forward beside the xpub and the index.
+check("pairing/btc: --btc-account is written to the keyfile as a whole "
+      "number, default 0, and an impossible one is refused",
+      '"btc_account": int(args.btc_account)' in _kp_src
+      and _pairs_btc(_BTC_OK + ["--btc-account", "3"]) is None
+      and _pairs_btc(_BTC_OK + ["--btc-account", "-1"]) is not None
+      and _pairs_btc(_BTC_OK + ["--btc-account", str(2 ** 31)]) is not None)
 check("pairing/fee: any one of the three without the others is refused",
       "go together" in (_pairs_fee(["--fee-rpc", "http://127.0.0.1:18085"]) or "")
       and "go together" in (_pairs_fee(["--fee-sweep-to", _FS_TO[0]]) or ""))
@@ -4833,6 +4873,26 @@ def _rec_of(dd):
 
 
 _ACC = {"broadcast": True, "broadcast_outcome": "accepted", "seen": True}
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC)
+# THE ACCOUNT NUMBER RIDES IN THE ENVIRONMENT beside the xpub and the index
+# (STAGE5_PLAN.md 3.5): 0 for a keyfile from before the field existed,
+# the paired number otherwise, and a present-but-wrong one is refused.
+check("the forward's child is handed GS_BTC_ACCOUNT=0 for a keyfile without "
+      "the field, off the argv", len(_ran) == 1
+      and _ran[0][1].get("GS_BTC_ACCOUNT") == "0"
+      and "--account" not in _ran[0][0])
+_o3, _e3, _ran3, _dd3, _bb3 = _fwd_run_plan(_FWD_REC,
+                                            {**_SEND_KEY, "btc_account": 3},
+                                            _ACC)
+check("...and the paired account number when the keyfile carries one",
+      _e3 is None and len(_ran3) == 1
+      and _ran3[0][1].get("GS_BTC_ACCOUNT") == "3")
+_o4, _e4, _ran4, _dd4, _bb4 = _fwd_run_plan(_FWD_REC,
+                                            {**_SEND_KEY, "btc_account": -1},
+                                            _ACC)
+check("...a keyfile account that is not a whole number in range is refused "
+      "btc_config_malformed before any child runs",
+      getattr(_e4, "code", None) == "btc_config_malformed" and _ran4 == [])
 _o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC)
 check("a sending run whose plan says accepted: done, the ledger marks "
       "forward_sent TRUE beside the bucket and the path, and the M3 carries "
@@ -5189,12 +5249,20 @@ check(f"every address used for a whole recovery gap ({P.BTC_INDEX_GAP + 1} "
       and not _rec4(_d7, "B7A1").get("btc_index"))
 
 _floor = A.btc_deposit_min_sat(_BK)
-check("the deposit floor on the intake is the wire floor plus a one-input "
-      "forward's fee at the ceiling rate with the largest OP_RETURN the "
-      "policy allows -- computed from gs_btc_tx's own bounds",
-      _floor == P.DEPOSIT_MIN_SAT + _BT.vsize_upper_bound(
-          1, [_BT.INBOUND_SPK_MAX, _BT.op_return_script_len(80)]) * 200
-      and _floor > P.DEPOSIT_MIN_SAT
+_fee_c = _BT.vsize_upper_bound(
+    1, [_BT.INBOUND_SPK_MAX, _BT.op_return_script_len(80)]) * 200
+# THE FLOOR IS THE LARGER OF THE FORWARDER'S TWO GUARDS at the ceiling
+# (STAGE5_PLAN.md 3.3): the dust floor after the fee, and the fee capped at
+# a fifth of the deposit. The first floor took only the first, so a deposit
+# at it with fees at the ceiling was refused by the second.
+check("the deposit floor on the intake is gs_btc_tx.forward_floor_sat at the "
+      "keyfile's ceiling and policy: the larger of dust-floor-plus-fee and "
+      "fee-over-the-cap, from gs_btc_tx's own bounds",
+      _floor == _BT.forward_floor_sat(80, 200, P.DEPOSIT_MIN_SAT)
+      and _floor == max(P.DEPOSIT_MIN_SAT + _fee_c,
+                        -(-_fee_c * 100 // 20))
+      and _floor > P.DEPOSIT_MIN_SAT + _fee_c
+      and _fee_c <= _floor * _BT.FORWARD_MAX_FEE_FRACTION
       and A.btc_deposit_min_sat({**_BK, "op_return_max_bytes": 120,
                                  "feerate_ceiling_sat_vb": 50}) < _floor)
 _d8, _runs8, _run8 = _btc_env("btc8_")

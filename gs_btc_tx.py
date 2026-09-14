@@ -40,6 +40,7 @@ and the rules that keep money from going wrong are stated where they bite:
 Nothing here logs, prints, or touches the hash chain.
 """
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "third_party"))
@@ -67,6 +68,15 @@ INPUT_BASE = 36 + 1 + 4
 #: (1 + 1 + 32). The bound the forwarder sizes its fee against before the
 #: quote is known, and the bound the vault's deposit floor is built from.
 INBOUND_SPK_MAX = 34
+#: The forward's floor on what reaches ThorChain AFTER the fee, in satoshis.
+#: ThorChain's BTC dust threshold is 10,000 sat: an inbound below it is
+#: ignored, not swapped, and the money is gone. It equals
+#: gs_wake_proto.DEPOSIT_MIN_SAT; tests pin the two together.
+FORWARD_MIN_SAT = 10_000
+#: A fee over this fraction of what settled is refused by the forwarder: at
+#: that point it is paying the miner more than a fifth of the client's
+#: money, and the right answer is to wait for cheaper blocks, not burn it.
+FORWARD_MAX_FEE_FRACTION = Decimal("0.20")
 #: The account level of BIP84: m/84'/coin'/0'.
 BIP84_PURPOSE = 84
 #: nLockTime at or above this is a UNIX timestamp, not a height.
@@ -209,6 +219,40 @@ def fee_for(vsize, sat_per_vb):
     return vsize * sat_per_vb
 
 
+def forward_floor_sat(op_return_max_bytes, ceiling_sat_vb,
+                      min_send_sat=FORWARD_MIN_SAT):
+    """The smallest deposit a ONE-INPUT forward can carry at the ceiling
+    rate under EVERY guard the forwarder applies, in satoshis.
+
+    Two guards bound it, and the floor is the larger of the two:
+      - what reaches ThorChain after the fee must be at least
+        `min_send_sat` (the dust floor): `min_send_sat + fee`;
+      - the fee may not exceed FORWARD_MAX_FEE_FRACTION of what settled:
+        `fee / FORWARD_MAX_FEE_FRACTION`, rounded up.
+    The fee is the upper-bound fee of one P2WPKH input, the largest inbound
+    script and the largest OP_RETURN the policy allows, at the ceiling
+    rate -- the same bound the forwarder sizes against, so a deposit of
+    exactly this is forwardable when fees are at the ceiling.
+
+    STAGE5_PLAN.md 3.3: the first floor took only the first guard, so a
+    deposit at the floor with fees at the ceiling paid ~80% of itself to
+    the miner in the sizing and was refused by the second guard -- the
+    vault had accepted a deposit the forwarder could never send at that
+    rate. The ceiling is the operator's choice; the number follows from
+    it, and gs_wake_keys prints both side by side at pairing.
+    """
+    if isinstance(min_send_sat, bool) or not isinstance(min_send_sat, int) \
+            or min_send_sat < FORWARD_MIN_SAT:
+        raise BtcTxError(f"min_send_sat must be an int of at least "
+                         f"{FORWARD_MIN_SAT}")
+    fee = fee_for(vsize_upper_bound(
+        1, [INBOUND_SPK_MAX, op_return_script_len(op_return_max_bytes)]),
+        ceiling_sat_vb)
+    by_cap = Decimal(fee) / FORWARD_MAX_FEE_FRACTION
+    by_cap_sat = int(by_cap) + (1 if by_cap != int(by_cap) else 0)
+    return max(min_send_sat + fee, by_cap_sat)
+
+
 # --- building ---------------------------------------------------------------
 
 def _check_input(u):
@@ -306,10 +350,25 @@ def require_native():
                          "curve's running time depends on the secret key")
 
 
-def account_from_mnemonic(mnemonic, network="main", passphrase=""):
-    """The BIP84 account key m/84'/coin'/0' from a BIP39 mnemonic, as a
-    PRIVATE HDKey. Refuses an invalid mnemonic (bad checksum, unknown word)
-    rather than deriving something from garbage."""
+#: The largest BIP32 account number: one under the hardened bit.
+MAX_ACCOUNT = _HARDENED - 1
+
+
+def account_from_mnemonic(mnemonic, network="main", passphrase="",
+                          account=0):
+    """The BIP84 account key m/84'/coin'/<account>' from a BIP39 mnemonic,
+    as a PRIVATE HDKey. Refuses an invalid mnemonic (bad checksum, unknown
+    word) rather than deriving something from garbage, and an account
+    number that is not a whole number under the hardened bit.
+
+    `account` is 0 unless the pair was retired to a fresh chain
+    (STAGE5_PLAN.md 3.5/3.6: a wiped ledger behind a used account is
+    answered by pairing the next account, whose addresses nobody has ever
+    been handed). The xpub the Pi is handed is proven to be THIS account's
+    (account_matches_xpub), so a wrong number signs for nothing."""
+    if isinstance(account, bool) or not isinstance(account, int) \
+            or not 0 <= account <= MAX_ACCOUNT:
+        raise BtcTxError(f"account must be an int in 0..{MAX_ACCOUNT}")
     net = network_of(network)
     words = " ".join(str(mnemonic).split())
     if not bip39.mnemonic_is_valid(words):
@@ -318,7 +377,7 @@ def account_from_mnemonic(mnemonic, network="main", passphrase=""):
     root = bip32.HDKey.from_seed(seed, version=net["xprv"])
     return root.derive([BIP84_PURPOSE + _HARDENED,
                         int(net["bip32"]) + _HARDENED,
-                        0 + _HARDENED])
+                        int(account) + _HARDENED])
 
 
 def account_matches_xpub(account, xpub_text):

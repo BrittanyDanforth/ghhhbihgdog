@@ -157,7 +157,19 @@ def _fake_quote(url, payload, proxies=None):
                         "expectedBuyAmount": str(exp)}]}
 
 
+def _fake_inbound(url, proxies=None):
+    """THORNode's inbound list, stubbed to agree with the stubbed quote:
+    there is no testnet THORNode, and a sending forward refuses to run
+    without the cross-check (STAGE5_PLAN.md 3.5), so the check runs here
+    against the same address the quote named. What this proves is that the
+    check is wired and passes when the two agree; what it cannot prove is
+    anything about the real THORNode."""
+    return [{"chain": "BTC", "address": _addr1, "halted": False,
+             "dust_threshold": "10000"}]
+
+
 F.safe_post = _fake_quote
+F.safe_get = _fake_inbound
 F.btc_per_xmr_oracle = lambda proxies=None, getter=None: _RATE
 _out = os.path.join(_scratch, "plan.json")
 os.environ[F.SEED_ENV] = _SEED
@@ -166,7 +178,7 @@ os.environ["GS_BTC_INDEX"] = "0"
 argv = ["--broadcast", "--tor-proxy", _TOR, "--network", "testnet",
         "--dest-from-receive-wallet", _bundle, "--outfile", _out,
         "--min-conf", "1", "--op-return-max-bytes", str(_POLICY),
-        "--seen-wait", "120"]
+        "--seen-wait", "120", "--thornode", "http://thornode.stub.invalid"]
 for s in _SERVERS:
     argv += ["--electrum", s]
 buf = io.StringIO()

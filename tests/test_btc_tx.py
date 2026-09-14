@@ -239,6 +239,50 @@ check("...and it refuses no inputs or no outputs",
       and _refused(T.vsize_upper_bound, 1, []))
 
 # ===========================================================================
+print("\n== the deposit floor: the larger of the forwarder's two guards "
+      "(STAGE5_PLAN.md 3.3) ==")
+# The forwarder refuses a fee over FORWARD_MAX_FEE_FRACTION of what settled,
+# and refuses what is left under FORWARD_MIN_SAT. The floor the vault
+# accepts a deposit by must satisfy BOTH at the ceiling, or it accepts
+# deposits the forwarder can never send at that rate. Computed here from
+# the same bound the forwarder sizes against.
+for _opm, _ceil in ((80, 200), (130, 200), (80, 40), (255, 100000), (1, 1)):
+    _fee = T.fee_for(T.vsize_upper_bound(
+        1, [T.INBOUND_SPK_MAX, T.op_return_script_len(_opm)]), _ceil)
+    _fl = T.forward_floor_sat(_opm, _ceil)
+    _by_cap = -(-_fee * 100 // 20)                       # ceil(fee / 0.20)
+    check(f"policy {_opm}, ceiling {_ceil}: the floor is max(dust floor + "
+          "fee, ceil(fee / fraction)), and at it the fee is within the cap "
+          "and the remainder clears the dust floor",
+          _fl == max(T.FORWARD_MIN_SAT + _fee, _by_cap)
+          and _fee <= _fl * T.FORWARD_MAX_FEE_FRACTION
+          and _fl - _fee >= T.FORWARD_MIN_SAT)
+    check(f"...and one satoshi under it breaks one of the two",
+          (_fee > (_fl - 1) * T.FORWARD_MAX_FEE_FRACTION)
+          or (_fl - 1 - _fee < T.FORWARD_MIN_SAT))
+check("at the shipped policy and ceiling (80 bytes, 200 sat/vB) the cap is "
+      "the binding guard, by a wide margin: the first floor (dust + fee) "
+      "was under a third of the honest one",
+      T.forward_floor_sat(80, 200) > 3 * (T.FORWARD_MIN_SAT + T.fee_for(
+          T.vsize_upper_bound(1, [T.INBOUND_SPK_MAX,
+                                  T.op_return_script_len(80)]), 200)))
+check("a higher dust floor raises the floor with it, never below the cap's",
+      T.forward_floor_sat(80, 200, 300_000) == 300_000 + T.fee_for(
+          T.vsize_upper_bound(1, [T.INBOUND_SPK_MAX,
+                                  T.op_return_script_len(80)]), 200))
+for _bad in (9_999, 0, -1, True, "10000", 1.5):
+    try:
+        T.forward_floor_sat(80, 200, _bad)
+        _r = None
+    except T.BtcTxError as _e:
+        _r = str(_e)
+    check(f"a dust floor of {_bad!r} is refused (never under ThorChain's "
+          "own, never coerced)", _r is not None)
+check("the fraction and the floor are declared once, here, and are what the "
+      "forwarder and the vault read",
+      str(T.FORWARD_MAX_FEE_FRACTION) == "0.20"
+      and T.FORWARD_MIN_SAT == 10_000)
+
 print("\n== the vault's derivation meets the Pi's on the BIP84 vector ==")
 _MNEMONIC = ("abandon abandon abandon abandon abandon abandon abandon abandon "
              "abandon abandon abandon about")
@@ -273,6 +317,30 @@ check("...and at change=1 index 0 the published first change address",
       _es.p2wpkh(T.key_for(_acct, 1, 0).get_public_key())
       .address(NETWORKS["main"])
       == "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el")
+# THE ACCOUNT NUMBER (STAGE5_PLAN.md 3.5): a retired chain is the next
+# account of the same seed. Account 1 is a different key, its xpub does not
+# match account 0's, and account_matches_xpub tells them apart -- so a
+# forward handed the wrong number derives a key that signs for nothing.
+_acct1 = T.account_from_mnemonic(_MNEMONIC, account=1)
+_xpub1 = _acct1.to_public().to_base58()
+check("account 1 of the seed is a different account key from account 0, at "
+      "the same depth", _acct1.get_public_key().sec() != _acct.get_public_key()
+      .sec() and _acct1.depth == 3 == _acct.depth)
+check("...and each matches only its own xpub",
+      T.account_matches_xpub(_acct1, _xpub1)
+      and not T.account_matches_xpub(_acct1, _XPUB)
+      and not T.account_matches_xpub(_acct, _xpub1))
+check("...the default is account 0, which is what every pair before the "
+      "field existed was",
+      T.account_from_mnemonic(_MNEMONIC, account=0).get_public_key().sec()
+      == _acct.get_public_key().sec())
+for _bad in (-1, T.MAX_ACCOUNT + 1, True, "1", 1.0, None):
+    try:
+        T.account_from_mnemonic(_MNEMONIC, account=_bad)
+        _r = None
+    except T.BtcTxError as _e:
+        _r = str(_e)
+    check(f"an account of {_bad!r} is refused, never coerced", _r is not None)
 _tacct = T.account_from_mnemonic(_MNEMONIC, network="testnet")
 check("testnet: coin type 1, and the address matches the Pi's tpub path",
       _es.p2wpkh(T.key_for(_tacct, 0, 0).get_public_key())

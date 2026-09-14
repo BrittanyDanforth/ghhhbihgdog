@@ -1320,18 +1320,20 @@ def btc_mode(key: dict) -> bool:
 
 
 def btc_deposit_min_sat(key: dict) -> int:
-    """The smallest deposit this pair can FORWARD: what must reach ThorChain
-    after the fee (the wire floor, which equals the forwarder's
-    FORWARD_MIN_SAT) plus a fee allowance for a one-input forward carrying
-    the largest OP_RETURN this pair's policy allows, at the ceiling rate.
-    STAGE2_PLAN.md found the wire floor alone can never be forwarded: a
-    deposit of exactly it is fee minus nothing."""
+    """The smallest deposit this pair can FORWARD at its own fee ceiling,
+    under every guard the forwarder applies: the dust floor after the fee
+    AND the cap on the fee's share of the deposit
+    (gs_btc_tx.forward_floor_sat). STAGE2_PLAN.md found the wire floor
+    alone can never be forwarded (a deposit of exactly it is fee minus
+    nothing); STAGE5_PLAN.md 3.3 found the first fix stopped at the first
+    guard, and a deposit at that floor was refused by the second whenever
+    fees were at the ceiling. The keyfile's ceiling and policy decide the
+    number; both are validated, never coerced."""
     import gs_btc_tx as _btx
     op_max = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)
     ceiling = _btc_setting(key, "feerate_ceiling_sat_vb", 200, 1, 100000)
-    bound = _btx.vsize_upper_bound(
-        1, [_btx.INBOUND_SPK_MAX, _btx.op_return_script_len(op_max)])
-    return int(proto.DEPOSIT_MIN_SAT) + int(bound) * int(ceiling)
+    return int(_btx.forward_floor_sat(op_max, ceiling,
+                                      int(proto.DEPOSIT_MIN_SAT)))
 
 
 def _btc_address(key: dict, index: int) -> str:
@@ -1397,8 +1399,10 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                   "have all been used and the ledger knows none of them: the "
                   "ledger and the chain disagree by more than a recovery gap. "
                   "Nothing was published. The intake stays closed until the "
-                  "ledger is restored at the machine; re-pairing the same "
-                  "account does not reopen it (same chain, same addresses).")
+                  "ledger is restored at the machine, or the pair is retired "
+                  "to a fresh chain: re-pair with --btc-account one higher "
+                  "and that account's xpub (re-pairing the same account does "
+                  "not reopen it: same chain, same addresses).")
 
 
 #: The forwarder's one-word status when it found nothing settled -> the
@@ -3599,6 +3603,12 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # here).
             env_extra["GS_BTC_XPUB"] = str(key["btc_account_xpub"])
             env_extra["GS_BTC_INDEX"] = str(int(_btc_index))
+            # ...AND WHICH ACCOUNT OF THE SEED THE XPUB IS (STAGE5_PLAN.md
+            # 3.5): absent from a keyfile written before the field existed
+            # means 0, which it was; present and wrong is refused, never
+            # coerced, like every other intake setting.
+            env_extra["GS_BTC_ACCOUNT"] = str(
+                _btc_setting(key, "btc_account", 0, 0, 2 ** 31 - 1))
             if os.environ.get("GS_SWAPKIT_API_KEY"):
                 env_extra["GS_SWAPKIT_API_KEY"] = \
                     os.environ["GS_SWAPKIT_API_KEY"]

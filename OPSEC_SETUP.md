@@ -2038,8 +2038,13 @@ python3 gs_wake_keys pair --deposit-in-chat \
 
 What the vault does with it, per `/deposit`: refuses the amount below the
 intake floor before anything is minted (`deposit_too_small`; the floor is
-the forward's 10,000-sat minimum plus a fee allowance at the ceiling rate for
-a one-input transaction, so the deposit can actually be sent on); derives
+the smallest deposit a one-input forward can carry when fees are at the
+pair's ceiling under BOTH of the forwarder's guards — what is left after
+the fee must clear the 10,000-sat dust floor, and the fee may not take more
+than a fifth of the deposit — so a deposit the vault accepts can actually
+be sent on; `gs_wake_keys pair` prints the number beside the ceiling it
+follows from, about 0.0021 BTC at the shipped 200 sat/vB and a fifth of
+that at 40); derives
 the next address from the xpub; asks the network over Tor, on that
 address's own circuit, whether it has EVER been used, and steps past one
 that has (up to a gap of 20, then `btc_index_exhausted`); refuses outright
@@ -2076,7 +2081,8 @@ python3 gs_telegram_pager ... \
                            # sends it on; match the vault's
     --btc-network main     # main, testnet, signet or regtest
     --btc-poll 600         # seconds between looks; under 60 is refused
-    --deposit-min-sat N    # the vault's intake floor, so the wizard refuses
+    --deposit-min-sat N    # the vault's intake floor (printed at pairing),
+                           # so the wizard refuses
                            # a too-small deposit HERE, with the number,
                            # instead of spending a wake on the vault's refusal
 ```

@@ -187,7 +187,14 @@ import time
 #: a slip as "not a set of deposit instructions" -- loud -- and an old vault
 #: never sends one. Update both boxes together. No record changes size and
 #: no job changes its key set.
-WIRE_VERSION = 6
+#:
+#: 7: two phase words, `delayed` (a forward the vault would not send at
+#: today's fee; the Pi tries again by itself) and `returned` (money came
+#: back to the deposit address -- a refund or a second payment -- and is
+#: being sent on again), for stage 5's failure handling. As with 5: no
+#: record changes shape, the closed vocabulary grows, an old Pi refuses a
+#: new vault's M3 carrying either word, loud. Update both boxes together.
+WIRE_VERSION = 7
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -419,7 +426,8 @@ BTC_INDEX_GAP = 20
 #:              the operator will act on. The signed transaction is kept
 #:              on the vault until the network shows it.
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
-          "more_locked", "moved", "partial", "full", "sent", "unsure")
+          "more_locked", "moved", "partial", "full", "sent", "unsure",
+          "delayed", "returned")
 
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
@@ -890,6 +898,17 @@ PHASE_LINES = {
             "later.",
     "unsure": "the forward may or may not have gone out. It will be checked "
               "before anything else is done with it.",
+    # A FORWARD THE MACHINE WOULD NOT SEND AT TODAY'S PRICE (stage 5): the
+    # fee would eat too much of it. Fees fall in hours; the Pi tries again
+    # by itself, and the sentence says so -- no number, no coin, nothing
+    # to do.
+    "delayed": "the network is busy right now, so it waits. It is tried again "
+               "later, by itself — nothing to do.",
+    # MONEY CAME BACK TO WHERE IT WAS PAID (stage 5): a refund, or a second
+    # payment. It is sent on again by the same path; the reader needs to
+    # know only that it is handled.
+    "returned": "some of it came back to where it was paid and is being sent "
+                "on again — nothing to do.",
     # NOT RENDERED ON ITS OWN. The pager acts on this one -- it starts the
     # next leg -- and says so in its own words, because "more left" is not
     # something the operator has to do anything about. The sentence is here

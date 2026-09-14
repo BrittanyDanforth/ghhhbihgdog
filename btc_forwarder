@@ -122,12 +122,16 @@ bcast_seen = bcast.seen
 #: and that figure is not a coincidence: ThorChain's BTC dust threshold is
 #: 10,000 sat -- an inbound below it is ignored, not swapped, and the money
 #: is gone. tests/test_btc_forwarder.py pins the two constants together.
-FORWARD_MIN_SAT = 10_000
+#: DECLARED IN gs_btc_tx beside the fee fraction, because the vault's
+#: deposit floor is built from both (gs_btc_tx.forward_floor_sat) and two
+#: copies is how the floor and this tool's guards came to disagree
+#: (STAGE5_PLAN.md section 1, item 7).
+FORWARD_MIN_SAT = btx.FORWARD_MIN_SAT
 #: A fee larger than this fraction of the settled deposit is refused: at
 #: that point the forward is paying the miner more than a fifth of the
 #: client's money, and the right answer is to wait for cheaper blocks, not
 #: to burn it.
-MAX_FEE_FRACTION = Decimal("0.20")
+MAX_FEE_FRACTION = btx.FORWARD_MAX_FEE_FRACTION
 #: The slippage the arrival watcher accepts, mirrored from
 #: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
 ARRIVAL_TOLERANCE = Decimal("0.10")
@@ -517,10 +521,13 @@ def take_seed():
     return words, passphrase
 
 
-def account_for(words, passphrase, network, account_xpub):
-    """The private account key, proven to be the xpub the Pi watches."""
+def account_for(words, passphrase, network, account_xpub, account_no=0):
+    """The private account key m/84'/coin'/<account_no>', proven to be the
+    xpub the Pi watches. A wrong account number derives a key the xpub
+    does not match and is refused; it can never sign for the address."""
     try:
-        account = btx.account_from_mnemonic(words, network, passphrase)
+        account = btx.account_from_mnemonic(words, network, passphrase,
+                                            account=account_no)
     except btx.BtcTxError as e:
         raise Refused("seed_invalid", str(e))
     if not btx.account_matches_xpub(account, account_xpub):
@@ -637,6 +644,11 @@ def build_cli():
                     help="the deposit address's index under the xpub. Prefer "
                          "GS_BTC_INDEX in the environment, for the reason "
                          "above.")
+    ap.add_argument("--account", type=int, default=None, metavar="N",
+                    help="which account of the seed the xpub is "
+                         "(m/84'/coin'/N'; default 0). Prefer GS_BTC_ACCOUNT "
+                         "in the environment. The derived account is proven "
+                         "against the xpub either way.")
     ap.add_argument("--max-affiliate-bps", type=int, default=0,
                     help="the largest affiliate fee (basis points, to a "
                          "THORName) a quoted memo may carry (default 0: none)")
@@ -692,6 +704,31 @@ def main(argv=None):
                            or args.seen_interval <= 0):
         raise Refused("bad_args", "--quote-max-age must be >= 1, "
                       "--seen-wait >= 0, --seen-interval > 0")
+    # MONEY DOES NOT MOVE ON THE AGGREGATOR'S WORD ALONE (STAGE5_PLAN.md
+    # 3.5). The THORNode cross-check of the inbound address was optional,
+    # so a sending forward could pay whatever address a compromised
+    # aggregator named with the one check against that never running. A
+    # rehearsal may still run without it; a broadcast may not.
+    if args.broadcast and not args.thornode:
+        raise Refused("bad_args", "--broadcast needs --thornode: a forward "
+                      "that sends pays the inbound address the aggregator "
+                      "names, and THORNode's own inbound list is the one "
+                      "check against an aggregator naming its own. Pair "
+                      "--thornode (gs_wake_keys) or rehearse with --dry-run.")
+    # WHICH ACCOUNT OF THE SEED THE XPUB IS (STAGE5_PLAN.md 3.5): 0 unless
+    # the pair was retired to a fresh chain. From the environment like the
+    # xpub; absent means 0, which every pair before the field was.
+    account_no = env_or_argv("GS_BTC_ACCOUNT",
+                             None if args.account is None else
+                             str(args.account), "the account number")
+    try:
+        account_no = int(str(account_no)) if account_no not in (None, "") \
+            else 0
+    except ValueError:
+        raise Refused("bad_args", "the account number is not a whole number")
+    if account_no < 0 or account_no > btx.MAX_ACCOUNT:
+        raise Refused("bad_args", f"the account number must be in "
+                      f"0..{btx.MAX_ACCOUNT}")
     # THE XPUB AND THE INDEX, from the environment by preference (the wake
     # agent puts them there); argv still works for a hand run, with the
     # warning env_or_argv prints. Neither present is a refusal.
@@ -806,7 +843,8 @@ def main(argv=None):
     account = None
     if not args.plan_only:
         words, passphrase = take_seed()
-        account = account_for(words, passphrase, args.network, xpub)
+        account = account_for(words, passphrase, args.network, xpub,
+                              account_no=account_no)
         del words
     tx, txid, vsize, real_rate, signed = build_and_sign(
         chosen, picture["tip"], inbound_spk, send_sat, fee_sat, memo_b,

@@ -342,10 +342,18 @@ def build_cli() -> argparse.ArgumentParser:
     # the agent unit's EnvironmentFile, like the wallet password. Off by
     # default, absent from every keyfile written before it existed.
     p.add_argument("--btc-xpub", default="",
-                   help="the BIP84 ACCOUNT xpub (m/84'/coin'/0') the deposit "
-                        "addresses are derived from. Public. The seed that "
-                        "signs goes in GS_BTC_SEED in the agent unit's "
-                        "EnvironmentFile, never here.")
+                   help="the BIP84 ACCOUNT xpub (m/84'/coin'/N', N from "
+                        "--btc-account) the deposit addresses are derived "
+                        "from. Public. The seed that signs goes in "
+                        "GS_BTC_SEED in the agent unit's EnvironmentFile, "
+                        "never here.")
+    p.add_argument("--btc-account", type=int, default=0, metavar="N",
+                   help="which account of the seed --btc-xpub is (default 0). "
+                        "Raise it to retire a chain: a wiped ledger behind a "
+                        "used account is reopened only by pairing the next "
+                        "account, whose addresses nobody was ever handed "
+                        "(STAGE5_PLAN.md 3.6). The forward derives this "
+                        "account and proves it against the xpub.")
     p.add_argument("--btc-electrum", action="append", default=[],
                    metavar="HOST[:PORT][,PIN]",
                    help="Electrum server the vault looks at deposits through, "
@@ -586,11 +594,21 @@ def _validate_btc(args) -> None:
                  "host's address with no job that can move it. Pair the\n"
                  "    two together (a rehearsal until --allow-btc-broadcast "
                  "is added), or pair without --btc-xpub.")
+    if getattr(args, "btc_account", 0) is not None and not (
+            0 <= int(args.btc_account) <= 2 ** 31 - 1):
+        sys.exit("[!] --btc-account must be a whole number in 0..2^31-1.")
     if args.allow_btc_broadcast and not args.allow_btc_forward:
         sys.exit("[!] --allow-btc-broadcast needs --allow-btc-forward: a "
                  "forward that may not sign has nothing to send.\n    The "
                  "two are separate on purpose -- the first is a rehearsal, "
                  "the second moves money.")
+    if args.allow_btc_broadcast and not args.thornode:
+        sys.exit("[!] --allow-btc-broadcast needs --thornode: a forward that "
+                 "SENDS pays whatever inbound address the aggregator names,\n"
+                 "    and THORNode's own inbound list is the one check "
+                 "against an aggregator naming its own address. A rehearsal\n"
+                 "    may run without it; money may not move without it "
+                 "(STAGE5_PLAN.md 3.5).")
     if args.btc_network not in ("main", "testnet", "signet", "regtest"):
         sys.exit("[!] --btc-network must be main, testnet, signet or regtest.")
     if args.btc_min_conf < 1:
@@ -620,6 +638,32 @@ def _validate_btc(args) -> None:
         except _w.BtcWatchError as e:
             sys.exit(f"[!] --btc-xpub is not an account xpub of the "
                      f"{args.btc_network} network: {e}")
+
+
+def intake_floor_lines(args) -> list:
+    """What the operator is told at pairing about the intake's floor: the
+    smallest deposit this pair can send on when fees are at ITS ceiling
+    (gs_btc_tx.forward_floor_sat -- the same arithmetic the vault refuses
+    a smaller deposit by), the ceiling it follows from, and the two things
+    they can do with it: set the pager's --deposit-min-sat to the same
+    number so the wizard refuses early, or pair a lower ceiling. Empty
+    without --btc-xpub. STAGE5_PLAN.md 3.3."""
+    if not getattr(args, "btc_xpub", ""):
+        return []
+    import gs_btc_tx as _btx
+    _floor = _btx.forward_floor_sat(int(args.op_return_max_bytes),
+                                    int(args.feerate_ceiling_sat_vb))
+    _btc = f"{_floor / 100_000_000:.8f}".rstrip("0").rstrip(".")
+    return [
+        f"      Intake floor: {_floor} sat ({_btc} BTC) -- the smallest "
+        f"deposit this pair can send on",
+        f"      when fees are at its {int(args.feerate_ceiling_sat_vb)} "
+        f"sat/vB ceiling (the fee must stay under a fifth of it).",
+        f"      Start the pager with --deposit-min-sat {_floor} so a smaller "
+        f"one is refused there,",
+        f"      with the number, or pair again with a lower "
+        f"--feerate-ceiling-sat-vb for a lower floor.",
+    ]
 
 
 def _validate(args) -> None:
@@ -1024,6 +1068,11 @@ def do_pair(args) -> int:
         # THE BTC INTAKE'S SETTINGS: public xpub, servers, policy, its own
         # spending switch. No seed here, ever.
         "btc_account_xpub": str(args.btc_xpub or ""),
+        # WHICH ACCOUNT OF THE SEED THAT XPUB IS. The forward derives it and
+        # proves it against the xpub; the vault never needs it (public
+        # derivation from the xpub). Written always, so a keyfile from
+        # before the field existed reads as account 0, which it was.
+        "btc_account": int(args.btc_account),
         "btc_electrum": [str(s) for s in (args.btc_electrum or [])],
         "btc_network": str(args.btc_network or "main"),
         "btc_min_conf": int(args.btc_min_conf),
@@ -1068,6 +1117,8 @@ def do_pair(args) -> int:
     print(f"  [+] Paired. Code {agreed['sas']}.")
     print(f"      This box : {tp_path}  (0400)")
     print(f"      Doorbell : {payload['doorbell_url']}")
+    for _line in intake_floor_lines(args):
+        print(_line)
     print()
     print("  [!] This file is NOT encrypted, and that is on purpose.")
     print("      gs_wake_agent runs at boot with nobody here, on a disk that")
