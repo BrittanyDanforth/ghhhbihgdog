@@ -374,7 +374,7 @@ try:
     # ceiling is not what this cycle is about, so it is raised here.
     _INTAKE_KEY = {"btc_account_xpub": _ZPUB4, "btc_electrum": ["s.onion"],
                    "btc_network": "main", "deposit_in_chat": True,
-                   "account_ceiling": 500}
+                   "account_ceiling": 500, "op_return_max_bytes": 140}
     # THE SEED IS PROVEN AGAINST THE XPUB BEFORE AN ADDRESS IS ISSUED, on
     # the machine that holds both: _ZPUB4 is account 0 of this mnemonic.
     # Without it the deposit is refused before any child, over the real
@@ -439,7 +439,7 @@ try:
     p4f, out4f, err4f, _r, text4f = cycle(
         "forward_to_swap", {"handle": _h4, "owner": P.HOST_OWNER}, _bay,
         key_extra={**_INTAKE_KEY, "allow_btc_forward": True,
-                   "btc_min_conf": 2, "op_return_max_bytes": 120},
+                   "btc_min_conf": 2, "op_return_max_bytes": 140},
         env={"GS_BTC_SEED": "abandon abandon abandon abandon abandon abandon "
                             "abandon abandon abandon abandon abandon about"},
         deps_over={"extend_deadman": lambda s: True,
@@ -464,7 +464,7 @@ try:
     _BTC_KEY = {"allow_btc_forward": True,
                 "btc_account_xpub": "xpub6FIXTUREACCOUNT",
                 "btc_electrum": ["s.onion"], "btc_network": "main",
-                "btc_min_conf": 2, "op_return_max_bytes": 120}
+                "btc_min_conf": 2, "op_return_max_bytes": 140}
     _MNEMONIC = ("abandon abandon abandon abandon abandon abandon abandon "
                  "abandon abandon abandon abandon about")
     _ran2x = []

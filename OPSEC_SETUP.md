@@ -2046,8 +2046,25 @@ plaintext trade is decided knowingly, in the same command, or not at all.
 python3 gs_wake_keys pair --deposit-in-chat \
     --btc-xpub <account xpub> --btc-electrum <host.onion> \
     --allow-btc-forward [--allow-btc-broadcast --thornode <url>] \
+    --op-return-max-bytes 140 \
     [--btc-account N] [--btc-bump-after SECONDS] ...       # ON THE VAULT
 ```
+
+`--op-return-max-bytes` is not optional on an intake pair, and the pairing
+refuses one without it. The forward lays the swap memo out itself, and no
+swap memo fits the 80-byte standard: the op and asset, a 95-character
+Monero address and the output limit the forward writes (in 1e8 base units,
+so a bigger deposit is a longer memo) are at least 126 bytes. A pair under
+that forwards a drill's crumbs and refuses the first real deposit with
+`memo_overflow`, for ever, with the client's money on the host's address
+— so the vault refuses to mint a deposit or compose a forward under it
+(`op_return_too_small`), and the pairing refuses to write it. 140 leaves
+room for the streaming fields an aggregator quotes. Set it ONLY on a node
+whose relay policy carries it: Bitcoin Core 30 and later by default, older
+nodes with `-datacarriersize` raised — and your own electrs sits on your
+own node, which is where the forward is sent. Affiliate fields that carry
+no fee are dropped from the memo before it is laid out, so an aggregator's
+decoration cannot push a memo past the policy.
 
 `--btc-bump-after` (default 7200, at most a week) is how long a forward may
 sit in the mempool before a run of the forward replaces it at today's rate
@@ -2188,7 +2205,14 @@ handful of wakes and not one an hour per deposit. A retry, like the recheck
 below, is a start nobody asked for: it leaves `--btc-reserve` of the day's
 pokes for taps, so the automatic path cannot spend the last wake a client's
 question needs (a first forward of a confirmed deposit is not held back —
-moving the money is what the budget is for). Money that can never be sent on at
+moving the money is what the budget is for). A first forward that was
+REFUSED or FAILED for any other reason — a stale quote, an aggregator or a
+THORNode that did not answer over Tor, a relay that said no — is tried
+again by itself too, three times, an hour, two and four hours later, and
+the chat hears once that it is ("tried again later, by itself — or tap
+below to try it now"); after the third the deposit is left for a tap
+("did not go through, again"), so a permanent refusal costs three wakes
+and stops. Money that can never be sent on at
 any rate this pair allows — under what was quoted — is `short`; the client
 can pay more to the same address. Once a forward has gone out, a tap past
 the recheck window — and the watcher's own recheck, once per window — runs

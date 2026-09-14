@@ -1228,8 +1228,10 @@ _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
       # NO-RESULT outcome mutation_sweep scores as no verdict at all.
       "wallet_file": "/var/lib/gs/spend.wallet",
       # The forward composes from these two the same way; without them it
-      # refuses (no_btc_config) and the sweep-over-JOBS loop would raise.
-      "btc_account_xpub": "xpub6FIXTUREACCOUNT", "btc_electrum": ["s.onion"]}
+      # refuses (no_btc_config) and the sweep-over-JOBS loop would raise --
+      # and under the 80-byte default it refuses op_return_too_small.
+      "btc_account_xpub": "xpub6FIXTUREACCOUNT", "btc_electrum": ["s.onion"],
+      "op_return_max_bytes": 140}
 # ...AND THE SAME KEY WITHOUT THE BTC INTAKE, for the deposit dispatches
 # below: with an xpub paired, a deposit allocates a BTC address and asks the
 # network whether it is fresh (stage 4), which is its own block of checks
@@ -4488,9 +4490,30 @@ def _pairs_btc(extra):
 _BTC_OK = ["--allow-btc-forward", "--btc-xpub", _BTC_XPUB_OK,
            "--btc-electrum", "s.onion", "--btc-electrum", "t.onion:50001,"
            + "ab" * 32, "--thornode", "https://tn.example",
-           "--deposit-in-chat"]
+           "--deposit-in-chat", "--op-return-max-bytes", "140"]
 check("pairing/btc: a complete BTC intake passes validation",
       _pairs_btc(_BTC_OK) is None)
+# AN INTAKE PAIR THAT COULD NEVER FORWARD. The default OP_RETURN policy is
+# the 80-byte standard, and no swap memo fits it: the documented recipe
+# paired an intake that refused every forward with memo_overflow, for
+# ever, with the client's money on the host's address. The memo grows with
+# the deposit, so the bound is the forward's own arithmetic, not 80.
+_BTC_NOPOL = [a for a in _BTC_OK if a not in ("--op-return-max-bytes", "140")]
+check("pairing/btc: an intake pair with the DEFAULT OP_RETURN policy (80) is "
+      "refused at pairing, naming the flag, the bound and the number to "
+      "pair with",
+      "--op-return-max-bytes" in (_pairs_btc(_BTC_NOPOL) or "")
+      and str(A.SWAP_MEMO_MAX_BYTES) in (_pairs_btc(_BTC_NOPOL) or "")
+      and str(A.SWAP_MEMO_POLICY_BYTES) in (_pairs_btc(_BTC_NOPOL) or ""))
+check("...one byte under the bound is refused; the bound itself and the "
+      "recommended policy pass; a pair WITHOUT an xpub keeps the default",
+      _pairs_btc(_BTC_NOPOL + ["--op-return-max-bytes",
+                               str(A.SWAP_MEMO_MAX_BYTES - 1)]) is not None
+      and _pairs_btc(_BTC_NOPOL + ["--op-return-max-bytes",
+                                   str(A.SWAP_MEMO_MAX_BYTES)]) is None
+      and _pairs_btc(_BTC_NOPOL + ["--op-return-max-bytes",
+                                   str(A.SWAP_MEMO_POLICY_BYTES)]) is None
+      and _pairs_btc([]) is None)
 check("pairing/btc: --btc-xpub WITHOUT --deposit-in-chat is refused at "
       "pairing, naming the mode it needs (the address reaches a phone "
       "through the chat or not at all)",
@@ -4657,7 +4680,7 @@ _FWD_KEY = {"allow_btc_forward": True,
             "btc_account_xpub": "xpub6FIXTUREACCOUNT",
             "btc_electrum": ["s.onion", "t.onion:50001"],
             "btc_network": "main", "btc_min_conf": 3,
-            "op_return_max_bytes": 120, "thornode_url": "https://tn.example"}
+            "op_return_max_bytes": 140, "thornode_url": "https://tn.example"}
 _FWD_REC = {"bundle": "/tmp/bay/wallet_fwd.json", "minted": 1,
             "slip": "/tmp/bay/thor_pairs_A3F1.json", "owner": OWNER,
             "btc_index": 3}
@@ -4724,7 +4747,7 @@ check("...the argv is composed from the KEYFILE and the LEDGER: --dry-run, "
       and _argv.count("--electrum") == 2 and "t.onion:50001" in _argv
       and _argv[_argv.index("--network") + 1] == "main"
       and _argv[_argv.index("--min-conf") + 1] == "3"
-      and _argv[_argv.index("--op-return-max-bytes") + 1] == "120"
+      and _argv[_argv.index("--op-return-max-bytes") + 1] == "140"
       and _argv[_argv.index("--thornode") + 1] == "https://tn.example"
       and _argv[_argv.index("--dest-from-receive-wallet") + 1]
       == "/tmp/bay/wallet_fwd.json"
@@ -4775,6 +4798,29 @@ for _bad in ({"btc_min_conf": 0}, {"btc_min_conf": "2"},
           f"never coerced: {_bad}",
           _o2 is None and getattr(_e2, "code", None) == "btc_config_malformed"
           and _ran2 == [])
+# A POLICY NO SWAP MEMO FITS is refused before the child, which would have
+# refused memo_overflow after a look, a quote and a wake -- and would have
+# for ever, since every retry quotes the same memo. Absent (a keyfile from
+# before pairing refused it) means the 80-byte default, which is that case.
+for _pol in (120, 80, None):
+    _kp = {**_FWD_KEY}
+    if _pol is None:
+        _kp.pop("op_return_max_bytes", None)
+    else:
+        _kp["op_return_max_bytes"] = _pol
+    _o3, _e3, _ran3 = _fwd_run(_FWD_REC, _kp)
+    check(f"a forward under an OP_RETURN policy no swap memo fits "
+          f"({'absent' if _pol is None else _pol}) is REFUSED "
+          f"op_return_too_small before any child, naming the number to "
+          f"re-pair with",
+          _o3 is None and getattr(_e3, "code", None) == "op_return_too_small"
+          and _ran3 == []
+          and str(A.SWAP_MEMO_POLICY_BYTES) in str(getattr(_e3, "message",
+                                                            "") or _e3))
+_o3, _e3, _ran3 = _fwd_run(_FWD_REC, {**_FWD_KEY, "op_return_max_bytes":
+                                      A.SWAP_MEMO_MAX_BYTES})
+check("...and the bound itself composes the forward",
+      _e3 is None and bool(_ran3))
 os.environ["GS_BTC_SEED_PASSPHRASE"] = "pp"
 try:
     _o, _e, _ran = _fwd_run(_FWD_REC, _FWD_KEY)
@@ -5480,7 +5526,7 @@ _ADDR = {0: "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",       # BIP84 vectors
 _, _, _k4, _ = new_env()
 _BK = {**_k4, "btc_account_xpub": _ZPUB, "btc_electrum": ["s.onion"],
        "btc_network": "main", "deposit_in_chat": True,
-       "allow_btc_forward": True}
+       "allow_btc_forward": True, "op_return_max_bytes": 140}
 _SHARED_IN = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 _MEMO4 = "=:XMR.XMR:" + _XMR_SAMPLE + ":0/1/0"
 
@@ -5638,12 +5684,15 @@ check("...while account 1's OWN xpub on account 1 passes the proof: done, "
       and "btc_seed_unset" not in _kinds)
 # (find, not index: on a copy with the call removed this must read RED,
 # not die with no RESULT line -- which the sweep scores as no verdict)
-_pos_prove = _A_SRC.find('if job == "receive_and_quote" and btc_mode(key):\n'
-                         '        _prove_btc_seed(key)')
+_pos_guard = _A_SRC.find('if job == "receive_and_quote" and btc_mode(key):')
+_pos_policy = _A_SRC.find("        _check_btc_policy(key)\n        _prove_btc_seed(key)",
+                          max(0, _pos_guard))
+_pos_steps = _A_SRC.find("    steps = build_argv(job, params, key, artifact_dir")
 check("...the proof is made BEFORE the mint (source): the call sits ahead "
-      "of build_argv in _dispatch, guarded by the intake mode",
-      0 <= _pos_prove
-      < _A_SRC.find("    steps = build_argv(job, params, key, artifact_dir"))
+      "of build_argv in _dispatch, guarded by the intake mode, with the "
+      "OP_RETURN policy check on the line before it",
+      0 <= _pos_guard < _pos_policy < _pos_steps
+      and _pos_policy - _pos_guard < 400)
 
 # THE LEDGER IS NOT TRUSTED ALONE, and an EMPTY ledger behind a USED chain
 # is refused outright (STAGE5_PLAN.md 3.6): every address the gap search
@@ -5710,7 +5759,7 @@ check("the ledger's bound keeps every record carrying btc_index (the oldest "
 
 _floor = A.btc_deposit_min_sat(_BK)
 _fee_c = _BT.vsize_upper_bound(
-    1, [_BT.INBOUND_SPK_MAX, _BT.op_return_script_len(80)]) * 200
+    1, [_BT.INBOUND_SPK_MAX, _BT.op_return_script_len(140)]) * 200
 # THE FLOOR IS THE LARGER OF THE FORWARDER'S TWO GUARDS at the ceiling
 # (STAGE5_PLAN.md 3.3): the dust floor after the fee, and the fee capped at
 # a fifth of the deposit. The first floor took only the first, so a deposit
@@ -5718,7 +5767,7 @@ _fee_c = _BT.vsize_upper_bound(
 check("the deposit floor on the intake is gs_btc_tx.forward_floor_sat at the "
       "keyfile's ceiling and policy: the larger of dust-floor-plus-fee and "
       "fee-over-the-cap, from gs_btc_tx's own bounds",
-      _floor == _BT.forward_floor_sat(80, 200, P.DEPOSIT_MIN_SAT)
+      _floor == _BT.forward_floor_sat(140, 200, P.DEPOSIT_MIN_SAT)
       and _floor == max(P.DEPOSIT_MIN_SAT + _fee_c,
                         -(-_fee_c * 100 // 20))
       and _floor > P.DEPOSIT_MIN_SAT + _fee_c
@@ -5730,6 +5779,22 @@ _o, _c, _asked, _ = _btc_dispatch(_d8, _run8, "B8A1", True, amount=_floor - 1)
 check("a deposit ONE satoshi under the floor is refused deposit_too_small "
       "BEFORE anything is minted or asked", _c == "deposit_too_small"
       and _runs8 == [] and _asked == [])
+# ...AND A DEPOSIT UNDER A POLICY NO SWAP MEMO FITS is refused before an
+# address exists: the forward could never send what landed there.
+_d8p, _runs8p, _run8p = _btc_env("btc8p_")
+_o, _c, _asked, _kinds8p = _btc_dispatch(_d8p, _run8p, "B8A2", True,
+                                         key={**_BK, "op_return_max_bytes": 80})
+check("a deposit on a pair whose OP_RETURN policy cannot carry a swap memo "
+      "is refused op_return_too_small BEFORE anything is minted or asked, "
+      "the kind on the chain", _c == "op_return_too_small"
+      and _runs8p == [] and _asked == []
+      and "op_return_too_small" in _kinds8p)
+_d8q, _runs8q, _run8q = _btc_env("btc8q_")
+_kq = {**_BK}
+_kq.pop("op_return_max_bytes", None)
+_o, _c, _asked, _ = _btc_dispatch(_d8q, _run8q, "B8A3", True, key=_kq)
+check("...and so is one on a keyfile from before the field existed (the "
+      "80-byte default)", _c == "op_return_too_small" and _runs8q == [])
 _o, _c, _asked, _ = _btc_dispatch(_d8, _run8, "B8A2", True, amount=_floor)
 check("...and exactly the floor is taken", _c is None and len(_runs8) == 2)
 try:

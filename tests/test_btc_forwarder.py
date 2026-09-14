@@ -704,15 +704,33 @@ check("a limit UNDER the floor (1 base unit) is raised to the floor",
       and _plan["memo"].endswith(f":{_floor_of(_plan)}/1/0"))
 # a limit between the floor and the expected output: the aggregator was
 # stricter than us; kept as written, even its notation
-_code, _out, _plan, _net, _tx = _limit_case(
-    "=:XMR.XMR:" + _DEST + ":{LIMIT}/3/5:thorname:0")
+_net = Net(memo="=:XMR.XMR:" + _DEST + ":{LIMIT}/3/5:thorname:25")
+_code, _out, _plan, _ = run(_net, "--max-affiliate-bps", "25", policy=255)
 check("a limit at or over the floor is kept as written -- streaming 3/5 "
-      "and the affiliate fields untouched, memo_limit_set false",
+      "and an affiliate fee within policy untouched, memo_limit_set false",
       _code == 0 and _plan["memo_limit_set"] is False
       and _plan["memo"] == _net.last_memo
-      and _plan["memo"].endswith("/3/5:thorname:0")
+      and _plan["memo"].endswith("/3/5:thorname:25")
       and _plan["memo_limit_base_units"]
       == int(_net.last_memo.split(":")[3].split("/")[0]))
+# AFFILIATE FIELDS THAT CARRY NO FEE ARE DROPPED: a 0-bps affiliate pays
+# nobody and changes nothing on the chain, but its bytes decided whether
+# the memo fit the OP_RETURN policy -- for every quote that carried it.
+_code, _out, _plan, _net, _tx = _limit_case(
+    "=:XMR.XMR:" + _DEST + ":{LIMIT}/3/5:" + "a" * 30 + ":0", policy=255)
+check("a thirty-character THORName at 0 bps is dropped from the memo laid "
+      "out (the quoted memo kept beside it): the limit and streaming "
+      "fields stay, nothing else follows them",
+      _code == 0 and _plan["memo"].endswith("/3/5")
+      and _plan["memo"].count(":") == 3
+      and _plan["memo_quoted"].endswith(":" + "a" * 30 + ":0")
+      and _plan["affiliate_bps"] == 0)
+_qlen30 = len(("=:XMR.XMR:" + _DEST + ":0/1/0:" + "a" * 30 + ":0").encode())
+_code, _out, _plan, _net, _tx = _limit_case(
+    "=:XMR.XMR:" + _DEST + ":0/1/0:" + "a" * 30 + ":0", policy=_qlen30 - 20)
+check("...so a policy the DECORATED memo would not fit still forwards: the "
+      "laid-out memo is the bounded one",
+      _code == 0 and _plan["memo_bytes"] <= _qlen30 - 20)
 # ABOVE the expected output: that swap can only refund, minus fees
 _r("memo_bad_limit", Net(memo="=:XMR.XMR:" + _DEST + ":99999999999/1/0"),
    policy=255)
@@ -763,6 +781,29 @@ check("the affiliate fields are read from positions 4-5 and the fee is "
       == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:30", 49500000, 30, True))
       and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:31",
                   _E, _W, 30) == ("refused", "memo_affiliate_fee"))
+check("affiliate fields at 0 bps are dropped (a name, an empty name, a "
+      "name with no fee field); fields THIS tool does not read after the "
+      "fee keep everything; a fee the policy allows keeps the fields",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0::0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:0:evm:x",
+                  _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:0:evm:x", 49500000, 0,
+                 True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:5", _E, _W,
+                  10)
+      == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:5", 49500000, 5, True)))
+check("the memo bound the pairing enforces is the forward's own arithmetic: "
+      "op and asset, a 95-character address, a 16-digit limit, '/1/0'",
+      C.SWAP_MEMO_MAX_BYTES == len("=:XMR.XMR:") + 95 + 1 + 16 + 4
+      and C.SWAP_MEMO_POLICY_BYTES > C.SWAP_MEMO_MAX_BYTES
+      and len(F.enforce_memo_terms("=:XMR.XMR:" + "8" * 95 + ":0/1/0",
+                                   Decimal("20000000"), Decimal("19999999"),
+                                   0)[0].encode()) <= C.SWAP_MEMO_MAX_BYTES)
 # THE SIZE CHECK IS ON THE FINAL BYTES, after the limit is written in
 _qlen = len(("=:XMR.XMR:" + _DEST + ":0/1/0").encode())
 check("a policy that fits the QUOTED memo but not the laid-out one refuses "

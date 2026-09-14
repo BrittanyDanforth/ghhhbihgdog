@@ -219,6 +219,46 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### The deep read: constants nobody could mock, and the pair that could never forward
+- Read for values that look right and are not: the Electrum fee estimate's
+  units (BTC/kB to sat/vB, ceiling -- right), the transaction sizing
+  constants (right), the SwapKit route fields, the THORNode inbound fields
+  and the memo grammar (match the published schemas), the CoinGecko URL,
+  the wake protocol's crypto (libsodium Box with library nonces, argon2id,
+  HMAC-SHA256 tokens under compare_digest, commit-then-reveal pairing:
+  Kerckhoffs holds, security rests on keys alone), the broadcaster's
+  Electrum methods.
+- FOUND: the pairing's default `--op-return-max-bytes` is the 80-byte
+  standard, the documented intake recipe never set it, and no swap memo
+  fits 80. Worse, the memo grows with the deposit (the output limit the
+  forward writes is in 1e8 base units), so a policy of 120 -- the tests'
+  fixture -- forwards small deposits and refuses the first large one with
+  `memo_overflow`, for ever, with the client's money on the host's
+  address. Fixed at three ends: `gs_common.SWAP_MEMO_MAX_BYTES` (126, the
+  forward's own arithmetic) with `SWAP_MEMO_POLICY_BYTES` (140) to pair
+  with; the pairing refuses an intake pair under the bound naming the
+  flag and the number; the vault refuses to mint a deposit
+  (`op_return_too_small`, before an address exists) or compose a forward
+  under it; and the forwarder drops affiliate fields that carry no fee, so
+  an aggregator's decoration (a thirty-character THORName at 0 bps) cannot
+  push a memo past the policy. OPSEC_SETUP's recipe now carries the flag.
+- FOUND: a first forward refused or failed for any reason other than the
+  fee (`delayed`) left the deposit `stalled` for a tap. Most such refusals
+  are the network on a bad Tor day (a stale quote, an aggregator or
+  THORNode that did not answer, a relay that said no), and on an
+  unattended host a tap never comes: a confirmed deposit sat on the
+  host's address for ever. Now `STALL_RETRIES` (3) automatic retries, the
+  wait doubling from `--btc-fee-retry`, as background starts that leave
+  the reserve; the chat hears once that it is tried again by itself, and
+  once more when the retries are spent. A run that finished clears the
+  count. test_telegram_pager 792; four anchors.
+- Checked and left alone: the forward's worst case over Tor (look,
+  history, quote, oracle, THORNode, submit, seen, each bounded) fits its
+  900 s budget; the quote-age bound (300 s) covers the cross-check's own
+  circuit; Telegram's 48 h deletion window and the long-poll hold.
+- Still only mainnet can prove: that THORChain routes XMR and takes this
+  memo at all. Every stage's docs say so; nothing here changes that.
+
 ### After stage 6: the functionality pass (the weaknesses list, read end to end)
 - Read: `Limits`, `start_job`, `_btc_can_start`, `_btc_apply`, the
   `delayed` branches, `btc_tick`'s recheck, `gs_btc_watch.look` (it fails

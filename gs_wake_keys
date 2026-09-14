@@ -79,8 +79,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
-    atomic_write_json, integrity_log, install_signal_handlers, secure_mkdir,
-    wipe_covers,
+    SWAP_MEMO_MAX_BYTES, SWAP_MEMO_POLICY_BYTES, atomic_write_json,
+    integrity_log, install_signal_handlers, secure_mkdir, wipe_covers,
 )
 import gs_wake_proto as proto                                # noqa: E402
 from decimal import Decimal                                  # noqa: E402
@@ -626,6 +626,23 @@ def _validate_btc(args) -> None:
         sys.exit("[!] --op-return-max-bytes must be 1..255 (80 is the "
                  "standard relay limit; no swap memo fits it -- see "
                  "STAGE2_PLAN.md section 2).")
+    if args.btc_xpub and args.op_return_max_bytes < SWAP_MEMO_MAX_BYTES:
+        # AN INTAKE PAIR THAT CAN NEVER FORWARD. The host-side forward lays
+        # the memo out itself, and the memo grows with the deposit (the
+        # output limit is written in 1e8 base units): under this bound a
+        # pair forwards a drill's crumbs and refuses the first real deposit
+        # with memo_overflow, for ever, with the client's money on the
+        # host's address. The default of 80 is exactly that pair.
+        sys.exit(f"[!] --op-return-max-bytes {int(args.op_return_max_bytes)} "
+                 f"cannot carry the swap memo the forward writes: the op and "
+                 f"asset, a 95-character Monero address and an output limit "
+                 f"of up to 16 digits are {SWAP_MEMO_MAX_BYTES} bytes, so "
+                 f"this pair would refuse some or every forward "
+                 f"(memo_overflow) and the deposit would sit on the host's "
+                 f"address.\n    Pair with --op-return-max-bytes "
+                 f"{SWAP_MEMO_POLICY_BYTES} or more -- and ONLY on a node "
+                 f"whose relay policy carries it (Bitcoin Core 30 or later, "
+                 f"or -datacarriersize raised); see STAGE2_PLAN.md section 2.")
     if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb:
         sys.exit("[!] the fee band must satisfy 1 <= --feerate-floor-sat-vb "
                  "<= --feerate-ceiling-sat-vb.")

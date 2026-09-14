@@ -5146,6 +5146,10 @@ class Pager:
                                  "said": set(), "since": time.time()}
             if not e:
                 return
+            if out == "done":
+                # THE RUN FINISHED: whatever it said, the automatic retries
+                # of a refused or failed forward start over from here.
+                e.pop("stall_tries", None)
             if out == "done" and phase in ("sent", "unsure"):
                 # Gone from the address, or may be: the vault's word is the
                 # phase line the forward branch renders. KEPT on the list as
@@ -5235,22 +5239,65 @@ class Pager:
                 # words; this end waits a window and asks again.
                 e["rechecked_at"] = time.time()
                 return
-            # A rehearsal (done, no word), a refusal or a failure: the
-            # automatic path stops here so it cannot spend a wake a tick,
-            # and the button still asks. Said once.
-            e["state"] = "stalled"
-            first = "stalled" not in e["said"]
-            e["said"].add("stalled")
-        if first and out != "done":
+            if out != "done":
+                # A REFUSAL OR A FAILURE ON A FIRST FORWARD IS TRIED AGAIN,
+                # BY ITSELF, A BOUNDED NUMBER OF TIMES (STALL_RETRIES). Most
+                # of what refuses a forward is the network on a bad Tor day
+                # -- a stale quote, an aggregator or a THORNode that did not
+                # answer, a relay that said no -- and a confirmed deposit
+                # left for a tap sat on the host's address for as long as
+                # nobody tapped, which on an unattended host is for ever.
+                # The wait doubles from --btc-fee-retry, so a permanent
+                # refusal costs three wakes over seven hours and then stops;
+                # the tap still tries at once. A rehearsal (done, no word)
+                # is not retried: nothing failed.
+                try:
+                    _tries = max(0, int(e.get("stall_tries") or 0)) + 1
+                except (TypeError, ValueError):
+                    _tries = 1
+                if _tries <= int(self.STALL_RETRIES):
+                    e["state"] = "seen"
+                    e["stall_tries"] = _tries
+                    e["retry_after"] = time.time() + float(
+                        self.btc_fee_retry_s) * float(2 ** (_tries - 1))
+                    first = "stall_retry" not in e["said"]
+                    e["said"].add("stall_retry")
+                    _say = "retry" if first else None
+                else:
+                    e["state"] = "stalled"
+                    first = "stalled" not in e["said"]
+                    e["said"].add("stalled")
+                    _say = "stalled" if first else None
+            else:
+                # A rehearsal (done, no word): the automatic path stops
+                # here so it cannot spend a wake a tick, and the button
+                # still asks. Nothing to say -- nothing failed.
+                e["state"] = "stalled"
+                e["said"].add("stalled")
+                _say = None
+        if _say:
             try:
                 _cn = self._label(chat_id, h)
             except BaseException:                            # noqa: BLE001
                 _cn = h
-            self.send(chat_id,
-                      f"{_cn}: it is here, but sending it on did not go "
-                      f"through. Tap below to try again.",
-                      buttons=self._handle_buttons(h, "receive_and_quote",
-                                                   chat_id))
+            if _say == "retry":
+                self.send(chat_id,
+                          f"{_cn}: it is here, but sending it on did not go "
+                          f"through. It is tried again later, by itself — "
+                          f"or tap below to try it now.",
+                          buttons=self._handle_buttons(h, "receive_and_quote",
+                                                       chat_id))
+            else:
+                self.send(chat_id,
+                          f"{_cn}: it is here, but sending it on did not go "
+                          f"through, again. Tap below to try again.",
+                          buttons=self._handle_buttons(h, "receive_and_quote",
+                                                       chat_id))
+
+    #: How many times a first forward that was refused or failed is tried
+    #: again by itself before the deposit is left for a tap. The wait
+    #: doubles from --btc-fee-retry: an hour, two, four.
+    STALL_RETRIES = 3
 
     #: How long after a forward went out this end asks the forward about
     #: it again (stage 6): --btc-recheck. At least the vault's
@@ -5425,10 +5472,12 @@ class Pager:
             e["conf"], e["unconf"] = conf, unconf
             chat = e["chat"]
             _waiting = time.time() < float(e.get("retry_after") or 0.0)
-            # A FEE RETRY is a start nobody asked for: it leaves the
-            # reserve for taps (_btc_can_start), and it is not said --
-            # the chat heard the vault's own `delayed` sentence.
-            _retry = int(e.get("fee_tries") or 0) > 0
+            # A FEE RETRY, or the retry of a refused or failed forward, is
+            # a start nobody asked for: it leaves the reserve for taps
+            # (_btc_can_start), and it is not said -- the chat heard the
+            # vault's own `delayed` sentence, or the retry sentence.
+            _retry = (int(e.get("fee_tries") or 0) > 0
+                      or int(e.get("stall_tries") or 0) > 0)
             if state == "confirmed" and _waiting:
                 # A `delayed` forward's retry is not due yet: the vault
                 # said so once, in its own words; nothing is said or

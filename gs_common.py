@@ -2445,6 +2445,23 @@ def parse_swap_route(route: dict) -> tuple:
 #: characters, so "=:XMR.XMR:<address>" on its own is already over it.
 OP_RETURN_STD_BYTES = 80
 
+#: The most bytes the swap memo the HOST-SIDE FORWARD writes can take when
+#: no affiliate fee rides on it: the short op and asset ("=:XMR.XMR:"), a
+#: 95-character Monero address, the output limit the forwarder sets in 1e8
+#: base units (at most 16 digits -- Monero's whole supply is under 2e15 of
+#: them) and THORChain's example streaming fields ("/1/0"). The memo's
+#: length GROWS WITH THE DEPOSIT (a bigger deposit is a longer limit), so an
+#: OP_RETURN policy under this forwards the small deposits a drill sends and
+#: refuses the first real one (memo_overflow) -- with the client's money
+#: already on the host's address. The pairing refuses an intake pair under
+#: it, and the vault refuses to mint a deposit or compose a forward under it.
+SWAP_MEMO_MAX_BYTES = len("=:XMR.XMR:") + 95 + 1 + 16 + len("/1/0")
+#: What to pair with: room over that bound for a streaming interval and
+#: quantity of a few digits, or the long-form "SWAP:" op an aggregator may
+#: quote. Only on a node whose relay policy carries it (Bitcoin Core 30 and
+#: later by default; older nodes with -datacarriersize raised).
+SWAP_MEMO_POLICY_BYTES = 140
+
 
 def memo_size_note(memo: str) -> str:
     """A warning when the memo will not fit a standard OP_RETURN, else "".

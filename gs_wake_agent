@@ -65,6 +65,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
+    SWAP_MEMO_MAX_BYTES, SWAP_MEMO_POLICY_BYTES,
     daemon_fee_estimate, fee_estimate_per_tx, isolated_proxy,
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
     install_signal_handlers, resource_check, rpc_lock_scope,
@@ -1354,6 +1355,31 @@ def _btc_unused_live(key: dict, address: str) -> bool:
                      network=str(key.get("btc_network") or "main"))
 
 
+def _check_btc_policy(key: dict) -> None:
+    """The keyfile's OP_RETURN policy can carry the swap memo the forward
+    writes -- checked BEFORE a deposit address is issued and before a
+    forward is composed, never after a client's money is on the address.
+
+    The memo grows with the deposit (its output limit is written in 1e8
+    base units), so a policy under gs_common.SWAP_MEMO_MAX_BYTES forwards
+    a drill's crumbs and refuses the first real deposit with memo_overflow
+    -- for ever, since every retry quotes the same memo. A keyfile from
+    before the pairing refused this (its default was the 80-byte standard,
+    which no swap memo fits) is exactly the case. Present-and-wrong values
+    are refused by _btc_setting as everywhere."""
+    _op = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)
+    if _op < SWAP_MEMO_MAX_BYTES:
+        integrity_log("wake", "op_return_too_small")
+        raise Refused(
+            "op_return_too_small",
+            f"this machine's OP_RETURN policy ({_op} bytes) cannot carry "
+            f"the swap memo a forward writes (at least "
+            f"{SWAP_MEMO_MAX_BYTES}), so no deposit could be sent on. "
+            f"Nothing was minted or spent. Re-pair with "
+            f"--op-return-max-bytes {SWAP_MEMO_POLICY_BYTES} on a node "
+            f"whose relay policy carries it.")
+
+
 def _prove_btc_seed(key: dict) -> None:
     """The seed in this machine's environment DERIVES the account xpub the
     Pi watches -- proven before a deposit address is issued, never after a
@@ -1957,6 +1983,9 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
         # that is present and wrong is refused, and only an ABSENT one takes
         # the default (a keyfile written before the field existed).
         _min_conf = _btc_setting(key, "btc_min_conf", 2, 1, 1008)
+        # A POLICY NO SWAP MEMO FITS is refused before the child, which
+        # would refuse memo_overflow after a look, a quote and a wake.
+        _check_btc_policy(key)
         _op_max = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)
         _floor = _btc_setting(key, "feerate_floor_sat_vb", 1, 1, 100000)
         _ceiling = _btc_setting(key, "feerate_ceiling_sat_vb", 200, 1, 100000)
@@ -3787,6 +3816,10 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # never sign for is not one to hand a client, and the refusal costs no
     # child -- no XMR subaddress minted, no quote, no address asked about.
     if job == "receive_and_quote" and btc_mode(key):
+        # ...AND THAT THE FORWARD COULD EVER SEND WHAT LANDS THERE: an
+        # OP_RETURN policy no swap memo fits is refused here, before an
+        # address exists, for the same reason the seed is proven here.
+        _check_btc_policy(key)
         _prove_btc_seed(key)
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
                        slip=slip, handle=handle, owned_fee=_owned_fee,

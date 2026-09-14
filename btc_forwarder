@@ -425,6 +425,18 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
     checked before still holds; it is checked AGAIN on the result anyway.
     The affiliate fee, in basis points to a THORName, is a skim of up to
     10%; it is capped by policy, default 0.
+
+    ...WITH ONE EXCEPTION: AFFILIATE FIELDS THAT CARRY NO FEE ARE DROPPED.
+    An aggregator decorates its memo ("::0", or its own THORName at 0
+    basis points). On the chain a 0-bps affiliate pays nobody and changes
+    nothing about the swap; in an OP_RETURN it is bytes, and bytes are what
+    the relay policy counts -- so up to thirty characters of somebody's
+    name decided whether a forward fit the policy at all (memo_overflow,
+    for every quote that carried it, for ever). Dropped when the fee is
+    zero and nothing follows the fee field; kept byte for byte when a fee
+    the operator allows rides on it, or when fields this tool does not read
+    (an aggregator's EVM addresses) follow. The memo's length is then
+    bounded by gs_common.SWAP_MEMO_MAX_BYTES plus the streaming fields.
     Returns (memo_text_out, limit_base_units, affiliate_bps, limit_set)."""
     parts = str(memo_text).strip().split(":")
     while len(parts) < 4:
@@ -452,7 +464,6 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
     if limit_set:
         sub[0] = str(limit)
         parts[3] = "/".join(sub)
-    out = ":".join(parts)
     bps = 0
     fee_field = parts[5].strip() if len(parts) > 5 else ""
     if fee_field:
@@ -465,6 +476,9 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
         raise Refused("memo_affiliate_fee",
                       f"the memo carries an affiliate fee of {bps} basis "
                       f"points, over the {max_affiliate_bps} this box allows")
+    if bps == 0 and not any(p.strip() for p in parts[6:]):
+        parts = parts[:4]
+    out = ":".join(parts)
     return out, limit, bps, limit_set
 
 

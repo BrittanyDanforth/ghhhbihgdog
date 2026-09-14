@@ -5021,8 +5021,8 @@ for _out, _ph, _want, _msgs in (("done", "sent", "sent", 0),
                                 ("done", "delayed", "seen", 0),
                                 ("done", "returned", "seen", 0),
                                 ("done", "", "stalled", 0),
-                                ("refused", "", "stalled", 1),
-                                ("failed", "", "stalled", 1)):
+                                ("refused", "", "seen", 1),
+                                ("failed", "", "seen", 1)):
     _rp, _rs, _rj = _watch_pager()
     _rp.btc_open["B4A1"]["state"] = "forwarding"
     _rp._btc_forward_result("B4A1", _out, _ph, 111)
@@ -5034,6 +5034,65 @@ for _out, _ph, _want, _msgs in (("done", "sent", "sent", 0),
           and len(_rs) == _msgs
           and (not _msgs or ("did not go through" in _rs[0][0]
                              and _rs[0][1])))
+# A REFUSED OR FAILED FIRST FORWARD IS TRIED AGAIN BY ITSELF, a bounded
+# number of times, the wait doubling from --btc-fee-retry: most of what
+# refuses a forward is the network on a bad Tor day, and a confirmed deposit
+# left for a tap sat on the host's address for ever on an unattended host.
+_st, _sts, _stj = _watch_pager()
+_st.btc_servers = [("s.onion", 50002, None)]
+_st.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_st.btc_fee_retry_s = 3600
+_st.btc_open["B4A1"]["state"] = "forwarding"
+_st_waits, _st_states = [], []
+for _i in range(4):
+    _st._btc_forward_result("B4A1", "refused", "", 111)
+    _ste = _st.btc_open.get("B4A1", {})
+    _st_states.append(_ste.get("state"))
+    _st_waits.append(_ste.get("retry_after", 0) - time.time())
+check("three refusals in a row keep the deposit `seen` with a retry one, "
+      "two, then four hours out; the FOURTH leaves it stalled for a tap",
+      _st_states == ["seen", "seen", "seen", "stalled"]
+      and all(abs(w - x) < 5 for w, x in zip(_st_waits[:3],
+                                              (3600, 7200, 14400)))
+      and pg.Pager.STALL_RETRIES == 3)
+check("...said twice in all: once that it is tried again by itself (with "
+      "the button to try now), once that it did not go through again",
+      len(_sts) == 2 and "tried again later, by itself" in _sts[0][0]
+      and _sts[0][1] and "again. Tap below" in _sts[1][0] and _sts[1][1]
+      and not any(ch.isdigit() for t, _b in _sts
+                  for ch in t.split(":", 1)[1]))
+_st2, _sts2, _stj2 = _watch_pager()
+_st2.btc_servers = [("s.onion", 50002, None)]
+_st2.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_st2.btc_open["B4A1"]["state"] = "forwarding"
+_st2.btc_open["B4A1"]["said"].add("confirmed")
+_st2._btc_forward_result("B4A1", "failed", "", 111)
+_st2.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("a tick before the retry time starts nothing for it",
+      _stj2 == [] and _st2.btc_open["B4A1"]["state"] == "seen")
+_st2.btc_open["B4A1"]["retry_after"] = time.time() - 1
+_st2.limits.headroom = lambda: 2
+_st2.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...the retry is a BACKGROUND start: with only the reserve left it "
+      "waits, silently", _stj2 == [] and len(_sts2) == 1)
+_st2.limits.headroom = lambda: 5
+_st2.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...and starts once there is room, through start_job, without "
+      "repeating any sentence",
+      _stj2 == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and len(_sts2) == 1
+      and _st2.btc_open["B4A1"]["state"] == "forwarding")
+_st2._btc_forward_result("B4A1", "done", "delayed", 111)
+check("a run that FINISHED (whatever its word) clears the retry count",
+      "stall_tries" not in _st2.btc_open["B4A1"]
+      and _st2.btc_open["B4A1"]["state"] == "seen")
+_st3, _sts3, _stj3 = _watch_pager()
+_st3.btc_open["B4A1"]["state"] = "forwarding"
+_st3.btc_open["B4A1"]["stall_tries"] = "junk"
+_st3._btc_forward_result("B4A1", "refused", "", 111)
+check("a malformed retry count starts over rather than dying",
+      _st3.btc_open["B4A1"].get("stall_tries") == 1
+      and _st3.btc_open["B4A1"]["state"] == "seen")
 _rp, _rs, _rj = _watch_pager()
 _rp._btc_forward_result("ZZZZ", "done", "sent", 111)
 check("a forward for a handle this end is not watching changes nothing",

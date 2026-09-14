@@ -4720,6 +4720,39 @@ MUTATIONS = [
   '        plan["superseded_height"] = int(newest["height"])\n',
   '',
   ['test_btc_forwarder']),
+ ('pairing accepts an intake policy no swap memo fits', 'gs_wake_keys',
+  '    if args.btc_xpub and args.op_return_max_bytes < SWAP_MEMO_MAX_BYTES:',
+  '    if False:',
+  ['test_wake_agent']),
+ ('a deposit is minted under a policy no swap memo fits', 'gs_wake_agent',
+  '        _check_btc_policy(key)\n        _prove_btc_seed(key)',
+  '        _prove_btc_seed(key)',
+  ['test_wake_agent']),
+ ('a forward is composed under a policy no swap memo fits', 'gs_wake_agent',
+  '        _check_btc_policy(key)\n'
+  '        _op_max = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)',
+  '        _op_max = _btc_setting(key, "op_return_max_bytes", 80, 1, 255)',
+  ['test_wake_agent']),
+ ('the policy check never refuses', 'gs_wake_agent',
+  '    if _op < SWAP_MEMO_MAX_BYTES:\n'
+  '        integrity_log("wake", "op_return_too_small")',
+  '    if False:\n'
+  '        integrity_log("wake", "op_return_too_small")',
+  ['test_wake_agent']),
+ ('affiliate fields that carry no fee are kept on the memo', 'btc_forwarder',
+  '    if bps == 0 and not any(p.strip() for p in parts[6:]):\n'
+  '        parts = parts[:4]',
+  '    if False:\n'
+  '        parts = parts[:4]',
+  ['test_btc_forwarder']),
+ ('affiliate fields WITH a fee are dropped too', 'btc_forwarder',
+  '    if bps == 0 and not any(p.strip() for p in parts[6:]):',
+  '    if not any(p.strip() for p in parts[6:]):',
+  ['test_btc_forwarder']),
+ ('the swap-memo bound is the 80-byte standard', 'gs_common.py',
+  'SWAP_MEMO_MAX_BYTES = len("=:XMR.XMR:") + 95 + 1 + 16 + len("/1/0")',
+  'SWAP_MEMO_MAX_BYTES = 80',
+  ['test_btc_forwarder', 'test_wake_agent']),
  ('the bump window is not handed to the forwarder', 'gs_wake_agent',
   '                "--bump-after", str(_bump),\n',
   '',
@@ -4815,6 +4848,27 @@ MUTATIONS = [
  ('a held fee retry is said as if it were a first forward', 'gs_telegram_pager',
   '                say = None if _retry else "held"',
   '                say = "held"',
+  ['test_telegram_pager']),
+ ('a refused first forward is never tried again by itself', 'gs_telegram_pager',
+  '                if _tries <= int(self.STALL_RETRIES):',
+  '                if False:',
+  ['test_telegram_pager']),
+ ('the automatic retries of a refused forward are unbounded', 'gs_telegram_pager',
+  '                if _tries <= int(self.STALL_RETRIES):',
+  '                if True:',
+  ['test_telegram_pager']),
+ ('a finished run keeps the stall retry count', 'gs_telegram_pager',
+  '            if out == "done":\n'
+  '                # THE RUN FINISHED: whatever it said, the automatic retries\n'
+  '                # of a refused or failed forward start over from here.\n'
+  '                e.pop("stall_tries", None)\n',
+  '',
+  ['test_telegram_pager']),
+ ('the retry of a refused forward is a foreground start (the reserve ignored)',
+  'gs_telegram_pager',
+  '            _retry = (int(e.get("fee_tries") or 0) > 0\n'
+  '                      or int(e.get("stall_tries") or 0) > 0)',
+  '            _retry = int(e.get("fee_tries") or 0) > 0',
   ['test_telegram_pager']),
  ('the operator alert repeats every failure', 'gs_telegram_pager',
   '            if _last and _now - _last < float(self.ALERT_MIN_GAP_S):\n'
@@ -5129,9 +5183,9 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the seed is not proven before a deposit address is issued',
   'gs_wake_agent',
-  '    if job == "receive_and_quote" and btc_mode(key):\n'
+  '        _check_btc_policy(key)\n'
   '        _prove_btc_seed(key)',
-  '    if job == "receive_and_quote" and btc_mode(key):\n'
+  '        _check_btc_policy(key)\n'
   '        pass',
   ['test_wake_agent']),
  ('a seed that derives another account passes the proof', 'gs_wake_agent',
