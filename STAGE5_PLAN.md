@@ -1,0 +1,367 @@
+# Stage 5: what happens when it does not go to plan — failure handling and reconciliation
+
+Status: **PLANNED** (this commit); the build follows step by step, and the
+status block at the end is updated as each step lands. This file is the
+whole context for stage 5 of the BTC-intake rework (`BTC_INTAKE_DESIGN.md`;
+the earlier stages are `STAGE2_PLAN.md`, `STAGE3_PLAN.md`, `STAGE4_PLAN.md`).
+
+Stages 2–4 built the path that works: a client pays a plain address, the Pi
+sees it, the vault signs and sends the forward, the swap lands, the mix
+runs. Stage 5 is every place that path can stop with the client's money
+sitting somewhere and nobody able to move it — and the promise "you get
+back about X", which the forward-time swap does not keep by itself.
+
+---
+
+## 1. The end-to-end read (what is real, what is mocked, what is fake)
+
+Before planning, the whole money path was read again as a stranger would,
+without trusting the tests to have covered it: the wizard (`/deposit`),
+`start_job`, the doorbell, `_run_validated`/`_dispatch` in BTC mode, the
+deposit-time quote, the plain slip, the pager's reply and watcher, the
+forward job, `btc_forwarder` top to bottom, `gs_btc_broadcast` top to
+bottom, `gs_btc_watch.look`, the phase words, and back to the pager.
+
+**Real.** The signing is embit on the system libsecp256k1 and refuses any
+other backend; BIP143 is checked byte for byte against known vectors. The
+quote goes to `api.swapkit.dev`, the price cross-check to CoinGecko, the
+inbound cross-check to a THORNode the operator names, all over Tor on
+separate circuits. The Electrum client, the SOCKS5 framing, the TLS pin,
+the broadcast method and the history poll are the shipped code, driven in
+the suites through a real transport against an in-process SOCKS5 + TLS
+Electrum server (`tests/btcmock.py`) that computes the real txid of the hex
+it is handed. Every refusal in the forwarder is reachable and tested.
+
+**Mocked, and said so.** This sandbox has no Tor and no egress, so nothing
+in it has ever touched a network. `tests/real_btc_forward_testnet.py`
+drives the shipped forwarder over real Tor against real testnet on a box
+that has both, with ONLY the quote stubbed, and its header says what that
+leaves unproven: that THORChain accepts the memo. There is no testnet
+THORChain and no testnet XMR quote; only mainnet, with money, proves the
+swap starts. That statement stays true at the end of stage 5; the plan
+below adds nothing that pretends otherwise.
+
+**Nothing fake found**, in the sense of a stub shipped as production, a
+guard that cannot fire, a switch with no writer, or a sentence promising
+what the code does not do — with the exceptions below, which are not fakes
+but gaps the working path hides, each found by asking "where does the
+client's money sit now, and who can move it?":
+
+1. **A forward that moved money and then died reads as "not yet" for
+   ever.** The plan is written AFTER the broadcast. A power cut, the
+   deadman, or a crash between the two leaves the outputs spent and no
+   plan; the next run's `look` (listunspent only) sees nothing unspent and
+   answers `nothing_settled` → `not_yet`. The swap went through and the
+   phone hears "nothing on the address yet" indefinitely.
+2. **A forward the mempool dropped is stranded behind the once-sent rule.**
+   `seen` at height 0 is a mempool listing; a fee spike evicts it, it never
+   confirms, the deposit's outputs are unspent again — and the handle is
+   `forward_sent`, so every later run is a no-op answering `sent`. The
+   signed bytes were kept only while unseen, so there is nothing to re-send
+   and no path to re-sign. The client's money sits on the host's address.
+3. **A refund lands where nobody looks.** THORChain refunds a swap it will
+   not execute (the memo's limit not met, a halted chain, dust) to the
+   SENDER: the transaction's input address, which is the host's deposit
+   address. After `sent` the Pi has closed its watch entry and the vault
+   answers `sent` for ever; the refunded bitcoin sits on the host's address
+   with the client told the forward went out.
+4. **`unsure` is answered for ever.** An ambiguous broadcast (bytes left,
+   no acceptance, not listed in the wait) keeps the hex and reports
+   `unsure`; nothing ever asks again whether it was listed, re-sends the
+   kept bytes, or re-signs if the outputs are still there.
+5. **The XMR side judges the arrival against the wrong quote.** The
+   watching jobs read `expected_xmr` from the pairs file the DEPOSIT-time
+   quote wrote, for the whole deposit; the real swap was quoted at forward
+   time for the deposit minus the fee, at that day's rate. A rate move over
+   the 10% tolerance reads as `short` ("UNDER what was quoted... Check
+   before going further") about a swap that delivered exactly what it
+   quoted. Reconciliation was named in the design and never built.
+6. **A fee spike stalls the automatic path for good.** `fee_eats_deposit`
+   and `fee_out_of_band` are refusals with no status word, so the pager
+   marks the deposit stalled ("did not go through. Tap below to try
+   again") and the watcher stops. Fees fall in hours; nothing tries again.
+7. **The deposit floor and the fee cap contradict each other at the
+   floor.** The vault's floor is `FORWARD_MIN_SAT` plus one input's fee at
+   the ceiling rate; the forwarder refuses a fee over 20% of what settled.
+   At the floor with fees at the ceiling the fee is ~80% of the deposit:
+   the vault accepted a deposit the forwarder can never send at that rate.
+8. **The THORNode cross-check is optional even when money moves.**
+   `--thornode` may be omitted at pairing; then the forward pays whatever
+   the aggregator names, and the one check against a compromised
+   aggregator never runs. The design called that "the failure this
+   catches"; a switch that can be off is not a catch.
+9. **A wiped ledger closes the intake, and can pair a late payer with a
+   new client.** `btc_index_exhausted` is permanent for the account (the
+   forwarder derives account 0 only, so re-pairing changes nothing), and
+   after a wipe an address issued to a client who pays LATE looks fresh to
+   the network and can be reissued (STAGE4_PLAN.md section 8).
+
+---
+
+## 2. Self-doubt on the design, and the decisions this plan makes
+
+**"Once sent, never again" was the wrong invariant.** It keyed on the
+HANDLE; the thing that must never happen twice is a signature over the
+same OUTPOINT. A refund, a client's second payment, an evicted forward —
+each puts money on the address that has never been forwarded, and a rule
+on the handle strands all of them. The ledger records the outpoints each
+forward spent (`forward_inputs`), and a run may sign only outputs not on
+that list. The handle's `forward_sent` stays as the fact "a forward went
+out", not as a lock.
+
+**The repeat run is the reconciliation, not a no-op.** Stage 4 turned the
+tap after `sent` into a run that answers from the plan. Stage 5 makes that
+run LOOK: is our txid listed (mempool or block)? Are the inputs still
+unspent? Is there new money on the address? Each answer is one word to the
+phone and one action on the vault, listed in 3.1. No new job on the wire:
+`forward_to_swap` on a sent handle is it, and the Pi already routes there.
+
+**Words, not numbers, still.** Every new phase word is a closed sentence
+with no coin, amount, depth, fee or server in it. The vault knows the
+numbers; the phone hears "it is being sent on again" or "the network is
+busy; tried again later, by itself".
+
+**The floor is made honest rather than the cap made soft.** The cap (a
+fee over 20% of the deposit is refused) protects the client; the floor was
+what lied. It becomes the smallest deposit that is forwardable AT THE
+CEILING under every rule: `max(FORWARD_MIN_SAT + fee_ceiling,
+ceil(fee_ceiling / MAX_FEE_FRACTION))`. That is 0.002 BTC at the shipped
+200 sat/vB ceiling and a fifth of it at 40; the ceiling is the operator's
+choice and the number is quoted to them at pairing. A lower cap would have
+burned the client's money to keep a small number on the wizard.
+
+**Fee spikes are waited out, by the machine.** A fee refusal becomes a
+status word (`delayed`); the pager keeps the deposit on its list and tries
+the forward again after `--btc-fee-retry` (default one hour), through the
+same gates as any wake. No operator, no tap.
+
+**The THORNode cross-check becomes mandatory where money moves.**
+`--allow-btc-broadcast` requires `--thornode` at pairing, and the forwarder
+refuses `--broadcast` without one. A rehearsal may still run without it.
+
+**The wiped ledger gets one rule: the ledger and the chain agree at
+index 0, or the account is retired.** A vault whose ledger knows no index
+while address 0 has history refuses every deposit (`ledger_wiped`) and
+names the way out: re-pair with `--btc-account N+1`, a fresh chain under
+the same seed. The forwarder derives the paired account and still proves
+it against the xpub. One rule closes both the exhaustion and the late
+payer; the gap search stays for the small case (a pruned record or two).
+Records carrying `btc_index` are exempt from the ledger's pruning, so a
+quiet month does not fake a wipe.
+
+**Persistence on the Pi stays "none".** After a restart every ask goes to
+the forward, which now answers truthfully at every stage (`not_yet`,
+`arriving`, `delayed`, `sent`, `returned`, `unsure`); the automatic
+sentences resume for a deposit as soon as its forward answers a word the
+watcher can act on. Rule 6 keeps the card clean; the vault is the record.
+
+---
+
+## 3. Design
+
+### 3.1 The reconciliation run: `forward_to_swap` on a handle that has a forward
+
+`_dispatch` no longer answers a sent handle from the plan alone. It runs
+`btc_forwarder --reconcile` (a third mode, exclusive with the other two)
+with the plan's path; the forwarder reads the plan (txid, `tx_hex` when
+kept, the inputs it spent, `send_sat`, `expected_xmr`) and asks the
+network, on the address's own circuits: the address's HISTORY
+(`Broadcaster.history`, read-only) and its unspent outputs (`look`). Then
+one of these, in this order, each a status word and an action:
+
+| what the network shows | word | the forwarder does |
+|---|---|---|
+| our txid listed at height > 0 | `sent` | nothing; writes `{state: confirmed}` beside the plan (depth stays on the vault) |
+| our txid listed at height ≤ 0 | `sent` | nothing (still confirming) |
+| not listed; inputs still unspent; hex kept | `unsure` → re-sent | `submit` the SAME bytes again; the outcome updates the plan (`resends`), `seen` polled |
+| not listed; inputs still unspent; no hex | `returned` | the outputs are money never sent: a FRESH forward of them (new quote, new signature, new plan; the old plan kept as `btc_forward_<handle>.<n>.json`); the ledger's `forward_inputs` grows |
+| not listed; inputs spent by a tx that is not ours | FAILED, no word; kind `forward_foreign_spend` | nothing is signed. Only a leaked key does this; the phone hears "failed", which is true of the machine, and the operator reads the kind at the vault |
+| new unspent outputs beyond the forwarded inputs (a refund, or a second payment) | `returned` | a fresh forward of the new outputs only, as above, once they settle to `min_conf` (a refund is a normal payment to the address) |
+| the outputs are gone, our txid is in the history, and there is no plan (case 1 of section 1) | `sent` | the history shows our spend; the ledger learns `forward_sent`, the plan is reconstructed from the history (txid, inputs) with `reconstructed: true` |
+
+The word `moved` is NOT reused: on the wire it means "paid out by a
+withdrawal", and a forward that went out is `sent`. `_phase_of` reads the
+new `{state}` words: `confirmed` → `sent`; `resent` → `unsure` or `sent`
+by the new outcome; `returned` → `returned`. A run that could ask nobody
+is a failure, as today.
+The once-per-outpoint rule lives in the forwarder (`forward_inputs` from
+the plan chain) and in `_dispatch` (the ledger's list), both, and the
+sweep proves a second signature over a listed outpoint is refused.
+
+### 3.2 Fee spikes: `delayed`, and the pager tries again
+
+`fee_eats_deposit`, `fee_out_of_band` and `no_fee_estimate` write
+`{state: delayed}` before refusing; `_phase_of` maps it to the new word
+`delayed` ("the network is busy right now; it is tried again later, by
+itself"). The pager, on `delayed` for a watched deposit, keeps the entry
+as `seen` with `retry_after = now + --btc-fee-retry` (default 3600 s,
+floor 600) and the watcher's tick starts the forward again once the time
+has passed and `_btc_can_start()`; said once. The daily wake budget bounds
+the retries by construction.
+
+### 3.3 The floor, made honest
+
+`btc_deposit_min_sat(key)` becomes `max(FORWARD_MIN_SAT + fee_ceiling,
+-(-fee_ceiling // MAX_FEE_FRACTION))` with `fee_ceiling` the one-input
+upper-bound fee at the keyfile's ceiling rate. `gs_wake_keys pair` prints
+the resulting floor in BTC next to the ceiling it follows from, so the
+operator sets `--deposit-min-sat` on the pager to the same number (or
+lowers the ceiling). test_btc_forwarder proves a deposit at the floor is
+forwardable at the ceiling under every guard the forwarder has.
+
+### 3.4 The XMR side judges the real swap
+
+When a forward's plan first says the money moved (the mark in
+`_dispatch`, and the reconciliation's `moved` for case 1), the agent
+rewrites the handle's pairs file — the one `swap_status` and `watch` read
+— from the plan: `btc_in` becomes `send_sat` in BTC, `expected_xmr` the
+forward-time quote, and a new `forwarded_txid` field is added for the
+operator's reading at the machine. The deposit-time quote is kept beside
+it as `quoted_at_deposit` so nothing is lost. The watchers then compare
+the arrival to what was actually swapped; "short" means short. A fresh
+forward after `returned` rewrites again (the newest swap is the one still
+in flight). The pairs file never travels; the rewrite is vault-side only.
+
+### 3.5 Pairing and the forwarder's arguments
+
+`--allow-btc-broadcast` requires `--thornode`; `btc_forwarder --broadcast`
+and `--reconcile` refuse without `--thornode`. `--btc-account N` (default
+0) is written to the keyfile as `btc_account`; the forwarder takes
+`GS_BTC_ACCOUNT` from the environment beside the xpub and index and
+derives `m/84'/coin'/N'`, still proving it against the xpub the Pi was
+handed. `gs_wake_keys pair` refuses an xpub that is not the seed-less
+account N (it cannot check the seed, but it prints the account it was
+told and the floor of 3.3).
+
+### 3.6 The wiped ledger
+
+`_allocate_btc_index`: when the ledger knows no index at all and address 0
+is not fresh, refuse `ledger_wiped` with the re-pair instruction; the gap
+search runs only when the ledger knows at least one index. `_save_handles`
+never prunes a record carrying `btc_index` (it prunes the rest as today).
+
+### 3.7 The wire
+
+`PHASES` gains `delayed` and `returned`, each with a numberless,
+machine-nameless line in `PHASE_LINES`; the doorbell's closed table
+accepts them; `WIRE_VERSION` 7 (a changelog entry; no shape change). No
+new M3 field, no new job.
+
+### 3.8 The pager
+
+`_btc_forward_result`: `delayed` keeps the entry as `seen` with
+`retry_after`; `returned` puts a closed entry back on the list as `seen`
+(the forward will report again); `moved` closes it like `sent`. The
+watcher starts a retry only after `retry_after` and through the same
+gates. `--btc-fee-retry SECONDS` on the command line (default 3600, floor
+600). New sentences: "the network is busy right now; it is tried again
+later, by itself" and "some of it came back and is being sent on again —
+nothing to do", both in the banned-word scan.
+
+### 3.9 Rule 6
+
+Every new sentence goes through `tests/test_depo_wizard.py`'s scan and its
+currency ceiling. Nothing new reaches the hash chain but kinds
+(`forward_resent`, `forward_returned`, `forward_foreign_spend`,
+`forward_delayed`, `ledger_wiped`). The status files beside the plan carry
+one word each; the plan chain carries the numbers, 0600, on the vault.
+
+### 3.10 What only a box with Tor can prove
+
+`tests/real_btc_forward_testnet.py` grows a second act on the same funded
+address: a forward whose broadcast is deliberately sent to a server that
+will not relay it (policy 80), then `--reconcile` finding it unlisted and
+re-sending to the one that will; and a third act that pays the address
+again after the forward and shows `--reconcile` answering `returned` and
+forwarding the new outputs only. THORChain's acceptance of the memo stays
+unprovable off mainnet; the file's header keeps saying so.
+
+---
+
+## 4. Build order, each step validated before the next
+
+1. **The floor and the cap agree** (3.3): `btc_deposit_min_sat`, the
+   pairing printout, the forwarder proof. test_wake_agent, test_btc_forwarder.
+2. **Pairing** (3.5): `--allow-btc-broadcast` needs `--thornode`;
+   `--btc-account`; the forwarder's account derivation and `GS_BTC_ACCOUNT`.
+   test_wake_agent (`_pairs_btc`), test_btc_tx, test_btc_forwarder.
+3. **The wire** (3.7): two words, two lines, version 7. test_wake_protocol,
+   test_wake_doorbell, test_plain_slip's phase checks.
+4. **The forwarder's status words on refusal** (3.2's `delayed`) and the
+   `moved` detection of section 1 case 1 (history on `not_seen`).
+   test_btc_forwarder against the in-process server with history.
+5. **`--reconcile`** (3.1): the table, the outpoint rule, the plan chain,
+   the re-send of kept bytes, the fresh forward of new outputs. The largest
+   step; test_btc_forwarder drives every row against the mock server
+   (history and listunspent scenarios), including a foreign spend.
+6. **The agent**: `_dispatch` runs the reconciliation instead of answering
+   from the plan; `forward_inputs` on the ledger; the pairs rewrite (3.4);
+   `ledger_wiped` and the pruning exemption (3.6); `_phase_of` for the new
+   words. test_wake_agent, test_wake_endtoend (a returned deposit forwarded
+   again on the real path; a delayed one).
+7. **The pager** (3.8): `delayed` with the retry, `returned`, `moved`,
+   `--btc-fee-retry`. test_telegram_pager, test_depo_wizard's scans.
+8. **Docs**: OPSEC_SETUP (the floor and the ceiling, the retry, what
+   `returned` means, `--btc-account`, the testnet acts), BTC_INTAKE_DESIGN
+   (stage 5 BUILT, the outpoint invariant), SESSION_LOG.
+9. **Anchors** (section 6), the sweep, the full suite, the self-doubt pass
+   (a section 8 like stage 4's), commit.
+
+---
+
+## 5. Tests that break by design
+
+- test_wake_agent / test_wake_endtoend: "a sent handle answers from the
+  plan with no child" — now a child runs (the reconciliation) and the
+  word comes from what the network shows.
+- test_btc_forwarder: the floor arithmetic; "exactly one of --dry-run /
+  --broadcast" becomes exactly one of three.
+- test_wake_protocol / test_wake_doorbell: the closed phase table grows.
+- test_telegram_pager: a refused forward no longer always stalls.
+
+---
+
+## 6. Mutation anchors to add
+
+- the outpoint rule: a second signature over a forwarded outpoint;
+- the reconciliation re-signs when the hex was kept (should re-send);
+- `returned` forwards ALL outputs instead of the new ones;
+- a foreign spend is answered `sent`;
+- `moved` (case 1) answered `not_yet`;
+- `delayed` written without the refusal, or the pager retrying before
+  `retry_after`, or retrying without the gates;
+- the floor formula drops the cap term;
+- pairing accepts `--allow-btc-broadcast` without `--thornode`;
+- the pairs rewrite skipped, or rewriting `expected_xmr` from the
+  deposit-time quote;
+- `ledger_wiped` not refused; a `btc_index` record pruned;
+- a new sentence with a banned word.
+
+---
+
+## 7. Hazards this stage does not close
+
+- THORChain's acceptance of the memo is proven only on mainnet with money.
+- A leaked seed: the foreign-spend word tells the operator, and nothing
+  else can.
+- The operator's Electrum servers still see the addresses they are asked
+  about; an own node over an onion is the answer, as before.
+- The client's money sits on the host's address between arrival and
+  forward and again after a refund: custody, stated in the design, is
+  narrowed by this stage (the retry, the returned path) and not removed.
+- Depth of the forward's confirmation is the vault's knowledge; the phone
+  hears `sent` and then the XMR side's words.
+
+---
+
+## Status
+
+- [ ] 1. floor and cap
+- [ ] 2. pairing, account
+- [ ] 3. wire
+- [ ] 4. status words on refusal, moved detection
+- [ ] 5. `--reconcile`
+- [ ] 6. agent
+- [ ] 7. pager
+- [ ] 8. docs
+- [ ] 9. anchors, sweep, full suite, self-doubt, commit
