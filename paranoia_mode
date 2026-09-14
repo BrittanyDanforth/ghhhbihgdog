@@ -1121,7 +1121,14 @@ def main():
                     help="recompute integrity_chain.log and report the first "
                          "broken link, then exit without wiping anything. "
                          "Detects edits and mid-file deletions; tail "
-                         "truncation is undetectable by design.")
+                         "truncation is undetectable by design -- and so is "
+                         "a REWRITE by someone who recomputed every later "
+                         "link, since the chain carries no key (the "
+                         "algorithm is public, Kerckhoffs). It is evidence "
+                         "against a card only when you hold its last hash "
+                         "off the box: print the tail after each session "
+                         "and note the hash; a chain that recomputes but no "
+                         "longer ends in it was rewritten.")
     args = ap.parse_args()
 
     if args.verify_chain:

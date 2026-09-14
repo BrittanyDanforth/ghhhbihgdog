@@ -247,11 +247,15 @@ refuters per finding) found real defects, all fixed in the rewrite:
   are the network on a bad Tor day (a stale quote, an aggregator or
   THORNode that did not answer, a relay that said no), and on an
   unattended host a tap never comes: a confirmed deposit sat on the
-  host's address for ever. Now `STALL_RETRIES` (3) automatic retries, the
-  wait doubling from `--btc-fee-retry`, as background starts that leave
-  the reserve; the chat hears once that it is tried again by itself, and
-  once more when the retries are spent. A run that finished clears the
-  count. test_telegram_pager 792; four anchors.
+  host's address for ever. Now `STALL_RETRIES` (5) automatic retries, the
+  wait doubling from `--btc-fee-retry` (thirty-one hours in all, past the
+  vault's own 24 h wake budget, which the Pi cannot tell from any other
+  refusal), as background starts that leave the reserve; the chat hears
+  once that it is tried again by itself, and once more when the retries
+  are spent. A run that finished clears the count. A refusal about an
+  UNPAID deposit changes nothing (found on the second read: it had
+  entered the retry branch and ended the hold on the payment details).
+  test_telegram_pager 796; six anchors.
 - Checked and left alone: the forward's worst case over Tor (look,
   history, quote, oracle, THORNode, submit, seen, each bounded) fits its
   900 s budget; the quote-age bound (300 s) covers the cross-check's own

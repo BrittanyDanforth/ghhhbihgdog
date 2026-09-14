@@ -5239,6 +5239,16 @@ class Pager:
                 # words; this end waits a window and asks again.
                 e["rechecked_at"] = time.time()
                 return
+            if e["state"] == "not_seen":
+                # NOTHING HAS LANDED. A refusal or a failure about an UNPAID
+                # deposit (the vault's own wake budget, a switch, a wiped
+                # ledger, a tap that raced the look) changes nothing here:
+                # the money is not here to send on, "it is here" would be
+                # false, a retry would spend a wake on an empty address,
+                # and moving the entry off not_seen would end the hold that
+                # keeps the payment details in the chat until it is paid.
+                # The poke said what happened; the look keeps watching.
+                return
             if out != "done":
                 # A REFUSAL OR A FAILURE ON A FIRST FORWARD IS TRIED AGAIN,
                 # BY ITSELF, A BOUNDED NUMBER OF TIMES (STALL_RETRIES). Most
@@ -5248,9 +5258,11 @@ class Pager:
                 # left for a tap sat on the host's address for as long as
                 # nobody tapped, which on an unattended host is for ever.
                 # The wait doubles from --btc-fee-retry, so a permanent
-                # refusal costs three wakes over seven hours and then stops;
-                # the tap still tries at once. A rehearsal (done, no word)
-                # is not retried: nothing failed.
+                # refusal costs STALL_RETRIES wakes over thirty-one hours
+                # and then stops -- long enough to outlast the vault's own
+                # 24 h wake budget, which this end cannot tell from any
+                # other refusal; the tap still tries at once. A rehearsal
+                # (done, no word) is not retried: nothing failed.
                 try:
                     _tries = max(0, int(e.get("stall_tries") or 0)) + 1
                 except (TypeError, ValueError):
@@ -5296,8 +5308,11 @@ class Pager:
 
     #: How many times a first forward that was refused or failed is tried
     #: again by itself before the deposit is left for a tap. The wait
-    #: doubles from --btc-fee-retry: an hour, two, four.
-    STALL_RETRIES = 3
+    #: doubles from --btc-fee-retry: an hour, two, four, eight, sixteen --
+    #: thirty-one hours in all, so a refusal that is the vault's own 24 h
+    #: wake budget (which the Pi cannot tell from any other) is outlasted,
+    #: and a permanent one costs five wakes and stops.
+    STALL_RETRIES = 5
 
     #: How long after a forward went out this end asks the forward about
     #: it again (stage 6): --btc-recheck. At least the vault's
@@ -5498,6 +5513,16 @@ class Pager:
             elif state == "seen" and e["state"] == "not_seen":
                 e["state"] = "seen"
                 say = "seen"
+            elif state == "not_seen" and e["state"] == "seen":
+                # THE MONEY LEFT BEFORE IT CONFIRMED: a payment seen in the
+                # mempool and then replaced or dropped. Back to waiting --
+                # the address is looked at on the same clock as any unpaid
+                # deposit and forgotten on it, instead of "received" for
+                # ever about money that is not there. Nothing said: the
+                # chat heard "received" once, and hears "received" again
+                # only if it lands again (a fee retry's or a stall retry's
+                # count is left alone; both are cleared by the next answer).
+                e["state"] = "not_seen"
             if say and say in e["said"]:
                 say = None
             if say:

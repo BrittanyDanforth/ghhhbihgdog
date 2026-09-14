@@ -1299,6 +1299,28 @@ check("a chain with no current plan is read from its newest rotated one, "
 check("NON-VACUITY: a chain with NO plan anywhere is still refused no_plan",
       _refusal(Net(utxos=_UNSPENT0), "--reconcile", *_TN, dry_run=False)[3]
       == "no_plan")
+# A ROTATED NAME IS NEVER TAKEN TWICE. The rotation counts the rotated
+# files and writes count+1; with a gap in the numbers (a file removed by
+# hand, a recovery that moved one back beside a foreign file that kept its
+# number) that name can already be a plan of ours, and the rotation would
+# have put the current plan OVER it -- a record the pairs rewrite and the
+# reconciliation both read, gone.
+_pG, _ofG, _hxG = _first_send()
+_stemG = _ofG[:-len(".json")]
+with open(_stemG + ".1.json", "w") as _fh:
+    json.dump({**json.load(open(_ofG)), "txid": "11" * 32}, _fh)
+with open(_stemG + ".3.json", "w") as _fh:
+    json.dump({**json.load(open(_ofG)), "txid": "33" * 32}, _fh)
+_nG = Net(utxos=_RET, spends=[_listed(_pG, _hxG)], fee=10,
+          submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nG, _ofG)
+check("a rotation into a chain whose numbers have a gap (.1 and .3 present) "
+      "takes the next FREE number (.4) rather than writing over .3",
+      _c == F.EXIT_OK and _p is not None
+      and _p["reconcile_reason"] == "returned"
+      and json.load(open(_stemG + ".3.json"))["txid"] == "33" * 32
+      and json.load(open(_stemG + ".4.json"))["txid"] == _pG["txid"]
+      and len(F._plan_chain(_ofG)) == 4)
 _pX, _ofX, _hxX = _first_send()
 F._rotate_plan(_ofX)
 with open(F._plan_chain(_ofX)[0], "w") as _fh:

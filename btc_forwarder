@@ -871,6 +871,15 @@ def _rotate_plan(outfile):
     stem = p.name[:-len(".json")]
     n = 1 + sum(1 for _ in _plan_chain(outfile)[1:])
     target = p.with_name(f"{stem}.{n}.json")
+    # NEVER OVER A PLAN THAT EXISTS. The count assumes the rotated names
+    # are 1..n with no gap; a gap (a rotated file removed by hand, a
+    # recovery that moved one back while a foreign file kept its number)
+    # would put this plan over an earlier one and lose a record the pairs
+    # rewrite and the reconciliation both read. The next free number is
+    # taken instead, and _plan_chain sorts by number, so order holds.
+    while target.exists():
+        n += 1
+        target = p.with_name(f"{stem}.{n}.json")
     os.replace(p, target)
     return target
 

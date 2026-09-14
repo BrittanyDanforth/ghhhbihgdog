@@ -5044,17 +5044,20 @@ _st.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
 _st.btc_fee_retry_s = 3600
 _st.btc_open["B4A1"]["state"] = "forwarding"
 _st_waits, _st_states = [], []
-for _i in range(4):
+for _i in range(6):
     _st._btc_forward_result("B4A1", "refused", "", 111)
     _ste = _st.btc_open.get("B4A1", {})
     _st_states.append(_ste.get("state"))
     _st_waits.append(_ste.get("retry_after", 0) - time.time())
-check("three refusals in a row keep the deposit `seen` with a retry one, "
-      "two, then four hours out; the FOURTH leaves it stalled for a tap",
-      _st_states == ["seen", "seen", "seen", "stalled"]
-      and all(abs(w - x) < 5 for w, x in zip(_st_waits[:3],
-                                              (3600, 7200, 14400)))
-      and pg.Pager.STALL_RETRIES == 3)
+check("five refusals in a row keep the deposit `seen` with a retry one, "
+      "two, four, eight, then sixteen hours out (thirty-one in all, past "
+      "the vault's own 24 h budget); the SIXTH leaves it stalled for a tap",
+      _st_states == ["seen"] * 5 + ["stalled"]
+      and all(abs(w - x) < 5 for w, x in zip(_st_waits[:5],
+                                              (3600, 7200, 14400, 28800,
+                                               57600)))
+      and pg.Pager.STALL_RETRIES == 5
+      and sum(3600 * 2 ** i for i in range(5)) > 86400)
 check("...said twice in all: once that it is tried again by itself (with "
       "the button to try now), once that it did not go through again",
       len(_sts) == 2 and "tried again later, by itself" in _sts[0][0]
@@ -5093,6 +5096,39 @@ _st3._btc_forward_result("B4A1", "refused", "", 111)
 check("a malformed retry count starts over rather than dying",
       _st3.btc_open["B4A1"].get("stall_tries") == 1
       and _st3.btc_open["B4A1"]["state"] == "seen")
+# NOTHING HAS LANDED: a refusal about an UNPAID deposit (the vault's own
+# budget, a switch, a wipe, a tap that raced the look) changes nothing --
+# no "it is here", no retry, and the hold on the payment details stays.
+_st4, _sts4, _stj4 = _watch_pager()
+_st4._btc_pay_message("B4A1", 777)
+for _o4 in ("refused", "failed", "done"):
+    _st4._btc_forward_result("B4A1", _o4, "", 111)
+check("a refusal, a failure or a wordless answer about a deposit nothing "
+      "has reached leaves it not_seen, says nothing, counts no retry, and "
+      "keeps the payment details on hold",
+      _st4.btc_open["B4A1"]["state"] == "not_seen" and _sts4 == []
+      and "stall_tries" not in _st4.btc_open["B4A1"]
+      and "retry_after" not in _st4.btc_open["B4A1"]
+      and _st4._btc_held_messages() == {(111, 777)})
+# THE MONEY LEFT BEFORE IT CONFIRMED (a payment seen in the mempool, then
+# replaced or dropped): back to waiting, not "received" for ever.
+_st5, _sts5, _stj5 = _watch_pager()
+_st5.btc_servers = [("s.onion", 50002, None)]
+_st5.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_st5.btc_tick(look=_look_returning("seen", unconf=5000000))
+_st5.btc_tick(look=_look_returning("not_seen"))
+check("a look that no longer sees the unconfirmed payment puts the entry "
+      "back to not_seen, silently, after the one 'received' line",
+      _st5.btc_open["B4A1"]["state"] == "not_seen" and len(_sts5) == 1
+      and "received" in _sts5[0][0])
+_st5.btc_tick(look=_look_returning("seen", unconf=5000000))
+check("...and seen again is not said again", _st5.btc_open["B4A1"]["state"]
+      == "seen" and len(_sts5) == 1)
+_st5.btc_open["B4A1"]["state"] = "not_seen"
+_st5.btc_open["B4A1"]["since"] = time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1
+_st5.btc_tick(look=_look_returning("not_seen"))
+check("...and once back to waiting it is forgotten on the unpaid deposit's "
+      "clock", "B4A1" not in _st5.btc_open)
 _rp, _rs, _rj = _watch_pager()
 _rp._btc_forward_result("ZZZZ", "done", "sent", 111)
 check("a forward for a handle this end is not watching changes nothing",

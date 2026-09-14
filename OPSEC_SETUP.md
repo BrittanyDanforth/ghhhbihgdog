@@ -1606,6 +1606,11 @@ effort on the swap and the phone.
       `pager.log`. `paranoia_mode`'s search roots do not reach `/var/lib/gs`
       from a shell; run it from there (§8)
 - [ ] Spend USB not in the ThinkPad
+- [ ] After each session, `paranoia_mode --verify-chain` and **note the
+      chain's last hash off the box**. The chain carries no key (the
+      algorithm is public — Kerckhoffs), so anyone who can write the card
+      can rewrite a line and recompute every link below it; the noted hash
+      is the only thing that makes a rewrite visible
 - [ ] Router: no port forwards, especially UDP 9
 - [ ] Throwaway Telegram, not the account with your face
 - [ ] A test `/depo` (or a hand-run quote) writes the slip **only**
@@ -2208,11 +2213,12 @@ question needs (a first forward of a confirmed deposit is not held back —
 moving the money is what the budget is for). A first forward that was
 REFUSED or FAILED for any other reason — a stale quote, an aggregator or a
 THORNode that did not answer over Tor, a relay that said no — is tried
-again by itself too, three times, an hour, two and four hours later, and
-the chat hears once that it is ("tried again later, by itself — or tap
-below to try it now"); after the third the deposit is left for a tap
-("did not go through, again"), so a permanent refusal costs three wakes
-and stops. Money that can never be sent on at
+again by itself too, five times, an hour, two, four, eight and sixteen
+hours later (thirty-one hours in all, so even the vault's own 24 h wake
+budget refusing is outlasted), and the chat hears once that it is ("tried
+again later, by itself — or tap below to try it now"); after the fifth the
+deposit is left for a tap ("did not go through, again"), so a permanent
+refusal costs five wakes and stops. Money that can never be sent on at
 any rate this pair allows — under what was quoted — is `short`; the client
 can pay more to the same address. Once a forward has gone out, a tap past
 the recheck window — and the watcher's own recheck, once per window — runs
