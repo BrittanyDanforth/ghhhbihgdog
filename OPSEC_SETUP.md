@@ -1375,6 +1375,12 @@ first two on the vault where they cannot be talked around from a phone:
   minute is answered with silence past that, and nobody else is slowed by
   it. A client who spends the shared wake budget on taps is a client to
   take off the allowlist; nothing here can tell them from an anxious one.
+  The intake's own starts (a fee retry, a recheck of a forward that went
+  out) leave `--btc-reserve` pokes (2) for taps, and a fee retry's wait
+  doubles with every `delayed` in a row. On a bot serving several people
+  the operator is not in every chat: `--alert-chat` names the one that
+  hears, at most hourly, that a forward for some other chat FAILED — one
+  line, no deposit, no reason (the job log at the vault has both).
 - **Wall clock, which is what actually binds once the first two are sized.**
   One vault drains one withdrawal at a time; eight people withdrawing at ten
   hops is three days of queue nobody can shorten. Three or four people in
@@ -2134,6 +2140,13 @@ python3 gs_telegram_pager ... \
                            # so the wizard refuses
                            # a too-small deposit HERE, with the number,
                            # instead of spending a wake on the vault's refusal
+    --btc-reserve 2        # how many of the day's courtesy pokes are kept
+                           # for taps: a fee retry or a recheck this end
+                           # starts by itself waits while that many or
+                           # fewer remain (0 disables; under --daily-cap)
+    --alert-chat <id>      # optional, an allowlisted chat: one line, at most
+                           # hourly, when a forward for some OTHER chat
+                           # failed -- for a bot serving several people
 ```
 
 `--btc-electrum` is not optional on an intake pair. It is also how the
@@ -2169,7 +2182,13 @@ would not pay for at today's fee — the fee would take more than a fifth of
 the deposit, or the estimate is outside your band — is the word `delayed`:
 "the network is busy right now, so it waits. It is tried again later, by
 itself", and the pager tries again after `--btc-fee-retry`, through the
-same gates as any wake, without a tap. Money that can never be sent on at
+same gates as any wake, without a tap — and each `delayed` in a row doubles
+that wait, up to eight times the base, so a spike that lasts a day is a
+handful of wakes and not one an hour per deposit. A retry, like the recheck
+below, is a start nobody asked for: it leaves `--btc-reserve` of the day's
+pokes for taps, so the automatic path cannot spend the last wake a client's
+question needs (a first forward of a confirmed deposit is not held back —
+moving the money is what the budget is for). Money that can never be sent on at
 any rate this pair allows — under what was quoted — is `short`; the client
 can pay more to the same address. Once a forward has gone out, a tap past
 the recheck window — and the watcher's own recheck, once per window — runs

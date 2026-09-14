@@ -1259,6 +1259,12 @@ class Limits:
             self.pokes = [t for t in self.pokes if now - t < 86400]
             return self.pokes
 
+    def headroom(self) -> int:
+        """How many pokes the day's cap still allows: the cap less the
+        last 24 hours' count, never negative. The watcher's own starts (a
+        fee retry, a recheck) read it to leave a reserve for taps."""
+        return max(0, int(self.daily_cap) - len(self.recent()))
+
     def why_not(self) -> str:
         """'' if a poke is allowed, else the reason to send back."""
         now = time.time()
@@ -1705,6 +1711,17 @@ class Pager:
         #: or stuck forward. At least the vault's --btc-bump-after.
         self.btc_recheck_s = int(getattr(args, "btc_recheck", 10800)
                                  or 10800)
+        #: How many of the day's courtesy pokes are kept for TAPS: a fee
+        #: retry or a recheck this end starts by itself waits while fewer
+        #: than that remain, so the automatic path cannot spend the last
+        #: wake a client's "has it arrived?" needs. Zero disables it.
+        _rsv = getattr(args, "btc_reserve", None)
+        self.btc_reserve = 2 if _rsv is None else max(0, int(_rsv))
+        #: An allowlisted chat that hears one line, at most hourly, when a
+        #: forward for some OTHER chat failed (_alert_operator), or None.
+        _al = getattr(args, "alert_chat", None)
+        self.alert_chat = (int(_al) if isinstance(_al, int)
+                           and not isinstance(_al, bool) else None)
         #: The smallest deposit the wizard takes. The vault has its own floor
         #: on the intake (what can be forwarded after the fee); set this to
         #: it so the refusal happens here, with the number, and not after a
@@ -3263,6 +3280,10 @@ class Pager:
         if job == "forward_to_swap":
             self._btc_forward_result(
                 (params or {}).get("handle") or "", out, _early, chat_id)
+            if out == "failed":
+                # THE RUN DIED, and on a bot serving several people the
+                # deposit's own chat is not the operator's.
+                self._alert_operator(chat_id, job)
         if _early and out != "done" and job in ("watch", "swap_status"):
             # THE LABEL, NOT THE HANDLE. This one branch still printed the
             # raw four hex characters, so the one reply an operator gets while
@@ -5142,6 +5163,7 @@ class Pager:
                 e["word"] = phase
                 e["sent_at"] = time.time()
                 e.pop("retry_after", None)
+                e.pop("fee_tries", None)
                 return
             if out == "done" and phase == "forwarded":
                 # IN A BLOCK (stage 6): the rechecks end here. Kept on the
@@ -5152,6 +5174,7 @@ class Pager:
                 e["sent_at"] = time.time()
                 e.pop("retry_after", None)
                 e.pop("rechecked_at", None)
+                e.pop("fee_tries", None)
                 return
             if out == "done" and phase == "returned":
                 if not e.get("addr"):
@@ -5168,14 +5191,20 @@ class Pager:
                 e["said"].discard("held")
                 e.pop("retry_after", None)
                 e.pop("rechecked_at", None)
+                e.pop("fee_tries", None)
                 return
             if out == "done" and phase == "delayed":
+                # ...AND EACH `delayed` IN A ROW DOUBLES THE WAIT
+                # (fee_retry_wait): a fee spike that lasts a day cost a
+                # wake an hour per deposit, which with two deposits was the
+                # whole day's budget on retries alone.
+                _wait = self.fee_retry_wait(e)
                 if e["state"] in ("sent", "forwarded"):
                     # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY
                     # (stage 6): the original stands, listed, and the
                     # recheck is not due again until --btc-fee-retry has
                     # passed. The entry stays as it was.
-                    e["retry_after"] = time.time() + float(self.btc_fee_retry_s)
+                    e["retry_after"] = time.time() + _wait
                     return
                 # THE VAULT WOULD NOT PAY TODAY'S FEE. Fees fall in hours:
                 # the deposit stays on the list as money seen and the
@@ -5183,7 +5212,7 @@ class Pager:
                 # through the same gates, without a word here (the forward
                 # branch has already rendered the vault's own sentence).
                 e["state"] = "seen"
-                e["retry_after"] = time.time() + float(self.btc_fee_retry_s)
+                e["retry_after"] = time.time() + _wait
                 return
             if out == "done" and phase in ("arriving", "not_yet"):
                 if not e.get("addr"):
@@ -5227,6 +5256,26 @@ class Pager:
     #: it again (stage 6): --btc-recheck. At least the vault's
     #: --btc-bump-after, or the recheck finds no bump due.
     btc_recheck_s = 10800
+
+    #: How many times a fee retry's wait doubles before it stops growing:
+    #: one, two, four, then eight times --btc-fee-retry (eight hours on the
+    #: default), for as long as the vault keeps answering `delayed`.
+    FEE_RETRY_DOUBLINGS = 3
+
+    def fee_retry_wait(self, e: dict) -> float:
+        """The wait before this entry's next fee retry, counting the try:
+        --btc-fee-retry doubled per `delayed` answer in a row, at most
+        FEE_RETRY_DOUBLINGS times. The count is cleared by any answer that
+        is not `delayed` (sent, unsure, forwarded, returned). Under the
+        watch lock; never raises on a malformed count."""
+        try:
+            tries = int(e.get("fee_tries") or 0)
+        except (TypeError, ValueError):
+            tries = 0
+        tries = max(0, tries) + 1
+        e["fee_tries"] = tries
+        return float(self.btc_fee_retry_s) * float(
+            2 ** min(tries - 1, int(self.FEE_RETRY_DOUBLINGS)))
 
     def _recheck_due_entry(self, e, now) -> bool:
         """Whether a watch entry's forward is the forward's question again
@@ -5312,7 +5361,7 @@ class Pager:
         # while the box is busy. The forward's answer starts a new window
         # or ends the rechecks.
         for h in _due:
-            if not self._btc_can_start():
+            if not self._btc_can_start(background=True):
                 break
             started = False
             try:
@@ -5329,13 +5378,22 @@ class Pager:
                 integrity_log("pager", "forward_recheck")
                 break
 
-    def _btc_can_start(self) -> bool:
+    #: How many of the day's pokes a background start leaves for taps
+    #: (--btc-reserve); the instance reads its own from the command line.
+    btc_reserve = 2
+
+    def _btc_can_start(self, background: bool = False) -> bool:
         """Whether a wake could start right now: nothing running, the day's
         budget not spent, no restart hold. The same three gates start_job
         applies, read WITHOUT spending anything -- a confirmed deposit the
         watcher cannot send on yet stays on the list and is tried again next
         tick, silently, instead of the chat hearing "no: busy" every ten
-        minutes for the hours a withdrawal holds this box."""
+        minutes for the hours a withdrawal holds this box.
+
+        `background`: a start nobody asked for (a fee retry, a recheck of a
+        forward that went out) -- ONE MORE GATE: it leaves --btc-reserve of
+        the day's pokes for taps. A first forward of a confirmed deposit is
+        not background: moving the money is what the budget is for."""
         _b = getattr(self, "busy", None)
         if _b is not None and _b.locked():
             return False
@@ -5345,6 +5403,10 @@ class Pager:
                 return False
             if self._hold_why():
                 return False
+            if background:
+                _h = getattr(_l, "headroom", None)
+                if callable(_h) and int(_h()) <= int(self.btc_reserve):
+                    return False
         except BaseException:                                # noqa: BLE001
             return False
         return True
@@ -5363,12 +5425,17 @@ class Pager:
             e["conf"], e["unconf"] = conf, unconf
             chat = e["chat"]
             _waiting = time.time() < float(e.get("retry_after") or 0.0)
+            # A FEE RETRY is a start nobody asked for: it leaves the
+            # reserve for taps (_btc_can_start), and it is not said --
+            # the chat heard the vault's own `delayed` sentence.
+            _retry = int(e.get("fee_tries") or 0) > 0
             if state == "confirmed" and _waiting:
                 # A `delayed` forward's retry is not due yet: the vault
                 # said so once, in its own words; nothing is said or
                 # started until --btc-fee-retry has passed.
                 e["state"] = "seen"
-            elif state == "confirmed" and self._btc_can_start():
+            elif state == "confirmed" and self._btc_can_start(
+                    background=_retry):
                 e["state"] = "forwarding"
                 e.pop("retry_after", None)
                 say, start = "confirmed", True
@@ -5378,7 +5445,7 @@ class Pager:
                 # the list as money seen and the next tick tries again; the
                 # chat hears why once, in words with nothing in them.
                 e["state"] = "seen"
-                say = "held"
+                say = None if _retry else "held"
             elif state == "seen" and e["state"] == "not_seen":
                 e["state"] = "seen"
                 say = "seen"
@@ -5437,6 +5504,40 @@ class Pager:
                 if shutdown_requested():
                     return
                 time.sleep(1)
+
+    #: The least time between two operator alerts: one line an hour at
+    #: most, so a server that is down for a night is one line, not a
+    #: stream of them.
+    ALERT_MIN_GAP_S = 3600
+    #: --alert-chat, or None (the instance reads its own).
+    alert_chat = None
+
+    def _alert_operator(self, chat_id: int, job: str) -> None:
+        """One numberless line to --alert-chat when a forward FAILED for
+        some OTHER chat: the run died (the history unreadable, a look that
+        failed, a spend that is not ours) and only the deposit's own chat
+        was told, which on a bot serving several people is not the
+        operator. Nothing about which deposit, whose, or why -- the job log
+        at the machine has that -- and at most one an hour. Never raises."""
+        try:
+            _to = getattr(self, "alert_chat", None)
+            if not isinstance(_to, int) or isinstance(_to, bool):
+                return
+            if _to == chat_id or _to not in (getattr(self, "allow", None)
+                                             or ()):
+                return
+            _now = time.monotonic()
+            _last = float(self.__dict__.get("_alert_last") or 0.0)
+            if _last and _now - _last < float(self.ALERT_MIN_GAP_S):
+                return
+            self.__dict__["_alert_last"] = _now
+            integrity_log("pager", "operator_alerted")
+            self.send(_to, f"{chat_name(job)}: failed for a deposit in "
+                           f"another chat. It needs someone at the other "
+                           f"end.")
+        except BaseException as ex:                          # noqa: BLE001
+            print(f"  [!] the operator alert did not send: "
+                  f"{_redact(ex)[:120]}")
 
     def _btc_balance_text(self, cid: int) -> str:
         """The chat's own watched deposits, one line each, and the totals
@@ -5692,7 +5793,8 @@ class Pager:
                   f"{self.btc_poll_s}s over {len(self.btc_servers)} server(s); "
                   f"a forward that went out is asked about again after "
                   f"{self.btc_recheck_s}s (set it at or above the vault's "
-                  f"--btc-bump-after).")
+                  f"--btc-bump-after); {self.btc_reserve} of the day's "
+                  f"pokes kept for taps.")
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
               + (f", {len(self.allow_users)} allowlisted sender(s)"
                  if self.allow_users else "")
@@ -6099,6 +6201,17 @@ def build_cli():
                          "set it to the vault's intake floor so a deposit it "
                          "would refuse is refused here, with the number, "
                          "before a wake. Default: the wire's own floor.")
+    ap.add_argument("--btc-reserve", type=int, default=2, metavar="N",
+                    help="how many of the day's courtesy pokes are kept for "
+                         "taps: a fee retry or a recheck this end starts by "
+                         "itself waits while fewer than that remain, so the "
+                         "automatic path cannot spend the last wake a "
+                         "client's question needs (default 2; 0 disables)")
+    ap.add_argument("--alert-chat", type=int, default=None, metavar="CHAT_ID",
+                    help="an allowlisted chat that hears one line, at most "
+                         "hourly, when a forward for some OTHER chat failed: "
+                         "for a bot serving several people, whose operator "
+                         "is not in every chat")
     return ap
 
 
@@ -6160,6 +6273,17 @@ def main(argv=None) -> int:
                      "to confirm.")
     if getattr(args, "deposit_min_sat", 0) < 0:
         sys.exit("[!] --deposit-min-sat cannot be negative.")
+    if getattr(args, "btc_reserve", 2) < 0:
+        sys.exit("[!] --btc-reserve cannot be negative. 0 disables it.")
+    if getattr(args, "btc_reserve", 2) >= int(args.daily_cap):
+        sys.exit(f"[!] --btc-reserve {int(args.btc_reserve)} at or above "
+                 f"--daily-cap {int(args.daily_cap)} leaves nothing for the "
+                 "automatic path: no fee retry and no recheck would ever "
+                 "start. Keep it under the cap.")
+    if getattr(args, "alert_chat", None) is not None and int(
+            args.alert_chat) not in {int(c) for c in (args.chat_id or [])}:
+        sys.exit("[!] --alert-chat must be one of the allowlisted --chat-id "
+                 "values: a line about a failed job goes nowhere else.")
 
     # FAIL CLOSED ON TOR, BEFORE ANYTHING ELSE. OPSEC_SETUP.md section 4: "If
     # Tor is down, the bot does not start."

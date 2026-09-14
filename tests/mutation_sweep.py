@@ -4765,13 +4765,74 @@ MUTATIONS = [
   '                e["word"] = phase\n'
   '                e["sent_at"] = time.time()\n'
   '                e.pop("retry_after", None)\n'
+  '                e.pop("fee_tries", None)\n'
   '                return',
   '                e["state"] = "sent"\n'
   '                e["word"] = phase\n'
   '                e["sent_at"] = time.time()\n'
   '                e.pop("retry_after", None)\n'
+  '                e.pop("fee_tries", None)\n'
   '                e.pop("rechecked_at", None)\n'
   '                return',
+  ['test_telegram_pager']),
+ ('the fee retry count is never cleared by a sent answer', 'gs_telegram_pager',
+  '                e.pop("retry_after", None)\n'
+  '                e.pop("fee_tries", None)\n'
+  '                return\n'
+  '            if out == "done" and phase == "forwarded":',
+  '                e.pop("retry_after", None)\n'
+  '                return\n'
+  '            if out == "done" and phase == "forwarded":',
+  ['test_telegram_pager']),
+ ('the fee retry never backs off', 'gs_telegram_pager',
+  '        return float(self.btc_fee_retry_s) * float(\n'
+  '            2 ** min(tries - 1, int(self.FEE_RETRY_DOUBLINGS)))',
+  '        return float(self.btc_fee_retry_s)',
+  ['test_telegram_pager']),
+ ('the fee retry backs off without a cap', 'gs_telegram_pager',
+  '            2 ** min(tries - 1, int(self.FEE_RETRY_DOUBLINGS)))',
+  '            2 ** (tries - 1))',
+  ['test_telegram_pager']),
+ ('a background start ignores the reserve', 'gs_telegram_pager',
+  '            if background:\n'
+  '                _h = getattr(_l, "headroom", None)',
+  '            if False:\n'
+  '                _h = getattr(_l, "headroom", None)',
+  ['test_telegram_pager']),
+ ('the recheck ignores the reserve', 'gs_telegram_pager',
+  '            if not self._btc_can_start(background=True):\n'
+  '                break',
+  '            if not self._btc_can_start():\n'
+  '                break',
+  ['test_telegram_pager']),
+ ('a fee retry is started like a first forward (the reserve ignored)',
+  'gs_telegram_pager',
+  '            elif state == "confirmed" and self._btc_can_start(\n'
+  '                    background=_retry):',
+  '            elif state == "confirmed" and self._btc_can_start(\n'
+  '                    background=False):',
+  ['test_telegram_pager']),
+ ('a held fee retry is said as if it were a first forward', 'gs_telegram_pager',
+  '                say = None if _retry else "held"',
+  '                say = "held"',
+  ['test_telegram_pager']),
+ ('the operator alert repeats every failure', 'gs_telegram_pager',
+  '            if _last and _now - _last < float(self.ALERT_MIN_GAP_S):\n'
+  '                return',
+  '            if False:\n'
+  '                return',
+  ['test_telegram_pager']),
+ ("the operator alert goes to the deposit's own chat", 'gs_telegram_pager',
+  '            if _to == chat_id or _to not in (getattr(self, "allow", None)\n'
+  '                                             or ()):',
+  '            if _to not in (getattr(self, "allow", None)\n'
+  '                                             or ()):',
+  ['test_telegram_pager']),
+ ('a failed forward never alerts the operator', 'gs_telegram_pager',
+  '            if out == "failed":\n'
+  '                # THE RUN DIED',
+  '            if False:\n'
+  '                # THE RUN DIED',
   ['test_telegram_pager']),
  ('a forward learned after a restart is not put back on the list', 'gs_telegram_pager',
   '            if (not e and out == "done"\n'
@@ -4903,7 +4964,8 @@ MUTATIONS = [
   '                e["state"] = "seen"\n                say = "confirmed"',
   ['test_telegram_pager']),
  ('the watcher starts the forward on money merely seen', 'gs_telegram_pager',
-  '            elif state == "confirmed" and self._btc_can_start():\n'
+  '            elif state == "confirmed" and self._btc_can_start(\n'
+  '                    background=_retry):\n'
   '                e["state"] = "forwarding"',
   '            elif state in ("confirmed", "seen") and self._btc_can_start():\n'
   '                e["state"] = "forwarding"',

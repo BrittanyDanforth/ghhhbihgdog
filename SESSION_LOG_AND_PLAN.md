@@ -219,6 +219,30 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### After stage 6: the functionality pass (the weaknesses list, read end to end)
+- Read: `Limits`, `start_job`, `_btc_can_start`, `_btc_apply`, the
+  `delayed` branches, `btc_tick`'s recheck, `gs_btc_watch.look` (it fails
+  over across servers per address, so "one server down means no deposits"
+  holds only with one server configured), the vault's job log (truncated
+  per boot, not a growth). Three fixes on the Pi, each with tests and
+  anchors swept:
+- **A reserve for taps.** `Limits.headroom()`; a start nobody asked for
+  (a fee retry, a recheck) waits while `--btc-reserve` (default 2) or fewer
+  of the day's courtesy pokes remain, so the automatic path cannot spend
+  the last wake a client's question needs. A first forward of a confirmed
+  deposit is not background. A held retry is silent (the chat heard the
+  vault's `delayed` sentence); refused at startup at or above `--daily-cap`.
+- **The fee retry backs off.** Each `delayed` in a row doubles the wait
+  (`fee_retry_wait`: 1, 2, 4, then 8 times `--btc-fee-retry`, the count
+  on the entry, cleared by any other answer). A day-long spike cost a wake
+  an hour per deposit — two deposits was the whole budget on retries.
+- **The operator hears a failed forward.** `--alert-chat` (allowlisted,
+  refused otherwise): one numberless line, at most hourly, when a forward
+  for some OTHER chat FAILED; nothing for the deposit's own chat, a
+  refusal, or a done run. Kind `operator_alerted`.
+- Counts: test_telegram_pager 785; 651 anchors, 12 swept (one survived on
+  a test that looked only at other chats; tightened and re-swept).
+
 ### Stage 6: the forward after the send — a stuck forward is found and bumped, the reconcile is driven (`STAGE6_PLAN.md`)
 - Planned first, after an end-to-end read of what stage 5 built, without
   trusting its tests (section 1 of the plan: four things left half-wired);

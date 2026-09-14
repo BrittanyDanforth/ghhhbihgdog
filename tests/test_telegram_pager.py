@@ -4727,6 +4727,196 @@ check("...a tick after it: the forward is started again through the same "
       _dj == [(111, "forward_to_swap", {"handle": "B4A1"})]
       and _dp.btc_open["B4A1"]["state"] == "forwarding"
       and "retry_after" not in _dp.btc_open["B4A1"] and _ds == [])
+
+print("\n-- the functionality pass: the fee retry backs off, background "
+      "starts leave a reserve, a failed forward reaches the operator --")
+# EACH `delayed` IN A ROW DOUBLES THE WAIT, up to eight times the base. A
+# fee spike that lasted a day cost a wake an hour per deposit; with two
+# deposits that was the whole day's budget on retries alone.
+_bo, _bs, _bj = _watch_pager()
+_bo.btc_fee_retry_s = 3600
+_bo.btc_open["B4A1"]["state"] = "forwarding"
+_waits = []
+for _i in range(6):
+    _bo._btc_forward_result("B4A1", "done", "delayed", 111)
+    _waits.append(_bo.btc_open.get("B4A1", {}).get("retry_after", 0)
+                  - time.time())
+check("the fee retry backs off: one, two, four, eight times --btc-fee-retry, "
+      "then eight for ever; the count is on the entry; nothing said",
+      all(abs(w - x) < 5 for w, x in zip(_waits, (3600, 7200, 14400, 28800,
+                                                   28800, 28800)))
+      and _bo.btc_open.get("B4A1", {}).get("fee_tries") == 6 and _bs == []
+      and pg.Pager.FEE_RETRY_DOUBLINGS == 3)
+_bo._btc_forward_result("B4A1", "done", "sent", 111)
+check("...a `sent` answer clears the count", "fee_tries" not in _bo.btc_open.get("B4A1", {}))
+_bo._btc_forward_result("B4A1", "done", "delayed", 111)
+check("...so the next `delayed` -- on a SENT entry, a replacement the vault "
+      "would not pay for -- waits one base again, the entry still sent",
+      abs(_bo.btc_open.get("B4A1", {}).get("retry_after", 0) - time.time() - 3600) < 5
+      and _bo.btc_open.get("B4A1", {}).get("state") == "sent")
+for _w in ("unsure", "forwarded", "returned"):
+    _bo._btc_forward_result("B4A1", "done", "delayed", 111)
+    _bo._btc_forward_result("B4A1", "done", _w, 111)
+    check(f"...and `{_w}` clears it too",
+          "fee_tries" not in _bo.btc_open.get("B4A1", {}))
+_bo.btc_open.get("B4A1", {})["fee_tries"] = "junk"
+check("fee_retry_wait never raises on a malformed count: it starts over",
+      abs(pg.Pager.fee_retry_wait(_bo, _bo.btc_open.get("B4A1", {})) - 3600) < 1
+      and _bo.btc_open.get("B4A1", {}).get("fee_tries") == 1)
+# A START NOBODY ASKED FOR LEAVES A RESERVE OF THE DAY'S POKES FOR TAPS:
+# a fee retry or a recheck waits while --btc-reserve or fewer remain, so
+# the automatic path cannot spend the last wake a client's question needs.
+# A FIRST forward of a confirmed deposit is not background.
+_rv, _rs, _rj = _watch_pager()
+_rv.btc_servers = [("s.onion", 50002, None)]
+_rv.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rv.btc_fee_retry_s = 3600
+_rv.btc_open["B4A1"]["state"] = "forwarding"
+_rv.btc_open["B4A1"]["said"].add("confirmed")
+_rv._btc_forward_result("B4A1", "done", "delayed", 111)
+_rv.btc_open.get("B4A1", {})["retry_after"] = time.time() - 1
+_rv.limits.headroom = lambda: 2                    # two pokes left today
+check("(setup) the reserve defaults to two; a tap could start, a "
+      "background start could not",
+      pg.Pager.btc_reserve == 2 and _rv.btc_reserve == 2
+      and _rv._btc_can_start() and not _rv._btc_can_start(background=True))
+_rv.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("a fee RETRY due with only the reserve left is NOT started, and not "
+      "said as 'held' (the chat heard the vault's own delayed sentence); "
+      "the entry stays seen for the next tick",
+      _rj == [] and _rs == [] and _rv.btc_open.get("B4A1", {}).get("state") == "seen")
+_rv.limits.headroom = lambda: 3
+_rv.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("...with one more than the reserve it starts, silently",
+      _rj == [(111, "forward_to_swap", {"handle": "B4A1"})] and _rs == [])
+_rv2, _rs2, _rj2 = _watch_pager()
+_rv2.btc_servers = [("s.onion", 50002, None)]
+_rv2.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rv2.limits.headroom = lambda: 1
+_rv2.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("a FIRST forward of a confirmed deposit is not background: it starts "
+      "with one poke left (moving the money is what the budget is for), "
+      "and is said",
+      _rj2 == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and len(_rs2) == 1 and "Sending it on now" in _rs2[0][0])
+_rv3, _rs3, _rj3 = _watch_pager()
+_rv3.btc_servers = [("s.onion", 50002, None)]
+_rv3.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rv3._btc_forward_result("B4A1", "done", "sent", 111)
+_rv3.btc_open.get("B4A1", {})["sent_at"] = time.time() - _rv3.btc_recheck_s - 1
+_rv3.limits.headroom = lambda: 2
+_rv3.btc_tick(look=_look_returning("not_seen"))
+check("the automatic RECHECK leaves the reserve too: not started with two "
+      "pokes left, unstamped", _rj3 == []
+      and "rechecked_at" not in _rv3.btc_open.get("B4A1", {}))
+_rv3.limits.headroom = lambda: 3
+_rv3.btc_tick(look=_look_returning("not_seen"))
+check("...and starts with three", len(_rj3) == 1)
+_rv4, _rs4, _rj4 = _watch_pager()
+_rv4.btc_servers = [("s.onion", 50002, None)]
+_rv4.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rv4.btc_reserve = 0
+_rv4._btc_forward_result("B4A1", "done", "sent", 111)
+_rv4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _rv4.btc_recheck_s - 1
+_rv4.limits.headroom = lambda: 1
+_rv4.btc_tick(look=_look_returning("not_seen"))
+check("--btc-reserve 0 disables the reserve: the recheck starts with one "
+      "poke left; and a limiter without headroom (a harness) is no gate",
+      len(_rj4) == 1
+      and pg.Pager._btc_can_start(_watch_pager()[0], background=True))
+_lh = pg.Limits(__import__("pathlib").Path(os.path.join(
+    tempfile.mkdtemp(prefix="headroom_"), "hr.json")), 0, 3)
+_lh_seq = [_lh.headroom()]
+for _ in range(4):
+    _lh.record()
+    _lh_seq.append(_lh.headroom())
+check("Limits.headroom counts down from the cap with each poke and never "
+      "goes negative", _lh_seq == [3, 2, 1, 0, 0])
+_src_cli = __import__("inspect").getsource(pg.build_cli)
+_src_main_fp = __import__("inspect").getsource(pg.main)
+check("--btc-reserve and --alert-chat are flags; a negative reserve, one at "
+      "or above --daily-cap, and an alert chat outside the allowlist are "
+      "refused at startup; the startup line says how many pokes are kept",
+      "--btc-reserve" in _src_cli and "--alert-chat" in _src_cli
+      and "--btc-reserve cannot be negative" in _src_main_fp
+      and "at or above" in _src_main_fp
+      and "--alert-chat must be one of the allowlisted" in _src_main_fp
+      and "kept for taps" in __import__("inspect").getsource(pg.Pager.run))
+
+
+def _forward_outcome_pager(outcome, alert_chat=None, allow=(111, 222),
+                           chat=111, phase=""):
+    """Drive the REAL start_job for a forward whose wake ends with
+    `outcome` (a stubbed doorbell), the way _depo_done_with_mid does, so
+    the worker renders the result. Returns (pager, [(chat, text)])."""
+    _fp, _, _, _ = _tapper(allow)
+    _fs = []
+    _fp.alert_chat = alert_chat
+    _fp.max_clients = len(allow)          # several people: not the one-person rule
+    _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
+    _fp.send = lambda c, t, buttons=None: (_fs.append((c, t)), True)[1]
+
+    class _R:
+        def __init__(self):
+            self.result = {"status": outcome, "handle": "B4A1",
+                           "phase": phase}
+            self.events = []
+
+        def outcome(self):
+            return outcome
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(run_wake=lambda *a, **k: _R())
+        _fp.start_job(chat, "forward_to_swap", {"handle": "B4A1"})
+        for _ in range(600):
+            if not _fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _fp, _fs
+
+
+# A FORWARD THAT FAILED reaches the operator: on a bot serving several
+# people the deposit's own chat is not the operator's, and the run that
+# died (the history unreadable, a spend that is not ours) was said to
+# nobody who could act. One numberless line, at most hourly.
+_BANNED_HERE = ("vault", "thinkpad", "keyfile", "thorchain", "monero", "xmr",
+                "tor", "bitcoin", "btc", "mix", "hop", "memo", "swap",
+                "wallet", "ghostspiral")
+_ap, _asent = _forward_outcome_pager("failed", alert_chat=222)
+_aline = [t for c, t in _asent if c == 222]
+check("a forward that FAILED for one chat: that chat hears 'forward: "
+      "failed.' and --alert-chat hears ONE line with no digit, no handle "
+      "and none of the banned words",
+      any(c == 111 and t.startswith("forward: failed") for c, t in _asent)
+      and len(_aline) == 1 and "another chat" in _aline[0]
+      and not any(ch.isdigit() for ch in _aline[0])
+      and "B4A1" not in _aline[0]
+      and not any(w in _aline[0].lower().split() for w in _BANNED_HERE))
+_n0 = len(_asent)
+_ap._alert_operator(111, "forward_to_swap")
+check("...a second failure inside the hour is NOT another line",
+      len(_asent) == _n0)
+_ap.__dict__["_alert_last"] = time.monotonic() - pg.Pager.ALERT_MIN_GAP_S - 1
+_ap._alert_operator(111, "forward_to_swap")
+check("...and one an hour later is", len(_asent) == _n0 + 1
+      and pg.Pager.ALERT_MIN_GAP_S == 3600)
+for _cfg, _why in ((111, "the deposit's own chat"), (333, "a chat outside "
+                                                     "the allowlist"),
+                   (None, "no alert chat configured")):
+    _apx, _asx = _forward_outcome_pager("failed", alert_chat=_cfg)
+    check(f"...nothing extra when the alert chat is {_why}: no line about "
+          "'another chat' anywhere, and nothing outside the deposit's chat",
+          [t for c, t in _asx if c not in (111,)] == []
+          and not any("another chat" in t for c, t in _asx))
+for _oc in ("refused", "done"):
+    _apx, _asx = _forward_outcome_pager(_oc, alert_chat=222)
+    check(f"...and a forward that ended `{_oc}` alerts nobody",
+          [t for c, t in _asx if c == 222] == [])
 # MONEY CAME BACK (`returned`): watched again from here, and when it
 # settles the forward is started and said as for a first payment.
 _rp9, _rs9, _rj9 = _watch_pager()
