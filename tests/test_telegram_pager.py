@@ -4598,8 +4598,9 @@ check("...a tick after it: the forward is started again through the same "
 # settles the forward is started and said as for a first payment.
 _rp9, _rs9, _rj9 = _watch_pager()
 _rp9._btc_forward_result("B4A1", "done", "sent", 111)
+# (a missing entry is a FAIL, not a crash: the sweep drops it on purpose)
 check("(setup) sent: kept on the list as sent, and learned for routing",
-      _rp9.btc_open["B4A1"]["state"] == "sent"
+      (_rp9.btc_open.get("B4A1") or {}).get("state") == "sent"
       and "B4A1" in _rp9._btc_sent_set())
 _calls9 = []
 _rp9.btc_tick(look=_look_returning("confirmed", conf=5000000, calls=_calls9))
@@ -4607,7 +4608,7 @@ check("...a sent entry is not looked at", _calls9 == [] and _rj9 == [])
 _rp9._btc_forward_result("B4A1", "done", "returned", 111)
 check("returned: the entry is watched again ('seen'), the routing learns "
       "the forward is the next ask again",
-      _rp9.btc_open["B4A1"]["state"] == "seen"
+      (_rp9.btc_open.get("B4A1") or {}).get("state") == "seen"
       and "B4A1" not in _rp9._btc_sent_set())
 _rp9.btc_tick(look=_look_returning("confirmed", conf=3000000))
 check("...and when the returned money settles the forward is started and "
@@ -4622,7 +4623,8 @@ _sp9.handle_owner["B4A1"] = 111
 _sp9.handle(_msg(111, 111, "/balance"))
 check("/balance names a sent deposit as 'sent on'",
       "sent on" in _ss9[-1][0] and "sent" in pg.Pager.BTC_STATE_WORDS)
-_sp9.btc_open["B4A1"]["sent_at"] = time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1
+_sp9.btc_open.setdefault("B4A1", {"state": "sent", "said": set()})["sent_at"] \
+    = time.time() - pg.proto.DEPOSIT_PLACE_TTL_S - 1
 _sp9.btc_tick(look=_look_returning("not_seen"))
 check("...and is dropped from the list after DEPOSIT_PLACE_TTL_S since it "
       "went out", "B4A1" not in _sp9.btc_open)
@@ -4770,7 +4772,7 @@ _sp3.handle(_msg(111, 111, f"/check {_sp3._label(111, 'B4A1')}"))
 check("after the forward reported SENT, /check on that deposit asks the XMR "
       "side (swap_status): the forward has nothing more to say; the entry "
       "is kept as sent", _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
-      and _sp3.btc_open["B4A1"]["state"] == "sent")
+      and (_sp3.btc_open.get("B4A1") or {}).get("state") == "sent")
 _tap(_sp3, "c:B4A1")
 check("...and so does the button", _sj3[-1] == (111, "swap_status",
                                                  {"handle": "B4A1"}))

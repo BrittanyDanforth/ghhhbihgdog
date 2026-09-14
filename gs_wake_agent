@@ -1486,7 +1486,26 @@ def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
         return False, None
 
 
-def _reconcile_pairs(rec: dict, plan: dict) -> bool:
+def _forward_chain(artifact_dir, handle: str) -> list:
+    """The rotated predecessors of this handle's plan (a reconciliation's
+    fresh forward moves the earlier plan aside as <stem>.<n>.json), newest
+    first. NEVER raises; unreadable ones are skipped."""
+    out = []
+    try:
+        stem = f"btc_forward_{handle}"
+        for f in Path(artifact_dir).glob(f"{stem}.*.json"):
+            mid = f.name[len(stem) + 1:-len(".json")]
+            if not mid.isdigit():
+                continue
+            p = _read_json(f)
+            if isinstance(p, dict):
+                out.append((int(mid), p))
+    except Exception:                                        # noqa: BLE001
+        return []
+    return [p for _n, p in sorted(out, reverse=True)]
+
+
+def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
     """THE XMR SIDE JUDGES THE REAL SWAP (STAGE5_PLAN.md 3.4). The watching
     jobs read `expected_xmr` and `btc_in` from the pairs file the
     DEPOSIT-time quote wrote, for the whole deposit at that day's rate; the
@@ -1495,22 +1514,37 @@ def _reconcile_pairs(rec: dict, plan: dict) -> bool:
     "short" about a swap that delivered exactly what it quoted. So once a
     plan says the money moved and carries a quote, the pair routed to this
     deposit's destination is rewritten from it: what was sent, what was
-    quoted, the txid for the operator's reading -- the deposit-time figures
-    kept beside them as `quoted_at_deposit`, written once. A reconstructed
-    plan (no quote survives a crash) rewrites nothing. Returns whether the
-    file was rewritten. Never raises."""
+    quoted, the txids for the operator's reading -- the deposit-time
+    figures kept beside them as `quoted_at_deposit`, written once.
+
+    EVERY FORWARD OF THE DEPOSIT COUNTS. A returned deposit (a refund, a
+    second payment) is forwarded again as a second swap to the SAME
+    destination; rewriting from the newest plan alone would tell the
+    watcher to expect only the second swap's output, so it would call the
+    payment complete when that one landed and the first was still in
+    flight. What is sent and what is quoted are summed over the plan and
+    its rotated predecessors that moved money and were not superseded. A
+    reconstructed plan (no quote survives a crash) contributes nothing.
+    Returns whether the file was rewritten. Never raises."""
     try:
         path = rec.get("slip")
-        moved = (plan.get("broadcast") is True
-                 and plan.get("broadcast_outcome") in ("accepted",
-                                                       "ambiguous"))
-        if not path or not moved or not plan.get("expected_xmr") \
-                or not plan.get("dest_xmr"):
+
+        def _counts(p):
+            return (isinstance(p, dict) and p.get("broadcast") is True
+                    and p.get("broadcast_outcome") in ("accepted",
+                                                       "ambiguous")
+                    and not p.get("superseded_by")
+                    and p.get("expected_xmr") not in (None, "")
+                    and p.get("dest_xmr") == plan.get("dest_xmr"))
+        counted = [p for p in [plan] + list(chain or ()) if _counts(p)]
+        if not path or not counted or not plan.get("dest_xmr"):
             return False
         pairs = _read_json(Path(path))
         if not isinstance(pairs, list):
             return False
         from gs_common import fmt_btc as _fmt
+        _sent = sum(int(p.get("send_sat") or 0) for p in counted)
+        _exp = sum(Decimal(str(p["expected_xmr"])) for p in counted)
         changed = False
         for pair in pairs:
             if not isinstance(pair, dict) \
@@ -1519,9 +1553,9 @@ def _reconcile_pairs(rec: dict, plan: dict) -> bool:
             pair.setdefault("quoted_at_deposit",
                             {"btc_in": pair.get("btc_in"),
                              "expected_xmr": pair.get("expected_xmr")})
-            pair["btc_in"] = _fmt(Decimal(int(plan.get("send_sat") or 0))
-                                  / Decimal(10 ** 8))
-            pair["expected_xmr"] = str(plan["expected_xmr"])
+            pair["btc_in"] = _fmt(Decimal(_sent) / Decimal(10 ** 8))
+            pair["expected_xmr"] = str(_exp)
+            pair["forwarded_txids"] = [p.get("txid") for p in counted]
             pair["forwarded_txid"] = plan.get("txid")
             changed = True
         if changed:
@@ -4030,7 +4064,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                     if isinstance(i, dict)}
             handles[handle]["forward_inputs"] = sorted(
                 set(handles[handle].get("forward_inputs") or []) | _ins)
-            _reconcile_pairs(handles[handle], _plan_now)
+            _reconcile_pairs(handles[handle], _plan_now,
+                             chain=_forward_chain(artifact_dir, handle))
         except Exception:                                    # noqa: BLE001
             integrity_log("wake", "forward_inputs_unrecorded")
     if _spent_pair is not None:

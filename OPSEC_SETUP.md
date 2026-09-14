@@ -2033,8 +2033,14 @@ plaintext trade is decided knowingly, in the same command, or not at all.
 ```bash
 python3 gs_wake_keys pair --deposit-in-chat \
     --btc-xpub <account xpub> --btc-electrum <host.onion> \
-    --allow-btc-forward [--allow-btc-broadcast] ...       # ON THE VAULT
+    --allow-btc-forward [--allow-btc-broadcast --thornode <url>] \
+    [--btc-account N] ...                                  # ON THE VAULT
 ```
+
+It prints the intake floor beside the ceiling it follows from — the
+smallest deposit this pair can send on when fees are at its
+`--feerate-ceiling-sat-vb` under both of the forwarder's guards — and the
+pager flag to set (`--deposit-min-sat`).
 
 What the vault does with it, per `/deposit`: refuses the amount below the
 intake floor before anything is minted (`deposit_too_small`; the floor is
@@ -2081,6 +2087,9 @@ python3 gs_telegram_pager ... \
                            # sends it on; match the vault's
     --btc-network main     # main, testnet, signet or regtest
     --btc-poll 600         # seconds between looks; under 60 is refused
+    --btc-fee-retry 3600   # how long after the vault would not pay today's
+                           # fee for a forward this end tries again, by
+                           # itself (floor 600)
     --deposit-min-sat N    # the vault's intake floor (printed at pairing),
                            # so the wizard refuses
                            # a too-small deposit HERE, with the number,
@@ -2107,6 +2116,34 @@ deposit nothing has reached after two days — the window the vault's own
 reserve gives an unpaid deposit — is dropped from the watch list, so a
 never-paid address is not looked at, on a fresh circuit, every ten minutes
 for ever; a payment that lands later is still sent on by the button.
+
+**When it does not go to plan** (`STAGE5_PLAN.md`). A forward the vault
+would not pay for at today's fee — the fee would take more than a fifth of
+the deposit, or the estimate is outside your band — is the word `delayed`:
+"the network is busy right now, so it waits. It is tried again later, by
+itself", and the pager tries again after `--btc-fee-retry`, through the
+same gates as any wake, without a tap. Money that can never be sent on at
+any rate this pair allows — under what was quoted — is `short`; the client
+can pay more to the same address. Once a forward has gone out, every tap
+runs the RECONCILIATION on the vault: it reads the address's history from
+your Electrum server and confirms the transaction is listed, re-sends the
+kept bytes if it is not, re-signs a fresh forward if the network dropped
+it, and — the case nobody plans for — sends on money that CAME BACK to the
+address (ThorChain refunds a swap it will not run to the paying address,
+and a client may pay twice): "some of it came back to where it was paid
+and is being sent on again". A spend of the address that is not the
+vault's own fails the run with `foreign_spend` on the chain: only a leaked
+seed does that, and the job log at the machine names the transaction.
+Never two signatures over one output while a spend of it may be in the
+network: that is the rule the reconciliation keeps, and the plan chain
+beside the ledger (`btc_forward_<handle>.json`, `.1.json`, …) is the record
+of every forward a deposit had. `--allow-btc-broadcast` needs `--thornode`:
+money does not move on the aggregator's word alone. `--btc-account N`
+retires a chain: a vault whose ledger was wiped behind a used account, or
+paired to an account used before, refuses every deposit (`ledger_wiped`)
+until it is re-paired with the next account's xpub, because every address
+of the old chain may have been handed to someone whose payment could still
+arrive.
 
 Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
 a slip, so an old doorbell rejects a new record **on length, before any

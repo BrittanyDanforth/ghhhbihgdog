@@ -23,13 +23,21 @@ WHAT IT PROVES, on the box that can run it:
   D. the transaction's OP_RETURN is the real-shaped swap memo the stub
      quoted, laid out with OP_PUSHDATA1, and its first output pays the
      "inbound" -- address 1 of the same account -- which then shows the
-     money as unconfirmed when looked at.
+     money as unconfirmed when looked at;
+  E. (stage 5) --reconcile against the real history: every listed
+     transaction fetched from the server and re-hashed, our forward found
+     listed, the plan brought up to date, nothing sent again.
 
 WHAT IT CANNOT PROVE, said plainly: that THORChain accepts the memo. There
 is no testnet THORChain and no testnet XMR quote, so the aggregator is
 stubbed here (the "inbound" is our own address 1, the "expected" Monero is
-derived from a fixed rate). Only mainnet, with money, proves the swap
-starts; that is the stage the design gates on every stage before it.
+derived from a fixed rate; THORNode's inbound list is stubbed to agree).
+Only mainnet, with money, proves the swap starts; that is the stage the
+design gates on every stage before it. Nor does it drive the re-send, the
+evicted re-sign or the returned money: those need a server that refuses
+the bytes, or a second payment to address 0 after this run -- pay it
+again and run the same argv with --reconcile by hand; it must answer
+`returned` until the payment settles, then forward it on its own.
 
 Requires, in the environment:
   GS_BTC_TESTNET_SEED      a BIP39 mnemonic whose testnet account (m/84'/1'/0')
@@ -223,6 +231,46 @@ check("address 1 shows the forwarded amount (unconfirmed or confirmed)",
 _pic0 = W.look(_addr0, _servers, _TOR, min_conf=1, network="testnet")
 check("address 0's spent outputs are gone from its unspent list",
       _pic0["settled_sat"] < _pic["settled_sat"])
+
+# --- E. the reconciliation, against the real history ------------------------
+print("\n== E. --reconcile: the real history, each transaction fetched ==")
+# The tap after a forward runs this (stage 5): the forwarder reads the
+# address's history from a real server -- blockchain.transaction.get for
+# every listed transaction, parsed here -- finds our transaction listed, and
+# brings the plan up to date without sending anything. What it proves: the
+# history path works against a real server over Tor. What it cannot prove
+# here: the re-send, the evicted re-sign and the returned money, which need
+# a server that refuses the bytes or a second payment to the address; act
+# on those by hand -- pay address 0 again after this run and run the same
+# argv with --reconcile: it must answer `returned` until the payment
+# settles, then forward it on its own.
+_before = len(_posts)
+argv_r = [a for a in argv if a != "--broadcast"] + ["--reconcile"]
+buf_r = io.StringIO()
+os.environ[F.SEED_ENV] = _SEED
+os.environ["GS_BTC_XPUB"] = _XPUB
+os.environ["GS_BTC_INDEX"] = "0"
+try:
+    with redirect_stdout(buf_r):
+        code_r = F.main(argv_r)
+except SystemExit as e:
+    code_r = e.code
+finally:
+    os.environ.pop("GS_BTC_XPUB", None)
+    os.environ.pop("GS_BTC_INDEX", None)
+    os.environ.pop(F.SEED_ENV, None)
+print("      " + "\n      ".join(buf_r.getvalue().strip().splitlines()))
+plan_r = json.load(open(_out)) if os.path.exists(_out) else None
+check("--reconcile found our transaction LISTED by a real server (the "
+      "history read, each transaction fetched and re-hashed) and reported "
+      "done", code_r == 0 and plan_r is not None
+      and plan_r.get("reconciled_ts") and plan_r["seen"] is True
+      and plan_r["txid"] == plan["txid"])
+check("...it asked for no quote and rotated no plan: nothing was sent again",
+      len(_posts) == _before and not [
+          f for f in os.listdir(_scratch)
+          if f.startswith("plan.") and f.endswith(".json") and f != "plan.json"
+          and f[5:-5].isdigit()])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

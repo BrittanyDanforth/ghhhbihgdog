@@ -4848,7 +4848,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the pairs file keeps the deposit-time quote after the forward',
   'gs_wake_agent',
-  '            pair["expected_xmr"] = str(plan["expected_xmr"])',
+  '            pair["expected_xmr"] = str(_exp)',
   '            pass',
   ['test_wake_agent']),
  ('a wiped ledger behind a used chain issues addresses', 'gs_wake_agent',
@@ -4877,11 +4877,10 @@ MUTATIONS = [
   '        if True:\n            # A FORWARD OF OURS THE CHAIN FORGOT',
   ['test_btc_forwarder']),
  ('--reconcile decides without the history', 'btc_forwarder',
-  '        integrity_log("forward", "history_unavailable")\n'
-  '        print(f"[!] the address\'s history could not be read ({e}); a "',
-  '        integrity_log("forward", "history_unavailable")\n'
-  '        spends = []\n'
-  '        print(f"[!] the address\'s history could not be read ({e}); a "',
+  '              "reconciliation cannot decide without it")\n'
+  '        raise SystemExit(EXIT_FAILED)',
+  '              "reconciliation cannot decide without it")\n'
+  '        spends = []',
   ['test_btc_forwarder']),
  ('a fresh forward overwrites the earlier plan instead of rotating it',
   'btc_forwarder',

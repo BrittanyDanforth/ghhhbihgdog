@@ -1,7 +1,8 @@
 # Stage 5: what happens when it does not go to plan — failure handling and reconciliation
 
-Status: **PLANNED** (this commit); the build follows step by step, and the
-status block at the end is updated as each step lands. This file is the
+Status: **BUILT** — planned first, built step by step against sections 3–4,
+then read back against the code (section 8: what the plan got wrong, and
+the fixes). The status block at the end is the tally. This file is the
 whole context for stage 5 of the BTC-intake rework (`BTC_INTAKE_DESIGN.md`;
 the earlier stages are `STAGE2_PLAN.md`, `STAGE3_PLAN.md`, `STAGE4_PLAN.md`).
 
@@ -354,14 +355,66 @@ unprovable off mainnet; the file's header keeps saying so.
 
 ---
 
+## 8. Self-doubt after the build (what the plan got wrong, and the fixes)
+
+Read back against the code once every step was green, asking again
+"where does the client's money sit now, and who can move it?":
+
+- **The pairs rewrite counted one swap.** 3.4 said "rewritten from the
+  plan"; a returned deposit's second forward is a second swap to the same
+  destination, so the newest plan alone told the XMR watcher to expect only
+  the second output and to call the payment complete when that one landed
+  with the first still in flight -- the client invited to withdraw early.
+  FIXED: what was sent and what was quoted are summed over the plan and its
+  rotated predecessors that moved money and were not superseded; the
+  rotated chain is read from the artifact directory on the real mark path.
+- **"Moved" was the wrong word for a forward found on chain.** The plan's
+  table said `moved` for case 1; on the wire `moved` means "paid out by a
+  withdrawal". A forward that went out is `sent`, and that is what the
+  reconstructed plan reads as. A foreign spend is a FAILED run with the
+  kind, not a word the phone could misread.
+- **A rejected re-send was a dead end.** The first design refused
+  `broadcast_rejected` when every server refused the kept bytes; those
+  bytes are stale (a policy, a fee the network no longer takes) and the
+  inputs still ours, so a fresh forward at today's fee follows, the stale
+  plan rotated aside.
+- **Two source tripwires from stage 3 were rewritten, not removed.** "the
+  signed bytes are never read from a file" is now "from ONE file, the
+  tool's own plan, schema checked, under --reconcile only, the bytes it
+  kept because the network had not shown them"; "submit is called once" is
+  "in exactly two places, the second for kept bytes". Both are pinned.
+- **The steps 5-6 commit went in with four rotten anchors** because the
+  anchor check's exit code did not gate the commit in one shell command;
+  step 7 re-pointed them and the sweep ran after. One anchor of step 5
+  ('--reconcile decides without the history') SURVIVED its first sweep:
+  the mutation left the failure in place. Re-formed to remove it; caught.
+- **Not closed, stated:** a forward listed by the server that accepted it
+  but not by the one the reconciliation asks would be re-signed as
+  "evicted" and race the original (both pay the same inbound with the
+  same memo; whichever confirms swaps once; every input opts into RBF). A
+  history over MAX_HISTORY (a dust attack) fails the reconciliation until
+  the operator acts by hand. A client's own payment replaced away under a
+  forward makes the plan's inputs vanish: `history_inconsistent`, FAILED,
+  the operator reads the log.
+
+---
+
 ## Status
 
-- [ ] 1. floor and cap
-- [ ] 2. pairing, account
-- [ ] 3. wire
-- [ ] 4. status words on refusal, moved detection
-- [ ] 5. `--reconcile`
-- [ ] 6. agent
-- [ ] 7. pager
-- [ ] 8. docs
-- [ ] 9. anchors, sweep, full suite, self-doubt, commit
+- [x] 1. floor and cap — test_btc_tx 101, test_btc_forwarder, test_wake_agent
+- [x] 2. pairing, account — test_wake_agent (`_pairs_btc`), test_btc_tx,
+      test_btc_forwarder
+- [x] 3. wire — v7; test_wake_protocol 189, test_plain_slip 236,
+      test_wake_doorbell 161, test_depo_wizard 434
+- [x] 4. status words on refusal, the emptied address read —
+      test_btc_forwarder, test_btc_broadcast 96
+- [x] 5. `--reconcile` — test_btc_forwarder 219 (every row of 3.1)
+- [x] 6. agent — test_wake_agent 692, test_wake_endtoend 70
+- [x] 7. pager — test_telegram_pager 716
+- [x] 8. docs — OPSEC_SETUP (the floor beside the ceiling, "When it does not
+      go to plan", the pairing recipe, `--btc-fee-retry`), BTC_INTAKE_DESIGN
+      (stage 5 BUILT, the outpoint invariant), SESSION_LOG, the testnet
+      script's act E
+- [x] 9. anchors (41 for stage 5, 595 total), the sweep (39 caught first
+      pass, the two non-verdicts fixed and re-swept), the full suite, this
+      section, commit

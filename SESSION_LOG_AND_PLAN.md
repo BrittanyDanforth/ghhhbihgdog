@@ -219,6 +219,53 @@ refuters per finding) found real defects, all fixed in the rewrite:
   had been flagging it missing since `b2d3993`); test_gitignore lists it
   as this repo's own source.
 
+### Stage 5: what happens when it does not go to plan (`STAGE5_PLAN.md`)
+- Planned first, after an end-to-end read of the whole money path done
+  without trusting the tests (section 1 of the plan: what is real, what is
+  mocked and said so, and nine gaps the working path hid); built in five
+  commits; section 8 is the self-doubt pass.
+- The invariant changed: not "once per handle" but one signature per
+  OUTPOINT while a spend of it may be in the network. `btc_forwarder
+  --reconcile` (a third mode, held to the sending mode's rules) is what
+  the tap after a forward runs: `gs_btc_broadcast` gained
+  `blockchain.transaction.get` (read-only, bounded, re-hashed) and
+  `spends_of()` (the address's history, each transaction fetched in one
+  session, the spends of its own outputs with their values); the run then
+  confirms our transaction is listed (bringing the plan up to date,
+  turning an ambiguous send into accepted, dropping kept bytes), re-sends
+  kept bytes (a rejected re-send becomes a fresh forward at today's fee),
+  re-signs an evicted forward, forwards money that came back leaving out
+  what our listed forwards consumed (`returned` while it is not settled),
+  adopts a listed spend with our memo the chain forgot, or FAILS on a
+  spend that is not ours or a history it could not read. A fresh forward
+  rotates the earlier plan aside: the plan chain is the record. An address
+  that holds nothing unspent is read for its last spend on ANY run, so a
+  forward that went out and died before its plan was written is
+  reconstructed from the chain rather than answered "not yet" for ever.
+- A refusal about today's fee is a word: `delayed` (cheaper blocks would
+  carry it; the Pi retries after `--btc-fee-retry`) or `short` (even the
+  floor rate could not; under what was quoted). The floor is honest: the
+  larger of the forwarder's two guards at the ceiling
+  (`gs_btc_tx.forward_floor_sat`), printed at pairing beside the ceiling.
+- The XMR side judges the real swap: once a plan says the money moved and
+  carries a quote, the pairs file the watching jobs read is rewritten to
+  what was sent and what was quoted, the deposit-time figures kept beside
+  it once.
+- `--allow-btc-broadcast` requires `--thornode`, and the agent refuses a
+  sending pair without one before any child; `--btc-account N` retires a
+  chain (the forwarder derives that account and proves it against the
+  xpub); an empty ledger behind a used address 0 is refused `ledger_wiped`
+  with the next account named; intake records are never pruned.
+- The pager: `delayed` keeps the deposit watched with a retry time,
+  `returned` watches it again and unlearns the routing, a sent deposit is
+  kept as `sent` (its address remembered for a refund) and forgotten after
+  the reserve's window.
+- Wire 7 (`delayed`, `returned`). Counts: test_btc_forwarder 219,
+  test_btc_broadcast 96, test_btc_tx 101, test_wake_agent 691,
+  test_telegram_pager 716, test_wake_endtoend 70, test_depo_wizard 434.
+  The testnet script gains act E (`--reconcile` against the real history)
+  and says which rows only a hand-driven second payment can prove.
+
 ### Stage 4: the deposit the client actually makes — a plain address, no note (`STAGE4_PLAN.md`)
 - Planned first, built against the plan in six commits plus the self-doubt
   pass recorded in its section 8.
@@ -724,7 +771,7 @@ rule-6 material).
 | 2 | `forward_to_swap` job: build + sign the BTC tx (every settled output of the deposit address, inbound from a forward-time SwapKit quote, the quote's memo in an OP_RETURN laid out with OP_PUSHDATA1, no change), `--dry-run` required and no broadcast path exists; seed from `GS_BTC_SEED` only; constant-time gate; `WIRE_VERSION` 4; `allow_btc_forward` switch | **DONE, dry-run only, reviewed** — `gs_btc_tx.py` (test_btc_tx 73/73, BIP143 byte for byte), `btc_forwarder` (test_btc_forwarder 133/133; the memo's output limit is SET by the tool, never trusted), job wiring (test_wake_agent 621/621, test_wake_protocol 189/189, test_wake_endtoend 59/59 over real HTTP), 39 anchors all caught; `STAGE2_PLAN.md` is the record. Testnet moves to stage 3 with the broadcast |
 | 3 | Broadcast over Tor; "seen" in the network as the proof; testnet end-to-end on a box with Tor; reorg edges and confirmation depth moved to stage 5 | **BUILT** — `gs_btc_broadcast.py` (test_btc_broadcast 75/75), `btc_forwarder --broadcast` (test_btc_forwarder 163/163, one forward through the real transport + real subclass + real forwarder against an in-process SOCKS5+TLS Electrum), wire v5 with `sent`/`unsure`, `allow_btc_broadcast`, the ledger's `forward_sent` and the once-sent rule (test_wake_agent 642, test_wake_endtoend 64, doorbell 161, pager 653), `tests/real_btc_forward_testnet.py` (skips here), 24 new anchors all caught; `STAGE3_PLAN.md` is the record |
 | 4 | Deposit UX: unique address, no note, auto received→confirmed→forwarding, per-owner `/balance` (gated); pager + doorbell + doc; banned-word and currency scans extended | **BUILT** — the vault mints a fresh, network-verified address per deposit and a memo-less plain slip (wire v6, two exact shapes); the Pi watches it in memory (the xpub never goes on the card), says received/confirmed once each and starts the forward through the one wake path when the box is free; the button and `/check` on an intake deposit ask the forward, after a restart too; `/balance`; pairing couples `--btc-xpub` to `--deposit-in-chat` and `--allow-btc-forward` (test_wake_agent 669, test_telegram_pager 704, test_depo_wizard 434, test_plain_slip 232, test_btc_forwarder 168, test_btc_broadcast 83, test_wake_endtoend 70), 36 anchors all caught; `STAGE4_PLAN.md` is the record, its section 8 the self-doubt findings |
-| 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | pending |
+| 5 | Failure handling + floating-rate reconciliation: fee spikes, dust/minimum refusal, forward failure + retry, reorg, reconcile the real swapped-out amount; full suite + anchors green | **BUILT** — `btc_forwarder --reconcile` (listed / re-send / re-sign evicted / forward returned money / foreign spend fails; the plan chain; one signature per outpoint), fee refusals as `delayed`/`short` with the Pi retrying, an emptied address read for our own forward, the pairs file rewritten to the real swap, the honest floor, `--thornode` required to send, `--btc-account`, `ledger_wiped`; test_btc_forwarder 219, test_btc_broadcast 96, test_btc_tx 101, test_wake_agent 691, test_telegram_pager 716, test_wake_endtoend 70; `STAGE5_PLAN.md` is the record |
 
 Each stage is validated before the next. Mainnet is not touched until every
 stage is green on testnet and reviewed.

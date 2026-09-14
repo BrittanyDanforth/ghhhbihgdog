@@ -4863,10 +4863,11 @@ check("...while a rehearsal pair without one still rehearses",
       and "--thornode" not in _ran[0][0])
 
 
-def _fwd_run_plan(rec, key_extra, plan):
+def _fwd_run_plan(rec, key_extra, plan, siblings=None):
     """A forward whose fake child WRITES the plan file the real one would,
-    so the mark and the phase word can be read from it. Returns
-    (out, err, ran, dir, bell)."""
+    so the mark and the phase word can be read from it -- and, with
+    `siblings` ({n: plan}), the rotated predecessors <stem>.<n>.json a
+    reconciliation leaves beside it. Returns (out, err, ran, dir, bell)."""
     dd, kk, bb = _fwd_env(rec, key_extra)
     ran = []
 
@@ -4876,6 +4877,9 @@ def _fwd_run_plan(rec, key_extra, plan):
             _of = argv[argv.index("--outfile") + 1]
             Path(_of).write_text(plan if isinstance(plan, str)
                                  else json.dumps(plan))
+            for _n, _p in (siblings or {}).items():
+                Path(_of[:-len(".json")] + f".{_n}.json").write_text(
+                    json.dumps(_p))
         return 0, False
 
     dp = deps_for(dd, bb, extend_deadman=lambda s: True, run_child=child)
@@ -4945,12 +4949,26 @@ check("a plan that moved money and carries a quote rewrites the pair routed "
 check("...the pair for another destination is untouched",
       json.loads(_pp.read_text())[1]["btc_in"] == "0.01"
       and "forwarded_txid" not in json.loads(_pp.read_text())[1])
-A._reconcile_pairs({"slip": str(_pp)}, {**_PLAN_Q, "expected_xmr": "1.20",
-                                        "send_sat": 4970000})
-check("...a later forward (a returned deposit) rewrites again, and the "
+# EVERY FORWARD OF THE DEPOSIT COUNTS: a returned deposit's second swap
+# goes to the same destination, so the watcher must expect BOTH outputs --
+# from the newest plan alone it would call the payment complete when the
+# second landed with the first still in flight.
+A._reconcile_pairs({"slip": str(_pp)}, {**_PLAN_Q, "expected_xmr": "0.20",
+                                        "send_sat": 700000,
+                                        "txid": "cd" * 32},
+                   chain=[_PLAN_Q, {**_PLAN_Q, "superseded_by": "x",
+                                    "expected_xmr": "9"},
+                          {**_PLAN_Q, "broadcast_outcome": "rejected",
+                           "expected_xmr": "9"},
+                          {**_PLAN_Q, "expected_xmr": None}])
+check("...a later forward (a returned deposit) rewrites again SUMMING what "
+      "every forward that moved money sent and quoted -- a superseded, a "
+      "rejected and a reconstructed plan contribute nothing -- and the "
       "deposit-time figures are written ONCE",
-      json.loads(_pp.read_text())[0]["expected_xmr"] == "1.20"
-      and json.loads(_pp.read_text())[0]["btc_in"] == "0.0497"
+      json.loads(_pp.read_text())[0]["expected_xmr"] == "1.51"
+      and json.loads(_pp.read_text())[0]["btc_in"] == "0.0568"
+      and json.loads(_pp.read_text())[0]["forwarded_txids"]
+      == ["cd" * 32, "ab" * 32]
       and json.loads(_pp.read_text())[0]["quoted_at_deposit"]
       == {"btc_in": "0.05", "expected_xmr": "1.5"})
 _pp2 = _pd / "thor_pairs_B.json"
@@ -4980,6 +4998,21 @@ check("...and the rewrite happens on the real mark path, when a sending run "
       "reports done", _ew is None
       and json.loads(_ppw.read_text())[0]["expected_xmr"] == "1.4"
       and json.loads(_ppw.read_text())[0]["btc_in"] == "0.001")
+# ...reading the plan CHAIN on that path: an earlier forward's rotated plan
+# beside the new one is summed in.
+_ow2, _ew2, _ranw2, _ddw2, _bbw2 = _fwd_run_plan(
+    {**_FWD_REC, "slip": str(_ppw)}, _SEND_KEY,
+    {**_ACC, "expected_xmr": "1.4", "dest_xmr": "/tmp/bay/x",
+     "send_sat": 100000, "txid": "ab" * 32},
+    siblings={"1": {**_ACC, "expected_xmr": "0.6", "dest_xmr": "/tmp/bay/x",
+                    "send_sat": 50000, "txid": "ee" * 32}})
+check("...the rotated predecessors are read from the artifact dir on the "
+      "real path and summed (chain reader never raises on junk)",
+      _ew2 is None
+      and A._forward_chain(_ddw2, "A3F1")[0]["txid"] == "ee" * 32
+      and A._forward_chain(_ddw2, "ZZZZ") == []
+      and json.loads(_ppw.read_text())[0]["expected_xmr"] == "2.0"
+      and json.loads(_ppw.read_text())[0]["btc_in"] == "0.0015")
 _o3, _e3, _ran3, _dd3, _bb3 = _fwd_run_plan(_FWD_REC,
                                             {**_SEND_KEY, "btc_account": 3},
                                             _ACC)

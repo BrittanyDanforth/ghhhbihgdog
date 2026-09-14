@@ -211,6 +211,23 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
    deposit ask the forward, which sends a settled one on and otherwise
    answers `not_yet`/`arriving` from the forwarder's one-word status file.
 5. **Failure handling**: fee spikes, dust/minimum refusal, forward failure and
-   retry, reorg/confirmation edge cases, floating-rate reconciliation.
+   retry, reorg/confirmation edge cases, floating-rate reconciliation. BUILT
+   (`STAGE5_PLAN.md` is its record, section 1 the end-to-end read that
+   found the gaps, section 8 the self-doubt pass). The invariant changed:
+   not "once per handle" but **one signature per outpoint while a spend of
+   it may be in the network**. `btc_forwarder --reconcile` is what a tap
+   after a forward runs: it reads the address's history (each transaction
+   fetched, read-only) and confirms our transaction is listed, re-sends
+   kept bytes, re-signs an evicted one, forwards money that came back (a
+   refund, a second payment) leaving out what our listed forwards consumed,
+   or fails on a spend that is not ours; a plan chain is the record. A fee
+   the vault will not pay today is the word `delayed` and the Pi tries
+   again by itself; money that can never be sent on is `short`. The XMR
+   side judges the forward-time swap (the pairs file is rewritten from the
+   plan). The floor is the larger of the forwarder's two guards at the
+   ceiling; `--allow-btc-broadcast` requires `--thornode`; a wiped ledger
+   behind a used chain is refused with the next account named
+   (`--btc-account`). What only mainnet proves is unchanged: that THORChain
+   takes the memo.
 
 Mainnet only after every stage above is green on testnet and reviewed.
