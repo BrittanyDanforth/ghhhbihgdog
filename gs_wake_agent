@@ -1369,6 +1369,45 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
             and not isinstance(r.get("btc_index"), bool)]
     nxt = (max(used) + 1) if used else 0
     ask = unused or (lambda addr: _btc_unused_live(key, addr))
+    if not used:
+        # THE LEDGER KNOWS NO INDEX: a fresh pair, or a WIPED ledger behind
+        # a used chain (STAGE5_PLAN.md 3.6). The two are told apart by
+        # address 0 alone: fresh, and this is index 0; used, and every
+        # address the gap search could reach was handed to somebody whose
+        # payment may still be coming -- a late payer and a new client on
+        # one line is the one thing a fresh chain prevents. So a used
+        # address 0 with an empty ledger is refused outright, with the way
+        # out: the next account of the same seed. Intake records are
+        # exempt from the ledger's pruning, so a quiet month cannot fake
+        # this.
+        try:
+            addr0 = _btc_address(key, 0)
+        except Exception as e:                               # noqa: BLE001
+            raise Refused("btc_config_malformed",
+                          "this machine's keyfile names an account xpub the "
+                          f"watch side cannot derive from ({type(e).__name__}); "
+                          "re-pair.")
+        try:
+            fresh0 = ask(addr0)
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", "btc_lookup_failed")
+            raise Refused("btc_lookup_failed",
+                          "could not ask the network whether the next deposit "
+                          "address is fresh, so no address was issued: one "
+                          "that might have been used already is two people's "
+                          "money on one line. Nothing was published.")
+        if fresh0:
+            return 0
+        integrity_log("wake", "ledger_wiped")
+        raise Refused("ledger_wiped",
+                      "this machine's ledger knows no deposit and the "
+                      "account's first address has already been used: the "
+                      "ledger was wiped behind a used chain, or the account "
+                      "was used before this pair. Every address this chain "
+                      "could hand out may have been handed out already, to "
+                      "someone whose payment could still arrive. Nothing was "
+                      "published. Re-pair with --btc-account one higher and "
+                      "that account's xpub: a fresh chain nobody was handed.")
     for step in range(int(proto.BTC_INDEX_GAP) + 1):
         idx = nxt + step
         try:
@@ -1411,7 +1450,8 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
 #: "short" money that can never be sent on at any rate this pair allows
 #: (under what was quoted) -- stage 5.
 _FORWARD_STATUS_PHASE = {"not_seen": "not_yet", "seen": "arriving",
-                         "delayed": "delayed", "short": "short"}
+                         "delayed": "delayed", "short": "short",
+                         "returned": "returned"}
 
 
 def _forward_status_path(artifact_dir, handle: str) -> Path:
@@ -1448,6 +1488,53 @@ def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
         return False, None
 
 
+def _reconcile_pairs(rec: dict, plan: dict) -> bool:
+    """THE XMR SIDE JUDGES THE REAL SWAP (STAGE5_PLAN.md 3.4). The watching
+    jobs read `expected_xmr` and `btc_in` from the pairs file the
+    DEPOSIT-time quote wrote, for the whole deposit at that day's rate; the
+    swap that actually ran was quoted at forward time for the deposit
+    minus the fee. A rate move over the watcher's tolerance read as
+    "short" about a swap that delivered exactly what it quoted. So once a
+    plan says the money moved and carries a quote, the pair routed to this
+    deposit's destination is rewritten from it: what was sent, what was
+    quoted, the txid for the operator's reading -- the deposit-time figures
+    kept beside them as `quoted_at_deposit`, written once. A reconstructed
+    plan (no quote survives a crash) rewrites nothing. Returns whether the
+    file was rewritten. Never raises."""
+    try:
+        path = rec.get("slip")
+        moved = (plan.get("broadcast") is True
+                 and plan.get("broadcast_outcome") in ("accepted",
+                                                       "ambiguous"))
+        if not path or not moved or not plan.get("expected_xmr") \
+                or not plan.get("dest_xmr"):
+            return False
+        pairs = _read_json(Path(path))
+        if not isinstance(pairs, list):
+            return False
+        from gs_common import fmt_btc as _fmt
+        changed = False
+        for pair in pairs:
+            if not isinstance(pair, dict) \
+                    or pair.get("dest_xmr") != plan.get("dest_xmr"):
+                continue
+            pair.setdefault("quoted_at_deposit",
+                            {"btc_in": pair.get("btc_in"),
+                             "expected_xmr": pair.get("expected_xmr")})
+            pair["btc_in"] = _fmt(Decimal(int(plan.get("send_sat") or 0))
+                                  / Decimal(10 ** 8))
+            pair["expected_xmr"] = str(plan["expected_xmr"])
+            pair["forwarded_txid"] = plan.get("txid")
+            changed = True
+        if changed:
+            atomic_write_json(pairs, Path(path), perms=0o600)
+            integrity_log("wake", "pairs_reconciled")
+        return changed
+    except Exception:                                        # noqa: BLE001
+        integrity_log("wake", "pairs_unreconciled")
+        return False
+
+
 def _btc_setting(key: dict, name: str, default: int, lo: int, hi: int) -> int:
     """A whole-number BTC-intake setting from the keyfile: the default only
     when the field is ABSENT (a keyfile from before it existed), refused
@@ -1465,7 +1552,7 @@ def _btc_setting(key: dict, name: str, default: int, lo: int, hi: int) -> int:
 
 def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                bundle: str = None, slip: str = None, handle: str = None,
-               owned_fee=(), btc_index=None) -> list:
+               owned_fee=(), btc_index=None, reconcile: bool = False) -> list:
     """The argv lists for one job, in order, composed ENTIRELY from the fixed
     template plus this machine's own keyfile. (The per-step environment is
     built by _dispatch beside each step; only build_fee_sweep_argv returns
@@ -1703,6 +1790,19 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
             raise Refused("btc_config_malformed",
                           "this machine's keyfile names a Bitcoin network "
                           "this tool does not know; re-pair.")
+        # MONEY DOES NOT MOVE ON THE AGGREGATOR'S WORD ALONE (STAGE5_PLAN.md
+        # 3.5): a run that may send -- a broadcast, or a reconciliation --
+        # needs the THORNode cross-check, and the forwarder refuses to run
+        # without it. Refused HERE, before a wake is spent on a child that
+        # will refuse, with the re-pair named; a keyfile written before
+        # pairing required it is exactly the case.
+        if (reconcile or _btc_broadcast_on(key)) \
+                and not key.get("thornode_url"):
+            raise Refused("no_thornode",
+                          "this pair sends but names no THORNode to check "
+                          "the inbound address against; re-pair with "
+                          "--thornode (money does not move on the "
+                          "aggregator's word alone).")
         # THE XPUB AND THE INDEX ARE NOT HERE. The xpub is the public
         # generator of every deposit address this host has ever minted --
         # holding it links all of them to each other and to this box -- and
@@ -1713,7 +1813,11 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                 # THE MODE IS THE KEYFILE'S SECOND SWITCH. A rehearsal --
                 # signed, printed, never sent -- unless the operator paired
                 # --allow-btc-broadcast as well; then the forward SENDS.
-                "--broadcast" if _btc_broadcast_on(key) else "--dry-run",
+                # A forward that already went out is RECONCILED instead
+                # (stage 5): what became of it decides what the run does,
+                # and _dispatch has checked this pair may still send.
+                "--reconcile" if reconcile else
+                ("--broadcast" if _btc_broadcast_on(key) else "--dry-run"),
                 "--tor-proxy", proxy,
                 "--network", _net,
                 "--dest-from-receive-wallet", str(bundle),
@@ -3175,6 +3279,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     bundle = slip = None
     _spent_pair = None
     _btc_index = None
+    _reconcile = False
     # EVERY JOB THAT NAMES A HANDLE RESOLVES IT HERE, and `withdraw` was
     # missing from this tuple while its argv template already interpolated
     # `bundle`. Driven: the composed command was
@@ -3328,29 +3433,30 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         _sent_before = (rec.get("forward_sent")
                         or _forward_outcome(artifact_dir, params["handle"])[0])
         if _sent_before:
-            # ...AND ANSWERED, NOT REFUSED. The wake that reaches here is
-            # the client tapping "has it arrived?" AFTER the forward went
-            # out: the Pi routes every ask about an intake deposit to this
-            # job, and after a restart it cannot know which were sent. A
-            # refusal reached the phone as "refused" with no reason on it,
-            # about money that had been sent on correctly. So a sent
-            # handle's forward run is a no-op that reports DONE, and
-            # _phase_of reads the plan the sending run wrote: `sent`, or
-            # `unsure`. No child, no quote, no signature -- once sent,
-            # never signed again still holds, and the once-sent anchor
-            # proves no child runs. Stage 5 turns this run into the
-            # reconciliation: is the txid listed yet, re-send kept bytes.
-            integrity_log("wake", "forward_repeat")
-            # THE LEDGER CATCHES UP with the plan (a crash between the
-            # sending child's exit and the mark left it unmarked): sent,
-            # and where the plan is. The bucket is left as it was -- this
-            # run sent nothing -- and set only if the record never had one.
-            rec["forward_sent"] = True
-            rec["forward_plan"] = \
-                str(artifact_dir / f"btc_forward_{params['handle']}.json")
-            rec.setdefault("forwarded", int(time.time()) // 600 * 600)
-            _save_handles(artifact_dir, handles, led["owners"])
-            return "done", "done", params["handle"]
+            # ...AND RECONCILED, NOT REFUSED (STAGE5_PLAN.md 3.1). The wake
+            # that reaches here is the client tapping "has it arrived?"
+            # AFTER the forward went out (the Pi routes every ask about an
+            # intake deposit to this job). Stage 4 answered it from the
+            # plan; stage 5 runs the forwarder in --reconcile mode, which
+            # asks the network what became of the forward and acts: it
+            # confirms it is listed, re-sends kept bytes, re-signs an
+            # evicted one, forwards money that came back, or FAILS on a
+            # spend that is not ours. The invariant is one signature per
+            # OUTPOINT while a spend of it may be in the network, kept by
+            # the forwarder from its plan chain and mirrored on this
+            # record as `forward_inputs`. A reconciliation may SEND, so a
+            # pair whose sending switch was turned off since is refused
+            # here rather than handed a mode it may not run.
+            if not _btc_broadcast_on(key):
+                integrity_log("wake", "forward_repeat")
+                raise Refused("forward_not_sending",
+                              f"a forward of handle {params['handle']} went "
+                              "out and this pair no longer sends "
+                              "(allow_btc_broadcast is off), so what became "
+                              "of it cannot be reconciled from here. Re-pair "
+                              "to send, or read the plan at the machine.")
+            integrity_log("wake", "forward_reconcile")
+            _reconcile = True
         # A REHEARSAL MAY BE FOLLOWED BY THE REAL THING, and by nothing
         # else. A done dry run marks its record (a time bucket, no amount,
         # no txid); a second DRY RUN is refused rather than re-quoting the
@@ -3482,7 +3588,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                   if job == "withdraw" else [])
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
                        slip=slip, handle=handle, owned_fee=_owned_fee,
-                       btc_index=_btc_index)
+                       btc_index=_btc_index, reconcile=_reconcile)
 
     # AN ADDRESS MINTED FOR A DEPOSIT THAT NEVER GOT ITS QUOTE IS THE NEXT
     # DEPOSIT'S ADDRESS. See _reusable_receive; decided before the loop so
@@ -3912,6 +4018,23 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             str(artifact_dir / f"btc_forward_{handle}.json")
         handles[handle]["forward_sent"] = bool(
             _forward_outcome(artifact_dir, handle)[0])
+        # THE OUTPOINTS OUR FORWARDS SPENT, accumulated over every run
+        # (STAGE5_PLAN.md section 2): the invariant is one signature per
+        # OUTPOINT while a spend of it may be in the network, not one
+        # forward per handle. The forwarder keeps the same list from its
+        # plan chain; this is the ledger's copy, read by the pairs rewrite
+        # and by the operator. No amount, no txid.
+        try:
+            _plan_now = _read_json(
+                artifact_dir / f"btc_forward_{handle}.json") or {}
+            _ins = {f"{i.get('tx_hash')}:{i.get('vout')}"
+                    for i in (_plan_now.get("inputs") or [])
+                    if isinstance(i, dict)}
+            handles[handle]["forward_inputs"] = sorted(
+                set(handles[handle].get("forward_inputs") or []) | _ins)
+            _reconcile_pairs(handles[handle], _plan_now)
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", "forward_inputs_unrecorded")
     if _spent_pair is not None:
         for _rec in handles.values():
             if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:
@@ -4058,7 +4181,18 @@ def _save_handles(d: Path, h: dict, owners: dict = None) -> None:
     """Write the ledger. `owners` omitted keeps what the file already holds,
     so a caller that only touched handles cannot drop the other half."""
     if len(h) > MAX_HANDLES:
-        h = dict(list(h.items())[-MAX_HANDLES:])
+        # INTAKE RECORDS ARE NEVER PRUNED (STAGE5_PLAN.md 3.6): a record
+        # carrying btc_index is what tells a fresh pair from a wiped ledger
+        # and what the once-per-outpoint rule reads. The bound falls on the
+        # rest, most recent kept.
+        _intake = {k for k, r in h.items()
+                   if isinstance(r, dict)
+                   and isinstance(r.get("btc_index"), int)
+                   and not isinstance(r.get("btc_index"), bool)}
+        _others = [k for k in h if k not in _intake]
+        _room = max(0, MAX_HANDLES - len(_intake))
+        _drop = set(_others[:max(0, len(_others) - _room)])
+        h = {k: r for k, r in h.items() if k not in _drop}
     if owners is None:
         owners = _load_ledger(d)["owners"]
     atomic_write_json({"handles": h, "owners": owners},

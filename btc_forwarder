@@ -13,8 +13,22 @@ is a refusal, so no mode is ever reached by omission.
 
 The broadcast lives in gs_btc_broadcast, a module the Pi never imports;
 the watch client this tool looks with still knows no method that could
-move money. The signed bytes are never read from a file: what is sent is
-what was signed a moment ago, in this process (STAGE3_PLAN.md 3.2).
+move money. The signed bytes are not read from a file: what is sent is
+what was signed a moment ago, in this process (STAGE3_PLAN.md 3.2) -- with
+ONE exception, stage 5's --reconcile, which re-sends the bytes this tool
+itself kept in its own plan because the network had not shown them.
+
+STAGE 5 (STAGE5_PLAN.md): --reconcile, the third mode. A forward already
+went out and the plan says so; the run asks the network what became of it
+and acts: confirms it is listed (and brings the plan up to date), re-sends
+kept bytes, re-signs an evicted transaction, forwards money that came
+back to the address (a refund, a second payment) leaving out every output
+a listed forward of ours consumed, or FAILS on a spend this tool did not
+sign. A fresh forward rotates the earlier plan aside rather than
+overwriting it: the plan chain is the record of every forward the deposit
+had. And on any run, an address that holds nothing unspent is read for its
+last spend before "not yet" is answered (reconcile_emptied), and a
+refusal about today's fee is a word (delayed / short), not a dead end.
 
 What it does, in order, and what it refuses at each step:
 
@@ -203,7 +217,7 @@ def fee_band(rate, floor, ceiling):
     return rate
 
 
-def select_inputs(utxos, min_conf, rate):
+def select_inputs(utxos, min_conf, rate, exclude=()):
     """The outputs the forward spends, and why the rest are left.
 
     SETTLED TO min_conf, output by output -- gs_btc_watch.summarize counts
@@ -214,11 +228,17 @@ def select_inputs(utxos, min_conf, rate):
     (perhaps deliberately) parked on the address; sweeping two hundred of
     them would make the fee eat the deposit and strand the real payment.
     Dust stays where it is; it is not money this forward can carry.
+    NEVER TWICE: an outpoint in `exclude` -- consumed by a forward of ours
+    the network lists (--reconcile) -- is not spendable money whatever a
+    server says, and is left out before anything else is decided.
     Returns (chosen, skipped_dust, unsettled)."""
     marginal_vb = btx.INPUT_BASE + -(-btx.WITNESS_P2WPKH_MAX // 4)
     floor = 2 * marginal_vb * rate
+    excluded = {(str(t).lower(), int(v)) for t, v in exclude}
     chosen, dust, unsettled = [], 0, 0
     for u in utxos:
+        if (str(u["tx_hash"]).lower(), int(u["vout"])) in excluded:
+            continue
         if u["confirmations"] < min_conf or u["confirmations"] < 1:
             unsettled += 1
         elif u["value"] <= floor:
@@ -603,8 +623,11 @@ def status_path(outfile):
 #: (`short`: under what was quoted). Nothing else is ever in the file.
 STATUS_DELAYED = "delayed"
 STATUS_SHORT = "short"
+#: Money came BACK to the address after the forward (a refund, a second
+#: payment) and is not yet settled; it is sent on when it is (--reconcile).
+STATUS_RETURNED = "returned"
 STATUS_WORDS = (watch.STATE_NOT_SEEN, watch.STATE_SEEN, STATUS_DELAYED,
-                STATUS_SHORT)
+                STATUS_SHORT, STATUS_RETURNED)
 #: The refusals that are about TODAY'S FEE, not about the deposit: with
 #: cheaper blocks the same deposit forwards. Each becomes `delayed` (or
 #: `short`, when even the floor rate could not carry it) rather than a
@@ -776,6 +799,288 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
     return EXIT_OK
 
 
+def _plan_chain(outfile):
+    """This handle's plan files, newest first: the current one and the
+    rotated predecessors `<stem>.<n>.json` a reconciliation left behind
+    when it wrote a fresh forward. Only files that exist."""
+    p = Path(outfile)
+    stem = p.name[:-len(".json")] if p.name.endswith(".json") else p.name
+    rotated = []
+    for f in p.parent.glob(f"{stem}.*.json"):
+        mid = f.name[len(stem) + 1:-len(".json")]
+        if mid.isdigit():
+            rotated.append((int(mid), f))
+    return ([p] if p.exists() else []) + [f for _n, f in
+                                         sorted(rotated, reverse=True)]
+
+
+def _rotate_plan(outfile):
+    """Move the current plan aside as `<stem>.<n>.json` before a fresh one
+    is written for the same handle; the chain is the record of every
+    forward this deposit had. Returns the new name, or None."""
+    p = Path(outfile)
+    if not p.exists():
+        return None
+    stem = p.name[:-len(".json")]
+    n = 1 + sum(1 for _ in _plan_chain(outfile)[1:])
+    target = p.with_name(f"{stem}.{n}.json")
+    os.replace(p, target)
+    return target
+
+
+def _read_plan(path):
+    with open(path, encoding="utf-8") as fh:
+        plan = json.load(fh)
+    if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
+        raise Refused("no_plan", "the plan file is not one this tool wrote")
+    return plan
+
+
+def _memo_is_ours(tx_hex, dest_xmr):
+    """(memo_text or None, True iff its OP_RETURN names our destination)."""
+    from embit.transaction import Transaction as _Tx
+    tx = _Tx.parse(bytes.fromhex(tx_hex))
+    memo = None
+    for o in tx.vout:
+        data = _op_return_data(o.script_pubkey.data)
+        if data is not None:
+            try:
+                memo = data.decode("utf-8")
+            except UnicodeDecodeError:
+                memo = None
+            break
+    ours = bool(memo) and instruction_field_safe(memo) \
+        and _memo_fields_bind(memo, dest_xmr)
+    return memo, ours
+
+
+def reconcile(args, plan, picture, address, index, servers, dest_xmr):
+    """What became of the forward the plan describes, and what to do
+    (STAGE5_PLAN.md 3.1). Reads the address's spends (read-only) beside
+    the look already taken, and returns one of:
+
+        ("done", EXIT_OK)         our transaction is listed; the plan is
+                                  brought up to date (seen, height; an
+                                  ambiguous outcome becomes accepted; kept
+                                  bytes are dropped). The agent reads `sent`.
+        ("resend", tx_hex)        not listed, its inputs still unspent, the
+                                  signed bytes kept: hand the SAME bytes to
+                                  the network again.
+        ("forward", exclude, why) money to send on that no listed forward
+                                  of ours consumed: `evicted` (our unlisted
+                                  transaction's own inputs, re-signed --
+                                  every input opts into RBF), or `returned`
+                                  (new outputs: a refund, a second payment).
+                                  The caller runs the ordinary forward with
+                                  `exclude` left out, after rotating the plan.
+
+    A spend of the address that is not in our plan chain is examined: an
+    OP_RETURN naming this destination is a forward of ours the chain
+    forgot (adopted as ours); anything else FAILS the run with the kind on
+    the chain -- nothing is signed. Money come back but not yet settled is
+    the word `returned` and a refusal: sent on when it settles."""
+    try:
+        spends = bcast_spends(address, servers, args.tor_proxy,
+                              network=args.network, timeout=args.timeout)
+    except watch.PinMismatch as e:
+        raise Refused("pin_mismatch", str(e))
+    except watch.BtcWatchError as e:
+        integrity_log("forward", "history_unavailable")
+        print(f"[!] the address's history could not be read ({e}); a "
+              "reconciliation cannot decide without it")
+        raise SystemExit(EXIT_FAILED)
+    chain = []
+    for f in _plan_chain(args.outfile):
+        try:
+            chain.append(_read_plan(f))
+        except (OSError, ValueError, Refused):
+            continue
+    ours = {str(p.get("txid") or "").lower() for p in chain
+            if p.get("txid")}
+    ours.add(str(plan.get("txid") or "").lower())
+    listed = {s["txid"]: s for s in spends}
+    for s in spends:
+        if s["txid"] in ours:
+            continue
+        _memo, mine = _memo_is_ours(s["hex"], dest_xmr)
+        if mine:
+            # A FORWARD OF OURS THE CHAIN FORGOT: a signature this tool
+            # made whose plan was lost. It is ours; its inputs are gone.
+            integrity_log("forward", "adopted_spend")
+            ours.add(s["txid"])
+            continue
+        integrity_log("forward", "foreign_spend")
+        print("[!] the deposit address was spent by a transaction this "
+              "tool did not sign: its memo does not name this deposit's "
+              f"destination (txid {s['txid']}). Nothing is signed. If no "
+              "operator moved it by hand, the seed has leaked.")
+        raise SystemExit(EXIT_FAILED)
+    consumed = {(i["tx_hash"], int(i["vout"]))
+                for s in spends if s["txid"] in ours for i in s["inputs"]}
+    unspent = {(str(u["tx_hash"]).lower(), int(u["vout"])): u
+               for u in picture["utxos"]}
+    fresh = {k: u for k, u in unspent.items() if k not in consumed}
+    settled_new = [u for u in fresh.values()
+                   if u["confirmations"] >= args.min_conf
+                   and u["confirmations"] >= 1]
+    unsettled_new = [u for u in fresh.values() if u not in settled_new]
+    txid = str(plan.get("txid") or "").lower()
+    if txid in listed:
+        hit = listed[txid]
+        plan["seen"] = True
+        plan["seen_height"] = hit["height"]
+        plan["seen_server"] = hit.get("server")
+        plan["seen_asked"] = True
+        if plan.get("broadcast_outcome") != bcast.OUTCOME_ACCEPTED:
+            plan["broadcast_outcome"] = bcast.OUTCOME_ACCEPTED
+        plan["broadcast"] = True
+        plan["tx_hex"], plan["tx_hex_reason"] = None, None
+        plan["reconciled_ts"] = int(time.time()) // 600 * 600
+        write_plan(args.outfile, plan)
+        integrity_log("forward", "reconciled_listed")
+        where = ("in the mempool" if hit["height"] <= 0
+                 else f"in a block at height {hit['height']}")
+        print(f"  reconcile: our transaction is listed {where}. Nothing to "
+              "send.")
+        if settled_new:
+            integrity_log("forward", "returned_settled")
+            print(f"  reconcile: {len(settled_new)} new settled output(s) on "
+                  "the address that no forward of ours consumed (a refund, "
+                  "or a second payment): forwarding them.")
+            return "forward", sorted(consumed), "returned"
+        if unsettled_new:
+            integrity_log("forward", "returned_unsettled")
+            write_status(args.outfile, STATUS_RETURNED)
+            raise Refused("returned_unsettled",
+                          f"{len(unsettled_new)} new output(s) came back to "
+                          "the address and are not settled yet; they are "
+                          "sent on once they are")
+        print(f"  plan updated: {args.outfile}")
+        return "done", EXIT_OK
+    # NOT LISTED. Where are the inputs it spent?
+    plan_inputs = {(str(i["tx_hash"]).lower(), int(i["vout"]))
+                   for i in plan.get("inputs") or []}
+    if plan_inputs and plan_inputs <= set(unspent):
+        if plan.get("tx_hex"):
+            integrity_log("forward", "resend")
+            print("  reconcile: our transaction is not listed and its inputs "
+                  "are still unspent; the signed bytes were kept. Sending "
+                  "the same transaction again.")
+            return "resend", plan["tx_hex"]
+        integrity_log("forward", "evicted")
+        print("  reconcile: our transaction is not listed and its inputs are "
+              "still unspent, and no bytes were kept (it was listed once). "
+              "Re-signing a fresh forward of the same money.")
+        return "forward", sorted(consumed), "evicted"
+    if plan_inputs and plan_inputs & consumed:
+        # Its inputs were consumed by a listed forward of ours under
+        # another txid (an earlier reconciliation re-signed). That one is
+        # the record; this plan is superseded by it.
+        newest = max((s for s in spends if s["txid"] in ours),
+                     key=lambda s: (s["height"] <= 0, s["height"]))
+        plan["superseded_by"] = newest["txid"]
+        plan["reconciled_ts"] = int(time.time()) // 600 * 600
+        write_plan(args.outfile, plan)
+        integrity_log("forward", "reconciled_superseded")
+        print(f"  reconcile: this plan's inputs were spent by our listed "
+              f"transaction {newest['txid']}; recorded.")
+        if settled_new:
+            return "forward", sorted(consumed), "returned"
+        return "done", EXIT_OK
+    integrity_log("forward", "history_inconsistent")
+    print("[!] reconcile: the plan's inputs are neither unspent nor consumed "
+          "by any transaction the server lists; the server's history and "
+          "unspent set contradict each other. Nothing is signed.")
+    raise SystemExit(EXIT_FAILED)
+
+
+def resend(args, plan, tx_hex, address, servers):
+    """Hand the SAME signed bytes to the network again (--reconcile found
+    our transaction unlisted with its inputs still unspent). The plan is
+    updated with this attempt. Returns ("done", exit_code) after an
+    accepted or ambiguous outcome (the money may have moved; seen is
+    polled as after a first send), raises SystemExit(EXIT_FAILED) when no
+    server could be reached, and returns ("forward", [], "rejected") when
+    every server that answered refused the bytes -- the transaction is
+    stale (a policy or a fee the network no longer takes) and its inputs
+    are still ours, so a fresh forward at today's fee follows."""
+    txid = str(plan.get("txid") or "").lower()
+    integrity_log("forward", "resending")
+    try:
+        sub = bcast_submit(tx_hex, txid, address, servers, args.tor_proxy,
+                           network=args.network, timeout=args.timeout)
+    except watch.PinMismatch:
+        raise Refused("pin_mismatch",
+                      "a pinned Electrum server presented another "
+                      "certificate while re-sending; nothing was sent")
+    except watch.BtcWatchError as e:
+        raise Refused("bad_args", str(e))
+    outcome = sub["outcome"]
+    integrity_log("forward", f"broadcast_{outcome}")
+    plan["resends"] = int(plan.get("resends") or 0) + 1
+    plan["broadcast_outcome"] = outcome
+    plan["broadcast_server"] = sub["server"]
+    plan["broadcast_codes"] = sub["codes"]
+    plan["broadcast_attempts"] = sub["attempts"]
+    plan["broadcast_mismatched"] = sub["mismatched"]
+    plan["reconciled_ts"] = int(time.time()) // 600 * 600
+    if outcome == bcast.OUTCOME_UNREACHABLE:
+        write_plan(args.outfile, plan)
+        print(f"[!] re-send: no Electrum server could be reached "
+              f"({sub['attempts']} tried); nothing moved")
+        raise SystemExit(EXIT_FAILED)
+    if outcome == bcast.OUTCOME_REJECTED:
+        # STALE BYTES, LIVE MONEY: every server that answered refused the
+        # transaction the network once listed. Its inputs are still ours;
+        # a fresh forward at today's fee is the way on, not a refusal.
+        plan["broadcast"] = False
+        write_plan(args.outfile, plan)
+        integrity_log("forward", "resend_rejected")
+        print(f"  re-send: every server that answered ({len(sub['codes'])} "
+              f"of {sub['attempts']}) rejected the kept transaction (codes "
+              f"{sub['codes']}); re-signing a fresh forward of the same "
+              "money.")
+        return "forward", [], "rejected"
+    try:
+        seen_r = bcast_seen(txid, address, servers, args.tor_proxy,
+                            network=args.network, timeout=args.timeout,
+                            wait_s=args.seen_wait,
+                            interval_s=args.seen_interval,
+                            avoid=sub["server"])
+    except watch.PinMismatch:
+        seen_r = {"seen": False, "height": None, "server": None,
+                  "cert_sha256": None, "polls": 0, "asked": False,
+                  "pin_mismatch": True}
+        integrity_log("forward", "seen_pin_mismatch")
+    integrity_log("forward",
+                  "broadcast_seen" if seen_r["seen"] else "broadcast_unseen")
+    plan["broadcast"] = True
+    plan["seen"] = bool(seen_r["seen"])
+    plan["seen_height"] = seen_r["height"]
+    plan["seen_server"] = seen_r["server"]
+    plan["seen_asked"] = bool(seen_r["asked"])
+    plan["seen_polls"] = seen_r["polls"]
+    if seen_r["seen"]:
+        plan["tx_hex"], plan["tx_hex_reason"] = None, None
+    else:
+        plan["tx_hex"] = tx_hex
+        plan["tx_hex_reason"] = ("unseen" if outcome == bcast.OUTCOME_ACCEPTED
+                                 else "ambiguous")
+    write_plan(args.outfile, plan)
+    by = f" by {sub['server']}" if sub["server"] else ""
+    print(f"  re-sent: {outcome}{by} after {sub['attempts']} server(s); "
+          f"attempt {plan['resends']}")
+    if seen_r["seen"]:
+        where = ("in the mempool" if seen_r["height"] <= 0
+                 else f"in a block at height {seen_r['height']}")
+        print(f"  seen: {where}, listed by {seen_r['server']}")
+    else:
+        print("  seen: NOT yet listed; the signed transaction is kept in "
+              "the plan file")
+    print(f"  plan updated: {args.outfile}")
+    return "done", EXIT_OK
+
+
 def build_cli():
     ap = argparse.ArgumentParser(
         description="Forward a settled BTC deposit into the ThorChain swap: "
@@ -789,6 +1094,13 @@ def build_cli():
                     help="after signing, hand the transaction to the "
                          "configured Electrum servers over Tor and wait to "
                          "see it listed. Money moves.")
+    ap.add_argument("--reconcile", action="store_true",
+                    help="a forward already went out (the plan at --outfile "
+                         "says so): ask the network what became of it and "
+                         "act -- confirm it is listed, re-send kept bytes, "
+                         "re-sign an evicted one, forward money that came "
+                         "back, or fail on a spend that is not ours. Sends "
+                         "when it must; the third of three exclusive modes.")
     ap.add_argument("--quote-max-age", type=int,
                     default=DEFAULT_QUOTE_MAX_AGE_S, metavar="S",
                     help="refuse to send if this many seconds passed since "
@@ -867,15 +1179,21 @@ def build_cli():
 def main(argv=None):
     install_signal_handlers()
     args = build_cli().parse_args(argv)
-    # EXACTLY ONE MODE. Neither is the stage-2 refusal (kept by name: an
-    # old caller that passes nothing still gets it); both is a contradiction.
-    if args.dry_run == args.broadcast:
-        raise Refused("not_dry_run", "exactly one of --dry-run and "
-                      "--broadcast is required: no mode is reached by "
+    # EXACTLY ONE MODE. None is the stage-2 refusal (kept by name: an old
+    # caller that passes nothing still gets it); two is a contradiction. A
+    # reconciliation SENDS when it must, so it is held to the broadcast's
+    # own requirements below.
+    if sum(1 for m in (args.dry_run, args.broadcast, args.reconcile) if m) \
+            != 1:
+        raise Refused("not_dry_run", "exactly one of --dry-run, --broadcast "
+                      "and --reconcile is required: no mode is reached by "
                       "omission, and a dry run cannot also send")
-    if args.broadcast and args.plan_only:
+    if (args.broadcast or args.reconcile) and args.plan_only:
         raise Refused("bad_args", "--plan-only writes an unsigned plan; "
-                      "there is nothing to broadcast")
+                      "there is nothing to broadcast or reconcile")
+    if args.reconcile:
+        # THE SENDING MODE'S RULES, because a reconciliation may send.
+        args.broadcast = True
     if args.broadcast and (args.quote_max_age < 1 or args.seen_wait < 0
                            or args.seen_interval <= 0):
         raise Refused("bad_args", "--quote-max-age must be >= 1, "
@@ -964,6 +1282,27 @@ def main(argv=None):
         raise SystemExit(EXIT_FAILED)
     if shutdown_requested():
         raise SystemExit(EXIT_FAILED)
+    # THE RECONCILIATION (STAGE5_PLAN.md 3.1): a forward already went out.
+    # What became of it decides everything after this point; a fresh
+    # forward, when one follows, leaves out every outpoint a listed forward
+    # of ours consumed and does not overwrite the earlier plan.
+    exclude, why = (), None
+    if args.reconcile:
+        try:
+            plan0 = _read_plan(args.outfile)
+        except (OSError, ValueError):
+            raise Refused("no_plan", "--reconcile needs the plan of the "
+                          "forward that went out, at --outfile")
+        verdict = reconcile(args, plan0, picture, address, index, servers,
+                            dest_xmr)
+        if verdict[0] == "resend":
+            verdict = resend(args, plan0, verdict[1], address, servers)
+        if verdict[0] == "done":
+            return verdict[1]
+        _, exclude, why = verdict
+        exclude = [tuple(x) for x in exclude]
+        integrity_log("forward", f"reconcile_{why}")
+        _rotate_plan(args.outfile)
     if picture["settled_sat"] <= 0:
         # NOTHING UNSPENT AT ALL: was it ever paid, and where did it go? A
         # forward that went out and died before its plan was written is
@@ -990,7 +1329,8 @@ def main(argv=None):
         rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
                         args.feerate_floor, args.feerate_ceiling)
         chosen, skipped_dust, unsettled = select_inputs(picture["utxos"],
-                                                        args.min_conf, rate)
+                                                        args.min_conf, rate,
+                                                        exclude=exclude)
         if not chosen:
             raise Refused("nothing_economic",
                           "what is settled here is all dust at this fee "
@@ -1177,6 +1517,11 @@ def main(argv=None):
         "server": picture.get("server"),
         "cert_sha256": picture.get("cert_sha256"),
         "ts": int(time.time()) // 600 * 600,
+        # A RECONCILIATION'S FRESH FORWARD says why it exists and what it
+        # left out; a first forward says neither.
+        "reconcile_reason": why,
+        "excluded_outpoints": len(exclude),
+        "resends": 0,
     }
     write_plan(args.outfile, plan)
     if not args.broadcast:

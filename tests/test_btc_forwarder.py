@@ -202,6 +202,9 @@ class Net:
                              "address": address, "servers": servers,
                              "proxy": proxy_url, **kw})
         r = self.submit_result
+        if isinstance(r, list):
+            # One outcome per call, in order (a re-send, then a fresh send).
+            r = r.pop(0) if r else _UNREACHABLE
         if isinstance(r, Exception):
             raise r
         return dict(r) if r else _UNREACHABLE
@@ -902,9 +905,9 @@ _c, _o, _p, _of = run(_nm)
 check("a refusal that is not about the fee (memo_unbound) writes NO status "
       "word: it is a refusal, and the phone hears that",
       _c == F.EXIT_REFUSED and _status_of(_of) is None)
-check("the four words the status file may carry, and the six fee kinds that "
+check("the five words the status file may carry, and the six fee kinds that "
       "earn one", set(F.STATUS_WORDS) == {"not_seen", "seen", "delayed",
-                                          "short"}
+                                          "short", "returned"}
       and set(F.DELAY_KINDS) == {"no_fee_estimate", "bad_fee_estimate",
                                  "fee_out_of_band", "fee_eats_deposit",
                                  "nothing_economic", "below_minimum"})
@@ -1006,6 +1009,188 @@ check("an OP_RETURN is read exactly as this tool lays one out -- one push, "
       and F._op_return_data(bytes([0x6a, 0x4c, 3]) + b"abcd") is None
       and F._op_return_data(_IN_SPK.data) is None
       and F._op_return_data(b"") is None and F._op_return_data(None) is None)
+
+print("\n== STAGE 5: --reconcile, what became of a forward that went out ==")
+_TN = ("--thornode", "https://tn.example")
+
+
+def _first_send(submit=_ACCEPTED, seen=_SEEN0):
+    """A first forward that SENT: returns (plan, outfile, signed hex)."""
+    net = Net(submit=submit, seen=seen)
+    code, out, plan, of = run(net, broadcast=True)
+    assert code == 0 and plan is not None, (code, out)
+    return plan, of, net.submits[0]["raw_hex"]
+
+
+def _listed(plan, raw_hex, height=850002, inputs=None):
+    return {"txid": plan["txid"], "height": height, "hex": raw_hex,
+            "inputs": inputs or [{"tx_hash": _H1, "vout": 0,
+                                  "value": 200000}],
+            "server": "s.onion"}
+
+
+def _reconcile(net, of, *extra):
+    return run(net, "--reconcile", *_TN, *extra, dry_run=False, outfile=of)
+
+
+_UNSPENT0 = [{"tx_hash": _H1, "vout": 0, "value": 200000,
+              "confirmations": 5}]
+
+# (a) LISTED, nothing new: bring the plan up to date, send nothing.
+_p1, _of1, _hx1 = _first_send()
+_n1 = Net(utxos=[], spends=[_listed(_p1, _hx1)])
+_c, _o, _p, _ = _reconcile(_n1, _of1)
+check("listed in a block, nothing new on the address: done, no quote, no "
+      "send; the plan is brought up to date (seen, the height, a "
+      "reconciliation stamp) and NOT rotated",
+      _c == F.EXIT_OK and _n1.posts == [] and _n1.submits == []
+      and _p is not None and _p["txid"] == _p1["txid"] and _p["seen"] is True
+      and _p["seen_height"] == 850002 and _p.get("reconciled_ts")
+      and ("forward", "reconciled_listed") in _n1.kinds
+      and len(F._plan_chain(_of1)) == 1 and _status_of(_of1) is None)
+# (b) an AMBIGUOUS first send, now listed: the outcome becomes accepted and
+# the kept bytes are dropped -- the phone stops hearing "unsure".
+_p2, _of2, _hx2 = _first_send(submit=_AMBIGUOUS, seen=_NOT_SEEN)
+check("(setup) an ambiguous, unseen first send kept its bytes",
+      _p2["broadcast_outcome"] == "ambiguous" and _p2["tx_hex"] == _hx2)
+_n2 = Net(utxos=[], spends=[_listed(_p2, _hx2, height=0)])
+_c, _o, _p, _ = _reconcile(_n2, _of2)
+check("an ambiguous send found listed (mempool): accepted now, the kept bytes "
+      "dropped, done", _c == F.EXIT_OK and _p["broadcast_outcome"] == "accepted"
+      and _p["tx_hex"] is None and _p["seen"] is True
+      and _p["seen_height"] == 0 and _n2.submits == [])
+# (c) NOT listed, inputs still unspent, bytes kept: the SAME bytes again.
+_p3, _of3, _hx3 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_n3 = Net(utxos=_UNSPENT0, spends=[], submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_n3, _of3)
+check("not listed, inputs unspent, bytes kept: RE-SENT -- the identical "
+      "bytes, no quote, no new signature; seen now, the bytes dropped, "
+      "resends counted, the plan not rotated",
+      _c == F.EXIT_OK and len(_n3.submits) == 1
+      and _n3.submits[0]["raw_hex"] == _hx3
+      and _n3.submits[0]["txid"] == _p3["txid"] and _n3.posts == []
+      and _p["resends"] == 1 and _p["seen"] is True and _p["tx_hex"] is None
+      and _p["txid"] == _p3["txid"] and len(F._plan_chain(_of3)) == 1
+      and ("forward", "resend") in _n3.kinds)
+# (c') the re-send is REJECTED by every server: stale bytes, live money --
+# a fresh forward at today's fee follows, the old plan rotated aside.
+_p4, _of4, _hx4 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_n4 = Net(utxos=_UNSPENT0, spends=[], submit=[_REJECTED, _ACCEPTED],
+          seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_n4, _of4)
+_chain4 = F._plan_chain(_of4)
+check("a rejected re-send: a FRESH forward is quoted, signed and sent; the "
+      "old plan is rotated aside (rejected, not moved) and the new one says "
+      "why it exists", _c == F.EXIT_OK and len(_n4.submits) == 2
+      and _n4.submits[0]["raw_hex"] == _hx4 and len(_n4.posts) == 1
+      and len(_chain4) == 2 and _p["reconcile_reason"] == "rejected"
+      and _p["broadcast_outcome"] == "accepted"
+      and json.load(open(_chain4[1]))["broadcast"] is False
+      and json.load(open(_chain4[1]))["resends"] == 1
+      and ("forward", "resend_rejected") in _n4.kinds
+      and ("forward", "reconcile_rejected") in _n4.kinds)
+# (d) NOT listed, inputs unspent, no bytes (it was listed once): evicted --
+# re-signed afresh (every input opts into RBF), the old plan rotated.
+_p5, _of5, _hx5 = _first_send()
+check("(setup) a seen first send kept no bytes", _p5["tx_hex"] is None)
+_n5 = Net(utxos=_UNSPENT0, spends=[], submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_n5, _of5)
+check("evicted (not listed, inputs unspent, nothing kept): a fresh forward "
+      "of the same money -- quoted, signed, sent -- the old plan rotated, "
+      "the reason recorded", _c == F.EXIT_OK and len(_n5.posts) == 1
+      and len(_n5.submits) == 1 and _p["reconcile_reason"] == "evicted"
+      and _p["inputs"][0]["tx_hash"] == _H1
+      and len(F._plan_chain(_of5)) == 2
+      and ("forward", "evicted") in _n5.kinds)
+# (e) listed, and NEW settled money on the address: a refund or a second
+# payment -- forwarded, and ONLY the new outputs.
+_p6, _of6, _hx6 = _first_send()
+_n6 = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 150000,
+                  "confirmations": 5}],
+          spends=[_listed(_p6, _hx6)], submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_n6, _of6)
+check("RETURNED, settled: the new output is forwarded on its own (the old "
+      "plan's input is excluded), quoted for its own amount, a new plan "
+      "beside the rotated old one", _c == F.EXIT_OK and len(_n6.posts) == 1
+      and _p["reconcile_reason"] == "returned"
+      and [(i["tx_hash"], i["vout"]) for i in _p["inputs"]] == [(_H2, 0)]
+      and _p["excluded_outpoints"] == 1 and _p["settled_sat"] == 150000
+      and len(F._plan_chain(_of6)) == 2
+      and json.load(open(F._plan_chain(_of6)[1]))["txid"] == _p6["txid"]
+      and ("forward", "returned_settled") in _n6.kinds)
+# (f) listed, new money NOT settled yet: the word `returned`, sent on later.
+_p7, _of7, _hx7 = _first_send()
+_n7 = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 150000,
+                  "confirmations": 0}], spends=[_listed(_p7, _hx7)])
+_c, _o, _p, _ = _reconcile(_n7, _of7)
+check("RETURNED, not settled: refused returned_unsettled with the status "
+      "word 'returned', nothing sent, the plan (seen) not rotated",
+      _c == F.EXIT_REFUSED and _status_of(_of7) == "returned"
+      and _n7.submits == [] and _n7.posts == []
+      and ("forward", "refused:returned_unsettled") in _n7.kinds
+      and len(F._plan_chain(_of7)) == 1 and _p["seen"] is True)
+# (g) a spend of the address that is NOT ours: the run fails, nothing signed.
+_p8, _of8, _hx8 = _first_send()
+_n8 = Net(utxos=[], spends=[_listed(_p8, _hx8),
+                            {**_spend_tx("=:XMR.XMR:" + _OTHER + ":0/1/0"),
+                             "inputs": [{"tx_hash": _H2, "vout": 0,
+                                         "value": 5000}]}])
+_c, _o, _p, _ = _reconcile(_n8, _of8)
+check("a spend this tool did not sign among the address's spends: FAILED, "
+      "the kind on the chain, nothing signed or sent",
+      _c == F.EXIT_FAILED and _n8.submits == [] and _n8.posts == []
+      and ("forward", "foreign_spend") in _n8.kinds)
+# (h) our plan's txid is not listed, but a listed spend with OUR memo
+# consumed its inputs (an earlier reconciliation re-signed; this plan is
+# the older one): adopted, recorded as superseded, done.
+_p9, _of9, _hx9 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_adopt = {**_spend_tx("=:XMR.XMR:" + _DEST + ":99/1/0"), "height": 850003}
+_n9 = Net(utxos=[], spends=[_adopt])
+_c, _o, _p, _ = _reconcile(_n9, _of9)
+check("a listed spend with OUR memo that the plan chain did not know: "
+      "adopted as ours; this plan's inputs were consumed by it, so it is "
+      "recorded as superseded and the run is done -- nothing re-sent",
+      _c == F.EXIT_OK and _p["superseded_by"] == _adopt["txid"]
+      and _n9.submits == [] and _n9.posts == []
+      and ("forward", "adopted_spend") in _n9.kinds
+      and ("forward", "reconciled_superseded") in _n9.kinds)
+# (i) the history could not be read: a reconciliation cannot decide.
+_p10, _of10, _hx10 = _first_send()
+_n10 = Net(utxos=_UNSPENT0, spends=F.watch.BtcWatchError("nobody answered"),
+           submit=_ACCEPTED)
+_c, _o, _p, _ = _reconcile(_n10, _of10)
+check("the history unreadable: FAILED with the kind, nothing sent (a decision "
+      "without the history could double-spend)",
+      _c == F.EXIT_FAILED and _n10.submits == []
+      and ("forward", "history_unavailable") in _n10.kinds)
+# (j) the plan's inputs are neither unspent nor in any listed spend.
+_p11, _of11, _hx11 = _first_send()
+_n11 = Net(utxos=[], spends=[], submit=_ACCEPTED)
+_c, _o, _p, _ = _reconcile(_n11, _of11)
+check("the server's history and unspent set contradict each other: FAILED, "
+      "nothing signed", _c == F.EXIT_FAILED and _n11.submits == []
+      and _n11.posts == []
+      and ("forward", "history_inconsistent") in _n11.kinds)
+# (k) the arguments.
+_nk = Net(utxos=_UNSPENT0)
+check("--reconcile without a plan at --outfile is refused no_plan; with "
+      "--dry-run it is two modes; without --thornode it may not send",
+      _refusal(_nk, "--reconcile", *_TN, dry_run=False)[3] == "no_plan"
+      and _refusal(Net(), "--reconcile", *_TN)[3] == "not_dry_run"
+      and _refusal(Net(), "--reconcile", dry_run=False,
+                   outfile=_of1)[3] == "bad_args")
+_ch, _du, _un = F.select_inputs(
+    [{"tx_hash": _H1, "vout": 0, "value": 200000, "confirmations": 5},
+     {"tx_hash": _H2, "vout": 1, "value": 150000, "confirmations": 5}],
+    2, 10, exclude=[(_H1, 0)])
+check("select_inputs leaves an excluded outpoint out before anything else "
+      "is decided", [u["tx_hash"] for u in _ch] == [_H2] and _du == 0
+      and _un == 0)
+check("the plan chain: the current plan first, then the rotated ones newest "
+      "first, and the status file is never mistaken for one",
+      [p.name for p in F._plan_chain(_of4)]
+      == [os.path.basename(_of4), os.path.basename(_of4)[:-5] + ".1.json"]
+      and not any(".status." in p.name for p in F._plan_chain(_of7)))
 
 print("\n== THORNode's word on the inbound ==")
 _ok_node = [{"chain": "BTC", "address": _INBOUND, "halted": False,
@@ -1401,16 +1586,29 @@ for _opm, _ceil in ((80, 200), (130, 200), (80, 40), (255, 100000), (1, 1)):
     check(f"...and one satoshi under it is REFUSED by one of the two guards "
           f"at that ceiling ({_opm}/{_ceil}) -- the floor is minimal, not "
           "padded", _under == F.EXIT_REFUSED)
+_i_main_send = _src.index("bcast_submit(", _src.index("if args.broadcast:\n"))
 check("the forwarder names no Electrum method that spends: the broadcast is "
-      "reached through gs_btc_broadcast's submit, called exactly once, "
-      "inside the --broadcast branch, after the real-rate floor",
+      "reached through gs_btc_broadcast's submit, called in exactly two "
+      "places -- inside the --broadcast branch after the real-rate floor, "
+      "and inside resend() for bytes this tool itself kept",
       "transaction.broadcast" not in _src and "sendrawtransaction" not in _src
-      and _src.count("bcast_submit(") == 1
+      and _src.count("bcast_submit(") == 2
       and _src.index("rate fell under the floor")
-      < _src.index("if args.broadcast:\n") < _src.index("bcast_submit("))
-check("the forwarder never reads a transaction from a file to send it (no "
-      "--rebroadcast, no plan read)", "--rebroadcast" not in _src
-      and "json.load(" not in _src)
+      < _src.index("if args.broadcast:\n") < _i_main_send
+      and _src.index("def resend(") < _src.index("bcast_submit(")
+      < _src.index("def build_cli("))
+# THE ONE FILE A TRANSACTION IS READ FROM TO SEND IT is the plan this tool
+# wrote (STAGE5_PLAN.md 3.1): only under --reconcile, only after the
+# schema is checked, and only the bytes kept because the network had not
+# shown them. No --rebroadcast flag, no other read.
+check("the forwarder reads a transaction from a file to send it ONLY in "
+      "--reconcile, from its own plan (schema checked), the kept bytes",
+      "--rebroadcast" not in _src and _src.count("json.load(") == 1
+      and _src.index("json.load(") > _src.index("def _read_plan(")
+      and 'plan.get("schema") != PLAN_SCHEMA' in _src
+      and 'if plan.get("tx_hex"):' in _src
+      and _src.index("_read_plan(args.outfile)")
+      > _src.index("if args.reconcile:\n        try:"))
 check("the seed is never an argument: no --seed, no --mnemonic",
       "--seed" not in _src and "--mnemonic" not in _src
       and "add_argument(\"--seed" not in _src)

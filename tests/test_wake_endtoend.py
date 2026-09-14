@@ -519,7 +519,10 @@ try:
                                          "seen": True}))
         return 0, False
 
-    _SEND_KEY = {**_BTC_KEY, "allow_btc_broadcast": True}
+    # A SENDING PAIR NAMES A THORNODE (stage 5): the cross-check is required
+    # where money moves, and the agent refuses a sending pair without one.
+    _SEND_KEY = {**_BTC_KEY, "allow_btc_broadcast": True,
+                 "thornode_url": "https://tn.example"}
     p4, out4, err4, ran4, text4 = cycle(
         "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
         key_extra=_SEND_KEY, env={"GS_BTC_SEED": _MNEMONIC},
@@ -549,18 +552,32 @@ try:
           _rec4.get("forward_sent") is True
           and not any(k in json.dumps(_rec4) for k in ("txid", "server",
                                                         "accepted")))
+    _ran5 = []
+
+    def _reconciling_child(argv, env_extra, budget):
+        """The forwarder in --reconcile mode, faked: records its argv and
+        leaves the plan as it found it (the network still lists it)."""
+        _ran5.append((list(argv), dict(env_extra or {})))
+        return 0, False
+
     p5, out5, err5, ran5, text5 = cycle(
         "forward_to_swap", {"handle": _h1, "owner": P.HOST_OWNER}, _bay,
         key_extra=_SEND_KEY, env={"GS_BTC_SEED": _MNEMONIC},
-        deps_over={"extend_deadman": lambda s: True})
-    # ONCE SENT, NEVER SIGNED AGAIN -- AND ANSWERED, NOT REFUSED. The wake
+        deps_over={"extend_deadman": lambda s: True,
+                   "run_child": _reconciling_child})
+    # A FORWARD THAT WENT OUT IS RECONCILED (STAGE5_PLAN.md 3.1). The wake
     # after a forward is the client tapping "has it arrived?" (the Pi routes
-    # every ask about an intake deposit to this job); a refusal reached the
-    # phone as "refused" with no reason, about money sent on correctly.
-    check("ONCE: a second run on a SENT handle runs NO child (nothing is "
-          "signed or quoted again) and answers DONE with the word 'sent' "
-          "on the real path, read from the plan the sending run wrote",
-          err5 is None and out5 and out5[0] == "done" and ran5 == []
+    # every ask about an intake deposit to this job): the forwarder runs in
+    # --reconcile mode on the deposit's own plan and answers from what the
+    # network shows; with the transaction still listed, that is `sent`.
+    check("a second run on a SENT handle runs the forwarder in --reconcile "
+          "mode (not --broadcast) on the real path, with the seed, the "
+          "account and the THORNode it needs, and answers DONE with 'sent'",
+          err5 is None and out5 and out5[0] == "done" and len(_ran5) == 1
+          and "--reconcile" in _ran5[0][0] and "--broadcast" not in _ran5[0][0]
+          and "--thornode" in _ran5[0][0]
+          and _ran5[0][1].get("GS_BTC_SEED") == _MNEMONIC
+          and _ran5[0][1].get("GS_BTC_ACCOUNT") == "0"
           and p5 is not None and p5.result
           and p5.result["status"] == "done" and p5.result["phase"] == "sent"
           and p5.result["slip"] == "" and p5.result["plain"] == {})

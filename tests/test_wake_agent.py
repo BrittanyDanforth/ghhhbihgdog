@@ -4827,18 +4827,40 @@ _o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000}, _SEND_KEY)
 check("A REHEARSAL MAY BE FOLLOWED BY THE REAL THING: a handle with a dry-run "
       "mark is forwarded again by a sending run, which supersedes the plan",
       _e is None and bool(_ran) and "--broadcast" in _ran[0][0])
-for _mode, _mk in (("sending", _SEND_KEY), ("rehearsal", _FWD_KEY)):
-    _o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000,
-                             "forward_sent": True}, _mk)
-    # ONCE SENT, NEVER SIGNED AGAIN: no child. AND ANSWERED, NOT REFUSED: the
-    # wake after a forward is the client asking "has it arrived?", and a
-    # refusal reached the phone as "refused" with no reason about money sent
-    # on correctly. The word (sent / unsure) is read from the plan; the
-    # end-to-end suite pins it on the wire.
-    check(f"...but a handle whose forward was SENT runs NO child in {_mode} "
-          "mode (a second signature would conflict with the first) and "
-          "answers done, not refused", _o is not None and _e is None
-          and _ran == [])
+# A FORWARD THAT WENT OUT IS RECONCILED (STAGE5_PLAN.md 3.1): the wake after
+# a forward is the client asking "has it arrived?", and the answer is what
+# the network shows -- so the forwarder runs in --reconcile mode, which
+# confirms, re-sends, re-signs an evicted transaction, forwards money that
+# came back, or fails on a spend that is not ours. Stage 4's no-op answer
+# from the plan is gone; the once-per-outpoint rule lives in the child.
+_o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000,
+                         "forward_sent": True}, _SEND_KEY)
+_argv_rc = _ran[0][0] if _ran else []
+check("a handle whose forward was SENT, on a sending pair: the forwarder runs "
+      "in --reconcile mode (not --broadcast, not --dry-run), with the "
+      "THORNode named, on the deposit's own plan",
+      _e is None and len(_ran) == 1 and "--reconcile" in _argv_rc
+      and "--broadcast" not in _argv_rc and "--dry-run" not in _argv_rc
+      and "--thornode" in _argv_rc
+      and _argv_rc[_argv_rc.index("--outfile") + 1].endswith(
+          "btc_forward_A3F1.json"))
+_o, _e, _ran = _fwd_run({**_FWD_REC, "forwarded": 1700000000,
+                         "forward_sent": True}, _FWD_KEY)
+check("...on a pair whose sending switch is OFF, a sent handle is refused "
+      "forward_not_sending before any child (a reconciliation may send, and "
+      "this pair may not)", _o is None
+      and getattr(_e, "code", None) == "forward_not_sending" and _ran == [])
+_o, _e, _ran = _fwd_run(_FWD_REC, {k: v for k, v in _SEND_KEY.items()
+                                   if k != "thornode_url"})
+check("a SENDING pair that names no THORNode is refused no_thornode before "
+      "any child: money does not move on the aggregator's word alone",
+      _o is None and getattr(_e, "code", None) == "no_thornode"
+      and _ran == [])
+_o, _e, _ran = _fwd_run(_FWD_REC, {k: v for k, v in _FWD_KEY.items()
+                                   if k != "thornode_url"})
+check("...while a rehearsal pair without one still rehearses",
+      _e is None and len(_ran) == 1 and "--dry-run" in _ran[0][0]
+      and "--thornode" not in _ran[0][0])
 
 
 def _fwd_run_plan(rec, key_extra, plan):
@@ -4881,6 +4903,83 @@ check("the forward's child is handed GS_BTC_ACCOUNT=0 for a keyfile without "
       "the field, off the argv", len(_ran) == 1
       and _ran[0][1].get("GS_BTC_ACCOUNT") == "0"
       and "--account" not in _ran[0][0])
+# THE OUTPOINTS OUR FORWARDS SPENT, accumulated on the record (STAGE5_PLAN.md
+# section 2): the ledger's copy of the once-per-outpoint rule, no amount.
+_ACC_IN = {**_ACC, "inputs": [{"tx_hash": "ab" * 32, "vout": 0, "value": 1},
+                              {"tx_hash": "cd" * 32, "vout": 3, "value": 2}]}
+_oi, _ei, _rani, _ddi, _bbi = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC_IN)
+check("a sent forward's plan inputs are recorded on the ledger as outpoints "
+      "(txid:vout), sorted, without their values",
+      _ei is None and _rec_of(_ddi).get("forward_inputs")
+      == sorted(["ab" * 32 + ":0", "cd" * 32 + ":3"])
+      and "value" not in json.dumps(_rec_of(_ddi).get("forward_inputs")))
+_oi2, _ei2, _rani2, _ddi2, _bbi2 = _fwd_run_plan(
+    {**_FWD_REC, "forward_inputs": ["ef" * 32 + ":1"]}, _SEND_KEY, _ACC_IN)
+check("...and a later forward's inputs are UNIONED with what the record "
+      "already had", _rec_of(_ddi2).get("forward_inputs")
+      == sorted(["ab" * 32 + ":0", "cd" * 32 + ":3", "ef" * 32 + ":1"]))
+# THE XMR SIDE JUDGES THE REAL SWAP (STAGE5_PLAN.md 3.4): the pairs file the
+# watching jobs read is rewritten from the forward's plan once the money
+# moved -- the deposit-time figures kept beside it, written once.
+_pd = Path(tempfile.mkdtemp(prefix="pairs_"))
+_pp = _pd / "thor_pairs_A3F1.json"
+_pp.write_text(json.dumps([
+    {"schema": "thor_pairs_v1", "btc_in": "0.05", "deposit": "bc1qshared",
+     "memo": "=:XMR.XMR:" + _XMR_SAMPLE + ":0/1/0", "dest_xmr": _XMR_SAMPLE,
+     "expected_xmr": "1.5", "ts": 1700000000},
+    {"schema": "thor_pairs_v1", "btc_in": "0.01", "deposit": "bc1qshared",
+     "memo": "=:XMR.XMR:8other:0/1/0", "dest_xmr": "8other",
+     "expected_xmr": "0.3", "ts": 1700000000}]))
+_PLAN_Q = {"broadcast": True, "broadcast_outcome": "accepted",
+           "expected_xmr": "1.31", "dest_xmr": _XMR_SAMPLE,
+           "send_sat": 4980000, "txid": "ab" * 32}
+check("a plan that moved money and carries a quote rewrites the pair routed "
+      "to its destination: what was sent, what was quoted, the txid -- and "
+      "keeps the deposit-time figures beside them",
+      A._reconcile_pairs({"slip": str(_pp)}, _PLAN_Q) is True
+      and json.loads(_pp.read_text())[0]["btc_in"] == "0.0498"
+      and json.loads(_pp.read_text())[0]["expected_xmr"] == "1.31"
+      and json.loads(_pp.read_text())[0]["forwarded_txid"] == "ab" * 32
+      and json.loads(_pp.read_text())[0]["quoted_at_deposit"]
+      == {"btc_in": "0.05", "expected_xmr": "1.5"})
+check("...the pair for another destination is untouched",
+      json.loads(_pp.read_text())[1]["btc_in"] == "0.01"
+      and "forwarded_txid" not in json.loads(_pp.read_text())[1])
+A._reconcile_pairs({"slip": str(_pp)}, {**_PLAN_Q, "expected_xmr": "1.20",
+                                        "send_sat": 4970000})
+check("...a later forward (a returned deposit) rewrites again, and the "
+      "deposit-time figures are written ONCE",
+      json.loads(_pp.read_text())[0]["expected_xmr"] == "1.20"
+      and json.loads(_pp.read_text())[0]["btc_in"] == "0.0497"
+      and json.loads(_pp.read_text())[0]["quoted_at_deposit"]
+      == {"btc_in": "0.05", "expected_xmr": "1.5"})
+_pp2 = _pd / "thor_pairs_B.json"
+_pp2.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("a reconstructed plan (no quote), a rehearsal, or a rejected send "
+      "rewrites nothing; a missing file never raises",
+      A._reconcile_pairs({"slip": str(_pp2)},
+                         {**_PLAN_Q, "expected_xmr": None}) is False
+      and A._reconcile_pairs({"slip": str(_pp2)},
+                             {**_PLAN_Q, "broadcast": False}) is False
+      and A._reconcile_pairs({"slip": str(_pp2)},
+                             {**_PLAN_Q, "broadcast_outcome": "rejected"})
+      is False
+      and A._reconcile_pairs({"slip": str(_pd / "none.json")}, _PLAN_Q)
+      is False
+      and json.loads(_pp2.read_text())[0]["expected_xmr"] == "1.5")
+_pw = Path(tempfile.mkdtemp(prefix="pairsw_"))
+_ppw = _pw / "thor_pairs_A3F1.json"
+_ppw.write_text(json.dumps([{"dest_xmr": "/tmp/bay/x", "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+_ow, _ew, _ranw, _ddw, _bbw = _fwd_run_plan(
+    {**_FWD_REC, "slip": str(_ppw)}, _SEND_KEY,
+    {**_ACC, "expected_xmr": "1.4", "dest_xmr": "/tmp/bay/x",
+     "send_sat": 100000, "txid": "ab" * 32})
+check("...and the rewrite happens on the real mark path, when a sending run "
+      "reports done", _ew is None
+      and json.loads(_ppw.read_text())[0]["expected_xmr"] == "1.4"
+      and json.loads(_ppw.read_text())[0]["btc_in"] == "0.001")
 _o3, _e3, _ran3, _dd3, _bb3 = _fwd_run_plan(_FWD_REC,
                                             {**_SEND_KEY, "btc_account": 3},
                                             _ACC)
@@ -4950,13 +5049,16 @@ except Exception as _ex:                                     # noqa: BLE001
 finally:
     os.environ.pop("GS_BTC_SEED", None)
 check("a record WITHOUT the forward_sent mark but with a plan on disk that "
-      "says accepted runs NO child (the file the sending run wrote is "
-      "consulted, not the ledger alone) and answers done with the plan's "
-      "word 'sent'; the record is now marked sent",
-      _e is None and _o is not None and _ranx == []
+      "says accepted is RECONCILED, not forwarded afresh (the file the "
+      "sending run wrote is consulted, not the ledger alone): one child in "
+      "--reconcile mode, and with the plan untouched by it the run answers "
+      "done with the plan's word 'sent' and the record catches up",
+      _e is None and _o is not None and len(_ranx) == 1
+      and "--reconcile" in _ranx[0] and "--broadcast" not in _ranx[0]
       and (_bb.result or {}).get("status") == "done"
       and (_bb.result or {}).get("phase") == "sent"
-      and _rec_of(_dd).get("forward_sent") is True)
+      and _rec_of(_dd).get("forward_sent") is True
+      and _rec_of(_dd).get("forward_inputs") == [])
 print("\n== a forward that found nothing settled says what it saw ==")
 
 
@@ -5006,7 +5108,8 @@ check("...'seen' (money present, not settled) is the word 'arriving'",
 # (the Pi tries again by itself), and one that can never be sent on at any
 # rate this pair allows is `short` -- each reported DONE with its word,
 # neither "the machine FAILED", neither marking the record.
-for _st, _ph in (("delayed", "delayed"), ("short", "short")):
+for _st, _ph in (("delayed", "delayed"), ("short", "short"),
+                 ("returned", "returned")):
     _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _st)
     check(f"...the forwarder's '{_st}' (exit 2, no plan) is the word "
           f"'{_ph}', done, the record untouched",
@@ -5014,10 +5117,11 @@ for _st, _ph in (("delayed", "delayed"), ("short", "short")):
           and (_bb.result or {}).get("status") == "done"
           and "forwarded" not in _rec_of(_dd)
           and not _rec_of(_dd).get("forward_sent"))
-check("the status-word table maps exactly the four words the forwarder "
+check("the status-word table maps exactly the five words the forwarder "
       "writes, to words the wire knows",
       A._FORWARD_STATUS_PHASE == {"not_seen": "not_yet", "seen": "arriving",
-                                  "delayed": "delayed", "short": "short"}
+                                  "delayed": "delayed", "short": "short",
+                                  "returned": "returned"}
       and all(v in P.PHASES for v in A._FORWARD_STATUS_PHASE.values()))
 _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, None)
 check("...any OTHER exit 2 (no status file) is still a failed job with no "
@@ -5240,13 +5344,34 @@ check("the second deposit on the same ledger: index 1, asked about the "
       and _asked == [_ADDR[1]]
       and A.plain_slip_for_chat(_BK, _d4, "done", "B4A2")["d"] == _ADDR[1])
 
+# THE LEDGER IS NOT TRUSTED ALONE, and an EMPTY ledger behind a USED chain
+# is refused outright (STAGE5_PLAN.md 3.6): every address the gap search
+# could reach may have been handed to someone whose payment is still
+# coming, and a late payer and a new client on one line is the one thing a
+# fresh chain prevents. Address 0 alone tells the two apart.
 _d5, _runs5, _run5 = _btc_env("btc5_")
-_o, _c, _asked, _ = _btc_dispatch(_d5, _run5, "B5A1",
-                                  lambda a: a != _ADDR[0])
-check("THE LEDGER IS NOT TRUSTED ALONE: a fresh ledger whose index 0 the "
-      "network says is USED steps to index 1 (asked about both, in order)",
-      _c is None and _rec4(_d5, "B5A1")["btc_index"] == 1
-      and _asked == [_ADDR[0], _ADDR[1]])
+_o, _c, _asked, _kinds5 = _btc_dispatch(_d5, _run5, "B5A1",
+                                        lambda a: a != _ADDR[0])
+check("an EMPTY ledger whose index 0 the network says is USED: refused "
+      "ledger_wiped after ONE ask (address 0 only), no address issued, the "
+      "quote never ran, the way out named",
+      _c == "ledger_wiped" and _asked == [_ADDR[0]] and len(_runs5) == 1
+      and "ledger_wiped" in _kinds5
+      and not _rec4(_d5, "B5A1").get("btc_index"))
+_ADDR[2] = __import__("gs_btc_watch").derive_receive_address(_ZPUB, 2, "main")
+# (the seeded record carries a slip, so it is a finished deposit and not a
+# reusable bundle _dispatch would fold into the new one; its key is four
+# hex digits, the only shape the ledger loader keeps)
+_d5b, _runs5b, _run5b = _btc_env("btc5b_", handles={
+    "A0A0": {"bundle": "/x/w.json", "minted": 1, "btc_index": 0,
+             "slip": "/x/thor_pairs_A0A0.json"}})
+_o, _c, _asked, _ = _btc_dispatch(_d5b, _run5b, "B5B1",
+                                  lambda a: a != _ADDR[1])
+check("a ledger that knows index 0, with index 1 USED on the network (a "
+      "pruned record, a crash between issue and save): steps to index 2, "
+      "asked about 1 and 2 in order", _c is None
+      and _rec4(_d5b, "B5B1")["btc_index"] == 2
+      and _asked == [_ADDR[1], _ADDR[2]])
 _d6, _runs6, _run6 = _btc_env("btc6_")
 _o, _c, _asked, _kinds = _btc_dispatch(
     _d6, _run6, "B6A1", W_ERR := __import__("gs_btc_watch").BtcWatchError("x"))
@@ -5257,13 +5382,30 @@ check("a look nobody answered REFUSES the deposit (btc_lookup_failed): no "
       and _rec4(_d6, "B6A1").get("bundle")
       and not _rec4(_d6, "B6A1").get("btc_index")
       and "btc_lookup_failed" in _kinds)
-_d7, _runs7, _run7 = _btc_env("btc7_")
+_d7, _runs7, _run7 = _btc_env("btc7_", handles={
+    "A0A0": {"bundle": "/x/w.json", "minted": 1, "btc_index": 0,
+             "slip": "/x/thor_pairs_A0A0.json"}})
 _o, _c, _asked, _kinds = _btc_dispatch(_d7, _run7, "B7A1", False)
-check(f"every address used for a whole recovery gap ({P.BTC_INDEX_GAP + 1} "
-      "asked): refused btc_index_exhausted, nothing issued",
+check(f"a ledger that knows index 0 with every address after it used for a "
+      f"whole recovery gap ({P.BTC_INDEX_GAP + 1} asked, from index 1): "
+      "refused btc_index_exhausted, nothing issued, the next account named",
       _c == "btc_index_exhausted" and len(_asked) == P.BTC_INDEX_GAP + 1
-      and "btc_index_exhausted" in _kinds
+      and _asked[0] == _ADDR[1] and "btc_index_exhausted" in _kinds
       and not _rec4(_d7, "B7A1").get("btc_index"))
+# INTAKE RECORDS ARE NEVER PRUNED: the bound falls on the rest.
+_dp = Path(tempfile.mkdtemp(prefix="prune_"))
+_big = {}
+for _i in range(3):
+    _big[f"I{_i:03d}"] = {"bundle": "/x", "minted": 1, "btc_index": _i}
+for _i in range(A.MAX_HANDLES + 5):
+    _big[f"W{_i:04d}"] = {"bundle": "/x", "minted": 1}
+A._save_handles(_dp, _big, {})
+_kept = json.loads((_dp / A.HANDLES_FILE).read_text())["handles"]
+check("the ledger's bound keeps every record carrying btc_index (the oldest "
+      "three here) and prunes the oldest of the REST down to the bound",
+      len(_kept) == A.MAX_HANDLES
+      and all(f"I{_i:03d}" in _kept for _i in range(3))
+      and "W0000" not in _kept and f"W{A.MAX_HANDLES + 4:04d}" in _kept)
 
 _floor = A.btc_deposit_min_sat(_BK)
 _fee_c = _BT.vsize_upper_bound(

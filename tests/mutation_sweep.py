@@ -4819,6 +4819,78 @@ MUTATIONS = [
   '        if tx.txid().hex() != want:',
   '        if False:',
   ['test_btc_broadcast']),
+ # Steps 5-6: the reconciliation, the outpoint rule, the pairs rewrite, the
+ # wiped ledger.
+ ('a sent handle is forwarded afresh instead of reconciled', 'gs_wake_agent',
+  '            integrity_log("wake", "forward_reconcile")\n'
+  '            _reconcile = True',
+  '            integrity_log("wake", "forward_reconcile")\n'
+  '            _reconcile = False',
+  ['test_wake_agent', 'test_wake_endtoend']),
+ ('a sent handle is reconciled on a pair that no longer sends',
+  'gs_wake_agent',
+  '            if not _btc_broadcast_on(key):\n'
+  '                integrity_log("wake", "forward_repeat")',
+  '            if False:\n'
+  '                integrity_log("wake", "forward_repeat")',
+  ['test_wake_agent']),
+ ('a sending pair without a THORNode is handed a child that will refuse',
+  'gs_wake_agent',
+  '        if (reconcile or _btc_broadcast_on(key)) \\\n'
+  '                and not key.get("thornode_url"):',
+  '        if False:',
+  ['test_wake_agent']),
+ ('the forwarded outpoints are not recorded on the ledger', 'gs_wake_agent',
+  '            handles[handle]["forward_inputs"] = sorted(\n'
+  '                set(handles[handle].get("forward_inputs") or []) | _ins)',
+  '            handles[handle]["forward_inputs"] = sorted(_ins)',
+  ['test_wake_agent']),
+ ('the pairs file keeps the deposit-time quote after the forward',
+  'gs_wake_agent',
+  '            pair["expected_xmr"] = str(plan["expected_xmr"])',
+  '            pass',
+  ['test_wake_agent']),
+ ('a wiped ledger behind a used chain issues addresses', 'gs_wake_agent',
+  '        if fresh0:\n            return 0\n'
+  '        integrity_log("wake", "ledger_wiped")',
+  '        if True:\n            return 0\n'
+  '        integrity_log("wake", "ledger_wiped")',
+  ['test_wake_agent']),
+ ('intake records are pruned with the rest', 'gs_wake_agent',
+  '        _others = [k for k in h if k not in _intake]',
+  '        _others = list(h)',
+  ['test_wake_agent']),
+ ('--reconcile re-signs when the bytes were kept', 'btc_forwarder',
+  '        if plan.get("tx_hex"):\n            integrity_log("forward", "resend")',
+  '        if False:\n            integrity_log("forward", "resend")',
+  ['test_btc_forwarder']),
+ ('--reconcile forwards the consumed outputs again with the new ones',
+  'btc_forwarder',
+  '            return "forward", sorted(consumed), "returned"\n'
+  '        if unsettled_new:',
+  '            return "forward", [], "returned"\n'
+  '        if unsettled_new:',
+  ['test_btc_forwarder']),
+ ('--reconcile calls a foreign spend ours', 'btc_forwarder',
+  '        if mine:\n            # A FORWARD OF OURS THE CHAIN FORGOT',
+  '        if True:\n            # A FORWARD OF OURS THE CHAIN FORGOT',
+  ['test_btc_forwarder']),
+ ('--reconcile decides without the history', 'btc_forwarder',
+  '        integrity_log("forward", "history_unavailable")\n'
+  '        print(f"[!] the address\'s history could not be read ({e}); a "',
+  '        integrity_log("forward", "history_unavailable")\n'
+  '        spends = []\n'
+  '        print(f"[!] the address\'s history could not be read ({e}); a "',
+  ['test_btc_forwarder']),
+ ('a fresh forward overwrites the earlier plan instead of rotating it',
+  'btc_forwarder',
+  '        _rotate_plan(args.outfile)\n    if picture["settled_sat"] <= 0:',
+  '        pass\n    if picture["settled_sat"] <= 0:',
+  ['test_btc_forwarder']),
+ ('a rejected re-send is a dead end', 'btc_forwarder',
+  '        return "forward", [], "rejected"',
+  '        raise SystemExit(EXIT_FAILED)',
+  ['test_btc_forwarder']),
  ('a never-paid deposit is watched for ever', 'gs_telegram_pager',
   '                       >= proto.DEPOSIT_PLACE_TTL_S]:',
   '                       >= float("inf")]:',
