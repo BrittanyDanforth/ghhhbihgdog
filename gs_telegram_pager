@@ -5453,8 +5453,18 @@ class Pager:
                 # question again, which answers truthfully at every stage.
                 self._btc_sent_set().discard(_h)
                 integrity_log("pager", "btc_watch_forgotten")
+            # ...AND THE FORWARDED ONES, WHILE THEY ARE KEPT (third
+            # self-doubt pass): money that comes back AFTER the forward
+            # mined -- a refund (ThorChain acts once the inbound has
+            # confirmed, so a refund lands after `forwarded` whenever a
+            # tap or a recheck saw the block first), a second payment --
+            # landed on an entry nothing looked at and nothing rechecked,
+            # and every tap on it went to the XMR side, "nothing yet" for
+            # ever. A look is not a wake. An entry learned after a restart
+            # has no address and is not looked at.
             snapshot = [(h, dict(e)) for h, e in opened.items()
-                        if e["state"] in ("not_seen", "seen")]
+                        if e["state"] in ("not_seen", "seen")
+                        or (e["state"] == "forwarded" and e.get("addr"))]
             # THE FORWARDS THAT WENT OUT AND ARE DUE A RECHECK (stage 6),
             # not yet started this window. Read here, started below the
             # looks -- one per tick, since one job is all the box runs.
@@ -5542,8 +5552,25 @@ class Pager:
         lock, opened = self._btc()
         with lock:
             e = opened.get(h)
-            if not e or e["state"] not in ("not_seen", "seen"):
+            if not e or e["state"] not in ("not_seen", "seen", "forwarded"):
                 return
+            if e["state"] == "forwarded":
+                if state not in ("seen", "confirmed"):
+                    # Still empty after the forward: still forwarded.
+                    return
+                # MONEY CAME BACK AFTER THE FORWARD MINED (third self-doubt
+                # pass): watched again from here exactly as the vault's
+                # `returned` word is handled -- money seen, the forward
+                # the next ask, said and started as for a first payment
+                # when it settles (and kept by the vault past its bound).
+                e["state"] = "seen"
+                for _w in ("confirmed", "held", "seen"):
+                    e["said"].discard(_w)
+                e.pop("retry_after", None)
+                e.pop("rechecked_at", None)
+                e.pop("fee_tries", None)
+                self._btc_sent_set().discard(h)
+                integrity_log("pager", "btc_returned_seen")
             e["conf"], e["unconf"] = conf, unconf
             chat = e["chat"]
             _waiting = time.time() < float(e.get("retry_after") or 0.0)

@@ -5675,6 +5675,43 @@ check("when the automatic retries are spent (stalled) the operator's chat "
       and not any(ch.isdigit() for ch in _kalines[0])
       and any(c == 111 and "did not go through, again" in t
               for c, t in _kasends))
+# MONEY THAT COMES BACK AFTER THE FORWARD MINED was stranded: a `forwarded`
+# entry was not looked at and not rechecked, and every tap on it went to
+# the XMR side. ThorChain refunds only once the inbound has confirmed, so a
+# refund lands after `forwarded` whenever a tap or a recheck saw the block
+# first. A forwarded entry is looked at now, while it is kept.
+_rf, _rfs, _rfj = _watch_pager()
+_rf.btc_servers = [("s.onion", 50002, None)]
+_rf.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rf._btc_forward_result("B4A1", "done", "forwarded", 111)
+_rfcalls = []
+_rf.btc_tick(look=_look_returning("not_seen", calls=_rfcalls))
+check("a forwarded entry IS looked at, with its address; an empty address "
+      "changes nothing (still forwarded, in the sent set, nothing said or "
+      "started)", len(_rfcalls) == 1 and _rfcalls[0][0] == _BTC_ADDR
+      and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarded"
+      and "B4A1" in _rf._btc_sent_set() and _rfs == [] and _rfj == [])
+_rf.btc_tick(look=_look_returning("seen", unconf=100000))
+check("money seen on it again: watched as money seen, the forward is the "
+      "next ask again, nothing said yet",
+      (_rf.btc_open.get("B4A1") or {}).get("state") == "seen"
+      and "B4A1" not in _rf._btc_sent_set() and _rfs == [] and _rfj == [])
+_rf.limits.headroom = lambda: 9
+_rf.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...and when it settles the forward is started and 'confirmed. "
+      "Sending it on now.' is said, as for a first payment",
+      _rfj == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and len(_rfs) == 1 and "Sending it on now" in _rfs[0][0])
+_rg, _rgs, _rgj = _watch_pager()
+_rg.btc_servers = [("s.onion", 50002, None)]
+_rg.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rg.btc_open.pop("B4A1", None)
+_rg._btc_forward_result("B4A1", "done", "forwarded", 111)
+_rgcalls = []
+_rg.btc_tick(look=_look_returning("confirmed", conf=100000, calls=_rgcalls))
+check("...a forwarded entry learned after a restart has no address and is "
+      "not looked at", (_rg.btc_open.get("B4A1") or {}).get("addr") == ""
+      and _rgcalls == [] and _rgj == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

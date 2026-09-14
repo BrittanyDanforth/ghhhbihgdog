@@ -296,6 +296,20 @@ refuters per finding) found real defects, all fixed in the rewrite:
   not a failure, so nothing had told them the automatic path stopped on
   a confirmed deposit. test_btc_forwarder 274, test_wake_agent 740,
   test_telegram_pager 814; 679 anchors, 22 swept this pass.
+- FOUND next to it: money that came back AFTER the forward mined was
+  stranded. A `forwarded` entry was not looked at (the snapshot took
+  not_seen and seen only), not rechecked (only `sent` is), and every tap
+  on it went to the XMR side, "nothing yet" for ever -- while ThorChain
+  refunds only once the inbound has confirmed, so a refund lands after
+  `forwarded` whenever a tap or a recheck saw the block first; a second
+  payment likewise. The `forwarded` branch even said "money that comes
+  back to it can be watched again" and nothing did. Now a forwarded entry
+  with an address is looked at while it is kept (a look is not a wake);
+  money seen on it again is handled as the vault's `returned` word is --
+  money seen, the forward the next ask, said and started as for a first
+  payment when it settles, and kept by the vault past --returns-max. An
+  entry learned after a restart has no address and is not looked at.
+  test_telegram_pager 818; two anchors.
 - Checked and left alone: the forward's worst case over Tor (look,
   history, quote, oracle, THORNode, submit, seen, each bounded) fits its
   900 s budget; the quote-age bound (300 s) covers the cross-check's own

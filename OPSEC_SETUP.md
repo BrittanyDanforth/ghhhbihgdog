@@ -2200,7 +2200,12 @@ the word was `unsure`), when the next tap, or the watcher itself if nobody
 taps, asks the forward again (the reconciliation, below), once per window,
 until the forward's transaction is in a block: the word `forwarded` ("the
 forward has confirmed. Nothing more to check on this side — ask again later
-for the arrival"), after which every tap asks the swap side. After a
+for the arrival"), after which every tap asks the swap side. A forwarded
+deposit's address is still looked at while the entry is kept (two days; a
+look is not a wake): money that comes back to it after the forward
+confirmed — a refund, which ThorChain issues only once the inbound has
+confirmed; a second payment — is seen, said and sent on as a first payment
+is, and the next tap asks the forward again. After a
 restart the first tap goes to the vault's forward, which answers what
 became of it without signing anything, and that answer puts the deposit
 back on this end's list with its word and its clock, so the same windows
