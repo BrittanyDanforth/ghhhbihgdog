@@ -5776,8 +5776,14 @@ class Pager:
                   f"{_redact(ex)[:120]}")
 
     def _btc_balance_text(self, cid: int) -> str:
-        """The chat's own watched deposits, one line each, and the totals
-        from the last looks -- figures only, no currency word."""
+        """The chat's own watched deposits, one line each: a label and a
+        state word, NO FIGURE. It used to total what the last looks saw
+        (received, confirmed) -- on-chain amounts, not the ones the chat
+        was quoted: an overpayment, a refund, a stranger's dust, or the
+        sum of two deposits, none of which the chat had, re-published
+        after the wizard's own echo was deliberately deleted (rule 6:
+        nothing that names an amount reaches the transcript that it did
+        not already carry)."""
         lock, opened = self._btc()
         with lock:
             mine = [(h, dict(e)) for h, e in opened.items()
@@ -5787,17 +5793,12 @@ class Pager:
                     "restarted since it started. /deposit is the way in; "
                     "the button under a deposit still asks about it.")
         lines = []
-        conf = unconf = 0
         for h, e in mine:
             try:
                 _cn = self._label(cid, h)
             except BaseException:                            # noqa: BLE001
                 _cn = h
             lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(e['state'], e['state'])}")
-            conf += int(e.get("conf") or 0)
-            unconf += int(e.get("unconf") or 0)
-        lines.append(f"received so far: {proto.btc_display(conf + unconf)}, "
-                     f"confirmed: {proto.btc_display(conf)}")
         return "\n".join(lines)
 
     def _working_line(self, job: str, params: dict, how: str) -> str:

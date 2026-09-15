@@ -2263,9 +2263,12 @@ restart the first tap goes to the vault's forward, which answers what
 became of it without signing anything, and that answer puts the deposit
 back on this end's list with its word and its clock, so the same windows
 apply to it.
-`/balance` lists this chat's watched deposits by label and state, with the
-figures the chat already saw. Every one of those sentences is in the pager's
-banned-word scan; none carries a number the chat did not already have. A
+`/balance` lists this chat's watched deposits by label and state, and no
+figure at all: what the looks saw on the chain (an overpayment, a refund, a
+stranger's dust, the sum of two deposits) is not what the chat was quoted,
+and it used to be re-published there after the wizard's own echo had been
+deleted. Every one of those sentences is in the pager's banned-word scan;
+none carries a number the chat did not already have. A
 deposit nothing has reached after two days — the window the vault's own
 reserve gives an unpaid deposit — is dropped from the watch list, so a
 never-paid address is not looked at, on a fresh circuit, every ten minutes

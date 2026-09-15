@@ -5682,6 +5682,15 @@ MUTATIONS = [
   '    return secrets.randbelow(max(1, int(bound)))',
   '    return 0',
   ['test_btc_forwarder']),
+ ('/balance totals what the looks saw on the chain into the transcript',
+  'gs_telegram_pager',
+  '            lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(e[\'state\'], '
+  'e[\'state\'])}")\n'
+  '        return "\\n".join(lines)',
+  '            lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(e[\'state\'], '
+  'e[\'state\'])}")\n'
+  '        return "\\n".join(lines) + "\\nreceived so far: 0.055"',
+  ['test_telegram_pager']),
 ]
 
 

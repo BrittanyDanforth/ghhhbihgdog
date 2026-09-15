@@ -132,8 +132,9 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
   together (an old box refuses the unknown job loud, as the header promises).
 - **Deposit UX:** `/deposit` returns a unique address and amount, **no memo, no
   note, no phone warning**. Auto "received — waiting for confirmations", then
-  "confirmed — forwarding". A `/balance` per owner (an amount, so gated behind
-  the same opt-in as the plaintext deposit surface, per rule 6).
+  "confirmed — forwarding". A `/balance` per owner lists each deposit's
+  label and state word only — no amount, per rule 6 (the on-chain figure
+  is not the one the chat was quoted).
 
 ## The hazards, named (not glossed)
 

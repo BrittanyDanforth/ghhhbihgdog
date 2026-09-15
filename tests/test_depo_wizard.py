@@ -1815,10 +1815,13 @@ _bal_empty._btc = pg.Pager._btc.__get__(_bal_empty)
 _COMPOSED += [("_btc_balance_text", pg.Pager._btc_balance_text(_bal, 7)),
               ("_btc_balance_text_empty",
                pg.Pager._btc_balance_text(_bal_empty, 7))]
-check("the balance reply renders every state word and the two figures",
+check("the balance reply renders every state word and NO figure (the "
+      "on-chain totals it carried were amounts the chat was never quoted)",
       all(w in dict(_COMPOSED)["_btc_balance_text"]
           for w in pg.Pager.BTC_STATE_WORDS.values())
-      and "received so far" in dict(_COMPOSED)["_btc_balance_text"]
+      and "received so far" not in dict(_COMPOSED)["_btc_balance_text"]
+      and not re.search(r"\d", dict(_COMPOSED)["_btc_balance_text"]
+                        .replace("A3F1-9C2B7E01", ""))
       and "nothing is in flight" in dict(_COMPOSED)["_btc_balance_text_empty"])
 check(f"the scan now also drives the {len(_COMPOSED)} replies that are "
       f"BUILT rather than written, which it used to miss entirely",

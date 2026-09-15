@@ -5399,9 +5399,9 @@ check("...and the tick starts the automatic recheck for it, for its own "
       _qj8[-1] == (111, "forward_to_swap", {"handle": "B4A1"})
       and len(_qj8) == _q8_n + 1)
 _q8.handle(_msg(111, 111, "/balance"))
-check("...and /balance names it by its state word, in figures the chat "
-      "already had (none from this end)",
-      "sent on" in _qs8[-1][0] and "received so far: 0" in _qs8[-1][0])
+check("...and /balance names it by its state word, and by nothing else: "
+      "no figure from this end",
+      "sent on" in _qs8[-1][0] and "received so far" not in _qs8[-1][0])
 _q8._btc_forward_result("B4A1", "done", "returned", 111)
 check("money that came back to a forward learned after a restart: no "
       "address to watch it on, so the entry is forgotten again and the "
@@ -5518,11 +5518,14 @@ _bp2.btc_open["B4A2"].update({"state": "forwarding", "conf": 500000})
 _bp2._btc_register("C9C9", "bc1qtheirs", 222)
 _bp2.handle(_msg(111, 111, "/balance"))
 _bal = _bs2[-1][0]
-check("/balance lists this chat's watched deposits by label and state and "
-      "totals what the last looks saw -- received (all) and confirmed -- "
-      "as bare figures", "received, confirming" in _bal
-      and "confirmed, sending on" in _bal
-      and "received so far: 0.055" in _bal and "confirmed: 0.015" in _bal
+check("/balance lists this chat's watched deposits by label and state, and "
+      "NO FIGURE: what the looks saw on the chain (an overpayment, a "
+      "refund, a stranger's dust, the sum of two deposits) is not the "
+      "amount the chat was quoted, and must not reach the transcript "
+      "(fix pass after the deep read)",
+      "received, confirming" in _bal and "confirmed, sending on" in _bal
+      and "received so far" not in _bal and "confirmed:" not in _bal
+      and "0.055" not in _bal and "0.015" not in _bal and "0.05" not in _bal
       and _bp2._label(111, "B4A1") in _bal and _bj2 == [])
 check("...another chat's deposit is not in it, and no address is",
       "C9C9" not in _bal and _bp2._label(222, "C9C9") not in _bal
