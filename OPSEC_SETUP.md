@@ -2103,6 +2103,11 @@ an attacker's address and an attacker's dust verify. It is FULL when it
 carries at least what was sent less a slack (the larger of a twentieth and
 0.001 BTC) and at least half; a streaming swap that filled part of the way
 refunds only the rest, and that must not read as the whole swap undone.
+Such a PARTIAL refund takes its share out instead: the forward then
+counts for what was sent less what came back, its quote scaled by that
+fraction, and the re-forward of the part that came back sums beside it —
+never the same satoshis twice (left in whole, the pair waited for more
+than could ever land and told the client "short" for ever).
 Kerckhoffs: the memo is a public convention anyone can put in a
 transaction of their own to the address, and the amount can be matched;
 only the source cannot be forged, since only ThorChain's signers spend

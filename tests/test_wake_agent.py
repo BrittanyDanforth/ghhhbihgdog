@@ -5114,12 +5114,42 @@ check("...a refund recorded on a ROTATED plan counts too, and junk in a "
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25")
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
-check("...a verified refund that is NOT full (a streaming swap filled part "
-      "of the way) lowers nothing: both still sum",
+# A PARTIAL REFUND TAKES ITS SHARE OUT (fix pass after the deep read): a
+# streaming swap that filled 60% of the 4,980,000 sat forward refunded the
+# rest less ThorChain's outbound fee, 1,962,000 sat. The forward's quote
+# was left in WHOLE beside the re-forward's, so the pair expected the same
+# satoshis twice and told the client "short" for ever. Now: the forward
+# counts for 3,018,000 sat and 1.31 x 3018000/4980000 = 0.793891566265
+# XMR, the re-forward's 1.25 sums beside it.
+_RFP = {**_RFV, "full": False, "value": 1962000}
+check("...a verified refund that is NOT full (a streaming swap filled 60% "
+      "and refunded the rest) takes ITS SHARE out: the forward counts for "
+      "what was sent less what came back, its quote scaled by that "
+      "fraction, and the re-forward sums beside it -- never the same "
+      "satoshis twice",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None, "refunds": [_RFP]},
+                         chain=[_PLAN_Q]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.043891566265"
+      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.07978"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"]
+      == ["ef" * 32, "ab" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...the same refund output recorded on the current plan AND on the "
+      "rotated one it was merged from is counted ONCE, and a junk `full` "
+      "reads as not full (its value, not the whole forward)",
       A._reconcile_pairs({"slip": str(_ppb)},
                          {**_NEW, "replaces": None,
-                          "refunds": [{**_RFV, "full": False},
-                                      {**_RFV, "full": "yes"}]},
+                          "refunds": [{**_RFP, "full": "yes"}]},
+                         chain=[{**_PLAN_Q, "refunds": [_RFP]}]) is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.043891566265")
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
+check("...an UNVERIFIED partial claim takes nothing out (both still sum)",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_NEW, "replaces": None,
+                          "refunds": [{**_RFP, "verified": False}]},
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.56")
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
@@ -5785,17 +5815,28 @@ _mk_file = _mk_dir / "k.key.issued"
 _MK = {**_BK, "btc_account": 1, "btc_account_xpub": _zpub1,
        "btc_issued_mark": str(_mk_file)}
 _fresh_mk = lambda a: True                                   # noqa: E731
+
+
+def _mk_read():
+    """The mark as written, or {} -- on a copy that never writes it this
+    must read RED, not die with no RESULT line."""
+    try:
+        return json.loads(_mk_file.read_text())
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
 _i0 = A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
-_mk = json.loads(_mk_file.read_text())
+_mk = _mk_read()
+_mk_text = _mk_file.read_text() if _mk_file.exists() else ""
 check("a fresh chain issues index 0 and WRITES the mark beside the keyfile: "
       "this chain's id, one issued, and no xpub or address in it",
       _i0 == 0 and _mk.get("issued") == 1 and _mk.get("account") == 1
       and _mk.get("xpub_id") == A._xpub_id(_MK)
-      and _zpub1 not in _mk_file.read_text()
-      and _addr1_0 not in _mk_file.read_text())
+      and _zpub1 not in _mk_text and _addr1_0 not in _mk_text)
 _i1 = A._allocate_btc_index(_MK, {"H1": {"btc_index": 0}}, unused=_fresh_mk)
 check("...the next deposit takes index 1 and the mark follows (two issued)",
-      _i1 == 1 and json.loads(_mk_file.read_text())["issued"] == 2)
+      _i1 == 1 and _mk_read().get("issued") == 2)
 try:
     A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
     _wk = None
@@ -5823,8 +5864,8 @@ check("re-paired on the next account (another chain), the same mark file "
       "is another chain's: index 0 issued, the mark rewritten for the new "
       "chain",
       _i_next == 0
-      and json.loads(_mk_file.read_text())
-      == {"account": 2, "xpub_id": A._xpub_id(_MK2), "issued": 1})
+      and _mk_read() == {"account": 2, "xpub_id": A._xpub_id(_MK2),
+                         "issued": 1})
 _mk_file.write_text("{not json")
 try:
     A._allocate_btc_index(_MK2, {}, unused=_fresh_mk)

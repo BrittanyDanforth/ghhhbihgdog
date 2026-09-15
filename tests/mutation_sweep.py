@@ -5638,6 +5638,23 @@ MUTATIONS = [
   '    k["btc_issued_mark"] = str(path) + ".issued"',
   '    k["btc_issued_mark"] = None',
   ['test_plain_slip', 'test_wake_agent']),
+ ('a partial refund is left in at its whole quote (the same satoshis '
+  'twice)', 'gs_wake_agent',
+  '                if _v > 0:\n'
+  '                    _back[_of] = _back.get(_of, 0) + _v',
+  '                if False:\n'
+  '                    _back[_of] = _back.get(_of, 0) + _v',
+  ['test_wake_agent']),
+ ("the refund's share is not taken out of what was sent", 'gs_wake_agent',
+  '            return _s - _b, _e2',
+  '            return _s, _e2',
+  ['test_wake_agent']),
+ ('the same refund output on two plans is counted twice', 'gs_wake_agent',
+  '                if _op in _rf_seen:\n'
+  '                    continue',
+  '                if False:\n'
+  '                    continue',
+  ['test_wake_agent']),
 ]
 
 

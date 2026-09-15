@@ -1786,17 +1786,54 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
         # own (Kerckhoffs: the convention is public); a forged one must not
         # be able to tell the client their swap is complete, so it changes
         # nothing here.
-        # ...AND ONLY A FULL ONE: a streaming swap that filled part of the
-        # way refunds only the rest, and its forward's output is still
-        # coming in part. A partial refund lowers nothing (the watcher
-        # then waits for more than will come and says "short", the safe
-        # direction) rather than telling the client a partial fill was
-        # the whole payment.
-        _refunded = {str(r.get("of") or "").lower()
-                     for p in [plan] + list(chain or ()) if isinstance(p, dict)
-                     for r in (p.get("refunds") or [])
-                     if isinstance(r, dict) and r.get("verified") is True
-                     and r.get("full") is True and r.get("of")}
+        # ...A FULL ONE DROPS THE FORWARD; A PARTIAL ONE SCALES IT (fix
+        # pass after the deep read). A streaming swap that filled part of
+        # the way refunds only the rest, and its forward's output is still
+        # coming in part. Leaving such a forward in at its WHOLE quote --
+        # beside the re-forward of the part that came back -- expected the
+        # same satoshis twice: the pair then waited for more than could
+        # ever land and told the client "short" for ever about a deposit
+        # that delivered everything. So a verified partial refund takes
+        # its share out: what was sent less what came back, and the quote
+        # scaled by that fraction (the refund is the unfilled part less
+        # ThorChain's outbound fee, so the fraction reads a touch HIGH --
+        # the safe direction, and well inside the arrival tolerance). The
+        # same output recorded on two plans (the current file and the
+        # rotated one it was merged from) is counted once.
+        _rf_seen, _refunded, _back = set(), set(), {}
+        for p in [plan] + list(chain or ()):
+            if not isinstance(p, dict):
+                continue
+            for r in (p.get("refunds") or []):
+                if not (isinstance(r, dict) and r.get("verified") is True
+                        and r.get("of")):
+                    continue
+                _of = str(r.get("of") or "").lower()
+                _op = (str(r.get("txid") or "").lower(), r.get("vout"), _of)
+                if _op in _rf_seen:
+                    continue
+                _rf_seen.add(_op)
+                if r.get("full") is True:
+                    _refunded.add(_of)
+                    continue
+                try:
+                    _v = int(r.get("value") or 0)
+                except (TypeError, ValueError):
+                    _v = 0
+                if _v > 0:
+                    _back[_of] = _back.get(_of, 0) + _v
+
+        def _share(p):
+            """(send_sat, expected_xmr) of forward `p` LESS the verified
+            part that came back: the quote scaled by what ThorChain kept."""
+            _s = int(p.get("send_sat") or 0)
+            _e = Decimal(str(p["expected_xmr"]))
+            _b = min(int(_back.get(str(p.get("txid") or "").lower(), 0)), _s)
+            if _b <= 0 or _s <= 0:
+                return _s, _e
+            _e2 = (_e * Decimal(_s - _b) / Decimal(_s)).quantize(
+                Decimal("0.000000000001"), rounding="ROUND_DOWN")
+            return _s - _b, _e2
 
         def _counts(p):
             return (isinstance(p, dict) and p.get("broadcast") is True
@@ -1862,8 +1899,8 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
         if not isinstance(pairs, list):
             return False
         from gs_common import fmt_btc as _fmt
-        _sent = sum(int(p.get("send_sat") or 0) for p in counted)
-        _exp = sum(Decimal(str(p["expected_xmr"])) for p in counted)
+        _sent = sum(_share(p)[0] for p in counted)
+        _exp = sum((_share(p)[1] for p in counted), Decimal(0))
         changed = False
         for pair in pairs:
             if not isinstance(pair, dict) \
