@@ -4469,6 +4469,73 @@ check("...and the address is now on this end's watch list for that chat, "
       "with the label bound to the chat", _bo.get("addr") == _BTC_ADDR
       and _bo.get("chat") == 111 and _bo.get("state") == "not_seen"
       and _bp.handle_owner.get("B4A1") == 111)
+
+
+# THE ONE MESSAGE THAT CARRIES THE ADDRESS IS RETRIED ONCE, AND A FAILURE IS
+# SAID (the MED pass after the deep read): sent once with no retry and no
+# word, a dropped POST left the address watched as unpaid for two days
+# while the client's last line promised "I will tell you here".
+def _depo_pay_fails(n, chat=111):
+    """_depo_done with the pay message's send failing `n` times."""
+    _fp, _fs, _, _ = _tapper((chat,))
+    _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
+    _fails = [n]
+
+    def _send(cid, t, buttons=None):
+        if "here is how to pay" in t and _fails[0] > 0:
+            _fails[0] -= 1
+            _fs.append(("<dropped> " + t, buttons))
+            return False
+        _fs.append((t, buttons))
+        return True
+    _fp.send = _send
+    _il = []
+    _saved_il = pg.integrity_log
+    pg.integrity_log = lambda st, kind, *a, **k: _il.append(kind)
+
+    class _Done:
+        def __init__(self):
+            self.result = {"status": "done", "handle": "B4A1", "slip": "",
+                           "plain": dict(_PLAIN_BTC), "phase": ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(run_wake=lambda *a, **k: _Done())
+        _fp.start_job(chat, "receive_and_quote", {"amount_sat": 5000000})
+        for _ in range(600):
+            if not _fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+        pg.integrity_log = _saved_il
+    return _fp, [t for t, _b in _fs], _il
+
+
+_pf1, _pt1, _pil1 = _depo_pay_fails(1)
+check("the pay message dropped ONCE is sent again and lands: the address is "
+      "watched, nothing said about a failure",
+      sum(1 for t in _pt1 if "here is how to pay" in t
+          and not t.startswith("<dropped>")) == 1
+      and (_pf1._btc()[1].get("B4A1") or {}).get("addr") == _BTC_ADDR
+      and not any("did not get through" in t for t in _pt1)
+      and "pay_undelivered" not in _pil1)
+_pf2, _pt2, _pil2 = _depo_pay_fails(2)
+check("...dropped TWICE: the watch entry goes (nothing was published to watch "
+      "for), the chain says pay_undelivered, and the client is told there "
+      "is nothing to pay yet and to /deposit again",
+      "B4A1" not in _pf2._btc()[1]
+      and "pay_undelivered" in _pil2
+      and any("did not get through" in t and "/deposit again" in t
+              for t in _pt2)
+      and not any("here is how to pay" in t and not t.startswith("<dropped>")
+                  for t in _pt2))
 _sp, _ss = _depo_done(_PLAIN_SHARED)
 _st = [t for t, _b in _ss]
 _note_i = [i for i, t in enumerate(_st) if t.startswith("=:XMR.XMR:")]

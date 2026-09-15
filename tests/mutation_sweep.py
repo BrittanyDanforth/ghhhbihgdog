@@ -5357,12 +5357,11 @@ MUTATIONS = [
   '        if _b is not None and _b.locked():\n            return False',
   '        if False:\n            return False',
   ['test_telegram_pager']),
- ('a start that start_job refused leaves the deposit marked as sending on',
-  'gs_telegram_pager',
+ ('a start that start_job refused leaves the deposit marked as sending on', 'gs_telegram_pager',
   '            elif e and e["state"] == "forwarding":\n'
-  '                e["state"] = "seen"',
-  '            elif e and e["state"] == "forwarding":\n'
-  '                pass',
+  '                # BACK TO WHERE IT CAME FROM (the MED pass after the deep',
+  '            elif False:\n'
+  '                # BACK TO WHERE IT CAME FROM (the MED pass after the deep',
   ['test_telegram_pager']),
  ('pairing accepts --btc-xpub without --allow-btc-forward (addresses nothing '
   'can send on from)', 'gs_wake_keys',
@@ -6001,6 +6000,20 @@ MUTATIONS = [
   'gs_telegram_pager',
   '                e["state"] = "forwarded" if _from_forwarded else "seen"',
   '                e["state"] = "seen"',
+  ['test_telegram_pager']),
+ ('the intake pay message is sent once, no retry', 'gs_telegram_pager',
+  '                if not _ok:\n'
+  '                    time.sleep(SLIP_RETRY_S)\n'
+  '                    _ok = self.send(chat_id, _pay, buttons=_pb)',
+  '                if False:\n'
+  '                    time.sleep(SLIP_RETRY_S)\n'
+  '                    _ok = self.send(chat_id, _pay, buttons=_pb)',
+  ['test_telegram_pager']),
+ ('an address nobody was shown stays on the watch list for two days',
+  'gs_telegram_pager',
+  '                integrity_log("pager", "pay_undelivered")\n'
+  '                self._btc_forget(h)',
+  '                integrity_log("pager", "pay_undelivered")',
   ['test_telegram_pager']),
 ]
 

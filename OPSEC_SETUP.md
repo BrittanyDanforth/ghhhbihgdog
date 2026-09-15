@@ -2204,7 +2204,11 @@ once a second party has said it is fresh, because the ledger that hands out
 indices is one of the things `paranoia_mode` wipes); records the index on
 the handle. The chat gets one message: the amount, the address, the label,
 and "I will say here when it arrives and when it has confirmed. After that
-it moves on by itself." **That one message outlives `--burn-after`** until
+it moves on by itself." It is sent again once if the first send does not
+land, and if that fails too the deposit is dropped from the watch list and
+the chat is told there is nothing to pay yet and to `/deposit` again (an
+address nobody was shown is not watched for two days). **That one message
+outlives `--burn-after`** until
 the pager sees money on the address: the details have not served their
 purpose before then, and a client who read them, went to buy the coin and
 came back twenty minutes later used to find no address and no way to get it
