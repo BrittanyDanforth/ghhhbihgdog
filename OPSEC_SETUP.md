@@ -2209,7 +2209,11 @@ The fee band: a server estimate ABOVE `--feerate-ceiling-sat-vb` is
 refused (a number nobody trusts is not clamped down to money), and one
 BELOW `--feerate-floor-sat-vb` pays the floor — the floor is your "never
 less than this", and a cheap network is the best day to forward, not one
-to wait out.
+to wait out. The band lives in 1..100000 sat/vB and `--btc-min-conf` in
+1..1008, the bounds the vault reads its keyfile under; pairing refuses a
+value outside them there and then (it used to take one, and the vault
+refused the keyfile at the first forward, with a client's money on the
+host's address).
 
 What the vault does with it, per `/deposit`: refuses the amount below the
 intake floor before anything is minted (`deposit_too_small`; the floor is

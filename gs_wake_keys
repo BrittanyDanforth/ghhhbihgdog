@@ -644,9 +644,17 @@ def _validate_btc(args) -> None:
                  "(STAGE5_PLAN.md 3.5).")
     if args.btc_network not in ("main", "testnet", "signet", "regtest"):
         sys.exit("[!] --btc-network must be main, testnet, signet or regtest.")
-    if args.btc_min_conf < 1:
-        sys.exit("[!] --btc-min-conf must be at least 1: an unconfirmed "
-                 "deposit is never settled money.")
+    # THE BOUNDS THE VAULT READS THE KEYFILE UNDER (gs_wake_agent
+    # _btc_setting: 1..1008 confirmations, 1..100000 sat/vB), checked HERE
+    # (the MED pass after the deep read). Pairing took any depth and any
+    # ceiling above the floor, and the vault refused the keyfile they were
+    # written into at the first forward -- with a client's money on the
+    # host's address -- instead of the operator at the one moment they
+    # were present.
+    if not 1 <= args.btc_min_conf <= 1008:
+        sys.exit("[!] --btc-min-conf must be 1..1008: an unconfirmed "
+                 "deposit is never settled money, and the vault reads no "
+                 "depth past a week of blocks.")
     if not 1 <= args.op_return_max_bytes <= 255:
         sys.exit("[!] --op-return-max-bytes must be 1..255 (80 is the "
                  "standard relay limit; no swap memo fits it -- see "
@@ -668,9 +676,11 @@ def _validate_btc(args) -> None:
                  f"{SWAP_MEMO_POLICY_BYTES} or more -- and ONLY on a node "
                  f"whose relay policy carries it (Bitcoin Core 30 or later, "
                  f"or -datacarriersize raised); see STAGE2_PLAN.md section 2.")
-    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb:
+    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb \
+            <= 100000:
         sys.exit("[!] the fee band must satisfy 1 <= --feerate-floor-sat-vb "
-                 "<= --feerate-ceiling-sat-vb.")
+                 "<= --feerate-ceiling-sat-vb <= 100000 (the vault reads no "
+                 "rate past that).")
     if not 0 <= args.max_affiliate_bps <= 1000:
         sys.exit("[!] --max-affiliate-bps must be 0..1000.")
     if not 0 <= int(getattr(args, "btc_bump_after", 7200)) <= 7 * 86400:

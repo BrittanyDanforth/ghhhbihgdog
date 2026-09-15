@@ -4521,6 +4521,35 @@ _BTC_OK = ["--allow-btc-forward", "--btc-xpub", _BTC_XPUB_OK,
            "--deposit-in-chat", "--op-return-max-bytes", "140"]
 check("pairing/btc: a complete BTC intake passes validation",
       _pairs_btc(_BTC_OK) is None)
+# THE VAULT'S BOUNDS, CHECKED AT PAIRING (the MED pass after the deep read):
+# the agent reads the keyfile's depth under 1..1008 and its rates under
+# 1..100000 (_btc_setting), and pairing took anything above the floor -- so
+# the keyfile was refused at the first forward, with a client's money on the
+# host's address, instead of the operator at pairing.
+check("pairing/btc: --btc-min-conf past 1008 (a week of blocks, the vault's "
+      "own bound) is refused at pairing naming the bound; 1008 passes; 0 "
+      "is still refused",
+      "1008" in (_pairs_btc(_BTC_OK + ["--btc-min-conf", "1009"]) or "")
+      and _pairs_btc(_BTC_OK + ["--btc-min-conf", "1008"]) is None
+      and "--btc-min-conf" in (_pairs_btc(_BTC_OK + ["--btc-min-conf", "0"])
+                               or ""))
+check("pairing/btc: a fee ceiling past 100000 sat/vB (the vault's own "
+      "bound) is refused at pairing naming it; 100000 passes; a floor above "
+      "the ceiling is still refused",
+      "100000" in (_pairs_btc(_BTC_OK + ["--feerate-ceiling-sat-vb", "100001"])
+                   or "")
+      and _pairs_btc(_BTC_OK + ["--feerate-ceiling-sat-vb", "100000"]) is None
+      and "--feerate-floor-sat-vb" in (
+          _pairs_btc(_BTC_OK + ["--feerate-floor-sat-vb", "300",
+                                "--feerate-ceiling-sat-vb", "200"]) or "")
+      and _pairs_btc(_BTC_OK + ["--feerate-floor-sat-vb", "200",
+                                "--feerate-ceiling-sat-vb", "200"]) is None)
+check("...and the bounds pairing checks ARE the vault's: the agent reads "
+      "the depth under 1..1008 and both rates under 1..100000",
+      '_btc_setting(key, "btc_min_conf", 2, 1, 1008)' in agent_src
+      and '_btc_setting(key, "feerate_floor_sat_vb", 1, 1, 100000)' in agent_src
+      and '_btc_setting(key, "feerate_ceiling_sat_vb", 200, 1, 100000)'
+      in agent_src)
 # THE MARKS' DIRECTORY IS NAMED AT PAIRING (self-doubt over the fix pass):
 # written into the keyfile, absolute like the artifact dir, and a chain the
 # marks already know is said out loud at the one moment the operator is

@@ -6175,6 +6175,18 @@ MUTATIONS = [
   '                            on_truncated=_history_truncated)',
   '                            with_funding=True)',
   ['test_btc_forwarder']),
+ # MED PASS: the vault's bounds on depth and rate are checked at pairing.
+ ('pairing takes a confirmation depth the vault refuses the keyfile for',
+  'gs_wake_keys',
+  '    if not 1 <= args.btc_min_conf <= 1008:',
+  '    if not 1 <= args.btc_min_conf:',
+  ['test_wake_agent']),
+ ('pairing takes a fee ceiling the vault refuses the keyfile for',
+  'gs_wake_keys',
+  '    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb \\\n'
+  '            <= 100000:',
+  '    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb:',
+  ['test_wake_agent']),
 ]
 
 
