@@ -208,7 +208,11 @@ upper-bound fee at the keyfile's ceiling rate. `gs_wake_keys pair` prints
 the resulting floor in BTC next to the ceiling it follows from, so the
 operator sets `--deposit-min-sat` on the pager to the same number (or
 lowers the ceiling). test_btc_forwarder proves a deposit at the floor is
-forwardable at the ceiling under every guard the forwarder has.
+forwardable at the ceiling under every guard the forwarder has. (Since
+the MED pass after the deep read the pairing carries the floor to the
+pager's card itself — `deposit_min_sat` in the pairing info, `PAIR_PROTO`
+5 — and `--deposit-min-sat` only raises it; the hand-copied flag left a
+gap between the wire's floor and the vault's that a deposit fell into.)
 
 ### 3.4 The XMR side judges the real swap
 

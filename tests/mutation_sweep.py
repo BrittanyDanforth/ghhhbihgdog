@@ -980,7 +980,7 @@ MUTATIONS = [
  # An incompatible wire change with no version bump lets two boxes agree to
  # pair and then fail at wake time.
  ("PAIR_PROTO is not bumped for the wire break", "gs_wake_proto.py",
-  "PAIR_PROTO = 4",
+  "PAIR_PROTO = 5",
   "PAIR_PROTO = 2",
   ["test_wake_protocol"]),
 
@@ -6081,6 +6081,70 @@ MUTATIONS = [
   '        if False:\n'
   '            continue',
   ['test_wake_agent']),
+ # MED PASS: the intake floor rides on the pairing to the pager.
+ ('the vault sends no intake floor in the pairing info',
+  'gs_wake_keys',
+  '    if _floor is not None:\n'
+  '        info["deposit_min_sat"] = int(_floor)',
+  '    if False:\n'
+  '        info["deposit_min_sat"] = int(_floor)',
+  ['test_wake_agent']),
+ ('the pairing shape check refuses the intake floor as unexpected',
+  'gs_wake_proto.py',
+  '        if k not in ("host", "port", "mac", "broadcast", "deposit_min_sat"):',
+  '        if k not in ("host", "port", "mac", "broadcast"):',
+  ['test_wake_protocol', 'test_wake_agent']),
+ ('the pairing shape check takes any intake floor (a bool, a string, dust)',
+  'gs_wake_proto.py',
+  '            if not isinstance(v, int) or isinstance(v, bool) \\\n'
+  '                    or not DEPOSIT_MIN_SAT <= v <= DEPOSIT_MAX_SAT:\n'
+  '                raise WakeError("pairing info carries a bad intake floor")',
+  '            if False:\n'
+  '                raise WakeError("pairing info carries a bad intake floor")',
+  ['test_wake_protocol']),
+ ('the Pi drops the intake floor the vault sent',
+  'gs_doorbell',
+  '    if "deposit_min_sat" in info:\n'
+  '        payload["deposit_min_sat"] = int(info["deposit_min_sat"])',
+  '    if False:\n'
+  '        payload["deposit_min_sat"] = int(info["deposit_min_sat"])',
+  ['test_wake_doorbell']),
+ ('load_key takes a card whose intake floor is junk',
+  'gs_doorbell',
+  '        if isinstance(_f, bool) or not isinstance(_f, int) \\\n'
+  '                or not proto.DEPOSIT_MIN_SAT <= _f <= proto.DEPOSIT_MAX_SAT:\n'
+  '            raise Doorbell(',
+  '        if False:\n'
+  '            raise Doorbell(',
+  ['test_wake_doorbell']),
+ ("the pager ignores the floor the pairing carried (the wire's floor again)",
+  'gs_telegram_pager',
+  '    if _card is not None:\n'
+  '        if isinstance(_card, bool) or not isinstance(_card, int) \\',
+  '    if False:\n'
+  '        if isinstance(_card, bool) or not isinstance(_card, int) \\',
+  ['test_telegram_pager']),
+ ("a --deposit-min-sat under the pairing's floor is taken",
+  'gs_telegram_pager',
+  '        if 0 < _flag < _card:\n'
+  '            raise ValueError(',
+  '        if False:\n'
+  '            raise ValueError(',
+  ['test_telegram_pager']),
+ ('the pager settles the floor after the state file, not at start',
+  'gs_telegram_pager',
+  '    try:\n'
+  '        deposit_floor_of(args, key)\n'
+  '    except ValueError as e:\n'
+  '        sys.exit(f"[!] {e}")\n'
+  '\n'
+  '    st = Path(args.state)',
+  '    st = Path(args.state)\n'
+  '    try:\n'
+  '        deposit_floor_of(args, key)\n'
+  '    except ValueError as e:\n'
+  '        sys.exit(f"[!] {e}")\n',
+  ['test_telegram_pager']),
 ]
 
 

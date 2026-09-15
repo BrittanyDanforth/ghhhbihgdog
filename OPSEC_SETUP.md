@@ -2183,8 +2183,14 @@ above the floor keep it soft.
 
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its
-`--feerate-ceiling-sat-vb` under both of the forwarder's guards — and the
-pager flag to set (`--deposit-min-sat`). It also prints the account's
+`--feerate-ceiling-sat-vb` under both of the forwarder's guards — and
+SENDS it to the Pi in the pairing, checked like the MAC on both boxes; the
+pager reads it off its card and refuses a smaller deposit in the chat, with
+the number, before a wake is spent on the vault's refusal (it used to be a
+flag you copied across by hand, and a deposit between the wire's floor and
+this one was accepted, paid, and refused after a wake). `--deposit-min-sat`
+on the pager raises it; a value under it is refused at start. A pair
+without the intake sends none. It also prints the account's
 FIRST address: compare it with your wallet's first native-segwit receiving
 address while the wallet is open in front of you. An xpub's prefix does
 not say which purpose it was derived under, and a BIP44 or BIP49 account
@@ -2269,10 +2275,12 @@ python3 gs_telegram_pager ... \
                            # the forward about it again, by itself, once per
                            # window (floor 600); at or above the vault's
                            # --btc-bump-after, or a bump is never found due
-    --deposit-min-sat N    # the vault's intake floor (printed at pairing),
-                           # so the wizard refuses
-                           # a too-small deposit HERE, with the number,
-                           # instead of spending a wake on the vault's refusal
+    --deposit-min-sat N    # RAISES the wizard's floor. Its default is the
+                           # vault's intake floor, which the pairing carries
+                           # to this card: a too-small deposit is refused
+                           # HERE, with the number, instead of spending a
+                           # wake on the vault's refusal. A value under the
+                           # pairing's floor is refused at start.
     --btc-reserve 2        # how many of the day's courtesy pokes are kept
                            # for taps: a fee retry or a recheck this end
                            # starts by itself waits while that many or

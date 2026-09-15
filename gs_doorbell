@@ -336,6 +336,18 @@ def load_key(path: Path, passphrase: bytes = None) -> dict:
             f"{path} must name an exact listen_host; refusing to bind "
             f"{host!r}. Binding all interfaces would expose the doorbell on "
             f"the VPN tunnel as well as the LAN.")
+    # THE INTAKE FLOOR, when the card carries one (a pair with the intake;
+    # the MED pass after the deep read): the pager builds its wizard's floor
+    # from it, so it is checked here, once, where the operator is standing
+    # -- a whole number of satoshi within the wire's own bounds, as the
+    # pairing checked it -- rather than trusted by the box that spends it.
+    if "deposit_min_sat" in k:
+        _f = k.get("deposit_min_sat")
+        if isinstance(_f, bool) or not isinstance(_f, int) \
+                or not proto.DEPOSIT_MIN_SAT <= _f <= proto.DEPOSIT_MAX_SAT:
+            raise Doorbell(
+                f"{path} carries an intake floor that is not a whole number "
+                f"of satoshi within the wire's bounds. Re-pair both boxes.")
     return k
 
 
@@ -1248,6 +1260,18 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
         # because a field on a sealed card that no longer means anything is a
         # field the next person has to work out the meaning of.
     }
+    # THE INTAKE FLOOR, when the vault sent one (the MED pass after the deep
+    # read): a pair with the intake tells this box the smallest deposit the
+    # vault can forward at its own fee ceiling, and the pager reads it off
+    # this card so its wizard refuses a smaller one, with the number, before
+    # a wake is spent on the vault's refusal. This is a number on a card that
+    # is assumed seizable, and it is kept for the reason the ladder was not:
+    # it is a threshold the pager already speaks to the chat when a deposit
+    # is under it, not an amount anyone paid, and it changes with the fee
+    # ceiling, not with any client. It passed _pair_info's shape check on
+    # both boxes before it got here.
+    if "deposit_min_sat" in info:
+        payload["deposit_min_sat"] = int(info["deposit_min_sat"])
     print()
     print(f"  [*] Sealing the keyfile ({args.kdf}). This is deliberately slow.")
     t0 = time.monotonic()

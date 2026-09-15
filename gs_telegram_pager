@@ -992,7 +992,10 @@ def welcome_text(burn_after: int = 0, key: dict = None) -> str:
     #
     # `deposit_in_chat` is a field of the VAULT's keyfile. The Pi's sealed card
     # carries role, secret, peer_public, pair_fingerprint, listen_host,
-    # listen_port, target_mac, wol_broadcast and wol_port -- and nothing else,
+    # listen_port, target_mac, wol_broadcast and wol_port -- and, since the
+    # MED pass after the deep read, the intake floor a vault paired with
+    # --btc-xpub sent (deposit_min_sat: a threshold this box already speaks
+    # to the chat, not an amount anyone paid) -- and nothing else,
     # deliberately: gs_doorbell's pairing block argues at length that values
     # which mean something get removed from a card that is assumed seizable.
     # So `self.key` never has this field, `.get` is always falsy, and the
@@ -1594,6 +1597,45 @@ def _confirm_question(rng):
     return f"{a} + {b} = ?   reply with the answer", a + b
 
 
+def deposit_floor_of(args, key) -> int:
+    """The smallest deposit the wizard takes, in satoshi (the MED pass after
+    the deep read).
+
+    The vault refuses a deposit under ITS floor -- the smallest it can
+    forward at its own fee ceiling -- after a wake. The wizard took any
+    deposit down to the wire's own floor unless the operator copied that
+    number across by hand (--deposit-min-sat), so a deposit between the two
+    was accepted in the chat, paid, and refused on the vault. The pairing
+    now carries the vault's floor to this card (`deposit_min_sat`, sent by
+    a vault paired with --btc-xpub, checked by gs_wake_proto._pair_info on
+    both boxes and by gs_doorbell.load_key here), and it is the default.
+
+    --deposit-min-sat RAISES it. A flag UNDER the pairing's floor is refused
+    (ValueError, said at start): the vault refuses a smaller deposit anyway,
+    so taking one here only spends a wake finding out. A card without a
+    floor (a pair without the intake, or from before the field) takes the
+    flag, else the wire's own floor, as before. A card value that is not a
+    whole number within the wire's bounds is refused too, in case a card
+    reached here without load_key's check. Pure."""
+    _flag = int(getattr(args, "deposit_min_sat", 0) or 0)
+    _card = (key or {}).get("deposit_min_sat") if isinstance(key, dict) \
+        else None
+    if _card is not None:
+        if isinstance(_card, bool) or not isinstance(_card, int) \
+                or not proto.DEPOSIT_MIN_SAT <= _card <= proto.DEPOSIT_MAX_SAT:
+            raise ValueError("the card's intake floor is not a whole number "
+                             "of satoshi within the wire's bounds; re-pair "
+                             "both boxes.")
+        if 0 < _flag < _card:
+            raise ValueError(
+                f"--deposit-min-sat {_flag} is under the intake floor this "
+                f"pairing carried ({_card} sat): the vault refuses a smaller "
+                f"deposit anyway, so this end cannot take one. Use "
+                f"{_card} or more, or leave the flag off.")
+        return max(_flag, int(_card))
+    return int(_flag or proto.DEPOSIT_MIN_SAT)
+
+
 class Pager:
     #: THE INTAKE'S SETTINGS, AS CLASS DEFAULTS: __init__ sets them from the
     #: command line, and a Pager built without __init__ (every fixture in the
@@ -1739,12 +1781,13 @@ class Pager:
         _al = getattr(args, "alert_chat", None)
         self.alert_chat = (int(_al) if isinstance(_al, int)
                            and not isinstance(_al, bool) else None)
-        #: The smallest deposit the wizard takes. The vault has its own floor
-        #: on the intake (what can be forwarded after the fee); set this to
-        #: it so the refusal happens here, with the number, and not after a
-        #: wake. The wire's floor by default.
-        self.deposit_min_sat = int(getattr(args, "deposit_min_sat", 0)
-                                   or proto.DEPOSIT_MIN_SAT)
+        #: The smallest deposit the wizard takes: the vault's own floor on
+        #: the intake (what can be forwarded after the fee at its ceiling),
+        #: carried to this card by the pairing since the MED pass after the
+        #: deep read, so the refusal happens here, with the number, and not
+        #: after a wake; --deposit-min-sat raises it; the wire's floor for a
+        #: card without one (deposit_floor_of).
+        self.deposit_min_sat = deposit_floor_of(args, key)
         self.busy = threading.Lock()
         self.ignored = 0
         #: kind -> when that kind last reached the chain. See _log_ignored.
@@ -6554,10 +6597,13 @@ def build_cli():
                          "10800, floor 600). At least the vault's "
                          "--btc-bump-after, or the recheck finds no bump due.")
     ap.add_argument("--deposit-min-sat", type=int, default=0,
-                    help="the smallest deposit the wizard takes, in satoshi; "
-                         "set it to the vault's intake floor so a deposit it "
-                         "would refuse is refused here, with the number, "
-                         "before a wake. Default: the wire's own floor.")
+                    help="the smallest deposit the wizard takes, in satoshi. "
+                         "Default: the vault's intake floor, which the "
+                         "pairing carries to this card (a smaller deposit "
+                         "is refused here, with the number, before a wake), "
+                         "else the wire's own floor. Set it higher to raise "
+                         "it; a value under the pairing's floor is refused "
+                         "at start.")
     ap.add_argument("--btc-reserve", type=int, default=2, metavar="N",
                     help="how many of the day's courtesy pokes are kept for "
                          "taps: a fee retry or a recheck this end starts by "
@@ -6808,6 +6854,13 @@ def main(argv=None) -> int:
                  f"({type(e).__name__}), so this cannot issue a confirmation "
                  f"number that belongs to one chat. Re-pair with "
                  f"gs_wake_keys.")
+    # THE WIZARD'S FLOOR, settled here where the operator can read the
+    # refusal: a --deposit-min-sat UNDER the floor the pairing carried would
+    # take a deposit the vault refuses and spend a wake finding out.
+    try:
+        deposit_floor_of(args, key)
+    except ValueError as e:
+        sys.exit(f"[!] {e}")
 
     st = Path(args.state)
     try:

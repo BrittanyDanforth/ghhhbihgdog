@@ -4633,14 +4633,65 @@ _fl_lines = _K.intake_floor_lines(_fl_args)
 _fl_want = __import__("gs_btc_tx").forward_floor_sat(
     int(_fl_args.op_return_max_bytes), int(_fl_args.feerate_ceiling_sat_vb))
 check("pairing/btc: the operator is told the intake floor at pairing -- the "
-      "number the vault refuses under, the ceiling it follows from, the "
-      "pager flag to set and the way to lower it",
+      "number the vault refuses under, the ceiling it follows from, that "
+      "the pairing carries it to the pager, the flag that raises it and "
+      "the way to lower it",
       any(str(_fl_want) in ln for ln in _fl_lines)
       and any(f"{int(_fl_args.feerate_ceiling_sat_vb)} sat/vB" in ln
               for ln in _fl_lines)
-      and any(f"--deposit-min-sat {_fl_want}" in ln for ln in _fl_lines)
+      and any("pairing to the pager" in ln for ln in _fl_lines)
+      and any("--deposit-min-sat" in ln for ln in _fl_lines)
       and any("--feerate-ceiling-sat-vb" in ln for ln in _fl_lines)
       and "for _line in intake_floor_lines(args):" in _kp_src)
+# THE FLOOR RIDES ON THE PAIRING (the MED pass after the deep read): the
+# wizard took any deposit down to the wire's floor unless the operator
+# copied this number across by hand, and a deposit between the two was
+# accepted in the chat, paid, and refused by the vault after a wake.
+check("intake_floor_sat is the vault's own floor (forward_floor_sat at the "
+      "ceiling, the wire's floor under it) with --btc-xpub, None without",
+      _K.intake_floor_sat(_fl_args) == _fl_want
+      and _fl_want == __import__("gs_btc_tx").forward_floor_sat(
+          int(_fl_args.op_return_max_bytes),
+          int(_fl_args.feerate_ceiling_sat_vb), int(_K.proto.DEPOSIT_MIN_SAT))
+      and _K.intake_floor_sat(_K.build_cli().parse_args(
+          ["pair", "--out", os.path.join(_fw_dir2, "k.key"),
+           "--artifact-dir", _fw_dir2])) is None)
+
+
+class _OAConn:
+    def getsockname(self):
+        return ("192.168.1.2", 8770)
+
+
+def _one_attempt_info(args):
+    """The info the vault SENDS in the ceremony, with the LAN and the
+    protocol stubbed out."""
+    seen = {}
+    _ll, _pr = _K.local_link, _K.proto.pair_responder
+    _K.local_link = lambda ip: ("eth0", "aa:bb:cc:dd:ee:ff", "192.168.1.255")
+    _K.proto.pair_responder = (
+        lambda conn, sk, pub, info, ask, say:
+        seen.setdefault("info", dict(info)) and {"ok": True})
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _K._one_attempt(_OAConn(), ("192.168.1.9", 5), None, b"", args)
+    finally:
+        _K.local_link, _K.proto.pair_responder = _ll, _pr
+    return seen.get("info")
+
+
+check("...and the vault SENDS it in the pairing info beside the MAC and "
+      "broadcast, where the Pi's shape check reads it; a pair without the "
+      "intake sends none",
+      _one_attempt_info(_fl_args)
+      == {"mac": "aa:bb:cc:dd:ee:ff", "broadcast": "192.168.1.255",
+          "deposit_min_sat": _fl_want}
+      and _one_attempt_info(_K.build_cli().parse_args(
+          ["pair", "--out", os.path.join(_fw_dir2, "k.key"),
+           "--artifact-dir", _fw_dir2]))
+      == {"mac": "aa:bb:cc:dd:ee:ff", "broadcast": "192.168.1.255"}
+      and _K.proto._pair_info({"info": _one_attempt_info(_fl_args)})
+      .get("deposit_min_sat") == _fl_want)
 # THE FIRST ADDRESS, FOR THE OPERATOR'S EYES: an xpub's version bytes do not
 # say which purpose it was derived under, and a BIP44 account key would hand
 # out addresses the seed's m/84' account never signs for.

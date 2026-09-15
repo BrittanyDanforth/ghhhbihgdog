@@ -926,6 +926,38 @@ check("PAIR_PROTO was bumped past the version that had no per-window nonce",
       P.PAIR_PROTO >= 3)
 
 # ===========================================================================
+# THE INTAKE FLOOR RIDES ON THE PAIRING (the MED pass after the deep read).
+# A vault paired with --btc-xpub sends the smallest deposit it can forward at
+# its own fee ceiling; the pager reads it off its card and refuses a smaller
+# one before a wake is spent on the vault's refusal. It is checked here like
+# the MAC: a whole number of satoshi within the wire's own bounds.
+# ===========================================================================
+check("_pair_info accepts the vault's intake floor beside the MAC, and "
+      "returns it as sent",
+      P._pair_info({"info": {**_VINFO, "deposit_min_sat": 150000}})
+      == {**_VINFO, "deposit_min_sat": 150000}
+      and P._pair_info({"info": {**_VINFO,
+                                 "deposit_min_sat": P.DEPOSIT_MIN_SAT}})
+      .get("deposit_min_sat") == P.DEPOSIT_MIN_SAT
+      and P._pair_info({"info": {**_VINFO,
+                                 "deposit_min_sat": P.DEPOSIT_MAX_SAT}})
+      .get("deposit_min_sat") == P.DEPOSIT_MAX_SAT)
+for _bad_floor, _why in ((True, "a bool"), ("150000", "a string"),
+                         (1.5, "a fraction"), (P.DEPOSIT_MIN_SAT - 1,
+                                               "under the wire's floor"),
+                         (P.DEPOSIT_MAX_SAT + 1, "over the wire's ceiling"),
+                         (None, "null")):
+    _refused = False
+    try:
+        P._pair_info({"info": {**_VINFO, "deposit_min_sat": _bad_floor}})
+    except P.WakeError as e:
+        _refused = "intake floor" in str(e)
+    check(f"...and refuses an intake floor that is {_why}", _refused)
+check("PAIR_PROTO was bumped for the floor: an old Pi refuses the field as "
+      "unexpected, and the failure must name the version, not the MAC",
+      P.PAIR_PROTO >= 5)
+
+# ===========================================================================
 # HALF A PAIRING. _pair_config runs AFTER both operators confirmed, and only
 # the RECEIVING side validated -- so the box holding a bad value (an IPv6
 # address from sock.getsockname() on an IPv6-routed LAN) sent it and wrote its

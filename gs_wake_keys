@@ -730,20 +730,34 @@ def mark_note_lines(args) -> list:
     ]
 
 
+def intake_floor_sat(args):
+    """The intake's floor for this pairing: the smallest deposit this pair
+    can send on when fees are at ITS ceiling (gs_btc_tx.forward_floor_sat
+    -- the same arithmetic the vault refuses a smaller deposit by, with
+    the wire's own floor under it), or None without --btc-xpub. Told to
+    the operator (intake_floor_lines) and SENT TO THE PI in the pairing
+    info (the MED pass after the deep read), so the pager refuses a
+    smaller deposit with the number before a wake is spent on the vault's
+    refusal; it used to be a flag the operator had to copy across."""
+    if not getattr(args, "btc_xpub", ""):
+        return None
+    import gs_btc_tx as _btx
+    return int(_btx.forward_floor_sat(int(args.op_return_max_bytes),
+                                      int(args.feerate_ceiling_sat_vb),
+                                      int(proto.DEPOSIT_MIN_SAT)))
+
+
 def intake_floor_lines(args) -> list:
     """What the operator is told at pairing about the intake's floor: the
     smallest deposit this pair can send on when fees are at ITS ceiling
-    (gs_btc_tx.forward_floor_sat -- the same arithmetic the vault refuses
-    a smaller deposit by), the ceiling it follows from, and the two things
-    they can do with it: set the pager's --deposit-min-sat to the same
-    number so the wizard refuses early, or pair a lower ceiling. Empty
+    (intake_floor_sat), the ceiling it follows from, that the pairing
+    carries it to the pager, and the two things they can do with it: raise
+    it on the pager with --deposit-min-sat, or pair a lower ceiling. Empty
     without --btc-xpub. STAGE5_PLAN.md 3.3."""
-    if not getattr(args, "btc_xpub", ""):
+    _floor = intake_floor_sat(args)
+    if _floor is None:
         return []
-    import gs_btc_tx as _btx
     import gs_btc_watch as _w
-    _floor = _btx.forward_floor_sat(int(args.op_return_max_bytes),
-                                    int(args.feerate_ceiling_sat_vb))
     _btc = f"{_floor / 100_000_000:.8f}".rstrip("0").rstrip(".")
     # THE FIRST ADDRESS, FOR THE OPERATOR'S EYES. An xpub's version bytes do
     # not say which purpose it was derived under: a BIP44 or BIP49 account
@@ -771,10 +785,10 @@ def intake_floor_lines(args) -> list:
         f"deposit this pair can send on",
         f"      when fees are at its {int(args.feerate_ceiling_sat_vb)} "
         f"sat/vB ceiling (the fee must stay under a fifth of it).",
-        f"      Start the pager with --deposit-min-sat {_floor} so a smaller "
-        f"one is refused there,",
-        f"      with the number, or pair again with a lower "
-        f"--feerate-ceiling-sat-vb for a lower floor.",
+        f"      It rides on this pairing to the pager, which refuses a "
+        f"smaller one there, with the number;",
+        f"      --deposit-min-sat on the pager raises it. Pair again with a "
+        f"lower --feerate-ceiling-sat-vb for a lower floor.",
     ]
 
 
@@ -1068,9 +1082,20 @@ def _one_attempt(conn, peer, sk, my_pub, args) -> dict:
     # is the shape of a message that has stopped describing reality.
     where = f"on {iface} " if iface and iface != "(given)" else ""
     print(f"  [*] This machine will be woken {where}({mac}), broadcast {brd}.")
-    return proto.pair_responder(conn, sk, my_pub,
-                                {"mac": mac, "broadcast": brd},
-                                ask_match, print)
+    info = {"mac": mac, "broadcast": brd}
+    # THE INTAKE FLOOR RIDES ON THE PAIRING (the MED pass after the deep
+    # read). The pager's wizard took any deposit down to the wire's own
+    # floor unless the operator copied this pair's real floor across by
+    # hand (--deposit-min-sat), so a deposit between the two was accepted
+    # in the chat, paid, and refused by the vault after a wake. The number
+    # goes to the Pi here, validated by the same shape check as the MAC
+    # (gs_wake_proto._pair_info), and the pager reads it off its card. A
+    # threshold the chat is already told when a deposit is under it, not
+    # an amount anyone paid. Only a pair with the intake sends one.
+    _floor = intake_floor_sat(args)
+    if _floor is not None:
+        info["deposit_min_sat"] = int(_floor)
+    return proto.pair_responder(conn, sk, my_pub, info, ask_match, print)
 
 
 def do_pair(args) -> int:

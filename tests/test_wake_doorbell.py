@@ -231,6 +231,76 @@ check("...while the KDF parameters ARE outside, because they are not secrets "
       _sealed["kdf"] == "argon2id" and isinstance(_sealed["ops"], int)
       and isinstance(_sealed["mem"], int) and len(_sealed["salt"]) == 32)
 
+print("\n== the intake floor rides on the pairing (the MED pass) ==")
+# A vault paired with --btc-xpub sends the smallest deposit it can forward at
+# its own fee ceiling; this box writes it on the card and the pager refuses a
+# smaller deposit with the number before a wake is spent on the vault's
+# refusal. A threshold the chat is already told, not an amount anyone paid.
+check("load_key accepts a card carrying the intake floor the pairing sent, "
+      "and hands it on as sent",
+      DB.load_key(_keyfile({**KEY, "deposit_min_sat": 150000},
+                           name="floor.key"), PW).get("deposit_min_sat")
+      == 150000
+      and "deposit_min_sat" not in DB.load_key(_keyfile(KEY, name="nofl.key"),
+                                               PW))
+# (A fraction is not tried here: the sealed card refuses any float before
+# a field is read -- "refusing a float in a wake note" -- and the wire's
+# shape check is what refuses one in test_wake_protocol.)
+for _bad_f, _why in ((True, "a bool"), ("150000", "a string"),
+                     (P.DEPOSIT_MIN_SAT - 1, "under the wire's floor"),
+                     (P.DEPOSIT_MAX_SAT + 1, "over the wire's ceiling"),
+                     (None, "null")):
+    _refused = False
+    try:
+        DB.load_key(_keyfile({**KEY, "deposit_min_sat": _bad_f},
+                             name=f"floor_{abs(hash(_why)) % 9999}.key"), PW)
+    except DB.Doorbell as e:
+        _refused = "intake floor" in str(e)
+    check(f"...and refuses a card whose intake floor is {_why}", _refused)
+
+
+class _DPSock:
+    def getsockname(self):
+        return ("192.168.1.9", 40000)
+
+    def close(self):
+        pass
+
+
+def _do_pair_with(peer_info):
+    """do_pair against a stubbed ceremony that agrees on `peer_info`:
+    returns (rc, the card as load_key reads it)."""
+    d = Path(tempfile.mkdtemp())
+
+    class _A:
+        key = str(d / "pi.key")
+        vault, pair_port, port, kdf = "192.168.1.2", 8770, 41337, KDF
+
+    _orig = DB.proto.pair_initiator
+    DB.proto.pair_initiator = lambda sock, sk, pub, info, ask, say: {
+        "peer_info": dict(peer_info),
+        "peer_public": TP.public_key.encode().hex(), "sas": "0000-0000"}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = DB.do_pair(_A(), connect=lambda: _DPSock(), ask=lambda s: True,
+                            getpass_fn=lambda p: PW.decode())
+    finally:
+        DB.proto.pair_initiator = _orig
+    return rc, DB.load_key(Path(_A.key), PW)
+
+
+_dp_rc, _dp_key = _do_pair_with({"mac": "aa:bb:cc:dd:ee:ff",
+                                 "broadcast": "192.168.1.255",
+                                 "deposit_min_sat": 150000})
+check("do_pair writes the floor the vault sent onto the card, beside the MAC",
+      _dp_rc == 0 and _dp_key.get("deposit_min_sat") == 150000
+      and _dp_key.get("target_mac") == "aa:bb:cc:dd:ee:ff")
+_dp_rc2, _dp_key2 = _do_pair_with({"mac": "aa:bb:cc:dd:ee:ff",
+                                   "broadcast": "192.168.1.255"})
+check("...and a pair without the intake writes no floor (the pager then "
+      "takes its flag, else the wire's own)",
+      _dp_rc2 == 0 and "deposit_min_sat" not in _dp_key2)
+
 
 print("\n== the job comes in on stdin, never on argv ==")
 help_text = DB.build_cli().format_help()

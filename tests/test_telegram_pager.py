@@ -5666,11 +5666,58 @@ _a = _cli.parse_args(["--btc-electrum", "s.onion", "--btc-electrum",
                       "--btc-network", "testnet", "--btc-poll", "120",
                       "--deposit-min-sat", "60000"])
 check("the intake's settings are command-line flags (never on the card): "
-      "servers, depth, network, poll, floor",
+      "servers, depth, network, poll; the floor is a flag too, and since "
+      "the MED pass the pairing carries the vault's own to the card",
       _a.btc_electrum == ["s.onion", "t.onion:50001,ab"] and _a.btc_min_conf == 3
       and _a.btc_network == "testnet" and _a.btc_poll == 120
       and _a.deposit_min_sat == 60000
       and _cli.parse_args([]).btc_electrum == [])
+
+print("\n-- the floor the pairing carried (the MED pass) --")
+# The wizard took any deposit down to the wire's floor unless the operator
+# copied the vault's real floor across by hand, and a deposit between the two
+# was accepted in the chat, paid, and refused on the vault after a wake. The
+# pairing now carries the vault's floor to the card; it is the default, the
+# flag raises it, and a flag under it is refused at start.
+_fl0 = types.SimpleNamespace(deposit_min_sat=0)
+check("deposit_floor_of: the card's floor is the default; the flag raises "
+      "it; a card without one takes the flag, else the wire's own floor",
+      pg.deposit_floor_of(_fl0, {"deposit_min_sat": 150000}) == 150000
+      and pg.deposit_floor_of(types.SimpleNamespace(deposit_min_sat=200000),
+                              {"deposit_min_sat": 150000}) == 200000
+      and pg.deposit_floor_of(types.SimpleNamespace(deposit_min_sat=60000),
+                              {}) == 60000
+      and pg.deposit_floor_of(_fl0, {}) == pg.proto.DEPOSIT_MIN_SAT
+      and pg.deposit_floor_of(types.SimpleNamespace(), None)
+      == pg.proto.DEPOSIT_MIN_SAT)
+for _flag, _card, _why in (
+        (60000, {"deposit_min_sat": 150000}, "a flag UNDER the pairing's "
+                                             "floor (the vault refuses a "
+                                             "smaller deposit anyway)"),
+        (0, {"deposit_min_sat": True}, "a bool on the card"),
+        (0, {"deposit_min_sat": "150000"}, "a string on the card"),
+        (0, {"deposit_min_sat": pg.proto.DEPOSIT_MIN_SAT - 1},
+         "a card floor under the wire's own")):
+    _refused = False
+    try:
+        pg.deposit_floor_of(types.SimpleNamespace(deposit_min_sat=_flag), _card)
+    except ValueError as e:
+        _refused = "floor" in str(e)
+    check(f"...and refuses {_why}", _refused)
+_flp = pg.Pager(types.SimpleNamespace(state=os.path.join(_d, "fl.json"),
+                                      min_interval=0, daily_cap=99,
+                                      chat_id=[111], no_jitter=True,
+                                      key="unused", deposit_min_sat=0),
+                "123456:TOKEN", {"deposit_min_sat": 150000},
+                {"https": "socks5h://x"})
+check("a pager built on a card that carries the floor takes it as the "
+      "wizard's own",
+      _flp.deposit_min_sat == 150000)
+check("main settles the floor at start, where the refusal can be read, "
+      "before the state file is touched",
+      "deposit_floor_of(args, key)" in _src.split("def main(")[1]
+      and _src.split("def main(")[1].index("deposit_floor_of(args, key)")
+      < _src.split("def main(")[1].index("st = Path(args.state)"))
 
 # THIRD SELF-DOUBT PASS: MONEY THAT CAME BACK AGAIN IS KEPT BY THE VAULT.
 # Nothing here is tried by itself for it: no look, no recheck, no retry --

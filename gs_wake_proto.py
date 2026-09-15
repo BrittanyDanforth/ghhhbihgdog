@@ -1489,7 +1489,11 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
 # 256 to 1024 to make room for the sealed slip. All three are incompatible wire
 # changes; leaving this number alone let a new box and an old box agree to pair
 # and then fail at wake time, which is the worst place to discover it.
-PAIR_PROTO = 4
+# 5 (the MED pass after the deep read): the pairing info gained the intake
+# floor (`deposit_min_sat`, sent by a vault paired with --btc-xpub, read by the
+# pager off its card). An old Pi refuses the field as unexpected and the
+# ceremony dies saying the MAC was refused; the version says which box is old.
+PAIR_PROTO = 5
 PAIR_MAX_LINE = 8192
 #: The ceremony runs once, with a human at both ends. Generous, but bounded:
 #: a pairing socket that waits forever is a socket someone can leave open.
@@ -1607,7 +1611,8 @@ PAIR_ABORT = {
     "protocol": "the other box did not understand this pairing protocol. Are "
                 "both boxes running the same version of this repository?",
     "self_key": "the other box says it was offered its own public key back.",
-    "info": "the other box refused the address or MAC this one sent.",
+    "info": "the other box refused the address, MAC or intake floor this one "
+            "sent.",
 }
 
 
@@ -1671,11 +1676,22 @@ def _pair_info(body: dict) -> dict:
         raise WakeError("pairing message carries no info object")
     out = {}
     for k, v in sorted(info.items()):
-        if k not in ("host", "port", "mac", "broadcast"):
+        if k not in ("host", "port", "mac", "broadcast", "deposit_min_sat"):
             raise WakeError("pairing info carries an unexpected field")
         if k == "port":
             if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 65535:
                 raise WakeError("pairing info carries a bad port")
+        elif k == "deposit_min_sat":
+            # THE INTAKE FLOOR (the MED pass after the deep read): the
+            # smallest deposit the vault can forward at its own fee ceiling,
+            # sent by a vault paired with --btc-xpub so the pager refuses a
+            # smaller one before a wake is spent on the vault's refusal. A
+            # whole number of satoshi within the wire's own bounds; the
+            # pager reads it off its card, so it is checked here like the
+            # rest.
+            if not isinstance(v, int) or isinstance(v, bool) \
+                    or not DEPOSIT_MIN_SAT <= v <= DEPOSIT_MAX_SAT:
+                raise WakeError("pairing info carries a bad intake floor")
         elif k == "mac":
             # \Z, NOT $ -- see the IPv4 note below; the same hole let
             # "de:ad:be:ef:ca:fe\n" through into the keyfile.

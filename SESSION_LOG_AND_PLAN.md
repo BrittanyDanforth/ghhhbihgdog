@@ -560,7 +560,11 @@ refuters per finding) found real defects, all fixed in the rewrite:
   record is not marked forwarded (no plan was written).
 - The pager: `--btc-electrum` (repeatable), `--btc-min-conf`,
   `--btc-network`, `--btc-poll` (≥ 60 s), `--deposit-min-sat` on the command
-  line, never on the card. The intake reply is one message (amount,
+  line, never on the card (since the MED pass after the deep read the
+  vault's own intake floor DOES ride on the card, sent in the pairing info
+  and checked like the MAC -- a threshold the chat is already told, not an
+  amount anyone paid -- and the flag only raises it; the hand-copied flag
+  left a gap a deposit fell into). The intake reply is one message (amount,
   address, label, "I will say here when it arrives and when it has
   confirmed. After that it moves on by itself"), registered on the watch
   list before it is sent. The watcher thread looks at every open address on
