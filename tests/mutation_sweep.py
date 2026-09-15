@@ -5647,7 +5647,9 @@ MUTATIONS = [
   '        nxt = _marked',
   ['test_wake_agent']),
  ('an unreadable mark reads as no mark', 'gs_wake_agent',
+  '    except Exception as e:                                   # noqa: BLE001\n'
   '        integrity_log("wake", "btc_issued_mark_unreadable")',
+  '    except Exception as e:                                   # noqa: BLE001\n'
   '        return None',
   ['test_wake_agent']),
  ('the loader does not name the mark', 'gs_wake_agent',
@@ -5858,6 +5860,60 @@ MUTATIONS = [
   '            if send_sat + _jit >= dust:',
   '            if False:',
   ['test_btc_forwarder']),
+ ("the loader ignores the marks' directory (the mark beside the keyfile, "
+  "unwritable under the unit)", 'gs_wake_agent',
+  '        k["btc_issued_mark"] = str(Path(_md.strip())\n'
+  '                                   / f"issued_{_xpub_id(k)}.json")',
+  '        k["btc_issued_mark"] = str(path) + ".issued"',
+  ['test_plain_slip']),
+ ('the chain id is a digest of the xpub text (a zpub re-pair is a fresh '
+  'chain)', 'gs_wake_agent',
+  '        return _w.chain_id(xpub, str(key.get("btc_network") or "main"))',
+  '        raise ValueError("text")',
+  ['test_wake_agent']),
+ ('a mark whose count is not a number crashes the deposit', 'gs_wake_agent',
+  '    if isinstance(_n, bool) or not isinstance(_n, int) \\\n'
+  '            or not 0 <= _n < 0x80000000:',
+  '    if False:',
+  ['test_wake_agent']),
+ ('the ledger records an issued index only after the quote child ran (a '
+  'death in between reads as a wiped ledger)', 'gs_wake_agent',
+  '                    _save_handles(artifact_dir, handles, led["owners"])\n'
+  '                except Refused:',
+  '                except Refused:',
+  ['test_wake_agent']),
+ ("the dry run's probe never writes (a mark's place it cannot write reads "
+  "writable)", 'gs_wake_agent',
+  '        atomic_write_json({"probe": True}, probe, perms=0o600)\n'
+  '        probe.unlink()',
+  '        pass',
+  ['test_wake_agent']),
+ ("the pairing writes no marks' directory into the keyfile", 'gs_wake_keys',
+  '        "btc_issued_mark_dir": str(args.mark_dir),',
+  '',
+  ['test_wake_agent']),
+ ('the pairing does not say a chain the marks already know', 'gs_wake_keys',
+  '        for _line in mark_note_lines(args):\n'
+  '            print(_line)',
+  '        pass',
+  ['test_wake_agent']),
+ ("the unit does not create the marks' directory (a mark the unit cannot "
+  "write refuses every deposit)", 'systemd/gs-wake-agent.service',
+  'StateDirectory=ghostspiral-marks\n',
+  '',
+  ['test_wake_agent']),
+ ("a reused record's issued index is dropped from the ledger (the deposit "
+  "after a failed one is refused as a wiped ledger)", 'gs_wake_agent',
+  '                _reuse_idx = _old_rec.get("btc_index")',
+  '                _reuse_idx = None',
+  ['test_wake_agent']),
+ ('a handed-back index is never reissued (a hole per failed deposit)',
+  'gs_wake_agent',
+  '        if ask(_pa):\n'
+  '            if _marked < _pref + 1:',
+  '        if False:\n'
+  '            if _marked < _pref + 1:',
+  ['test_wake_agent']),
 ]
 
 

@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import socket
@@ -115,6 +116,11 @@ THINKPAD_FILE = "gs_wake_thinkpad.key"
 #: The ceremony's own port. Open for one connection, once, ever. It is not the
 #: doorbell port and it is not in either keyfile.
 PAIR_PORT = 8769
+#: Where the vault keeps its issued-index marks by default: the agent
+#: unit's StateDirectory= (systemd/gs-wake-agent.service), which systemd
+#: creates at every start and which sits outside every wipe root and
+#: outside the artifact dir. Tests pin the two names together.
+MARK_DIR_DEFAULT = "/var/lib/ghostspiral-marks"
 
 _SIOCGIFADDR = 0x8915
 _SIOCGIFHWADDR = 0x8927
@@ -278,6 +284,17 @@ def build_cli() -> argparse.ArgumentParser:
                    help="ABSOLUTE path where woken jobs write bundles and "
                         "slips. Must match ReadWritePaths= and "
                         "WorkingDirectory= in systemd/gs-wake-agent.service.")
+    p.add_argument("--mark-dir", default=MARK_DIR_DEFAULT,
+                   help="ABSOLUTE path of the directory the vault keeps its "
+                        "issued-index marks in (one small file per intake "
+                        "chain: a chain id and a count, no address), OUTSIDE "
+                        "the wipe and OUTSIDE the artifact dir, and writable "
+                        "by the agent unit -- the default is the unit's "
+                        "StateDirectory=, which systemd creates at every "
+                        "start. Keep the default across re-pairs: the marks "
+                        "are what stop a wiped ledger handing an issued, "
+                        f"unpaid address to a second client. (default: "
+                        f"{MARK_DIR_DEFAULT})")
     # --amount-ladder IS GONE. It held the BTC amounts a wake could select by
     # index, so the Pi sent a slot and never a number. The chat now asks for
     # the amount being sent and the wire carries it in satoshis; see
@@ -675,6 +692,42 @@ def _validate_btc(args) -> None:
         except _w.BtcWatchError as e:
             sys.exit(f"[!] --btc-xpub is not an account xpub of the "
                      f"{args.btc_network} network: {e}")
+        for _line in mark_note_lines(args):
+            print(_line)
+
+
+def mark_note_lines(args) -> list:
+    """What the operator is told at pairing when the vault's issued-index
+    mark already knows THIS chain (self-doubt over the fix pass): the
+    chain has handed out addresses before, and the ledger at
+    --artifact-dir must still know them, or the first deposit is refused
+    ledger_wiped -- the guard working, not a fault. Said here, at the one
+    moment the operator is present, rather than found at the first client.
+    Empty when there is no mark, no xpub, or the mark cannot be read (the
+    agent refuses that itself, naming the file)."""
+    xpub = str(getattr(args, "btc_xpub", "") or "")
+    if not xpub:
+        return []
+    import gs_btc_watch as _w
+    try:
+        cid = _w.chain_id(xpub, str(getattr(args, "btc_network", "main")
+                                    or "main"))
+        p = Path(str(args.mark_dir)) / f"issued_{cid}.json"
+        d = json.loads(p.read_text())
+        n = d.get("issued") if isinstance(d, dict) else None
+    except Exception:                                        # noqa: BLE001
+        return []
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return []
+    return [
+        f"[*] This chain has handed out {n} deposit address(es) before "
+        f"(the mark at {p}).",
+        f"    The ledger at --artifact-dir must still know them, or the "
+        f"first deposit is refused",
+        f"    ledger_wiped -- the guard doing its job. To retire the chain "
+        f"instead, pair the next",
+        f"    --btc-account with that account's xpub.",
+    ]
 
 
 def intake_floor_lines(args) -> list:
@@ -923,6 +976,13 @@ def _validate(args) -> None:
                  f"choose. Give an absolute path, and make it the one "
                  f"WorkingDirectory= and ReadWritePaths= name in "
                  f"systemd/gs-wake-agent.service (/var/lib/ghostspiral).")
+    if not os.path.isabs(args.mark_dir):
+        sys.exit(f"[!] --mark-dir {args.mark_dir!r} is relative. The agent "
+                 f"runs under systemd, where the working directory is '/', "
+                 f"so a relative path resolves somewhere you did not choose "
+                 f"and ProtectSystem=strict mounts read-only. Give an "
+                 f"absolute path the unit may write ({MARK_DIR_DEFAULT} is "
+                 f"its StateDirectory=).")
     if args.mac and not MAC_RE.match(args.mac):
         sys.exit(f"[!] --mac {args.mac!r} is not a MAC address.")
     if args.broadcast and not is_ipv4(args.broadcast):
@@ -1132,6 +1192,12 @@ def do_pair(args) -> int:
         # derivation from the xpub). Written always, so a keyfile from
         # before the field existed reads as account 0, which it was.
         "btc_account": int(args.btc_account),
+        # WHERE THE ISSUED-INDEX MARKS LIVE (self-doubt over the fix pass):
+        # the agent keeps one file per chain there, outside the wipe and
+        # outside the artifact dir, in a place the unit may write. Written
+        # always; a keyfile from before the field keeps its mark beside
+        # itself, which under /etc the unit cannot write.
+        "btc_issued_mark_dir": str(args.mark_dir),
         "btc_electrum": [str(s) for s in (args.btc_electrum or [])],
         "btc_network": str(args.btc_network or "main"),
         "btc_min_conf": int(args.btc_min_conf),

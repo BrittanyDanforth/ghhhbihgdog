@@ -128,7 +128,10 @@ def mint_pair(port, artifact_dir, kdf="interactive"):
         [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
          "--out", d, "--bind", "127.0.0.1", "--pair-port", str(pport),
          "--mac", "aa:bb:cc:dd:ee:ff", "--broadcast", "255.255.255.255",
-         "--artifact-dir", str(artifact_dir)],
+         "--artifact-dir", str(artifact_dir),
+         # The issued-index marks' directory: under the ceremony's own
+         # tempdir, so a test never writes the shipped /var/lib path.
+         "--mark-dir", os.path.join(d, "marks")],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, cwd=d)
     # Wait for the listener rather than sleeping a guess: a fixed sleep here

@@ -144,3 +144,11 @@ pager.log
 # while auditing it. Each one is a full copy of the tree; committing them
 # would put ten copies of the repository on the branch.
 .claude/worktrees/
+
+# The vault's issued-index marks (gs_wake_agent): a chain id, an account
+# number and a count of deposit addresses handed out. Kept OUTSIDE the wipe
+# on purpose (they are the guard against a wiped ledger reissuing an unpaid
+# address), so a developer pairing with --mark-dir . or an old keyfile's
+# beside-the-keyfile mark must not land in a public tree either.
+issued_*.json
+*.issued

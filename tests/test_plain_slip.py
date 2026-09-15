@@ -351,11 +351,11 @@ check("a non-boolean plain_slip is refused rather than being truthy",
       _loadkey_with(deposit_in_chat="yes") == "deposit_in_chat_malformed")
 
 
-def _loadkey_mark():
+def _loadkey_mark(extra=None):
     """The loaded key of a real keyfile, and the keyfile's path."""
     d = Path(tempfile.mkdtemp(prefix="vkey_"))
     payload = {"role": "thinkpad", "secret": bytes(VAULT).hex(),
-               "peer_public": bytes(PI.public_key).hex()}
+               "peer_public": bytes(PI.public_key).hex(), **(extra or {})}
     p = d / "tp.key"
     p.write_text(json.dumps(P.lock_keyfile(payload, b"", role="thinkpad")))
     os.chmod(p, 0o400)
@@ -363,11 +363,36 @@ def _loadkey_mark():
 
 
 _kmk, _pmk = _loadkey_mark()
-check("the loader names the issued-index mark BESIDE the keyfile, under a "
-      "suffix the wipe does not take (fix pass: a wiped ledger must not hand "
-      "an issued, unpaid address out again)",
+check("a keyfile from before the marks' directory field keeps its "
+      "issued-index mark BESIDE itself, under a suffix the wipe does not take "
+      "(fix pass: a wiped ledger must not hand an issued, unpaid address out "
+      "again)",
       _kmk.get("btc_issued_mark") == str(_pmk) + ".issued"
       and not str(_kmk.get("btc_issued_mark")).endswith(".key"))
+# SELF-DOUBT OVER THAT FIX: beside a keyfile under /etc the mark was
+# unwritable under the shipped unit. The pairing names a directory the unit
+# may write, and the mark for a chain lives there under the chain's id --
+# one file per chain, so alternating accounts or a renamed keyfile loses no
+# record, and an xpub and a zpub of one account share one.
+_ZP1 = ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r"
+        "1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
+_mdir = tempfile.mkdtemp(prefix="marks_")
+_km1, _pm1 = _loadkey_mark({"btc_issued_mark_dir": _mdir,
+                            "btc_account_xpub": _ZP1, "btc_account": 0})
+_cid1 = __import__("gs_btc_watch").chain_id(_ZP1, "main")
+check("with the field, the mark is <dir>/issued_<chain id>.json: not beside "
+      "the keyfile, named by the chain and not by the keyfile",
+      _km1.get("btc_issued_mark") == os.path.join(_mdir, f"issued_{_cid1}.json")
+      and str(_pm1) not in _km1.get("btc_issued_mark"))
+_km2, _ = _loadkey_mark({"btc_issued_mark_dir": _mdir + "/",
+                         "btc_account_xpub": _ZP1, "btc_account": 3})
+check("...the same chain under another keyfile (and account number, and a "
+      "trailing slash) names the SAME mark: the record follows the chain",
+      _km2.get("btc_issued_mark") == _km1.get("btc_issued_mark"))
+_km3, _ = _loadkey_mark({"btc_issued_mark_dir": "   ",
+                         "btc_account_xpub": _ZP1})
+check("...and a blank field is no field: beside the keyfile, as before",
+      str(_km3.get("btc_issued_mark")).endswith("tp.key.issued"))
 # ---- AN OLD KEYFILE FAILS LOUDLY RATHER THAN LOSING THE MODE ------------
 #
 # The field was called plain_slip. Reading the new name with .get() would turn

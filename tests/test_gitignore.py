@@ -361,12 +361,31 @@ for _t in _TOOLS:
 check(f"every runtime-name classification still matches a live f-string "
       f"({sorted(set(_RUNTIME_FRAGMENTS.values()) - set(_runtime)) or 'all present'})",
       not (set(_RUNTIME_FRAGMENTS.values()) - set(_runtime)))
+#: Runtime-built names that are NOT erased ON PURPOSE, each with the reason.
+#: The same discipline as _EXEMPT: an entry that matches no live f-string is
+#: a red check, so this cannot become a place to park a name nobody checks.
+_RUNTIME_EXEMPT = {
+    # The vault's issued-index mark: a chain id, an account number and a
+    # count of deposit addresses handed out -- what stops a wiped ledger
+    # handing an issued, unpaid address to a second client. It has to OUTLIVE
+    # the wipe to do that (OPSEC_SETUP.md, the intake), lives outside every
+    # wipe root (the unit's StateDirectory=), and the "door coming in"
+    # instruction shreds it by hand. It is gitignored regardless.
+    "issued_*.json": "outlives the wipe by design; shredded by hand",
+}
 for _g, _who in sorted(_runtime.items()):
+    if _g in _RUNTIME_EXEMPT:
+        continue
     # Substitute a concrete token for the * so fnmatch has something to chew.
     if not _erased_by_name(_g.replace("*", "X")):
         _runtime_bad.append((_g, sorted(_who)))
 check(f"every artifact name BUILT AT RUNTIME is erased by a glob "
       f"(unaccounted: {_runtime_bad or 'none'})", not _runtime_bad)
+check(f"every runtime exemption still matches a live f-string, and is "
+      f"gitignored even though it is not wiped "
+      f"({sorted(set(_RUNTIME_EXEMPT) - set(_runtime)) or 'all present'})",
+      not (set(_RUNTIME_EXEMPT) - set(_runtime))
+      and all(is_ignored(_g.replace("*", "X")) for _g in _RUNTIME_EXEMPT))
 check(f"NON-VACUITY: the runtime scan found names to check "
       f"({len(_runtime)} globs)", len(_runtime) >= 5)
 check("NON-VACUITY: ...including the peel chain's derived name, which is a "

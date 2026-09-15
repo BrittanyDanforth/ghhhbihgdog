@@ -621,16 +621,29 @@ def load_key(path: Path) -> dict:
             f"answers to one question and this machine will not guess: sealed "
             f"delivery puts the payload where only gs_delivery.key can read "
             f"it, plaintext puts it in the chat. Remove one.")
-    # THE ISSUED-INDEX MARK LIVES BESIDE THE KEYFILE, under a suffix the
-    # wipe does not take (paranoia_mode removes gs_wake_*.key and the
-    # artifact dir; this file is neither): the one record, outside the
-    # ledger, that an intake chain has handed out an address. Named here
-    # so every key this machine runs under names one; _allocate_btc_index
-    # refuses an empty ledger the mark contradicts. Without it a wiped
-    # ledger behind an address that was ISSUED but not yet PAID handed
-    # that address to a second client -- the chain cannot tell an unpaid
-    # address from a fresh one, and address 0 was the only one asked.
-    k["btc_issued_mark"] = str(path) + ".issued"
+    # THE ISSUED-INDEX MARK: the one record, outside the ledger, that an
+    # intake chain has handed out an address. Named here so every key this
+    # machine runs under names one; _allocate_btc_index refuses an empty
+    # ledger the mark contradicts. Without it a wiped ledger behind an
+    # address that was ISSUED but not yet PAID handed that address to a
+    # second client -- the chain cannot tell an unpaid address from a
+    # fresh one, and address 0 was the only one asked.
+    # IN ITS OWN DIRECTORY (self-doubt over that fix): the pairing names
+    # one (`btc_issued_mark_dir`; /var/lib/ghostspiral-marks by default,
+    # the unit's StateDirectory=, outside every wipe root), and the mark
+    # for a chain is <dir>/issued_<chain id>.json -- one file per chain,
+    # never dropped, never tied to the keyfile's name or place. Beside the
+    # keyfile it sat under /etc, which ProtectSystem=strict mounts
+    # read-only: under the shipped unit EVERY deposit was refused
+    # btc_issued_unrecorded, and nothing before the first client said so.
+    # A keyfile from before the field keeps the old place beside itself,
+    # and --dry-run tries the write and says what it found.
+    _md = k.get("btc_issued_mark_dir")
+    if isinstance(_md, str) and _md.strip():
+        k["btc_issued_mark"] = str(Path(_md.strip())
+                                   / f"issued_{_xpub_id(k)}.json")
+    else:
+        k["btc_issued_mark"] = str(path) + ".issued"
     return k
 
 
@@ -1462,11 +1475,21 @@ def _issued_mark_path(key: dict):
 
 
 def _xpub_id(key: dict) -> str:
-    """Which CHAIN a mark is about: a short digest of the account xpub,
-    never the xpub itself (it derives every deposit address). A mark left
-    behind by a wipe names no address, no amount and no client."""
-    return hashlib.sha256(
-        str(key.get("btc_account_xpub") or "").encode()).hexdigest()[:16]
+    """Which CHAIN a mark is about: gs_btc_watch.chain_id -- a short digest
+    of the chain's FIRST ADDRESS, never the xpub itself (it derives every
+    deposit address). A mark left behind by a wipe names no address, no
+    amount and no client. From the address and not the xpub's text
+    (self-doubt over the fix pass): an xpub and a zpub of one account are
+    one chain, and a re-pair that pasted the other encoding read as a
+    fresh chain and handed index 0 out again. An xpub that derives
+    nothing (refused elsewhere) gets a digest of its text, so this never
+    raises and a mark is still a mark."""
+    xpub = str(key.get("btc_account_xpub") or "")
+    try:
+        import gs_btc_watch as _w
+        return _w.chain_id(xpub, str(key.get("btc_network") or "main"))
+    except Exception:                                        # noqa: BLE001
+        return hashlib.sha256(("xpub:" + xpub).encode()).hexdigest()[:16]
 
 
 def _read_issued_mark(key: dict):
@@ -1492,7 +1515,38 @@ def _read_issued_mark(key: dict):
                       "was issued. Fix or remove it at the machine.") from e
     if not isinstance(d, dict) or d.get("xpub_id") != _xpub_id(key):
         return None
+    # ...AND SAYS A COUNT (self-doubt over the fix pass): a mark whose
+    # `issued` is not a whole number under the hardened bound escaped as
+    # an uncaught ValueError -- a crash, the box powered off -- or as
+    # btc_config_malformed, blaming an xpub that was fine.
+    _n = d.get("issued")
+    if isinstance(_n, bool) or not isinstance(_n, int) \
+            or not 0 <= _n < 0x80000000:
+        integrity_log("wake", "btc_issued_mark_unreadable")
+        raise Refused("btc_issued_mark_unreadable",
+                      f"the issued-index mark ({p}) does not carry a whole "
+                      "number of issued addresses; it is what tells a wiped "
+                      "ledger from a fresh one, so no address was issued. Fix "
+                      "or remove it at the machine.")
     return d
+
+
+def _mark_probe(key: dict) -> tuple:
+    """(writable, what): whether the issued-index mark's place can be
+    written by THIS process, proven by writing and removing a probe file
+    beside it -- never the mark itself (a dry run issues nothing). NEVER
+    raises; `what` is the directory or the error's class."""
+    p = _issued_mark_path(key)
+    if p is None:
+        return False, "no mark named"
+    try:
+        probe = p.with_name(p.name + f".probe{os.getpid()}")
+        secure_mkdir(p.parent, narrow_existing=False)
+        atomic_write_json({"probe": True}, probe, perms=0o600)
+        probe.unlink()
+        return True, str(p.parent)
+    except Exception as e:                                   # noqa: BLE001
+        return False, f"{p}: {type(e).__name__}"
 
 
 def _write_issued_mark(key: dict, issued: int) -> None:
@@ -1504,6 +1558,11 @@ def _write_issued_mark(key: dict, issued: int) -> None:
     if p is None:
         return
     try:
+        # THE DIRECTORY TOO, owner-only: the unit's StateDirectory= exists
+        # at every start, a hand-run or a dev box's does not yet, and a
+        # mark refused for a missing parent is the same refusal of every
+        # deposit as a read-only one -- with the same fix a mkdir is.
+        secure_mkdir(p.parent, narrow_existing=False)
         atomic_write_json({"account": int(key.get("btc_account") or 0),
                            "xpub_id": _xpub_id(key), "issued": int(issued)},
                           p, perms=0o600)
@@ -1517,7 +1576,8 @@ def _write_issued_mark(key: dict, issued: int) -> None:
                       "published.") from e
 
 
-def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
+def _allocate_btc_index(key: dict, handles: dict, unused=None,
+                        prefer=None) -> int:
     """The next deposit index: one past the highest the ledger knows,
     stepping past any address the NETWORK says has been used, up to
     BTC_INDEX_GAP of them. The ledger's counter is never trusted alone --
@@ -1540,19 +1600,32 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
     used = [r.get("btc_index") for r in handles.values()
             if isinstance(r, dict) and isinstance(r.get("btc_index"), int)
             and not isinstance(r.get("btc_index"), bool)]
+    # A NEVER-PUBLISHED INDEX HANDED BACK (`prefer`: a reused record's, see
+    # _dispatch) is one the ledger knew: it counts as known here, so the
+    # deposit after a failed one is not refused as a wiped ledger, and it
+    # is reissued below once the network says it is still fresh.
+    _pref = (prefer if isinstance(prefer, int) and not isinstance(prefer, bool)
+             and prefer >= 0 else None)
+    if _pref is not None:
+        used = used + [_pref]
     nxt = (max(used) + 1) if used else 0
     _mark = _read_issued_mark(key)
     _marked = int(_mark.get("issued") or 0) if isinstance(_mark, dict) else 0
     if not used and _marked > 0:
         integrity_log("wake", "ledger_wiped")
         raise Refused("ledger_wiped",
-                      "this machine's ledger knows no deposit, and the mark "
-                      "beside the keyfile says this chain has already handed "
-                      f"out {_marked} address(es): the ledger was wiped behind "
-                      "a chain in use, and an address it handed out may be "
-                      "unpaid still, with its payment on the way. Nothing was "
-                      "published. Re-pair with --btc-account one higher and "
-                      "that account's xpub: a fresh chain nobody was handed.")
+                      "this machine's ledger knows no deposit, and the "
+                      f"issued-index mark ({_issued_mark_path(key)}) says this "
+                      f"chain has already handed out {_marked} address(es): "
+                      "the ledger was wiped behind a chain in use, and an "
+                      "address it handed out may be unpaid still, with its "
+                      "payment on the way. Nothing was published. Re-pair "
+                      "with --btc-account one higher and that account's "
+                      "xpub: a fresh chain nobody was handed. (Remove the "
+                      "mark instead ONLY if you know no address of this "
+                      "chain is owed a payment -- for one, a machine that "
+                      "died between issuing an address and recording it "
+                      "never sent that address to anyone.)")
     if used and _marked > nxt:
         _once("wake", "btc_index_below_mark")
         nxt = _marked
@@ -1571,6 +1644,24 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                           "address is fresh, so no address was issued: one "
                           "that might have been used already is two people's "
                           "money on one line. Nothing was published.")
+    if _pref is not None:
+        # REISSUED, once the network says it is still fresh: the address
+        # was issued (the mark counts it) and never published (its record
+        # had no slip), so it is the right one for this deposit and leaves
+        # no hole in the chain -- a wallet recovering by gap limit stops
+        # at twenty unused addresses in a row, and a hole per failed
+        # deposit was a way to get there. Used after all: the next index.
+        try:
+            _pa = _btc_address(key, _pref)
+        except Exception as e:                               # noqa: BLE001
+            raise Refused("btc_config_malformed",
+                          "this machine's keyfile names an account xpub the "
+                          f"watch side cannot derive from ({type(e).__name__}); "
+                          "re-pair.")
+        if ask(_pa):
+            if _marked < _pref + 1:
+                _write_issued_mark(key, _pref + 1)
+            return _pref
     if not used:
         # THE LEDGER KNOWS NO INDEX: a fresh pair, or a WIPED ledger behind
         # a used chain (STAGE5_PLAN.md 3.6). The two are told apart by
@@ -2793,6 +2884,24 @@ def run_once(args, deps: dict = None) -> tuple:
                       f"the same one if these two boxes were paired together.")
         agent_say(f"      The doorbell answered at {key['doorbell_url']} with "
                   f"a {len(window)}-byte wake window.")
+        # THE ISSUED-INDEX MARK, TRIED (self-doubt over the fix pass): a
+        # mark this unit cannot write refuses EVERY deposit as
+        # btc_issued_unrecorded, and beside a keyfile under /etc that was
+        # the shipped layout -- read-only under ProtectSystem=strict --
+        # with nothing before the first client saying so. This is the
+        # command the pairing tells the operator to run, so it says.
+        if btc_mode(key):
+            _ok, _what = _mark_probe(key)
+            if _ok:
+                agent_say(f"      Issued-index mark: writable ({_what}).")
+            else:
+                agent_say(f"  [!] Issued-index mark: NOT writable ({_what}). "
+                          "Every deposit would be refused "
+                          "btc_issued_unrecorded under this unit. Its "
+                          "directory must be one the unit may write "
+                          "(StateDirectory=ghostspiral-marks in the shipped "
+                          "unit; the pairing's --mark-dir names it): re-pair "
+                          "with --mark-dir, or fix the unit.")
         # WHERE A SLIP WILL GO, said here because this is the command the
         # pairing tells the operator to run, and because the answer changes
         # SILENTLY under them.
@@ -4080,6 +4189,15 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     _reuse = (_reusable_receive(key, handles, balance=reuse_balance,
                                 owner=_owner)
               if job == "receive_and_quote" else None)
+    # ...AND ITS DEPOSIT INDEX WITH IT (self-doubt over the issued-index
+    # mark): the reused record may carry an index that was ISSUED (the
+    # mark counts it) and never published (no slip). Popping the record
+    # dropped the index from the ledger's knowledge, and a ledger that
+    # knew only that record then contradicted the mark: ledger_wiped, for
+    # the deposit right after a failed one. The index is handed to the
+    # allocator, which reissues it once the network says it is still
+    # fresh -- never a hole in the chain, never a mark ahead of nothing.
+    _reuse_idx = None
     before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
     for i, argv in enumerate(steps):
         env_extra = {}
@@ -4093,7 +4211,11 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 # that dropped it (a failed deposit carries no label), and
                 # two handles naming one address is the collision the
                 # redraw loop exists to prevent.
-                handles.pop(_old_h, None)
+                _old_rec = handles.pop(_old_h, None) or {}
+                _reuse_idx = _old_rec.get("btc_index")
+                if isinstance(_reuse_idx, bool) \
+                        or not isinstance(_reuse_idx, int):
+                    _reuse_idx = None
                 integrity_log("wake", "receive_bundle_reused")
             else:
                 # Identify the new bundle by a DIRECTORY DIFF, not by
@@ -4170,7 +4292,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             if btc_mode(key):
                 try:
                     handles[handle]["btc_index"] = _allocate_btc_index(
-                        key, handles, unused=btc_unused)
+                        key, handles, unused=btc_unused, prefer=_reuse_idx)
+                    # THE LEDGER FOLLOWS THE MARK AT ONCE (self-doubt over
+                    # the fix pass): the record used to be saved only
+                    # after the quote child ran, so a machine that died
+                    # in between (the deadman, a timeout, a power cut)
+                    # left a mark one ahead of an empty ledger, and the
+                    # next deposit was refused ledger_wiped for a wipe
+                    # that never happened. The mark and the ledger now
+                    # diverge only inside one write.
+                    _save_handles(artifact_dir, handles, led["owners"])
                 except Refused:
                     # ...AND THE SLIP PATH GOES WITH IT (fix pass after the
                     # deep read): the record was saved naming a slip file

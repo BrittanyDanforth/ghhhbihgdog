@@ -220,6 +220,18 @@ CapabilityBoundingSet=
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/ghostspiral
+# THE ISSUED-INDEX MARKS' DIRECTORY (/var/lib/ghostspiral-marks): one small
+# file per intake chain saying how many deposit addresses it has handed out,
+# which is what stops a wiped ledger handing an issued, unpaid address to a
+# second client. It must OUTLIVE the artifact dir's wipe and be WRITABLE
+# under ProtectSystem=strict. Beside the keyfile under /etc it was neither
+# writable nor noticed: every deposit was refused btc_issued_unrecorded.
+# StateDirectory= rather than a second ReadWritePaths= entry: systemd
+# creates it at every start, so a fresh box never fails to start over a
+# path that does not exist yet. The pairing tool's --mark-dir default names
+# the same directory; keep them equal.
+StateDirectory=ghostspiral-marks
+StateDirectoryMode=0700
 PrivateTmp=yes
 
 [Install]

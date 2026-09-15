@@ -1755,7 +1755,15 @@ that case destroy the pairing yourself, and re-key both boxes afterwards:
 
 ```bash
 shred -u /etc/gs_wake_thinkpad.key
+shred -u /var/lib/ghostspiral-marks/issued_*.json   # the intake's issued-index marks
 ```
+
+The second line is for a vault that ran the BTC intake: the marks name
+no address and no client, but they say an intake ran here and how many
+addresses it handed out, which is the class of thing the wipe exists to
+remove. `paranoia_mode` leaves them on purpose (they are what stops a
+wiped ledger handing an issued, unpaid address out again); a door coming
+in is the one case where that guard no longer matters.
 
 If you instead keep the keyfile inside a swept root, `paranoia_mode`
 destroys it on every wipe and says so ("DESTROYED the WAKE PAIRING"),
@@ -2377,13 +2385,26 @@ paired to an account used before, refuses every deposit (`ledger_wiped`)
 until it is re-paired with the next account's xpub, because every address
 of the old chain may have been handed to someone whose payment could still
 arrive. The chain alone cannot tell an address that was handed out and
-not yet paid from a fresh one, so the vault also keeps a mark beside its
-keyfile — `<keyfile>.issued`, a chain id and a count, no address and no
-amount — that paranoia_mode leaves in place on purpose: an empty ledger
-the mark contradicts is refused as wiped even when address 0 is still
-unpaid, and a ledger that lost only its newest records is stepped past
-the mark. A deposit is refused rather than issued if that mark cannot be
-written.
+not yet paid from a fresh one, so the vault also keeps a mark — one small
+file per intake chain, `issued_<chain id>.json` under the pairing's
+`--mark-dir` (`/var/lib/ghostspiral-marks`, the agent unit's
+`StateDirectory=`, which systemd creates at every start and which sits
+outside every wipe root and outside the artifact dir), holding a chain id
+(a digest of the chain's first address, so an xpub and a zpub of one
+account are one chain), the account number and a count; no address and
+no amount — that paranoia_mode leaves in place on purpose: an empty
+ledger the mark contradicts is refused as wiped even when address 0 is
+still unpaid, and a ledger that lost only its newest records is stepped
+past the mark. A deposit is refused rather than issued if that mark
+cannot be written; `gs_wake_agent --dry-run` tries the write and says
+what it found, so a unit that cannot write there is caught before the
+first client and not by them. The ledger records an issued index the
+moment it is issued, so a machine that dies between the two leaves the
+mark at most one ahead. Pairing the same chain again prints how many
+addresses it has handed out; keep `--mark-dir` at its default across
+re-pairs, since the marks are what the guard rests on. Destroying the
+pairing (below) shreds the marks too: they say an intake ran here and
+roughly how much of it.
 
 Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
 a slip, so an old doorbell rejects a new record **on length, before any

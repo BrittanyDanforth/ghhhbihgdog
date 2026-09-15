@@ -979,6 +979,23 @@ for _line in open(os.path.join(REPO, "gs_wake_keys")).read().splitlines():
 check("the unit's WorkingDirectory, HOME, ReadWritePaths and the pairing "
       "tool's default artifact dir are ALL the same directory",
       _wd and _wd == _home == _rw == _default_dir)
+# THE ISSUED-INDEX MARKS' DIRECTORY (self-doubt over the fix pass). Beside
+# the keyfile under /etc the mark was unwritable under ProtectSystem=strict:
+# every deposit refused btc_issued_unrecorded, and tests were blind because
+# the mark tests used tempdirs while the unit checks pinned /etc separately.
+# The unit now creates the directory itself (StateDirectory=) and the
+# pairing tool's default names the same one.
+_sd = _val(_agent_u, "StateDirectory")
+_mark_default = None
+for _line in open(os.path.join(REPO, "gs_wake_keys")).read().splitlines():
+    if _line.startswith("MARK_DIR_DEFAULT = "):
+        _mark_default = _line.split("=", 1)[1].strip().strip('"')
+check("the unit creates the marks' directory at every start (StateDirectory=, "
+      "0700), and it is the pairing tool's default --mark-dir",
+      _sd == "ghostspiral-marks"
+      and _val(_agent_u, "StateDirectoryMode") == "0700"
+      and _mark_default == "/var/lib/" + _sd
+      and _mark_default != _wd and not _mark_default.startswith(_wd + "/"))
 
 _cwd0, _home0 = os.getcwd(), os.environ.get("HOME")
 try:
@@ -988,6 +1005,10 @@ try:
     check("...and paranoia_mode's sweep actually reaches it under exactly "
           "that environment — measured, not asserted",
           A.wipe_covers(_wd) and A.wipe_covers(os.path.join(_wd, "x.json")))
+    check("...while the marks' directory beside it is NOT reached under that "
+          "same environment: the marks outlive the wipe on purpose",
+          not A.wipe_covers(_mark_default)
+          and not A.wipe_covers(os.path.join(_mark_default, "issued_x.json")))
     os.chdir("/")
     os.environ["HOME"] = "/root"
     check("...while under systemd's OWN defaults (cwd=/, HOME=/root) it does "
@@ -4500,6 +4521,38 @@ _BTC_OK = ["--allow-btc-forward", "--btc-xpub", _BTC_XPUB_OK,
            "--deposit-in-chat", "--op-return-max-bytes", "140"]
 check("pairing/btc: a complete BTC intake passes validation",
       _pairs_btc(_BTC_OK) is None)
+# THE MARKS' DIRECTORY IS NAMED AT PAIRING (self-doubt over the fix pass):
+# written into the keyfile, absolute like the artifact dir, and a chain the
+# marks already know is said out loud at the one moment the operator is
+# present, not found at the first client.
+_mk_pair = tempfile.mkdtemp(prefix="gs_markdir_")
+check("pairing/btc: --mark-dir must be absolute, and an absolute one passes",
+      "--mark-dir" in (_pairs_btc(_BTC_OK + ["--mark-dir", "marks"]) or "")
+      and _pairs_btc(_BTC_OK + ["--mark-dir", _mk_pair]) is None)
+_ks_src = open(os.path.join(REPO, "gs_wake_keys"), encoding="utf-8").read()
+check("...the keyfile carries it (btc_issued_mark_dir), written always",
+      '"btc_issued_mark_dir": str(args.mark_dir)' in _ks_src)
+_cid_ok = __import__("gs_btc_watch").chain_id(_BTC_XPUB_OK, "main")
+Path(_mk_pair, f"issued_{_cid_ok}.json").write_text(json.dumps(
+    {"account": 0, "xpub_id": _cid_ok, "issued": 3}))
+_note = io.StringIO()
+with contextlib.redirect_stdout(_note):
+    _pairs_btc(_BTC_OK + ["--mark-dir", _mk_pair])
+check("...and pairing a chain the marks already know says so: three "
+      "addresses handed out, the ledger must still know them, retire by "
+      "pairing the next account",
+      "3 deposit address(es)" in _note.getvalue()
+      and "ledger_wiped" in _note.getvalue()
+      and "--btc-account" in _note.getvalue())
+_note2 = io.StringIO()
+with contextlib.redirect_stdout(_note2):
+    _pairs_btc(_BTC_OK + ["--mark-dir", tempfile.mkdtemp(prefix="gs_mk0_")])
+    _pairs_btc(_BTC_OK + ["--mark-dir", _mk_pair, "--btc-account", "1",
+                          "--btc-xpub", _BTC_XPUB_OK])
+check("...silent when there is no mark; and a mark is read by CHAIN, not by "
+      "the account number typed (the same xpub under another --btc-account "
+      "is the same chain, and still said)",
+      _note2.getvalue().count("deposit address(es)") == 1)
 # AN INTAKE PAIR THAT COULD NEVER FORWARD. The default OP_RETURN policy is
 # the 80-byte standard, and no swap memo fits it: the documented recipe
 # paired an intake that refused every forward with memo_overflow, for
@@ -5797,7 +5850,8 @@ def _btc_env(prefix, handles=None):
 
 
 def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
-                  job_id="job-b", seed=_FWD_MNEMONIC, passphrase=None):
+                  job_id="job-b", seed=_FWD_MNEMONIC, passphrase=None,
+                  reuse=1):
     """(out, refused_code, addresses_asked, kinds). The seed rides in the
     environment as the unit's EnvironmentFile puts it there: the deposit
     proves it against the pair's xpub before it issues an address, so the
@@ -5823,7 +5877,7 @@ def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
             out = A._dispatch("receive_and_quote",
                               {"amount_sat": amount, "owner": OWNER},
                               key or _BK, d, handle, runner, job_id,
-                              reuse_balance=lambda k, a, s: 1,
+                              reuse_balance=lambda k, a, s: reuse,
                               btc_unused=ask)
         code = None
     except A.Refused as e:
@@ -5993,7 +6047,10 @@ except A.Refused as _e:
 check("a mark that exists and cannot be read is not 'no mark': refused, "
       "nothing issued",
       _uk == "btc_issued_mark_unreadable")
-_MK3 = {**_MK, "btc_issued_mark": str(_mk_dir / "no_such_dir" / "k.issued")}
+# A PLACE THAT CANNOT BE MADE: a directory the agent may create is created
+# (0700 -- a dev box's, a hand run's); one under /proc cannot be, by anyone,
+# and reads as "no mark" first (ENOENT), so it is the WRITE that refuses.
+_MK3 = {**_MK, "btc_issued_mark": "/proc/gs_wake_no_such_dir/k.issued"}
 try:
     A._allocate_btc_index(_MK3, {}, unused=_fresh_mk)
     _nk = None
@@ -6002,6 +6059,152 @@ except A.Refused as _e:
 check("a mark that cannot be WRITTEN refuses the deposit: nothing issued "
       "that the record does not hold",
       _nk == "btc_issued_unrecorded")
+_MK4 = {**_MK, "btc_issued_mark": str(_mk_dir / "made" / "deeper" / "k.issued")}
+check("...while a directory that does not exist yet is made, owner-only, "
+      "and the mark written there (the unit's StateDirectory= exists at "
+      "every start; a dev box's or a hand run's does not yet)",
+      A._allocate_btc_index(_MK4, {}, unused=_fresh_mk) == 0
+      and (_mk_dir / "made" / "deeper" / "k.issued").is_file()
+      and oct(os.stat(_mk_dir / "made" / "deeper").st_mode)[-3:] == "700"
+      and oct(os.stat(_mk_dir / "made").st_mode)[-3:] == "700")
+# SELF-DOUBT OVER THAT FIX: the chain id, the mark's count, the ledger's
+# lag, and the probe a dry run makes.
+_xpub1 = _btx_s.account_from_mnemonic(_FWD_MNEMONIC, "main", "", 1) \
+    .to_public(version=__import__(
+        "embit.networks", fromlist=["NETWORKS"]).NETWORKS["main"]["xpub"]) \
+    .to_base58()
+_W_ = __import__("gs_btc_watch")
+check("the chain id is a digest of the chain's FIRST ADDRESS, not the xpub's "
+      "text: an xpub and a zpub of one account are ONE chain, another "
+      "account another; sixteen hex characters that name no address",
+      _xpub1 != _zpub1 and _xpub1.startswith("xpub")
+      and A._xpub_id({**_MK, "btc_account_xpub": _xpub1}) == A._xpub_id(_MK)
+      == _W_.chain_id(_zpub1, "main") == _W_.chain_id(_xpub1, "main")
+      and A._xpub_id(_MK) != A._xpub_id({**_MK, "btc_account_xpub": _ZPUB})
+      and re.fullmatch(r"[0-9a-f]{16}", A._xpub_id(_MK))
+      and _addr1_0 not in A._xpub_id(_MK))
+try:
+    _W_.chain_id("xpubjunk", "main")
+    _cj = None
+except _W_.BtcWatchError:
+    _cj = "refused"
+check("...an xpub that derives nothing: chain_id refuses, and the agent's id "
+      "still answers (a digest of the text) rather than raising mid-deposit",
+      _cj == "refused"
+      and re.fullmatch(r"[0-9a-f]{16}",
+                       A._xpub_id({**_MK, "btc_account_xpub": "xpubjunk"})))
+for _bad in ("three", True, 2 ** 40, -1, None, 1.5):
+    _mk_file.write_text(json.dumps({"account": 1, "xpub_id": A._xpub_id(_MK),
+                                    "issued": _bad}))
+    try:
+        A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
+        _bk = None
+    except A.Refused as _e:
+        _bk = _e.code
+    except Exception as _e:                                  # noqa: BLE001
+        _bk = "crashed:" + type(_e).__name__
+    check(f"a mark whose count is {_bad!r} is refused as unreadable (named), "
+          "never a crash and never a blamed xpub",
+          _bk == "btc_issued_mark_unreadable")
+_mk_file.write_text(json.dumps({"account": 1, "xpub_id": A._xpub_id(_MK),
+                                "issued": 0}))
+check("...a count of zero is a mark that says nothing: index 0 issued",
+      A._allocate_btc_index(_MK, {}, unused=_fresh_mk) == 0)
+# THE LEDGER FOLLOWS THE MARK AT ONCE. The record was saved only after the
+# quote child ran: a machine that died in between left a mark one ahead of
+# an empty ledger, and the next deposit was refused ledger_wiped for a wipe
+# that never happened.
+_dL, _runsL, _runL = _btc_env("btclag_")
+_mk_lag = Path(tempfile.mkdtemp(prefix="issuedlag_")) / "k.issued"
+
+
+def _runL_dies(argv, env_extra, budget_s):
+    if "thor_swap_preparer" in " ".join(argv):
+        raise RuntimeError("the machine died here")
+    return _runL(argv, env_extra, budget_s)
+
+
+try:
+    _btc_dispatch(_dL, _runL_dies, "BA71", True,
+                  key={**_MK, "btc_issued_mark": str(_mk_lag)})
+    _lag = "no raise"
+except RuntimeError:
+    _lag = "died"
+check("the machine dies during the quote, AFTER the index was issued: the "
+      "ledger already carries the index (saved the moment it was issued) "
+      "beside a mark of one, so the next deposit is not refused as wiped",
+      _lag == "died" and _rec4(_dL, "BA71").get("btc_index") == 0
+      and json.loads(_mk_lag.read_text()).get("issued") == 1)
+_o, _c, _asked, _kinds = _btc_dispatch(_dL, _runL, "BA72", True,
+                                       key={**_MK, "btc_issued_mark":
+                                            str(_mk_lag)})
+check("...driven: the next deposit takes index 1, refused by nothing",
+      _c is None and _rec4(_dL, "BA72").get("btc_index") == 1
+      and json.loads(_mk_lag.read_text()).get("issued") == 2)
+# A NEVER-PUBLISHED INDEX IS REISSUED, NOT LOST. The deposit after a
+# failed one reuses the failed one's receive bundle (_reusable_receive)
+# and popped its record -- and with it the only index the ledger knew, so
+# the mark contradicted an empty ledger: ledger_wiped, for the client
+# right after a failure. The index rides over and, fresh on the network
+# still, is handed out again: no hole in the chain either (a wallet
+# recovering by gap limit stops at twenty unused addresses in a row).
+_mk_re = Path(tempfile.mkdtemp(prefix="issuedre_")) / "k.issued"
+_KR = {**_MK, "btc_issued_mark": str(_mk_re)}
+check("prefer: an issued, unpublished index handed back is reissued once "
+      "the network says it is fresh, the mark unchanged and the empty "
+      "ledger NOT read as wiped",
+      A._allocate_btc_index(_KR, {}, unused=_fresh_mk) == 0
+      and A._allocate_btc_index(_KR, {}, unused=_fresh_mk, prefer=0) == 0
+      and json.loads(_mk_re.read_text()).get("issued") == 1)
+_asked_re = []
+check("...used on the network after all, the next index is issued instead "
+      "and the mark follows; junk in prefer is ignored",
+      A._allocate_btc_index(_KR, {}, prefer=0,
+                            unused=lambda a: _asked_re.append(a)
+                            or a != _addr1_0) == 1
+      and json.loads(_mk_re.read_text()).get("issued") == 2
+      and _asked_re[0] == _addr1_0
+      and A._allocate_btc_index(_KR, {"H1": {"btc_index": 1}},
+                                unused=_fresh_mk, prefer="0") == 2)
+_dR, _runsR, _runR = _btc_env("btcreuse_")
+_mk_rd = Path(tempfile.mkdtemp(prefix="issuedrd_")) / "k.issued"
+
+
+def _runR_dies(argv, env_extra, budget_s):
+    if "thor_swap_preparer" in " ".join(argv):
+        raise RuntimeError("the machine died here")
+    return _runR(argv, env_extra, budget_s)
+
+
+try:
+    _btc_dispatch(_dR, _runR_dies, "BA73", True,
+                  key={**_MK, "btc_issued_mark": str(_mk_rd)})
+except RuntimeError:
+    pass
+_o, _c, _asked, _kinds = _btc_dispatch(_dR, _runR, "BA74", True,
+                                       key={**_MK, "btc_issued_mark":
+                                            str(_mk_rd)}, reuse=0)
+check("driven: the deposit after one that died reuses its bundle AND its "
+      "index -- index 0 again, asked of the network again, the mark still "
+      "one, the old record gone, and no ledger_wiped for the client",
+      _c is None and ("receive_bundle_reused" in _kinds)
+      and _rec4(_dR, "BA74").get("btc_index") == 0
+      and _rec4(_dR, "BA73") == {}
+      and json.loads(_mk_rd.read_text()).get("issued") == 1
+      and _asked.count(_addr1_0) >= 1 and "ledger_wiped" not in _kinds)
+check("the dry run's probe: writable where the mark's directory exists, "
+      "named and not writable where it does not, and 'no mark named' for a "
+      "key that names none -- never the mark itself written",
+      A._mark_probe({**_MK, "btc_issued_mark": str(_mk_lag)})
+      == (True, str(_mk_lag.parent))
+      and json.loads(_mk_lag.read_text()).get("issued") == 2
+      and not any(p.name.startswith("k.issued.probe")
+                  for p in _mk_lag.parent.iterdir())
+      and A._mark_probe(_MK3)[0] is False
+      and "Error" in A._mark_probe(_MK3)[1]
+      and "/proc/gs_wake_no_such_dir" in A._mark_probe(_MK3)[1]
+      and A._mark_probe({**_MK, "btc_issued_mark": ""})
+      == (False, "no mark named"))
 check("a hand-built key that names no mark allocates as before, and "
       "load_key names one for every real keyfile, beside it",
       A._allocate_btc_index({**_MK, "btc_issued_mark": None}, {},

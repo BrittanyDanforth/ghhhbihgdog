@@ -294,6 +294,18 @@ def summarize(utxos, tip, min_conf):
             "utxos": out}
 
 
+def chain_id(xpub, network="main"):
+    """A short, public-safe name for the CHAIN an account xpub derives: a
+    digest of its FIRST receiving address, never of the xpub's text. An
+    xpub and a zpub of one account derive the same addresses and are one
+    chain; keyed on the text, the vault's issued-index mark read a re-pair
+    that pasted the other encoding as a fresh chain and handed address 0
+    out again. Sixteen hex characters: names no address, no amount, no
+    client. Raises BtcWatchError for an xpub that derives nothing."""
+    a0 = derive_receive_address(xpub, 0, network)
+    return hashlib.sha256(("addr0:" + str(a0)).encode()).hexdigest()[:16]
+
+
 def classify(confirmed_sat, unconfirmed_sat, settled_sat):
     """One of the three states from the settled picture. Pure."""
     if settled_sat > 0:
