@@ -730,7 +730,11 @@ dust constant, OP_RETURN builder or coin selection.
   4 (a changelog, not a check — an old vault refuses the unknown name);
   `gs_wake_agent`: argv composed from the keyfile + the ledger's `bundle`
   and `btc_index`, per-job spending switch (`allow_btc_forward`, never
-  `allow_withdraw`), owner wall, spent → `already_moved`, no index →
+  `allow_withdraw`), owner wall, spent → `already_moved` (since the MED
+  pass after the deep read only for a record with no index: paid out is
+  the XMR side's word, an intake address can be paid after it -- a
+  partial swap's late refund, a client paying again -- so its forward
+  runs and `_retire_files` keeps its plan chain), no index →
   `no_btc_deposit`, seed injected into that one step's environment
   (`btc_seed_unset` otherwise), the plan named for the deposit's handle;
   `gs_wake_keys` pairing flags (`--btc-xpub`, `--btc-electrum`,

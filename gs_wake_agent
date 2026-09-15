@@ -3691,10 +3691,24 @@ def _retire_files(rec: dict) -> None:
     address, the memo naming the receive address in full, the amounts and the
     account -- a who-sent-what line for every client, on a disk that
     auto-unlocks, until a hand-run wipe that would also end every other
-    client's open run. Retired the moment the money has left instead."""
+    client's open run. Retired the moment the money has left instead.
+
+    NOT THE FORWARD PLAN OF AN INTAKE RECORD (the MED pass after the deep
+    read): the plan chain is what a later reconciliation reads to tell a
+    refund from a stranger's payment, to leave out what a listed forward
+    of ours consumed, and to know the outpoints it must never sign twice
+    -- and money can reach the host's own address after the withdrawal
+    (the forward branch of _dispatch says how). Shredded here, the next
+    return to the address met a chain with no plan and was refused for
+    ever. It stays until the hand-run wipe, which covers every
+    btc_forward_*.json; a record with no deposit address of the host's
+    (quoted for the client to pay ThorChain directly) has no chain to
+    keep and its plan goes with the rest."""
     for _k in ("slip", "bundle", "forward_plan"):
         _p = rec.get(_k)
         if not _p:
+            continue
+        if _k == "forward_plan" and rec.get("btc_index") is not None:
             continue
         try:
             if Path(_p).is_file():
@@ -3998,7 +4012,18 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             raise Refused("handle_not_yours",
                           f"handle {params['handle']} was recorded for a "
                           f"different owner.")
-        if rec.get("spent") is True:
+        # PAID OUT IS THE XMR SIDE'S WORD, NOT THE ADDRESS'S (the MED pass
+        # after the deep read). `spent` says the record's subaddress was
+        # withdrawn. On a record quoted for the client to pay ThorChain
+        # directly that is the end of it. On an intake record the deposit
+        # address is the host's own, and money can reach it AFTER the
+        # withdrawal: the refund of a streaming swap that filled part of
+        # the way and paid out (the part that did swap was withdrawn, the
+        # rest comes back later), or a client paying the address they
+        # were shown once more. Both need the reconciliation the forward
+        # runs, which this refusal denied for ever -- and the plan chain
+        # it reconciles by, which _retire_files keeps for such a record.
+        if rec.get("spent") is True and rec.get("btc_index") is None:
             raise Refused("already_moved",
                           f"handle {params['handle']} has already been paid "
                           "out; there is nothing left to forward.")

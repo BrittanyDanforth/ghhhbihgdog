@@ -6065,6 +6065,22 @@ MUTATIONS = [
   '        try:\n'
   '            out.add((str(r.get("txid") or "").lower(), int(r.get("vout"))))',
   ['test_btc_forwarder']),
+ # MED PASS: paid out is the XMR side's word; an intake record's address
+ # can still be paid, and its plan chain must be there to reconcile by.
+ ("a paid-out intake record's forward is refused already_moved",
+  'gs_wake_agent',
+  '        if rec.get("spent") is True and rec.get("btc_index") is None:\n'
+  '            raise Refused("already_moved",',
+  '        if rec.get("spent") is True:\n'
+  '            raise Refused("already_moved",',
+  ['test_wake_agent']),
+ ("a paid-out intake record's plan chain is shredded with its slip",
+  'gs_wake_agent',
+  '        if _k == "forward_plan" and rec.get("btc_index") is not None:\n'
+  '            continue',
+  '        if False:\n'
+  '            continue',
+  ['test_wake_agent']),
 ]
 
 

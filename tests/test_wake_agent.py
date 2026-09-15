@@ -4902,7 +4902,17 @@ _o, _e, _ran = _fwd_run({k: v for k, v in _FWD_REC.items()
 check("...and so is one from before the field existed",
       _o is None and getattr(_e, "code", None) == "no_btc_deposit")
 _o, _e, _ran = _fwd_run({**_FWD_REC, "spent": True}, _FWD_KEY)
-check("a handle already paid out is refused already_moved",
+check("an INTAKE handle whose subaddress was paid out is NOT refused "
+      "already_moved: paid out is the XMR side's word, and money can reach "
+      "the host's own address after it (a partial swap's late refund, a "
+      "client paying the address again), so the forward runs (the MED pass "
+      "after the deep read)",
+      getattr(_e, "code", None) != "already_moved" and len(_ran) == 1)
+_o, _e, _ran = _fwd_run({**_FWD_REC, "btc_index": None, "spent": True},
+                        _FWD_KEY)
+check("...a paid-out handle with NO deposit address of the host's (a "
+      "client-paid quote) is still refused already_moved, before "
+      "no_btc_deposit",
       _o is None and getattr(_e, "code", None) == "already_moved" and _ran == [])
 _o, _e, _ran = _fwd_run({**_FWD_REC, "owner": "f" * 16}, _FWD_KEY)
 check("ANOTHER OWNER'S handle is refused handle_not_yours at the vault, "
@@ -5806,8 +5816,20 @@ check("...and the M3 reply carries NO slip and NO plain for a done forward "
 _pf = _dd / "btc_forward_A3F1.json"
 _pf.write_text("{}")
 A._retire_files({"forward_plan": str(_pf)})
-check("_retire_files takes the forward plan with the handle's other files",
+check("_retire_files takes the forward plan with the handle's other files "
+      "for a record with no deposit address of the host's",
       not _pf.exists())
+_pf.write_text("{}")
+_sl, _bd = _dd / "thor_pairs_A3F1.json", _dd / "wallet_fwd_A3F1.json"
+_sl.write_text("{}")
+_bd.write_text("{}")
+A._retire_files({"forward_plan": str(_pf), "slip": str(_sl),
+                 "bundle": str(_bd), "btc_index": 3})
+check("...but an INTAKE record's forward plan STAYS when its slip and "
+      "bundle go: the chain is what a later return to the host's own "
+      "address is reconciled by (the MED pass after the deep read)",
+      _pf.exists() and not _sl.exists() and not _bd.exists())
+_pf.unlink()
 _o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
 check("a handle naming no single bundle has no destination: "
       "handle_not_forwardable", _o is None

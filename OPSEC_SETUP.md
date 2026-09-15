@@ -1321,7 +1321,14 @@ records, and what the chat is told:
 - **A paid-out deposit leaves no slip behind.** Its slip (the deposit address,
   the memo naming the receive address in full, the amounts) and its bundle
   are shredded the moment its withdrawal reports done; the ledger keeps the
-  record, its spent flag and two small integers. The job log is truncated at
+  record, its spent flag and two small integers. An intake deposit's forward
+  plan chain stays, and its forward still runs after the pay-out: paid out
+  is the XMR side's word, and money can reach the host's own address after
+  it — the late refund of a streaming swap that filled part of the way, or
+  a client paying the address they were shown once more — which only the
+  reconciliation that reads the chain can tell from a stranger's payment
+  and send on. The chain goes with the wipe (`btc_forward_*.json` is in
+  its patterns). The job log is truncated at
   every boot, so it holds the run in progress and no more — read it before
   the next wake if a run needs looking at. The vault's job ledger keeps ids
   and ten-minute buckets, not job words.
