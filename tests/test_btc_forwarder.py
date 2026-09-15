@@ -73,6 +73,11 @@ def load(name):
 
 
 F = load("btc_forwarder")
+# THE CHAIN-SIDE JITTER (fix pass after the deep read) is pinned to nothing
+# here, so every figure below is exact; the jitter itself is tested where
+# it is named, at the end.
+F.FEE_JITTER = lambda bound: 0
+F.LIMIT_JITTER = lambda cap: 0
 import gs_btc_tx as T                                        # noqa: E402
 import gs_btc_watch as W                                     # noqa: E402
 import gs_common as C                                        # noqa: E402
@@ -2632,6 +2637,68 @@ check("five dust outputs with a forged REFUND memo: five claims recorded, "
       sum(1 for k in _nS.kinds if k == ("forward", "refund_claimed")) == 1
       and len(json.load(open(F._plan_chain(_ofS)[-1])).get("refunds") or [])
       == 5)
+
+# KERCKHOFFS ON THE CHAIN (fix pass after the deep read). The fee was
+# EXACTLY the vsize bound times the rate, and the memo's limit EXACTLY 99
+# times an integer: two public formulas that picked this host's forwards
+# out of every ThorChain inbound with public data alone, one false
+# positive in ~27,000. Each now carries a little randomness.
+print("\n== KERCKHOFFS ON THE CHAIN: the fee and the limit are not formulas ==")
+_draws = {F._fee_jitter(274) for _ in range(400)}
+check("the default fee jitter is 0..bound-1 and not constant (a bound of 1 "
+      "draws 0)",
+      all(0 <= d < 274 for d in _draws) and len(_draws) > 20
+      and F._fee_jitter(1) == 0)
+_ldraws = {F._limit_jitter(5000) for _ in range(400)}
+check("the default limit jitter is 0..cap and not constant (a cap of 0 "
+      "draws 0)",
+      all(0 <= d <= 5000 for d in _ldraws) and len(_ldraws) > 20
+      and F._limit_jitter(0) == 0)
+_srcF = open(F.__file__, encoding="utf-8").read()
+check("both draw from the system CSPRNG (secrets), never the random module",
+      _srcF.count("secrets.randbelow(") == 2 and "import random" not in _srcF)
+_p0, _of0, _ = _first_send()                          # jitter pinned to 0
+F.FEE_JITTER = lambda bound: 7
+_p7, _of7, _hx7 = _first_send()
+check("a forward with a fee jitter of 7 pays bound*rate + 7 sat -- the SIGNED "
+      "transaction's fee (fee_mismatch still enforced) -- so the fee is not "
+      "the bound times anything",
+      _p7["fee_sat"] == _p0["fee_sat"] + 7
+      and _p7["fee_sat"] % _p7["vsize_bound"] == 7
+      and _p7["send_sat"] == _p0["send_sat"] - 7)
+F.FEE_JITTER = lambda bound: 10 ** 9
+_fee0 = _p0["fee_sat"]
+_cF, _oF, _pF, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                   "value": 20000 + _fee0,
+                                   "confirmations": 5}]),
+                       "--min-send-sat", "20000")
+check("AT THE EXACT FLOOR (settled = the smallest forward + the fee) there "
+      "is no room and no jitter: the forward is signed at the smallest "
+      "amount, never refused below_minimum by a satoshi of randomness",
+      _cF == 0 and _pF["fee_sat"] == _fee0 and _pF["send_sat"] == 20000)
+_cG, _oG, _pG, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                   "value": 200000, "confirmations": 5}]))
+check("...and the jitter never takes the fee past the fee fraction: at "
+      "200,000 sat a huge draw stops at exactly 20%",
+      _cG == 0 and _pG["fee_sat"] == 40000 and _pG["send_sat"] == 160000)
+F.FEE_JITTER = lambda bound: 0
+F.LIMIT_JITTER = lambda cap: 1
+_code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
+check("a limit jitter of 1 writes the floor LESS ONE into the memo: no "
+      "longer 99 times anything",
+      _code == 0 and _plan["memo_limit_set"] is True
+      and _plan["memo_limit_base_units"] == _floor_of(_plan) - 1
+      and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan) - 1}/1/0"
+      and _floor_of(_plan) % 99 == 0
+      and (_floor_of(_plan) - 1) % 99 != 0)
+F.LIMIT_JITTER = lambda cap: cap
+_code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
+check("the largest draw takes at most LIMIT_JITTER_MAX base units and 1% "
+      "of the floor",
+      _code == 0 and _plan["memo_limit_base_units"]
+      == _floor_of(_plan) - min(F.LIMIT_JITTER_MAX, _floor_of(_plan) // 100)
+      and _plan["memo_limit_base_units"] > 0)
+F.LIMIT_JITTER = lambda cap: 0
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

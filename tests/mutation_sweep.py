@@ -5655,6 +5655,33 @@ MUTATIONS = [
   '                if False:\n'
   '                    continue',
   ['test_wake_agent']),
+ ('the fee is the bound times the rate exactly (a formula on the chain)',
+  'btc_forwarder',
+  '        fee_sat += max(0, min(int(FEE_JITTER(vsize_bound)), _room))',
+  '        fee_sat += 0',
+  ['test_btc_forwarder']),
+ ('the fee jitter can push a floor deposit into a refusal',
+  'btc_forwarder',
+  '        _room = min(settled_sat - fee_sat - int(args.min_send_sat),\n'
+  '                    int(settled_sat * MAX_FEE_FRACTION) - fee_sat)',
+  '        _room = 10 ** 9',
+  ['test_btc_forwarder']),
+ ("the memo's limit is 99 times an integer (a formula on the chain)",
+  'btc_forwarder',
+  '    floor = max(1, floor - int(LIMIT_JITTER(min(LIMIT_JITTER_MAX,\n'
+  '                                                floor // 100))))',
+  '    floor = max(1, floor - 0)',
+  ['test_btc_forwarder']),
+ ('the limit jitter is not capped at a hundredth of the floor',
+  'btc_forwarder',
+  '    floor = max(1, floor - int(LIMIT_JITTER(min(LIMIT_JITTER_MAX,\n'
+  '                                                floor // 100))))',
+  '    floor = max(1, floor - int(LIMIT_JITTER(floor)))',
+  ['test_btc_forwarder']),
+ ('the default fee jitter is constant', 'btc_forwarder',
+  '    return secrets.randbelow(max(1, int(bound)))',
+  '    return 0',
+  ['test_btc_forwarder']),
 ]
 
 

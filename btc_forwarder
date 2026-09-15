@@ -104,6 +104,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from decimal import Decimal
@@ -149,6 +150,32 @@ FORWARD_MIN_SAT = btx.FORWARD_MIN_SAT
 #: client's money, and the right answer is to wait for cheaper blocks, not
 #: to burn it.
 MAX_FEE_FRACTION = btx.FORWARD_MAX_FEE_FRACTION
+#: KERCKHOFFS, ON THE CHAIN (fix pass after the deep read). The fee this
+#: tool paid was EXACTLY the vsize bound times an integer rate, and the
+#: limit it wrote into the memo was EXACTLY 99 times an integer (six
+#: decimals of XMR, times 1e8, times 0.99): two public formulas that
+#: together picked this host's forwards out of every ThorChain inbound
+#: with public data alone -- one false positive in ~27,000 -- and through
+#: them every client's deposit address. Each now carries a little
+#: randomness from the system's CSPRNG: the fee is bound*rate plus
+#: 0..bound-1 sat (never a satoshi the deposit cannot bear), the limit is
+#: the floor less 0..LIMIT_JITTER_MAX base units (never more than 1% of
+#: it, never below 1). Both are injectable so the tests can pin them.
+LIMIT_JITTER_MAX = 5000
+
+
+def _fee_jitter(bound):
+    """0..bound-1 satoshis, so the fee modulo the bound is uniform."""
+    return secrets.randbelow(max(1, int(bound)))
+
+
+def _limit_jitter(cap):
+    """0..cap base units."""
+    return secrets.randbelow(max(0, int(cap)) + 1)
+
+
+FEE_JITTER = _fee_jitter
+LIMIT_JITTER = _limit_jitter
 #: The slippage the arrival watcher accepts, mirrored from
 #: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
 ARRIVAL_TOLERANCE = Decimal("0.10")
@@ -465,6 +492,13 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
         raise Refused("memo_bad_limit",
                       "the worst-case arrival rounds to nothing in base "
                       "units; no floor can be written")
+    # ...LESS A LITTLE (LIMIT_JITTER), so the limit written is not 99
+    # times anything: at most LIMIT_JITTER_MAX base units and 1% of the
+    # floor, never below 1. The floor is a rounding margin under the
+    # worst case the watcher already accepts; a hundredth of it less is
+    # still that.
+    floor = max(1, floor - int(LIMIT_JITTER(min(LIMIT_JITTER_MAX,
+                                                floor // 100))))
     ceiling = int(expected_xmr * Decimal(10 ** 8))
     if quoted > ceiling:
         raise Refused("memo_bad_limit",
@@ -2019,6 +2053,14 @@ def main(argv=None):
         n_inputs = len(chosen)
         vsize_bound, fee_sat = size_the_fee(n_inputs,
                                             args.op_return_max_bytes, rate)
+        # ...PLUS 0..bound-1 sat (FEE_JITTER), so the fee is not the bound
+        # times anything -- and never a satoshi the deposit cannot bear:
+        # capped by the room above the smallest forward and under the
+        # fee fraction, so at the exact floor there is no jitter rather
+        # than a refusal the floor said could not happen.
+        _room = min(settled_sat - fee_sat - int(args.min_send_sat),
+                    int(settled_sat * MAX_FEE_FRACTION) - fee_sat)
+        fee_sat += max(0, min(int(FEE_JITTER(vsize_bound)), _room))
         send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
     except Refused as e:
         # A REFUSAL ABOUT TODAY'S FEE IS A WORD, NOT A DEAD END (STAGE5_PLAN.md
