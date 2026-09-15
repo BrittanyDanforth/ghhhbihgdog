@@ -2302,9 +2302,11 @@ a bump or a re-sign that carried returned money under the bound counts
 toward it. After `kept`, the client's taps ask the swap side (the money
 that DID swap is what they are waiting for), and once per `--btc-recheck`
 window a tap asks the forward again. Move the money by hand at the vault
-(the job log names the outputs; a spend of exactly those is recognised as
-your hand, `kept_moved`, not as a leaked seed), or re-pair with a higher
-bound and let the next window's tap send it on. A replacement the vault
+(the plan file names the outputs under `returned_kept`; a spend of exactly
+those is recognised as your hand, `kept_moved`, and written on the plan as
+`returned_moved` so every later run recognises it too, not as a leaked
+seed), or re-pair with a higher bound and let the next window's tap send
+it on. A replacement the vault
 would not pay for today is `delayed` like a
 first forward, and the original stands. A spend of the address that is not
 the vault's own fails the run with `foreign_spend` on the chain: only a

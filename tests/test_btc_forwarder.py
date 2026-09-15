@@ -2563,6 +2563,27 @@ check("a later spend of EXACTLY the kept outputs by a transaction this tool "
       _c == F.EXIT_OK and ("forward", "kept_moved") in _nM2.kinds
       and ("forward", "foreign_spend") not in _nM2.kinds
       and "returned_kept" not in _p)
+check("...and the move is RECORDED on the plan (returned_moved names the "
+      "outpoints), since the kept mark it matched is now gone",
+      _p.get("returned_moved") == [[_HK3, 0]])
+# THE RUN AFTER: the same spend is still in the history and the kept mark
+# is cleared. This used to be foreign_spend -- "the seed has leaked" --
+# on every later reconciliation of the deposit, for ever, before any
+# forward logic, so nothing that came to the address later could move.
+_nM2b = Net(utxos=[], spends=_lM + [_lM3, _moved], fee=10)
+_c, _o, _p, _ = _reconcile(_nM2b, _ofM)
+check("the NEXT reconciliation, with the same hand move in the history "
+      "and no kept mark left, is still the operator's hand: done, "
+      "kept_moved, no seed-leak alarm, the record kept as it was",
+      _c == F.EXIT_OK and ("forward", "kept_moved") in _nM2b.kinds
+      and ("forward", "foreign_spend") not in _nM2b.kinds
+      and _p.get("returned_moved") == [[_HK3, 0]])
+_nM2c = Net(utxos=[], spends=_lM + [_lM3, _moved], fee=10)
+_c, _o, _p, _ = _reconcile(_nM2c, _ofM)
+check("...and the one after that (the record is not rewritten when it "
+      "already names the spend)",
+      _c == F.EXIT_OK and ("forward", "kept_moved") in _nM2c.kinds
+      and ("forward", "foreign_spend") not in _nM2c.kinds)
 _moved2 = {**_spend_tx(None, send=120000),
            "inputs": [{"tx_hash": _HK3, "vout": 0, "value": 130000},
                       {"tx_hash": _H2, "vout": 1, "value": 140000}]}
@@ -2570,6 +2591,33 @@ _nM3 = Net(utxos=[], spends=_lM + [_moved2], fee=10)
 _c, _o, _p, _ = _reconcile(_nM3, _ofM)
 check("...a spend that takes MORE than the kept outputs is still the alarm",
       _c == F.EXIT_FAILED and ("forward", "foreign_spend") in _nM3.kinds)
+# AT THE BOUND, A BUMP DOES NOT LOSE THE KEPT MARK. The listed branch
+# cleared the mark before the bump check, and a bump never rewrites it,
+# so the replacement's chain carried no mark: the agent said `sent`
+# about money that sat kept on the address, and a hand move of it in
+# that window was the seed-leak alarm.
+_ofB, _lB, _pB3, _hxB3 = _two_returns()
+_lB3u = _listed(_pB3, _hxB3, height=0,
+                inputs=[{"tx_hash": _H2, "vout": 1, "value": 140000}])
+_nB1 = Net(utxos=_RET3, spends=_lB + [_lB3u], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB1, _ofB)
+check("(setup) at the bound, the current forward in the mempool at today's "
+      "rate: the return is kept and the mark names it",
+      _c == F.EXIT_OK and _p.get("reconcile_reason") == "returned"
+      and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
+_age_plan(_ofB, 3 * 3600)
+_nB2 = Net(utxos=_RET3, spends=_lB + [_lB3u], fee=30, submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB2, _ofB)
+_chainB = [json.load(open(_f)) for _f in F._plan_chain(_ofB)]
+check("...fees rise and the forward is BUMPED: the replacement leaves the "
+      "kept output out, and the kept mark SURVIVES on the rotated plan, so "
+      "the agent still says kept and a hand move is still recognised",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "bumped"
+      and all((i["tx_hash"], i["vout"]) != (_HK3, 0) for i in _p["inputs"])
+      and any((q.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]]
+              for q in _chainB))
 # A STRANGER'S CLAIMS WRITE ONE LINE, not one per output.
 _pS, _ofS, _hxS = _first_send()
 _nS = Net(utxos=[{"tx_hash": _HRF, "vout": i, "value": 600,

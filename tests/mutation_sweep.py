@@ -5582,6 +5582,30 @@ MUTATIONS = [
   '            if _amt < self.deposit_min_sat:',
   '            if False:',
   ['test_telegram_pager']),
+ # The fix pass after the deep read.
+ ('a hand move of the kept outputs is not recorded (the run after cries '
+  'seed leak)', 'btc_forwarder',
+  '            if not _ins <= _seen_moved:\n'
+  '                plan["returned_moved"] = sorted(',
+  '            if False:\n'
+  '                plan["returned_moved"] = sorted(',
+  ['test_btc_forwarder']),
+ ('the moved record is not read when the kept set is built',
+  'btc_forwarder',
+  '        _ops += list(_p.get("returned_moved") or [])',
+  '        _ops += []',
+  ['test_btc_forwarder']),
+ ('a bump clears the kept mark (the client hears sent about kept money)',
+  'btc_forwarder',
+  '        if stuck is None:\n'
+  '            plan.pop("returned_kept", None)\n'
+  '        write_plan(args.outfile, plan)\n'
+  '        integrity_log("forward", "reconciled_listed")',
+  '        if True:\n'
+  '            plan.pop("returned_kept", None)\n'
+  '        write_plan(args.outfile, plan)\n'
+  '        integrity_log("forward", "reconciled_listed")',
+  ['test_btc_forwarder']),
 ]
 
 

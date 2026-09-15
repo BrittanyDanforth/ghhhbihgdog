@@ -1325,11 +1325,23 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         plan["refunds"] = _merged
     # THE OUTPUTS THE VAULT KEEPS (returned past --returns-max), from every
     # plan in the chain: a spend of exactly those is the operator moving
-    # them by hand -- the documented remedy -- and not a leaked seed.
+    # them by hand -- the documented remedy -- and not a leaked seed. AND
+    # THE ONES ALREADY MOVED (`returned_moved`, written below the moment a
+    # hand move is recognised, never popped): the kept mark is this run's
+    # to make and is cleared once the money is gone, so without a record
+    # of its own the run AFTER the one that said "the operator's hand"
+    # found the same spend, no mark, and cried seed leak -- for ever, and
+    # before any forward logic, so a later refund or payment to the
+    # address could never be forwarded either.
     _kept_ops = set()
     for _p in [plan] + chain:
-        _rk = _p.get("returned_kept") if isinstance(_p, dict) else None
-        for _o in ((_rk or {}).get("outpoints") or []):
+        if not isinstance(_p, dict):
+            continue
+        _rk = _p.get("returned_kept")
+        _ops = list(((_rk or {}).get("outpoints") or [])
+                    if isinstance(_rk, dict) else [])
+        _ops += list(_p.get("returned_moved") or [])
+        for _o in _ops:
             try:
                 _kept_ops.add((str(_o[0]).lower(), int(_o[1])))
             except (TypeError, ValueError, IndexError, KeyError):
@@ -1353,6 +1365,16 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # a seed holder can spend from the address, and a leaked seed
             # that took ONLY the kept outputs took what the operator was
             # about to move anyway; one that took more fails below.
+            # RECORDED ON THE PLAN AT ONCE, and written: the same spend is
+            # in the history on every later run, and the kept mark it
+            # matched is cleared below once nothing is left to keep.
+            _seen_moved = {(str(_o[0]).lower(), int(_o[1]))
+                           for _o in (plan.get("returned_moved") or [])
+                           if isinstance(_o, (list, tuple)) and len(_o) == 2}
+            if not _ins <= _seen_moved:
+                plan["returned_moved"] = sorted(
+                    [list(o) for o in (_seen_moved | _ins)])
+                write_plan(args.outfile, plan)
             integrity_log("forward", "kept_moved")
             print(f"  reconcile: the kept outputs were moved by a spend "
                   f"this tool did not sign (txid {s['txid']}): the "
@@ -1487,9 +1509,14 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         plan["tx_hex"], plan["tx_hex_reason"] = None, None
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         # A KEPT MARK IS THIS RUN'S TO MAKE, not a stale one's: money the
-        # operator moved by hand is a foreign spend (failed above), and
-        # money still here is written kept again below.
-        plan.pop("returned_kept", None)
+        # operator moved by hand is recorded above (returned_moved), and
+        # money still here is written kept again below -- UNLESS this run
+        # bumps instead, which never reaches _kept: the mark then stands,
+        # since the bump leaves the kept money out (_bump) and the agent
+        # reads the word `kept` off it. Popped before a bump, the client
+        # heard `sent` for a window about money that sat on the address.
+        if stuck is None:
+            plan.pop("returned_kept", None)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_listed")
         where = ("in the mempool" if hit["height"] <= 0
@@ -1553,7 +1580,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # run, so a superseder that was in the mempool is caught mined.
         plan["superseded_height"] = int(newest["height"])
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
-        plan.pop("returned_kept", None)
+        if stuck is None:                      # as in the listed branch
+            plan.pop("returned_kept", None)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_superseded")
         print(f"  reconcile: this plan's inputs were spent by our listed "
