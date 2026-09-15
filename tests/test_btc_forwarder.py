@@ -2271,7 +2271,8 @@ check("a CONFIRMED return whose memo names our forward, carrying LESS than "
       and _p["reconcile_reason"] == "returned"
       and _oldR.get("refunds") == [{"txid": _HRF, "vout": 0, "value": 150000,
                                     "of": _pR["txid"].lower(),
-                                    "verified": True, "full": True}]
+                                    "verified": True, "full": True,
+                                    "outbound_fee_sat": None}]
       and ("forward", "refund_seen") in _nR1.kinds
       and sum("inbound_addresses" in u for u, _ in _nR1.gets) == 1)
 _pU2, _ofU2, _hxU2 = _first_send()
@@ -2414,13 +2415,13 @@ check("classify_returns is pure and tolerant: junk entries, a memo in any "
            {"txid": "99" * 32, "send_sat": 5000000, "inbound": _OTHER_ADDR},
            "junk"])
       == [{"txid": "aa" * 32, "vout": 1, "value": 4, "of": "bb" * 32,
-           "verified": True, "full": False},
+           "verified": True, "full": False, "outbound_fee_sat": None},
           {"txid": "cc" * 32, "vout": 0, "value": 4, "of": "bb" * 32,
-           "verified": True, "full": False},
+           "verified": True, "full": False, "outbound_fee_sat": None},
           {"txid": "ee" * 32, "vout": 2, "value": 4, "of": "bb" * 32,
-           "verified": True, "full": False},
+           "verified": True, "full": False, "outbound_fee_sat": None},
           {"txid": "11" * 32, "vout": 0, "value": 4900000, "of": "99" * 32,
-           "verified": True, "full": True}]
+           "verified": True, "full": True, "outbound_fee_sat": None}]
       and F.classify_returns([], []) == [] and F.classify_returns(None, None) == [])
 check("the refund slack is the larger of a twentieth and a fixed floor: a "
       "5 BTC forward refunded 0.05 short is full, 0.26 short is not; a "
@@ -2435,16 +2436,87 @@ check("the refund slack is the larger of a twentieth and a fixed floor: a "
           [{"txid": "99" * 32, "send_sat": 500000000, "inbound": _INBOUND},
            {"txid": "88" * 32, "send_sat": 100000, "inbound": _INBOUND}])
       == [{"txid": "11" * 32, "vout": 0, "value": 495000000, "of": "99" * 32,
-           "verified": True, "full": True},
+           "verified": True, "full": True, "outbound_fee_sat": None},
           {"txid": "22" * 32, "vout": 0, "value": 474000000, "of": "99" * 32,
-           "verified": True, "full": False},
+           "verified": True, "full": False, "outbound_fee_sat": None},
           {"txid": "33" * 32, "vout": 0, "value": 1, "of": "88" * 32,
-           "verified": True, "full": False}]
+           "verified": True, "full": False, "outbound_fee_sat": None}]
       and F.REFUND_FEE_SLACK_SAT == 100000
       and not hasattr(F, "thor_inbound_address"))
 check("the forwarder's memo reader IS gs_btc_tx's (one reader for what it "
       "writes, what it recognises as its own, and what it reads back)",
       F._op_return_data is F.btx.op_return_data)
+# THE OUTBOUND FEE RIDES ON THE PLAN AND THE REFUND RECORD (self-doubt over
+# the partial-refund fix). ThorChain takes its outbound fee from the
+# unfilled part before refunding it, so a refund alone reads the fill a
+# fee's worth too high -- the whole arrival tolerance of a small forward.
+_fee_node = [{"chain": "BTC", "address": _INBOUND, "halted": False,
+              "dust_threshold": "10000", "outbound_fee": "30000"}]
+check("with --thornode the plan records THORNode's outbound fee for BTC, "
+      "in sat; without the field, or without a node, None",
+      run(Net(thornode=_fee_node), "--thornode", "https://t")[2]
+      ["outbound_fee_sat"] == 30000
+      and run(Net(thornode=_ok_node), "--thornode", "https://t")[2]
+      ["outbound_fee_sat"] is None
+      and run(Net())[2]["outbound_fee_sat"] is None)
+check("...junk or a negative fee is None, and a fee over the refund slack is "
+      "CAPPED at it (a lying node lowers what a client is told to expect by "
+      "no more than a FULL refund already rests on)",
+      run(Net(thornode=[{**_fee_node[0], "outbound_fee": "abc"}]),
+          "--thornode", "https://t")[2]["outbound_fee_sat"] is None
+      and run(Net(thornode=[{**_fee_node[0], "outbound_fee": "-5"}]),
+              "--thornode", "https://t")[2]["outbound_fee_sat"] is None
+      and run(Net(thornode=[{**_fee_node[0], "outbound_fee": "9999999"}]),
+              "--thornode", "https://t")[2]["outbound_fee_sat"] == 100000
+      and F.REFUND_FEE_SLACK_SAT == F.btx.REFUND_FEE_SLACK_SAT == 100000)
+check("a refund of a plan that carries the fee records it, and FULL is judged "
+      "on the refund PLUS the fee: 0.003 BTC sent, 0.00195 back with a "
+      "0.0003 fee is the whole swap undone (0.00225 >= 0.002); the same "
+      "refund of a plan without the fee is not",
+      F.classify_returns(
+          [{"txid": "11" * 32, "vout": 0, "value": 195000, "height": 9,
+            "memo": "REFUND:" + "99" * 32, "from_address": _INBOUND},
+           {"txid": "22" * 32, "vout": 0, "value": 195000, "height": 9,
+            "memo": "REFUND:" + "88" * 32, "from_address": _INBOUND}],
+          [{"txid": "99" * 32, "send_sat": 300000, "inbound": _INBOUND,
+            "outbound_fee_sat": 30000},
+           {"txid": "88" * 32, "send_sat": 300000, "inbound": _INBOUND}])
+      == [{"txid": "11" * 32, "vout": 0, "value": 195000, "of": "99" * 32,
+           "verified": True, "full": True, "outbound_fee_sat": 30000},
+          {"txid": "22" * 32, "vout": 0, "value": 195000, "of": "88" * 32,
+           "verified": True, "full": False, "outbound_fee_sat": None}]
+      and F.classify_returns(
+          [{"txid": "11" * 32, "vout": 0, "value": 195000, "height": 9,
+            "memo": "REFUND:" + "99" * 32, "from_address": _INBOUND}],
+          [{"txid": "99" * 32, "send_sat": 300000, "inbound": _INBOUND,
+            "outbound_fee_sat": "30000"}])[0]["outbound_fee_sat"] is None
+      and F.btx.refund_is_full(200000, 300000) is True
+      and F.btx.refund_is_full(199999, 300000) is False
+      and F.btx.refund_is_full(1, 100000) is False
+      and F.btx.refund_is_full(50000, 100000) is True
+      and F.btx.refund_is_full("x", 100000) is False
+      and F.btx.refund_is_full(True, 100000) is False
+      and F.btx.refund_is_full(5, 0) is False)
+# ...AND A RECORD FROM BEFORE THE FIELD LEARNS IT when the same output is
+# classified again with the fee known (the merge upgrades, never lowers).
+_pF, _ofF, _hxF = _first_send()
+_plF = json.load(open(_ofF))
+_plF["refunds"] = [{"txid": _HRF, "vout": 0, "value": 40000,
+                    "of": _pF["txid"], "verified": True, "full": False}]
+_plF["outbound_fee_sat"] = 30000
+with open(_ofF, "w") as _fh:
+    json.dump(_plF, _fh)
+_nF = Net(utxos=[{"tx_hash": _HRF, "vout": 0, "value": 40000,
+                  "confirmations": 5}],
+          spends=[_listed(_pF, _hxF)], fee=10, submit=_ACCEPTED, seen=_SEEN0,
+          funding=[_paid(_HRF, 40000, "REFUND:" + _pF["txid"], _INBOUND)])
+_c, _o, _p, _ = _reconcile(_nF, _ofF)
+_recF = [r for q in [_p] + [json.load(open(f)) for f in F._plan_chain(_ofF)]
+         for r in (q.get("refunds") or []) if r.get("txid") == _HRF]
+check("a refund record written before the fee field carries the fee once "
+      "the same output is classified again on a plan that knows it",
+      _c == F.EXIT_OK and _recF
+      and all(r.get("outbound_fee_sat") == 30000 for r in _recF))
 
 print("\n== THE BOUND HOLDS ON EVERY PATH (after the review of the third pass) ==")
 # The evicted re-sign and the rejected re-send's fresh forward used to

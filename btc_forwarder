@@ -587,8 +587,17 @@ def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
 def cross_check_inbound(inbound, thornode_url, proxy_url):
     """THORNode's own inbound_addresses, on a second circuit: the BTC
     entry must exist, must not be halted, and must name the SAME address
-    the aggregator gave us. Returns the entry's dust threshold in sat, or
-    None when it did not carry one."""
+    the aggregator gave us. Returns (dust threshold, outbound fee), each
+    in sat or None when the entry did not carry a usable one. THE
+    OUTBOUND FEE IS WHAT A REFUND LACKS: ThorChain refunds the unfilled
+    part of a streaming swap less this fee, and the pairs rewrite on the
+    vault scales the forward's quote by what was actually swapped -- the
+    refund PLUS the fee -- or a small forward reads `short` for ever (the
+    fee is a tenth of a 0.003 BTC forward; the arrival tolerance is a
+    tenth). Recorded on the plan from the node the operator named, at the
+    moment that node is trusted for the inbound address itself; capped at
+    REFUND_FEE_SLACK_SAT, so a lying node can lower what a client is told
+    to expect by no more than the slack a FULL refund already rests on."""
     proxies = isolated_proxy(proxy_url, "forward:inbound")
     try:
         entries = safe_get(f"{thornode_url.rstrip('/')}/thorchain/"
@@ -618,7 +627,10 @@ def cross_check_inbound(inbound, thornode_url, proxy_url):
                       "the aggregator's inbound address is NOT the one "
                       "THORNode publishes; refusing to pay it")
     dust = finite_decimal(entry.get("dust_threshold"))
-    return int(dust) if dust is not None and dust > 0 else None
+    fee = finite_decimal(entry.get("outbound_fee"))
+    return (int(dust) if dust is not None and dust > 0 else None,
+            min(int(fee), int(REFUND_FEE_SLACK_SAT))
+            if fee is not None and fee >= 0 else None)
 
 
 #: A refund is the inbound less ThorChain's outbound fee. It is FULL -- the
@@ -631,8 +643,10 @@ def cross_check_inbound(inbound, thornode_url, proxy_url):
 #: then call the payment complete when only part had landed. A refund
 #: under the slack is recorded, verified or not, and lowers nothing --
 #: the safe direction (the watcher waits for more than will come, which
-#: it says as "short", rather than for less).
-REFUND_FEE_SLACK_SAT = 100_000
+#: it says as "short", rather than for less). THE RULE LIVES IN gs_btc_tx
+#: (refund_is_full): the vault applies it too, to what came back of one
+#: forward across several outputs, and two copies of one rule drift.
+REFUND_FEE_SLACK_SAT = btx.REFUND_FEE_SLACK_SAT
 
 
 def classify_returns(paid, plans):
@@ -667,7 +681,18 @@ def classify_returns(paid, plans):
     one and changes nothing. Everything else on the address is a payment.
     Pure.
 
-    Returns [{txid, vout, value, of, verified, full}], one per refund."""
+    THE OUTBOUND FEE RIDES ON THE RECORD (self-doubt over the partial-
+    refund fix): what ThorChain kept of a partly filled swap is the
+    refund PLUS the outbound fee it took from the unfilled part, and the
+    plan carries that fee from THORNode's inbound entry when the forward
+    was built (`outbound_fee_sat`, or None). FULL is judged on the two
+    together, and the vault's pairs rewrite scales the quote by the two
+    together; a plan from before the field, or a run without --thornode,
+    carries None and the vault scales by the refund alone (a touch high,
+    the direction that reads `short`, never `complete`).
+
+    Returns [{txid, vout, value, of, verified, full, outbound_fee_sat}],
+    one per refund."""
     by_txid = {str(p.get("txid") or "").lower(): p for p in plans or ()
                if isinstance(p, dict) and p.get("txid")}
     vaults = {str(p.get("inbound") or "").strip().lower()
@@ -700,14 +725,16 @@ def classify_returns(paid, plans):
             srcs = [f.get("from_address")]
         srcs = {str(s or "").strip().lower() for s in srcs} - {""}
         ok = bool(srcs & vaults)
-        # FULL: within the slack of what was sent, AND at least half of
-        # it -- the slack's fixed floor is more than a small forward, and
-        # without the second bound a single sat back from one would have
-        # read as the whole swap undone.
-        slack = max(int(REFUND_FEE_SLACK_SAT), sent // 20)
+        _fee = p.get("outbound_fee_sat")
+        if isinstance(_fee, bool) or not isinstance(_fee, int) or _fee < 0:
+            _fee = None
+        # FULL: the refund and the fee it lacks together within the slack
+        # of what was sent, AND at least half of it (btx.refund_is_full).
         out.append({"txid": str(f.get("txid") or "").lower(), "vout": vout,
                     "value": value, "of": of, "verified": bool(ok),
-                    "full": bool(value >= max(sent - slack, sent // 2))})
+                    "full": bool(btx.refund_is_full(value + (_fee or 0),
+                                                    sent)),
+                    "outbound_fee_sat": _fee})
     return out
 
 
@@ -934,6 +961,7 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
         "tip": tip,
         "inbound": inbound,
         "inbound_cross_checked": False,
+        "outbound_fee_sat": None,
         "memo": memo,
         "memo_quoted": None,
         "memo_limit_set": None,
@@ -1356,6 +1384,9 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                         m["verified"] = True
                     if r["full"] and m.get("full") is not True:
                         m["full"] = True
+                    if m.get("outbound_fee_sat") is None \
+                            and r.get("outbound_fee_sat") is not None:
+                        m["outbound_fee_sat"] = r["outbound_fee_sat"]
                     break
             else:
                 _merged.append(dict(r))
@@ -2140,9 +2171,10 @@ def main(argv=None):
     memo_b = fit_memo(memo_text, dest_xmr, args.op_return_max_bytes)
 
     # 4. THORNode's word on the inbound, when the operator named a node
-    cross_checked = False
+    cross_checked, outbound_fee = False, None
     if args.thornode:
-        dust = cross_check_inbound(inbound, args.thornode, args.tor_proxy)
+        dust, outbound_fee = cross_check_inbound(inbound, args.thornode,
+                                                 args.tor_proxy)
         cross_checked = True
         if dust is not None and send_sat < dust:
             raise Refused("below_thor_dust",
@@ -2261,6 +2293,12 @@ def main(argv=None):
         "tip": picture["tip"],
         "inbound": inbound,
         "inbound_cross_checked": cross_checked,
+        # WHAT A REFUND OF THIS FORWARD LACKS: ThorChain's outbound fee for
+        # BTC from the node's inbound entry, in sat (None without a node or
+        # without the field). classify_returns judges FULL on the refund
+        # plus this, and the vault scales a partly filled swap's quote by
+        # the two together.
+        "outbound_fee_sat": outbound_fee,
         "memo": memo_text,                       # as laid out in the OP_RETURN
         "memo_quoted": memo_quoted,              # as the aggregator returned it
         "memo_limit_set": limit_set,             # True: the floor was written in

@@ -77,6 +77,36 @@ FORWARD_MIN_SAT = 10_000
 #: that point it is paying the miner more than a fifth of the client's
 #: money, and the right answer is to wait for cheaper blocks, not burn it.
 FORWARD_MAX_FEE_FRACTION = Decimal("0.20")
+#: A refund is the inbound less ThorChain's outbound fee. It is FULL -- the
+#: whole swap undone, so the forward drops out of what the XMR side
+#: expects -- only when it carries at least what was sent less this slack
+#: (the larger of a twentieth of the amount and REFUND_FEE_SLACK_SAT), and
+#: at least half of what was sent (a small forward is under the slack). A
+#: streaming swap that filled part of the way refunds only the rest, and
+#: that must NOT read as "the swap never happened": the XMR side would
+#: then call the payment complete when only part had landed. HERE, not in
+#: the forwarder alone: the vault's pairs rewrite applies the same test to
+#: what came back of one forward across several outputs, and two copies
+#: of one rule drift.
+REFUND_FEE_SLACK_SAT = 100_000
+
+
+def refund_is_full(back_sat, sent_sat):
+    """Whether `back_sat` coming back of a `sent_sat` forward is the WHOLE
+    swap undone (see REFUND_FEE_SLACK_SAT): within the slack of what was
+    sent, AND at least half of it -- the slack's fixed floor is more than
+    a small forward, and without the second bound a single sat back from
+    one would read as the whole swap undone. Pure; junk is False."""
+    try:
+        back, sent = int(back_sat), int(sent_sat)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(back_sat, bool) or isinstance(sent_sat, bool) or sent <= 0:
+        return False
+    slack = max(int(REFUND_FEE_SLACK_SAT), sent // 20)
+    return back >= max(sent - slack, sent // 2)
+
+
 #: The account level of BIP84: m/84'/coin'/0'.
 BIP84_PURPOSE = 84
 #: nLockTime at or above this is a UNIX timestamp, not a height.

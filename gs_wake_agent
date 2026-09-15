@@ -1794,13 +1794,34 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
         # same satoshis twice: the pair then waited for more than could
         # ever land and told the client "short" for ever about a deposit
         # that delivered everything. So a verified partial refund takes
-        # its share out: what was sent less what came back, and the quote
-        # scaled by that fraction (the refund is the unfilled part less
-        # ThorChain's outbound fee, so the fraction reads a touch HIGH --
-        # the safe direction, and well inside the arrival tolerance). The
-        # same output recorded on two plans (the current file and the
-        # rotated one it was merged from) is counted once.
-        _rf_seen, _refunded, _back = set(), set(), {}
+        # its share out: what was sent less what ThorChain did not swap,
+        # and the quote scaled by that fraction. The same output recorded
+        # on two plans (the current file and the rotated one it was merged
+        # from) is counted once.
+        # WHAT WAS NOT SWAPPED IS THE REFUND PLUS THE FEE IT LACKS (self-
+        # doubt over that fix): ThorChain takes its outbound fee from the
+        # unfilled part before refunding it, so the refund alone reads the
+        # fill a fee's worth too HIGH -- a tenth of a 0.003 BTC forward,
+        # the whole arrival tolerance, so every forward under ten fees
+        # read `short` for ever, with the fill's real slippage on top. The
+        # forwarder records the fee on the refund (`outbound_fee_sat`,
+        # from THORNode's inbound entry when the forward was built); a
+        # record without it counts the refund alone and says so on the
+        # chain once a rewrite (refund_fee_unknown) -- a touch high, the
+        # direction that reads `short`, never `complete`.
+        # ...AND SEVERAL PARTS MAY MAKE A WHOLE: two outputs refunding one
+        # forward that together reach the FULL test (gs_btc_tx
+        # refund_is_full, the forwarder's own rule) are the whole swap
+        # undone -- the forward drops out and, when it was the only one,
+        # the deposit-time quote comes back -- where the sum used to be
+        # capped at what was sent and the forward left in at nothing: a
+        # target of zero, which the watcher refuses to wait for at all.
+        import gs_btc_tx as _btx
+        _rf_seen, _refunded, _back, _said = set(), set(), {}, set()
+        _sent_of = {str(p.get("txid") or "").lower(): int(p.get("send_sat")
+                                                          or 0)
+                    for p in [plan] + list(chain or ())
+                    if isinstance(p, dict) and p.get("txid")}
         for p in [plan] + list(chain or ()):
             if not isinstance(p, dict):
                 continue
@@ -1809,7 +1830,11 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
                         and r.get("of")):
                     continue
                 _of = str(r.get("of") or "").lower()
-                _op = (str(r.get("txid") or "").lower(), r.get("vout"), _of)
+                try:
+                    _vo = int(r.get("vout"))
+                except (TypeError, ValueError):
+                    _vo = None
+                _op = (str(r.get("txid") or "").lower(), _vo, _of)
                 if _op in _rf_seen:
                     continue
                 _rf_seen.add(_op)
@@ -1820,8 +1845,26 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
                     _v = int(r.get("value") or 0)
                 except (TypeError, ValueError):
                     _v = 0
-                if _v > 0:
-                    _back[_of] = _back.get(_of, 0) + _v
+                if _v <= 0:
+                    # A verified partial refund whose amount cannot be read
+                    # takes nothing out: the whole quote stands (the state
+                    # this fix exists to end), so the operator hears of it.
+                    if "refund_value_unreadable" not in _said:
+                        _said.add("refund_value_unreadable")
+                        integrity_log("wake", "refund_value_unreadable")
+                    continue
+                _f = r.get("outbound_fee_sat")
+                if isinstance(_f, int) and not isinstance(_f, bool) \
+                        and _f >= 0:
+                    _v += _f
+                elif "refund_fee_unknown" not in _said:
+                    _said.add("refund_fee_unknown")
+                    integrity_log("wake", "refund_fee_unknown")
+                _back[_of] = _back.get(_of, 0) + _v
+        for _of, _b in list(_back.items()):
+            if _btx.refund_is_full(_b, _sent_of.get(_of, 0)):
+                _refunded.add(_of)
+                del _back[_of]
 
         def _share(p):
             """(send_sat, expected_xmr) of forward `p` LESS the verified

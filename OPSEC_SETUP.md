@@ -2104,10 +2104,17 @@ carries at least what was sent less a slack (the larger of a twentieth and
 0.001 BTC) and at least half; a streaming swap that filled part of the way
 refunds only the rest, and that must not read as the whole swap undone.
 Such a PARTIAL refund takes its share out instead: the forward then
-counts for what was sent less what came back, its quote scaled by that
-fraction, and the re-forward of the part that came back sums beside it —
-never the same satoshis twice (left in whole, the pair waited for more
-than could ever land and told the client "short" for ever).
+counts for what was sent less what ThorChain did not swap — the refund
+PLUS the outbound fee it took from the unfilled part, recorded on the
+plan from THORNode's inbound entry when the forward was built — its
+quote scaled by that fraction, and the re-forward of the part that came
+back sums beside it — never the same satoshis twice (left in whole, the
+pair waited for more than could ever land and told the client "short"
+for ever; scaled by the refund alone, a forward under ten fees read
+"short" for ever too, the fee being the whole arrival tolerance of a
+small one). A plan without the fee scales by the refund alone and says
+so on the chain (`refund_fee_unknown`). Two partial refunds of one
+forward that together reach the FULL test are the whole swap undone.
 Kerckhoffs: the memo is a public convention anyone can put in a
 transaction of their own to the address, and the amount can be matched;
 only the source cannot be forged, since only ThorChain's signers spend

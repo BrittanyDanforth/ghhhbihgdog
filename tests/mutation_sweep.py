@@ -5055,8 +5055,9 @@ MUTATIONS = [
   ['test_btc_forwarder']),
  ('any refund reads as full (a partial fill undone whole)',
   'btc_forwarder',
-  '                    "full": bool(value >= max(sent - slack, sent // 2))})',
-  '                    "full": True})',
+  '                    "full": bool(btx.refund_is_full(value + (_fee or 0),\n'
+  '                                                    sent)),',
+  '                    "full": True,',
   ['test_btc_forwarder']),
  ('the operator moving kept money by hand raises the seed-leak alarm',
   'btc_forwarder',
@@ -5655,10 +5656,10 @@ MUTATIONS = [
   ['test_plain_slip', 'test_wake_agent']),
  ('a partial refund is left in at its whole quote (the same satoshis '
   'twice)', 'gs_wake_agent',
-  '                if _v > 0:\n'
-  '                    _back[_of] = _back.get(_of, 0) + _v',
-  '                if False:\n'
-  '                    _back[_of] = _back.get(_of, 0) + _v',
+  '                _back[_of] = _back.get(_of, 0) + _v\n'
+  '        for _of, _b in list(_back.items()):',
+  '                _back[_of] = 0\n'
+  '        for _of, _b in list(_back.items()):',
   ['test_wake_agent']),
  ("the refund's share is not taken out of what was sent", 'gs_wake_agent',
   '            return _s - _b, _e2',
@@ -5782,6 +5783,59 @@ MUTATIONS = [
   '    for _o in seq:',
   '    for _o in seq:',
   ['test_btc_forwarder']),
+ ("THORNode's outbound fee is not recorded on the plan", 'btc_forwarder',
+  '            min(int(fee), int(REFUND_FEE_SLACK_SAT))\n'
+  '            if fee is not None and fee >= 0 else None)',
+  '            None)',
+  ['test_btc_forwarder']),
+ ('a lying node names any outbound fee it likes (uncapped)', 'btc_forwarder',
+  '            min(int(fee), int(REFUND_FEE_SLACK_SAT))\n'
+  '            if fee is not None and fee >= 0 else None)',
+  '            int(fee)\n'
+  '            if fee is not None and fee >= 0 else None)',
+  ['test_btc_forwarder']),
+ ('FULL is judged on the refund alone, not the refund plus the fee',
+  'btc_forwarder',
+  '                    "full": bool(btx.refund_is_full(value + (_fee or 0),\n'
+  '                                                    sent)),',
+  '                    "full": bool(btx.refund_is_full(value, sent)),',
+  ['test_btc_forwarder']),
+ ('a refund record from before the fee field never learns it',
+  'btc_forwarder',
+  '                    if m.get("outbound_fee_sat") is None \\\n'
+  '                            and r.get("outbound_fee_sat") is not None:',
+  '                    if False:',
+  ['test_btc_forwarder']),
+ ('a refund is full within the slack alone (a single sat back from a small '
+  'forward undoes the whole swap)', 'gs_btc_tx.py',
+  '    return back >= max(sent - slack, sent // 2)',
+  '    return back >= sent - slack',
+  ['test_btc_forwarder']),
+ ('the pairs rewrite scales by the refund alone (a small forward reads short '
+  'for ever)', 'gs_wake_agent',
+  '                    _v += _f',
+  '                    pass',
+  ['test_wake_agent']),
+ ('two partial refunds that make a whole leave the forward in at nothing '
+  '(a target of zero)', 'gs_wake_agent',
+  '            if _btx.refund_is_full(_b, _sent_of.get(_of, 0)):',
+  '            if False:',
+  ['test_wake_agent']),
+ ('the same refund output with vout 0 and "0" is counted twice',
+  'gs_wake_agent',
+  '                    _vo = int(r.get("vout"))',
+  '                    _vo = r.get("vout")',
+  ['test_wake_agent']),
+ ('a verified partial refund with no readable amount keeps the whole quote '
+  'silently', 'gs_wake_agent',
+  '                    if "refund_value_unreadable" not in _said:',
+  '                    if False:',
+  ['test_wake_agent']),
+ ('a refund record without the fee scales by the refund alone silently',
+  'gs_wake_agent',
+  '                elif "refund_fee_unknown" not in _said:',
+  '                elif False:',
+  ['test_wake_agent']),
 ]
 
 

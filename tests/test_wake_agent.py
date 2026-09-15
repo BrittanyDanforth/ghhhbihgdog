@@ -5164,6 +5164,124 @@ check("...and when EVERY forward was refunded in full the DEPOSIT-time "
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5"
       and json.loads(_ppb.read_text())[0]["forwarded_txids"] == []
       and json.loads(_ppb.read_text())[0]["forwarded_txid"] is None)
+# SELF-DOUBT OVER THE PARTIAL-REFUND FIX. ThorChain takes its outbound fee
+# from the unfilled part BEFORE refunding it, so the refund alone reads
+# the fill a fee's worth too high. At 0.003 BTC sent with a 0.0003 BTC
+# fee that is the whole arrival tolerance: a swap filled 60% refunds
+# 0.0009 (0.0012 unfilled less the fee); scaled by the refund the pair
+# expected 0.7 of the quote, the re-forward of the 0.0009 quoted beside
+# it, and the most that could ever land -- 0.6 of the quote plus the
+# re-forward, with NO slippage at all -- sat under the pair's own floor.
+# "short", for ever, for every forward under ten fees. Now the fee the
+# forwarder recorded on the refund is what was not swapped, with the
+# refund, and the pair expects what ThorChain actually swapped.
+_A3 = {**_PLAN_Q, "txid": "a3" * 32, "send_sat": 300000, "expected_xmr": "1"}
+_B3 = {**_PLAN_Q, "txid": "b3" * 32, "send_sat": 89000,
+       "expected_xmr": "0.2967", "replaces": None}
+_RF3 = {"txid": "c3" * 32, "vout": 0, "value": 90000, "of": "a3" * 32,
+        "verified": True, "full": False, "outbound_fee_sat": 30000}
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
+                             "expected_xmr": "1"}]))
+_r3 = A._reconcile_pairs({"slip": str(_ppb)}, {**_B3, "refunds": [_RF3]},
+                         chain=[_A3])
+_pair3 = json.loads(_ppb.read_text())[0]
+from gs_common import swap_arrival_floor as _saf
+_floor3, _ = _saf(Decimal(_pair3["expected_xmr"]), Decimal("0.10"),
+                  chunk_amounts=[Decimal("0.6"), Decimal("0.2967")])
+check("a partial refund counts the refund PLUS the fee it lacks as what was "
+      "not swapped: 0.003 sent, 0.0009 back with a 0.0003 fee is a 60% fill, "
+      "the quote scaled to 0.6, and a zero-slippage landing of the two "
+      "swaps clears the pair's own arrival floor (scaled by the refund "
+      "alone it did not: short for ever)",
+      _r3 is True and _pair3["expected_xmr"] == "0.896700000000"
+      and _pair3["btc_in"] == "0.00269"
+      and Decimal("0.6") + Decimal("0.2967") >= _floor3
+      and Decimal("0.6") + Decimal("0.2967") < _saf(
+          Decimal("0.9967"), Decimal("0.10"),
+          chunk_amounts=[Decimal("0.7"), Decimal("0.2967")])[0])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
+                             "expected_xmr": "1"}]))
+_il3 = []
+_saved_il3 = A.integrity_log
+A.integrity_log = lambda st, kind, *a, **k: _il3.append(kind)
+try:
+    _r3b = A._reconcile_pairs({"slip": str(_ppb)},
+                              {**_B3, "refunds": [{**_RF3,
+                                                   "outbound_fee_sat": None}]},
+                              chain=[_A3])
+    _pair3b = json.loads(_ppb.read_text())[0]
+    _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
+                                 "expected_xmr": "1"}]))
+    _r3c = A._reconcile_pairs({"slip": str(_ppb)},
+                              {**_B3, "refunds": [{**_RF3, "value": 0},
+                                                  {**_RF3, "vout": 1,
+                                                   "value": None},
+                                                  {**_RF3, "vout": 2,
+                                                   "value": "9e4"}]},
+                              chain=[_A3])
+    _pair3c = json.loads(_ppb.read_text())[0]
+finally:
+    A.integrity_log = _saved_il3
+check("...a record without the fee (a plan from before the field, a run "
+      "without a node) scales by the refund alone -- a touch high, the "
+      "direction that reads short -- and says so on the chain once",
+      _r3b is True and _pair3b["expected_xmr"] == "0.996700000000"
+      and _il3.count("refund_fee_unknown") == 1)
+check("...a verified partial refund whose amount cannot be read takes "
+      "nothing out (the whole quote stands) and says so on the chain once "
+      "-- never silently the state this fix exists to end",
+      _r3c is True and _pair3c["expected_xmr"] == "1.2967"
+      and _il3.count("refund_value_unreadable") == 1)
+# SEVERAL PARTS MAY MAKE A WHOLE. Two outputs refunding one forward that
+# together reach the FULL test are the whole swap undone; the sum used to
+# be capped at what was sent and the forward left in at NOTHING -- a
+# target of zero, which the watcher refuses to wait for at all -- with
+# the deposit-time quote never put back.
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
+                             "expected_xmr": "1"}]))
+A._reconcile_pairs({"slip": str(_ppb)}, _A3)
+check("(setup) the sending run's rewrite stashed the deposit-time quote",
+      json.loads(_ppb.read_text())[0]["quoted_at_deposit"]
+      == {"btc_in": "0.003", "expected_xmr": "1"})
+check("two partial refunds of the ONLY forward that together reach the FULL "
+      "test (0.0012 + 0.0014 of 0.003, no fee known) undo the whole swap: "
+      "the deposit-time quote comes back and no forward is named -- never "
+      "a target of zero",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_A3, "refunds": [{**_RF3, "value": 120000,
+                                              "outbound_fee_sat": None},
+                                             {**_RF3, "vout": 1,
+                                              "value": 140000,
+                                              "outbound_fee_sat": None}]})
+      is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == []
+      and json.loads(_ppb.read_text())[0]["forwarded_txid"] is None)
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
+                             "expected_xmr": "1"}]))
+check("...two parts that do NOT reach it (0.0009 + 0.0006 of 0.003) are a "
+      "partial fill still: the forward counts for the half that swapped",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_A3, "refunds": [{**_RF3, "value": 90000,
+                                              "outbound_fee_sat": None},
+                                             {**_RF3, "vout": 1,
+                                              "value": 60000,
+                                              "outbound_fee_sat": None}]})
+      is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "0.500000000000"
+      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["a3" * 32])
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
+                             "expected_xmr": "1"}]))
+check("...and the same output on the current plan with vout 0 and on the "
+      "rotated one with vout \"0\" is ONE refund (the key is read as a "
+      "number, as the forwarder writes it)",
+      A._reconcile_pairs({"slip": str(_ppb)},
+                         {**_B3, "refunds": [_RF3]},
+                         chain=[{**_A3, "refunds": [{**_RF3, "vout": "0"}]}])
+      is True
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "0.896700000000")
+_ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                             "expected_xmr": "1.5"}]))
 # THE REAL SEQUENCE: the sending run's rewrite put the FORWARD-time quote
 # in first; only then was the forward refunded. The deposit-time figures
 # the first rewrite stashed are what come back.
