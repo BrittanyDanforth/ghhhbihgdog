@@ -5705,6 +5705,28 @@ MUTATIONS = [
   '               "result_phase_unknown")',
   'EVENT_VOCAB = ("m1_second_ephemeral", "result_refused")',
   ['test_telegram_pager']),
+ ('a chat id that is not a number leaks the one-job lock for the life of '
+  'the process', 'gs_telegram_pager',
+  '        try:\n'
+  '            params = dict(params)\n'
+  '            params["owner"] = owner_token(self.key, cid)\n'
+  '            if not leg:\n'
+  '                self.__dict__["_contended"] = False\n'
+  '            self._running = cid',
+  '        params = dict(params)\n'
+  '        params["owner"] = owner_token(self.key, cid)\n'
+  '        if not leg:\n'
+  '            self.__dict__["_contended"] = False\n'
+  '        try:\n'
+  '            self._running = cid',
+  ['test_telegram_pager']),
+ ('a recheck whose entry vanished hands start_job a None chat',
+  'gs_telegram_pager',
+  '            if not isinstance(_chat, int) or isinstance(_chat, bool):\n'
+  '                continue',
+  '            if False:\n'
+  '                continue',
+  ['test_telegram_pager']),
 ]
 
 

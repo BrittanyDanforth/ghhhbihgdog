@@ -4780,10 +4780,13 @@ class Pager:
         # at the one place a wake starts, and nowhere else: a chat can only
         # ever emit its own token. A fresh (leg 0) withdrawal also clears the
         # contention flag, so a chain is judged on ITS run's waiters.
-        params = dict(params)
-        params["owner"] = owner_token(self.key, cid)
-        if not leg:
-            self.__dict__["_contended"] = False
+        #
+        # INSIDE THE GUARD BELOW (fix pass after the deep read): these three
+        # lines sat between the two guarded blocks, and owner_token raises
+        # on a chat id that is not a number -- which the watcher's recheck
+        # handed it once an entry vanished under it -- with `busy` acquired
+        # and nothing left to release it. Every later poke then answered
+        # "a wake is already running" for the life of the process.
         # RELEASE IT IF ANYTHING BETWEEN HERE AND THE THREAD RAISES.
         #
         # The guard used to start at Thread.start(), on the reasoning that a
@@ -4800,6 +4803,10 @@ class Pager:
         # finally owns the lock, and a release here would free a lock the
         # worker still thinks it holds.
         try:
+            params = dict(params)
+            params["owner"] = owner_token(self.key, cid)
+            if not leg:
+                self.__dict__["_contended"] = False
             self._running = cid
             # WHICH LEG THIS IS, recorded before the thread starts so the
             # worker reads it rather than a slot _worker has already cleared.
@@ -5560,11 +5567,20 @@ class Pager:
         for h in _due:
             if not self._btc_can_start(background=True):
                 break
+            # THE ENTRY MAY HAVE GONE while the looks ran (a tap's answer
+            # popped it): read it under the lock, and hand start_job
+            # nothing rather than a None chat (fix pass after the deep
+            # read -- that None raised inside start_job with the one-job
+            # lock held, for the life of the process).
+            with lock:
+                _e = opened.get(h)
+                _chat = _e.get("chat") if isinstance(_e, dict) else None
+            if not isinstance(_chat, int) or isinstance(_chat, bool):
+                continue
             started = False
             try:
                 started = bool(self.start_job(
-                    (opened.get(h) or {}).get("chat"), "forward_to_swap",
-                    {"handle": h}))
+                    _chat, "forward_to_swap", {"handle": h}))
             except BaseException as ex:                      # noqa: BLE001
                 print(f"  [!] the recheck did not start: {_redact(ex)[:120]}")
             if started:

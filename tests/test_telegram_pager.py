@@ -5823,6 +5823,53 @@ check("a refusal on an entry whose early wait had doubled to its cap keeps "
       (_ew.btc_open.get("B4A1") or {}).get("retry_after", 0) - time.time()
       >= pg.Pager.EARLY_WAIT_S * 8 - 5)
 
+# THE ONE-JOB LOCK CANNOT LEAK (fix pass after the deep read). Three
+# statements sat between start_job's two guarded blocks, and owner_token
+# raises on a chat id that is not a number -- which the watcher's recheck
+# handed it once an entry vanished under it -- with `busy` acquired and
+# nothing left to release it: every later poke, from every chat, answered
+# "a wake is already running" for the life of the process.
+print("\n== THE ONE-JOB LOCK CANNOT LEAK ==")
+_lp, _ls = _room_pager((111,), ())
+_lk_ret, _lk_exc = None, None
+try:
+    _lk_ret = _lp.start_job(None, "forward_to_swap", {"handle": "B4A1"})
+except BaseException as _e:                                  # noqa: BLE001
+    _lk_exc = _e
+check("start_job handed a chat that is not a number REFUSES -- False, "
+      "'could not start' to the chat -- and gives the one-job lock back; "
+      "it used to raise past the guard with the lock held",
+      _lk_ret is False and _lk_exc is None and not _lp.busy.locked()
+      and bool(_ls) and "could not start" in _ls[-1])
+# ...AND THE RECHECK LOOP NEVER HANDS IT ONE: an entry that vanishes while
+# the looks run (a tap's answer popped it) is read under the lock and
+# skipped, rather than reaching start_job as a None chat.
+_q9, _qs9, _qt9, _qj9 = _tapper()
+_q9._btc_forward_result("B4A1", "done", "unsure", 111)
+_q9._btc_register("B4A2", _BTC_ADDR, 111)
+_q9_n = len(_qj9)
+_q9.btc_tick(look=_look_returning("not_seen"))
+check("(setup) an unsure forward learned after a restart is rechecked on the "
+      "tick, for its own chat",
+      _qj9[-1] == (111, "forward_to_swap", {"handle": "B4A1"})
+      and len(_qj9) == _q9_n + 1)
+_q9b, _qs9b, _qt9b, _qj9b = _tapper()
+_q9b._btc_forward_result("B4A1", "done", "unsure", 111)
+_q9b._btc_register("B4A2", _BTC_ADDR, 111)
+
+
+def _look_and_pop(addr, servers, proxy, **kw):
+    _q9b.btc_open.pop("B4A1", None)          # a tap's answer took it meanwhile
+    return _look_returning("not_seen")(addr, servers, proxy, **kw)
+
+
+_q9b_n = len(_qj9b)
+_q9b.btc_tick(look=_look_and_pop)
+check("...and when the entry VANISHES while the looks run, the recheck is "
+      "skipped: start_job is never handed a None chat",
+      len(_qj9b) == _q9b_n
+      and all(isinstance(c, int) for c, _j, _pp in _qj9b))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)
