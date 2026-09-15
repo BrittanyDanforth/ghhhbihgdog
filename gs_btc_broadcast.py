@@ -345,7 +345,7 @@ def _prev_address(raw, vout, net):
 
 def spends_of(address, servers, proxy_url, *, network="main",
               timeout=DEFAULT_TIMEOUT, transport_factory=None,
-              with_funding=False):
+              with_funding=False, on_truncated=None):
     """Every transaction in the address's history that SPENDS an output
     paying it, oldest first, with what each spend carried.
 
@@ -372,10 +372,25 @@ def spends_of(address, servers, proxy_url, *, network="main",
     One server's session: the history, then blockchain.transaction.get for
     each entry, each transaction parsed and its txid recomputed (a server
     cannot hand back a different transaction under a listed id). Read-only.
-    Refuses a history longer than MAX_HISTORY, and a listed transaction
-    that neither pays nor spends the address (a server whose history and
-    transactions contradict each other is not one to reason from). Raises
-    BtcWatchError when no server answered."""
+    Refuses a listed transaction that neither pays nor spends the address
+    (a server whose history and transactions contradict each other is not
+    one to reason from). Raises BtcWatchError when no server answered.
+
+    A HISTORY LONGER THAN MAX_HISTORY IS READ AS ITS NEWEST MAX_HISTORY
+    ENTRIES, not refused (the MED pass after the deep read). It was
+    refused outright, so anyone who could read the address -- it is in
+    the chat -- could jam a deposit's every reconciliation for good with
+    a flood of dust, until the operator acted by hand. Electrum lists the
+    confirmed entries by height and the mempool's after them, so the tail
+    is the newest. `on_truncated(total)` is called once, for the caller
+    to put a kind on the chain. What the window cannot hold cannot be
+    reasoned from, and the reconciliation fails SAFELY for it, never
+    falsely: listunspent stays the source of truth for what is on the
+    address, a forward of ours that fell off the window leaves its
+    inputs neither unspent nor consumed (history_inconsistent, nothing
+    signed), and a spend in the window whose inputs are older than the
+    window is still LISTED, with no inputs, so a spend that is not ours
+    is still the alarm it was."""
     spk = btx.address_script(address, network).data
     net = btx.network_of(network)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
@@ -387,9 +402,10 @@ def spends_of(address, servers, proxy_url, *, network="main",
             with Broadcaster(transport) as b:
                 b.handshake()
                 entries = b.history(scripthash)
+                n_all, truncated = len(entries), False
                 if len(entries) > MAX_HISTORY:
-                    raise BtcWatchError("electrum: history too long to be "
-                                        "a deposit address's")
+                    entries = entries[-MAX_HISTORY:]
+                    truncated = True
                 txs = [(e, b.transaction(e["tx_hash"])) for e in entries]
                 prevs = {}
                 if with_funding:
@@ -436,9 +452,18 @@ def spends_of(address, servers, proxy_url, *, network="main",
                      if (i.txid.hex(), int(i.vout)) in funding]
             pays = any(o.script_pubkey.data == spk for o in tx.vout)
             if not spent and not pays:
-                raise BtcWatchError("electrum: the history lists a "
-                                    "transaction that does not touch the "
-                                    "address")
+                if not truncated:
+                    raise BtcWatchError("electrum: the history lists a "
+                                        "transaction that does not touch "
+                                        "the address")
+                # A SPEND OF OUTPUTS OLDER THAN THE WINDOW: the funding it
+                # consumed fell off the tail, so nothing here names its
+                # inputs. Listed all the same, with none: the caller tells
+                # a spend of ours from a foreign one by its id and memo,
+                # and a foreign spend it could not see was the hole.
+                out.append({"txid": e["tx_hash"], "height": e["height"],
+                            "hex": raw, "inputs": [], "server": host})
+                continue
             if spent:
                 out.append({"txid": e["tx_hash"], "height": e["height"],
                             "hex": raw, "inputs": spent, "server": host})
@@ -458,6 +483,8 @@ def spends_of(address, servers, proxy_url, *, network="main",
                                      "from_address": (srcs[0] if srcs
                                                       else None),
                                      "from_addresses": list(srcs)})
+        if truncated and on_truncated is not None:
+            on_truncated(n_all)
         return (out, paid) if with_funding else out
     why = str(last) if isinstance(last, BtcWatchError) \
         else type(last).__name__

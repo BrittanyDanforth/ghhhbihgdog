@@ -668,11 +668,46 @@ check("a transaction that is not the one asked for (its txid does not "
       "match) is refused", _refused(
           B.spends_of, _A0, _SERVERS, _PROXY, transport_factory=_factory(
               _FT(history=_HIST[:1], transactions={_FUND_ID: _SPEND1_HEX}))))
-check("a history longer than a deposit address could have is refused "
-      "before anything is fetched",
+# A HISTORY LONGER THAN THE WINDOW IS READ AS ITS NEWEST ENTRIES (the MED
+# pass after the deep read). It was refused outright, so anyone who could
+# read the address -- it is in the chat -- could jam a deposit's every
+# reconciliation for good with a flood of dust, until the operator acted by
+# hand. Electrum lists confirmed entries by height and the mempool's after
+# them: the tail is the newest.
+_trunc_seen = []
+_HIST_LONG = ([{"tx_hash": _FUND_ID, "height": 849000}] * (B.MAX_HISTORY + 2)
+              + _HIST)
+_rl, _, _ftl = _spends(_FT(history=_HIST_LONG, transactions=_TXS),
+                       on_truncated=_trunc_seen.append)
+check("a history longer than MAX_HISTORY is read as its newest MAX_HISTORY "
+      "entries, not refused: the spends at the tail come back with their "
+      "inputs, exactly MAX_HISTORY transactions are fetched, and the caller "
+      "is told once with the total",
+      [x["txid"] for x in _rl] == [_SPEND1_ID, _SPEND2_ID]
+      and _rl[0]["inputs"] == [{"tx_hash": _FUND_ID, "vout": 0,
+                                "value": 300000}]
+      and _ftl[0].methods.count("blockchain.transaction.get")
+      == B.MAX_HISTORY
+      and _trunc_seen == [len(_HIST_LONG)])
+_trunc_seen2 = []
+_spends(_FT(history=_HIST, transactions=_TXS),
+        on_truncated=_trunc_seen2.append)
+check("...and a history within the window tells the caller nothing",
+      _trunc_seen2 == [])
+_rc, _, _ = _spends(_FT(history=[{"tx_hash": _FUND_ID, "height": 849000}]
+                        + [{"tx_hash": _SPEND1_ID, "height": 850001}]
+                        * (B.MAX_HISTORY + 1), transactions=_TXS),
+                    on_truncated=lambda n: None)
+check("a spend in the window whose funding fell OFF it is still LISTED, "
+      "with no inputs (a spend that is not ours must stay the alarm it "
+      "was), not refused as 'does not touch the address'",
+      _rc and {x["txid"] for x in _rc} == {_SPEND1_ID}
+      and all(x["inputs"] == [] and x["hex"] == _SPEND1_HEX for x in _rc))
+check("...while in a history WITHIN the window such a transaction is still "
+      "the contradiction it always was: refused",
       _refused(B.spends_of, _A0, _SERVERS, _PROXY, transport_factory=_factory(
-          _FT(history=[{"tx_hash": _FUND_ID, "height": 1}]
-              * (B.MAX_HISTORY + 1), transactions=_TXS))))
+          _FT(history=[{"tx_hash": _SPEND1_ID, "height": 850001}],
+              transactions=_TXS))))
 check("a server that has no such transaction, or hangs up mid-fetch, is "
       "routed around and the next decides",
       _spends(_FT(history=_HIST, transactions={}),

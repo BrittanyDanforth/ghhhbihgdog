@@ -6145,6 +6145,36 @@ MUTATIONS = [
   '    except ValueError as e:\n'
   '        sys.exit(f"[!] {e}")\n',
   ['test_telegram_pager']),
+ # MED PASS: a flooded history is read as its newest entries, not refused.
+ ('a history over the window is refused outright again (a dust flood jams '
+  'the deposit for good)',
+  'gs_btc_broadcast.py',
+  '                if len(entries) > MAX_HISTORY:\n'
+  '                    entries = entries[-MAX_HISTORY:]\n'
+  '                    truncated = True',
+  '                if len(entries) > MAX_HISTORY:\n'
+  '                    raise BtcWatchError("electrum: history too long")',
+  ['test_btc_broadcast']),
+ ('a spend whose funding fell off the window is dropped from the answer',
+  'gs_btc_broadcast.py',
+  '                out.append({"txid": e["tx_hash"], "height": e["height"],\n'
+  '                            "hex": raw, "inputs": [], "server": host})\n'
+  '                continue',
+  '                continue',
+  ['test_btc_broadcast']),
+ ('the caller is never told the history was truncated',
+  'gs_btc_broadcast.py',
+  '        if truncated and on_truncated is not None:\n'
+  '            on_truncated(n_all)',
+  '        if False:\n'
+  '            on_truncated(n_all)',
+  ['test_btc_broadcast', 'test_btc_forwarder']),
+ ('the reconciliation asks for no word on a truncated history',
+  'btc_forwarder',
+  '                            with_funding=True,\n'
+  '                            on_truncated=_history_truncated)',
+  '                            with_funding=True)',
+  ['test_btc_forwarder']),
 ]
 
 

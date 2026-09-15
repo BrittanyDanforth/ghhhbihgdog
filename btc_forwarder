@@ -135,6 +135,18 @@ bcast_seen = bcast.seen
 # went out and whose plan was never written (stage 5).
 bcast_spends = bcast.spends_of
 
+
+def _history_truncated(total):
+    """The address's history was longer than the reader's window and was
+    read as its newest entries (gs_btc_broadcast.spends_of, the MED pass
+    after the deep read): a kind on the chain, and the count in the job
+    log, so a flood of dust on the address is seen for what it is."""
+    integrity_log("forward", "history_truncated")
+    print(f"  [!] the address's history has {int(total)} entries; only the "
+          f"newest {int(bcast.MAX_HISTORY)} were read. A forward that fell "
+          "off that window cannot be reconciled from here (the run fails, "
+          "nothing is signed); one within it is.")
+
 #: The forward's floor, in satoshis, on what reaches ThorChain AFTER the
 #: fee. It equals gs_wake_proto.DEPOSIT_MIN_SAT (10,000 sat, 0.0001 BTC),
 #: and that figure is not a coincidence: ThorChain's BTC dust threshold is
@@ -919,7 +931,8 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
     say, and raises SystemExit(EXIT_FAILED) for a foreign spend."""
     try:
         spends = bcast_spends(address, servers, proxy_url, network=network,
-                              timeout=timeout)
+                              timeout=timeout,
+                              on_truncated=_history_truncated)
     except watch.PinMismatch as e:
         raise Refused("pin_mismatch", str(e))
     except watch.BtcWatchError as e:
@@ -1436,7 +1449,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     try:
         _res = bcast_spends(address, servers, args.tor_proxy,
                             network=args.network, timeout=args.timeout,
-                            with_funding=True)
+                            with_funding=True,
+                            on_truncated=_history_truncated)
     except watch.PinMismatch as e:
         raise Refused("pin_mismatch", str(e))
     except watch.BtcWatchError as e:

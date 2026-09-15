@@ -129,9 +129,12 @@ class Net:
                  expected=None, oracle=_ORACLE, thornode=None,
                  look_error=None, post_error=None, routes=None,
                  factor=Decimal(1), submit=None, seen=None, clock=None,
-                 spends=None, funding=None):
+                 spends=None, funding=None, truncated=None):
         self.factor = factor                     # quote vs oracle, x
         self.clock = clock                       # the quote-age clock
+        # A HISTORY LONGER THAN THE READER'S WINDOW (the MED pass): the
+        # total spends_of would report through on_truncated, or None.
+        self.truncated = truncated
         # WHAT PAID THE ADDRESS (third self-doubt pass): the `paid` half
         # bcast.spends_of returns with_funding -- memos and sources.
         self.funding_result = funding
@@ -232,6 +235,8 @@ class Net:
         r = self.spends_result
         if isinstance(r, Exception):
             raise r
+        if self.truncated is not None and kw.get("on_truncated") is not None:
+            kw["on_truncated"](self.truncated)
         if kw.get("with_funding"):
             return list(r or []), list(self.funding_result or [])
         return list(r or [])
@@ -2760,6 +2765,31 @@ check("_carried_returned: a plan with carried_refunds counts by it alone "
            "carried_refunds": None, "carried_returned": 2},
           {"reconcile_reason": None, "txid": "5" * 64,
            "carried_refunds": None}]) == 3)
+
+print("\n== MED PASS: a flooded history is read as its newest entries ==")
+# The reader refused a history over its window outright, so anyone who could
+# read the address (it is in the chat) could jam every reconciliation of a
+# deposit for good with a flood of dust. It now reads the newest window and
+# says so through on_truncated; the forwarder puts the kind on the chain and
+# the count in the job log, and reconciles what the window holds.
+B_MAX_HISTORY = int(F.bcast.MAX_HISTORY)
+_pH, _ofH, _hxH = _first_send()
+_nH = Net(utxos=[], spends=[_listed(_pH, _hxH)], fee=10, submit=_ACCEPTED,
+          seen=_SEEN0, truncated=B_MAX_HISTORY + 137)
+_c, _o, _p, _ = _reconcile(_nH, _ofH)
+check("a reconciliation whose history reader had to truncate is told, puts "
+      "history_truncated on the chain and the count in the job log, and "
+      "goes on to reconcile the listed forward: done",
+      _c == F.EXIT_OK and ("forward", "history_truncated") in _nH.kinds
+      and str(B_MAX_HISTORY + 137) in _o and str(B_MAX_HISTORY) in _o
+      and ("forward", "reconciled_listed") in _nH.kinds
+      and _nH.spend_calls and callable(
+          _nH.spend_calls[0].get("on_truncated")))
+_nH2 = Net(utxos=[], spends=[_listed(_pH, _hxH)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nH2, _ofH)
+check("...and one whose history fit says nothing of the kind",
+      _c == F.EXIT_OK and ("forward", "history_truncated") not in _nH2.kinds)
 # MONEY THE VAULT KEPT, MOVED BY HAND: the documented remedy, and it used
 # to raise the seed-leak alarm on every later reconciliation.
 _ofM, _lM, _pM3, _hxM3 = _two_returns()

@@ -396,8 +396,13 @@ Read back against the code once every step was green, asking again
   but not by the one the reconciliation asks would be re-signed as
   "evicted" and race the original (both pay the same inbound with the
   same memo; whichever confirms swaps once; every input opts into RBF). A
-  history over MAX_HISTORY (a dust attack) fails the reconciliation until
-  the operator acts by hand. A client's own payment replaced away under a
+  history over MAX_HISTORY (a dust attack) failed the reconciliation until
+  the operator acted by hand; since the MED pass after the deep read it is
+  read as its newest MAX_HISTORY entries (`history_truncated` on the
+  chain), a forward within the window reconciles, and one that fell off
+  it fails SAFELY (`history_inconsistent`, nothing signed) -- a flood can
+  still delay a deposit, it can no longer jam one for good, and it can
+  never make a run report success. A client's own payment replaced away under a
   forward makes the plan's inputs vanish: `history_inconsistent`, FAILED,
   the operator reads the log.
 
