@@ -5988,6 +5988,15 @@ MUTATIONS = [
   '        raise e\n'
   '        raise Refused("build_failed",',
   ['test_btc_forwarder']),
+ ("a forward's stale status word from a run that died is read as this run's",
+  'gs_wake_agent',
+  '    if job == "forward_to_swap" and handle:\n'
+  '        try:\n'
+  '            _forward_status_path(artifact_dir, handle).unlink()',
+  '    if False:\n'
+  '        try:\n'
+  '            _forward_status_path(artifact_dir, handle).unlink()',
+  ['test_wake_agent']),
 ]
 
 

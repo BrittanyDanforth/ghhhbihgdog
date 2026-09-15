@@ -4162,6 +4162,25 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 f"could not clear the previous status answer "
                 f"({e.strerror}). Refusing to run a probe that might report "
                 f"the last one's result.")
+    # THE FORWARD'S OWN ONE-WORD ANSWER, TOO (the MED pass after the deep
+    # read). btc_forwarder writes btc_forward_<h>.status.json when it finds
+    # nothing settled, and this end removes it after the one read that
+    # needs it -- unless the agent died between the child's write and that
+    # read (the deadman, a power cut, a timeout during the result post),
+    # when the stale word made a LATER refusal that wrote no word of its
+    # own (inbound_mismatch, a rejected broadcast) read as done and
+    # `not_yet`: a failed forward reported as money not yet there.
+    if job == "forward_to_swap" and handle:
+        try:
+            _forward_status_path(artifact_dir, handle).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise Refused(
+                "status_file_stuck",
+                f"could not clear the previous forward's status answer "
+                f"({e.strerror}). Refusing to run a forward that might "
+                f"report the last one's word.")
 
     # ASKED ONCE, USED TWICE. The flag and the drawn address must agree --
     # --usage-fee with no GS_USAGE_FEE_ADDRESS is the configuration that mints

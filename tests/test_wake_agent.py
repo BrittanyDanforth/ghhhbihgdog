@@ -5526,11 +5526,15 @@ check("a record WITHOUT the forward_sent mark but with a plan on disk that "
 print("\n== a forward that found nothing settled says what it saw ==")
 
 
-def _fwd_run_rc(rec, key_extra, rc, state=None):
+def _fwd_run_rc(rec, key_extra, rc, state=None, stale=None):
     """A forward whose fake child exits `rc` and, with `state`, writes the
     one-word status file the real forwarder writes on nothing_settled.
+    `stale` plants a status word from an EARLIER run before this one.
     Returns (out, err, ran, dir, bell)."""
     dd, kk, bb = _fwd_env(rec, key_extra)
+    if stale is not None:
+        (dd / "btc_forward_A3F1.status.json").write_text(
+            json.dumps({"state": stale}))
     ran = []
 
     def child(argv, env_extra, budget):
@@ -5563,6 +5567,20 @@ check("the forwarder refused nothing_settled (exit 2) and wrote 'not_seen': "
       and "forwarded" not in _rec_of(_dd) and "forward_sent" not in _rec_of(_dd))
 check("...and the status file is read once and gone",
       not (_dd / "btc_forward_A3F1.status.json").exists())
+# A STALE WORD FROM A RUN THAT DIED IS NOT THIS RUN'S ANSWER (the MED pass
+# after the deep read): the file is removed after the one read that needs
+# it, so an agent that died in between (the deadman, a power cut) left it,
+# and the next forward's refusal that wrote no word of its own was read as
+# done and `not_yet` -- a failed forward reported as money not yet there.
+_o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, None,
+                                     stale="not_seen")
+check("a status word left by an earlier run is cleared BEFORE the child "
+      "runs: a refusal that writes no word is a refusal, never done + "
+      "not_yet off the stale file",
+      _e is None and _o is not None and _o[1] != "done"
+      and (_bb.result or {}).get("phase") != "not_yet"
+      and not (_dd / "btc_forward_A3F1.status.json").exists()
+      and len(_ran) == 1)
 _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, "seen")
 check("...'seen' (money present, not settled) is the word 'arriving'",
       (_bb.result or {}).get("phase") == "arriving"
