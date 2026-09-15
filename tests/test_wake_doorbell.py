@@ -690,11 +690,16 @@ _newer = P.seal(TP, PI.public_key, P.TAG_M3,
 _st_d = er4.post("/result", _newer)[0]
 er4.close()
 check("an authenticated answer carrying a status word this build lacks is "
-      "ACCEPTED (200), its status and handle kept, the word blanked -- never "
-      "passed through -- and the skew recorded as result_phase_unknown",
+      "ACCEPTED (200), its status and handle kept, the word replaced by "
+      "PHASE_UNKNOWN (outside the vocabulary: never a rehearsal, never "
+      "'nothing more') -- never passed through -- and the skew recorded as "
+      "result_phase_unknown",
       _st_d == 200 and er4.pending.outcome() == "done"
       and er4.pending.result["handle"] == "BEEF"
-      and er4.pending.result["phase"] == ""
+      and er4.pending.result["phase"] == P.PHASE_UNKNOWN
+      and P.PHASE_UNKNOWN not in P.PHASES
+      and not P.phase_is_known(P.PHASE_UNKNOWN)
+      and "some_newer_word" not in json.dumps(er4.pending.result)
       and "result_phase_unknown" in er4.pending.events
       and "result_ok" in er4.pending.events
       and "result_refused" not in er4.pending.events)

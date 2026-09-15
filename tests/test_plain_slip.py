@@ -462,11 +462,13 @@ check("...and each one ALONE is accepted, so the refusal is about carrying "
 for _bad_phase in ("FAILED", "everything is fine, send more", "landed!",
                    "not_yet ", 7, None):
     _pd = pending()
-    check(f"a phase of {_bad_phase!r} is accepted with the WORD BLANKED and "
-          "the skew recorded (result_phase_unknown), the status and handle "
-          "kept",
+    check(f"a phase of {_bad_phase!r} is accepted with the word replaced by "
+          "PHASE_UNKNOWN (never blanked: '' is a word with a meaning of its "
+          "own) and the skew recorded (result_phase_unknown), the status and "
+          "handle kept",
           accepted(_pd, phase=_bad_phase)
-          and _pd.result["phase"] == "" and _pd.result["status"] == "done"
+          and _pd.result["phase"] == P.PHASE_UNKNOWN
+          and _pd.result["status"] == "done"
           and _pd.result["handle"] == "A3F1"
           and "result_phase_unknown" in _pd.events)
 _pd_ok = pending()

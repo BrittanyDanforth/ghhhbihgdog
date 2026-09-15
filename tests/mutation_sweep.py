@@ -2694,12 +2694,13 @@ MUTATIONS = [
   "            (artifact_dir / STATUS_FILE).unlink()",
   ["test_plain_slip"]),
 
- ("the pager only renders a phase on a finished job", "gs_telegram_pager",
-  '        if _early and out != "done" and job in ("watch", "swap_status"):\n'
+ ('the pager only renders a phase on a finished job', 'gs_telegram_pager',
+  '        if _early and _early != proto.PHASE_UNKNOWN and out != "done" \\\n'
+  '                and job in ("watch", "swap_status"):\n'
   '            # THE LABEL, NOT THE HANDLE. This one branch still printed',
-  "        if False:\n"
+  '        if False:\n'
   '            # THE LABEL, NOT THE HANDLE. This one branch still printed',
-  ["test_plain_slip"]),
+  ['test_plain_slip']),
 
  # ---- the wizard is the only path, and the card holds no map -------------
  #
@@ -3231,11 +3232,11 @@ MUTATIONS = [
  # there is more here. Run /withdraw again" about a run that moved nothing --
  # a false success on the one job that spends, plus an instruction to repeat
  # a failure that would repeat identically.
- ("a failed spend carrying a phase is reported as a finished one",
-  "gs_telegram_pager",
-  '        if _early and out != "done" and job in ("watch", "swap_status"):',
-  '        if _early and out != "done":',
-  ["test_plain_slip"]),
+ ('a failed spend carrying a phase is reported as a finished one', 'gs_telegram_pager',
+  '        if _early and _early != proto.PHASE_UNKNOWN and out != "done" \\\n'
+  '                and job in ("watch", "swap_status"):',
+  '        if _early and _early != proto.PHASE_UNKNOWN and out != "done":',
+  ['test_plain_slip']),
 
  # ONE FLOAT FOR THE WHOLE PROCESS meant chat A tapping Status swallowed
  # chat B's next fifteen seconds -- with no reply at all, because a "slow
@@ -5201,8 +5202,12 @@ MUTATIONS = [
   '    "sent": "the forward went out from the vault. It confirms in 10 minutes.",',
   ['test_plain_slip', 'test_wake_agent']),
  ('the doorbell renders a sent forward as a rehearsal', 'gs_doorbell',
-  '            _ph = pending.result.get("phase") or ""\n            if _ph:',
-  '            _ph = pending.result.get("phase") or ""\n            if False:',
+  '            elif _ph:\n'
+  '                print(f"  [+] Vault finished job {pending.job}: "\n'
+  '                      f"{proto.PHASE_LINES.get(_ph, _ph)}")',
+  '            elif False:\n'
+  '                print(f"  [+] Vault finished job {pending.job}: "\n'
+  '                      f"{proto.PHASE_LINES.get(_ph, _ph)}")',
   ['test_wake_doorbell']),
  ('the pager renders a sent forward as a rehearsal', 'gs_telegram_pager',
   '                if phase and phase in proto.PHASE_LINES:',
@@ -5713,7 +5718,7 @@ MUTATIONS = [
  ('an unknown status word discards the whole answer', 'gs_doorbell',
   '            if not (isinstance(phase, str) and proto.phase_is_known(phase)):\n'
   '                self.events.append("result_phase_unknown")\n'
-  '                phase = ""',
+  '                phase = proto.PHASE_UNKNOWN',
   '            if not (isinstance(phase, str) and proto.phase_is_known(phase)):\n'
   '                raise Doorbell("result carries a status word this protocol "\n'
   '                               "has no meaning for")',
@@ -5914,6 +5919,39 @@ MUTATIONS = [
   '        if False:\n'
   '            if _marked < _pref + 1:',
   ['test_wake_agent']),
+ ('an unknown status word is blanked (a rehearsal, "nothing more", an '
+  'unanswered probe)', 'gs_doorbell',
+  '                self.events.append("result_phase_unknown")\n'
+  '                phase = proto.PHASE_UNKNOWN',
+  '                self.events.append("result_phase_unknown")\n'
+  '                phase = ""',
+  ['test_plain_slip', 'test_wake_doorbell', 'test_telegram_pager']),
+ ('a finished forward with a word this end lacks reads as a rehearsal',
+  'gs_telegram_pager',
+  '                if phase == proto.PHASE_UNKNOWN:\n'
+  '                    self.send(chat_id, f"{_cn}: {proto.PHASE_UNKNOWN_LINE}",',
+  '                if False:\n'
+  '                    self.send(chat_id, f"{_cn}: {proto.PHASE_UNKNOWN_LINE}",',
+  ['test_telegram_pager']),
+ ('a finished withdrawal with a word this end lacks gives the place back and '
+  'says nothing more was found', 'gs_telegram_pager',
+  '                _unknown = (res.get("phase") or "") == proto.PHASE_UNKNOWN',
+  '                _unknown = False',
+  ['test_telegram_pager']),
+ ('a forward answered with a word this end lacks goes stalled (nothing looks '
+  'at money that may have moved)', 'gs_telegram_pager',
+  '            if out == "done" and phase == proto.PHASE_UNKNOWN:\n'
+  '                # A WORD THIS END LACKS: the run finished, and whether the',
+  '            if False:\n'
+  '                # A WORD THIS END LACKS: the run finished, and whether the',
+  ['test_telegram_pager']),
+ ('a probe answered with a word this end lacks renders the raw word',
+  'gs_telegram_pager',
+  '                _line = (proto.PHASE_UNKNOWN_LINE\n'
+  '                         if phase == proto.PHASE_UNKNOWN\n'
+  '                         else proto.PHASE_LINES.get(phase, phase))',
+  '                _line = proto.PHASE_LINES.get(phase, phase)',
+  ['test_telegram_pager']),
 ]
 
 

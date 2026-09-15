@@ -744,9 +744,15 @@ class Pending:
             # discarded the same way. WIRE_VERSION is on no message, so a
             # pair on two builds has no other way to find out; the event
             # names it, on the terminal and in the chat.
+            # ...AND HANDED ON AS PHASE_UNKNOWN, NOT BLANKED (self-doubt
+            # over that fix): "" is a word of the vocabulary with a meaning
+            # of its own on every job -- a rehearsal, "nothing more was
+            # found", an unanswered probe -- and a blanked answer about
+            # money that moved read as one of those. A word outside the
+            # vocabulary reads as what it is everywhere.
             if not (isinstance(phase, str) and proto.phase_is_known(phase)):
                 self.events.append("result_phase_unknown")
-                phase = ""
+                phase = proto.PHASE_UNKNOWN
             self.result = {"status": status, "handle": handle, "slip": slip,
                            "plain": plain, "phase": phase}
             self.events.append("result_ok")
@@ -929,8 +935,11 @@ def make_handler(pending: Pending):
                     return self._reply(204)
                 except Doorbell:
                     # AUTHENTICATED AND THEN REFUSED, which is a different
-                    # fact: a duplicate result, a result naming another job, a
-                    # status this protocol has no word for. Reporting these as
+                    # fact: a duplicate result, a result naming another job
+                    # (a status word this protocol lacks is NOT refused any
+                    # more: the answer is kept, the word becomes
+                    # PHASE_UNKNOWN and result_phase_unknown names the
+                    # skew). Reporting these as
                     # "did not authenticate" would tell the operator a LAN
                     # host was posting noise when what happened is that the
                     # vault sent two answers. Same 204 on the wire either way,
@@ -1554,7 +1563,11 @@ def report(pending: Pending) -> int:
             _ph = pending.result.get("phase") or ""
             # NO HANDLE LINE. A withdrawal registers none, so printing one
             # would name a label nothing can be asked about.
-            if _ph:
+            if _ph == proto.PHASE_UNKNOWN:
+                # A WORD THIS BUILD LACKS: not "nothing more was found" --
+                # whether more remains is exactly what could not be read.
+                print(f"      {proto.PHASE_UNKNOWN_LINE} UPDATE BOTH BOXES.")
+            elif _ph:
                 print(f"      {proto.PHASE_LINES.get(_ph, _ph)}")
             else:
                 # NOT "nothing is left" -- see WITHDRAW_NO_MORE_LINE for the
@@ -1571,7 +1584,12 @@ def report(pending: Pending) -> int:
             # the line is the protocol's own sentence for it, the same one
             # the chat shows; without one it was a rehearsal.
             _ph = pending.result.get("phase") or ""
-            if _ph:
+            if _ph == proto.PHASE_UNKNOWN:
+                # NOT "a rehearsal": whether it went out is what could not
+                # be read.
+                print(f"  [+] Vault finished job {pending.job}: "
+                      f"{proto.PHASE_UNKNOWN_LINE} UPDATE BOTH BOXES.")
+            elif _ph:
                 print(f"  [+] Vault finished job {pending.job}: "
                       f"{proto.PHASE_LINES.get(_ph, _ph)}")
             else:
@@ -1582,7 +1600,10 @@ def report(pending: Pending) -> int:
         h = pending.result.get("handle") or "(none)"
         print(f"  [+] Vault finished job {pending.job}. Handle {h}.")
         phase = pending.result.get("phase") or ""
-        if phase:
+        if phase == proto.PHASE_UNKNOWN:
+            print(f"      Swap status: {proto.PHASE_UNKNOWN_LINE} UPDATE BOTH "
+                  f"BOXES.")
+        elif phase:
             print(f"      Swap status: {proto.PHASE_LINES.get(phase, phase)}")
         if pending.job in ("swap_status", "watch"):
             # A PROBE IS ANSWERED BY ITS PHASE LINE. It carries no slip and no

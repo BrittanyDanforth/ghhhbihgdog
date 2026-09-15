@@ -3262,9 +3262,9 @@ class Pager:
         # the return code; when they disagree, the honest answer wins.
         #
         # It is safe to trust here because it is not this box's word: the
-        # doorbell refuses any phase outside the protocol's closed table
-        # before this line can see it, which is also what stops the vault
-        # gaining a free-text channel into a chat.
+        # doorbell replaces any phase outside the protocol's closed table
+        # by PHASE_UNKNOWN before this line can see it, which is also what
+        # stops the vault gaining a free-text channel into a chat.
         #
         # ...AND IT IS SCOPED TO THE JOBS THAT ARGUMENT IS ABOUT, which are
         # the two that WATCH. For those, "your money has not arrived yet" is
@@ -3307,7 +3307,8 @@ class Pager:
                     chat_id, job, "failed" if out == "failed" else "stopped")
             self._btc_forward_result(
                 (params or {}).get("handle") or "", out, _early, chat_id)
-        if _early and out != "done" and job in ("watch", "swap_status"):
+        if _early and _early != proto.PHASE_UNKNOWN and out != "done" \
+                and job in ("watch", "swap_status"):
             # THE LABEL, NOT THE HANDLE. This one branch still printed the
             # raw four hex characters, so the one reply an operator gets while
             # a probe is still in flight named a string the bot would then
@@ -3370,6 +3371,14 @@ class Pager:
             if job == "forward_to_swap":
                 # WITH A WORD, THE WORD'S OWN SENTENCE (sent / unsure): the
                 # forward went out, or may have. Without one, a rehearsal.
+                # WITH A WORD THIS END LACKS (self-doubt over the fix
+                # pass): neither -- blanked, it read as a rehearsal about
+                # money that may have moved. The event line above said
+                # what happened; this says only that it finished.
+                if phase == proto.PHASE_UNKNOWN:
+                    self.send(chat_id, f"{_cn}: {proto.PHASE_UNKNOWN_LINE}",
+                              buttons=self._handle_buttons(h, job, chat_id))
+                    return
                 if phase and phase in proto.PHASE_LINES:
                     self.send(chat_id, f"{_cn}: {proto.PHASE_LINES[phase]}",
                               buttons=self._handle_buttons(h, job, chat_id))
@@ -3403,9 +3412,13 @@ class Pager:
                 # The sentence comes from the protocol's own table so this box
                 # cannot invent a reassurance, and the word it renders was
                 # checked against a closed set by the doorbell before it got
-                # here.
-                self.send(chat_id,
-                          f"{_cn}: {proto.PHASE_LINES.get(phase, phase)}",
+                # here -- or replaced by PHASE_UNKNOWN, which has its one
+                # sentence here and touches no place (self-doubt over the
+                # fix pass: blanked, it fell through to the deposit lines).
+                _line = (proto.PHASE_UNKNOWN_LINE
+                         if phase == proto.PHASE_UNKNOWN
+                         else proto.PHASE_LINES.get(phase, phase))
+                self.send(chat_id, f"{_cn}: {_line}",
                           buttons=self._phase_buttons(phase, h, job, chat_id))
                 return
             # A FINISHED SPEND IS NOT A READY DEPOSIT, and it used to be
@@ -3475,6 +3488,11 @@ class Pager:
                 # own word, and this end says "in a while" rather than
                 # arming a leg that would find nothing spendable yet.
                 _locked = (res.get("phase") or "") == "more_locked"
+                # A WORD THIS END LACKS (self-doubt over the fix pass):
+                # whether more remains is what could not be read, so it is
+                # neither "nothing more" nor a next leg, and the place is
+                # kept rather than given back on a guess.
+                _unknown = (res.get("phase") or "") == proto.PHASE_UNKNOWN
                 _leg = self._chain_leg
                 # SAID FROM NOWHERE, so it cannot lean on a conversation the
                 # reader may not have in front of them.
@@ -3548,6 +3566,9 @@ class Pager:
                            "More is here but still unlocking — /withdraw "
                            "again in a while."
                            if _locked else
+                           "Whether more remains could not be read here — "
+                           "/withdraw again later to see."
+                           if _unknown else
                            proto.WITHDRAW_NO_MORE_LINE))
                 # ONE RETRY, like the slip path, and for a sharper reason.
                 # This is the ONLY notification that a spend completed, at the
@@ -3578,7 +3599,7 @@ class Pager:
                 # THE PLACE IS GIVEN BACK when nothing of this owner's is
                 # left -- not while more remains or is unlocking, which is
                 # still a deposit in flight.
-                if not (_more or _locked):
+                if not (_more or _locked or _unknown):
                     self._drop_place(chat_id)
                 else:
                     self._hold_place(chat_id)
@@ -5165,6 +5186,12 @@ class Pager:
                 # per --btc-recheck window (_btc_kept_due), so an operator
                 # who raised the bound or moved the money is heard.
                 self._btc_sent_set().add(h)
+            if out == "done" and phase == proto.PHASE_UNKNOWN:
+                # A WORD THIS END LACKS (self-doubt over the fix pass): the
+                # forward finished and what it did cannot be read here.
+                # The forward's question until it can be: the next tap
+                # asks the forward, not the XMR side.
+                self._btc_sent_set().discard(h)
             e = opened.get(h)
             if (not e and out == "done"
                     and phase in ("sent", "unsure", "forwarded", "kept")
@@ -5196,6 +5223,21 @@ class Pager:
                     # ...and so do the waits after a forward the vault found
                     # early: it got past the look.
                     e.pop("early_tries", None)
+            if out == "done" and phase == proto.PHASE_UNKNOWN:
+                # A WORD THIS END LACKS: the run finished, and whether the
+                # money went is exactly what could not be read. Blanked,
+                # this read as a rehearsal and the entry went `stalled` --
+                # nothing looked at it again -- about money that may have
+                # moved. Handled as `unsure` instead: kept on the list as
+                # sent, the recheck due once a window, until an answer
+                # this end can read (or the boxes are updated, which the
+                # event line asked for).
+                e["state"] = "sent"
+                e["word"] = "unsure"
+                e["sent_at"] = time.time()
+                e.pop("retry_after", None)
+                e.pop("fee_tries", None)
+                return
             if out == "done" and phase in ("sent", "unsure"):
                 # Gone from the address, or may be: the vault's word is the
                 # phase line the forward branch renders. KEPT on the list as

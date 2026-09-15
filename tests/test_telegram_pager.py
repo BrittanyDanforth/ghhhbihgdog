@@ -5870,6 +5870,97 @@ check("...and when the entry VANISHES while the looks run, the recheck is "
       len(_qj9b) == _q9b_n
       and all(isinstance(c, int) for c, _j, _pp in _qj9b))
 
+# A STATUS WORD THIS END LACKS IS NOT A BLANK (self-doubt over the fix pass).
+# "" is a word of the vocabulary with a meaning of its own on every job: a
+# finished forward with "" is a rehearsal ("Nothing was sent"), a finished
+# withdrawal with "" is "nothing more was found" and gives the place back,
+# a probe with "" falls through to the deposit lines. Blanking a newer
+# vault's word made its answer about money that moved read as each of
+# those. The doorbell now hands on PHASE_UNKNOWN, a word outside the
+# vocabulary, and every consumer says one sentence and moves nothing.
+print("\n== a status word this end lacks ==")
+
+
+def _unknown_run(job, params, handle="", pre=None):
+    """A job whose answer carries PHASE_UNKNOWN, through the REAL start_job
+    and poke with the doorbell stubbed. Returns (pager, texts)."""
+    _up, _us, _, _ = _tapper()
+    _up.start_job = pg.Pager.start_job.__get__(_up, pg.Pager)
+    if pre:
+        pre(_up)
+
+    class _Odd:
+        def __init__(self):
+            self.result = {"status": "done", "handle": handle, "slip": "",
+                           "plain": {}, "phase": pg.proto.PHASE_UNKNOWN}
+            self.events = ["result_phase_unknown"]
+
+        def outcome(self):
+            return "done"
+
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(run_wake=lambda *a, **k: _Odd())
+        _up.start_job(111, job, params)
+        for _ in range(600):
+            if not _up.busy.locked() and _up._chain is None:
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _up, [t for t, _b in _us]
+
+
+def _pre_fwd(p):
+    p._btc_register("B4A1", _BTC_ADDR, 111)
+    p.btc_open["B4A1"]["state"] = "forwarding"
+    p.btc_open["B4A1"]["said"].add("confirmed")
+
+
+_uf, _ufm = _unknown_run("forward_to_swap", {"handle": "B4A1"}, "B4A1",
+                         pre=_pre_fwd)
+check("a finished FORWARD with a word this end lacks: the event sentence, "
+      "then one closed sentence -- never 'Nothing was sent' (a rehearsal) "
+      "about money that may have moved",
+      any("word this end does not have yet" in t for t in _ufm)
+      and any(pg.proto.PHASE_UNKNOWN_LINE in t for t in _ufm)
+      and not any("Nothing was sent" in t for t in _ufm)
+      and not any("signed on the machine" in t for t in _ufm)
+      and pg.proto.PHASE_UNKNOWN not in "\n".join(_ufm))
+check("...and the watch list treats it as `unsure`: the entry is sent with "
+      "the word unsure (a recheck once a window), not stalled, and the next "
+      "tap asks the forward, not the other side",
+      _uf.btc_open["B4A1"]["state"] == "sent"
+      and _uf.btc_open["B4A1"].get("word") == "unsure"
+      and "B4A1" not in _uf._btc_sent_set())
+check("...the sentence carries no digit and none of the banned words",
+      not re.search(r"\d", pg.proto.PHASE_UNKNOWN_LINE)
+      and not re.search(r"\b(vault|thinkpad|keyfile|tor|wallet|swap|memo|"
+                        r"btc|bitcoin|xmr|monero|hop|mix)\b",
+                        pg.proto.PHASE_UNKNOWN_LINE, re.I)
+      and pg.proto.PHASE_UNKNOWN not in pg.proto.PHASES
+      and pg.proto.PHASE_UNKNOWN not in pg.proto.PHASE_LINES)
+_uw, _uwm = _unknown_run("withdraw", {"exit_to": ["4" + "8" * 94],
+                                      "depth": 2})
+check("a finished WITHDRAWAL with a word this end lacks says the spend went "
+      "and that whether more remains could not be read -- never 'nothing "
+      "more was found', never a next leg -- and KEEPS the place",
+      any("sent." in t and "could not be read" in t for t in _uwm)
+      and not any(pg.proto.WITHDRAW_NO_MORE_LINE in t for t in _uwm)
+      and not any("another is starting" in t.lower() for t in _uwm)
+      and pg.owner_token(_uw.key, 111) in _uw._places()
+      and _uw._chain is None)
+_us_, _usm = _unknown_run("swap_status", {"handle": "A3F1"}, "A3F1")
+check("a PROBE answered with a word this end lacks gets the one sentence: "
+      "never the raw word, never the deposit lines ('quoted', 'payment "
+      "details')",
+      any(pg.proto.PHASE_UNKNOWN_LINE in t for t in _usm)
+      and not any("quoted" in t for t in _usm)
+      and not any("payment details" in t.lower() for t in _usm)
+      and pg.proto.PHASE_UNKNOWN not in "\n".join(_usm))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

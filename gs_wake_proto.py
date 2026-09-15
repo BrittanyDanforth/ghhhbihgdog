@@ -889,6 +889,23 @@ def phase_is_known(word) -> bool:
 WITHDRAW_NO_MORE_LINE = ("Nothing more was found to send: none is here, too "
                          "little to send on, or it could not be checked.")
 
+#: A STATUS WORD THIS BUILD DOES NOT HAVE, as the doorbell hands it on. It
+#: is NOT in PHASES on purpose: "" is a member of the vocabulary with a
+#: job-specific meaning of its own -- a finished forward with "" is a
+#: rehearsal, a finished withdrawal with "" is "nothing more was found",
+#: a probe with "" is unanswered -- so blanking an unknown word made a
+#: newer vault's answer about money that moved read as "nothing was sent",
+#: dropped a client's place after a withdrawal, and left a probe on the
+#: deposit sentence (self-doubt over the fix pass). A word outside the
+#: vocabulary cannot be mistaken for any of those: every consumer reads it
+#: as "the answer is here and its word is not", says this one sentence,
+#: and leaves the place, the entry and the next step as they were. A
+#: vault that sent this literal word is treated the same way, which is
+#: also right.
+PHASE_UNKNOWN = "unknown"
+PHASE_UNKNOWN_LINE = ("finished, with a status word this end cannot read yet. "
+                      "Ask again later.")
+
 PHASE_LINES = {
     "not_yet": "nothing on the address yet. Normal — ask again in a while.",
     # RECEIVED, AND NOT YET SPENDABLE, in those words. "Something arrived and
