@@ -4476,12 +4476,12 @@ MUTATIONS = [
   '    if False:',
   ['test_btc_forwarder']),
  ('a worst case that rounds to nothing writes a zero floor', 'btc_forwarder',
-  '    if floor < 1:',
+  '    if floor < 1 or worst_xmr <= 0:',
   '    if False:',
   ['test_btc_forwarder']),
- ('the floor forgets its 1% rounding margin', 'btc_forwarder',
-  '    floor = int(worst_xmr * Decimal(10 ** 8) * Decimal("0.99"))',
-  '    floor = int(worst_xmr * Decimal(10 ** 8))',
+ ('the floor forgets its margin (the whole quote as the limit)', 'btc_forwarder',
+  '    floor = int(expected_xmr * Decimal(10 ** 8) * (10000 - margin) / 10000)',
+  '    floor = int(expected_xmr * Decimal(10 ** 8))',
   ['test_btc_forwarder']),
  ('the rewritten limit is computed but never written into the memo',
   'btc_forwarder',
@@ -5671,10 +5671,11 @@ MUTATIONS = [
   '                if False:\n'
   '                    continue',
   ['test_wake_agent']),
- ('the fee is the bound times the rate exactly (a formula on the chain)',
-  'btc_forwarder',
-  '        fee_sat += max(0, min(int(FEE_JITTER(vsize_bound)), _room))',
-  '        fee_sat += 0',
+ ('the fee is the bound times the rate exactly (a formula on the chain)', 'btc_forwarder',
+  '        _jit = max(0, min(int(FEE_JITTER(vsize_bound)), _room))\n'
+  '        fee_sat += _jit',
+  '        _jit = 0\n'
+  '        fee_sat += _jit',
   ['test_btc_forwarder']),
  ('the fee jitter can push a floor deposit into a refusal',
   'btc_forwarder',
@@ -5836,6 +5837,27 @@ MUTATIONS = [
   '                elif "refund_fee_unknown" not in _said:',
   '                elif False:',
   ['test_wake_agent']),
+ ("the limit's margin is a constant (one public ratio again)",
+  'btc_forwarder',
+  '    return LIMIT_MARGIN_MIN_BPS + secrets.randbelow(\n'
+  '        max(0, LIMIT_MARGIN_MAX_BPS - LIMIT_MARGIN_MIN_BPS) + 1)',
+  '    return LIMIT_MARGIN_MAX_BPS',
+  ['test_btc_forwarder']),
+ ('the floor ignores the drawn margin (0.891 of the quote, for ever)',
+  'btc_forwarder',
+  '    floor = int(expected_xmr * Decimal(10 ** 8) * (10000 - margin) / 10000)',
+  '    floor = int(expected_xmr * Decimal(10 ** 8) * Decimal("0.891"))',
+  ['test_btc_forwarder']),
+ ('a drawn margin over the tolerance writes a limit under what the watcher '
+  'accepts', 'btc_forwarder',
+  '    margin = min(max(int(LIMIT_MARGIN_BPS()), 0), int(LIMIT_MARGIN_MAX_BPS))',
+  '    margin = int(LIMIT_MARGIN_BPS())',
+  ['test_btc_forwarder']),
+ ('a send the fee jitter alone took under a live dust threshold is refused by '
+  'chance', 'btc_forwarder',
+  '            if send_sat + _jit >= dust:',
+  '            if False:',
+  ['test_btc_forwarder']),
 ]
 
 

@@ -174,8 +174,29 @@ def _limit_jitter(cap):
     return secrets.randbelow(max(0, int(cap)) + 1)
 
 
+#: THE LIMIT'S MARGIN IS DRAWN PER FORWARD (self-doubt over the fix pass).
+#: The jitter above killed the "99 times an integer" test, but the limit
+#: it was taken from was still 0.99 of 0.90 of the quote: a public RATIO,
+#: 0.891 to five decimals, and Midgard lists every swap's memo, in and out
+#: amounts -- a soft but sharp classifier over the BTC->XMR inbounds. Now
+#: the margin under the quote is drawn once per forward from the band
+#: common wallet settings cover (3% to the arrival tolerance, in basis
+#: points), so the ratio is a band the population shares, not a number.
+#: Never above the tolerance: a swap that executes lands at or above what
+#: the watcher accepts, and a tighter limit only refunds sooner.
+LIMIT_MARGIN_MIN_BPS = 300
+LIMIT_MARGIN_MAX_BPS = 1000
+
+
+def _limit_margin():
+    """LIMIT_MARGIN_MIN_BPS..LIMIT_MARGIN_MAX_BPS basis points, uniform."""
+    return LIMIT_MARGIN_MIN_BPS + secrets.randbelow(
+        max(0, LIMIT_MARGIN_MAX_BPS - LIMIT_MARGIN_MIN_BPS) + 1)
+
+
 FEE_JITTER = _fee_jitter
 LIMIT_JITTER = _limit_jitter
+LIMIT_MARGIN_BPS = _limit_margin
 #: The slippage the arrival watcher accepts, mirrored from
 #: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
 ARRIVAL_TOLERANCE = Decimal("0.10")
@@ -451,13 +472,16 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
     which ThorChain refunds instead of executing. Aggregators routinely
     quote it as 0 (THORChain's own example memo is ":0/1/0"), and a zero or
     empty limit executes at ANY price. This tool lays the OP_RETURN out
-    itself, so it writes its own floor into the memo -- the worst-case
-    arrival it already gates on, less a 1% rounding margin -- whenever the
-    quote's limit is absent, zero, or lower. A higher limit the aggregator
-    chose is kept as written (stricter is fine) UNLESS it is above the
-    quote's own expected output: that swap can only refund, minus the
-    outbound fee, so it is refused. A limit field that is not a number is
-    refused too: a memo this tool cannot read is not one it should rewrite.
+    itself, so it writes its own floor into the memo -- the expected output
+    less a margin drawn per forward (LIMIT_MARGIN_BPS, never over the
+    arrival tolerance the watcher gates on) -- whenever the quote's limit
+    is absent, zero, or lower. A higher limit the aggregator chose is kept
+    as written (stricter is fine) UNLESS it is above the quote's own
+    expected output: that swap can only refund, minus the outbound fee, so
+    it is refused. A limit field that is not a number is refused too: a
+    memo this tool cannot read is not one it should rewrite. `worst_xmr`
+    is the watcher's floor, kept in the call so the two gates are read
+    side by side; the margin's ceiling is what keeps the limit above it.
     Only the limit is ever touched -- the streaming interval/quantity and
     every other field stay byte for byte -- so the destination binding
     checked before still holds; it is checked AGAIN on the result anyway.
@@ -487,16 +511,19 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
                       "the memo's output limit field is not a number; "
                       "refusing to rewrite a memo this tool cannot read")
     quoted = int(Decimal(lim_text)) if lim_text else 0
-    floor = int(worst_xmr * Decimal(10 ** 8) * Decimal("0.99"))
-    if floor < 1:
+    # THE FLOOR: the expected output less the margin drawn for this
+    # forward, clamped to 0..LIMIT_MARGIN_MAX_BPS (the arrival tolerance,
+    # so the limit never sits under what the watcher accepts and a swap
+    # that executes is never `short` by the memo's own doing).
+    margin = min(max(int(LIMIT_MARGIN_BPS()), 0), int(LIMIT_MARGIN_MAX_BPS))
+    floor = int(expected_xmr * Decimal(10 ** 8) * (10000 - margin) / 10000)
+    if floor < 1 or worst_xmr <= 0:
         raise Refused("memo_bad_limit",
                       "the worst-case arrival rounds to nothing in base "
                       "units; no floor can be written")
-    # ...LESS A LITTLE (LIMIT_JITTER), so the limit written is not 99
-    # times anything: at most LIMIT_JITTER_MAX base units and 1% of the
-    # floor, never below 1. The floor is a rounding margin under the
-    # worst case the watcher already accepts; a hundredth of it less is
-    # still that.
+    # ...LESS A LITTLE (LIMIT_JITTER), so the limit written is not the
+    # margin times anything either: at most LIMIT_JITTER_MAX base units
+    # and 1% of the floor, never below 1.
     floor = max(1, floor - int(LIMIT_JITTER(min(LIMIT_JITTER_MAX,
                                                 floor // 100))))
     ceiling = int(expected_xmr * Decimal(10 ** 8))
@@ -2138,7 +2165,8 @@ def main(argv=None):
         # than a refusal the floor said could not happen.
         _room = min(settled_sat - fee_sat - int(args.min_send_sat),
                     int(settled_sat * MAX_FEE_FRACTION) - fee_sat)
-        fee_sat += max(0, min(int(FEE_JITTER(vsize_bound)), _room))
+        _jit = max(0, min(int(FEE_JITTER(vsize_bound)), _room))
+        fee_sat += _jit
         send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
     except Refused as e:
         # A REFUSAL ABOUT TODAY'S FEE IS A WORD, NOT A DEAD END (STAGE5_PLAN.md
@@ -2177,9 +2205,20 @@ def main(argv=None):
                                                  args.tor_proxy)
         cross_checked = True
         if dust is not None and send_sat < dust:
-            raise Refused("below_thor_dust",
-                          "ThorChain's live dust threshold is above what "
-                          "this forward would carry; it would be ignored")
+            if send_sat + _jit >= dust:
+                # ONLY THE FEE'S JITTER PUT IT UNDER (self-doubt over the
+                # fix pass): the room the jitter was given knew the floor
+                # and the fee fraction, not a live dust threshold above
+                # the floor, so a send within one bound of it was signed
+                # on some draws and refused on others. Deterministic now:
+                # the jitter gives back what the threshold needs. The
+                # quote stands (it was for a little less; more arrives).
+                fee_sat -= dust - send_sat
+                send_sat = dust
+            else:
+                raise Refused("below_thor_dust",
+                              "ThorChain's live dust threshold is above what "
+                              "this forward would carry; it would be ignored")
     integrity_log("forward", "quoted")
 
     # 5-6. build, and sign unless plan-only

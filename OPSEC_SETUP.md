@@ -2133,14 +2133,27 @@ into the memo was EXACTLY 99 times an integer (six decimals of Monero,
 times 1e8, times 0.99). Two formulas anyone holding this source can test
 against every ThorChain inbound on the public chain: together they picked
 out this host's forwards with one false positive in about 27,000, and
-through them every client's deposit address. Both now carry a little
-randomness from the system's CSPRNG — the fee is the bound times the rate
-plus 0..bound-1 satoshis, never a satoshi the deposit cannot bear (at the
-exact floor there is no room and no jitter, never a refusal); the limit is
-the floor less up to 5000 base units and 1% of it — so neither divides by
-anything an observer can compute. What remains is the shape: two outputs,
-one OP_RETURN, every input from one address, which is what any single
-ThorChain deposit looks like.
+through them every client's deposit address. Both now carry randomness
+from the system's CSPRNG — the fee is the bound times the rate plus
+0..bound-1 satoshis, never a satoshi the deposit cannot bear (at the exact
+floor there is no room and no jitter, never a refusal); the limit is the
+quote less a margin drawn per forward across the band common wallet
+settings cover (3% to the 10% arrival tolerance), less up to 5000 base
+units — so neither divides by anything an observer can compute, and the
+limit's ratio to the quote is a band the population shares, not a number
+(it was 0.891 to five decimals after the first fix, a ratio Midgard's swap
+list lets anyone test). What remains are SOFT signals, and you should
+know them: no change output (a wallet-built deposit usually has one); a
+four-field memo with the affiliate decoration dropped, which some
+integrations write and most wallets do not; a fee above the public
+estimate by the ratio of the size bound to the real size (the bound
+assumes the largest inbound script and your whole OP_RETURN policy, so a
+policy close to the real memo length keeps that ratio small); and, for a
+deposit within a few bounds of the floor with fees at the ceiling, no
+room for the jitter. None is a test with one false positive in
+thousands; together they are a classifier an observer would have to
+train, not compute. A policy near the real memo length and deposits well
+above the floor keep it soft.
 
 It prints the intake floor beside the ceiling it follows from — the
 smallest deposit this pair can send on when fees are at its

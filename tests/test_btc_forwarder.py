@@ -78,6 +78,7 @@ F = load("btc_forwarder")
 # it is named, at the end.
 F.FEE_JITTER = lambda bound: 0
 F.LIMIT_JITTER = lambda cap: 0
+F.LIMIT_MARGIN_BPS = lambda: 1000                # the tolerance: 90% of expected
 import gs_btc_tx as T                                        # noqa: E402
 import gs_btc_watch as W                                     # noqa: E402
 import gs_common as C                                        # noqa: E402
@@ -657,13 +658,15 @@ check("...an affiliate fee within --max-affiliate-bps is accepted and "
 print("\n== THE LIMIT IS SET, NOT TRUSTED: the chain's only slippage guard ==")
 # THORChain's own example memo carries ":0/1/0" -- a swap at ANY price --
 # and aggregators quote it that way. The forwarder lays the OP_RETURN out
-# itself, so it writes its own floor (99% of the worst-case arrival, in
-# 1e8 base units) into the memo whenever the quote's limit is absent, zero
-# or lower. The limit is the ONLY field touched.
+# itself, so it writes its own floor (the expected output less a margin
+# drawn per forward -- pinned here to the arrival tolerance, 10% -- in 1e8
+# base units) into the memo whenever the quote's limit is absent, zero or
+# lower. The limit is the ONLY field touched.
 
 
-def _floor_of(plan):
-    return int(Decimal(plan["worst_case_xmr"]) * 10 ** 8 * Decimal("0.99"))
+def _floor_of(plan, margin_bps=1000):
+    return int(Decimal(plan["expected_xmr"]) * 10 ** 8
+               * (10000 - margin_bps) / 10000)
 
 
 def _limit_case(memo_in, policy=255):
@@ -679,11 +682,14 @@ check("a ZERO limit (THORChain's example) is SIGNED, with the floor written "
       and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan)}/1/0"
       and _plan["memo_limit_base_units"] == _floor_of(_plan)
       and _floor_of(_plan) > 0)
-check("...the floor is 99% of the worst case, which is 90% of expected",
+check("...the floor is the expected output less the margin (the tolerance "
+      "here), never under the worst case the watcher accepts",
       _floor_of(_plan)
-      == int(Decimal(_plan["worst_case_xmr"]) * 10 ** 8 * Decimal("0.99"))
+      == int(Decimal(_plan["expected_xmr"]) * 10 ** 8 * Decimal("0.9"))
       and Decimal(_plan["worst_case_xmr"])
-      < Decimal(_plan["expected_xmr"]))
+      < Decimal(_plan["expected_xmr"])
+      and _floor_of(_plan)
+      >= int(Decimal(_plan["worst_case_xmr"]) * 10 ** 8) - 100)
 check("...the memo AS QUOTED is kept beside it, unchanged",
       _plan["memo_quoted"] == "=:XMR.XMR:" + _DEST + ":0/1/0"
       and _plan["memo_quoted"] != _plan["memo"])
@@ -764,18 +770,36 @@ def _direct(fn, *a, **kw):
 
 _E, _W = Decimal("1.5"), Decimal("0.5")                   # expected, worst
 check("a limit in scientific notation (the chain accepts 1e8) parses, is "
-      "over the floor, and is kept in ITS notation",
-      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:1e8/1/0", _E, _W, 0)
+      "over the floor (90% of a 1.0 quote), and is kept in ITS notation",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:1e8/1/0", Decimal("1.0"),
+              _W, 0)
       == ("ok", ("=:XMR.XMR:x:1e8/1/0", 100000000, 0, False)))
-check("the floor is int(worst * 1e8 * 0.99), and 0 is raised to exactly it",
+check("the floor is int(expected * 1e8 * (1 - margin)) -- the margin pinned "
+      "to 10% -- and 0 is raised to exactly it",
       _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True)))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True)))
 check("one base unit under the floor is raised; the floor itself is kept",
-      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:49499999/1/0", _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
-      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:49500000/1/0",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:134999999/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True))
+      and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:135000000/1/0",
                   _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, False)))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, False)))
+_saved_margin = F.LIMIT_MARGIN_BPS
+F.LIMIT_MARGIN_BPS = lambda: 300
+check("a margin of 3% writes 97% of the expected output; a draw over the "
+      "tolerance is clamped to it and a negative one to zero (the limit "
+      "never under what the watcher accepts, never over the quote)",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:145500000/1/0", 145500000, 0, True)))
+F.LIMIT_MARGIN_BPS = lambda: 5000
+check("...clamped: a draw of 50% still writes 90%",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True)))
+F.LIMIT_MARGIN_BPS = lambda: -7
+check("...and a negative draw writes the whole expected output",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", _E, _W, 0)
+      == ("ok", ("=:XMR.XMR:x:150000000/1/0", 150000000, 0, True)))
+F.LIMIT_MARGIN_BPS = _saved_margin
 check("a limit of exactly the expected output is kept; one over is refused",
       _direct(F.enforce_memo_terms, "=:XMR.XMR:x:150000000/1/0",
               _E, _W, 0)[0] == "ok"
@@ -788,25 +812,25 @@ check("a worst case that rounds to nothing in base units is refused: no "
 check("the affiliate fields are read from positions 4-5 and the fee is "
       "capped by the policy passed in",
       _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:30", _E, _W, 30)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:30", 49500000, 30, True))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0:name:30", 135000000, 30, True))
       and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:31",
                   _E, _W, 30) == ("refused", "memo_affiliate_fee"))
 check("affiliate fields at 0 bps are dropped (a name, an empty name, a "
       "name with no fee field); fields THIS tool does not read after the "
       "fee keep everything; a fee the policy allows keeps the fields",
       _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:0", _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True))
       and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0::0", _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True))
       and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name", _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0", 49500000, 0, True))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True))
       and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:0:evm:x",
                   _E, _W, 0)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:0:evm:x", 49500000, 0,
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0:name:0:evm:x", 135000000, 0,
                  True))
       and _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0:name:5", _E, _W,
                   10)
-      == ("ok", ("=:XMR.XMR:x:49500000/1/0:name:5", 49500000, 5, True)))
+      == ("ok", ("=:XMR.XMR:x:135000000/1/0:name:5", 135000000, 5, True)))
 check("the memo bound the pairing enforces is the forward's own arithmetic: "
       "op and asset, a 95-character address, a 16-digit limit, '/1/0'",
       C.SWAP_MEMO_MAX_BYTES == len("=:XMR.XMR:") + 95 + 1 + 16 + 4
@@ -2869,8 +2893,92 @@ check("the default limit jitter is 0..cap and not constant (a cap of 0 "
       all(0 <= d <= 5000 for d in _ldraws) and len(_ldraws) > 20
       and F._limit_jitter(0) == 0)
 _srcF = open(F.__file__, encoding="utf-8").read()
-check("both draw from the system CSPRNG (secrets), never the random module",
-      _srcF.count("secrets.randbelow(") == 2 and "import random" not in _srcF)
+check("all three draw from the system CSPRNG (secrets), never the random "
+      "module",
+      _srcF.count("secrets.randbelow(") == 3 and "import random" not in _srcF)
+# THE LIMIT'S RATIO TO THE QUOTE IS A BAND, NOT A NUMBER (self-doubt over
+# the fix): the jitter killed the "99 times an integer" test, but the limit
+# was still 0.99 of 0.90 of the quote -- 0.891 to five decimals, a public
+# ratio Midgard's swap list lets anyone test. The margin is now drawn per
+# forward across the band common wallet settings cover.
+_mdraws = {F._limit_margin() for _ in range(400)}
+check("the default margin is drawn in 300..1000 basis points (3% to the "
+      "arrival tolerance) and is not constant",
+      all(F.LIMIT_MARGIN_MIN_BPS <= d <= F.LIMIT_MARGIN_MAX_BPS
+          for d in _mdraws) and len(_mdraws) > 20
+      and F.LIMIT_MARGIN_MIN_BPS == 300
+      and F.LIMIT_MARGIN_MAX_BPS == int(F.ARRIVAL_TOLERANCE * 10000))
+_saved_margin = F.LIMIT_MARGIN_BPS
+F.LIMIT_MARGIN_BPS = lambda: 300
+_pm3, _, _ = _first_send()
+F.LIMIT_MARGIN_BPS = lambda: 740
+_pm7, _, _ = _first_send()
+F.LIMIT_MARGIN_BPS = _saved_margin
+check("two forwards with two draws write two different ratios of limit to "
+      "quote (0.97 and 0.926), each the expected output less its own margin",
+      _pm3["memo_limit_base_units"] == _floor_of(_pm3, 300)
+      and _pm7["memo_limit_base_units"] == _floor_of(_pm7, 740)
+      and _pm3["expected_xmr"] == _pm7["expected_xmr"]
+      and _pm3["memo_limit_base_units"] > _pm7["memo_limit_base_units"]
+      > int(Decimal(_pm7["worst_case_xmr"]) * 10 ** 8))
+# A BUMP UNDER A JITTERED FEE. The original paid bound*rate + j; a
+# replacement must pay at least the original plus one bound (BIP125 rule
+# 4), so with any j >= 1 its rate is the paid rate plus TWO, not one, and
+# a ceiling of paid + 1 refuses it. Arithmetically right; pinned here so
+# the plan's "paid + 1" reads as what it is: the floor, not the usual.
+F.FEE_JITTER = lambda bound: bound - 1
+_pJ, _ofJ, _hxJ = _first_send()
+F.FEE_JITTER = lambda bound: 0
+check("(setup) the first send paid the bound times the rate plus bound-1",
+      _pJ["fee_sat"] == _pJ["vsize_bound"] * 10 + _pJ["vsize_bound"] - 1
+      and _pJ["feerate_target_sat_vb"] == 10)
+_age_plan(_ofJ, 3 * 3600)
+_nJ1 = Net(utxos=[], spends=[_listed(_pJ, _hxJ, height=0)], fee=11,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nJ1, _ofJ, "--feerate-ceiling", "11")
+check("stuck at 10 with the estimate at 11 and a ceiling of 11: the "
+      "replacement would have to pay 12 (one bound over a jittered fee), so "
+      "it is refused bump_over_ceiling (delayed) and the original stands",
+      _c == F.EXIT_REFUSED and "bump_over_ceiling" in _o
+      and _status_of(_ofJ) == "delayed" and _nJ1.submits == [])
+_nJ2 = Net(utxos=[], spends=[_listed(_pJ, _hxJ, height=0)], fee=11,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nJ2, _ofJ)
+check("...under the default ceiling it is bumped at 12 sat/vB, paying at "
+      "least the original's fee plus one bound",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "bumped"
+      and _p["feerate_target_sat_vb"] == 12
+      and _p["fee_sat"] >= _pJ["fee_sat"] + _p["vsize_bound"]
+      and _p["replaces"] == _pJ["txid"])
+# THE DUST CHECK IS NOT A COIN FLIP. The jitter's room knew the floor and
+# the fee fraction, not a live dust threshold above the floor: a send
+# within one bound of it was signed on some draws and refused on others.
+_p0J, _, _ = _first_send()                            # jitter pinned to 0
+_fee0J = _p0J["fee_sat"]
+_dustN = [{"chain": "BTC", "address": _INBOUND, "halted": False,
+           "dust_threshold": "11200"}]
+F.FEE_JITTER = lambda bound: 200
+# 11,260 sat would go on before the jitter (the deposit is 13,800 with a
+# 2,540 fee, so the fee fraction leaves the draw its full 200); the draw
+# takes it to 11,060, under the live threshold of 11,200.
+_cD, _oD, _pD, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                   "value": 11260 + _fee0J,
+                                   "confirmations": 5}],
+                           thornode=_dustN), "--thornode", "https://t")
+F.FEE_JITTER = lambda bound: 0
+check("a send of 11,260 sat that a draw of 200 took under a live dust "
+      "threshold of 11,200 is signed AT the threshold: the jitter gives "
+      "back the 140 it needs, never a refusal by chance",
+      _cD == 0 and _pD["send_sat"] == 11200
+      and _pD["fee_sat"] == _fee0J + 60)
+_cD2, _oD2, _pD2, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                      "value": 11160 + _fee0J,
+                                      "confirmations": 5}],
+                              thornode=_dustN), "--thornode", "https://t")
+check("...and a send under the threshold with NO jitter at all is refused "
+      "below_thor_dust, as before -- the refusal is about the deposit, not "
+      "the draw",
+      _cD2 == F.EXIT_REFUSED and "below_thor_dust" in _oD2 and _pD2 is None)
 _p0, _of0, _ = _first_send()                          # jitter pinned to 0
 F.FEE_JITTER = lambda bound: 7
 _p7, _of7, _hx7 = _first_send()
@@ -2898,13 +3006,13 @@ check("...and the jitter never takes the fee past the fee fraction: at "
 F.FEE_JITTER = lambda bound: 0
 F.LIMIT_JITTER = lambda cap: 1
 _code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
-check("a limit jitter of 1 writes the floor LESS ONE into the memo: no "
-      "longer 99 times anything",
+check("a limit jitter of 1 writes the floor LESS ONE into the memo: not the "
+      "margin times anything",
       _code == 0 and _plan["memo_limit_set"] is True
       and _plan["memo_limit_base_units"] == _floor_of(_plan) - 1
       and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan) - 1}/1/0"
-      and _floor_of(_plan) % 99 == 0
-      and (_floor_of(_plan) - 1) % 99 != 0)
+      and _floor_of(_plan) % 9 == 0
+      and (_floor_of(_plan) - 1) % 9 != 0)
 F.LIMIT_JITTER = lambda cap: cap
 _code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
 check("the largest draw takes at most LIMIT_JITTER_MAX base units and 1% "

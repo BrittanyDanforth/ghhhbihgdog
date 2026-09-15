@@ -155,7 +155,11 @@ If `due`: kind `reconcile_bumped`; return
   against what the look returned; `confirmations` = the greater of
   `--min-conf` and what the plan recorded -- they were settled when they
   were chosen and depth only grows) and to `settled_sat`;
-- raises the run's fee floor to `plan["feerate_target_sat_vb"] + 1`
+- raises the run's fee floor to the larger of
+  `plan["feerate_target_sat_vb"] + 1` and `ceil((old fee + bound) /
+  bound)` — with the fee's jitter (the Kerckhoffs pass) the old fee is
+  over the bound times the rate, so that is usually the paid rate plus
+  TWO; a ceiling of the paid rate plus one refuses the bump
   (`fee_band` then pays at least that; an estimate over the ceiling is
   still `delayed`, and the original stands);
 - runs the ordinary forward: quote for the new (smaller) amount, the
