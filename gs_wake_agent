@@ -4129,6 +4129,13 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                     handles[handle]["btc_index"] = _allocate_btc_index(
                         key, handles, unused=btc_unused)
                 except Refused:
+                    # ...AND THE SLIP PATH GOES WITH IT (fix pass after the
+                    # deep read): the record was saved naming a slip file
+                    # that was never written, and _deposit_pending tests
+                    # the FIELD, so a deposit nobody was ever shown held a
+                    # whole account reserve for two days and closed the
+                    # intake to the next client (at_capacity).
+                    handles[handle]["slip"] = None
                     _save_handles(artifact_dir, handles, led["owners"])
                     raise
         if job == "forward_to_swap":

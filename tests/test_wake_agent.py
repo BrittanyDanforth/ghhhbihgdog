@@ -5939,6 +5939,19 @@ check("a look nobody answered REFUSES the deposit (btc_lookup_failed): no "
       and _rec4(_d6, "B6A1").get("bundle")
       and not _rec4(_d6, "B6A1").get("btc_index")
       and "btc_lookup_failed" in _kinds)
+# ...AND "NO SLIP" IS TRUE OF THE RECORD (fix pass after the deep read): it
+# was saved naming a slip file that was never written, and _deposit_pending
+# tests the field, so a deposit nobody was ever shown held a whole account
+# reserve for two days and closed the intake to the next client.
+check("...the refused record names NO slip",
+      "slip" in _rec4(_d6, "B6A1") and _rec4(_d6, "B6A1")["slip"] is None)
+check("...so it holds no place in the account reserve",
+      A._deposit_pending(_rec4(_d6, "B6A1"), _BK, int(time.time())) is False)
+check("...and its bundle is the next deposit's (the same owner's, with "
+      "the wallet saying the address holds nothing)",
+      A._reusable_receive(_BK, json.loads(
+          (_d6 / A.HANDLES_FILE).read_text())["handles"],
+          balance=lambda k, a, s: 0, owner=OWNER) is not None)
 _d7, _runs7, _run7 = _btc_env("btc7_", handles={
     "A0A0": {"bundle": "/x/w.json", "minted": 1, "btc_index": 0,
              "slip": "/x/thor_pairs_A0A0.json"}})

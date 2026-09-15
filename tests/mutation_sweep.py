@@ -5727,6 +5727,14 @@ MUTATIONS = [
   '            if False:\n'
   '                continue',
   ['test_telegram_pager']),
+ ('a refused deposit keeps a slip path and holds the account reserve',
+  'gs_wake_agent',
+  '                    handles[handle]["slip"] = None\n'
+  '                    _save_handles(artifact_dir, handles, led["owners"])\n'
+  '                    raise',
+  '                    _save_handles(artifact_dir, handles, led["owners"])\n'
+  '                    raise',
+  ['test_wake_agent']),
 ]
 
 
