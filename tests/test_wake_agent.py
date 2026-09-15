@@ -5893,7 +5893,21 @@ def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
 
 
 def _rec4(d, h):
-    return json.loads((d / A.HANDLES_FILE).read_text())["handles"].get(h) or {}
+    """The raw record, or {} -- a copy that never saves the ledger must read
+    RED on the checks, not die with no RESULT line."""
+    try:
+        return json.loads((d / A.HANDLES_FILE).read_text())["handles"].get(h) or {}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def _mk_of(p):
+    """A mark as written, or {} -- a copy that never writes it must read RED,
+    not die."""
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:                                        # noqa: BLE001
+        return {}
 
 
 _d4, _runs4, _run4 = _btc_env("btc4_")
@@ -6134,13 +6148,13 @@ check("the machine dies during the quote, AFTER the index was issued: the "
       "ledger already carries the index (saved the moment it was issued) "
       "beside a mark of one, so the next deposit is not refused as wiped",
       _lag == "died" and _rec4(_dL, "BA71").get("btc_index") == 0
-      and json.loads(_mk_lag.read_text()).get("issued") == 1)
+      and _mk_of(_mk_lag).get("issued") == 1)
 _o, _c, _asked, _kinds = _btc_dispatch(_dL, _runL, "BA72", True,
                                        key={**_MK, "btc_issued_mark":
                                             str(_mk_lag)})
 check("...driven: the next deposit takes index 1, refused by nothing",
       _c is None and _rec4(_dL, "BA72").get("btc_index") == 1
-      and json.loads(_mk_lag.read_text()).get("issued") == 2)
+      and _mk_of(_mk_lag).get("issued") == 2)
 # A NEVER-PUBLISHED INDEX IS REISSUED, NOT LOST. The deposit after a
 # failed one reuses the failed one's receive bundle (_reusable_receive)
 # and popped its record -- and with it the only index the ledger knew, so
@@ -6155,14 +6169,14 @@ check("prefer: an issued, unpublished index handed back is reissued once "
       "ledger NOT read as wiped",
       A._allocate_btc_index(_KR, {}, unused=_fresh_mk) == 0
       and A._allocate_btc_index(_KR, {}, unused=_fresh_mk, prefer=0) == 0
-      and json.loads(_mk_re.read_text()).get("issued") == 1)
+      and _mk_of(_mk_re).get("issued") == 1)
 _asked_re = []
 check("...used on the network after all, the next index is issued instead "
       "and the mark follows; junk in prefer is ignored",
       A._allocate_btc_index(_KR, {}, prefer=0,
                             unused=lambda a: _asked_re.append(a)
                             or a != _addr1_0) == 1
-      and json.loads(_mk_re.read_text()).get("issued") == 2
+      and _mk_of(_mk_re).get("issued") == 2
       and _asked_re[0] == _addr1_0
       and A._allocate_btc_index(_KR, {"H1": {"btc_index": 1}},
                                 unused=_fresh_mk, prefer="0") == 2)
@@ -6190,7 +6204,7 @@ check("driven: the deposit after one that died reuses its bundle AND its "
       _c is None and ("receive_bundle_reused" in _kinds)
       and _rec4(_dR, "BA74").get("btc_index") == 0
       and _rec4(_dR, "BA73") == {}
-      and json.loads(_mk_rd.read_text()).get("issued") == 1
+      and _mk_of(_mk_rd).get("issued") == 1
       and _asked.count(_addr1_0) >= 1 and "ledger_wiped" not in _kinds)
 # THE OTHER GHOST (self-doubt over the ghost-record fix): a person sits down
 # between the mint and the quote. The mid-job inhibit gate saved the record
@@ -6223,7 +6237,7 @@ check("the dry run's probe: writable where the mark's directory exists, "
       "key that names none -- never the mark itself written",
       A._mark_probe({**_MK, "btc_issued_mark": str(_mk_lag)})
       == (True, str(_mk_lag.parent))
-      and json.loads(_mk_lag.read_text()).get("issued") == 2
+      and _mk_of(_mk_lag).get("issued") == 2
       and not any(p.name.startswith("k.issued.probe")
                   for p in _mk_lag.parent.iterdir())
       and A._mark_probe(_MK3)[0] is False
@@ -6231,6 +6245,16 @@ check("the dry run's probe: writable where the mark's directory exists, "
       and "/proc/gs_wake_no_such_dir" in A._mark_probe(_MK3)[1]
       and A._mark_probe({**_MK, "btc_issued_mark": ""})
       == (False, "no mark named"))
+# ...AND THE PROBE REALLY WRITES: a directory sitting at the probe's own
+# path makes the write fail where the directory exists and is the
+# process's to write (root can make any directory, so the /proc case
+# above cannot tell a probe that writes from one that only makes dirs).
+_pr_dir = Path(tempfile.mkdtemp(prefix="issuedpr_"))
+os.makedirs(_pr_dir / f"k.issued.probe{os.getpid()}")
+check("...a place where the probe file itself cannot be written reads NOT "
+      "writable, so the probe is a write and not a look",
+      A._mark_probe({**_MK, "btc_issued_mark": str(_pr_dir / "k.issued")})[0]
+      is False)
 check("a hand-built key that names no mark allocates as before, and "
       "load_key names one for every real keyfile, beside it",
       A._allocate_btc_index({**_MK, "btc_issued_mark": None}, {},
