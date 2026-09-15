@@ -4709,6 +4709,15 @@ def _one_attempt_info(args):
     return seen.get("info")
 
 
+def _shape_checked(info):
+    """What the Pi's shape check makes of `info`, or {} when it refuses:
+    a copy whose check refuses the floor must read RED here, not dead."""
+    try:
+        return _K.proto._pair_info({"info": info})
+    except _K.proto.WakeError:
+        return {}
+
+
 check("...and the vault SENDS it in the pairing info beside the MAC and "
       "broadcast, where the Pi's shape check reads it; a pair without the "
       "intake sends none",
@@ -4719,7 +4728,7 @@ check("...and the vault SENDS it in the pairing info beside the MAC and "
           ["pair", "--out", os.path.join(_fw_dir2, "k.key"),
            "--artifact-dir", _fw_dir2]))
       == {"mac": "aa:bb:cc:dd:ee:ff", "broadcast": "192.168.1.255"}
-      and _K.proto._pair_info({"info": _one_attempt_info(_fl_args)})
+      and _shape_checked(_one_attempt_info(_fl_args))
       .get("deposit_min_sat") == _fl_want)
 # THE FIRST ADDRESS, FOR THE OPERATOR'S EYES: an xpub's version bytes do not
 # say which purpose it was derived under, and a BIP44 account key would hand
@@ -5909,7 +5918,9 @@ check("...but an INTAKE record's forward plan STAYS when its slip and "
       "bundle go: the chain is what a later return to the host's own "
       "address is reconciled by (the MED pass after the deep read)",
       _pf.exists() and not _sl.exists() and not _bd.exists())
-_pf.unlink()
+# missing_ok: on a copy that shreds the plan the check above reads RED, and
+# this cleanup must not turn that into a dead suite (NO-RESULT in the sweep).
+_pf.unlink(missing_ok=True)
 _o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
 check("a handle naming no single bundle has no destination: "
       "handle_not_forwardable", _o is None
