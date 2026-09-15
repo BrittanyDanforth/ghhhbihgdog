@@ -2787,7 +2787,14 @@ _KEY_READS |= set(re.findall(r'key\[\s*"([a-z_]+)"\s*\]', _ag_src))
 _KEY_READS |= set(re.findall(r'\bk\.get\(\s*"([a-z_]+)"', _ag_src))
 _WRITERS = _kp_src + open(os.path.join(REPO, "gs_delivery_key"),
                           encoding="utf-8").read()
-_unwritable = sorted(f for f in _KEY_READS
+# ...OR THE LOADER ITSELF, for the one field that is a fact about WHERE the
+# keyfile sits rather than a setting: the issued-index mark's path is the
+# keyfile's path plus a suffix, named by load_key on every load (fix pass
+# after the deep read). A field the loader always sets has a switch.
+_LOADER_SETS = {"btc_issued_mark"}
+check("keyfile: the loader really does set the field it is exempted for",
+      all(f'k["{f}"] = ' in _ag_src for f in _LOADER_SETS))
+_unwritable = sorted(f for f in _KEY_READS - _LOADER_SETS
                      if f'"{f}"' not in _WRITERS)
 check(f"keyfile: every field the vault reads has a tool that writes it "
       f"({len(_KEY_READS)} fields checked)",
@@ -5768,6 +5775,79 @@ check("...while account 1's OWN xpub on account 1 passes the proof: done, "
       and _asked == [_addr1_0] and len(_runs4s) == 2
       and "btc_seed_xpub_mismatch" not in _kinds
       and "btc_seed_unset" not in _kinds)
+# THE ISSUED-INDEX MARK (fix pass after the deep read). A wiped ledger
+# behind an address that was ISSUED and not yet PAID handed that address
+# to a second client: the chain cannot tell an unpaid address from a
+# fresh one, and address 0 was the only thing asked. The mark beside the
+# keyfile, outside the wipe, is the floor.
+_mk_dir = Path(tempfile.mkdtemp(prefix="issuedmark_"))
+_mk_file = _mk_dir / "k.key.issued"
+_MK = {**_BK, "btc_account": 1, "btc_account_xpub": _zpub1,
+       "btc_issued_mark": str(_mk_file)}
+_fresh_mk = lambda a: True                                   # noqa: E731
+_i0 = A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
+_mk = json.loads(_mk_file.read_text())
+check("a fresh chain issues index 0 and WRITES the mark beside the keyfile: "
+      "this chain's id, one issued, and no xpub or address in it",
+      _i0 == 0 and _mk.get("issued") == 1 and _mk.get("account") == 1
+      and _mk.get("xpub_id") == A._xpub_id(_MK)
+      and _zpub1 not in _mk_file.read_text()
+      and _addr1_0 not in _mk_file.read_text())
+_i1 = A._allocate_btc_index(_MK, {"H1": {"btc_index": 0}}, unused=_fresh_mk)
+check("...the next deposit takes index 1 and the mark follows (two issued)",
+      _i1 == 1 and json.loads(_mk_file.read_text())["issued"] == 2)
+try:
+    A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
+    _wk = None
+except A.Refused as _e:
+    _wk = _e.code
+check("THE LEDGER WIPED behind two issued, unpaid addresses: refused as "
+      "ledger_wiped by the mark alone, with address 0 still unused on the "
+      "chain -- index 0 is not handed to a second client",
+      _wk == "ledger_wiped")
+_asked_mk = []
+try:
+    A._allocate_btc_index(_MK, {},
+                          unused=lambda a: _asked_mk.append(a) or True)
+except A.Refused:
+    pass
+check("...and the network is not even asked: the mark decides",
+      _asked_mk == [])
+check("a ledger that lost only its newest record (knows 0; the mark says "
+      "two issued) steps PAST the mark: index 2, never index 1 again",
+      A._allocate_btc_index(_MK, {"H1": {"btc_index": 0}},
+                            unused=_fresh_mk) == 2)
+_MK2 = {**_MK, "btc_account": 2, "btc_account_xpub": _ZPUB}
+_i_next = A._allocate_btc_index(_MK2, {}, unused=_fresh_mk)
+check("re-paired on the next account (another chain), the same mark file "
+      "is another chain's: index 0 issued, the mark rewritten for the new "
+      "chain",
+      _i_next == 0
+      and json.loads(_mk_file.read_text())
+      == {"account": 2, "xpub_id": A._xpub_id(_MK2), "issued": 1})
+_mk_file.write_text("{not json")
+try:
+    A._allocate_btc_index(_MK2, {}, unused=_fresh_mk)
+    _uk = None
+except A.Refused as _e:
+    _uk = _e.code
+check("a mark that exists and cannot be read is not 'no mark': refused, "
+      "nothing issued",
+      _uk == "btc_issued_mark_unreadable")
+_MK3 = {**_MK, "btc_issued_mark": str(_mk_dir / "no_such_dir" / "k.issued")}
+try:
+    A._allocate_btc_index(_MK3, {}, unused=_fresh_mk)
+    _nk = None
+except A.Refused as _e:
+    _nk = _e.code
+check("a mark that cannot be WRITTEN refuses the deposit: nothing issued "
+      "that the record does not hold",
+      _nk == "btc_issued_unrecorded")
+check("a hand-built key that names no mark allocates as before, and "
+      "load_key names one for every real keyfile, beside it",
+      A._allocate_btc_index({**_MK, "btc_issued_mark": None}, {},
+                            unused=_fresh_mk) == 0
+      and 'k["btc_issued_mark"] = str(path) + ".issued"' in _A_SRC)
 # (find, not index: on a copy with the call removed this must read RED,
 # not die with no RESULT line -- which the sweep scores as no verdict)
 _pos_guard = _A_SRC.find('if job == "receive_and_quote" and btc_mode(key):')

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
@@ -620,6 +621,16 @@ def load_key(path: Path) -> dict:
             f"answers to one question and this machine will not guess: sealed "
             f"delivery puts the payload where only gs_delivery.key can read "
             f"it, plaintext puts it in the chat. Remove one.")
+    # THE ISSUED-INDEX MARK LIVES BESIDE THE KEYFILE, under a suffix the
+    # wipe does not take (paranoia_mode removes gs_wake_*.key and the
+    # artifact dir; this file is neither): the one record, outside the
+    # ledger, that an intake chain has handed out an address. Named here
+    # so every key this machine runs under names one; _allocate_btc_index
+    # refuses an empty ledger the mark contradicts. Without it a wiped
+    # ledger behind an address that was ISSUED but not yet PAID handed
+    # that address to a second client -- the chain cannot tell an unpaid
+    # address from a fresh one, and address 0 was the only one asked.
+    k["btc_issued_mark"] = str(path) + ".issued"
     return k
 
 
@@ -1443,6 +1454,69 @@ def _prove_btc_seed(key: dict) -> None:
             "address to compare), or fix the seed at the machine.")
 
 
+def _issued_mark_path(key: dict):
+    """Where the issued-index mark lives (load_key names it beside the
+    keyfile), or None for a key that names none -- a hand-built one."""
+    p = key.get("btc_issued_mark")
+    return Path(str(p)) if isinstance(p, str) and p else None
+
+
+def _xpub_id(key: dict) -> str:
+    """Which CHAIN a mark is about: a short digest of the account xpub,
+    never the xpub itself (it derives every deposit address). A mark left
+    behind by a wipe names no address, no amount and no client."""
+    return hashlib.sha256(
+        str(key.get("btc_account_xpub") or "").encode()).hexdigest()[:16]
+
+
+def _read_issued_mark(key: dict):
+    """The mark's record for THIS chain -- {"account", "xpub_id",
+    "issued"} -- or None when there is no mark, or the mark is another
+    chain's (a re-pair on the next account starts fresh, as the wiped
+    ledger's refusal tells the operator to). A mark that exists and cannot
+    be read is not "no mark": that is the fail-open a wipe would hide
+    behind, so it refuses."""
+    p = _issued_mark_path(key)
+    if p is None:
+        return None
+    try:
+        d = json.loads(p.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("wake", "btc_issued_mark_unreadable")
+        raise Refused("btc_issued_mark_unreadable",
+                      f"the issued-index mark beside the keyfile ({p}) exists "
+                      f"and cannot be read ({type(e).__name__}); it is what "
+                      "tells a wiped ledger from a fresh one, so no address "
+                      "was issued. Fix or remove it at the machine.") from e
+    if not isinstance(d, dict) or d.get("xpub_id") != _xpub_id(key):
+        return None
+    return d
+
+
+def _write_issued_mark(key: dict, issued: int) -> None:
+    """Record that this chain has handed out `issued` addresses, BEFORE
+    the address is handed out: a record that cannot be written refuses
+    the deposit, since it is the one thing that stops a wiped ledger from
+    handing the same address to two people."""
+    p = _issued_mark_path(key)
+    if p is None:
+        return
+    try:
+        atomic_write_json({"account": int(key.get("btc_account") or 0),
+                           "xpub_id": _xpub_id(key), "issued": int(issued)},
+                          p, perms=0o600)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("wake", "btc_issued_unrecorded")
+        raise Refused("btc_issued_unrecorded",
+                      f"could not record the issued deposit index beside the "
+                      f"keyfile ({p}: {type(e).__name__}), so no address was "
+                      "issued: that record is what stops a wiped ledger "
+                      "handing one address to two people. Nothing was "
+                      "published.") from e
+
+
 def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
     """The next deposit index: one past the highest the ledger knows,
     stepping past any address the NETWORK says has been used, up to
@@ -1451,12 +1525,37 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
     hand a new client an address an earlier client paid. An address is
     issued only once a server has said it is fresh; "could not ask" refuses
     the deposit (fail closed) rather than guess. `unused` may be injected
-    (a test); by default the live look."""
+    (a test); by default the live look.
+
+    AND NEVER BELOW THE MARK (fix pass after the deep read): the network
+    cannot tell an address that was ISSUED and not yet PAID from a fresh
+    one, so the chain alone let a wiped ledger hand address 0 to a second
+    client while the first's payment was still coming -- and, on a
+    ledger that lost only its newest records, the same for every index
+    between what it remembers and what was handed out. The mark beside
+    the keyfile (_write_issued_mark, outside the wipe) is the floor: an
+    empty ledger it contradicts is refused as wiped, a short one is
+    stepped past it."""
     from gs_common import integrity_log_once as _once
     used = [r.get("btc_index") for r in handles.values()
             if isinstance(r, dict) and isinstance(r.get("btc_index"), int)
             and not isinstance(r.get("btc_index"), bool)]
     nxt = (max(used) + 1) if used else 0
+    _mark = _read_issued_mark(key)
+    _marked = int(_mark.get("issued") or 0) if isinstance(_mark, dict) else 0
+    if not used and _marked > 0:
+        integrity_log("wake", "ledger_wiped")
+        raise Refused("ledger_wiped",
+                      "this machine's ledger knows no deposit, and the mark "
+                      "beside the keyfile says this chain has already handed "
+                      f"out {_marked} address(es): the ledger was wiped behind "
+                      "a chain in use, and an address it handed out may be "
+                      "unpaid still, with its payment on the way. Nothing was "
+                      "published. Re-pair with --btc-account one higher and "
+                      "that account's xpub: a fresh chain nobody was handed.")
+    if used and _marked > nxt:
+        _once("wake", "btc_index_below_mark")
+        nxt = _marked
     _live = unused or (lambda addr: _btc_unused_live(key, addr))
 
     def ask(addr):
@@ -1492,6 +1591,7 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                           "re-pair.")
         fresh0 = ask(addr0)
         if fresh0:
+            _write_issued_mark(key, 1)
             return 0
         integrity_log("wake", "ledger_wiped")
         raise Refused("ledger_wiped",
@@ -1518,6 +1618,7 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None) -> int:
                 # ONCE per run, never a count: how many were skipped is the
                 # number of deposits the ledger forgot.
                 _once("wake", "btc_index_skipped")
+            _write_issued_mark(key, idx + 1)
             return idx
     integrity_log("wake", "btc_index_exhausted")
     raise Refused("btc_index_exhausted",

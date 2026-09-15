@@ -5606,6 +5606,38 @@ MUTATIONS = [
   '        write_plan(args.outfile, plan)\n'
   '        integrity_log("forward", "reconciled_listed")',
   ['test_btc_forwarder']),
+ ('a wiped ledger behind an unpaid first address hands it out again',
+  'gs_wake_agent',
+  '    if not used and _marked > 0:',
+  '    if False and _marked > 0:',
+  ['test_wake_agent']),
+ ('the issued mark is not written for the first address', 'gs_wake_agent',
+  '            _write_issued_mark(key, 1)\n'
+  '            return 0',
+  '            return 0',
+  ['test_wake_agent']),
+ ('the issued mark is not written for the next address', 'gs_wake_agent',
+  '            _write_issued_mark(key, idx + 1)\n'
+  '            return idx',
+  '            return idx',
+  ['test_wake_agent']),
+ ('a ledger that lost its newest records re-hands the indexes the mark '
+  'knows', 'gs_wake_agent',
+  '    if used and _marked > nxt:\n'
+  '        _once("wake", "btc_index_below_mark")\n'
+  '        nxt = _marked',
+  '    if False:\n'
+  '        _once("wake", "btc_index_below_mark")\n'
+  '        nxt = _marked',
+  ['test_wake_agent']),
+ ('an unreadable mark reads as no mark', 'gs_wake_agent',
+  '        integrity_log("wake", "btc_issued_mark_unreadable")',
+  '        return None',
+  ['test_wake_agent']),
+ ('the loader does not name the mark', 'gs_wake_agent',
+  '    k["btc_issued_mark"] = str(path) + ".issued"',
+  '    k["btc_issued_mark"] = None',
+  ['test_plain_slip', 'test_wake_agent']),
 ]
 
 

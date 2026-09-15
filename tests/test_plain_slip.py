@@ -349,6 +349,25 @@ check("...either one ALONE is fine", _loadkey_with(deposit_in_chat=True) == ""
       and _loadkey_with(delivery_public="aa" * 32) == "")
 check("a non-boolean plain_slip is refused rather than being truthy",
       _loadkey_with(deposit_in_chat="yes") == "deposit_in_chat_malformed")
+
+
+def _loadkey_mark():
+    """The loaded key of a real keyfile, and the keyfile's path."""
+    d = Path(tempfile.mkdtemp(prefix="vkey_"))
+    payload = {"role": "thinkpad", "secret": bytes(VAULT).hex(),
+               "peer_public": bytes(PI.public_key).hex()}
+    p = d / "tp.key"
+    p.write_text(json.dumps(P.lock_keyfile(payload, b"", role="thinkpad")))
+    os.chmod(p, 0o400)
+    return AG.load_key(p), p
+
+
+_kmk, _pmk = _loadkey_mark()
+check("the loader names the issued-index mark BESIDE the keyfile, under a "
+      "suffix the wipe does not take (fix pass: a wiped ledger must not hand "
+      "an issued, unpaid address out again)",
+      _kmk.get("btc_issued_mark") == str(_pmk) + ".issued"
+      and not str(_kmk.get("btc_issued_mark")).endswith(".key"))
 # ---- AN OLD KEYFILE FAILS LOUDLY RATHER THAN LOSING THE MODE ------------
 #
 # The field was called plain_slip. Reading the new name with .get() would turn

@@ -2326,7 +2326,14 @@ retires a chain: a vault whose ledger was wiped behind a used account, or
 paired to an account used before, refuses every deposit (`ledger_wiped`)
 until it is re-paired with the next account's xpub, because every address
 of the old chain may have been handed to someone whose payment could still
-arrive.
+arrive. The chain alone cannot tell an address that was handed out and
+not yet paid from a fresh one, so the vault also keeps a mark beside its
+keyfile — `<keyfile>.issued`, a chain id and a count, no address and no
+amount — that paranoia_mode leaves in place on purpose: an empty ledger
+the mark contradicts is refused as wiped even when address 0 is still
+unpaid, and a ledger that lost only its newest records is stepped past
+the mark. A deposit is refused rather than issued if that mark cannot be
+written.
 
 Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
 a slip, so an old doorbell rejects a new record **on length, before any
