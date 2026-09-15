@@ -3022,6 +3022,22 @@ check("the largest draw takes at most LIMIT_JITTER_MAX base units and 1% "
       and _plan["memo_limit_base_units"] > 0)
 F.LIMIT_JITTER = lambda cap: 0
 
+# A TRANSACTION THE SIGNER WILL NOT BUILD IS A REFUSAL, NOT A TRACEBACK
+# (the MED pass after the deep read). A server that repeated an outpoint
+# reached the signer as an input twice, and its refusal escaped main as an
+# uncaught exception: exit 1, no kind, no word, the same server leading
+# every retry of that deposit.
+print("\n== what the signer declines is a refusal ==")
+_dupU = {"tx_hash": _H1, "vout": 0, "value": 200000, "confirmations": 5}
+try:
+    _cX, _oX, _pX, _ = run(Net(utxos=[_dupU, dict(_dupU)]))
+except Exception as _e:                                      # noqa: BLE001
+    _cX, _oX, _pX = ("crashed", type(_e).__name__), "", None
+check("the look handing the forwarder one outpoint twice: refused build_failed "
+      "(exit 2, the kind on the chain, no plan), never a traceback",
+      _cX == F.EXIT_REFUSED and "build_failed" in _oX and _pX is None
+      and "Traceback" not in _oX)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

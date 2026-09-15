@@ -269,6 +269,21 @@ check("two mempool outputs sum; a negative Electrum height (-1, unconfirmed "
 check("tx_hash is normalised to lower case, vout carried through",
       W.summarize([_u(1, 1, _H.upper(), 7)], 1, 1)["utxos"][0]
       == {"tx_hash": _H, "vout": 7, "value": 1, "confirmations": 1})
+# THE MED PASS AFTER THE DEEP READ: a server that repeats an outpoint (a
+# bug, a hostile answer) reached the signer as an input twice, and the
+# forwarder died on the signer's refusal with a traceback -- and the same
+# server led every retry of that deposit. A repeat is the same output.
+_s = W.summarize([_u(799990, 500000, _H, 0), _u(799990, 500000, _H, 0),
+                  _u(799990, 500000, _H.upper(), 0)], 800000, 1)
+check("an outpoint a server lists twice (or thrice, in another case) counts "
+      "ONCE: one utxo, its value once, never an input twice for the signer",
+      len(_s["utxos"]) == 1 and _s["settled_sat"] == 500000
+      and _s["confirmed_sat"] == 500000)
+check("...and a value above all the bitcoin there is is a malformed entry, "
+      "refused; exactly all of it is not",
+      _refused(W.summarize, [_u(1, 21_000_000 * 100_000_000 + 1)], 800000, 1)
+      and W.summarize([_u(1, 21_000_000 * 100_000_000)], 800000, 1)
+      ["settled_sat"] == 21_000_000 * 100_000_000)
 check("classify truth table: (mined, mempool, settled) -> state",
       [W.classify(*t) for t in ((0, 0, 0), (5, 0, 0), (0, 5, 0), (5, 5, 0),
                                 (5, 0, 5), (12, 7, 3))]
@@ -1119,6 +1134,34 @@ check("a dead first server fails over to the live second one",
       _r["state"] == "confirmed" and len(_order) == 2
       and _r["server"] == _order[1] and _order[0] != _order[1]
       and _r["confirmed_sat"] == 700000)
+# A TIP nLockTime READS AS A DATE IS NOT A TIP (the MED pass after the deep
+# read): the forwarder writes the tip it is told into nLockTime, so a server
+# answering 600,000,000 made a forward no node would mine for thousands of
+# years (at the threshold, one the signer refused with a traceback), and led
+# every retry. Such an answer is a dead server to fail over.
+check("a tip of 500,000,000 or more is no usable tip: the only server fails "
+      "the look; one under it is fine",
+      _refused(_look, _FakeTransport(tip=500_000_000, utxos=[_u(1, 5)]))
+      and _refused(_look, _FakeTransport(tip=600_000_000, utxos=[_u(1, 5)]))
+      and _look(_FakeTransport(tip=499_999_999, utxos=[_u(1, 5)]))["tip"]
+      == 499_999_999
+      and W.Electrum.MAX_TIP_HEIGHT == 500_000_000)
+_order.clear()
+
+
+def _absurd_tip_factory(host, port, tag):
+    _order.append(host)
+    if len(_order) == 1:
+        return _FakeTransport(tip=600_000_000, utxos=[_u(1, 700000)])
+    return _FakeTransport(utxos=[_u(_TIP - 1, 700000)])
+
+
+_r = W.look(_A0, [("x.onion", 50002), ("y.onion", 50002)], _PROXY,
+            transport_factory=_absurd_tip_factory)
+check("...and with a second server configured, the absurd tip fails over "
+      "to it like a dead circuit does",
+      _r["state"] == "confirmed" and len(_order) == 2
+      and _r["server"] == _order[1] and _r["tip"] == _TIP)
 
 _bad = _FakeTransport(unspent_reply=[_u(1, "5")])
 _good = _FakeTransport(utxos=[_u(_TIP, 1)])

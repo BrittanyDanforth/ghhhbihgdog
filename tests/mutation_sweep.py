@@ -5965,6 +5965,29 @@ MUTATIONS = [
   '                _cn = "?"                        # never the bare handle',
   '                _cn = h',
   ['test_telegram_pager']),
+ # The MED pass after the deep read.
+ ('a repeated outpoint from a server reaches the signer twice', 'gs_btc_watch.py',
+  '        if _op in seen:\n'
+  '            continue',
+  '        if False:\n'
+  '            continue',
+  ['test_btc_watch']),
+ ('a value above all the bitcoin there is passes the look', 'gs_btc_watch.py',
+  '        if value > 21_000_000 * 100_000_000:',
+  '        if False:',
+  ['test_btc_watch']),
+ ('a tip nLockTime reads as a date passes the look (a forward no node mines)',
+  'gs_btc_watch.py',
+  '                and r["height"] < self.MAX_TIP_HEIGHT:',
+  '                and True:',
+  ['test_btc_watch']),
+ ("the signer's refusal escapes the forwarder as a traceback", 'btc_forwarder',
+  '    except btx.BtcTxError as e:\n'
+  '        raise Refused("build_failed",',
+  '    except btx.BtcTxError as e:\n'
+  '        raise e\n'
+  '        raise Refused("build_failed",',
+  ['test_btc_forwarder']),
 ]
 
 

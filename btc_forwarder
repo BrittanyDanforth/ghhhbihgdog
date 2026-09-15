@@ -2228,9 +2228,22 @@ def main(argv=None):
         account = account_for(words, passphrase, args.network, xpub,
                               account_no=account_no)
         del words
-    tx, txid, vsize, real_rate, signed = build_and_sign(
-        chosen, picture["tip"], inbound_spk, send_sat, fee_sat, memo_b,
-        account, index, address, args.network, sign=not args.plan_only)
+    # A TRANSACTION THE SIGNER WILL NOT BUILD IS A REFUSAL, NOT A TRACEBACK
+    # (the MED pass after the deep read): a server that repeated an
+    # outpoint, or named a tip nLockTime reads as a date, reached the signer
+    # as an input twice or a locktime out of range, and its own refusal
+    # escaped main as an uncaught exception -- exit 1, no kind on the chain,
+    # no word for the agent, and the same server leading every retry. The
+    # watch side now drops the repeat and refuses the tip; this is the
+    # backstop for whatever else the signer declines.
+    try:
+        tx, txid, vsize, real_rate, signed = build_and_sign(
+            chosen, picture["tip"], inbound_spk, send_sat, fee_sat, memo_b,
+            account, index, address, args.network, sign=not args.plan_only)
+    except btx.BtcTxError as e:
+        raise Refused("build_failed",
+                      f"the transaction could not be built or signed "
+                      f"({e}); nothing moved")
     if signed and real_rate < args.feerate_floor:
         raise Refused("fee_out_of_band", "the signed transaction's real "
                       "rate fell under the floor")

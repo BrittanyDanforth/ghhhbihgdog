@@ -262,6 +262,7 @@ def summarize(utxos, tip, min_conf):
     confirmed = unconfirmed = settled = 0
     shallowest = None
     out = []
+    seen = set()
     for u in utxos:
         if not isinstance(u, dict):
             raise BtcWatchError("electrum: bad listunspent entry")
@@ -274,6 +275,20 @@ def summarize(utxos, tip, min_conf):
                 or not (isinstance(height, int)
                         and not isinstance(height, bool)):
             raise BtcWatchError("electrum: bad listunspent entry (fields)")
+        # NO VALUE ABOVE ALL THE BITCOIN THERE IS, and NO OUTPOINT TWICE
+        # (the MED pass after the deep read): a server that repeats an
+        # outpoint -- a bug, a hostile answer -- reached the signer as two
+        # identical inputs, and the forwarder died on the signer's own
+        # refusal with a traceback instead of a word; the same server led
+        # every retry of that deposit (server_order is per address). An
+        # absurd value is refused like any malformed field; a repeat is
+        # the same output and counts once.
+        if value > 21_000_000 * 100_000_000:
+            raise BtcWatchError("electrum: bad listunspent entry (value)")
+        _op = (txid.lower(), vout)
+        if _op in seen:
+            continue
+        seen.add(_op)
         if height > 0:
             # Mined. Depth is tip - height + 1; a mined output can never be
             # shallower than 1 even if the tip we were told lags the block
@@ -716,11 +731,20 @@ class Electrum:
         except BtcWatchError:
             pass
 
+    #: A HEIGHT AT OR ABOVE THIS IS NOT A HEIGHT. nLockTime reads a value of
+    #: 500,000,000 or more as a UNIX time, and the forwarder writes the tip
+    #: it is told into nLockTime: a server answering an absurd height made
+    #: a transaction no node would mine for thousands of years (or, at the
+    #: threshold, one the signer refused with a traceback), and led every
+    #: retry of that deposit. Such an answer is a dead server to fail over.
+    MAX_TIP_HEIGHT = 500_000_000
+
     def tip_height(self):
         r = self._rpc("blockchain.headers.subscribe", [])
-        if isinstance(r, dict) and _is_uint(r.get("height")):
+        if isinstance(r, dict) and _is_uint(r.get("height")) \
+                and r["height"] < self.MAX_TIP_HEIGHT:
             return r["height"]
-        raise BtcWatchError("electrum: no tip height")
+        raise BtcWatchError("electrum: no usable tip height")
 
     def listunspent(self, scripthash):
         r = self._rpc("blockchain.scripthash.listunspent", [scripthash])
