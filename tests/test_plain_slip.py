@@ -427,13 +427,27 @@ check("...and each one ALONE is accepted, so the refusal is about carrying "
       "two payloads and not about either of them",
       accepted(pending(), slip=_REAL_BLOB) and accepted(pending(), plain=PLAIN))
 
-# AN UNKNOWN STATUS WORD IS REFUSED. The word is rendered into a sentence the
-# operator acts on, and the closed set is what stops the vault gaining a
-# free-text channel into a chat.
+# AN UNKNOWN STATUS WORD IS DROPPED, NOT THE ANSWER (fix pass after the deep
+# read). The word is rendered into a sentence the operator acts on, and the
+# closed set is what stops the vault gaining a free-text channel into a chat
+# -- so the word never passes through. But the answer it came with is the
+# vault's authenticated result, and refusing all of it for a word this build
+# is one release short of threw finished jobs away and had the pager call
+# them failures.
 for _bad_phase in ("FAILED", "everything is fine, send more", "landed!",
-                   "not_yet "):
-    check(f"a phase of {_bad_phase!r} is refused by the doorbell",
-          not accepted(pending(), phase=_bad_phase))
+                   "not_yet ", 7, None):
+    _pd = pending()
+    check(f"a phase of {_bad_phase!r} is accepted with the WORD BLANKED and "
+          "the skew recorded (result_phase_unknown), the status and handle "
+          "kept",
+          accepted(_pd, phase=_bad_phase)
+          and _pd.result["phase"] == "" and _pd.result["status"] == "done"
+          and _pd.result["handle"] == "A3F1"
+          and "result_phase_unknown" in _pd.events)
+_pd_ok = pending()
+check("...and a word the protocol has records no skew",
+      accepted(_pd_ok, phase="sent") and _pd_ok.result["phase"] == "sent"
+      and "result_phase_unknown" not in _pd_ok.events)
 check("...and every word the protocol DOES have is accepted",
       all(accepted(pending(), phase=_w) for _w in P.PHASES))
 check("plaintext alone is accepted", accepted(pending(), plain=PLAIN))

@@ -733,9 +733,20 @@ class Pending:
             # must be refused rather than passed through as itself. It is also what
             # stops the vault gaining a free-text channel into a chat.
             phase = body.get("phase", "")
-            if not proto.phase_is_known(phase):
-                raise Doorbell("result carries a status word this protocol has no "
-                               "meaning for")
+            # ...AND AN UNKNOWN WORD IS DROPPED, NOT THE WHOLE ANSWER (fix
+            # pass after the deep read). The word never reaches a chat --
+            # the closed set holds -- but the status, the handle and the
+            # slip it came with are the vault's authenticated answer, and
+            # refusing all of it for a word this build is too old to have
+            # threw a finished job away: the pager took the missing answer
+            # for a failure, said so in words that were false, and re-ran
+            # the forward five times over thirty-one hours, each answer
+            # discarded the same way. WIRE_VERSION is on no message, so a
+            # pair on two builds has no other way to find out; the event
+            # names it, on the terminal and in the chat.
+            if not (isinstance(phase, str) and proto.phase_is_known(phase)):
+                self.events.append("result_phase_unknown")
+                phase = ""
             self.result = {"status": status, "handle": handle, "slip": slip,
                            "plain": plain, "phase": phase}
             self.events.append("result_ok")
@@ -1508,10 +1519,16 @@ def _report_events(pending: Pending) -> None:
         # A DIFFERENT FACT, and it used to share the line above. These DID
         # authenticate, so only something holding the vault's key sent them.
         print(f"  [!] {refused} result(s) authenticated and were then refused: "
-              f"a second answer for a job already reported, an answer naming "
-              f"another job, or a status this protocol has no word for.")
+              f"a second answer for a job already reported, or an answer "
+              f"naming another job.")
         print(f"      That is the vault contradicting itself, not a stranger "
               f"on the switch. CHECK THE VAULT.")
+    if "result_phase_unknown" in pending.events:
+        print("  [!] The vault's answer carried a status word this build "
+              "does not have. The answer was kept and the word dropped: "
+              "the two boxes are on different builds.")
+        print("      UPDATE BOTH BOXES. Until then this box cannot say what "
+              "that job's status word meant.")
 
 
 def report(pending: Pending) -> int:

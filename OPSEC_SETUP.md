@@ -2362,7 +2362,14 @@ written.
 Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
 a slip, so an old doorbell rejects a new record **on length, before any
 crypto**, with `wake record is 1064 bytes, not 296`. Your existing keyfiles
-still open; the pairing survives.
+still open; the pairing survives. A pair on two builds now names itself
+where you read: a request in an older form, a request from a window before
+this one, and an answer carrying a status word the Pi's build does not have
+each reach the chat with their own closed sentence (and the terminal with
+UPDATE BOTH BOXES). An answer with an unknown word is kept — its status,
+handle and slip — and only the word is dropped; it used to be refused whole,
+and the pager took the missing answer for a failure and re-ran the forward
+five times.
 
 “No port forward, and no WAN path to WOL” is met more simply than by an onion
 service: the pager **long-polls outward** over Tor and listens on nothing at

@@ -467,6 +467,32 @@ finally:
     pg.doorbell = _real_doorbell
 check("events: a word this box has no sentence for is not rendered at all",
       "DROP TABLE" not in "\n".join(_eps2))
+# THE WIRE-BREAK WORDS REACH THE CHAT (fix pass after the deep read). The
+# doorbell recorded them and the terminal printed them; this surface -- the
+# one the feature exists for -- rendered neither, so a pair on two builds
+# heard only "try again", which failed identically for ever.
+_ep3 = pg.Pager(_args, "123456:TOKEN", {}, {"https": "socks5h://x"})
+_eps3 = []
+_ep3.send = lambda cid, t, buttons=None: (_eps3.append(t), True)[1]
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _EventPending(["m1_no_window_field", "m1_stale_window",
+                       "result_phase_unknown"]))
+try:
+    _ep3.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+finally:
+    pg.doorbell = _real_doorbell
+_eptext3 = "\n".join(_eps3)
+check("events: a request in an older form, a request from before this one, "
+      "and an answer with a word this end lacks each reach the CHAT with "
+      "their own closed sentence",
+      "older form" in _eptext3 and "same update" in _eptext3
+      and "from before this one" in _eptext3
+      and "word this end does not have yet" in _eptext3)
+check("events: ...with no digit, no handle and none of the banned words",
+      not re.search(r"\d", _eptext3)
+      and not re.search(r"\b(vault|thinkpad|keyfile|tor|wallet|swap|memo|"
+                        r"btc|bitcoin|xmr|monero|hop|mix)\b", _eptext3, re.I))
 check("events: ...and neither is bookkeeping nobody can act on",
       "m1_retry" not in "\n".join(_eps2))
 check("events: NON-VACUITY -- an ordinary run with nothing to report says "

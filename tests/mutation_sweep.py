@@ -5691,6 +5691,20 @@ MUTATIONS = [
   'e[\'state\'])}")\n'
   '        return "\\n".join(lines) + "\\nreceived so far: 0.055"',
   ['test_telegram_pager']),
+ ('an unknown status word discards the whole answer', 'gs_doorbell',
+  '            if not (isinstance(phase, str) and proto.phase_is_known(phase)):\n'
+  '                self.events.append("result_phase_unknown")\n'
+  '                phase = ""',
+  '            if not (isinstance(phase, str) and proto.phase_is_known(phase)):\n'
+  '                raise Doorbell("result carries a status word this protocol "\n'
+  '                               "has no meaning for")',
+  ['test_plain_slip', 'test_wake_doorbell']),
+ ('the wire-break words are not rendered to the chat', 'gs_telegram_pager',
+  'EVENT_VOCAB = ("m1_second_ephemeral", "result_refused",\n'
+  '               "m1_no_window_field", "m1_stale_window",\n'
+  '               "result_phase_unknown")',
+  'EVENT_VOCAB = ("m1_second_ephemeral", "result_refused")',
+  ['test_telegram_pager']),
 ]
 
 

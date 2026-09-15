@@ -646,7 +646,9 @@ FULL_ANSWER = proto.PHASE_LINES["full"]
 #: A DICT KEYED ON A FIXED TUPLE, so the vault cannot put text in a chat: this
 #: box renders its own sentence for a word the doorbell chose from a set it
 #: also fixes. Same rule as PHASE_LINES.
-EVENT_VOCAB = ("m1_second_ephemeral", "result_refused")
+EVENT_VOCAB = ("m1_second_ephemeral", "result_refused",
+               "m1_no_window_field", "m1_stale_window",
+               "result_phase_unknown")
 EVENT_LINES = {
     "m1_second_ephemeral":
         "A second signed request for this job arrived from somewhere else. "
@@ -656,6 +658,21 @@ EVENT_LINES = {
         "An answer came back for this job and was refused — it named the "
         "wrong job, or arrived after one was already in. Treat what follows "
         "as incomplete.",
+    # THE WIRE-BREAK WORDS (fix pass after the deep read): the doorbell
+    # records them, the terminal printed them, and this surface -- the
+    # one the feature exists for -- rendered neither. With the other end
+    # on an older build every request was refused and the only sentence
+    # anywhere was "try again", which failed identically for ever.
+    "m1_no_window_field":
+        "The other end asked in an older form this end no longer reads, so "
+        "nothing ran. Both ends need the same update before anything can.",
+    "m1_stale_window":
+        "The other end answered a request from before this one, so nothing "
+        "ran for this one. Ask again.",
+    "result_phase_unknown":
+        "The other end answered with a word this end does not have yet. "
+        "The answer was kept and the word dropped: both ends need the same "
+        "update before that word can be read here.",
 }
 
 SPEED_ANSWER = "Lighter is faster — see /withdraw."

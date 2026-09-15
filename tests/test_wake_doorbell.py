@@ -676,6 +676,34 @@ check("a duplicate result is refused, and recorded as REFUSED rather than as "
 check("...and the wire cannot tell the two apart: every refusal is 204, so a "
       "prober learns nothing from which one it hit",
       _st_a == 200 and _st_b == 204 and _st_c == 204)
+# A STATUS WORD THIS BUILD DOES NOT HAVE (fix pass after the deep read): the
+# answer is KEPT and the word dropped, and the event names the skew. It used
+# to refuse the whole answer -- a finished job thrown away because the other
+# box was one build newer -- and the pager took that for a failure.
+er4 = Bell()
+er4eph, er4ch = NP.PrivateKey.generate(), P.new_challenge()
+er4.post("/wake", m1_for(er4eph, er4ch, er4.pending.window))
+_newer = P.seal(TP, PI.public_key, P.TAG_M3,
+                {"job_id": er4.pending.job_id, "challenge": er4ch.hex(),
+                 "status": "done", "handle": "BEEF",
+                 "slip": "", "plain": {}, "phase": "some_newer_word"})
+_st_d = er4.post("/result", _newer)[0]
+er4.close()
+check("an authenticated answer carrying a status word this build lacks is "
+      "ACCEPTED (200), its status and handle kept, the word blanked -- never "
+      "passed through -- and the skew recorded as result_phase_unknown",
+      _st_d == 200 and er4.pending.outcome() == "done"
+      and er4.pending.result["handle"] == "BEEF"
+      and er4.pending.result["phase"] == ""
+      and "result_phase_unknown" in er4.pending.events
+      and "result_ok" in er4.pending.events
+      and "result_refused" not in er4.pending.events)
+_buf_ph = io.StringIO()
+with contextlib.redirect_stdout(_buf_ph):
+    DB._report_events(er4.pending)
+check("...and the terminal says UPDATE BOTH BOXES, naming the cause",
+      "UPDATE BOTH BOXES" in _buf_ph.getvalue()
+      and "status word" in _buf_ph.getvalue())
 _buf4 = io.StringIO()
 with contextlib.redirect_stdout(_buf4):
     DB.report(er3.pending)
