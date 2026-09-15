@@ -5997,6 +5997,11 @@ MUTATIONS = [
   '        try:\n'
   '            _forward_status_path(artifact_dir, handle).unlink()',
   ['test_wake_agent']),
+ ('a refused start demotes a forwarded deposit to seen (looked at every tick)',
+  'gs_telegram_pager',
+  '                e["state"] = "forwarded" if _from_forwarded else "seen"',
+  '                e["state"] = "seen"',
+  ['test_telegram_pager']),
 ]
 
 

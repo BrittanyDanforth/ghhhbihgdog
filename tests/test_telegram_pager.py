@@ -5961,6 +5961,31 @@ check("a PROBE answered with a word this end lacks gets the one sentence: "
       and not any("payment details" in t.lower() for t in _usm)
       and pg.proto.PHASE_UNKNOWN not in "\n".join(_usm))
 
+# A REFUSED START PUTS A FORWARDED DEPOSIT BACK WHERE IT WAS (the MED pass
+# after the deep read). Money came back to a forwarded, mined deposit and
+# settled; the start was refused (a tap took the lock, the budget went) and
+# the entry landed on `seen`: looked at every tick instead of once a
+# window, the reserve and floor gates of the forwarded branch left behind
+# -- 144 circuits a day for a spent address.
+print("\n== a refused start leaves a forwarded deposit forwarded ==")
+_fr, _frs, _frj = _watch_pager()
+_fr.limits.headroom = lambda: 9
+_fr.btc_open["B4A1"]["state"] = "forwarded"
+_fr.btc_open["B4A1"]["looked_at"] = time.time()
+_fr.start_job = lambda cid, job, params: False
+_fr._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
+                        "unconfirmed_sat": 0})
+check("returned money on a FORWARDED deposit whose start is refused: the "
+      "entry stays forwarded (its look stamp kept), not demoted to seen",
+      _fr.btc_open["B4A1"]["state"] == "forwarded"
+      and _fr.btc_open["B4A1"].get("looked_at"))
+_fr.btc_open["B4A1"]["state"] = "seen"
+_fr._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
+                        "unconfirmed_sat": 0})
+check("...while a first payment's refused start still goes back to seen, "
+      "for the next tick",
+      _fr.btc_open["B4A1"]["state"] == "seen")
+
 # A LABEL THAT CANNOT BE MADE IS A PLACEHOLDER, NEVER THE BARE HANDLE (the
 # handle is the bearer token the label retired). Reachable only for a pager
 # built without a usable pairing secret -- a harness -- and still wrong.

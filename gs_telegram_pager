@@ -5673,6 +5673,7 @@ class Pager:
         conf = int(r.get("confirmed_sat") or 0)
         unconf = int(r.get("unconfirmed_sat") or 0)
         say, start = None, False
+        _from_forwarded = False
         lock, opened = self._btc()
         with lock:
             e = opened.get(h)
@@ -5680,6 +5681,9 @@ class Pager:
                 return
             chat = e["chat"]
             if e["state"] == "forwarded":
+                # ...REMEMBERED, so a start that is then refused puts the
+                # entry back where it was (the tail below), not on `seen`.
+                _from_forwarded = True
                 # MONEY BACK AFTER THE FORWARD MINED (third self-doubt
                 # pass, reworked after its own review). The look comes
                 # once per --btc-recheck window (btc_tick), and only
@@ -5799,7 +5803,16 @@ class Pager:
                 # THE START HAPPENED: the wait it was due is spent.
                 e.pop("retry_after", None)
             elif e and e["state"] == "forwarding":
-                e["state"] = "seen"
+                # BACK TO WHERE IT CAME FROM (the MED pass after the deep
+                # read). A forwarded deposit whose returned money could
+                # not be started (a tap took the lock, the budget went)
+                # landed on `seen`: looked at every tick instead of once
+                # a window, and the reserve and floor gates of the
+                # forwarded branch left behind -- 144 circuits a day for
+                # a spent address, the volume the throttle exists to
+                # remove. It stays forwarded, its look stamp kept, and
+                # the next window tries again.
+                e["state"] = "forwarded" if _from_forwarded else "seen"
 
     def btc_watch_loop(self) -> None:
         """The watcher thread: a tick, then a sleep of --btc-poll, until
