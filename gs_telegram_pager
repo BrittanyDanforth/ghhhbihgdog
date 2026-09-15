@@ -3720,14 +3720,6 @@ class Pager:
                          "then it is deleted like the rest."
                          if int(getattr(self, "burn_after", 0) or 0) > 0
                          else "")
-                _pay = (f"{chat_name(job)}: here is how to pay.\n\n"
-                        + "\n".join(proto.plain_lines(
-                            plain, label=_cn)).rstrip()
-                        + "\n\nI will say here when it arrives and "
-                          "when it has confirmed. After that it moves "
-                          "on by itself — nothing more to do. Tap "
-                          "below to ask sooner." + _stay)
-                _pb = self._handle_buttons(h, job, chat_id)
                 # ONE RETRY, AND A FAILURE SENTENCE (the MED pass after the
                 # deep read): this is the ONLY place the client ever sees
                 # the address, and it was sent once with no retry and no
@@ -3736,10 +3728,28 @@ class Pager:
                 # will tell you here". Like the note above: one retry, then
                 # the watch entry goes (nothing was published to watch
                 # for) and the client is told to /deposit again.
-                _ok = self.send(chat_id, _pay, buttons=_pb)
+                #
+                # THE TEXT AND THE KEYBOARD STAY INSIDE THE send() CALL, not
+                # in a variable sent twice: test_depo_wizard walks every
+                # send() in this file and refuses a reply whose text carries
+                # no literal, or a keyboard that is not a known builder --
+                # a variable is out of the scan's reach.
+                def _send_pay():
+                    return self.send(
+                        chat_id,
+                        f"{chat_name(job)}: here is how to pay.\n\n"
+                        + "\n".join(proto.plain_lines(
+                            plain, label=_cn)).rstrip()
+                        + "\n\nI will say here when it arrives and "
+                          "when it has confirmed. After that it moves "
+                          "on by itself — nothing more to do. Tap "
+                          "below to ask sooner." + _stay,
+                        buttons=self._handle_buttons(h, job, chat_id))
+
+                _ok = _send_pay()
                 if not _ok:
                     time.sleep(SLIP_RETRY_S)
-                    _ok = self.send(chat_id, _pay, buttons=_pb)
+                    _ok = _send_pay()
                 if _ok:
                     self._btc_pay_message(h, getattr(_LAST_MID, "mid", None))
                     return

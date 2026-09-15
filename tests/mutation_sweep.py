@@ -6004,10 +6004,10 @@ MUTATIONS = [
  ('the intake pay message is sent once, no retry', 'gs_telegram_pager',
   '                if not _ok:\n'
   '                    time.sleep(SLIP_RETRY_S)\n'
-  '                    _ok = self.send(chat_id, _pay, buttons=_pb)',
+  '                    _ok = _send_pay()',
   '                if False:\n'
   '                    time.sleep(SLIP_RETRY_S)\n'
-  '                    _ok = self.send(chat_id, _pay, buttons=_pb)',
+  '                    _ok = _send_pay()',
   ['test_telegram_pager']),
  ('an address nobody was shown stays on the watch list for two days',
   'gs_telegram_pager',
