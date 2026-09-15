@@ -2623,6 +2623,148 @@ check("...fees rise and the forward is BUMPED: the replacement leaves the "
       and all((i["tx_hash"], i["vout"]) != (_HK3, 0) for i in _p["inputs"])
       and any((q.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]]
               for q in _chainB))
+# SELF-DOUBT OVER THAT FIX. The agent reads the word `kept` off the CURRENT
+# plan alone (gs_wake_agent _forward_kept), and the replacement IS the
+# current plan: a mark that survived only on the rotated one still left
+# the client hearing `sent` about money that sat on the address, until
+# the next reconciliation marked it again. The mark travels with the plan.
+check("...and the REPLACEMENT itself carries the kept mark (the current "
+      "plan is the one the agent reads `kept` off), naming the same output",
+      (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
+# UNDER A RAISED BOUND THE MARK GOES. Re-paired --returns-max 3, the bump
+# CARRIES the kept output (the tool is moving it); the mark on the rotated
+# plan then blessed a spend of exactly that output by a transaction this
+# tool did not sign -- a replacement of ours by a leaked seed -- as the
+# operator's hand. Two guards: the run that goes on to forward under the
+# bound pops the mark, and an output any plan of ours signed for is never
+# kept, whatever a stale mark says.
+_ofB2, _lB2, _pB23, _hxB23 = _two_returns()
+_lB23u = _listed(_pB23, _hxB23, height=0,
+                 inputs=[{"tx_hash": _H2, "vout": 1, "value": 140000}])
+_nB21 = Net(utxos=_RET3, spends=_lB2 + [_lB23u], fee=10, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB21, _ofB2)
+check("(setup) kept at the bound, the forward in the mempool",
+      _c == F.EXIT_OK
+      and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
+_age_plan(_ofB2, 3 * 3600)
+_nB22 = Net(utxos=_RET3, spends=_lB2 + [_lB23u], fee=30, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB22, _ofB2, "--returns-max", "3")
+_chainB2 = [json.load(open(_f)) for _f in F._plan_chain(_ofB2)]
+check("re-paired with a HIGHER bound, the bump CARRIES the kept output and "
+      "NO plan in the chain still calls it kept: the tool is moving it",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "bumped"
+      and any((i["tx_hash"], i["vout"]) == (_HK3, 0) for i in _p["inputs"])
+      and not any(isinstance(q.get("returned_kept"), dict) for q in _chainB2))
+_rbf = {**_spend_tx(None, send=120000),
+        "inputs": [{"tx_hash": _HK3, "vout": 0, "value": 130000}]}
+_nB23 = Net(utxos=[], spends=_lB2 + [_lB23u, _rbf], fee=30)
+_c, _o, _p, _ = _reconcile(_nB23, _ofB2, "--returns-max", "3")
+check("...so a spend of exactly that output by a transaction this tool did "
+      "NOT sign -- a replacement of ours, by a leaked seed -- is the alarm "
+      "(foreign_spend), never the operator's hand",
+      _c == F.EXIT_FAILED and ("forward", "foreign_spend") in _nB23.kinds
+      and ("forward", "kept_moved") not in _nB23.kinds)
+# THE SAME THROUGH AN EVICTED RE-SIGN, which never rewrites the old plan:
+# the mark rides into the chain on the rotated file, and only the second
+# guard (signed for, so never kept) stands between a foreign RBF of the
+# carried output and `kept_moved`.
+_ofB3, _lB3, _pB33, _hxB33 = _two_returns()
+_lB33u = _listed(_pB33, _hxB33, height=0,
+                 inputs=[{"tx_hash": _H2, "vout": 1, "value": 140000}])
+_nB31 = Net(utxos=_RET3, spends=_lB3 + [_lB33u], fee=10, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB31, _ofB3)
+check("(setup) kept at the bound, again",
+      _c == F.EXIT_OK
+      and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
+_nB32 = Net(utxos=_UNSPENT_E + _RET3, spends=_lB3, fee=10, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB32, _ofB3, "--returns-max", "3")
+_chainB3 = [json.load(open(_f)) for _f in F._plan_chain(_ofB3)]
+check("(setup) re-paired higher and EVICTED, the re-sign carries the kept "
+      "output while the rotated plan still names it kept",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "evicted"
+      and any((i["tx_hash"], i["vout"]) == (_HK3, 0) for i in _p["inputs"])
+      and any((q.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]]
+              for q in _chainB3))
+_nB33 = Net(utxos=_UNSPENT_E, spends=_lB3 + [_rbf], fee=10)
+_c, _o, _p, _ = _reconcile(_nB33, _ofB3, "--returns-max", "3")
+check("...and a foreign spend of exactly that output is STILL the alarm: an "
+      "output a plan of ours signed for is never kept, whatever a stale "
+      "mark on a rotated plan says",
+      _c == F.EXIT_FAILED and ("forward", "foreign_spend") in _nB33.kinds
+      and ("forward", "kept_moved") not in _nB33.kinds)
+# THE MARK IS POPPED, NOT ONLY OVERRULED: kept UNSETTLED money under a
+# raised bound rides in no replacement (nothing settled to carry), so the
+# second guard says nothing about it -- and a mark left standing would be
+# carried onto the replacement, and the agent would say `kept` about money
+# the next window's forward will send on.
+_ofB4, _lB4, _pB43, _hxB43 = _two_returns()
+_lB43u = _listed(_pB43, _hxB43, height=0,
+                 inputs=[{"tx_hash": _H2, "vout": 1, "value": 140000}])
+_RET3U = [{**_RET3[0], "confirmations": 0}]
+_nB41 = Net(utxos=_RET3U, spends=_lB4 + [_lB43u], fee=10, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB41, _ofB4)
+check("(setup) an UNSETTLED return at the bound is kept, the mark naming it",
+      _c == F.EXIT_OK
+      and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]]
+      and _p["returned_kept"]["settled"] is False)
+_age_plan(_ofB4, 3 * 3600)
+_nB42 = Net(utxos=_RET3U, spends=_lB4 + [_lB43u], fee=30, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB42, _ofB4, "--returns-max", "3")
+check("re-paired higher, a bump that carries nothing of it still DROPS the "
+      "mark: the replacement names no kept money (it will be sent on once "
+      "settled, not held for the operator)",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "bumped"
+      and "returned_kept" not in _p
+      and all((i["tx_hash"], i["vout"]) != (_HK3, 0) for i in _p["inputs"]))
+# A HAND MOVE TAKES THE OUTPUT OFF THE MARK, whatever else the run does.
+# With the forward stuck and today's rate over the ceiling the run is
+# refused after the reconciliation wrote the plan, and the mark stood
+# beside a `returned_moved` naming the same output: kept money, said the
+# operator's copy, that the next line said was gone.
+_ofB5, _lB5, _pB53, _hxB53 = _two_returns()
+_lB53u = _listed(_pB53, _hxB53, height=0,
+                 inputs=[{"tx_hash": _H2, "vout": 1, "value": 140000}])
+_nB51 = Net(utxos=_RET3, spends=_lB5 + [_lB53u], fee=10, submit=_ACCEPTED,
+            seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB51, _ofB5)
+check("(setup) kept at the bound, the forward in the mempool, once more",
+      _c == F.EXIT_OK
+      and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
+_age_plan(_ofB5, 3 * 3600)
+_nB52 = Net(utxos=[], spends=_lB5 + [_lB53u, _rbf], fee=30)
+_c, _o, _p, _ = _reconcile(_nB52, _ofB5, "--feerate-ceiling", "10")
+check("the kept output moved by hand while the forward sits stuck under a "
+      "ceiling that refuses the bump: refused (delayed), the move recorded "
+      "under returned_moved, and the mark GONE from the plan -- never both",
+      _c == F.EXIT_REFUSED and _status_of(_ofB5) == "delayed"
+      and ("forward", "kept_moved") in _nB52.kinds
+      and _p.get("returned_moved") == [[_HK3, 0]]
+      and "returned_kept" not in _p)
+# A CORRUPT RECORD IS A VERDICT, NOT A TRACEBACK: `returned_moved` and the
+# mark's outpoints are read by the tool that wrote them, and a hand-edited
+# or damaged plan used to escape main as an uncaught TypeError (no kind
+# on the chain, no exit code the agent knows).
+_pX, _ofX, _hxX = _first_send()
+_plX = json.load(open(_ofX))
+_plX["returned_moved"] = 5
+_plX["returned_kept"] = {"outpoints": [["zz", "x"], 7, None], "outputs": 1}
+with open(_ofX, "w") as _fh:
+    json.dump(_plX, _fh)
+_nX = Net(utxos=[], spends=[_listed(_pX, _hxX)])
+try:
+    _c, _o, _p, _ = _reconcile(_nX, _ofX)
+except Exception as _e:                                      # noqa: BLE001
+    _c, _p = ("crashed", type(_e).__name__), {}
+check("a plan whose returned_moved is not a list and whose mark names junk "
+      "still reconciles (listed: done), rather than dying with a traceback",
+      _c == F.EXIT_OK and _p.get("seen") is True
+      and ("forward", "reconciled_listed") in _nX.kinds)
 # A STRANGER'S CLAIMS WRITE ONE LINE, not one per output.
 _pS, _ofS, _hxS = _first_send()
 _nS = Net(utxos=[{"tx_hash": _HRF, "vout": i, "value": 600,

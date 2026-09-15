@@ -1401,10 +1401,10 @@ MUTATIONS = [
  # unknown word must be refused, not passed through as itself -- and the
  # closed set is also what stops the vault gaining a free-text channel into
  # a chat.
- ("the vault gains a free-text channel into a chat window", "gs_doorbell",
-  "        if not proto.phase_is_known(phase):",
-  "        if False:",
-  ["test_plain_slip"]),
+ ('the vault gains a free-text channel into a chat window', 'gs_doorbell',
+  '            if not (isinstance(phase, str) and proto.phase_is_known(phase)):',
+  '            if False:',
+  ['test_plain_slip', 'test_wake_doorbell']),
 
  # gs_wake_proto's header promises a version mismatch is caught before any
  # crypto and is "impossible to misread". Without an exact key set that was
@@ -3034,8 +3034,12 @@ MUTATIONS = [
  # cap never fired). The guarantee is unchanged -- every state write is inside
  # the try whose finally releases the lock -- so the mutation still lifts them
  # all out of it.
- ("a failed state write wedges the wake lock forever", "gs_telegram_pager",
+ ('a failed state write wedges the wake lock forever', 'gs_telegram_pager',
   '        try:\n'
+  '            params = dict(params)\n'
+  '            params["owner"] = owner_token(self.key, cid)\n'
+  '            if not leg:\n'
+  '                self.__dict__["_contended"] = False\n'
   '            self._running = cid\n'
   '            # WHICH LEG THIS IS, recorded before the thread starts so the\n'
   '            # worker reads it rather than a slot _worker has already cleared.\n'
@@ -3072,8 +3076,12 @@ MUTATIONS = [
   '        self._chain_leg = int(leg)\n'
   '        self.limits.record()\n'
   '        integrity_log("pager", "poke")\n'
-  '        try:',
-  ["test_telegram_pager"]),
+  '        try:\n'
+  '            params = dict(params)\n'
+  '            params["owner"] = owner_token(self.key, cid)\n'
+  '            if not leg:\n'
+  '                self.__dict__["_contended"] = False',
+  ['test_telegram_pager']),
 
  # ...AND THE LEG NUMBER IS ASSIGNED BELOW THE REFUSALS, WHICH IS THE FIX.
  # Above them, every call that returned without starting a job still wrote it
@@ -5060,12 +5068,13 @@ MUTATIONS = [
   '                    _claimed = True',
   '                    integrity_log("forward", "refund_claimed")',
   ['test_btc_forwarder']),
- ('a partial refund lowers what the XMR side expects',
-  'gs_wake_agent',
-  '                     if isinstance(r, dict) and r.get("verified") is True\n'
-  '                     and r.get("full") is True and r.get("of")}',
-  '                     if isinstance(r, dict) and r.get("verified") is True\n'
-  '                     and r.get("of")}',
+ ('a partial refund lowers what the XMR side expects', 'gs_wake_agent',
+  '                if r.get("full") is True:\n'
+  '                    _refunded.add(_of)\n'
+  '                    continue',
+  '                if True:\n'
+  '                    _refunded.add(_of)\n'
+  '                    continue',
   ['test_wake_agent']),
  ('every forward refunded leaves the forward-time quote in the pair',
   'gs_wake_agent',
@@ -5101,12 +5110,13 @@ MUTATIONS = [
   '                    and str(p.get("txid") or "").lower() not in _refunded)',
   '                    and True)',
   ['test_wake_agent']),
- ('an unverified refund claim lowers what the XMR side expects',
-  'gs_wake_agent',
-  '                     if isinstance(r, dict) and r.get("verified") is True\n'
-  '                     and r.get("full") is True and r.get("of")}',
-  '                     if isinstance(r, dict) and r.get("verified") is not None\n'
-  '                     and r.get("full") is True and r.get("of")}',
+ ('an unverified refund claim lowers what the XMR side expects', 'gs_wake_agent',
+  '                if not (isinstance(r, dict) and r.get("verified") is True\n'
+  '                        and r.get("of")):\n'
+  '                    continue',
+  '                if not (isinstance(r, dict) and r.get("verified") is not None\n'
+  '                        and r.get("of")):\n'
+  '                    continue',
   ['test_wake_agent']),
  ("a claimed refund's source is never read (every claim unverifiable)",
   'gs_btc_broadcast.py',
@@ -5448,9 +5458,13 @@ MUTATIONS = [
   '            pass',
   ['test_wake_agent']),
  ('a wiped ledger behind a used chain issues addresses', 'gs_wake_agent',
-  '        if fresh0:\n            return 0\n'
+  '        if fresh0:\n'
+  '            _write_issued_mark(key, 1)\n'
+  '            return 0\n'
   '        integrity_log("wake", "ledger_wiped")',
-  '        if True:\n            return 0\n'
+  '        if True:\n'
+  '            _write_issued_mark(key, 1)\n'
+  '            return 0\n'
   '        integrity_log("wake", "ledger_wiped")',
   ['test_wake_agent']),
  ('intake records are pruned with the rest', 'gs_wake_agent',
@@ -5522,10 +5536,11 @@ MUTATIONS = [
   '              "reconciliation cannot decide without it")\n'
   '        spends = []',
   ['test_btc_forwarder']),
- ('a fresh forward overwrites the earlier plan instead of rotating it',
-  'btc_forwarder',
-  "    if why:\n        # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,",
-  "    if False:\n        # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,",
+ ('a fresh forward overwrites the earlier plan instead of rotating it', 'btc_forwarder',
+  '        _rotate_plan(args.outfile)\n'
+  '    write_plan(args.outfile, plan)',
+  '        pass\n'
+  '    write_plan(args.outfile, plan)',
   ['test_btc_forwarder']),
  ('a rejected re-send is a dead end', 'btc_forwarder',
   '        return "forward", sorted(tuple(x) for x in (kept_exclude or ())), \\\n'
@@ -5592,12 +5607,12 @@ MUTATIONS = [
   ['test_btc_forwarder']),
  ('the moved record is not read when the kept set is built',
   'btc_forwarder',
-  '        _ops += list(_p.get("returned_moved") or [])',
-  '        _ops += []',
+  '        _kept_ops |= _pairs(_p.get("returned_moved"))',
+  '        _kept_ops |= set()',
   ['test_btc_forwarder']),
  ('a bump clears the kept mark (the client hears sent about kept money)',
   'btc_forwarder',
-  '        if stuck is None:\n'
+  '        if stuck is None or not _at_limit:\n'
   '            plan.pop("returned_kept", None)\n'
   '        write_plan(args.outfile, plan)\n'
   '        integrity_log("forward", "reconciled_listed")',
@@ -5735,6 +5750,38 @@ MUTATIONS = [
   '                    _save_handles(artifact_dir, handles, led["owners"])\n'
   '                    raise',
   ['test_wake_agent']),
+ # Self-doubt over the fix pass.
+ ('an output a plan of ours signed for still counts as kept (a foreign RBF '
+  'of it reads as the operator\'s hand)', 'btc_forwarder',
+  '    _kept_ops -= _signed_ops',
+  '    _kept_ops -= set()',
+  ['test_btc_forwarder']),
+ ('a bump under a raised bound keeps the mark (carried onto the replacement, '
+  'the agent says kept about money the next forward sends)', 'btc_forwarder',
+  '        if stuck is None or not _at_limit:\n'
+  '            plan.pop("returned_kept", None)\n'
+  '        write_plan(args.outfile, plan)\n'
+  '        integrity_log("forward", "reconciled_listed")',
+  '        if stuck is None:\n'
+  '            plan.pop("returned_kept", None)\n'
+  '        write_plan(args.outfile, plan)\n'
+  '        integrity_log("forward", "reconciled_listed")',
+  ['test_btc_forwarder']),
+ ('the kept mark does not travel onto the replacement (the agent says sent '
+  'about kept money)', 'btc_forwarder',
+  '            plan["returned_kept"] = _mk',
+  '            pass',
+  ['test_btc_forwarder']),
+ ('a hand move leaves the moved output on the kept mark', 'btc_forwarder',
+  '            if isinstance(_rk, dict) and _pairs(_rk.get("outpoints")) & _ins:',
+  '            if False:',
+  ['test_btc_forwarder']),
+ ('a corrupt returned_moved crashes the reconciliation', 'btc_forwarder',
+  '    if not isinstance(seq, (list, tuple)):\n'
+  '        return out\n'
+  '    for _o in seq:',
+  '    for _o in seq:',
+  ['test_btc_forwarder']),
 ]
 
 

@@ -1087,6 +1087,23 @@ def _outpoints(items):
     return {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in items or []}
 
 
+def _pairs(seq):
+    """(txid, vout) pairs from a list of two-element entries as the plan
+    records them (`returned_kept.outpoints`, `returned_moved`); anything
+    that is not such a list, or an entry that is not such a pair, counts
+    for nothing. NEVER raises: a plan file is written by this tool, but a
+    corrupt or hand-edited one must end in a verdict, not a traceback."""
+    out = set()
+    if not isinstance(seq, (list, tuple)):
+        return out
+    for _o in seq:
+        try:
+            out.add((str(_o[0]).lower(), int(_o[1])))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+    return out
+
+
 def _carried_returned(p):
     """Whether plan `p` was built for money that came back: its reason is
     "returned", or -- a bump, an evicted or rejected re-sign built while
@@ -1367,19 +1384,26 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # found the same spend, no mark, and cried seed leak -- for ever, and
     # before any forward logic, so a later refund or payment to the
     # address could never be forwarded either.
-    _kept_ops = set()
+    # LESS EVERY OUTPOINT A PLAN OF OURS SPENDS (self-doubt over the fix):
+    # a mark on a rotated plan outlives the bound it was written under.
+    # Re-paired higher, the next bump or re-sign CARRIED the kept output
+    # -- this tool signed for it -- while the rotated plan still named it
+    # kept, and a spend of exactly that output by a transaction this tool
+    # did not sign (a replacement of ours, by a leaked seed) was blessed as
+    # the operator's hand. An output this tool signed for is never kept;
+    # a foreign spend of it conflicts with our signature and IS the alarm.
+    _kept_ops, _signed_ops = set(), set()
     for _p in [plan] + chain:
         if not isinstance(_p, dict):
             continue
         _rk = _p.get("returned_kept")
-        _ops = list(((_rk or {}).get("outpoints") or [])
-                    if isinstance(_rk, dict) else [])
-        _ops += list(_p.get("returned_moved") or [])
-        for _o in _ops:
-            try:
-                _kept_ops.add((str(_o[0]).lower(), int(_o[1])))
-            except (TypeError, ValueError, IndexError, KeyError):
-                continue
+        _kept_ops |= _pairs((_rk or {}).get("outpoints")
+                            if isinstance(_rk, dict) else None)
+        _kept_ops |= _pairs(_p.get("returned_moved"))
+        _signed_ops |= _pairs([(i.get("tx_hash"), i.get("vout"))
+                               for i in (_p.get("inputs") or [])
+                               if isinstance(i, dict)])
+    _kept_ops -= _signed_ops
     listed = {s["txid"]: s for s in spends}
     for s in spends:
         if s["txid"] in ours:
@@ -1402,12 +1426,32 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # RECORDED ON THE PLAN AT ONCE, and written: the same spend is
             # in the history on every later run, and the kept mark it
             # matched is cleared below once nothing is left to keep.
-            _seen_moved = {(str(_o[0]).lower(), int(_o[1]))
-                           for _o in (plan.get("returned_moved") or [])
-                           if isinstance(_o, (list, tuple)) and len(_o) == 2}
+            _seen_moved = _pairs(plan.get("returned_moved"))
+            _dirty = False
             if not _ins <= _seen_moved:
                 plan["returned_moved"] = sorted(
                     [list(o) for o in (_seen_moved | _ins)])
+                _dirty = True
+            # ...AND TAKEN OFF THE MARK, whatever else this run does: a
+            # bump the ceiling refuses leaves the current plan as it is,
+            # and a mark that still named outputs `returned_moved` said
+            # were gone read as kept money to the operator (self-doubt
+            # over the fix). What is left stays marked, recounted; nothing
+            # left, no mark.
+            _rk = plan.get("returned_kept")
+            if isinstance(_rk, dict) and _pairs(_rk.get("outpoints")) & _ins:
+                _left = sorted(_pairs(_rk.get("outpoints")) - _ins)
+                if _left:
+                    _val = {(str(u["tx_hash"]).lower(), int(u["vout"])):
+                            int(u["value"]) for u in picture["utxos"]}
+                    _rk["outpoints"] = [list(o) for o in _left]
+                    _rk["outputs"] = len(_left)
+                    _rk["sat"] = sum(_val.get(o, 0) for o in _left)
+                    _rk["refunds"] = sum(1 for o in _left if o in _refund_ops)
+                else:
+                    plan.pop("returned_kept", None)
+                _dirty = True
+            if _dirty:
                 write_plan(args.outfile, plan)
             integrity_log("forward", "kept_moved")
             print(f"  reconcile: the kept outputs were moved by a spend "
@@ -1545,11 +1589,14 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # A KEPT MARK IS THIS RUN'S TO MAKE, not a stale one's: money the
         # operator moved by hand is recorded above (returned_moved), and
         # money still here is written kept again below -- UNLESS this run
-        # bumps instead, which never reaches _kept: the mark then stands,
-        # since the bump leaves the kept money out (_bump) and the agent
-        # reads the word `kept` off it. Popped before a bump, the client
-        # heard `sent` for a window about money that sat on the address.
-        if stuck is None:
+        # bumps AT THE BOUND, which never reaches _kept: the mark then
+        # stands, since the bump leaves the kept money out (_bump), main
+        # carries the mark onto the replacement, and the agent reads the
+        # word `kept` off it. Popped before that bump, the client heard
+        # `sent` for a window about money that sat on the address. UNDER
+        # the bound (re-paired higher) a bump carries the kept money
+        # instead, and the mark goes: this tool is moving it.
+        if stuck is None or not _at_limit:
             plan.pop("returned_kept", None)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_listed")
@@ -1614,7 +1661,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # run, so a superseder that was in the mempool is caught mined.
         plan["superseded_height"] = int(newest["height"])
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
-        if stuck is None:                      # as in the listed branch
+        if stuck is None or not _at_limit:     # as in the listed branch
             plan.pop("returned_kept", None)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_superseded")
@@ -2260,6 +2307,20 @@ def main(argv=None):
             if _prev_ins is not None else None),
     }
     if why:
+        # THE KEPT MARK TRAVELS WITH THE CURRENT PLAN (self-doubt over the
+        # fix): a fresh forward AT the bound -- a bump, a re-sign -- leaves
+        # the kept money out, and the plan it rotates aside was the only
+        # one that named it. The agent reads the word `kept` off the
+        # CURRENT plan alone, so the client heard `sent` about money that
+        # sat on the address until the next reconciliation marked it
+        # again. Carried only when none of it rides in this forward: an
+        # output this forward spends is not kept, it is being moved.
+        _mk = plan0.get("returned_kept") if isinstance(plan0, dict) else None
+        if isinstance(_mk, dict) and _pairs(_mk.get("outpoints")) \
+                and not (_pairs(_mk.get("outpoints"))
+                         & {(str(u["tx_hash"]).lower(), int(u["vout"]))
+                            for u in chosen}):
+            plan["returned_kept"] = _mk
         # A RECONCILIATION'S FRESH FORWARD ROTATES THE OLD PLAN ASIDE NOW,
         # with a plan in hand to take its place; the chain is the record of
         # every forward the deposit had, and it never lacks a current one.

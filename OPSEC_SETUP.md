@@ -2327,10 +2327,16 @@ toward it. After `kept`, the client's taps ask the swap side (the money
 that DID swap is what they are waiting for), and once per `--btc-recheck`
 window a tap asks the forward again. Move the money by hand at the vault
 (the plan file names the outputs under `returned_kept`; a spend of exactly
-those is recognised as your hand, `kept_moved`, and written on the plan as
-`returned_moved` so every later run recognises it too, not as a leaked
-seed), or re-pair with a higher bound and let the next window's tap send
-it on. A replacement the vault
+those is recognised as your hand, `kept_moved`, taken off the mark and
+written on the plan as `returned_moved` so every later run recognises it
+too, not as a leaked seed), or re-pair with a higher bound and let the next
+window's tap send it on. The mark follows the current plan: a bump or a
+re-sign at the bound leaves the kept money out and carries the mark onto
+its own plan, so the phone keeps hearing `kept` and not `sent`; under a
+raised bound the next forward carries the money instead and the mark
+goes. An output any forward of the vault's signed for is never kept,
+whatever an older plan in the chain says: a spend of it by anything but
+that forward is `foreign_spend`. A replacement the vault
 would not pay for today is `delayed` like a
 first forward, and the original stands. A spend of the address that is not
 the vault's own fails the run with `foreign_spend` on the chain: only a
