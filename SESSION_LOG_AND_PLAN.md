@@ -576,8 +576,10 @@ refuters per finding) found real defects, all fixed in the rewrite:
   DONE and the plan's word (`sent`/`unsure`) instead of refusing — no
   child, nothing signed — and the pager learns the sent handles from those
   answers and routes to `swap_status` from then on. `/balance` lists the
-  chat's own watched deposits by label and state with the figures the chat
-  already saw; every new sentence is in the banned-word scan. A deposit
+  chat's own watched deposits by label and state word, no figure (the fix
+  pass after the deep read took the totals out: an on-chain amount in the
+  transcript is a number on the chain); every new sentence is in the
+  banned-word scan. A deposit
   nothing has reached for `DEPOSIT_PLACE_TTL_S` is dropped from the list
   (the reserve's own window), so a never-paid address is not looked at for
   ever.

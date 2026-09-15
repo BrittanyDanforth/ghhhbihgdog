@@ -208,7 +208,7 @@ testnet end-to-end, where Tor is present. Mainnet still waits on every stage.
    "received" and "confirmed" once each, starts the forward through the one
    wake path when the box is free (held silently while a job runs), and
    closes the entry on `sent`/`unsure`; `/balance` lists the chat's own
-   deposits in figures it already saw; the button and `/check` on an intake
+   deposits by label and state word, no figure; the button and `/check` on an intake
    deposit ask the forward, which sends a settled one on and otherwise
    answers `not_yet`/`arriving` from the forwarder's one-word status file.
 5. **Failure handling**: fee spikes, dust/minimum refusal, forward failure and

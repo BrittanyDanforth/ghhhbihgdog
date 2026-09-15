@@ -5952,6 +5952,19 @@ MUTATIONS = [
   '                         else proto.PHASE_LINES.get(phase, phase))',
   '                _line = proto.PHASE_LINES.get(phase, phase)',
   ['test_telegram_pager']),
+ ('a person sitting down between the mint and the quote leaves a ghost record '
+  'holding the reserve', 'gs_wake_agent',
+  '            if isinstance(_rec_i, dict) and _rec_i.get("slip") \\\n'
+  '                    and not Path(str(_rec_i["slip"])).is_file():\n'
+  '                _rec_i["slip"] = None',
+  '            if False:\n'
+  '                _rec_i["slip"] = None',
+  ['test_wake_agent']),
+ ('a label that cannot be made falls back to the bare handle (the bearer '
+  'token the label retired)', 'gs_telegram_pager',
+  '                _cn = "?"                        # never the bare handle',
+  '                _cn = h',
+  ['test_telegram_pager']),
 ]
 
 

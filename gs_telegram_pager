@@ -4316,9 +4316,10 @@ class Pager:
         if err == "balance":
             # WHAT THIS BOX SAW ARRIVE, FROM MEMORY. Only the deposits this
             # process handed a unique address to, only this chat's, and only
-            # what the last look at each address said. No wake. The figures
-            # are the ones this chat was already shown when it deposited;
-            # no currency word, no address.
+            # the STATE the last look at each address earned -- the label
+            # and a word, no figure (rule 6: an on-chain amount in the
+            # transcript is a number on the chain), no currency word, no
+            # address. No wake.
             self.send(cid, self._btc_balance_text(cid), buttons=MENU_BUTTONS)
             return
         if err == "status":
@@ -5762,7 +5763,10 @@ class Pager:
             try:
                 _cn = self._label(chat, h)
             except BaseException:                            # noqa: BLE001
-                _cn = h
+                # NEVER THE BARE HANDLE: the label retired exactly that
+                # bearer token (see _label). A label that cannot be made
+                # is a placeholder, and the sentence still stands.
+                _cn = "?"
             if say == "seen":
                 self.send(chat, f"{_cn}: received — waiting for it to "
                                 f"confirm.",
@@ -5872,7 +5876,7 @@ class Pager:
             try:
                 _cn = self._label(cid, h)
             except BaseException:                            # noqa: BLE001
-                _cn = h
+                _cn = "?"                        # never the bare handle
             lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(e['state'], e['state'])}")
         return "\n".join(lines)
 

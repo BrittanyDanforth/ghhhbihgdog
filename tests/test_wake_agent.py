@@ -6192,6 +6192,32 @@ check("driven: the deposit after one that died reuses its bundle AND its "
       and _rec4(_dR, "BA73") == {}
       and json.loads(_mk_rd.read_text()).get("issued") == 1
       and _asked.count(_addr1_0) >= 1 and "ledger_wiped" not in _kinds)
+# THE OTHER GHOST (self-doubt over the ghost-record fix): a person sits down
+# between the mint and the quote. The mid-job inhibit gate saved the record
+# with its never-written slip PATH intact, and _deposit_pending tested the
+# field -- the same reserve held for two days, the same closed intake.
+_dI, _runsI, _runI = _btc_env("btcinh_")
+
+
+def _runI_sits(argv, env_extra, budget_s):
+    r = _runI(argv, env_extra, budget_s)
+    if "create_receive_wallet" in " ".join(argv):
+        (_dI / A.INHIBIT_FILE).touch()
+    return r
+
+
+_mk_in = Path(tempfile.mkdtemp(prefix="issuedin_")) / "k.issued"
+_o, _c, _asked, _kinds = _btc_dispatch(_dI, _runI_sits, "BA76", True,
+                                       key={**_MK, "btc_issued_mark":
+                                            str(_mk_in)})
+check("a person sits down between the mint and the quote: refused inhibited, "
+      "and the record saved names NO slip (it was never written), so it holds "
+      "no place and its bundle is the next deposit's",
+      _c == "inhibited" and "inhibited_mid_job" in _kinds
+      and _rec4(_dI, "BA76").get("slip") is None
+      and _rec4(_dI, "BA76").get("bundle")
+      and not A._deposit_pending({**_rec4(_dI, "BA76")}, _MK,
+                                 int(time.time()), ask=lambda k, a, s: 0))
 check("the dry run's probe: writable where the mark's directory exists, "
       "named and not writable where it does not, and 'no mark named' for a "
       "key that names none -- never the mark itself written",

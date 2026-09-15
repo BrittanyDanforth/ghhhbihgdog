@@ -183,10 +183,10 @@ The button and `/check` on a registered BTC deposit run `forward_to_swap`
 instead of `swap_status`; on an unregistered handle (after a restart) they
 run `swap_status` as today -- the vault answers from the XMR side, which is
 truthful about that side. `/balance`: for the chat's registered deposits,
-one line each with the label and its state, and the total received and
-confirmed in plain figures (the amounts the chat already saw). Gated
-implicitly: a registered deposit exists only where the plaintext mode is
-on.
+one line each with the label and its state word -- no figure (the fix pass
+after the deep read removed the totals: an on-chain amount in the
+transcript is a number on the chain, rule 6). Gated implicitly: a
+registered deposit exists only where the plaintext mode is on.
 
 ### 3.4 The doorbell
 

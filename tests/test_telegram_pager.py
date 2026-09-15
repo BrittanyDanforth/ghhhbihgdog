@@ -5961,6 +5961,20 @@ check("a PROBE answered with a word this end lacks gets the one sentence: "
       and not any("payment details" in t.lower() for t in _usm)
       and pg.proto.PHASE_UNKNOWN not in "\n".join(_usm))
 
+# A LABEL THAT CANNOT BE MADE IS A PLACEHOLDER, NEVER THE BARE HANDLE (the
+# handle is the bearer token the label retired). Reachable only for a pager
+# built without a usable pairing secret -- a harness -- and still wrong.
+_lb, _lbs, _, _ = _tapper()
+_lb._btc_register("B4A1", _BTC_ADDR, 111)
+_lb._label = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no key"))
+check("/balance with no label to be made shows '?' and never the handle",
+      "?:" in _lb._btc_balance_text(111)
+      and "B4A1" not in _lb._btc_balance_text(111))
+_lb.btc_tick(look=_look_returning("seen", unconf=5000000))
+check("...and so does the watcher's own line",
+      any(t.startswith("?:") for t, _b in _lbs)
+      and not any("B4A1" in t for t, _b in _lbs))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

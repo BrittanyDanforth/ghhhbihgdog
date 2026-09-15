@@ -4503,6 +4503,18 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         _inh = artifact_dir / INHIBIT_FILE
         if _inh.exists():
             integrity_log("wake", "inhibited_mid_job")
+            # A SLIP THAT WAS NEVER WRITTEN IS NO SLIP (self-doubt over the
+            # ghost-record fix): the deposit's record is built with its
+            # slip's PATH before the quote runs, and saved here with that
+            # path intact when a person sat down between the mint and the
+            # quote -- the same ghost the refused allocation used to leave,
+            # holding a whole account reserve for two days and closing the
+            # intake (at_capacity). The bundle stays: it is the next
+            # deposit's (_reusable_receive).
+            _rec_i = handles.get(handle)
+            if isinstance(_rec_i, dict) and _rec_i.get("slip") \
+                    and not Path(str(_rec_i["slip"])).is_file():
+                _rec_i["slip"] = None
             _save_handles(artifact_dir, handles, led["owners"])
             raise Refused(
                 "inhibited",
