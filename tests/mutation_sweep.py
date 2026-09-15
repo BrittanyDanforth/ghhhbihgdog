@@ -6015,6 +6015,56 @@ MUTATIONS = [
   '                self._btc_forget(h)',
   '                integrity_log("pager", "pay_undelivered")',
   ['test_telegram_pager']),
+ # MED PASS: the bound counts rounds of returned money, not honest top-ups.
+ ('no forward is ever a round: carried_refunds is always zero',
+  'btc_forwarder',
+  '                if (str(u["tx_hash"]).lower(), int(u["vout"])) in _round_ops\n',
+  '                if (str(u["tx_hash"]).lower(), int(u["vout"])) in ()\n',
+  ['test_btc_forwarder']),
+ ('the bound ignores carried_refunds: every returned forward is a round '
+  'again',
+  'btc_forwarder',
+  '    c = p.get("carried_refunds")\n'
+  '    if isinstance(c, int) and not isinstance(c, bool):\n'
+  '        return c > 0',
+  '    c = p.get("carried_refunds")\n'
+  '    if False and isinstance(c, int) and not isinstance(c, bool):\n'
+  '        return c > 0',
+  ['test_btc_forwarder']),
+ ('an output the size of a refund is not a round (only a verified one is)',
+  'btc_forwarder',
+  '        if any(v < s and btx.refund_is_full(v, s) for s in sent):\n'
+  '            out.add(o)',
+  '        if False:\n'
+  '            out.add(o)',
+  ['test_btc_forwarder']),
+ ('an output LARGER than a forward sent is a round',
+  'btc_forwarder',
+  '        if any(v < s and btx.refund_is_full(v, s) for s in sent):\n',
+  '        if any(btx.refund_is_full(v, s) for s in sent):\n',
+  ['test_btc_forwarder']),
+ ('a verified refund under the size of one is not a round',
+  'btc_forwarder',
+  '        if not isinstance(r, dict) or r.get("verified") is not True:\n'
+  '            continue\n'
+  '        try:\n'
+  '            out.add((str(r.get("txid") or "").lower(), int(r.get("vout"))))',
+  '        if True:\n'
+  '            continue\n'
+  '        try:\n'
+  '            out.add((str(r.get("txid") or "").lower(), int(r.get("vout"))))',
+  ['test_btc_forwarder']),
+ ('a refund CLAIM counts as a round',
+  'btc_forwarder',
+  '        if not isinstance(r, dict) or r.get("verified") is not True:\n'
+  '            continue\n'
+  '        try:\n'
+  '            out.add((str(r.get("txid") or "").lower(), int(r.get("vout"))))',
+  '        if not isinstance(r, dict) or r.get("verified") is None:\n'
+  '            continue\n'
+  '        try:\n'
+  '            out.add((str(r.get("txid") or "").lower(), int(r.get("vout"))))',
+  ['test_btc_forwarder']),
 ]
 
 

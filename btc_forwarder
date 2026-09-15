@@ -1159,15 +1159,89 @@ def _pairs(seq):
     return out
 
 
+def _chain_plans(outfile):
+    """Every plan of ours on the chain at `outfile` (the current file
+    included), oldest last as _plan_chain lists them. _plan_file, not
+    _read_plan: a rotated file that is not ours is skipped, and skipping
+    it must not construct a Refused (which puts a refusal on the chain and
+    a line in the log)."""
+    chain = []
+    for f in _plan_chain(outfile):
+        try:
+            _p = _plan_file(f)
+        except (OSError, ValueError):
+            continue
+        if _p is not None:
+            chain.append(_p)
+    return chain
+
+
+def round_outpoints(utxos, refunds, plans):
+    """The outpoints among `utxos` that count as a ROUND of returned money
+    toward --returns-max (the MED pass after the deep read): a VERIFIED
+    ThorChain refund (`refunds`, classify_returns' records), and any
+    output the SIZE of a refund of some forward in `plans` -- less than
+    it sent, and within what refund_is_full allows back.
+
+    The bound used to count every return. It exists to stop a route that
+    keeps refunding from being paid for again every recheck, and a refund
+    is what it must count; but a client who pays a deposit in three
+    instalments, or a stranger's dust, burned it too, and the third
+    honest payment was KEPT on the address for the operator's hand.
+    Nothing a refund has is certain to be there: the memo's shape is
+    ThorChain's to change, and the vault that refunds is the one holding
+    the money after a churn, which no forward of ours paid -- so a round
+    is counted by its source when that verifies, and by its amount
+    otherwise. A top-up that happens to be the size of a forward counts;
+    the cost of counting one is a kept output the operator moves, the
+    cost of missing a refund is the deposit. Pure; junk counts for
+    nothing."""
+    out = set()
+    for r in refunds or ():
+        if not isinstance(r, dict) or r.get("verified") is not True:
+            continue
+        try:
+            out.add((str(r.get("txid") or "").lower(), int(r.get("vout"))))
+        except (TypeError, ValueError):
+            continue
+    sent = set()
+    for p in plans or ():
+        s = p.get("send_sat") if isinstance(p, dict) else None
+        if isinstance(s, int) and not isinstance(s, bool) and s > 0:
+            sent.add(s)
+    for u in utxos or ():
+        if not isinstance(u, dict):
+            continue
+        try:
+            o = (str(u.get("tx_hash") or "").lower(), int(u.get("vout")))
+            v = int(u.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(u.get("value"), bool) or v <= 0:
+            continue
+        if any(v < s and btx.refund_is_full(v, s) for s in sent):
+            out.add(o)
+    return out
+
+
 def _carried_returned(p):
-    """Whether plan `p` was built for money that came back: its reason is
-    "returned", or -- a bump, an evicted or rejected re-sign built while
-    such money sat settled -- it carried inputs the plan it replaced or
-    re-signed did not have (`carried_returned`, written by main). Without
-    the second half a refund that rode in a replacement was never counted,
-    and the bound could be over-run by rounds it never saw."""
+    """Whether plan `p` counts toward --returns-max as a forward of money
+    that came back. A plan written since the MED pass says how many of
+    its inputs were a ROUND of returned money (`carried_refunds`, from
+    round_outpoints: a verified refund, or an output the size of one), and
+    counts when any was: a `returned` forward of honest top-ups alone does
+    not. An older plan, without the field, counts by the rule it was
+    written under: its reason is "returned", or -- a bump, an evicted or
+    rejected re-sign built while such money sat settled -- it carried
+    inputs the plan it replaced or re-signed did not have
+    (`carried_returned`). Without that half a refund that rode in a
+    replacement was never counted, and the bound could be over-run by
+    rounds it never saw."""
     if not isinstance(p, dict):
         return False
+    c = p.get("carried_refunds")
+    if isinstance(c, int) and not isinstance(c, bool):
+        return c > 0
     if p.get("reconcile_reason") == "returned":
         return True
     c = p.get("carried_returned")
@@ -1374,17 +1448,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # alone -- the stage-5 shape -- is taken as knowing of no memo.
     spends, paid = (_res if isinstance(_res, tuple) and len(_res) == 2
                     else (_res, []))
-    chain = []
-    for f in _plan_chain(args.outfile):
-        # _plan_file, not _read_plan: a rotated file that is not ours is
-        # skipped, and skipping it must not construct a Refused (which
-        # puts a refusal on the chain and a line in the log).
-        try:
-            _p = _plan_file(f)
-        except (OSError, ValueError):
-            continue
-        if _p is not None:
-            chain.append(_p)
+    chain = _chain_plans(args.outfile)
     ours = {str(p.get("txid") or "").lower() for p in chain
             if p.get("txid")}
     ours.add(str(plan.get("txid") or "").lower())
@@ -2055,6 +2119,7 @@ def main(argv=None):
     # forward, when one follows, leaves out every outpoint a listed forward
     # of ours consumed and does not overwrite the earlier plan.
     exclude, why, _replaces, _prev_ins = (), None, None, None
+    _round_ops = set()
     if args.reconcile:
         try:
             plan0 = _read_plan(args.outfile)
@@ -2083,9 +2148,18 @@ def main(argv=None):
         _, exclude, why = verdict[:3]
         exclude = [tuple(x) for x in exclude]
         integrity_log("forward", f"reconcile_{why}")
+        # WHICH OUTPUTS ON THE ADDRESS ARE A ROUND OF RETURNED MONEY, for
+        # the bound (round_outpoints): the refunds the reconciliation
+        # recorded on the plan this run (in memory, whether or not it
+        # wrote it) and the sizes of every forward on the chain. Counted
+        # into the new plan below (carried_refunds).
+        _round_ops = round_outpoints(picture.get("utxos"),
+                                     plan0.get("refunds"),
+                                     [plan0] + _chain_plans(args.outfile))
         if why in ("evicted", "rejected"):
             # THE INPUTS THE RE-SIGN IS FOR: anything else it carries came
-            # back meanwhile, and the bound counts it (carried_returned).
+            # back meanwhile (carried_returned), and the bound counts the
+            # rounds among it (carried_refunds).
             _prev_ins = _outpoints(plan0.get("inputs"))
         if why == "bumped":
             # THE REPLACEMENT SPENDS WHAT THE STUCK TRANSACTION SPENDS
@@ -2387,14 +2461,26 @@ def main(argv=None):
         "replaces": _replaces,
         # HOW MANY OF THIS FORWARD'S INPUTS CAME BACK MEANWHILE (a bump, an
         # evicted or rejected re-sign built while returned money sat
-        # settled): the bound counts such a plan as a forward of returned
-        # money (_carried_returned). None for a first forward and for a
+        # settled), for the operator's reading and for a reader of plans
+        # from before the field below. None for a first forward and for a
         # plan whose reason already says so.
         "carried_returned": (
             sum(1 for u in chosen
                 if (str(u["tx_hash"]).lower(), int(u["vout"]))
                 not in _prev_ins)
             if _prev_ins is not None else None),
+        # ...AND HOW MANY OF THOSE ARE A ROUND OF RETURNED MONEY (the MED
+        # pass after the deep read; round_outpoints): a verified ThorChain
+        # refund, or an output the size of one. THIS is what the bound
+        # counts (_carried_returned): a `returned` forward of honest
+        # top-ups alone carries none and is not a round. None for a first
+        # forward.
+        "carried_refunds": (
+            sum(1 for u in chosen
+                if (str(u["tx_hash"]).lower(), int(u["vout"])) in _round_ops
+                and (str(u["tx_hash"]).lower(), int(u["vout"]))
+                not in (_prev_ins or set()))
+            if why else None),
     }
     if why:
         # THE KEPT MARK TRAVELS WITH THE CURRENT PLAN (self-doubt over the

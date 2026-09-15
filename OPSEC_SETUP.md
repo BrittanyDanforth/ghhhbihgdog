@@ -2086,19 +2086,30 @@ sit in the mempool before a run of the forward replaces it at today's rate
 (the bump, below); the pager's `--btc-recheck` must be at least this, or
 its rechecks never find one due.
 
-`--btc-returns-max` (default 2, up to 1000) is how many forwards of money
-that CAME BACK to a deposit address — a refund, a second payment — one
-deposit may have before the next return is kept on the address for you
-instead of sent on again (`kept`, below). ThorChain refunds a swap it will
-not run, less its outbound fee; a route that keeps refunding would
-otherwise be paid for again every recheck until the deposit was gone. 0
-keeps the first return.
+`--btc-returns-max` (default 2, up to 1000) is how many ROUNDS of money
+that CAME BACK to a deposit address one deposit may have forwarded before
+the next return is kept on the address for you instead of sent on again
+(`kept`, below). ThorChain refunds a swap it will not run, less its
+outbound fee; a route that keeps refunding would otherwise be paid for
+again every recheck until the deposit was gone. 0 keeps the first return.
 
 **A refund or a second payment?** Both are money on the address that no
 forward of the vault's consumed, and both are sent on (or kept) the same
-way — the bound counts every return, because a refund whose memo ThorChain
-has since changed the shape of must still be bounded. They differ in the
-record: a refunded forward's swap never happened, and the XMR side, told to
+way. A ROUND, for the bound, is a VERIFIED refund (below) or an output the
+SIZE of a refund of some forward on the chain — less than it sent, within
+the slack a full refund is allowed (the larger of a twentieth and 0.001
+BTC). A second payment that is neither — a top-up larger than the forward,
+a stranger's dust — is forwarded and counts for nothing, so a client who
+pays a deposit in three instalments is not kept waiting on your hand for
+the third (the bound used to count every return, and was). Nothing a
+refund has is certain to be there — the memo's shape is ThorChain's to
+change, and after a churn the vault that refunds is one no forward of the
+vault's paid — so a round is counted by its source when that verifies and
+by its amount otherwise; a top-up that happens to be the size of a
+forward still counts, since counting one costs you a kept output to move
+and missing a refund costs the deposit. The plan says which of its inputs
+were rounds (`carried_refunds`). Refund and payment differ in the record
+too: a refunded forward's swap never happened, and the XMR side, told to
 expect its output, sat on "partial" for ever about a deposit whose
 re-forward had fully landed. So the reconciliation reads what paid the
 address: a CONFIRMED output whose transaction's memo is `REFUND:<txid>`
@@ -2354,8 +2365,10 @@ otherwise paid for again every recheck — the network fee and ThorChain's
 outbound fee per round, "sent" in the chat each time — until the deposit
 was gone. The bound holds on every path: an evicted re-sign, and the fresh
 forward after a re-send every server rejected, leave the kept money out;
-a bump or a re-sign that carried returned money under the bound counts
-toward it. After `kept`, the client's taps ask the swap side (the money
+a bump or a re-sign that carried a round of returned money (a verified
+refund, or an output the size of one — see `--btc-returns-max` above)
+under the bound counts toward it, and a forward of honest top-ups alone
+does not. After `kept`, the client's taps ask the swap side (the money
 that DID swap is what they are waiting for), and once per `--btc-recheck`
 window a tap asks the forward again. Move the money by hand at the vault
 (the plan file names the outputs under `returned_kept`; a spend of exactly

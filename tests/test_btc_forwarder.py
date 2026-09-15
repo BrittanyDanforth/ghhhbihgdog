@@ -2642,6 +2642,124 @@ check("_carried_returned / returned_forwards: a plan with reason "
           {"reconcile_reason": "returned", "txid": "e" * 64},
           {"reconcile_reason": None, "txid": "f" * 64, "carried_returned": "2"}])
       == 2)
+
+print("\n== MED PASS: the bound counts ROUNDS of returned money, not honest "
+      "top-ups ==")
+# The bound counted every return: a client who paid a deposit in three
+# instalments had the third KEPT on the address for the operator's hand, as
+# if a route were refunding. A round is a VERIFIED refund, or an output the
+# SIZE of a refund of some forward on the chain (round_outpoints: less than
+# it sent, within refund_is_full's slack); a payment that is neither is
+# forwarded and counts for nothing. Nothing a refund has is certain to be
+# there -- the memo's shape is ThorChain's, and after a churn the refunding
+# vault is one no forward of ours paid -- so a round is counted by its
+# source when that verifies and by its amount otherwise; a top-up the size
+# of a forward still counts, the cheap direction.
+_HT1, _HT2, _HT3 = "a1" * 32, "a2" * 32, "a3" * 32
+check("round_outpoints: a verified refund of any size, and an output less "
+      "than a forward sent and within refund_is_full's slack of it; not "
+      "one larger, not one under half, not a claim by itself; junk (a bool "
+      "value, a junk vout, a plan without send_sat) counts for nothing",
+      F.round_outpoints(
+          [{"tx_hash": _HT1, "vout": 0, "value": 40000},
+           {"tx_hash": _HT1, "vout": 1, "value": 150000},
+           {"tx_hash": _HT2, "vout": 0, "value": 500000},
+           {"tx_hash": _HT2, "vout": 1, "value": 50000},
+           {"tx_hash": _HT3.upper(), "vout": 0, "value": 150000, "x": 1},
+           {"tx_hash": _HT3, "vout": "j", "value": 1}, "junk", None,
+           {"tx_hash": _HT3, "vout": 2, "value": True}],
+          [{"txid": _HT1, "vout": 0, "verified": True},
+           {"txid": _HT2, "vout": 1, "verified": False}, "junk",
+           {"txid": _HT3, "vout": 1, "verified": 1}, {"vout": "x"}],
+          [{"send_sat": 190000}, {"send_sat": 0}, {"send_sat": True},
+           "junk", None, {}])
+      == {(_HT1, 0), (_HT1, 1), (_HT3, 0)}
+      and F.round_outpoints(None, None, None) == set()
+      and F.round_outpoints([{"tx_hash": _HT1, "vout": 0, "value": 190000}],
+                            [], [{"send_sat": 190000}]) == set())
+_pT, _ofT, _hxT = _first_send()
+_TOP1 = [{"tx_hash": _HT1, "vout": 0, "value": 500000, "confirmations": 5}]
+_nT1 = Net(utxos=_TOP1, spends=[_listed(_pT, _hxT)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _pT2, _ = _reconcile(_nT1, _ofT)
+check("a second payment LARGER than the forward (a top-up, no memo) is "
+      "forwarded as returned money and is NOT a round: the plan says so "
+      "(carried_refunds 0) and the bound counts nothing",
+      _c == F.EXIT_OK and len(_nT1.posts) == 1
+      and _pT2["reconcile_reason"] == "returned"
+      and _pT2["carried_refunds"] == 0 and _pT2["carried_returned"] is None
+      and F.returned_forwards(
+          [_pT2] + [json.load(open(f)) for f in F._plan_chain(_ofT)]) == 0)
+_hxT2 = _nT1.submits[0]["raw_hex"]
+_LT2 = _listed(_pT2, _hxT2, inputs=[{"tx_hash": _HT1, "vout": 0,
+                                     "value": 500000}])
+_TOP2 = [{"tx_hash": _HT2, "vout": 0, "value": 600000, "confirmations": 5}]
+_nT2 = Net(utxos=_TOP2, spends=[_listed(_pT, _hxT), _LT2], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pT3, _ = _reconcile(_nT2, _ofT)
+_hxT3 = _nT2.submits[0]["raw_hex"]
+_LT3 = _listed(_pT3, _hxT3, inputs=[{"tx_hash": _HT2, "vout": 0,
+                                     "value": 600000}])
+_TOP3 = [{"tx_hash": _HT3, "vout": 0, "value": 700000, "confirmations": 5}]
+_nT3 = Net(utxos=_TOP3, spends=[_listed(_pT, _hxT), _LT2, _LT3], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pT4, _ = _reconcile(_nT3, _ofT)
+check("...a SECOND and a THIRD top-up are forwarded too, under the default "
+      "bound of two: three `returned` forwards on the chain and not one "
+      "round among them -- the third used to be KEPT for the operator's "
+      "hand",
+      _c == F.EXIT_OK and len(_nT3.posts) == 1
+      and _pT4["reconcile_reason"] == "returned"
+      and "returned_kept" not in _pT4
+      and _pT3["carried_refunds"] == 0 and _pT4["carried_refunds"] == 0
+      and len(F._plan_chain(_ofT)) == 4
+      and F.returned_forwards(
+          [json.load(open(f)) for f in F._plan_chain(_ofT)]) == 0
+      and ("forward", "returned_kept") not in _nT3.kinds
+      and ("forward", "returned_settled") in _nT3.kinds)
+check("...and the evicted re-sign above, which carried an output the size "
+      "of a refund, records it as a round beside the older count",
+      _pC3["carried_refunds"] == 1 and _pC3["carried_returned"] == 1)
+_pQ, _ofQ, _hxQ = _first_send()
+_RQ = [{"tx_hash": _HRF, "vout": 0, "value": 40000, "confirmations": 5}]
+_nQ = Net(utxos=_RQ, spends=[_listed(_pQ, _hxQ)], fee=10, submit=_ACCEPTED,
+          seen=_SEEN0,
+          funding=[_paid(_HRF, 40000, "REFUND:" + _pQ["txid"].upper(),
+                         _INBOUND)])
+_c, _o, _pQ2, _ = _reconcile(_nQ, _ofQ)
+check("a VERIFIED refund far under the size of one (a streaming swap that "
+      "filled part of the way) is a round by its source: carried_refunds "
+      "1, and the bound counts it",
+      _c == F.EXIT_OK and _pQ2["reconcile_reason"] == "returned"
+      and _pQ2["carried_refunds"] == 1
+      and F.returned_forwards(
+          [json.load(open(f)) for f in F._plan_chain(_ofQ)]) == 1)
+_pQc, _ofQc, _hxQc = _first_send()
+_nQc = Net(utxos=_RQ, spends=[_listed(_pQc, _hxQc)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0,
+           funding=[_paid(_HRF, 40000, "REFUND:" + _pQc["txid"].upper(),
+                          _OTHER_ADDR)])
+_c, _o, _pQc2, _ = _reconcile(_nQc, _ofQc)
+check("...the same amount with the same memo from an address no forward of "
+      "ours paid is a CLAIM, and a claim of that size is not a round: "
+      "nothing rests on it",
+      _c == F.EXIT_OK and _pQc2["carried_refunds"] == 0
+      and F.returned_forwards(
+          [json.load(open(f)) for f in F._plan_chain(_ofQc)]) == 0)
+check("_carried_returned: a plan with carried_refunds counts by it alone "
+      "(zero is no round, whatever its reason or carried_returned); a "
+      "bool or None there falls back to the older rule",
+      F.returned_forwards([
+          {"reconcile_reason": "returned", "txid": "1" * 64,
+           "carried_refunds": 0, "carried_returned": 3},
+          {"reconcile_reason": "evicted", "txid": "2" * 64,
+           "carried_refunds": 1, "carried_returned": 0},
+          {"reconcile_reason": "returned", "txid": "3" * 64,
+           "carried_refunds": True},
+          {"reconcile_reason": "bumped", "txid": "4" * 64,
+           "carried_refunds": None, "carried_returned": 2},
+          {"reconcile_reason": None, "txid": "5" * 64,
+           "carried_refunds": None}]) == 3)
 # MONEY THE VAULT KEPT, MOVED BY HAND: the documented remedy, and it used
 # to raise the seed-leak alarm on every later reconciliation.
 _ofM, _lM, _pM3, _hxM3 = _two_returns()

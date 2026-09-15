@@ -327,9 +327,14 @@ refuters per finding) found real defects, all fixed in the rewrite:
   recorded (`refunds` on the plan, kept on rotation) and changes nothing,
   a verified refund's forward drops out of the pairs sums, and when every
   forward was refunded nothing is rewritten (the deposit-time quote
-  stands, never an expectation of nothing). The bound still counts every
-  return (a refund whose memo shape changed must stay bounded); the kept
-  mark says how many are verified refunds; the job log names each. The
+  stands, never an expectation of nothing). The bound counted every
+  return at first (a refund whose memo shape changed must stay bounded);
+  the MED pass after the deep read narrowed it to ROUNDS -- a verified
+  refund, or an output the size of one (`round_outpoints`, recorded on
+  the plan as `carried_refunds`) -- so three honest instalments no longer
+  leave the third kept for the operator's hand, while a refund with a
+  changed memo or from a churned vault still counts by its amount; the
+  kept mark says how many are verified refunds; the job log names each. The
   one new trust is THORNode's word on its own vault address, which the
   cross-check already sends the money on. test_btc_broadcast, forwarder,
   agent; six anchors.
