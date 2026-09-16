@@ -590,10 +590,24 @@ class Pending:
                 raise Doorbell("job already handed over to a different boot")
             if not self.fetch_open():
                 raise Doorbell("fetch window closed")
+            # THE PI'S HALF OF THE VAULT'S STATE KEY RIDES HERE
+            # (STAGE7_PLAN.md). The vault's disk unlocks itself, so its
+            # records cannot be sealed under anything the vault keeps; they
+            # are sealed under two halves, and this is the one that lives
+            # only on this card, derived from the secret in it. Inside M2,
+            # so it is boxed to the vault's per-boot ephemeral key and
+            # reaches RAM on a machine that powers off minutes later.
+            #
+            # A KEYFILE FROM BEFORE THIS STAGE carries a secret all the
+            # same, so the half derives; the VAULT decides whether it
+            # wants one, because only the vault knows how it was paired.
             m2 = proto.seal(
                 pi_sk, nacl.public.PublicKey(eph), proto.TAG_M2,
                 {"job_id": self.job_id, "challenge": chal.hex(),
-                 "job": self.job, **self.params})
+                 "job": self.job,
+                 "state_half": proto.derive_state_half(
+                     self.key.get("secret")).hex(),
+                 **self.params})
             self._issued[(eph, chal)] = m2
             self.collected_at = self.clock()
             self.events.append("job_collected")
@@ -1032,6 +1046,19 @@ def build_cli() -> argparse.ArgumentParser:
     # stdin so it never lands in /proc/<pid>/cmdline. tests/test_cli_flags.py
     # asserts these flags do not exist. There is NO --passphrase either, for
     # the same reason and more so.
+    # THE RECOVERY COMMAND FOR THE VAULT'S SEALED RECORDS (STAGE7_PLAN.md).
+    # The vault's ledger, slips, bundles and plans are sealed under two
+    # halves, one of which lives only on this card. If the vault has to be
+    # opened with no Pi to wake it -- the operator is at the machine, the Pi
+    # is dead, a deposit has to be paid out -- this prints that half, and
+    # `gs_wake_agent --unseal-state <hex>` takes it. It asks for the
+    # passphrase like every other read of this keyfile, and prints to the
+    # terminal only.
+    k = sub.add_parser("state-key",
+                       help="print this Pi's half of the vault's state key "
+                            "(for opening the vault's records by hand)")
+    k.add_argument("--key", default="/etc/gs_wake_pi.key",
+                   help="the Pi keyfile (0400)")
     p = sub.add_parser("pair", help="generate this Pi's key and pair with the "
                                     "vault (run this second)")
     p.add_argument("vault", help="the ThinkPad's LAN address, as gs_wake_keys "
@@ -1712,6 +1739,28 @@ def main(argv=None):
             return do_pair(args)
         except (Doorbell, proto.WakeError) as e:
             sys.exit(f"[!] {e}")
+    if args.cmd == "state-key":
+        try:
+            _k = load_key(Path(args.key))
+            _half = proto.derive_state_half(_k.get("secret")).hex()
+        except (Doorbell, proto.WakeError) as e:
+            sys.exit(f"[!] {e}")
+        print()
+        print("  This Pi's half of the vault's state key:")
+        print()
+        print(f"      {_half}")
+        print()
+        print("  It opens the vault's records WITH the vault's own half,")
+        print("  which is in the vault's keyfile. Either alone opens")
+        print("  nothing. At the vault:")
+        print()
+        print(f"      python3 gs_wake_agent --unseal-state {_half} \\")
+        print("          --key /etc/gs_wake_thinkpad.key")
+        print()
+        print("  It is DERIVED from this card's secret, so it is the same")
+        print("  every time and a re-pairing changes it -- after which the")
+        print("  records written under the old one cannot be opened.")
+        return 0
     try:
         # THE JOB FIRST, THE KEY SECOND. Reading the job before spending two
         # seconds on Argon2id means a typo costs the operator nothing, and it

@@ -102,6 +102,37 @@ NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S = 60, 180
 
 STATE_FILE = "gs_wake_state.json"
 HANDLES_FILE = "gs_wake_handles.json"
+#: THE SEALED STORE (STAGE7_PLAN.md). Everything the artifact directory
+#: keeps BETWEEN jobs lives in here at rest, under a key half of which is
+#: only ever on the Pi. Opened after the wake note is authenticated, closed
+#: before the machine powers off.
+SEALED_FILE = "state.sealed"
+#: What goes in it: the records a later job, or the operator, needs. Not
+#: the job log (shredded at the end of a clean run instead), not the
+#: integrity chain (an append-only audit file that must stay readable
+#: without the Pi), not wallet_feesweep.json (written and retired inside
+#: one sweep, which may run on a boot that has no half at all).
+#:
+#: THE STATUS FILES ARE IN, and the first version of this list said they
+#: were not, "unlinked after one read". That is true of every path that
+#: reaches the unlink -- and a probe that is killed, or a power cut, does
+#: not. What it leaves is `unlocked` and `total` as exact decimals: how
+#: much of somebody's swap has arrived, to the piconero, sitting on a disk
+#: that unlocks itself. The forward's own status file was already swept in
+#: by the btc_forward_*.json glob, so the pair of them disagreed. Sealing
+#: gs_wake_status.json changes no behaviour: every job that reads it
+#: unlinks it at its START (see _run_validated), so a member restored out
+#: of the store is cleared before it can be mistaken for this run's answer.
+SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json",
+                "thor_pairs_*.json", "wallet_*.json",
+                "btc_forward_*.json", "gs_wake_status.json")
+#: ...less these, by exact name, for the reasons above.
+SEALED_SKIP = ("wallet_feesweep.json",)
+#: The two halves, once the note has been opened: the vault's from the
+#: keyfile, the Pi's from M2. main()'s finally needs them to re-seal, and
+#: it has no keyfile and no note -- the same shape as _LATE_GUARD. RAM
+#: only, and the machine powers off a moment later.
+_STATE_KEY = {}
 #: Where a swap_status probe drops its machine-readable outcome, 0600, in the
 #: artifact directory so paranoia_mode wipes it with everything else. Read once
 #: by _phase_of and never kept.
@@ -645,6 +676,152 @@ def load_key(path: Path) -> dict:
     else:
         k["btc_issued_mark"] = str(path) + ".issued"
     return k
+
+
+def _sealed_members(dirpath: Path) -> list:
+    """Every plaintext member present in `dirpath`, sorted. Names only --
+    the caller reads them. A directory entry that is not a file (a stray
+    directory named like a member) is not one."""
+    out = set()
+    for pat in SEALED_GLOBS:
+        for p in dirpath.glob(pat):
+            if p.is_file() and p.name not in SEALED_SKIP:
+                out.add(p.name)
+    return sorted(out)
+
+
+def state_halves(key: dict, pi_half: bytes = None) -> tuple:
+    """(vault half, Pi half) as bytes, or (None, None) when this pairing
+    does not seal its records.
+
+    The vault's half is in its keyfile; its PRESENCE is the switch, so a
+    keyfile written before this stage runs exactly as it did. A malformed
+    one is refused rather than ignored: a pairing that meant to seal and
+    cannot is not a pairing that should quietly stop.
+    """
+    raw = key.get("state_half")
+    if raw is None or raw == "":
+        return None, None
+    try:
+        vault = bytes.fromhex(str(raw))
+    except (TypeError, ValueError):
+        vault = b""
+    if len(vault) != proto.STATE_HALF_BYTES:
+        raise Refused(
+            "state_half_malformed",
+            "this machine's keyfile carries a state_half that is not "
+            f"{proto.STATE_HALF_BYTES} bytes of hex. That is the half of "
+            "the key its own records are sealed under; re-pair rather than "
+            "run with records nothing can open.")
+    return vault, pi_half
+
+
+def state_open(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
+    """Write the sealed store's members out as plaintext. Returns how many.
+
+    REFUSES rather than starting empty. A store that will not open means
+    either a re-pairing since it was written or a file that has been
+    altered; running past it would hand out an address that is already
+    somebody's and lose the map from owner tokens to accounts. There is no
+    safe way to guess, so the job does not start.
+    """
+    p = artifact_dir / SEALED_FILE
+    if not p.is_file():
+        return 0
+    try:
+        container = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise Refused("state_unreadable",
+                      f"{p} is not readable JSON ({type(e).__name__}). The "
+                      "records this machine keeps are in it; nothing is run "
+                      "against a ledger that cannot be read.")
+    try:
+        members = proto.state_unseal(container, vault_half, pi_half)
+    except proto.WakeError as e:
+        raise Refused(
+            "state_unreadable",
+            f"the sealed records at {p} did not open ({e}). Either the two "
+            "boxes were re-paired since they were written -- the Pi's half "
+            "of the key changes with its secret -- or the file has been "
+            "altered. Nothing is run against a ledger that cannot be read. "
+            "To open it by hand: `gs_doorbell state-key` on the Pi, then "
+            "`gs_wake_agent --unseal-state <hex>` here.")
+    # A MEMBER ALREADY ON DISK IS A RUN THAT DIED, not something to
+    # overwrite: it is newer than the seal. Left where it is, and rolled
+    # into the next seal with the rest.
+    n = 0
+    for name, text in members.items():
+        if "/" in name or "\\" in name or name in ("", ".", ".."):
+            raise Refused("state_unreadable",
+                          "the sealed records name a member that is not a "
+                          "plain file name; refusing to write it.")
+        _t = artifact_dir / name
+        if _t.exists():
+            continue
+        _fd = os.open(str(_t), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, "w") as fh:
+            fh.write(text)
+        n += 1
+    return n
+
+
+def state_close(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
+    """Seal every member back into the store and shred the plaintext.
+
+    Returns how many were sealed, or -1 when nothing could be. FAILS SAFE
+    IN THE OTHER DIRECTION from state_open, deliberately: a seal that does
+    not happen leaves the bookkeeping readable, which is a privacy loss;
+    a shred whose ciphertext never landed loses the bookkeeping itself,
+    which is a client's money stuck. So the plaintext goes only after the
+    new container is on disk AND has been read back with the same key.
+    """
+    names = _sealed_members(artifact_dir)
+    p = artifact_dir / SEALED_FILE
+    if not names:
+        # NOTHING LEFT TO KEEP: a wiped vault, or a run that retired the
+        # last record. The stale container goes too -- left behind, it
+        # would be opened next time and write its members back out.
+        if p.is_file():
+            try:
+                secure_delete_or_warn(p, "the sealed records")
+            except Exception:                                # noqa: BLE001
+                return -1
+        return 0
+    members = {}
+    try:
+        for name in names:
+            members[name] = (artifact_dir / name).read_text()
+        container = proto.state_seal(members, vault_half, pi_half)
+        tmp = artifact_dir / (SEALED_FILE + ".new")
+        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, "w") as fh:
+            json.dump(container, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # READ IT BACK BEFORE ANYTHING IS DESTROYED. Not paranoia: this is
+        # the one moment where a bug costs the operator the ledger rather
+        # than costing them privacy, and the two failures point opposite
+        # ways.
+        back = proto.state_unseal(json.loads(tmp.read_text()),
+                                  vault_half, pi_half)
+        if back != members:
+            raise ValueError("the sealed copy does not read back")
+        os.replace(str(tmp), str(p))
+    except Exception:                                        # noqa: BLE001
+        try:
+            (artifact_dir / (SEALED_FILE + ".new")).unlink()
+        except OSError:
+            pass
+        return -1
+    gone = 0
+    for name in names:
+        try:
+            secure_delete_or_warn(artifact_dir / name,
+                                  "a sealed record's plaintext")
+            gone += 1
+        except Exception:                                    # noqa: BLE001
+            continue
+    return gone
 
 
 def load_state(dirpath: Path) -> dict:
@@ -3028,6 +3205,26 @@ def run_once(args, deps: dict = None) -> tuple:
     # validate_job only reads a closed, typed schema out of it.
     job_id, job, params = proto.validate_job(body)
 
+    # THE PI'S HALF OF THE STATE KEY, OUT OF THE AUTHENTICATED NOTE
+    # (STAGE7_PLAN.md). Recorded for main()'s finally, which re-seals and
+    # has neither the keyfile nor the note. A vault paired for sealing and
+    # handed a note without a half is a half-upgraded pair: refuse, because
+    # the alternative is running against records it cannot open, or
+    # starting an empty ledger and re-issuing somebody's address.
+    _vault_half, _ = state_halves(key)
+    if _vault_half is not None:
+        try:
+            _pi_half = proto.state_half_of(body)
+        except proto.WakeError:
+            raise Refused(
+                "state_half_missing",
+                "this machine's records are sealed to the pair, and the "
+                "note carries no half of the key. The Pi is running a "
+                "build from before that: update BOTH boxes, in the same "
+                "sitting, as the wire version says.")
+        _STATE_KEY["vault"], _STATE_KEY["pi"] = _vault_half, _pi_half
+        _STATE_KEY["dir"] = artifact_dir
+
     elapsed = _clock() - sent_at
     if elapsed > M1_M2_WINDOW_S:
         # NEVER the word "expired". The job is current; what is out of bounds
@@ -3108,6 +3305,17 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # in step. The M1 POST is run_once's, and it is already done by here.
     (job_id, job, params, challenge, _sleep, _rng, _verify_tor,
      _accounts, _child) = state_deps
+
+    # THE RECORDS ARE OPENED HERE, BEFORE ANYTHING READS ONE (STAGE7).
+    # First line of the first function that touches the directory: the
+    # replay ledger below is a member, and so is everything after it. A
+    # pairing that does not seal (no half in the keyfile) falls straight
+    # through, which is every install from before this stage.
+    if _STATE_KEY.get("vault") is not None:
+        _n = state_open(artifact_dir, _STATE_KEY["vault"], _STATE_KEY["pi"])
+        integrity_log("wake", "state_opened" if _n else "state_empty")
+    else:
+        integrity_log("wake", "state_unsealed")
 
     state = load_state(artifact_dir)
     if job_id in {j.get("id") for j in state["jobs"]}:
@@ -5240,6 +5448,78 @@ def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
               f"machine.")
 
 
+def retire_job_log(code: str, dry_run: bool = False) -> bool:
+    """Shred the job log when the run went well. Returns whether it went.
+
+    IT HOLDS THE CHILDREN'S OUTPUT: the deposit address, the memo naming
+    the client's XMR address, the amounts. It was truncated at the START
+    of the next boot, so between two wakes -- weeks, on the machine this
+    whole design keeps switched off -- the last deposit sat in the clear
+    beside the sealed records. Sealing those and leaving this is sealing
+    nothing.
+
+    ONLY ON A CLEAN RUN. A refusal or a crash is exactly when the operator
+    needs to read it, and under StandardOutput=null it is the only place
+    the reason exists. _AGENT_LOG is cleared first so a later line -- a
+    power-off that failed, say -- does not write the file straight back.
+    Never raises: bookkeeping must not be what keeps a vault switched on.
+    """
+    if dry_run or code not in ("done", "not_configured"):
+        return False
+    _p = _AGENT_LOG[0]
+    _AGENT_LOG[0] = None
+    if _p is None:
+        return False
+    try:
+        if Path(_p).is_file():
+            secure_delete_or_warn(Path(_p), "the job log")
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def unseal_state_cli(args) -> str:
+    """--unseal-state: open the sealed records by hand and stop.
+
+    The recovery path of STAGE7_PLAN.md §5. Everything the vault keeps
+    between jobs is sealed under two halves and the Pi holds one of them,
+    so a dead card would otherwise mean a ledger nobody can read and open
+    deposits nobody can pay out. This takes that half on the command line
+    -- printed by `gs_doorbell state-key`, at the machine, by the operator
+    -- and writes the members out as plaintext.
+
+    It does not power anything off and does not touch the doorbell. The
+    next ordinary wake seals what it finds, so the plaintext is the
+    operator's to use and then let the next poke put away.
+    """
+    key = load_key(Path(args.key))
+    artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
+    vault, _ = state_halves(key)
+    if vault is None:
+        agent_say("  [!] This keyfile carries no state half, so this "
+                  "machine's records are not sealed: they are already "
+                  "plaintext in the artifact directory. Nothing to open.")
+        return "unsealed"
+    try:
+        pi = bytes.fromhex(str(args.unseal_state).strip())
+    except ValueError:
+        pi = b""
+    if len(pi) != proto.STATE_HALF_BYTES:
+        agent_say(f"  [!] --unseal-state takes the Pi's half as "
+                  f"{proto.STATE_HALF_BYTES * 2} hex characters. Print it "
+                  f"with `gs_doorbell state-key` on the Pi.")
+        return "bad_half"
+    try:
+        n = state_open(artifact_dir, vault, pi)
+    except Refused as e:
+        agent_say(f"  [!] {e.msg}")
+        return e.code
+    agent_say(f"  [+] {n} record(s) written out in the clear at "
+              f"{artifact_dir}. They are sealed again by the next wake; "
+              f"run paranoia_mode instead if this box is finished with.")
+    return "opened"
+
+
 def build_cli() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Collect one job from the doorbell, run it, power off.")
@@ -5249,6 +5529,15 @@ def build_cli() -> argparse.ArgumentParser:
                          "gathered on the fee wallet to the addresses the "
                          "keyfile names, if it clears the threshold, then "
                          "stop. With --dry-run, say whether it would.")
+    ap.add_argument("--unseal-state", metavar="HEX", default="",
+                    help="open this machine's sealed records BY HAND and "
+                         "leave them as plaintext, then stop: no job, no "
+                         "doorbell, no power-off. HEX is the Pi's half of "
+                         "the key, which `gs_doorbell state-key` prints on "
+                         "the Pi. For the case the records must be read "
+                         "with no Pi to wake this box -- the card is dead "
+                         "and a deposit still has to be paid out. They are "
+                         "sealed again by the next ordinary wake.")
     ap.add_argument("--dry-run", action="store_true",
                     help="check the keyfile, preflight, Tor and that the "
                          "doorbell answers — then STOP, without asking for a "
@@ -5268,6 +5557,13 @@ def main(argv=None) -> int:
     _keep_on = False
     try:
         try:
+            if getattr(args, "unseal_state", ""):
+                # NOTHING ELSE RUNS ON THIS PATH, and it never powers the
+                # machine off: the operator is standing here, with the
+                # records open in front of them, which is the whole point.
+                code = unseal_state_cli(args)
+                _keep_on = True
+                return 0 if code == "opened" else 1
             if getattr(args, "fee_sweep", False):
                 code = run_fee_sweep_cli(args)
                 agent_say(f"  [+] Fee sweep finished: {code}.")
@@ -5311,6 +5607,41 @@ def main(argv=None) -> int:
                 pass
             raise
     finally:
+        # THE RECORDS GO BACK IN THE STORE BEFORE THE POWER DOES (STAGE7).
+        # Here, in the finally, because every other path out of this
+        # function -- a refusal, a crash, a fail-closed abort from
+        # gs_common -- ends with the machine off and the directory on a
+        # disk that unlocks itself. A run that never opened the store
+        # (no half in the keyfile, or a refusal before the note) leaves
+        # _STATE_KEY empty and this does nothing.
+        #
+        # FAILS THE OTHER WAY FROM state_open, and it must: an unsealed
+        # directory is a privacy loss the operator can still fix, while a
+        # shred whose ciphertext never landed is a client's money with no
+        # bookkeeping. state_close returns -1 rather than raising, and
+        # says so.
+        if _STATE_KEY.get("vault") is not None:
+            try:
+                _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],
+                                      _STATE_KEY["pi"])
+                if _sealed < 0:
+                    agent_say("  [!] THE RECORDS COULD NOT BE SEALED and are "
+                              "still readable on this disk. Nothing was "
+                              "destroyed. Look at the artifact directory "
+                              "before the next wake.")
+                    integrity_log("wake", "state_unsealed_fail")
+                else:
+                    integrity_log("wake", "state_sealed")
+            except Exception:                                # noqa: BLE001
+                # Bookkeeping must never be what keeps the box on, and a
+                # failure here has already left the plaintext in place.
+                try:
+                    integrity_log("wake", "state_unsealed_fail")
+                except Exception:                            # noqa: BLE001
+                    pass
+            finally:
+                _STATE_KEY.clear()
+        retire_job_log(code, args.dry_run)
         # EVERY path, including SystemExit from gs_common's own fail-closed
         # aborts, and including an unhandled exception.
         #

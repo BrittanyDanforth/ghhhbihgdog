@@ -1226,6 +1226,99 @@ check("result: a non-ASCII challenge echo is refused as a Doorbell, not "
       and _db_src_ch.index("_ch.isascii()")
       < _db_src_ch.index("hmac.compare_digest(_ch, c.hex())"))
 
+# ===========================================================================
+#  THE PI'S HALF OF THE VAULT'S STATE KEY (STAGE7_PLAN.md)
+# ===========================================================================
+print("\n== the card carries half of the vault's state key ==")
+#
+# WHY THIS LIVES HERE AND NOT ONLY ON THE VAULT. The vault's disk unlocks
+# itself at boot, so nothing the vault keeps can seal the vault's records
+# against somebody who takes the vault. The only secret in this system that is
+# NOT on that machine is the one on this card -- so the records are sealed
+# under two halves, and the doorbell's job is to hand its half over inside M2,
+# which is boxed to the vault's per-boot ephemeral key.
+#
+# What is asserted: the half the doorbell SENDS is the one the vault's own
+# reader takes out, it is derived rather than drawn (so it is the same across
+# boots and a wiped Pi that still has its card can still open the store), it
+# is one-way (a captured M2 is not the card's X25519 secret), and it is
+# different on a different card.
+_sb = Bell()
+_seph, _schal = NP.PrivateKey.generate(), P.new_challenge()
+_sst, _sm2 = _sb.post("/wake", m1_for(_seph, _schal, _sb.pending.window))
+_sbody = P.open_record(_seph, PI.public_key, _sm2, P.TAG_M2)
+check("state: the M2 carries a state_half", _sst == 200
+      and "state_half" in _sbody)
+check("state: ...and the vault's own reader takes the same bytes out of it, "
+      "so the two boxes agree without a second format",
+      P.state_half_of(_sbody) == P.derive_state_half(KEY["secret"]))
+check("state: ...which is STATE_HALF_BYTES long",
+      len(P.state_half_of(_sbody)) == P.STATE_HALF_BYTES)
+# ONE-WAY. An M2 is boxed, but the vault opens it in RAM and a bug that logged
+# a job body must not have logged the card's long-term secret with it.
+check("state: the half is NOT the card's X25519 secret, so an M2 that leaked "
+      "does not hand over the pairing",
+      _sbody["state_half"] != KEY["secret"]
+      and KEY["secret"] not in json.dumps(_sbody))
+# DERIVED, NOT DRAWN. A fresh random half per boot would mean the vault could
+# never open a store written by an earlier boot -- the whole ledger would be
+# unreadable after every power cycle.
+_sb2 = Bell()
+_seph2, _schal2 = NP.PrivateKey.generate(), P.new_challenge()
+_, _sm2b = _sb2.post("/wake", m1_for(_seph2, _schal2, _sb2.pending.window))
+_sbody2 = P.open_record(_seph2, PI.public_key, _sm2b, P.TAG_M2)
+check("state: a second boot sends the SAME half — it is derived from the "
+      "card, not drawn per wake, so yesterday's store still opens",
+      P.state_half_of(_sbody2) == P.state_half_of(_sbody))
+_sb.close()
+_sb2.close()
+# A DIFFERENT CARD IS A DIFFERENT HALF, so two installs of this public
+# repository do not seal their stores under the same key.
+_other = NP.PrivateKey.generate()
+check("state: a different card derives a different half",
+      P.derive_state_half(_other.encode().hex())
+      != P.derive_state_half(KEY["secret"]))
+
+# THE RECOVERY PATH. The Pi is dead, a deposit has to be paid out, the
+# operator is standing at the vault: `gs_doorbell state-key` prints the half
+# so `gs_wake_agent --unseal-state` can take it. Without this the pair is a
+# way to lose money, not a way to keep it private.
+_sk_path = _keyfile({**KEY, "role": "pi"}, name="statekey.key")
+_sk_out = io.StringIO()
+os.environ[DB.PASSPHRASE_ENV] = PW.decode()
+try:
+    with contextlib.redirect_stdout(_sk_out):
+        _sk_rc = DB.main(["state-key", "--key", str(_sk_path)])
+finally:
+    os.environ.pop(DB.PASSPHRASE_ENV, None)
+_sk_txt = _sk_out.getvalue()
+check("state-key: it exits clean and prints this card's half",
+      _sk_rc == 0 and P.derive_state_half(KEY["secret"]).hex() in _sk_txt)
+check("state-key: ...and never the secret it came from",
+      KEY["secret"] not in _sk_txt)
+check("state-key: ...and names the command that takes it at the vault, so "
+      "the half is not a number with no instructions",
+      "--unseal-state" in _sk_txt and "gs_wake_agent" in _sk_txt)
+check("state-key: ...and says the other half is the vault's, so nobody "
+      "reads this as the whole key",
+      "vault's own half" in _sk_txt)
+check("state-key: ...and warns that a re-pairing orphans the store",
+      "re-pairing" in _sk_txt)
+# IT IS A SUBCOMMAND OF THE SAME CLI, and it reads a sealed keyfile like every
+# other read: no unsealed shortcut for the recovery path.
+check("state-key: the subcommand parses with the keyfile default",
+      DB.build_cli().parse_args(["state-key"]).key == "/etc/gs_wake_pi.key")
+_unsealed = _keyfile({**KEY, "role": "pi"}, name="statekey_open.key",
+                     seal=False)
+_sk_refused = False
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        DB.main(["state-key", "--key", str(_unsealed)])
+except SystemExit:
+    _sk_refused = True
+check("state-key: an UNSEALED card is refused here too — the recovery path "
+      "is not a way around the passphrase", _sk_refused)
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

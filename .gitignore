@@ -121,6 +121,12 @@ accounts_count.txt
 gs_wake_*.key
 gs_wake_state.json
 gs_wake_handles.json
+# The sealed store those two live inside at rest (STAGE7_PLAN.md), and the
+# transient a killed seal may leave beside it. Ciphertext, and still not
+# ours to publish: the vault's own half of its key is in the keyfile on the
+# same disk, so a copy of this file is half of somebody's ledger.
+state.sealed
+state.sealed.new
 # receive_watch --result-json's outcome, written into the same artifact_dir as
 # the two above by the wake agent's swap_status job. It carries `unlocked` and
 # `total` as exact decimals -- how much of the swap has arrived, to the

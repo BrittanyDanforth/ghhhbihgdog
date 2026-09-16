@@ -69,11 +69,60 @@ not fixed by any of this.
 | **with `--allow-withdraw`:** spend wallet file + `GS_WALLET_PASSWORD` | ThinkPad disk + `/etc/gs-wake-spend.env` | **they can spend** |
 | **with `--allow-btc-forward`:** `GS_BTC_SEED` (+ passphrase) | `/etc/gs-wake-spend.env` on the ThinkPad | **they own every deposit address this intake ever issues** |
 | the vault's wake keyfile (unsealed by design — nobody is there at boot to type a passphrase) | ThinkPad `/etc`, `0400` | the wake secret, the Pi's address, the account xpub (so: every deposit address, past and future), your Electrum onion, your fee and sweep addresses |
-| the artifact directory (ledger, open slips, plan chains, job log, chain log) | ThinkPad disk | every open deposit, and every forward since the last hand wipe |
+| the artifact directory (ledger, open slips, plan chains, job log, chain log) | ThinkPad disk — **sealed between wakes**, see below | *during a job:* every open deposit and every forward since the last hand wipe. *Between wakes:* one `state.sealed` this machine cannot open by itself |
 
 The bottom four rows are the price of a machine that works while nobody
 is at it: an auto-unlocking disk decrypts itself for whoever powers it
 on. "Off" is not "sealed" — §6's ThinkPad row is scored on that.
+
+### The records are sealed to the *pair*, and half of the key is on the Pi
+
+The row above is the one row of the four that got better, and it is worth
+knowing exactly how far. The ThinkPad's disk unlocks itself, so nothing the
+ThinkPad keeps can seal the ThinkPad's own records — a key in its `/etc` is
+a key in the hand of whoever powers it on. So the records are sealed under
+**two halves**: one in the vault's keyfile, one derived from the secret on
+the Pi's SD card and carried inside the (already encrypted) note the Pi
+sends when it wakes the machine. Neither half opens anything alone.
+
+What that buys, and only this: a machine taken **between wakes**, with no
+Pi, is one `state.sealed` file — no ledger, no open slips, no plan chains,
+not even the *file names*, which were themselves a count of deposits and a
+list of handles. What it does **not** buy: a machine taken with the Pi, or
+taken mid-job while the records are open on the disk, reads everything.
+It is a clock-and-possession fix, not a safe.
+
+Two things follow that you have to actually do:
+
+* **Both boxes get updated in the same sitting.** A vault paired for
+  sealing that is woken by a Pi running an older build refuses the job and
+  says so, rather than starting on an empty ledger and re-issuing an
+  address somebody has already paid. A pairing made before this stage keeps
+  running unsealed; nothing turns on quietly, in either direction.
+* **A re-pairing orphans the store.** The Pi's half comes from the Pi's
+  secret, so `gs_doorbell pair` again — or a fresh SD card — changes it, and
+  the records written under the old one no longer open. Empty the vault's
+  artifact directory of open deposits *before* re-pairing, not after.
+
+**If the Pi dies and a deposit still has to be paid out**, you do not lose
+the records; you go and get the half by hand. Write these two beside the
+LUKS USB, because you will want them on the day the Pi does not boot:
+
+```
+# on the Pi (or the SD card in any reader), asks for the card's passphrase:
+gs_doorbell state-key --key /etc/gs_wake_pi.key
+
+# then at the ThinkPad, with the hex it printed:
+gs_wake_agent --unseal-state <hex> --key /etc/gs_wake_thinkpad.key
+```
+
+The second one writes the records back out in the clear and leaves them
+there — it is the "I am standing at the machine" path, so it does not wake
+anything, does not power anything off, and does not re-seal. The next
+normal wake seals them again.
+
+If the *card* is what died, the store is gone. That is the design: a half
+you could recover from the vault would be a half the vault's captor has.
 
 Telegram never gets: wallet path, RPC URL, view key, spend key, seed — and by
 default nothing else either, only which job finished and a 4-hex handle.
@@ -1504,7 +1553,7 @@ missing on a box where it is the only tamper-evidence there is.
 | Hotspot / SIM / towers | **Yes** — no cellular |
 | VPS host images a wallet | **Yes** — no wallet on Mullvad |
 | Door kick, Pi only | **Depends entirely on whether you encrypted the Pi (§3).** The wake keyfile is sealed with your passphrase, so the card alone no longer yields the wake key, your ThinkPad's MAC or your LAN layout — it yields Argon2id parameters and a salt. But an unencrypted card still hands over `/etc/wireguard/wg0.conf`, which is your **Mullvad private key**, and `/var/lib/tor`, which is your **guard set**. Those are your network identity and no work on the wake channel touches them. Wake traffic recorded off the switch stays sealed either way: each job note is boxed to a key the vault minted for that boot and then powered off with. Recovery is a two-box re-key (two commands, §8), plus a new Mullvad account |
-| Door kick, they take the ThinkPad | **Depends on what you paired it to do.** Paired for watching only: view-only wallet, the open slips and the ledger — the spend USB is elsewhere, so they cannot spend. Paired with `--allow-withdraw` (§4b): the spend wallet file and its password are both on that disk, so **they can spend**. Paired with `--allow-btc-forward`: `GS_BTC_SEED` is in the unit's environment file, so **they own every intake deposit address**, past and future. The disk auto-unlocks — that is what lets the Pi wake it — so full-disk encryption does not bear on this row at all; see §1 |
+| Door kick, they take the ThinkPad | **Depends on what you paired it to do.** Paired for watching only: the view-only wallet, and — *if they take it mid-job, or take the Pi with it* — the open slips and the ledger; taken between wakes, with no Pi, those are one sealed file this machine cannot open alone (§1). The spend USB is elsewhere either way, so they cannot spend. Paired with `--allow-withdraw` (§4b): the spend wallet file and its password are both on that disk, so **they can spend**. Paired with `--allow-btc-forward`: `GS_BTC_SEED` is in the unit's environment file, so **they own every intake deposit address**, past and future. The disk auto-unlocks — that is what lets the Pi wake it — so full-disk encryption does not bear on this row at all; see §1 |
 | Spend USB left in the laptop | **No** — you blew the split |
 | Stolen Telegram / bot token | **Partly, and it depends on `allow_withdraw`.** Without it they can wake and spam quotes, **not spend**, and the spam is bounded on the ThinkPad rather than on the stolen thing: a 24 h wake budget (12 by default) and an account ceiling (45) that refuses **minting** jobs once the wallet holds more subaddress accounts than the offline signer derives. Both live in the keyfile, so changing them needs physical access. **With `allow_withdraw` on, they can spend — to an address they type** (§4b), and the ceiling does not apply: it is checked for `receive_and_quote` only — the one remaining minting job — and a mix mints ~25 accounts of its own. That exemption is deliberate — refusing a withdrawal at 45 accounts would strand the money, and `airgap_tx_signer` already creates the accounts the offline wallet needs — but it means the ceiling bounds the cheap job and not the expensive one. What bounds a withdrawal is `allow_withdraw`, the wake budget, and the fact that one holds the pager for most of a day. They also get your vault powering on when they say |
 | Somebody on the switch during PAIRING | **Only if you compare the code.** The two boxes have never met, so nothing but you can tell the real peer from an impostor. Each commits to its key before seeing the other's, which is what stops an attacker grinding keys until the two codes agree — so the 8 characters you compare are worth 2^40 and a man in the middle has to guess once, in public, with you looking at it. If you do not actually compare them, this is unauthenticated key agreement and the software cannot tell |
@@ -1665,6 +1714,14 @@ effort on the swap and the phone.
       that, so if you have one on a USB stick something went wrong
 - [ ] You can still open the Pi's keyfile: poke the doorbell once and
       type the passphrase. There is no recovery if you cannot
+- [ ] After a test wake has finished, the vault's artifact directory
+      holds `state.sealed` and **no** `gs_wake_handles.json`,
+      `gs_wake_state.json`, `wallet_*.json` or `thor_pairs_*.json`. If
+      the plaintext is still there the seal did not happen, and the
+      agent said so on the way out (§1)
+- [ ] You have run `gs_doorbell state-key` **once**, and written the hex
+      it printed beside the LUKS USB with the `--unseal-state` command.
+      It is the only way back into the records if the Pi dies (§1)
 - [ ] `gs-wake-deadman.timer` is **active** — the agent refuses to run a
       job on a box that cannot turn itself off
 - [ ] `sleep.target suspend.target hibernate.target hybrid-sleep.target`
@@ -1805,6 +1862,14 @@ passwords. `paranoia_mode` reaches neither — `/etc` is not one of its
 roots. Copy the seed somewhere you can restore from BEFORE you shred it,
 or you are destroying the money with the evidence; the wallet files are
 worth the same care.
+
+The first line has a second effect worth knowing, and here it is the one
+you want: the vault's keyfile holds its half of the state key (§1), so
+shredding it makes any `state.sealed` that survives the wipe unopenable
+by anyone, you included. `paranoia_mode` erases that file anyway — but if
+you are wiping ahead of a door and there are **open deposits**, get what
+you owe out of the ledger before you run either command, because
+afterwards there is no ledger to read.
 
 The second line is for a vault that ran the BTC intake: the marks name
 no address and no client, but they say an intake ran here and how many

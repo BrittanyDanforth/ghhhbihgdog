@@ -6271,6 +6271,112 @@ MUTATIONS = [
   'with "\n'
   '                  f"a {len(window)}-byte wake window.")',
   ['test_wake_agent']),
+ # HOST-PRIVACY PASS, STAGE 7: what a machine that unlocks its own disk keeps
+ # at rest, and the half of its key that is NOT on it (STAGE7_PLAN.md).
+ ("the card's half of the state key IS the card's long-term secret",
+  'gs_wake_proto.py',
+  '    return hashlib.blake2b(b"gs-state-half-v1", key=key,\n'
+  '                           digest_size=STATE_HALF_BYTES).digest()',
+  '    return key',
+  ['test_wake_doorbell', 'test_wake_protocol']),
+ ("the container key ignores the Pi's half, so the seized machine opens it "
+  "alone", 'gs_wake_proto.py',
+  '    return hashlib.blake2b(bytes(vault_half) + bytes(pi_half),\n'
+  '                           key=bytes(salt), person=b"gs-state-v1",\n'
+  '                           digest_size=32).digest()',
+  '    return hashlib.blake2b(bytes(vault_half),\n'
+  '                           key=bytes(salt), person=b"gs-state-v1",\n'
+  '                           digest_size=32).digest()',
+  ['test_wake_protocol', 'test_wake_agent']),
+ ('every store is sealed under the same salt', 'gs_wake_proto.py',
+  '    _salt = salt if salt is not None else nacl.utils.random(STATE_SALT_BYTES)',
+  '    _salt = salt if salt is not None else bytes(STATE_SALT_BYTES)',
+  ['test_wake_protocol']),
+ ("a job body may smuggle its own half past the note's", 'gs_wake_proto.py',
+  '    reserved = {"job", "job_id", "challenge", "state_half"}',
+  '    reserved = {"job", "job_id", "challenge"}',
+  ['test_wake_protocol']),
+ ('the doorbell sends a half that is not derived from its card', 'gs_doorbell',
+  '                 "state_half": proto.derive_state_half(\n'
+  '                     self.key.get("secret")).hex(),',
+  '                 "state_half": bytes(proto.STATE_HALF_BYTES).hex(),',
+  ['test_wake_doorbell']),
+ ('the pairing gives the vault no half, so nothing is ever sealed',
+  'gs_wake_keys',
+  '        "state_half": os.urandom(proto.STATE_HALF_BYTES).hex(),',
+  '        "state_half": "",',
+  ['test_wake_agent']),
+ ('a keyfile from before this stage is switched INTO sealing',
+  'gs_wake_agent',
+  '    if raw is None or raw == "":\n'
+  '        return None, None',
+  '    if False:\n'
+  '        return None, None',
+  ['test_wake_agent']),
+ ('a malformed half in the keyfile runs unsealed instead of refusing',
+  'gs_wake_agent',
+  '    if len(vault) != proto.STATE_HALF_BYTES:',
+  '    if False:',
+  ['test_wake_agent']),
+ ('a vault that seals runs on a note carrying no half', 'gs_wake_agent',
+  '    _vault_half, _ = state_halves(key)\n'
+  '    if _vault_half is not None:',
+  '    _vault_half, _ = state_halves(key)\n'
+  '    if False:',
+  ['test_wake_agent']),
+ ('the records are never opened, so every run starts on an empty ledger',
+  'gs_wake_agent',
+  '    if _STATE_KEY.get("vault") is not None:\n'
+  '        _n = state_open(artifact_dir, _STATE_KEY["vault"], _STATE_KEY["pi"])',
+  '    if False:\n'
+  '        _n = state_open(artifact_dir, _STATE_KEY["vault"], _STATE_KEY["pi"])',
+  ['test_wake_agent']),
+ ('a store that will not open starts empty instead of refusing',
+  'gs_wake_agent',
+  '        raise Refused(\n'
+  '            "state_unreadable",\n'
+  '            f"the sealed records at {p} did not open ({e}). Either the two "',
+  '        return 0\n'
+  '        raise Refused(\n'
+  '            "state_unreadable",\n'
+  '            f"the sealed records at {p} did not open ({e}). Either the two "',
+  ['test_wake_agent']),
+ ("a run that died has its surviving record overwritten by the stale seal",
+  'gs_wake_agent',
+  '        if _t.exists():\n'
+  '            continue',
+  '        if False:\n'
+  '            continue',
+  ['test_wake_agent']),
+ ('the new container is never read back before the plaintext goes',
+  'gs_wake_agent',
+  '        if back != members:\n'
+  '            raise ValueError("the sealed copy does not read back")',
+  '        if False:\n'
+  '            raise ValueError("the sealed copy does not read back")',
+  ['test_wake_agent']),
+ ('the plaintext is left beside the ciphertext', 'gs_wake_agent',
+  '            secure_delete_or_warn(artifact_dir / name,\n'
+  '                                  "a sealed record\'s plaintext")\n'
+  '            gone += 1',
+  '            gone += 1',
+  ['test_wake_agent']),
+ ('only the ledger is sealed: the slips, bundles and forwards stay in the '
+  'clear', 'gs_wake_agent',
+  'SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json",\n'
+  '                "thor_pairs_*.json", "wallet_*.json",\n'
+  '                "btc_forward_*.json", "gs_wake_status.json")',
+  'SEALED_GLOBS = ("gs_wake_state.json",)',
+  ['test_wake_agent']),
+ ("a killed probe's exact figures are left in the clear", 'gs_wake_agent',
+  '                "btc_forward_*.json", "gs_wake_status.json")',
+  '                "btc_forward_*.json")',
+  ['test_wake_agent']),
+ ('main() finishes without re-sealing what it opened', 'gs_wake_agent',
+  '                _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],\n'
+  '                                      _STATE_KEY["pi"])',
+  '                _sealed = 0',
+  ['test_wake_agent']),
 ]
 
 

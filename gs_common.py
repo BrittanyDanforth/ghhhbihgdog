@@ -1151,6 +1151,12 @@ GS_ARTIFACT_FILE_PATTERNS = [
     #: but it is a dated record of every time you woke the vault from a phone
     #: -- which is exactly the correlation the jitters exist to break.
     "pager_state.json",
+    # THE SEALED STORE (STAGE7_PLAN.md) and the transient a killed seal may
+    # leave beside it. It is ciphertext, so a wipe that missed it would not
+    # hand anyone the ledger -- but the vault's own half of the key is in a
+    # keyfile on the same disk, so leaving it is leaving half the work, and
+    # "the artifact directory is erased" must stay true of every file in it.
+    "state.sealed", "state.sealed.new",
     "pager.log", "gs_wake_handles.json", ".gs_wake_inhibit",
     # WHERE A WOKEN JOB'S CHILDREN WRITE, because the alternative was the
     # systemd journal -- persistent, root-owned, rotated rather than erased,

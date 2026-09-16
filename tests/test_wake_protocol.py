@@ -1026,7 +1026,6 @@ check("...and driving a version mismatch really does put an abort on the "
       _mismatch is not None and _ab_seen
       and b"protocol" in _ab_seen[0])
 
-_finished()
 # ---- THE RESULT WINDOW HAD ZERO MARGIN, BY CONSTRUCTION -----------------
 #
 # result_budget_s summed the jitter and the per-step budget and stopped there,
@@ -1068,6 +1067,122 @@ check("window: NON-VACUITY -- the withdrawal window is still the longest, so "
       == max(P.result_budget_s(_j) for _j in P.JOBS))
 
 
+def _refused(fn, *a, **k):
+    """Whether `fn` raises WakeError. The suites above each rolled their
+    own two-line try/except for this; the stage-7 block below asks it a
+    dozen times."""
+    try:
+        fn(*a, **k)
+        return False
+    except P.WakeError:
+        return True
+
+
+# ===========================================================================
+# STAGE 7: THE STATE KEY. The vault's disk unlocks itself, so its records
+# cannot be sealed under anything the vault keeps. They are sealed under two
+# halves -- one in the vault's keyfile, one derived from the Pi's secret and
+# carried inside M2 -- and neither opens anything alone.
+# ===========================================================================
+_SK_V = bytes(range(32))
+_SK_P = P.derive_state_half("11" * 32)
+check("the Pi's half is derived from its own secret: the right length, "
+      "deterministic, and different for a different secret",
+      len(_SK_P) == P.STATE_HALF_BYTES
+      and _SK_P == P.derive_state_half("11" * 32)
+      and _SK_P != P.derive_state_half("12" * 32))
+#: ONE-WAY, and this suite did not say so. The sweep found it: a build whose
+#: derive_state_half simply RETURNED the secret was caught only by the
+#: doorbell suite, because nothing here compared the half to its input. The
+#: half rides inside M2 and is printed to a terminal by `gs_doorbell
+#: state-key`, so "it is not the card's long-term secret" is the property
+#: that makes both of those safe.
+check("...and it is ONE-WAY: the half is not the secret it came from, nor "
+      "any prefix of it, so a half that leaked does not hand over the card",
+      _SK_P != bytes.fromhex("11" * 32)
+      and _SK_P.hex() not in "11" * 32
+      and ("11" * 32) not in _SK_P.hex())
+for _bad, _why in (("nothex", "not hex"), ("11" * 31, "too short"),
+                   ("", "empty"), (None, "missing")):
+    _r = False
+    try:
+        P.derive_state_half(_bad)
+    except P.WakeError:
+        _r = True
+    check(f"...and a secret that is {_why} raises rather than deriving "
+          "something from nothing", _r)
+_SK_C = P.state_seal({"a.json": '{"x":1}', "b.json": "y"}, _SK_V, _SK_P)
+check("a sealed container carries the schema and the salt in the clear -- a "
+      "reader needs them to try a key at all -- and NOTHING else",
+      set(_SK_C) == {"schema", "salt", "box"}
+      and _SK_C["schema"] == P.STATE_SCHEMA
+      and len(bytes.fromhex(_SK_C["salt"])) == P.STATE_SALT_BYTES)
+check("...and the members come back exactly",
+      P.state_unseal(_SK_C, _SK_V, _SK_P) == {"a.json": '{"x":1}',
+                                              "b.json": "y"})
+check("...and the member NAMES are not in the file: the names are the "
+      "deposit count, the handles and the forwards each had",
+      "a.json" not in _json.dumps(_SK_C)
+      and "b.json" not in _json.dumps(_SK_C))
+for _v, _p, _why in ((b"\x00" * 32, _SK_P, "the vault's half alone is wrong"),
+                     (_SK_V, b"\x00" * 32, "the Pi's half alone is wrong"),
+                     (b"\x00" * 32, b"\x00" * 32, "both are wrong")):
+    _r = False
+    try:
+        P.state_unseal(_SK_C, _v, _p)
+    except P.WakeError as e:
+        _r = "did not open" in str(e)
+    check(f"a container does not open when {_why} -- neither half is the "
+          "key, and the two failures are one message because Poly1305 "
+          "cannot tell them apart", _r)
+_SK_T = dict(_SK_C)
+_SK_T["box"] = _SK_T["box"][:-2] + ("00" if _SK_T["box"][-2:] != "00" else "11")
+check("...nor when the body has been altered", _refused(
+    P.state_unseal, _SK_T, _SK_V, _SK_P))
+check("...nor a container of another schema, or with junk where the hex "
+      "should be",
+      _refused(P.state_unseal, {**_SK_C, "schema": "other"}, _SK_V, _SK_P)
+      and _refused(P.state_unseal, {**_SK_C, "salt": "zz"}, _SK_V, _SK_P)
+      and _refused(P.state_unseal, {**_SK_C, "salt": "00"}, _SK_V, _SK_P)
+      and _refused(P.state_unseal, "not a dict", _SK_V, _SK_P))
+#: THE SALT, NOT JUST THE BOX. This compared only ["box"], which differs
+#: between two seals of identical members ANYWAY -- SecretBox draws a fresh
+#: nonce per encryption. So a build that sealed every store under one fixed
+#: salt passed this check, and the sweep proved it: the mutation that replaced
+#: nacl.utils.random(STATE_SALT_BYTES) with a constant SURVIVED.
+_salt1 = P.state_seal({"a.json": "x"}, _SK_V, _SK_P)
+_salt2 = P.state_seal({"a.json": "x"}, _SK_V, _SK_P)
+check("two seals of the same members draw a FRESH SALT each time, so two "
+      "stores are never sealed under one key -- and the body differs too, "
+      "so the container does not say 'nothing changed since last wake'",
+      _salt1["salt"] != _salt2["salt"] and _salt1["box"] != _salt2["box"]
+      and len(bytes.fromhex(_salt1["salt"])) == P.STATE_SALT_BYTES)
+check("a half of the wrong length is refused before any box is opened",
+      _refused(P.state_key, b"\x00" * 31, _SK_P, b"\x00" * 16)
+      and _refused(P.state_key, _SK_V, b"\x00" * 31, b"\x00" * 16)
+      and _refused(P.state_key, _SK_V, _SK_P, b"\x00" * 15))
+check("state_half_of reads the note's half, and refuses a note whose half "
+      "is the wrong length or absent",
+      P.state_half_of({"state_half": _SK_P.hex()}) == _SK_P
+      and _refused(P.state_half_of, {"state_half": "00"})
+      and _refused(P.state_half_of, {}))
+check("`state_half` is RESERVED in an M2, so no job schema can use the "
+      "name and validate_job does not refuse a note that carries it",
+      all("state_half" not in P.JOBS[_j]["schema"] for _j in P.JOBS)
+      and P.validate_job({"job": "swap_status", "job_id": "ab" * 16,
+                          "challenge": "cd" * 32, "handle": "A1B2",
+                          "owner": "ef" * 8,
+                          "state_half": _SK_P.hex()})[1] == "swap_status")
+check("WIRE_VERSION was bumped for it: M2 changed SHAPE, so a "
+      "half-upgraded pair must fail at the version and not at the ledger",
+      P.WIRE_VERSION >= 10)
+
+# LAST LINE BEFORE THE RESULT. fail_loudly_on_crash disarms itself when this
+# is called, so a check BELOW it that DIES prints no RESULT line -- which the
+# sweep scores NO-RESULT and its own header says "proves nothing". The call
+# used to sit at line 1029 of 1166, so 137 lines ran unguarded; one stage-7
+# mutation scored NO-RESULT there instead of CAUGHT.
+_finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

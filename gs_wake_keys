@@ -1240,6 +1240,15 @@ def do_pair(args) -> int:
         # always; a keyfile from before the field keeps its mark beside
         # itself, which under /etc the unit cannot write.
         "btc_issued_mark_dir": str(args.mark_dir),
+        # THIS BOX'S HALF OF THE STATE KEY (STAGE7_PLAN.md). The other half
+        # lives only on the Pi and arrives inside each wake note, so this
+        # one being in the clear here -- on the disk that unlocks itself --
+        # is the design and not an oversight: neither half opens anything
+        # alone. Its PRESENCE is also the switch: a vault whose keyfile
+        # carries one seals its records and refuses a note that brings no
+        # half, and a keyfile from before this stage runs unsealed exactly
+        # as it did.
+        "state_half": os.urandom(proto.STATE_HALF_BYTES).hex(),
         "btc_electrum": [str(s) for s in (args.btc_electrum or [])],
         "btc_network": str(args.btc_network or "main"),
         "btc_min_conf": int(args.btc_min_conf),

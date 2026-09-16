@@ -3884,7 +3884,6 @@ check("artifact-dir: the shipped unit also sets UMask=0077, for files a "
       "UMask=0077" in (Path(REPO) / "systemd" / "gs-wake-agent.service").read_text())
 
 
-_finished()
 # ===========================================================================
 #  A WATCH THAT RAN OUT OF TIME IS NOT A FAILURE
 # ===========================================================================
@@ -6621,6 +6620,319 @@ check("pairing/btc: the returns bound pairs (0 and 1000 both pass) and is "
       and '"btc_returns_max": int(args.btc_returns_max)' in _kp_src
       and '_btc_setting(key, "btc_returns_max", 2, 0, 1000)' in _A_SRC)
 
+print("\n== STAGE 7: the records are sealed to the PAIR, not to the vault ==")
+# The vault's disk unlocks itself -- it must, to boot when the Pi wakes it --
+# so a seizure of that laptop read the ledger, every open slip (the deposit
+# address, the amount, the memo naming the client's XMR address), every
+# bundle and every forward plan. The fix rests on one measured property:
+# nothing in that directory is read before the Pi has authenticated a note.
+# So the key is split, the Pi's half rides inside M2, and at rest there is
+# one container and no member names.
+_SEAL_HALF = "ab" * 32
+
+
+def _sealed_env(job="receive_and_quote", params=None, half=_SEAL_HALF):
+    """A scratch vault PAIRED FOR SEALING: its keyfile carries a half."""
+    d, kf, key, bell = new_env(job, params)
+    key2 = dict(key)
+    key2["state_half"] = half
+    kf.chmod(0o600)
+    kf.write_text(json.dumps(P.lock_keyfile(key2, b"", role="thinkpad")))
+    kf.chmod(0o400)
+    return d, kf, key2, bell
+
+
+def _refused_code(env):
+    """The code a wake on `env` refuses with, or None. Takes _sealed_env's
+    tuple so a malformed keyfile can be driven in one line."""
+    _d, _kf, _k, _b = env
+    _o, _e, _t = run(_kf, deps_for(_d, _b))
+    return getattr(_e, "code", None)
+
+
+def _sealed_run(d, kf, bell, **over):
+    """One wake, then main()'s finally by hand: open, run, re-seal."""
+    dp = deps_for(d, bell, **over)
+    out, err, text = run(kf, dp)
+    if A._STATE_KEY.get("vault") is not None:
+        A.state_close(A._STATE_KEY["dir"], A._STATE_KEY["vault"],
+                      A._STATE_KEY["pi"])
+        A._STATE_KEY.clear()
+    return out, err, text, dp
+
+
+_sd, _skf, _skey, _sbell = _sealed_env()
+_so, _se, _stext, _sdp = _sealed_run(_sd, _skf, _sbell)
+_sleft = sorted(p.name for p in _sd.iterdir())
+check("a wake on a pairing that seals: the job runs and finishes as ever",
+      _se is None and _so and _so[0] == "done")
+check("...and at rest the artifact directory holds ONE container and NOT "
+      "one member: no ledger, no wake state, no bundle in the clear",
+      "state.sealed" in _sleft
+      and "gs_wake_handles.json" not in _sleft
+      and "gs_wake_state.json" not in _sleft
+      and not [n for n in _sleft if n.startswith("wallet_")]
+      and not [n for n in _sleft if n.startswith("thor_pairs_")])
+_sblob = (_sd / "state.sealed").read_text()
+check("...and the container does not leak the member NAMES either -- the "
+      "names are the deposit count, the handles and how many forwards "
+      "each had, which is most of what the sealing is for",
+      "gs_wake_handles" not in _sblob and "wallet_" not in _sblob
+      and "thor_pairs" not in _sblob
+      and json.loads(_sblob)["schema"] == P.STATE_SCHEMA
+      and set(json.loads(_sblob)) == {"schema", "salt", "box"})
+check("...and the job log, which holds the children's deposit address and "
+      "memo, goes too on a clean run -- it was truncated only at the START "
+      "of the next boot, so it sat there for the weeks between wakes",
+      (_sd / "gs_wake_job.log").is_file()
+      and A.retire_job_log("done") is True
+      and not (_sd / "gs_wake_job.log").exists()
+      and A._AGENT_LOG[0] is None)
+_jl2 = _sd / "gs_wake_job.log"
+A._AGENT_LOG[0] = _jl2
+_jl2.write_text("a refusal nobody else recorded\n")
+check("...and it STAYS on a refusal or a crash, which is exactly when it "
+      "is the only record of why -- and on a dry run, where the operator "
+      "is reading it",
+      A.retire_job_log("no_job") is False and _jl2.is_file()
+      and A.retire_job_log("crash") is False and _jl2.is_file()
+      and A.retire_job_log("done", dry_run=True) is False and _jl2.is_file())
+_jl2.unlink()
+check("...and main() calls it on every path out, in the finally",
+      "retire_job_log(code, args.dry_run)"
+      in _A_SRC.split("def main(")[1])
+# MAIN'S FINALLY IS WHAT _sealed_run STANDS IN FOR above: the helper calls
+# state_close by hand because run() is not main(). So the wiring itself is
+# checked here, or a main() that stopped re-sealing would leave every check
+# above green against a directory nothing ever closed.
+_main_src = _A_SRC.split("def main(")[1]
+check("...and main()'s own finally re-seals, with both halves and the "
+      "directory it recorded when the note was opened",
+      '_sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],'
+      in _main_src
+      and "_STATE_KEY.clear()" in _main_src
+      and "state_unsealed_fail" in _main_src)
+# THE NEXT WAKE OPENS IT: the ledger is back, and the proof is that the
+# replay guard still knows the job id the sealed run recorded.
+_sbell2 = DB.Pending({"secret": PI.encode().hex(),
+                      "peer_public": TP.public_key.encode().hex()},
+                     "receive_and_quote", with_owner({"amount_sat": 5000000}),
+                     clock=lambda: 0.0)
+_sbell2.job_id = _sbell.job_id
+_o2, _e2, _t2, _dp2 = _sealed_run(_sd, _skf, _sbell2)
+check("the next wake OPENS the store: the replay guard still holds the "
+      "job id the sealed run recorded, so the ledger came back",
+      _o2 is None and getattr(_e2, "code", None) == "job_replayed")
+check("...and the directory is sealed again afterwards, not left open",
+      "state.sealed" in [p.name for p in _sd.iterdir()]
+      and "gs_wake_handles.json" not in [p.name for p in _sd.iterdir()])
+# A HALF-UPGRADED PAIR: the vault seals, the Pi's note carries no half.
+_ud, _ukf, _ukey, _ubell = _sealed_env()
+_ubell.key = dict(_ubell.key)
+
+
+class _OldPi(DB.Pending):
+    """A doorbell from before this stage: its M2 carries no half."""
+
+    def on_m1(self, record):
+        import nacl.public as _np
+        pi_sk = _np.PrivateKey(bytes.fromhex(self.key["secret"]))
+        tp_pk = _np.PublicKey(bytes.fromhex(self.key["peer_public"]))
+        body = P.open_record(pi_sk, tp_pk, record, P.TAG_M1)
+        eph = P.eph_pk_of(body)
+        chal = P.challenge_of(body)
+        self.collected_at = self.clock()
+        return P.seal(pi_sk, _np.PublicKey(eph), P.TAG_M2,
+                      {"job_id": self.job_id, "challenge": chal.hex(),
+                       "job": self.job, **self.params})
+
+
+_uold = _OldPi({"secret": PI.encode().hex(),
+                "peer_public": TP.public_key.encode().hex()},
+               "receive_and_quote", with_owner({"amount_sat": 5000000}),
+               clock=lambda: 0.0)
+_uo, _ue, _ut = run(_ukf, deps_for(_ud, _uold))
+check("a vault paired for sealing, handed a note with NO half (a Pi from "
+      "before this stage): refused state_half_missing, nothing run -- "
+      "never an empty ledger that would re-issue somebody's address",
+      _uo is None and getattr(_ue, "code", None) == "state_half_missing"
+      and _sdp["_ran"] is not None and deps_for(_ud, _uold)["_ran"] == [])
+# A STORE THAT WILL NOT OPEN: a re-pairing since it was written, or a file
+# that has been altered. Refuse; do not start empty.
+_wd, _wkf, _wkey, _wbell = _sealed_env()
+_wsealed = P.state_seal({"gs_wake_handles.json": '{"handles": {}}'},
+                        bytes.fromhex(_SEAL_HALF), b"\x09" * 32)
+(_wd / "state.sealed").write_text(json.dumps(_wsealed))
+_wo, _we, _wt = run(_wkf, deps_for(_wd, _wbell))
+check("a store sealed under ANOTHER pairing: refused state_unreadable, "
+      "nothing run, and the refusal names both causes and the way out",
+      _wo is None and getattr(_we, "code", None) == "state_unreadable"
+      and "re-paired" in (getattr(_we, "msg", "") or "")
+      and "state-key" in (getattr(_we, "msg", "") or ""))
+_wd2, _wkf2, _, _wbell2 = _sealed_env()
+(_wd2 / "state.sealed").write_text("{not json")
+_wo2, _we2, _ = run(_wkf2, deps_for(_wd2, _wbell2))
+check("...and a container that is not even JSON is the same refusal, not "
+      "a crash", _wo2 is None
+      and getattr(_we2, "code", None) == "state_unreadable")
+# THE CLOSE FAILS SAFE THE OTHER WAY. A seal that cannot be written leaves
+# the bookkeeping readable; a shred whose ciphertext never landed loses it.
+_fd2 = Path(tempfile.mkdtemp(prefix="sealfail_"))
+(_fd2 / "gs_wake_handles.json").write_text('{"handles": {"A1B2": {}}}')
+_real_seal = P.state_seal
+P.state_seal = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk"))
+try:
+    _fres = A.state_close(_fd2, bytes.fromhex(_SEAL_HALF), b"\x01" * 32)
+finally:
+    P.state_seal = _real_seal
+check("a seal that FAILS leaves every plaintext where it was and says so "
+      "(-1): the privacy loss is recoverable, a lost ledger is a client's "
+      "money with no bookkeeping",
+      _fres == -1 and (_fd2 / "gs_wake_handles.json").is_file()
+      and not (_fd2 / "state.sealed").exists()
+      and not (_fd2 / "state.sealed.new").exists())
+# A CONTAINER THAT DOES NOT READ BACK IS NOT TRUSTED EITHER, and this is the
+# harder case: the seal "worked", the bytes are on the disk, and they are the
+# wrong bytes. Shredding the plaintext against them is the one failure in
+# this file that costs the ledger rather than the privacy.
+_bd2 = Path(tempfile.mkdtemp(prefix="sealback_"))
+(_bd2 / "gs_wake_handles.json").write_text('{"handles": {"C3D4": {}}}')
+_real_unseal = P.state_unseal
+P.state_unseal = lambda *a, **k: {"gs_wake_handles.json": "not what went in"}
+try:
+    _bres = A.state_close(_bd2, bytes.fromhex(_SEAL_HALF), b"\x02" * 32)
+finally:
+    P.state_unseal = _real_unseal
+check("a container that does not READ BACK with the same key is thrown "
+      "away and the plaintext kept (-1) -- the verify is not decoration",
+      _bres == -1 and (_bd2 / "gs_wake_handles.json").is_file()
+      and not (_bd2 / "state.sealed").exists()
+      and not (_bd2 / "state.sealed.new").exists())
+# A MEMBER ALREADY ON DISK IS NEWER THAN THE SEAL: a run that died left it
+# there, after the store was opened and before it was closed. The sealed copy
+# is what the run BEFORE that wrote, and writing it over the live one loses
+# whatever the dead run recorded -- an address it handed out, a forward it
+# sent, an owner token it bound.
+_od = Path(tempfile.mkdtemp(prefix="sealopen_"))
+(_od / "state.sealed").write_text(json.dumps(P.state_seal(
+    {"gs_wake_handles.json": '{"handles": {"OLD1": {}}}'},
+    bytes.fromhex(_SEAL_HALF), b"\x03" * 32)))
+(_od / "gs_wake_handles.json").write_text('{"handles": {"NEW1": {}}}')
+_on = A.state_open(_od, bytes.fromhex(_SEAL_HALF), b"\x03" * 32)
+check("a member already on disk is a run that DIED, not something to "
+      "overwrite: the live copy stays and the stale sealed one is not "
+      "written over it",
+      _on == 0 and "NEW1" in (_od / "gs_wake_handles.json").read_text()
+      and "OLD1" not in (_od / "gs_wake_handles.json").read_text())
+# ...AND THE NEXT SEAL ROLLS IT IN rather than dropping it, so the surviving
+# copy is not lost at the other end.
+_ogone = A.state_close(_od, bytes.fromhex(_SEAL_HALF), b"\x03" * 32)
+check("...and the next seal rolls that survivor back in, so failing safe "
+      "on the way IN does not lose it on the way OUT",
+      _ogone == 1
+      and "NEW1" in P.state_unseal(json.loads((_od / "state.sealed").read_text()),
+                                   bytes.fromhex(_SEAL_HALF),
+                                   b"\x03" * 32)["gs_wake_handles.json"])
+# ...AND THE PLAINTEXT GOES ONLY AFTER THE NEW CONTAINER READS BACK.
+_src_close = _A_SRC.split("def state_close")[1].split("\ndef ")[0]
+check("state_close reads the container back with the same key, and only "
+      "THEN puts it in place and destroys the plaintext",
+      _src_close.index("proto.state_unseal")
+      < _src_close.index("os.replace")
+      < _src_close.index('secure_delete_or_warn(artifact_dir / name'))
+# WHAT COUNTS AS A MEMBER, named one file at a time. The globs are the whole
+# of the claim "a machine taken between wakes yields one opaque file": every
+# name the artifact directory can hold is either in this list or is something
+# the directory is not supposed to keep. Driven against a directory holding
+# one of each, rather than read off the constant.
+_md = Path(tempfile.mkdtemp(prefix="sealwhat_"))
+for _n in ("gs_wake_state.json", "gs_wake_handles.json",
+           "thor_pairs_A1B2.json", "wallet_A1B2.json",
+           "wallet_withdraw_A1B2.json", "btc_forward_A1B2.json",
+           "btc_forward_A1B2.status.json", "gs_wake_status.json",
+           "wallet_feesweep.json", "gs_wake_job.log", "integrity_chain.log",
+           ".gs_wake_inhibit", "state.sealed"):
+    (_md / _n).write_text("{}")
+_mem = set(A._sealed_members(_md))
+check("sealed: the ledger, the wake state, every slip, every bundle and "
+      "every forward plan are members",
+      {"gs_wake_state.json", "gs_wake_handles.json", "thor_pairs_A1B2.json",
+       "wallet_A1B2.json", "wallet_withdraw_A1B2.json",
+       "btc_forward_A1B2.json"} <= _mem)
+check("sealed: ...and BOTH status files, because 'unlinked after one read' "
+      "is only true of the paths that reach the unlink -- a killed probe "
+      "leaves `unlocked` and `total` as exact decimals",
+      {"gs_wake_status.json", "btc_forward_A1B2.status.json"} <= _mem)
+check("sealed: ...and NOT the fee sweep's entry bundle, the job log, the "
+      "chain, the inhibit mark or the container itself",
+      not ({"wallet_feesweep.json", "gs_wake_job.log", "integrity_chain.log",
+            ".gs_wake_inhibit", "state.sealed"} & _mem))
+# THE RECOVERY PATH: the Pi is dead, the operator is at the machine.
+_rd, _rkf, _rkey, _rbell = _sealed_env()
+_ro, _re, _rt, _ = _sealed_run(_rd, _rkf, _rbell)
+_r_pi = P.derive_state_half(PI.encode().hex()).hex()
+_rbuf = io.StringIO()
+with contextlib.redirect_stdout(_rbuf):
+    _rcode = A.unseal_state_cli(types.SimpleNamespace(
+        key=str(_rkf), unseal_state=_r_pi))
+check("--unseal-state with the Pi's half writes the records back out in "
+      "the clear, at the machine, with no doorbell and no power-off",
+      _rcode == "opened"
+      and (_rd / "gs_wake_handles.json").is_file())
+_rbuf2 = io.StringIO()
+with contextlib.redirect_stdout(_rbuf2):
+    _rbad = A.unseal_state_cli(types.SimpleNamespace(
+        key=str(_rkf), unseal_state="00" * 32))
+check("...the WRONG half opens nothing and says which two things it could "
+      "be", _rbad == "state_unreadable")
+with contextlib.redirect_stdout(io.StringIO()):
+    _rjunk = A.unseal_state_cli(types.SimpleNamespace(
+        key=str(_rkf), unseal_state="nothex"))
+check("...and a half that is not 32 bytes of hex is named as that, not "
+      "tried", _rjunk == "bad_half")
+# AN INSTALL FROM BEFORE THIS STAGE IS UNTOUCHED.
+_nd, _nkf, _nkey, _nbell = new_env()
+_no, _ne, _nt, _ndp = _sealed_run(_nd, _nkf, _nbell)
+check("a keyfile with NO half runs exactly as it did: the job finishes "
+      "and the records stay plaintext -- nothing is silently downgraded "
+      "and nothing is silently turned on",
+      _ne is None and _no and _no[0] == "done"
+      and (_nd / "gs_wake_handles.json").is_file()
+      and not (_nd / "state.sealed").exists())
+check("...and a keyfile whose half is MALFORMED is refused rather than "
+      "quietly running unsealed",
+      _refused_code(_sealed_env(half="xy" * 32)) == "state_half_malformed")
+# THE HALVES THEMSELVES. This check used to read
+#     A and B or True
+# which is (A and B) or True -- always true, and B was false, so it asserted
+# nothing at all. Split into two checks that can actually go red.
+check("the pairing writes the vault its OWN half, drawn fresh: the two "
+      "halves are independent, so neither box's secret yields the other",
+      '"state_half": os.urandom(proto.STATE_HALF_BYTES).hex()' in _kp_src)
+_h_v, _h_p, _h_s = os.urandom(32), os.urandom(32), os.urandom(P.STATE_SALT_BYTES)
+_h_full = P.state_key(_h_v, _h_p, _h_s)
+check("neither half opens the store alone: changing EITHER one changes the "
+      "container key, and the two are not folded commutatively",
+      _h_full != P.state_key(_h_v, b"\x00" * 32, _h_s)
+      and _h_full != P.state_key(b"\x00" * 32, _h_p, _h_s)
+      and _h_full != P.state_key(_h_p, _h_v, _h_s)
+      and _h_full != P.state_key(_h_v, _h_p, os.urandom(P.STATE_SALT_BYTES)))
+check("the Pi's half is DERIVED from its long-term secret, so there is "
+      "nothing new to back up and it can be re-derived from the card",
+      P.derive_state_half(PI.encode().hex())
+      == P.derive_state_half(PI.encode().hex())
+      and P.derive_state_half(PI.encode().hex())
+      != P.derive_state_half(TP.encode().hex())
+      and len(P.derive_state_half(PI.encode().hex())) == P.STATE_HALF_BYTES)
+
+# LAST LINE BEFORE THE RESULT, AND THAT MATTERS MORE THAN IT LOOKS.
+# fail_loudly_on_crash disarms itself the moment this is called, so every
+# check BELOW the call ran with no crash guard at all -- and the call used to
+# sit at line 3887 of 6906, leaving 3019 lines of this file in that state.
+# Measured, not guessed: two stage-7 mutations that make this suite DIE rather
+# than fail scored NO-RESULT in the sweep, which its own header says "proves
+# nothing about its checks", instead of CAUGHT. It moved here.
+_finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

@@ -4156,7 +4156,6 @@ for _p in ("on_fanout:4_chunks", "subaddress_minted"):
     check(f"fee/chain: chain_safe leaves {_p!r} carrying no digit",
           not any(_c.isdigit() for _c in _gsc_mod.chain_safe(_p)))
 
-_finished()
 # ---- THE PREFERRED CHANNEL FOR THE FEE RATE WAS THE UNVALIDATED ONE -----
 #
 # --usage-fee-pct is type=decimal_arg. GS_USAGE_FEE_PCT went straight into
@@ -4230,6 +4229,11 @@ check("feepct: NON-VACUITY -- that value really does make mix_minimum_xmr "
       _mm_raised)
 
 
+# LAST LINE BEFORE THE RESULT. fail_loudly_on_crash disarms itself when this
+# is called, so a check BELOW it that DIES prints no RESULT line, which the
+# sweep scores NO-RESULT -- "proves nothing about its checks", by its own
+# header. The call used to sit 79 lines higher, above the fee-rate section.
+_finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

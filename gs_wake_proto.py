@@ -207,7 +207,16 @@ import time
 #: self-doubt pass. As with 5, 7 and 8: no record changes shape, the closed
 #: vocabulary grows, an old Pi refuses a new vault's M3 carrying it, loud.
 #: Update both boxes together.
-WIRE_VERSION = 9
+#:
+#: 10: M2 gains `state_half` (STAGE7_PLAN.md). This one DOES change a
+#: record's shape, which is why it is the first bump here that is not "the
+#: vocabulary grew": the vault's records are sealed under a key one half of
+#: which lives only on the Pi, and the Pi hands that half over inside every
+#: wake note. A vault paired for it refuses a note without one -- the
+#: alternative is running with an empty ledger and re-issuing somebody's
+#: address -- so a half-upgraded pair must fail at the version check and not
+#: at the ledger. Update both boxes together.
+WIRE_VERSION = 10
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -1171,6 +1180,144 @@ def window_of(body: dict) -> bytes:
 
 def job_id_of(body: dict) -> str:
     return _hexfield(body, "job_id", JOB_ID_BYTES).hex()
+
+
+# ---------------------------------------------------------------------------
+#  THE VAULT'S RECORDS ARE SEALED TO THE PAIR (STAGE7_PLAN.md)
+# ---------------------------------------------------------------------------
+# The vault's disk unlocks itself, because a machine that boots when a pager
+# wakes it cannot ask anybody for a passphrase. So a seizure of that laptop
+# reads its artifact directory: the ledger, every open slip (the deposit
+# address, the amount and the memo naming the client's XMR address), every
+# bundle and every forward plan. Full-disk encryption buys nothing against
+# it; the disk is the thing that decrypts.
+#
+# The one property that makes a fix possible: NOTHING in that directory is
+# read before the Pi has authenticated a wake note. So the key can live half
+# on each box, and the Pi can hand its half over inside M2 -- boxed to the
+# vault's per-boot ephemeral key, gone from RAM when the machine powers off
+# minutes later.
+#
+# The Pi's half is DERIVED from the secret already in its sealed keyfile
+# rather than generated beside it: there is then nothing new for the operator
+# to back up, and the half can be re-derived at any time from the card and
+# its passphrase (`gs_doorbell state-key`) when the vault has to be opened by
+# hand.
+STATE_HALF_BYTES = 32
+STATE_SALT_BYTES = 16
+#: The sealed store's schema; a reader that finds another refuses rather than
+#: guessing at bytes it does not understand.
+STATE_SCHEMA = "gs_wake_state_v1"
+
+
+def derive_state_half(secret_hex: str) -> bytes:
+    """The Pi's half of the state key, from the Pi's own long-term secret.
+
+    One-way and domain-separated: a half that leaked tells nobody the
+    secret it came from, and it cannot be replayed as any other value this
+    file derives from the same secret.
+    """
+    import hashlib
+    raw = str(secret_hex or "").strip()
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError:
+        raise WakeError("the keyfile's secret is not hex, so no state key "
+                        "can be derived from it")
+    if len(key) != 32:
+        raise WakeError("the keyfile's secret is not a 32-byte X25519 key")
+    return hashlib.blake2b(b"gs-state-half-v1", key=key,
+                           digest_size=STATE_HALF_BYTES).digest()
+
+
+def state_half_of(body: dict) -> bytes:
+    """The Pi's half out of an M2 body, or raise. Absent is NOT zero: a
+    vault paired for sealing refuses a note that carries none."""
+    return _hexfield(body, "state_half", STATE_HALF_BYTES)
+
+
+def state_key(vault_half: bytes, pi_half: bytes, salt: bytes) -> bytes:
+    """The container key: one half from each box, and a per-store salt.
+
+    Neither half opens anything alone -- which is the whole point, since
+    one of them sits in the clear on the machine an adversary takes.
+    """
+    import hashlib
+    for _n, _v, _len in (("vault half", vault_half, STATE_HALF_BYTES),
+                         ("Pi half", pi_half, STATE_HALF_BYTES),
+                         ("salt", salt, STATE_SALT_BYTES)):
+        if not isinstance(_v, (bytes, bytearray)) or len(_v) != _len:
+            raise WakeError(f"the state key's {_n} is not "
+                            f"{_len} bytes")
+    return hashlib.blake2b(bytes(vault_half) + bytes(pi_half),
+                           key=bytes(salt), person=b"gs-state-v1",
+                           digest_size=32).digest()
+
+
+def state_seal(members: dict, vault_half: bytes, pi_half: bytes,
+               salt: bytes = None) -> dict:
+    """Seal `members` (name -> text) into one container.
+
+    ONE container, not one file each: per-file sealing would leave the file
+    NAMES on the disk, and the names are thor_pairs_<handle>,
+    btc_forward_<handle> and wallet_<hex> -- the deposit count, the handles
+    and how many forwards each had, which is most of what the sealing is
+    for. The header carries the schema and the salt in the clear because a
+    reader needs them to try the key at all; it carries nothing else.
+    """
+    public, bindings = _nacl()
+    import nacl.secret
+    import nacl.utils
+    if not isinstance(members, dict):
+        raise WakeError("the state container takes a mapping of names to text")
+    for _k, _v in members.items():
+        if not isinstance(_k, str) or not isinstance(_v, str):
+            raise WakeError("a state member is not (name, text)")
+    _salt = salt if salt is not None else nacl.utils.random(STATE_SALT_BYTES)
+    box = nacl.secret.SecretBox(state_key(vault_half, pi_half, _salt))
+    raw = json.dumps(members, sort_keys=True,
+                     separators=(",", ":")).encode()
+    return {"schema": STATE_SCHEMA, "salt": bytes(_salt).hex(),
+            "box": bytes(box.encrypt(raw)).hex()}
+
+
+def state_unseal(container: dict, vault_half: bytes, pi_half: bytes) -> dict:
+    """The members back, or raise WakeError.
+
+    ONE message for a wrong key and for a tampered file, because Poly1305
+    fails the same way for both and pretending to tell them apart would be
+    inventing a fact. The caller says what the two causes are.
+    """
+    public, bindings = _nacl()
+    import nacl.secret
+    if not isinstance(container, dict):
+        raise WakeError("the sealed state is not a JSON object")
+    if container.get("schema") != STATE_SCHEMA:
+        raise WakeError(f"the sealed state is "
+                        f"{container.get('schema')!r}, not {STATE_SCHEMA}")
+    try:
+        salt = bytes.fromhex(container["salt"])
+        sealed = bytes.fromhex(container["box"])
+    except Exception as e:                                   # noqa: BLE001
+        raise WakeError("the sealed state's salt or body is not hex") from e
+    if len(salt) != STATE_SALT_BYTES:
+        raise WakeError("the sealed state's salt is the wrong length")
+    try:
+        raw = nacl.secret.SecretBox(
+            state_key(vault_half, pi_half, salt)).decrypt(sealed)
+    except WakeError:
+        raise
+    except Exception as e:                                   # noqa: BLE001
+        raise WakeError(
+            "the sealed state did not open: this is not the pairing that "
+            "wrote it, or the file has been altered. There is no way to "
+            "tell which from here.") from e
+    members = parse_body(raw)
+    for _k, _v in members.items():
+        if not isinstance(_k, str) or not isinstance(_v, str):
+            raise WakeError("the sealed state carries a member that is not "
+                            "(name, text)")
+    return members
 
 
 # ---------------------------------------------------------------------------
@@ -3028,7 +3175,12 @@ def validate_job(body: dict) -> tuple:
         raise WakeError("wake note names a job this machine does not run")
     spec = JOBS[job]
     job_id = job_id_of(body)
-    reserved = {"job", "job_id", "challenge"}
+    # `state_half` is reserved, not a job field: it belongs to the NOTE, not
+    # to any job (STAGE7_PLAN.md), the vault reads it with state_half_of, and
+    # no job schema may use the name. Optional here on purpose -- the vault
+    # decides whether a note without one is acceptable, because only the
+    # vault knows whether its own keyfile was paired for sealing.
+    reserved = {"job", "job_id", "challenge", "state_half"}
     got = set(body) - reserved
     want = set(spec["schema"])
     if got != want:
