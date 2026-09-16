@@ -1346,11 +1346,10 @@ def do_pair(args) -> int:
     # THE SETTINGS GO BEHIND THE PAIR (STAGE8_PLAN.md). Everything this box
     # is told, less the handful of fields it must read BEFORE the wake note
     # that carries the other half has been opened. The list of what stays
-    # readable lives in gs_wake_agent (KEYFILE_CLEAR) and is imported here
-    # rather than repeated, because two copies of a list like this drift and
-    # the drift is silent: a field the agent expects in the clear but the
-    # pairing sealed would fail at the first wake, hours later, with the
-    # operator 500 km away.
+    # readable is proto.SETTINGS_CLEAR -- in the protocol module because both
+    # boxes' tools need it and two copies of a list like this drift silently:
+    # a field the agent expects in the clear but the pairing sealed would
+    # fail at the first wake, hours later, with the operator 500 km away.
     #
     # THE XPUB IS WHY. A seized keyfile with it in the clear re-derives every
     # deposit address this intake has ever issued and finds all of them on

@@ -6932,6 +6932,13 @@ print("\n== STAGE 8: the SETTINGS are sealed to the pair too ==")
 # address this intake has ever issued and finds all of them on the public
 # chain, retrospectively, past any wipe, for as long as the chain exists.
 _S8_PI = P.derive_state_half(PI.encode().hex())
+#: The argv a real vault pairing takes. Up here because two sections use
+#: it: the driven pairing below, and the idle-boot refusal before it.
+_PAIR_ARGV = ["pair", "--artifact-dir", "/var/lib/gs",
+              "--rpc", "http://127.0.0.1:18083",
+              "--btc-xpub", _BTC_XPUB_OK, "--allow-btc-forward",
+              "--btc-electrum", "s.onion", "--thornode", "https://tn.example",
+              "--op-return-max-bytes", "140", "--deposit-in-chat"]
 
 
 def _refused_pair_info(info):
@@ -7147,12 +7154,65 @@ check("stage8: ...and a keyfile with no sealed section says so instead of "
       "failing", _unone == "unsealed")
 # THE IDLE-BOOT SWEEP CANNOT WORK AND SAYS SO, rather than being a flag that
 # writes and then silently never fires.
+#: DRIVEN, NOT GREPPED. Both of these were source checks, and the sweep
+#: showed exactly what that is worth: the mutation that turns each guard
+#: into `if False:` leaves the string in the file, so both SURVIVED. The
+#: behaviour is reachable in one call each, so it is called.
+#: A fee wallet that EXISTS: the pairing checks that before it reaches the
+#: idle-boot rule, and a missing one refused first -- so the check passed on
+#: the wrong refusal until this was driven properly.
+_ib_wallet = Path(tempfile.mkdtemp(prefix="feewal_")) / "fee.wallet"
+_ib_wallet.write_text("")
+_ib_argv = list(_PAIR_ARGV) + ["--out", tempfile.mkdtemp(),
+                               "--fee-rpc", "http://127.0.0.1:18084",
+                               "--fee-wallet-file", str(_ib_wallet),
+                               "--fee-sweep-to", "4" + "b" * 94]
+_ib_refused = None
+try:
+    _K._validate(_K.build_cli().parse_args(
+        _ib_argv + ["--fee-sweep-on-idle-boot"]))
+except SystemExit as _e:
+    _ib_refused = str(_e)
 check("stage8: the pairing REFUSES --fee-sweep-on-idle-boot, because a boot "
-      "nobody woke has no half and cannot read which wallet to sweep",
-      "--fee-sweep-on-idle-boot cannot be honoured" in _kp_src)
-check("stage8: ...and the idle-boot hook itself says which it is on a "
-      "keyfile somebody hand-edited, rather than nothing",
-      'integrity_log("wake", "fee_sweep:sealed")' in _A_SRC)
+      "nobody woke has no half and cannot read which wallet to sweep -- and "
+      "it says so while the operator is standing there",
+      _ib_refused is not None
+      and "cannot be honoured" in _ib_refused
+      and "--unseal-state" in _ib_refused)
+# NON-VACUITY: the SAME fee wallet pairs fine without the flag, so the
+# refusal above is about the flag and not about the wallet.
+_ib_ok = None
+try:
+    _K._validate(_K.build_cli().parse_args(_ib_argv))
+except SystemExit as _e:
+    _ib_ok = str(_e)
+check("stage8: NON-VACUITY -- the same fee wallet pairs without the flag, "
+      "so what was refused is the flag",
+      _ib_ok is None)
+# ...AND THE HOOK ITSELF, on a keyfile somebody hand-edited past that
+# refusal: it must name the cause rather than fall through to "this keyfile
+# names no fee wallet", which is a true sentence about the wrong thing.
+_ibd = Path(tempfile.mkdtemp(prefix="idleseal_"))
+_ib_log = _ibd / "chain.log"
+_ib_kinds = []
+_o_ilog = A.integrity_log
+A.integrity_log = lambda *a, **k: _ib_kinds.append(a[1] if len(a) > 1 else "")
+_ib_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_ib_buf):
+        _ib_ran = A._idle_boot_sweep(
+            {"sealed": {"schema": P.SETTINGS_SCHEMA, "salt": "00" * 16,
+                        "box": "00" * 48},
+             "state_half": _SEAL_HALF, "fee_rpc": "http://127.0.0.1:18084"},
+            _ibd, {})
+finally:
+    A.integrity_log = _o_ilog
+check("stage8: the idle-boot hook on a sealed keyfile does NOT run, says "
+      "which it is, and names the hand command -- rather than reporting no "
+      "fee wallet, or saying nothing at all",
+      _ib_ran is False and "fee_sweep:sealed" in _ib_kinds
+      and "--unseal-state" in _ib_buf.getvalue()
+      and "sealed to the pair" in _ib_buf.getvalue())
 # THE PAIRING SENDS THE HALF, AND ONLY AFTER THE CODE COMPARISON.
 _pi_src = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
 #: .index() FINDS THE FIRST OCCURRENCE, and derive_state_half is called in
@@ -7204,6 +7264,89 @@ check("stage8: the list of readable fields lives in ONE place, so the "
       "pairing and the agent cannot hold different copies of it",
       A.KEYFILE_CLEAR is P.SETTINGS_CLEAR
       and "proto.SETTINGS_CLEAR" in _kp_src)
+# THE WHOLE PAIRING, DRIVEN TO A WRITTEN KEYFILE. The checks above call
+# _seal_settings directly, and the sweep showed what that misses: deleting
+# the CALL to it in do_pair survived every one of them, because nothing here
+# had ever run do_pair. The socket and the ceremony are stubbed; everything
+# from `info = agreed["peer_info"]` onwards is the shipped code.
+
+
+class _FakeSrv:
+    """Stands in for the pairing socket: accepts once, then is closed."""
+
+    def settimeout(self, _t):
+        pass
+
+    def accept(self):
+        return _FakeConn(), ("10.0.0.9", 40000)
+
+    def close(self):
+        pass
+
+
+class _FakeConn:
+    def close(self):
+        pass
+
+
+def _drive_pair(half=None, extra=None, unseal=None):
+    """Run do_pair with the ceremony stubbed. Returns (rc, payload) or the
+    SystemExit message."""
+    _out = Path(tempfile.mkdtemp(prefix="pairseal_"))
+    _argv = list(_PAIR_ARGV) + ["--out", str(_out)] + list(extra or [])
+    _args = _K.build_cli().parse_args(_argv)
+    _peer = {"host": "10.0.0.9", "port": 8770}
+    if half is not None:
+        _peer["state_half"] = half
+    _o_listen, _o_attempt = _K._listen, _K._one_attempt
+    _o_unseal = P.state_unseal
+    _K._listen = lambda a: _FakeSrv()
+    _K._one_attempt = lambda c, p, sk, pub, a: {
+        "peer_public": PI.public_key.encode().hex(),
+        "sas": "0000-0000", "peer_info": dict(_peer)}
+    if unseal is not None:
+        P.state_unseal = unseal
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = _K.do_pair(_args)
+    except SystemExit as e:
+        return str(e), None
+    finally:
+        _K._listen, _K._one_attempt = _o_listen, _o_attempt
+        P.state_unseal = _o_unseal
+    _c = json.loads((_out / _K.THINKPAD_FILE).read_text())
+    return rc, _c
+
+
+_prc, _pc = _drive_pair(half=_S8_PI.hex())
+_ptxt = json.dumps(_pc)
+check("stage8: the SHIPPED pairing writes a keyfile whose xpub is not in "
+      "it -- do_pair really calls the seal, which no check that calls "
+      "_seal_settings itself can tell",
+      _prc == 0 and _BTC_XPUB_OK not in _ptxt
+      and "btc_account_xpub" not in _ptxt)
+check("stage8: ...and what it wrote opens with the two halves and gives "
+      "the xpub back, so the pairing sealed rather than dropped it",
+      A.open_keyfile(_pc["plain"],
+                     bytes.fromhex(_pc["plain"]["state_half"]),
+                     _S8_PI)["btc_account_xpub"] == _BTC_XPUB_OK)
+check("stage8: ...and the readable part is exactly SETTINGS_CLEAR",
+      set(_pc["plain"]) - {P.SETTINGS_FIELD} <= set(P.SETTINGS_CLEAR))
+_pno, _ = _drive_pair(half=None)
+check("stage8: a Pi that sends NO half stops the pairing with nothing "
+      "written, rather than a keyfile with the xpub in the clear",
+      isinstance(_pno, str) and "no half of the state key" in _pno)
+# A SEAL THAT DOES NOT READ BACK STOPS THE PAIRING TOO. The read-back is the
+# only moment the Pi's half is in reach, so a container that does not open
+# with it must never be written: the operator would get a box that pairs
+# cleanly and refuses every wake afterwards.
+_pbad, _ = _drive_pair(
+    half=_S8_PI.hex(),
+    unseal=lambda *a, **k: {P.SETTINGS_MEMBER: '{"btc_account_xpub": "no"}'})
+check("stage8: a sealed section that does not READ BACK stops the pairing "
+      "with nothing written -- not a box that pairs and then refuses every "
+      "wake",
+      isinstance(_pbad, str) and "could not seal its own settings" in _pbad)
 # A DRY RUN STOPS BEFORE M1, so it never has a half. It must still work: it
 # is how an operator checks a fresh pairing, and the fields it prints (the
 # delivery mode, the pairing code) are readable for exactly that reason.
