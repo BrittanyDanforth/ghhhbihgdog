@@ -24,8 +24,7 @@ import requests
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     safe_post, newnym, secure_delay, atomic_write_json,
-    install_signal_handlers, shutdown_requested, scrub_address,
-    secure_hex,
+    install_signal_handlers, shutdown_requested,
 )
 
 
@@ -42,12 +41,6 @@ MAX_MINE_WAIT_SECONDS = 7200
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
 
-    # NOTE: Monero does NOT support RBF (Replace-By-Fee). Once a TX is signed,
-    # its fee is fixed. If a node rejects with "low_fee", the TX must be
-    # re-created with higher priority on the signing machine and re-signed.
-    # There is no way to bump the fee of a pre-signed TX blob.
-
-
 def main():
     install_signal_handlers()
 
@@ -56,13 +49,13 @@ def main():
         description="Broadcast pre-signed Monero TX blobs with Tor + retry",
     )
     cli.add_argument("path",
-                     help="dir with *.blob, a single .blob, or manifest.json")
-    cli.add_argument("--wallet-file", default=None,
-                     help="needed for auto fee-bump")
+                     help="dir with *.signed files, a single .signed file, or "
+                          "signed_manifest_v1.json")
     cli.add_argument("--tor-proxy",
                      help="SOCKS5 proxy for all network access")
-    cli.add_argument("--rpc", default="http://node.onion:18089",
-                     help="primary Monero RPC")
+    cli.add_argument("--rpc", default="http://127.0.0.1:18081",
+                     help="primary Monero daemon RPC (NOT wallet-rpc; "
+                          "this must be monerod's HTTP endpoint)")
     cli.add_argument("--rpc-alt", help="fallback RPC")
     cli.add_argument("--rpc-list",
                      help="file with RPC endpoints, one per line")
@@ -99,14 +92,23 @@ def main():
     blobs: List[Path] = []
     input_path = Path(args.path)
     if args.path.endswith(".json"):
+        manifest_dir = input_path.parent
         with open(input_path) as f:
             entries = json.load(f)
         if isinstance(entries, dict) and "manifest" in entries:
             entries = entries["manifest"]
-        blobs = [
-            Path(e["file"]) if isinstance(e, dict) else Path(e)
-            for e in entries
-        ]
+        for e in entries:
+            raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
+            if raw_path.exists():
+                blobs.append(raw_path)
+            else:
+                # Try resolving by filename in the manifest's directory
+                local = manifest_dir / raw_path.name
+                if local.exists():
+                    blobs.append(local)
+                else:
+                    print(f"  [!] Blob not found: {raw_path} (also tried {local})")
+                    integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
         raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
@@ -189,6 +191,18 @@ def main():
             sys.exit(f"[!] {len(tampered)} blob(s) failed hash verification! Aborting.")
         integrity_log("broadcast", f"manifest_verified:{len(manifest_hashes)}_blobs_ok")
         print(f"  [+] Manifest verification: {len(manifest_hashes)} blobs OK")
+
+        # CRITICAL: Only broadcast blobs that are IN the manifest.
+        # Stale blobs from prior runs (with different destinations/amounts)
+        # would be silently broadcast to wrong addresses without this filter.
+        pre_filter = len(blobs)
+        blobs = [b for b in blobs if b.name in manifest_hashes]
+        rejected = pre_filter - len(blobs)
+        if rejected > 0:
+            integrity_log("broadcast", f"rejected_unmanifested_blobs:{rejected}")
+            print(f"  [!] Rejected {rejected} blob(s) not in manifest (stale from prior run?)")
+        if not blobs:
+            sys.exit("[!] No blobs remaining after manifest filter")
 
     # Compute blob fingerprint to bind progress to this specific set of blobs
     blob_fp = hashlib.sha256(

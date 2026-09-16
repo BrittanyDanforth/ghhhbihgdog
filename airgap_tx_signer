@@ -62,15 +62,17 @@ def _validate_plan(plan: List[dict]) -> None:
             sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
 
 
-def _load_unsigned(path: Path) -> List[dict]:
+def _load_unsigned(path: Path) -> tuple:
+    """Load unsigned_v1 bundle. Returns (plan_list, metadata_dict)."""
     with open(path) as f:
         raw = json.load(f)
     if isinstance(raw, dict):
         if "txs" in raw and isinstance(raw["txs"], list):
-            return raw["txs"]
+            meta = raw.get("meta", {})
+            return raw["txs"], meta
         sys.exit("[!] unsigned_v1 dict format missing 'txs' list")
     if isinstance(raw, list):
-        return raw
+        return raw, {}
     sys.exit("[!] unsigned_v1 has unexpected format")
 
 
@@ -81,13 +83,15 @@ def _compute_plan_fingerprint(plan: List[dict]) -> str:
     return h.hexdigest()[:32]
 
 
-def phase_create(args, plan: List[dict]):
+def phase_create(args, plan: List[dict], meta: dict = None):
     """PHASE 1: Create unsigned TXs via monero-wallet-rpc.
 
     The RPC's transfer_split method creates unsigned TXs and internally
     tracks which outputs are reserved, preventing double-spend between
     TXs in the same batch.
     """
+    if meta is None:
+        meta = {}
     proxy_url = args.tor_proxy
     if not proxy_url:
         sys.exit("[!] --tor-proxy required for phase 'create' (online machine)")
@@ -95,6 +99,11 @@ def phase_create(args, plan: List[dict]):
     verify_tor(proxy)
 
     rpc = connect_rpc(args.rpc, proxy_url=proxy_url)
+
+    # Account index from the plan metadata (set by GhostSpiral based on
+    # receive wallet). Defaults to 0 for sender mode.
+    acct_idx = meta.get("account_index", 0)
+    integrity_log("signer", f"using_account_index:{acct_idx}")
 
     outdir = Path(args.outdir)
     if outdir.is_dir():
@@ -117,10 +126,9 @@ def phase_create(args, plan: List[dict]):
               f"{tx['amt']} XMR -> {scrub_address(dst)}...")
 
         try:
-            # transfer_split creates the unsigned TX and reserves outputs
             result = rpc.raw_request("transfer_split", {
                 "destinations": [{"amount": amt_atomic, "address": dst}],
-                "account_index": 0,
+                "account_index": acct_idx,
                 "priority": args.fee_priority,
                 "get_tx_hex": False,
                 "do_not_relay": True,
@@ -324,11 +332,17 @@ def main():
     if not plan_path.exists():
         sys.exit(f"[!] File not found: {plan_path}")
 
-    plan = _load_unsigned(plan_path)
+    plan, meta = _load_unsigned(plan_path)
     _validate_plan(plan)
 
+    if meta.get("mock"):
+        sys.exit(
+            "[!] This plan was generated with MOCK balance (no real funds).\n"
+            "    It CANNOT be signed or broadcast. Create a real plan first."
+        )
+
     if args.phase == "create":
-        phase_create(args, plan)
+        phase_create(args, plan, meta)
     elif args.phase == "sign":
         phase_sign(args, plan)
 
