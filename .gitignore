@@ -127,6 +127,16 @@ gs_wake_handles.json
 # same disk, so a copy of this file is half of somebody's ledger.
 state.sealed
 state.sealed.new
+# The spend secrets, sealed (STAGE9_PLAN.md) and in plaintext. Both normally
+# live in /etc, which no wipe root reaches and no checkout contains -- but
+# --seal-secrets takes --secrets-env and --secrets-file, so an operator or a
+# developer testing the command can point either at the working tree. The
+# sealed one is ciphertext and still not ours to publish (the vault's half is
+# in the keyfile on the same disk); the plaintext one is a BIP39 seed.
+gs-wake-spend.sealed
+gs-wake-spend.sealed.new
+gs-wake-spend.env
+*.sealed
 # receive_watch --result-json's outcome, written into the same artifact_dir as
 # the two above by the wake agent's swap_status job. It carries `unlocked` and
 # `total` as exact decimals -- how much of the swap has arrived, to the

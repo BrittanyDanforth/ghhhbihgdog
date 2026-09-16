@@ -66,8 +66,8 @@ not fixed by any of this.
 | bot token, chat id | Pi only | they can wake / spam `/depo` |
 | Mullvad account number | paper / Pi `/etc`, not GitHub | they can use your pipe |
 | mix / `run_pipeline` | ThinkPad, you present, USB plugged in | — |
-| **with `--allow-withdraw`:** spend wallet file + `GS_WALLET_PASSWORD` | ThinkPad disk + `/etc/gs-wake-spend.env` | **they can spend** |
-| **with `--allow-btc-forward`:** `GS_BTC_SEED` (+ passphrase) | `/etc/gs-wake-spend.env` on the ThinkPad | **they own every deposit address this intake ever issues** |
+| **with `--allow-withdraw`:** spend wallet file + `GS_WALLET_PASSWORD` | ThinkPad disk; the password in `/etc/gs-wake-spend.env`, or **sealed to the pair** once you have run `--seal-secrets` (below) | **they can spend** — unless the password is sealed and they took the box between wakes, with no Pi |
+| **with `--allow-btc-forward`:** `GS_BTC_SEED` (+ passphrase) | same: plaintext in `/etc/gs-wake-spend.env` until you seal it | **they own every deposit address this intake ever issues** — the same caveat, and this is the row worth sealing for |
 | the vault's wake keyfile (unsealed by design — nobody is there at boot to type a passphrase) | ThinkPad `/etc`, `0400` | the wake secret and the Pi's LAN address. **The settings behind it — the account xpub, your Electrum onion, the node, your fee and sweep addresses, the switches — are sealed to the pair**, see below |
 | the artifact directory (ledger, open slips, plan chains, job log, chain log) | ThinkPad disk — **sealed between wakes**, see below | *during a job:* every open deposit and every forward since the last hand wipe. *Between wakes:* one `state.sealed` this machine cannot open by itself |
 
@@ -168,11 +168,57 @@ on the LUKS USB. And a seal that will not open refuses the job — which is
 what the sealed store above already does, under the same key, for the same
 two causes. There is no new way to be stuck.
 
-**Still in the clear on that machine**, and the next thing to fix:
-`/etc/gs-wake-spend.env` — `GS_BTC_SEED`, the wallet passwords, the API key.
-A child process reads them out of the unit's environment, so sealing them
-means the agent handing them to the child instead. §1's `--allow-btc-forward`
-row is scored on that, not on this.
+### ...and so are the secrets it signs with
+
+`/etc/gs-wake-spend.env` was the last large thing on that disk: the BIP39
+seed, the wallet passwords, the aggregator key. Stage 8 hid the xpub that
+*finds* every deposit address this intake ever issued; the seed is the key
+that *takes* them.
+
+It was in the clear for a real reason — a child process reads these out of
+the environment it inherits, and nobody is at the machine to type a
+passphrase. But the agent already strips every `GS_` variable from a child's
+environment and hands each step only what that step needs, so the children
+never inherited them from the unit anyway. Only the agent reads them, and
+only after the wake note. So they go behind the pair too.
+
+**Do this once, after pairing, at the machine:**
+
+```
+gs_doorbell state-key --key /etc/gs_wake_pi.key         # on the Pi
+gs_wake_agent --seal-secrets <hex> \
+              --key /etc/gs_wake_thinkpad.key           # here
+```
+
+That writes `/etc/gs-wake-spend.sealed` (0400). **It does not destroy the
+plaintext** — run a real job first, confirm it works, and only then:
+
+```
+shred -u /etc/gs-wake-spend.env
+# and delete the EnvironmentFile= line from gs-wake-agent.service
+```
+
+A tool that sealed your seed and shredded the only copy of it would be the
+one failure in this whole design that costs money instead of privacy, so it
+prints the command and leaves the decision with you.
+
+Three things to know:
+
+* **No sealed file means the old behaviour**, unchanged. Nothing is required.
+* **A sealed file that will not open refuses the job, and does not fall back
+  to the environment.** That is stricter than everywhere else here, on
+  purpose: if your seed is sealed you believe it is protected, and a box that
+  quietly signed from a plaintext leftover instead would never tell you.
+* **The seal is not a backup.** It seals the copy on this disk. Keep the seed
+  words where you already keep them, and remember that a re-pairing changes
+  the Pi's half and stops this file opening.
+
+**Still in the clear after all of this:** the Monero wallet file, which is the
+whole mix graph — encrypted under a password that is now sealed, which is
+better than it was and not the same as solved. And the issued-index marks,
+outside every seal on purpose (§4's wipe note says why): they name no address
+and no client, only that an intake ran here and how many addresses it handed
+out.
 
 Telegram never gets: wallet path, RPC URL, view key, spend key, seed — and by
 default nothing else either, only which job finished and a 4-hex handle.

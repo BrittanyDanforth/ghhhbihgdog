@@ -1256,6 +1256,13 @@ SETTINGS_CLEAR = ("schema", "version", "role", "secret", "peer_public",
 #: The keyfile member that holds everything else, and the name inside it.
 SETTINGS_FIELD = "sealed"
 SETTINGS_MEMBER = "settings.json"
+#: THE SPEND SECRETS' OWN SCHEMA (STAGE9_PLAN.md): the BTC seed, the wallet
+#: passwords, the aggregator key. Third container under the same two halves,
+#: third schema string, for the same reason the second one has its own -- a
+#: reader told which container it wants refuses the other at the header
+#: instead of failing at the MAC and blaming a re-pairing.
+SECRETS_SCHEMA = "gs_wake_secrets_v1"
+SECRETS_MEMBER = "secrets.json"
 
 
 def derive_state_half(secret_hex: str) -> bytes:

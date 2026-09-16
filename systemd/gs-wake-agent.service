@@ -194,6 +194,24 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 # /proc/<pid>/cmdline is 0444 and /proc/<pid>/environ is 0400, which is why
 # there is no flag for this and never will be.
 #
+# ...AND THEN SEAL IT AND TAKE THE LINE BACK OUT (STAGE9_PLAN.md). That file
+# is the last large thing on this disk that a seizure between wakes reads,
+# and the seed in it SPENDS every deposit address this intake has ever
+# issued -- stage 8 hid the xpub that finds them, this is the key that takes
+# them. Once, at the machine, after pairing:
+#
+#     gs_doorbell state-key --key /etc/gs_wake_pi.key      # on the Pi
+#     gs_wake_agent --seal-secrets <hex> \
+#                   --key /etc/gs_wake_thinkpad.key        # here
+#
+# That writes /etc/gs-wake-spend.sealed (0400), which opens only with both
+# boxes. It does NOT destroy the plaintext -- check a real job works first,
+# then shred it and DELETE the EnvironmentFile= line below. With the sealed
+# file present the agent does not need this unit to carry anything, and a
+# variable left here would be a readable copy of what was just sealed.
+#
+# Leaving the line in with no sealed file is the old behaviour, unchanged.
+#
 # WHAT STOPS IT REACHING EVERYTHING ELSE: run_child strips every GS_ variable
 # out of the environment it inherits and puts back only what the dispatcher
 # hands that step. So the wallet password reaches the mix, the seed reaches

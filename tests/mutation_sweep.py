@@ -2560,14 +2560,14 @@ MUTATIONS = [
  # collapsed them, so a forgotten password reached GhostSpiral as "no
  # password", was accepted, and died opening the wallet after the wake.
  ("the spending step is not handed the password it needs", "gs_wake_agent",
-  '            env_extra["GS_WALLET_PASSWORD"] = os.environ["GS_WALLET_PASSWORD"]',
+  '            env_extra["GS_WALLET_PASSWORD"] = secret_of("GS_WALLET_PASSWORD")',
   "            pass",
   ["test_wake_agent"]),
 
  # ...AND AN ABSENT ONE IS REFUSED RATHER THAN PASSED THROUGH AS EMPTY.
  ("an unset spend password is silently treated as no password again",
   "gs_wake_agent",
-  '            if "GS_WALLET_PASSWORD" not in os.environ:',
+  '            if not has_secret("GS_WALLET_PASSWORD"):',
   "            if False:",
   ["test_wake_agent"]),
 
@@ -4396,7 +4396,7 @@ MUTATIONS = [
   '            _allowed = key.get("allow_withdraw")',
   ['test_wake_agent']),
  ('the forward runs with no seed in the environment', 'gs_wake_agent',
-  '            if "GS_BTC_SEED" not in os.environ:',
+  '            if not has_secret("GS_BTC_SEED"):',
   '            if False:',
   ['test_wake_agent']),
  ('a finished forward re-ships the deposit slip to the phone', 'gs_wake_agent',
@@ -5488,7 +5488,7 @@ MUTATIONS = [
   '    if False:\n        integrity_log("wake", "btc_seed_xpub_mismatch")',
   ['test_wake_agent']),
  ('the passphrase is left out of the seed proof', 'gs_wake_agent',
-  '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
+  '                secret_of("GS_BTC_SEED_PASSPHRASE", ""),\n'
   '                account=account_no)',
   '                "",\n'
   '                account=account_no)',
@@ -5511,11 +5511,11 @@ MUTATIONS = [
   '                    pass',
   ['test_telegram_pager']),
  ('the account number is left out of the seed proof', 'gs_wake_agent',
-  '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
+  '                secret_of("GS_BTC_SEED_PASSPHRASE", ""),\n'
   '                account=account_no)\n'
   '        except _btx.BtcTxError:\n'
   '            integrity_log("wake", "btc_seed_invalid")',
-  '                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),\n'
+  '                secret_of("GS_BTC_SEED_PASSPHRASE", ""),\n'
   '                account=0)\n'
   '        except _btx.BtcTxError:\n'
   '            integrity_log("wake", "btc_seed_invalid")',
@@ -6474,6 +6474,87 @@ MUTATIONS = [
   'gs_wake_proto.py',
   'PAIR_PROTO = 6',
   'PAIR_PROTO = 5',
+  ['test_wake_agent']),
+ # STAGE 9: the secrets the vault SIGNS with, behind the same pair. The xpub
+ # finds every deposit address this intake issued; the seed spends them.
+ ("the secrets section wears the SETTINGS schema, so either reader takes "
+  'either container', 'gs_wake_proto.py',
+  'SECRETS_SCHEMA = "gs_wake_secrets_v1"',
+  'SECRETS_SCHEMA = SETTINGS_SCHEMA',
+  ['test_wake_agent']),
+ ('a sealed secrets file may put ANY variable into a child environment',
+  'gs_wake_agent',
+  '        if _k in SECRETS_ALLOWED and isinstance(_v, str):\n'
+  '            _SECRETS[_k] = _v',
+  '        if isinstance(_v, str):\n'
+  '            _SECRETS[_k] = _v',
+  ['test_wake_agent']),
+ ('the environment WINS over the seal, so a forgotten shred is a stale '
+  'signature', 'gs_wake_agent',
+  '    if name in _SECRETS:\n'
+  '        return _SECRETS[name]\n'
+  '    return os.environ.get(name, default)',
+  '    if name in os.environ:\n'
+  '        return os.environ[name]\n'
+  '    return _SECRETS.get(name, default)',
+  ['test_wake_agent']),
+ ('an EMPTY sealed password reads as "nobody configured this box"',
+  'gs_wake_agent',
+  '    return name in _SECRETS or name in os.environ',
+  '    return bool(_SECRETS.get(name) or os.environ.get(name))',
+  ['test_wake_agent']),
+ ('a secrets file that will not open FALLS BACK to the plaintext left '
+  'beside it', 'gs_wake_agent',
+  '        raise Refused(\n'
+  '            "secrets_unreadable",',
+  '        return 0\n'
+  '        raise Refused(\n'
+  '            "secrets_unreadable",',
+  ['test_wake_agent']),
+ ('the sealed secrets are never opened, so the wake signs from the '
+  'environment alone', 'gs_wake_agent',
+  '        _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),\n'
+  '                           _vault_half, _pi_half)',
+  '        _ns = 0',
+  ['test_wake_agent']),
+ ('the seed is read from the environment rather than the seal',
+  'gs_wake_agent',
+  '            env_extra["GS_BTC_SEED"] = secret_of("GS_BTC_SEED")',
+  '            env_extra["GS_BTC_SEED"] = os.environ.get("GS_BTC_SEED", "")',
+  ['test_wake_agent']),
+ ('the spend password is read from the environment rather than the seal',
+  'gs_wake_agent',
+  '            env_extra["GS_WALLET_PASSWORD"] = secret_of("GS_WALLET_PASSWORD")',
+  '            env_extra["GS_WALLET_PASSWORD"] = \\\n'
+  '                os.environ.get("GS_WALLET_PASSWORD", "")',
+  ['test_wake_agent']),
+ ("the fee sweep cannot see a sealed fee password and calls it unset",
+  'gs_wake_agent',
+  '    if not has_secret("GS_FEE_WALLET_PASSWORD"):',
+  '    if "GS_FEE_WALLET_PASSWORD" not in os.environ:',
+  ['test_wake_agent']),
+ ('--seal-secrets never reads its own container back before replacing the '
+  'file', 'gs_wake_agent',
+  '        if json.loads(back[proto.SECRETS_MEMBER]) != found:\n'
+  '            raise ValueError("the sealed copy does not read back")',
+  '        if False:\n'
+  '            raise ValueError("the sealed copy does not read back")',
+  ['test_wake_agent']),
+ ('--seal-secrets seals whatever else the EnvironmentFile holds',
+  'gs_wake_agent',
+  '        if _n in SECRETS_ALLOWED:\n'
+  '            found[_n] = _v.strip().strip(\'"\').strip("\'")',
+  '        if True:\n'
+  '            found[_n] = _v.strip()',
+  ['test_wake_agent']),
+ ('the sealed secrets land world-readable', 'gs_wake_agent',
+  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)',
+  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)',
+  ['test_wake_agent']),
+ ('a seed stays in RAM after a run that does not power the box off',
+  'gs_wake_agent',
+  '        _SECRETS.clear()\n        retire_job_log(',
+  '        retire_job_log(',
   ['test_wake_agent']),
 ]
 

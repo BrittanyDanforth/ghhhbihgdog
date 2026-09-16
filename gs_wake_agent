@@ -135,6 +135,28 @@ SEALED_SKIP = ("wallet_feesweep.json",)
 KEYFILE_SEALED = proto.SETTINGS_FIELD
 KEYFILE_MEMBER = proto.SETTINGS_MEMBER
 KEYFILE_CLEAR = proto.SETTINGS_CLEAR
+#: THE SPEND SECRETS, SEALED TO THE SAME PAIR (STAGE9_PLAN.md). The BTC
+#: seed, the wallet passwords and the aggregator key used to sit in
+#: /etc/gs-wake-spend.env in the clear, because a child process reads them
+#: out of the unit's environment and an unattended signer has to be able
+#: to. It still does -- run_child strips every GS_ variable and only
+#: env_extra puts any back -- but the agent now gets them from here and
+#: hands them over per step, instead of inheriting them from execve.
+#:
+#: THE SEED IS THE WORST THING ON THAT DISK. The xpub finds every deposit
+#: address this intake ever issued; the seed SPENDS them.
+SECRETS_FILE = "/etc/gs-wake-spend.sealed"
+#: Where the plaintext lives today, and what --seal-secrets reads once.
+SECRETS_ENV_FILE = "/etc/gs-wake-spend.env"
+#: What may be in it. An allow-list, so a sealed file cannot smuggle an
+#: arbitrary variable into a child's environment: the seal is written by
+#: the operator at the machine, but it is a FILE, and a file is something
+#: that can be swapped.
+SECRETS_ALLOWED = ("GS_BTC_SEED", "GS_BTC_SEED_PASSPHRASE",
+                   "GS_WALLET_PASSWORD", "GS_FEE_WALLET_PASSWORD",
+                   "GS_SWAPKIT_API_KEY")
+#: Opened after the note, RAM only, cleared in main()'s finally.
+_SECRETS = {}
 #: The two halves, once the note has been opened: the vault's from the
 #: keyfile, the Pi's from M2. main()'s finally needs them to re-seal, and
 #: it has no keyfile and no note -- the same shape as _LATE_GUARD. RAM
@@ -695,6 +717,69 @@ def _sealed_members(dirpath: Path) -> list:
             if p.is_file() and p.name not in SEALED_SKIP:
                 out.add(p.name)
     return sorted(out)
+
+
+def secret_of(name: str, default=None):
+    """One spend secret: from the sealed file if this box has one, else
+    from the environment.
+
+    THE ENVIRONMENT IS STILL READ, and that is the compatibility story
+    rather than a hole: an install that has not run `--seal-secrets` keeps
+    working off its EnvironmentFile exactly as it did. Sealed wins, so an
+    operator who has sealed and forgotten to shred the plaintext gets the
+    sealed value and not a stale one.
+    """
+    if name in _SECRETS:
+        return _SECRETS[name]
+    return os.environ.get(name, default)
+
+
+def has_secret(name: str) -> bool:
+    """Whether this box has that secret AT ALL -- sealed or in the
+    environment. Separate from secret_of because an EMPTY password is a
+    real answer ("this wallet has none") and `not value` is not the
+    question: every refusal in this file distinguishes unset from empty."""
+    return name in _SECRETS or name in os.environ
+
+
+def open_secrets(path, vault_half: bytes, pi_half: bytes) -> int:
+    """Load the sealed spend secrets into _SECRETS. Returns how many.
+
+    REFUSES rather than falling back to the environment. A box that has a
+    sealed secrets file and cannot open it is a box whose seed the
+    operator believes is protected; quietly signing from a plaintext
+    leftover instead would make the seal decorative, and the operator
+    would never learn. The same two causes as everything else under this
+    key: a re-pairing, or an altered file.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return 0
+    try:
+        container = json.loads(p.read_text())
+        members = proto.state_unseal(container, vault_half, pi_half,
+                                     schema=proto.SECRETS_SCHEMA)
+        inner = json.loads(members[proto.SECRETS_MEMBER])
+        if not isinstance(inner, dict):
+            raise ValueError("not an object")
+    except (proto.WakeError, KeyError, ValueError, TypeError) as e:
+        raise Refused(
+            "secrets_unreadable",
+            f"the sealed spend secrets at {p} did not open ({e}). Either "
+            "the two boxes were re-paired since they were sealed -- the "
+            "Pi's half of the key changes with its secret -- or the file "
+            "has been altered. Nothing is signed with a seed this machine "
+            "cannot read, and it will NOT fall back to the environment: "
+            "that would make the seal decorative. Re-seal at the machine "
+            "with `gs_wake_agent --seal-secrets <hex>`.")
+    _SECRETS.clear()
+    for _k, _v in inner.items():
+        # THE ALLOW-LIST, applied on the way IN. A sealed file is still a
+        # file; one swapped for another operator's would otherwise put
+        # whatever GS_ variables it liked into every child's environment.
+        if _k in SECRETS_ALLOWED and isinstance(_v, str):
+            _SECRETS[_k] = _v
+    return len(_SECRETS)
 
 
 def open_keyfile(key: dict, vault_half: bytes, pi_half: bytes) -> dict:
@@ -1341,7 +1426,7 @@ def build_fee_sweep_argv(key: dict, cfg: dict, bundle: str,
     from GS_FEE_WALLET_PASSWORD here so the two wallets' passwords are never
     one setting. run_child scrubs every other GS_* variable from the child.
     """
-    if "GS_FEE_WALLET_PASSWORD" not in os.environ:
+    if not has_secret("GS_FEE_WALLET_PASSWORD"):
         integrity_log("wake", "fee_sweep:password_unset")
         raise Refused(
             "fee_wallet_password_unset",
@@ -1360,7 +1445,7 @@ def build_fee_sweep_argv(key: dict, cfg: dict, bundle: str,
             "--wallets", str(withdraw_wallets(cfg["depth"])),
             "--output", str(artifact_dir)]
     env = {"GS_EXIT_TO": " ".join(cfg["dests"]),
-           "GS_WALLET_PASSWORD": os.environ["GS_FEE_WALLET_PASSWORD"]}
+           "GS_WALLET_PASSWORD": secret_of("GS_FEE_WALLET_PASSWORD")}
     return argv, env
 
 
@@ -1509,6 +1594,17 @@ def _retire_fee_bundle(artifact_dir: Path) -> None:
         integrity_log("wake", "retire_failed:fee_bundle")
 
 
+def _half_bytes(half_hex: str):
+    """The Pi's half from a hex string an operator typed, or None. One
+    parser, so `--unseal-state`, `--unseal-key` and `--seal-secrets` cannot
+    disagree about what a half looks like."""
+    try:
+        raw = bytes.fromhex(str(half_hex or "").strip())
+    except ValueError:
+        return None
+    return raw if len(raw) == proto.STATE_HALF_BYTES else None
+
+
 def _by_hand(key: dict, half_hex: str, what: str) -> dict:
     """Open a sealed keyfile with a half the operator typed, or refuse.
 
@@ -1549,6 +1645,16 @@ def run_fee_sweep_cli(args, deps: dict = None) -> str:
     # wallet", which would be a true sentence about the wrong thing.
     key = _by_hand(key, getattr(args, "unseal_state", ""),
                    "a fee sweep on a box nothing woke")
+    # THE FEE WALLET'S PASSWORD IS A SEALED SECRET TOO, and this boot has the
+    # half on its argv, so it can open them. Without this the sweep refused
+    # fee_password_unset on a box where the password is sealed and present --
+    # a true sentence about the wrong thing, again.
+    _fh = _half_bytes(getattr(args, "unseal_state", ""))
+    if _fh is not None:
+        _fv, _ = state_halves(key)
+        if _fv is not None:
+            open_secrets(getattr(args, "secrets_file", SECRETS_FILE),
+                         _fv, _fh)
     artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
     secure_mkdir(artifact_dir, narrow_existing=False)
     _AGENT_LOG[0] = artifact_dir / JOB_LOG
@@ -1707,7 +1813,7 @@ def _prove_btc_seed(key: dict) -> None:
     refuses it (btc_seed_unset): an address for money this machine cannot
     sign for is not an address to hand a client."""
     import gs_btc_tx as _btx
-    if "GS_BTC_SEED" not in os.environ:
+    if not has_secret("GS_BTC_SEED"):
         integrity_log("wake", "btc_seed_unset")
         raise Refused(
             "btc_seed_unset",
@@ -1720,9 +1826,9 @@ def _prove_btc_seed(key: dict) -> None:
     try:
         try:
             account = _btx.account_from_mnemonic(
-                os.environ["GS_BTC_SEED"],
+                secret_of("GS_BTC_SEED"),
                 str(key.get("btc_network") or "main"),
-                os.environ.get("GS_BTC_SEED_PASSPHRASE", ""),
+                secret_of("GS_BTC_SEED_PASSPHRASE", ""),
                 account=account_no)
         except _btx.BtcTxError:
             integrity_log("wake", "btc_seed_invalid")
@@ -3336,6 +3442,13 @@ def run_once(args, deps: dict = None) -> tuple:
         # not on the seized disk in a readable form. Rebinding `key` is the
         # whole wiring; everything downstream takes it as a parameter.
         key = open_keyfile(key, _vault_half, _pi_half)
+        # ...AND THE SPEND SECRETS (STAGE9_PLAN.md), if this box has sealed
+        # them. Same halves, same moment, same reason: the seed spends every
+        # deposit address the xpub above can find, and a machine taken
+        # between wakes should not be holding it in a readable file.
+        _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),
+                           _vault_half, _pi_half)
+        integrity_log("wake", "secrets_opened" if _ns else "secrets_plain")
 
     elapsed = _clock() - sent_at
     if elapsed > M1_M2_WINDOW_S:
@@ -4697,17 +4810,17 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # ARGV AND NEVER IN THE KEYFILE -- the wallet password's rule,
             # for the same reasons. Absent means refused, before the child
             # starts: a forward that cannot sign should not spend a look.
-            if "GS_BTC_SEED" not in os.environ:
+            if not has_secret("GS_BTC_SEED"):
                 integrity_log("wake", "btc_seed_unset")
                 raise Refused(
                     "btc_seed_unset",
                     "the machine has no BTC seed configured, so the forward "
                     "cannot sign. Nothing was spent. Set GS_BTC_SEED in the "
                     "agent unit's EnvironmentFile, at the machine.")
-            env_extra["GS_BTC_SEED"] = os.environ["GS_BTC_SEED"]
-            if "GS_BTC_SEED_PASSPHRASE" in os.environ:
+            env_extra["GS_BTC_SEED"] = secret_of("GS_BTC_SEED")
+            if has_secret("GS_BTC_SEED_PASSPHRASE"):
                 env_extra["GS_BTC_SEED_PASSPHRASE"] = \
-                    os.environ["GS_BTC_SEED_PASSPHRASE"]
+                    secret_of("GS_BTC_SEED_PASSPHRASE")
             # THE XPUB AND THE INDEX, off the argv for the reasons build_argv
             # gives; and the aggregator's API key, if this machine has one,
             # so a keyed SwapKit does not refuse every quote (run_child strips
@@ -4721,9 +4834,9 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # coerced, like every other intake setting.
             env_extra["GS_BTC_ACCOUNT"] = str(
                 _btc_setting(key, "btc_account", 0, 0, 2 ** 31 - 1))
-            if os.environ.get("GS_SWAPKIT_API_KEY"):
+            if secret_of("GS_SWAPKIT_API_KEY"):
                 env_extra["GS_SWAPKIT_API_KEY"] = \
-                    os.environ["GS_SWAPKIT_API_KEY"]
+                    secret_of("GS_SWAPKIT_API_KEY")
         if job == "withdraw":
             # THE DESTINATION, IN THE ENVIRONMENT, NEVER ON THE ARGV.
             # GhostSpiral reads GS_EXIT_TO through env_or_argv and prefers it
@@ -4786,7 +4899,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # -- the pager cannot know this and must not be told the wallet's
             # configuration -- but nothing has been unlocked and nothing has
             # moved.
-            if "GS_WALLET_PASSWORD" not in os.environ:
+            if not has_secret("GS_WALLET_PASSWORD"):
                 integrity_log("wake", "wallet_password_unset")
                 raise Refused(
                     "wallet_password_unset",
@@ -4795,7 +4908,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                     "the machine — and if the wallet genuinely has no "
                     "password, set it to an empty value so that choice is "
                     "on the record rather than assumed.")
-            env_extra["GS_WALLET_PASSWORD"] = os.environ["GS_WALLET_PASSWORD"]
+            env_extra["GS_WALLET_PASSWORD"] = secret_of("GS_WALLET_PASSWORD")
             # THE OPERATOR'S CUT, WHICH THIS PATH WAS NOT TAKING AT ALL.
             #
             # --usage-fee is action="store_true" and defaults OFF ("a run that
@@ -5632,6 +5745,100 @@ def unseal_state_cli(args) -> str:
     return "opened"
 
 
+def seal_secrets_cli(args) -> str:
+    """--seal-secrets: put the spend secrets behind the pair, by hand.
+
+    THE ONE SETUP STEP THAT CANNOT HAPPEN AT PAIRING, because the secrets
+    do not exist yet: the operator writes the seed and the passwords after
+    the two boxes are paired (OPSEC_SETUP.md section 5). So this is a
+    command they run once, at the machine, with the half from the Pi --
+    which means the recovery path is not a habit they are asked to
+    remember, it is the habit that installs the feature.
+
+    IT DOES NOT SHRED THE PLAINTEXT. It prints the command. A seal this
+    tool wrote and then destroyed the only copy of the seed against would
+    be the one failure in this whole design that costs a client's money
+    rather than their privacy, and no read-back check is worth betting a
+    seed on when the operator can look at the file themselves. Same rule
+    as state_close, one step further out.
+    """
+    key = load_key(Path(args.key))
+    pi = _half_bytes(getattr(args, "seal_secrets", ""))
+    vault, _ = state_halves(key)
+    if vault is None:
+        agent_say("  [!] This keyfile carries no state half, so there is no "
+                  "pair to seal to. Re-pair both boxes first.")
+        return "unsealed"
+    if pi is None:
+        agent_say(f"  [!] --seal-secrets takes the Pi's half as "
+                  f"{proto.STATE_HALF_BYTES * 2} hex characters. Print it "
+                  f"with `gs_doorbell state-key` on the Pi.")
+        return "bad_half"
+    src = Path(getattr(args, "secrets_env", "") or SECRETS_ENV_FILE)
+    try:
+        lines = src.read_text().splitlines()
+    except OSError as e:
+        agent_say(f"  [!] cannot read {src} ({e.strerror}). That is the "
+                  f"EnvironmentFile the unit uses today; point at it with "
+                  f"--secrets-env if it is somewhere else.")
+        return "no_source"
+    found = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        _n, _, _v = line.partition("=")
+        _n = _n.strip()
+        # THE ALLOW-LIST ON THE WAY IN AS WELL AS OUT. An EnvironmentFile
+        # can hold anything; only the five this machine actually hands to a
+        # child are sealed, so the container cannot become a general-purpose
+        # smuggler for whatever else is in that file.
+        if _n in SECRETS_ALLOWED:
+            found[_n] = _v.strip().strip('"').strip("'")
+    if not found:
+        agent_say(f"  [!] {src} names none of the spend secrets "
+                  f"({', '.join(SECRETS_ALLOWED)}). Nothing was written.")
+        return "nothing_to_seal"
+    out = Path(getattr(args, "secrets_file", "") or SECRETS_FILE)
+    try:
+        container = proto.state_seal(
+            {proto.SECRETS_MEMBER: json.dumps(found, sort_keys=True)},
+            vault, pi, schema=proto.SECRETS_SCHEMA)
+        # READ IT BACK WITH THE SAME TWO HALVES before it is in place, the
+        # same rule the store's close and the pairing's own seal follow.
+        back = proto.state_unseal(container, vault, pi,
+                                  schema=proto.SECRETS_SCHEMA)
+        if json.loads(back[proto.SECRETS_MEMBER]) != found:
+            raise ValueError("the sealed copy does not read back")
+        tmp = out.with_name(out.name + ".new")
+        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
+        with os.fdopen(_fd, "w") as fh:
+            json.dump(container, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(str(tmp), str(out))
+    except Exception as e:                                   # noqa: BLE001
+        agent_say(f"  [!] the spend secrets could not be sealed ({e}). "
+                  f"Nothing was written and {src} is untouched.")
+        return "seal_failed"
+    print()
+    print(f"  {len(found)} secret(s) sealed into {out} (0400):")
+    for _n in sorted(found):
+        print(f"      {_n}")
+    print()
+    print("  They now open only with this pair. The plaintext is STILL")
+    print(f"  there and this tool will not destroy it -- check the seal")
+    print("  works with a real job first, then, when you are sure:")
+    print()
+    print(f"      shred -u {src}")
+    print("      # and remove the EnvironmentFile= line from the unit")
+    print()
+    print("  KEEP THE SEED SOMEWHERE ELSE TOO. This seals the copy on this")
+    print("  disk; it is not a backup. A re-pairing changes the Pi's half")
+    print("  and this file stops opening.")
+    return "sealed"
+
+
 def unseal_key_cli(args) -> str:
     """--unseal-key: print this machine's sealed SETTINGS and stop.
 
@@ -5694,6 +5901,23 @@ def build_cli() -> argparse.ArgumentParser:
                          "--fee-sweep takes when this machine's SETTINGS are "
                          "sealed too: that boot has no note, so nothing "
                          "brings it a half.")
+    ap.add_argument("--seal-secrets", metavar="HEX", default="",
+                    help="put this machine's spend secrets -- the BTC seed, "
+                         "the wallet passwords, the aggregator key -- behind "
+                         "the pair, then stop. HEX is the Pi's half, the same "
+                         "one --unseal-state takes. Reads the unit's "
+                         "EnvironmentFile once and writes a sealed file "
+                         "beside it; it does NOT destroy the plaintext, it "
+                         "prints the command. Run this once, after pairing, "
+                         "at the machine.")
+    ap.add_argument("--secrets-env", metavar="PATH", default="",
+                    help=f"where the plaintext secrets are now (default "
+                         f"{SECRETS_ENV_FILE}). Only --seal-secrets reads it.")
+    ap.add_argument("--secrets-file", metavar="PATH", default=SECRETS_FILE,
+                    help=f"the sealed spend secrets (default {SECRETS_FILE}). "
+                         f"Absent means this box still uses the unit's "
+                         f"EnvironmentFile, which is how every install from "
+                         f"before this stage keeps working.")
     ap.add_argument("--unseal-key", metavar="HEX", default="",
                     help="print this machine's sealed SETTINGS and stop -- "
                          "the xpub, the servers, the fee destinations, the "
@@ -5726,6 +5950,12 @@ def main(argv=None) -> int:
                 code = unseal_state_cli(args)
                 _keep_on = True
                 return 0 if code == "opened" else 1
+            if getattr(args, "seal_secrets", ""):
+                # SETUP, not recovery, but the same posture: the operator is
+                # at the machine, nothing is woken and nothing powers off.
+                code = seal_secrets_cli(args)
+                _keep_on = True
+                return 0 if code == "sealed" else 1
             if getattr(args, "unseal_key", ""):
                 # SAME PATH, SAME REASON as --unseal-state above: the
                 # operator is at the machine and nothing is woken or
@@ -5812,6 +6042,13 @@ def main(argv=None) -> int:
                     pass
             finally:
                 _STATE_KEY.clear()
+        # THE SECRETS GO FROM RAM HERE, on every path out. The machine is
+        # about to power off, which clears them anyway -- but --dry-run,
+        # --fee-sweep and a refusal that keeps the box on all return through
+        # this finally without powering anything off, and a seed left in a
+        # module dict in a process that keeps running is a seed one bug away
+        # from a log line.
+        _SECRETS.clear()
         retire_job_log(code, args.dry_run)
         # EVERY path, including SystemExit from gs_common's own fail-closed
         # aborts, and including an unhandled exception.

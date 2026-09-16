@@ -7365,6 +7365,256 @@ check("stage8: ...and it still shows the pairing code, which is what an "
       "aa" in _dtext.lower() or "code" in _dtext.lower()
       or "doorbell" in _dtext.lower())
 
+print("\n== STAGE 9: the spend secrets behind the same pair ==")
+# The xpub finds every deposit address this intake ever issued. The SEED
+# spends them, and it sat in /etc/gs-wake-spend.env in the clear because a
+# child process reads it out of the unit's environment. It still does --
+# run_child strips every GS_ variable and only env_extra puts any back -- but
+# the agent now takes it from a sealed file and hands it over per step.
+
+
+_d0 = tempfile.mkdtemp(prefix="stage9_")
+
+
+def _secrets_file(d, obj, half=_SEAL_HALF, pi=None, schema=None):
+    """A real sealed secrets container on disk, at 0400 like the shipped one."""
+    _p = Path(d) / "spend.sealed"
+    _p.write_text(json.dumps(P.state_seal(
+        {P.SECRETS_MEMBER: json.dumps(obj, sort_keys=True)},
+        bytes.fromhex(half), pi if pi is not None else _S8_PI,
+        schema=schema or P.SECRETS_SCHEMA)))
+    return _p
+
+
+def _wake_with_secrets(sealed, env=None, half=_SEAL_HALF):
+    """One wake on a sealed-keyfile vault whose secrets are sealed too.
+
+    Returns (out, err, text, deps). The environment is REPLACED for the
+    call, so a test that means 'the seed is only in the sealed file' is not
+    quietly satisfied by the suite's own environment.
+    """
+    _d, _kf, _k, _b, _, _ = _stage8_env(
+        extra={"btc_account_xpub": "", "allow_withdraw": True,
+               "wallet_file": str(Path(_d0) / "spend.wallet")}, half=half)
+    _sp = _secrets_file(_d, sealed, half=half)
+    _saved = {n: os.environ.get(n) for n in A.SECRETS_ALLOWED}
+    for _n in A.SECRETS_ALLOWED:
+        os.environ.pop(_n, None)
+    for _n, _v in (env or {}).items():
+        os.environ[_n] = _v
+    _args = types.SimpleNamespace(key=str(_kf), dry_run=False,
+                                  secrets_file=str(_sp))
+    _buf = io.StringIO()
+    _dp = deps_for(_d, _b)
+    try:
+        with contextlib.redirect_stdout(_buf):
+            try:
+                _out = A.run_once(_args, {k: v for k, v in _dp.items()
+                                          if not k.startswith("_")})
+                _err = None
+            except (A.Refused, P.WakeError) as e:
+                _out, _err = None, e
+    finally:
+        for _n, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_n, None)
+            else:
+                os.environ[_n] = _v
+        A._SECRETS.clear()
+        A._STATE_KEY.clear()
+    return _out, _err, _buf.getvalue(), _dp
+
+
+_9o, _9e, _9t, _9dp = _wake_with_secrets(
+    {"GS_WALLET_PASSWORD": "sealed-pw"})
+check("stage9: a wake whose secrets are SEALED runs the job -- with the "
+      "environment emptied of every one of them first, so this cannot be "
+      "the old path passing",
+      _9e is None and _9o and _9o[0] == "done")
+# WHAT IS ON THE DISK IS A CONTAINER. Checked against the bytes, because
+# "it is encrypted" is the claim and the file is where it is either true
+# or not.
+_9blob = _secrets_file(_d0, {"GS_WALLET_PASSWORD": "sealed-pw",
+                             "GS_BTC_SEED": "abandon about"}).read_text()
+check("stage9: the file at rest carries neither the secret nor the NAME of "
+      "any secret it holds -- the names alone say which switches this box "
+      "was paired for",
+      "sealed-pw" not in _9blob and "abandon" not in _9blob
+      and "GS_BTC_SEED" not in _9blob and "GS_WALLET_PASSWORD" not in _9blob
+      and set(json.loads(_9blob)) == {"schema", "salt", "box"}
+      and json.loads(_9blob)["schema"] == P.SECRETS_SCHEMA)
+#: THE SECRET REACHES THE CHILD, which is the whole feature and is NOT what
+#: the wake above proved: receive_and_quote never asks for a spend password,
+#: so that run only showed the seal does not break a job. _dispatch_withdraw
+#: captures the env_extra handed to the child, with the environment emptied
+#: of the password first -- so the value it sees can only have come out of
+#: the sealed file.
+A._SECRETS.clear()
+A.open_secrets(_secrets_file(_d0, {"GS_WALLET_PASSWORD": "from-the-seal"}),
+               bytes.fromhex(_SEAL_HALF), _S8_PI)
+try:
+    _9code, _9seen = _dispatch_withdraw(None)
+finally:
+    A._SECRETS.clear()
+check("stage9: the SEALED spend password reaches the child that needs it, "
+      "with the environment holding none -- so the seal feeds the signer "
+      "rather than merely not breaking it",
+      _9code == "" and len(_9seen) == 1
+      and _9seen[0][1].get("GS_WALLET_PASSWORD") == "from-the-seal")
+# NON-VACUITY, the other way: with the seal EMPTY and the environment empty
+# too, the same dispatch refuses. So the check above is about the seal.
+_9none, _ = _dispatch_withdraw(None)
+check("stage9: NON-VACUITY -- with nothing sealed and nothing in the "
+      "environment, the same dispatch refuses wallet_password_unset",
+      _9none == "wallet_password_unset")
+# AND AN EXPLICIT EMPTY SEALED PASSWORD IS STILL 'a wallet with no
+# password', not 'nobody configured this box' -- the distinction the
+# environment path already drew, preserved through the seal.
+A._SECRETS.clear()
+A.open_secrets(_secrets_file(_d0, {"GS_WALLET_PASSWORD": ""}),
+               bytes.fromhex(_SEAL_HALF), _S8_PI)
+try:
+    _9emp, _9eseen = _dispatch_withdraw(None)
+finally:
+    A._SECRETS.clear()
+check("stage9: a sealed EMPTY password still runs, so the seal keeps the "
+      "distinction between 'no password on purpose' and 'unconfigured'",
+      _9emp == "" and len(_9eseen) == 1
+      and _9eseen[0][1].get("GS_WALLET_PASSWORD") == "")
+_9sec = {"GS_BTC_SEED": "abandon " * 11 + "about",
+         "GS_WALLET_PASSWORD": "sealed-pw", "GS_SWAPKIT_API_KEY": "sk-sealed"}
+_sp9 = _secrets_file(_d0, _9sec)
+_n9 = A.open_secrets(_sp9, bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("stage9: open_secrets loads every allowed secret and nothing else",
+      _n9 == 3 and A._SECRETS["GS_BTC_SEED"].endswith("about")
+      and A._SECRETS["GS_SWAPKIT_API_KEY"] == "sk-sealed")
+check("stage9: ...and secret_of/has_secret answer from it without the "
+      "environment having any of them",
+      A.secret_of("GS_WALLET_PASSWORD") == "sealed-pw"
+      and A.has_secret("GS_BTC_SEED")
+      and not A.has_secret("GS_FEE_WALLET_PASSWORD"))
+# SEALED WINS over a stale plaintext leftover, so an operator who sealed and
+# forgot to shred does not sign with yesterday's value.
+os.environ["GS_WALLET_PASSWORD"] = "stale-plaintext"
+try:
+    check("stage9: a sealed secret WINS over a leftover in the environment, "
+          "so a forgotten shred is not a stale signature",
+          A.secret_of("GS_WALLET_PASSWORD") == "sealed-pw")
+finally:
+    os.environ.pop("GS_WALLET_PASSWORD", None)
+# THE ALLOW-LIST, on the way in. A sealed file is still a file.
+A._SECRETS.clear()
+_evil = _secrets_file(_d0, {"GS_BTC_SEED": "s", "GS_EVIL": "x",
+                            "PATH": "/tmp/evil"})
+A.open_secrets(_evil, bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("stage9: a sealed file cannot smuggle an arbitrary variable into a "
+      "child's environment -- only the five this machine hands over",
+      set(A._SECRETS) == {"GS_BTC_SEED"}
+      and "GS_EVIL" not in A._SECRETS and "PATH" not in A._SECRETS)
+A._SECRETS.clear()
+# A FILE THAT WILL NOT OPEN REFUSES, and does NOT fall back to the
+# environment. This is the check that makes the seal mean something: a
+# fallback would make it decorative and the operator would never learn.
+os.environ["GS_WALLET_PASSWORD"] = "plaintext-still-here"
+try:
+    _bad9 = _secrets_file(_d0, {"GS_WALLET_PASSWORD": "x"},
+                          pi=b"\x07" * 32)
+    _r9 = None
+    try:
+        A.open_secrets(_bad9, bytes.fromhex(_SEAL_HALF), _S8_PI)
+    except A.Refused as e:
+        _r9 = e
+    check("stage9: a secrets file sealed under ANOTHER pairing refuses, and "
+          "says it will NOT fall back to the environment -- a fallback is "
+          "what would make the seal decorative",
+          _r9 is not None and _r9.code == "secrets_unreadable"
+          and "re-paired" in _r9.msg and "decorative" in _r9.msg)
+    for _b9, _why in ((_secrets_file(_d0, {"GS_BTC_SEED": "s"},
+                                     schema=P.SETTINGS_SCHEMA),
+                       "a container of the SETTINGS schema"),
+                      (None, "a file that is not JSON")):
+        if _b9 is None:
+            _b9 = Path(_d0) / "junk.sealed"
+            _b9.write_text("{not json")
+        _r = None
+        try:
+            A.open_secrets(_b9, bytes.fromhex(_SEAL_HALF), _S8_PI)
+        except A.Refused as e:
+            _r = e
+        check(f"stage9: ...and so does {_why}",
+              _r is not None and _r.code == "secrets_unreadable")
+finally:
+    os.environ.pop("GS_WALLET_PASSWORD", None)
+    A._SECRETS.clear()
+check("stage9: an ABSENT secrets file is not an error -- every install from "
+      "before this stage keeps reading its EnvironmentFile",
+      A.open_secrets(Path(_d0) / "nope.sealed", bytes.fromhex(_SEAL_HALF),
+                     _S8_PI) == 0)
+# --seal-secrets: the setup step, which is also the recovery habit.
+_env9 = Path(_d0) / "spend.env"
+_env9.write_text("# a comment\n"
+                 'GS_BTC_SEED="abandon abandon about"\n'
+                 "GS_WALLET_PASSWORD=pw1\n"
+                 "GS_FEE_WALLET_PASSWORD=\n"
+                 "SOMETHING_ELSE=keepout\n")
+_out9 = Path(_d0) / "written.sealed"
+_d9, _kf9, _k9, _, _, _ = _stage8_env()
+_sbuf = io.StringIO()
+with contextlib.redirect_stdout(_sbuf):
+    _src9 = A.seal_secrets_cli(types.SimpleNamespace(
+        key=str(_kf9), seal_secrets=_S8_PI.hex(),
+        secrets_env=str(_env9), secrets_file=str(_out9)))
+_stxt = _sbuf.getvalue()
+check("stage9: --seal-secrets writes a container the agent's own reader "
+      "opens, with the three named secrets and not the fourth line",
+      _src9 == "sealed" and _out9.is_file()
+      and A.open_secrets(_out9, bytes.fromhex(_SEAL_HALF), _S8_PI) == 3
+      and A._SECRETS["GS_WALLET_PASSWORD"] == "pw1"
+      and A._SECRETS["GS_FEE_WALLET_PASSWORD"] == ""
+      and "SOMETHING_ELSE" not in A._SECRETS)
+A._SECRETS.clear()
+check("stage9: ...it strips the quotes an EnvironmentFile line may carry, "
+      "so a quoted seed is not sealed with its quotes",
+      A.open_secrets(_out9, bytes.fromhex(_SEAL_HALF), _S8_PI)
+      and A._SECRETS["GS_BTC_SEED"] == "abandon abandon about")
+A._SECRETS.clear()
+check("stage9: ...the file is 0400, like the keyfile beside it",
+      oct(_out9.stat().st_mode & 0o777) == "0o400")
+check("stage9: ...it does NOT destroy the plaintext, it prints the command "
+      "-- the one failure here would cost a seed, not a secret",
+      _env9.is_file() and f"shred -u {_env9}" in _stxt
+      and "EnvironmentFile" in _stxt)
+check("stage9: ...and says the seal is not a backup, because a re-pairing "
+      "stops it opening",
+      "not a backup" in _stxt and "re-pairing" in _stxt)
+for _a9, _why, _want in (
+        (dict(seal_secrets="nothex", secrets_env=str(_env9)),
+         "a half that is not hex", "bad_half"),
+        (dict(seal_secrets=_S8_PI.hex(), secrets_env=str(Path(_d0) / "no.env")),
+         "an EnvironmentFile that is not there", "no_source"),
+        (dict(seal_secrets=_S8_PI.hex(), secrets_env=str(_out9)),
+         "a source naming none of the secrets", "nothing_to_seal")):
+    with contextlib.redirect_stdout(io.StringIO()):
+        _c9 = A.seal_secrets_cli(types.SimpleNamespace(
+            key=str(_kf9), secrets_file=str(Path(_d0) / "x.sealed"), **_a9))
+    check(f"stage9: --seal-secrets refuses {_why} as {_want}", _c9 == _want)
+# THE SECRETS LEAVE RAM on every path out, including the ones that keep the
+# box on: --dry-run, --fee-sweep, and a refusal with power=False all return
+# through main's finally without powering anything off.
+check("stage9: main()'s finally clears the secrets from RAM on every path "
+      "out, not only the ones that power the box off",
+      "_SECRETS.clear()" in _A_SRC.split("def main(")[1])
+check("stage9: ...and the fee sweep, which has the half on its argv, opens "
+      "them -- so a sealed fee password is not reported unset",
+      "open_secrets(getattr(args, \"secrets_file\", SECRETS_FILE)"
+      in _A_SRC.split("def run_fee_sweep_cli")[1].split("\ndef ")[0])
+check("stage9: every secret this machine reads goes through the one "
+      "indirection, so none of them is still an os.environ lookup",
+      not re.search(r'os\.environ\[\"GS_(BTC_SEED|WALLET_PASSWORD'
+                    r'|FEE_WALLET_PASSWORD|SWAPKIT_API_KEY)', _A_SRC)
+      and 'has_secret("GS_BTC_SEED")' in _A_SRC
+      and 'secret_of("GS_WALLET_PASSWORD")' in _A_SRC)
+
 # LAST LINE BEFORE THE RESULT, AND THAT MATTERS MORE THAN IT LOOKS.
 # fail_loudly_on_crash disarms itself the moment this is called, so every
 # check BELOW the call ran with no crash guard at all -- and the call used to
