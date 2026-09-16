@@ -7608,6 +7608,116 @@ check("stage9: ...and the fee sweep, which has the half on its argv, opens "
       "them -- so a sealed fee password is not reported unset",
       "open_secrets(getattr(args, \"secrets_file\", SECRETS_FILE)"
       in _A_SRC.split("def run_fee_sweep_cli")[1].split("\ndef ")[0])
+#: FOUR MORE THE SWEEP FOUND UNPROVEN, and the same lesson each time: the
+#: wake above runs receive_and_quote, which never asks for a secret, so it
+#: showed the seal does not BREAK a job and nothing more. Deleting the call
+#: that opens the secrets survived it.
+#:
+#: THE OPEN ITSELF, through a real wake: the chain says which of the two
+#: happened, so a run that never opened the file cannot claim it did.
+_k9 = []
+_o_il9 = A.integrity_log
+A.integrity_log = lambda *a, **k: _k9.append(a[1] if len(a) > 1 else "")
+try:
+    _wake_with_secrets({"GS_WALLET_PASSWORD": "pw"})
+finally:
+    A.integrity_log = _o_il9
+check("stage9: a wake with a sealed secrets file records secrets_opened -- "
+      "so a run that skipped the open cannot pass as one that did",
+      "secrets_opened" in _k9 and "secrets_plain" not in _k9)
+_k9b = []
+A.integrity_log = lambda *a, **k: _k9b.append(a[1] if len(a) > 1 else "")
+try:
+    _d9b, _kf9b, _, _b9b, _, _ = _stage8_env(extra={"btc_account_xpub": ""})
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            A.run_once(types.SimpleNamespace(
+                key=str(_kf9b), dry_run=False,
+                secrets_file=str(Path(_d0) / "absent.sealed")),
+                {k: v for k, v in deps_for(_d9b, _b9b).items()
+                 if not k.startswith("_")})
+        except (A.Refused, P.WakeError):
+            pass
+finally:
+    A.integrity_log = _o_il9
+    A._STATE_KEY.clear()
+    A._SECRETS.clear()
+check("stage9: NON-VACUITY -- with no sealed file it records secrets_plain "
+      "instead, so the kind really distinguishes the two",
+      "secrets_plain" in _k9b and "secrets_opened" not in _k9b)
+# THE SEED, THROUGH THE REAL FORWARD. _fwd_run drives forward_to_swap; with
+# the seed ONLY in the seal, the forward has to get it from there.
+A._SECRETS.clear()
+A.open_secrets(_secrets_file(_d0, {"GS_BTC_SEED": _FWD_MNEMONIC}),
+               bytes.fromhex(_SEAL_HALF), _S8_PI)
+_o_seed = os.environ.pop("GS_BTC_SEED", None)
+try:
+    _f9o, _f9e, _f9ran = _fwd_run(dict(_FWD_REC), _FWD_KEY, seed=None)
+finally:
+    if _o_seed is not None:
+        os.environ["GS_BTC_SEED"] = _o_seed
+    A._SECRETS.clear()
+_f9env = [e for _a, e in _f9ran if "GS_BTC_SEED" in e]
+check("stage9: the SEALED seed reaches btc_forwarder with the environment "
+      "holding none -- the forward signs from the seal",
+      _f9e is None and _f9env
+      and _f9env[0]["GS_BTC_SEED"] == _FWD_MNEMONIC)
+_f9n_o, _f9n_e, _f9n_ran = _fwd_run(dict(_FWD_REC), _FWD_KEY, seed=None)
+check("stage9: NON-VACUITY -- with nothing sealed and nothing in the "
+      "environment the same forward refuses btc_seed_unset before any "
+      "child runs",
+      getattr(_f9n_e, "code", None) == "btc_seed_unset" and _f9n_ran == [])
+# THE FEE SWEEP'S PASSWORD, at the builder that hands it over.
+#: The shape fee_sweep_config really returns, read off it rather than
+#: guessed: a first draft called the wallet key "wallet" and the builder
+#: raised KeyError, which the crash guard turned into a red check instead of
+#: a silent pass.
+_fcfg9 = {"rpc": "http://127.0.0.1:18084",
+          "wallet_file": "/tmp/fee.wallet",
+          "dests": ["4" + "c" * 94], "depth": 2,
+          "min_xmr": _dec.Decimal("0.1"), "address": "4" + "d" * 94,
+          "on_idle_boot": False}
+_o_fpw = os.environ.pop("GS_FEE_WALLET_PASSWORD", None)
+try:
+    A._SECRETS.clear()
+    _fr9 = None
+    try:
+        A.build_fee_sweep_argv(_k9key := {"artifact_dir": _d0,
+                                          "tor_proxy": "socks5h://x:9050"},
+                               _fcfg9, "/tmp/b.json", Path(_d0))
+    except A.Refused as e:
+        _fr9 = e
+    check("stage9: with the fee password NEITHER sealed nor in the "
+          "environment, the sweep still refuses it as unset",
+          _fr9 is not None and "fee" in (_fr9.code or "").lower())
+    A.open_secrets(_secrets_file(_d0, {"GS_FEE_WALLET_PASSWORD": "feepw"}),
+                   bytes.fromhex(_SEAL_HALF), _S8_PI)
+    _fargv, _fenv = A.build_fee_sweep_argv(_k9key, _fcfg9, "/tmp/b.json",
+                                           Path(_d0))
+    check("stage9: ...and a SEALED fee password is handed to the child as "
+          "GS_WALLET_PASSWORD, the name GhostSpiral reads",
+          _fenv.get("GS_WALLET_PASSWORD") == "feepw")
+finally:
+    A._SECRETS.clear()
+    if _o_fpw is not None:
+        os.environ["GS_FEE_WALLET_PASSWORD"] = _o_fpw
+# --seal-secrets' OWN READ-BACK, driven: a container that does not open with
+# the same two halves must not be put in place.
+_rb9 = Path(_d0) / "readback.sealed"
+_o_us = P.state_unseal
+P.state_unseal = lambda *a, **k: {P.SECRETS_MEMBER: '{"GS_WALLET_PASSWORD": "no"}'}
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _rbc = A.seal_secrets_cli(types.SimpleNamespace(
+            key=str(_kf9), seal_secrets=_S8_PI.hex(),
+            secrets_env=str(_env9), secrets_file=str(_rb9)))
+finally:
+    P.state_unseal = _o_us
+check("stage9: --seal-secrets reads its own container back and writes "
+      "NOTHING when it does not match -- a file that cannot be opened "
+      "later is worse than no file at all",
+      _rbc == "seal_failed" and not _rb9.exists()
+      and not _rb9.with_name(_rb9.name + ".new").exists())
 check("stage9: every secret this machine reads goes through the one "
       "indirection, so none of them is still an os.environ lookup",
       not re.search(r'os\.environ\[\"GS_(BTC_SEED|WALLET_PASSWORD'
