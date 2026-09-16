@@ -980,7 +980,7 @@ MUTATIONS = [
  # An incompatible wire change with no version bump lets two boxes agree to
  # pair and then fail at wake time.
  ("PAIR_PROTO is not bumped for the wire break", "gs_wake_proto.py",
-  "PAIR_PROTO = 5",
+  "PAIR_PROTO = 6",
   "PAIR_PROTO = 2",
   ["test_wake_protocol"]),
 
@@ -6091,7 +6091,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the pairing shape check refuses the intake floor as unexpected',
   'gs_wake_proto.py',
-  '        if k not in ("host", "port", "mac", "broadcast", "deposit_min_sat"):',
+  '        if k not in ("host", "port", "mac", "broadcast", "deposit_min_sat",\n'
+  '                     "state_half"):',
   '        if k not in ("host", "port", "mac", "broadcast"):',
   ['test_wake_protocol', 'test_wake_agent']),
  ('the pairing shape check takes any intake floor (a bool, a string, dust)',
@@ -6376,6 +6377,103 @@ MUTATIONS = [
   '                _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],\n'
   '                                      _STATE_KEY["pi"])',
   '                _sealed = 0',
+  ['test_wake_agent']),
+ # STAGE 8: the SETTINGS behind the same pair. The xpub is the one field that
+ # re-derives every deposit address this intake ever issued, past any wipe.
+ ('the xpub and the servers stay readable on the seized disk', 'gs_wake_keys',
+  '    payload = _seal_settings(payload, info["state_half"])',
+  '    payload = dict(payload)',
+  ['test_wake_agent']),
+ ('the pairing writes a keyfile even when the Pi sent no half (so the '
+  'settings go down in the clear)', 'gs_wake_keys',
+  '    if not info.get("state_half"):',
+  '    if False:',
+  ['test_wake_agent']),
+ ('the sealed settings are never read back before the pairing trusts them',
+  'gs_wake_keys',
+  '        if json.loads(_back[proto.SETTINGS_MEMBER]) != inner:\n'
+  '            raise ValueError("the sealed settings do not read back")',
+  '        if False:\n'
+  '            raise ValueError("the sealed settings do not read back")',
+  ['test_wake_agent']),
+ ('half the keyfile stays readable: the clear list grows the intake back',
+  'gs_wake_proto.py',
+  'SETTINGS_CLEAR = ("schema", "version", "role", "secret", "peer_public",\n'
+  '                  "doorbell_url", "artifact_dir", "state_half",\n'
+  '                  "pair_fingerprint", "delivery_public", "deposit_in_chat",\n'
+  '                  "tor_proxy", "rpc_primary")',
+  'SETTINGS_CLEAR = ("schema", "version", "role", "secret", "peer_public",\n'
+  '                  "doorbell_url", "artifact_dir", "state_half",\n'
+  '                  "pair_fingerprint", "delivery_public", "deposit_in_chat",\n'
+  '                  "tor_proxy", "rpc_primary", "btc_account_xpub",\n'
+  '                  "btc_electrum", "thornode_url")',
+  ['test_wake_agent']),
+ ("the settings section wears the STORE's schema, so either reader takes "
+  'either container', 'gs_wake_proto.py',
+  'SETTINGS_SCHEMA = "gs_wake_settings_v1"',
+  'SETTINGS_SCHEMA = STATE_SCHEMA',
+  ['test_wake_agent']),
+ ('a sealed keyfile is never merged, so the job runs on the clear half '
+  'alone', 'gs_wake_agent',
+  '        key = open_keyfile(key, _vault_half, _pi_half)',
+  '        pass',
+  ['test_wake_agent']),
+ ("the sealed section may replace the wake secret that authenticated the "
+  'note', 'gs_wake_agent',
+  '    merged = dict(inner)\n'
+  '    merged.update(key)',
+  '    merged = dict(key)\n'
+  '    merged.update(inner)',
+  ['test_wake_agent']),
+ ('a keyfile from before this stage is refused instead of running as it did',
+  'gs_wake_agent',
+  '    blob = key.get(KEYFILE_SEALED)\n'
+  '    if blob is None:\n'
+  '        return key',
+  '    blob = key.get(KEYFILE_SEALED)\n'
+  '    if False:\n'
+  '        return key',
+  ['test_wake_agent']),
+ ('the fee sweep reports "no fee wallet" instead of asking for the half',
+  'gs_wake_agent',
+  '    key = _by_hand(key, getattr(args, "unseal_state", ""),\n'
+  '                   "a fee sweep on a box nothing woke")',
+  '    key = dict(key)',
+  ['test_wake_agent']),
+ ('--unseal-key prints the wake secret into the operator\'s scrollback',
+  'gs_wake_agent',
+  '    _shown = sorted(k for k in key if k not in ("secret", "peer_public"))',
+  '    _shown = sorted(key)',
+  ['test_wake_agent']),
+ ('the idle-boot sweep says nothing at all on a sealed keyfile',
+  'gs_wake_agent',
+  '    if key.get(KEYFILE_SEALED) is not None:\n'
+  '        agent_say("  [!] This machine\'s settings are sealed to the pair and "',
+  '    if False:\n'
+  '        agent_say("  [!] This machine\'s settings are sealed to the pair and "',
+  ['test_wake_agent']),
+ ('the pairing takes an idle-boot sweep it can never run', 'gs_wake_keys',
+  '    if args.fee_sweep_on_idle_boot:\n'
+  '        sys.exit("[!] --fee-sweep-on-idle-boot cannot be honoured: this "',
+  '    if False:\n'
+  '        sys.exit("[!] --fee-sweep-on-idle-boot cannot be honoured: this "',
+  ['test_wake_agent']),
+ ("the Pi sends no half during pairing, so the vault has nothing to seal "
+  'with', 'gs_doorbell',
+  '            {"host": my_host, "port": port,\n'
+  '             "state_half": proto.derive_state_half(sk.encode().hex()).hex()},',
+  '            {"host": my_host, "port": port},',
+  ['test_wake_agent']),
+ ('a half off the LAN is written into the keyfile unchecked',
+  'gs_wake_proto.py',
+  '            if not isinstance(v, str) or len(v) != STATE_HALF_BYTES * 2:\n'
+  '                raise WakeError("pairing info carries a bad state half")',
+  '            pass',
+  ['test_wake_agent']),
+ ('PAIR_PROTO was not bumped, so an old Pi ships an unsealed keyfile',
+  'gs_wake_proto.py',
+  'PAIR_PROTO = 6',
+  'PAIR_PROTO = 5',
   ['test_wake_agent']),
 ]
 

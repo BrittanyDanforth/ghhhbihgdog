@@ -128,6 +128,13 @@ SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json",
                 "btc_forward_*.json", "gs_wake_status.json")
 #: ...less these, by exact name, for the reasons above.
 SEALED_SKIP = ("wallet_feesweep.json",)
+#: THE KEYFILE'S OWN SEALED SECTION (STAGE8_PLAN.md), under the same two
+#: halves as the store. The names and the list of what stays readable live
+#: in the protocol module, because gs_wake_keys has to seal exactly what
+#: this file expects to find sealed and two copies of that list drift.
+KEYFILE_SEALED = proto.SETTINGS_FIELD
+KEYFILE_MEMBER = proto.SETTINGS_MEMBER
+KEYFILE_CLEAR = proto.SETTINGS_CLEAR
 #: The two halves, once the note has been opened: the vault's from the
 #: keyfile, the Pi's from M2. main()'s finally needs them to re-seal, and
 #: it has no keyfile and no note -- the same shape as _LATE_GUARD. RAM
@@ -688,6 +695,56 @@ def _sealed_members(dirpath: Path) -> list:
             if p.is_file() and p.name not in SEALED_SKIP:
                 out.add(p.name)
     return sorted(out)
+
+
+def open_keyfile(key: dict, vault_half: bytes, pi_half: bytes) -> dict:
+    """The keyfile with its sealed section merged in (STAGE8_PLAN.md).
+
+    Returns a NEW dict; the caller rebinds. A keyfile with no sealed
+    section -- every pairing from before this stage -- comes back
+    unchanged, which is the whole of the compatibility story.
+
+    REFUSES rather than running on the clear half alone. A vault that
+    cannot read its own settings does not know its xpub, so it cannot tell
+    a deposit address it issued from one it did not; it does not know
+    whether it was permitted to spend; and it does not know where the
+    operator's cut goes. Every one of those is a wrong answer about money,
+    and none of them announces itself. The same two causes as the store,
+    because it is the same key: a re-pairing since it was written, or a
+    file that has been altered.
+    """
+    blob = key.get(KEYFILE_SEALED)
+    if blob is None:
+        return key
+    if not isinstance(blob, dict):
+        raise Refused(
+            "keyfile_unreadable",
+            "this machine's keyfile carries a sealed section that is not a "
+            "container. Re-pair rather than run on half a keyfile.")
+    try:
+        members = proto.state_unseal(blob, vault_half, pi_half,
+                                     schema=proto.SETTINGS_SCHEMA)
+        inner = json.loads(members[KEYFILE_MEMBER])
+        if not isinstance(inner, dict):
+            raise ValueError("not an object")
+    except (proto.WakeError, KeyError, ValueError, TypeError) as e:
+        raise Refused(
+            "keyfile_unreadable",
+            f"this machine's keyfile did not open ({e}). Either the two "
+            "boxes were re-paired since it was written -- the Pi's half of "
+            "the key changes with its secret -- or the file has been "
+            "altered. Nothing is run against settings that cannot be read: "
+            "this machine would not know which addresses are its own. To "
+            "read them by hand: `gs_doorbell state-key` on the Pi, then "
+            "`gs_wake_agent --unseal-key` here.")
+    # THE CLEAR HALF WINS ON A COLLISION, and a collision is a malformed
+    # keyfile rather than a choice: `secret` inside the seal must never be
+    # able to replace the secret that authenticated the note this half
+    # arrived in.
+    merged = dict(inner)
+    merged.update(key)
+    merged.pop(KEYFILE_SEALED, None)
+    return merged
 
 
 def state_halves(key: dict, pi_half: bytes = None) -> tuple:
@@ -1452,11 +1509,46 @@ def _retire_fee_bundle(artifact_dir: Path) -> None:
         integrity_log("wake", "retire_failed:fee_bundle")
 
 
+def _by_hand(key: dict, half_hex: str, what: str) -> dict:
+    """Open a sealed keyfile with a half the operator typed, or refuse.
+
+    The two boots that have no wake note -- `--fee-sweep` and the recovery
+    CLI -- both need this and both have somebody standing at the machine.
+    An unsealed keyfile falls straight through, so nothing about a pairing
+    from before stage 8 changes.
+    """
+    if key.get(KEYFILE_SEALED) is None:
+        return key
+    vault, _ = state_halves(key)
+    try:
+        pi = bytes.fromhex(str(half_hex or "").strip())
+    except ValueError:
+        pi = b""
+    if vault is None or len(pi) != proto.STATE_HALF_BYTES:
+        raise Refused(
+            "keyfile_half_needed",
+            f"this machine's settings are sealed to the pair, and {what} "
+            f"brings no half of the key. Print it on the Pi with "
+            f"`gs_doorbell state-key` -- or take the copy beside the LUKS "
+            f"USB -- and pass it here as `--unseal-state <hex>`.",
+            power=False)
+    return open_keyfile(key, vault, pi)
+
+
 def run_fee_sweep_cli(args, deps: dict = None) -> str:
     """`gs_wake_agent --fee-sweep`: the sweep by hand, with the same preflight
     a wake gets and without asking the doorbell for anything."""
     d = deps or {}
     key = load_key(Path(args.key))
+    # THE SWEEP RUNS ON A BOOT WITH NO NOTE, so if this keyfile is sealed
+    # (STAGE8_PLAN.md §4) the fee wallet's settings are behind a half that
+    # nothing here has. The operator is standing at the machine -- that is
+    # the whole premise of this flag -- so they can hand it over, from the
+    # copy beside the LUKS USB that OPSEC_SETUP.md section 1 tells them to
+    # keep. Refuse loudly rather than report "this keyfile names no fee
+    # wallet", which would be a true sentence about the wrong thing.
+    key = _by_hand(key, getattr(args, "unseal_state", ""),
+                   "a fee sweep on a box nothing woke")
     artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
     secure_mkdir(artifact_dir, narrow_existing=False)
     _AGENT_LOG[0] = artifact_dir / JOB_LOG
@@ -1488,6 +1580,19 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
     Both boots have no job, the machine is on and preflight passed; both get
     the hook.
     """
+    # A SEALED KEYFILE HAS NO FEE WALLET TO SEE FROM HERE (STAGE8_PLAN.md
+    # section 4). This boot has no note, so it has no half, so the settings
+    # are not readable -- and the sweep would otherwise report "this keyfile
+    # names no fee wallet", a true sentence about the wrong thing. The
+    # pairing refuses the two together, so reaching this means a keyfile
+    # somebody edited: say which it is, once, rather than nothing.
+    if key.get(KEYFILE_SEALED) is not None:
+        agent_say("  [!] This machine's settings are sealed to the pair and "
+                  "nothing woke this boot, so the fee wallet cannot be read "
+                  "from here. Run `gs_wake_agent --fee-sweep --unseal-state "
+                  "<hex>` at the machine instead.")
+        integrity_log("wake", "fee_sweep:sealed")
+        return False
     try:
         _fcfg = fee_sweep_config(key)
     except Refused as _fe:
@@ -3224,6 +3329,13 @@ def run_once(args, deps: dict = None) -> tuple:
                 "sitting, as the wire version says.")
         _STATE_KEY["vault"], _STATE_KEY["pi"] = _vault_half, _pi_half
         _STATE_KEY["dir"] = artifact_dir
+        # AND THE KEYFILE'S OWN SEALED SECTION, with the same two halves
+        # (STAGE8_PLAN.md). Here rather than at load, because the half only
+        # exists once the note has been opened -- which is the point: the
+        # xpub that names every deposit address this intake ever issued is
+        # not on the seized disk in a readable form. Rebinding `key` is the
+        # whole wiring; everything downstream takes it as a parameter.
+        key = open_keyfile(key, _vault_half, _pi_half)
 
     elapsed = _clock() - sent_at
     if elapsed > M1_M2_WINDOW_S:
@@ -5520,6 +5632,47 @@ def unseal_state_cli(args) -> str:
     return "opened"
 
 
+def unseal_key_cli(args) -> str:
+    """--unseal-key: print this machine's sealed SETTINGS and stop.
+
+    The recovery path of STAGE8_PLAN.md section 5, and the reason a sealed
+    keyfile is not a way to lose a working install: the operator standing
+    at the machine, with the half from the Pi or from beside the LUKS USB,
+    can read back everything the pairing put away.
+
+    PRINTS, and does not rewrite the keyfile. Putting the settings back in
+    the clear would undo the stage silently and leave a box that looks
+    paired-for-sealing and is not; if they want that they re-pair, which
+    is one command and says what it does. print() rather than agent_say()
+    for the same reason the dry run does: this is a terminal somebody is
+    reading, not a line for the job log on the disk.
+    """
+    key = load_key(Path(args.key))
+    if key.get(KEYFILE_SEALED) is None:
+        agent_say("  [!] This keyfile carries no sealed section: its "
+                  "settings are already readable. Nothing to open.")
+        return "unsealed"
+    try:
+        key = _by_hand(key, getattr(args, "unseal_key", ""), "this command")
+    except Refused as e:
+        agent_say(f"  [!] {e.msg}")
+        return e.code
+    _shown = sorted(k for k in key if k not in ("secret", "peer_public"))
+    print()
+    print("  This machine's settings, out of the sealed section:")
+    print()
+    for _k in _shown:
+        print(f"      {_k} = {key[_k]!r}")
+    print()
+    # THE TWO SECRETS ARE NOT IN THAT LIST, and it is not squeamishness:
+    # this prints to a terminal and very often into a scrollback, and
+    # neither of them is what the operator came here for. `secret` is the
+    # wake key; `peer_public` is not secret but travels with it.
+    print("  The wake keypair is not shown. Nothing here is written back:")
+    print("  re-pair if you want these readable on the disk again.")
+    return "opened"
+
+
 def build_cli() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Collect one job from the doorbell, run it, power off.")
@@ -5537,7 +5690,16 @@ def build_cli() -> argparse.ArgumentParser:
                          "the Pi. For the case the records must be read "
                          "with no Pi to wake this box -- the card is dead "
                          "and a deposit still has to be paid out. They are "
-                         "sealed again by the next ordinary wake.")
+                         "sealed again by the next ordinary wake. Also what "
+                         "--fee-sweep takes when this machine's SETTINGS are "
+                         "sealed too: that boot has no note, so nothing "
+                         "brings it a half.")
+    ap.add_argument("--unseal-key", metavar="HEX", default="",
+                    help="print this machine's sealed SETTINGS and stop -- "
+                         "the xpub, the servers, the fee destinations, the "
+                         "switches. HEX is the same half --unseal-state "
+                         "takes. Nothing is written back: this reads a "
+                         "keyfile, it does not un-seal one.")
     ap.add_argument("--dry-run", action="store_true",
                     help="check the keyfile, preflight, Tor and that the "
                          "doorbell answers — then STOP, without asking for a "
@@ -5562,6 +5724,15 @@ def main(argv=None) -> int:
                 # machine off: the operator is standing here, with the
                 # records open in front of them, which is the whole point.
                 code = unseal_state_cli(args)
+                _keep_on = True
+                return 0 if code == "opened" else 1
+            if getattr(args, "unseal_key", ""):
+                # SAME PATH, SAME REASON as --unseal-state above: the
+                # operator is at the machine and nothing is woken or
+                # powered off. Ordered after it so that passing both
+                # opens the records first, which is the one somebody in
+                # a hurry actually needs.
+                code = unseal_key_cli(args)
                 _keep_on = True
                 return 0 if code == "opened" else 1
             if getattr(args, "fee_sweep", False):

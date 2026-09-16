@@ -68,7 +68,7 @@ not fixed by any of this.
 | mix / `run_pipeline` | ThinkPad, you present, USB plugged in | — |
 | **with `--allow-withdraw`:** spend wallet file + `GS_WALLET_PASSWORD` | ThinkPad disk + `/etc/gs-wake-spend.env` | **they can spend** |
 | **with `--allow-btc-forward`:** `GS_BTC_SEED` (+ passphrase) | `/etc/gs-wake-spend.env` on the ThinkPad | **they own every deposit address this intake ever issues** |
-| the vault's wake keyfile (unsealed by design — nobody is there at boot to type a passphrase) | ThinkPad `/etc`, `0400` | the wake secret, the Pi's address, the account xpub (so: every deposit address, past and future), your Electrum onion, your fee and sweep addresses |
+| the vault's wake keyfile (unsealed by design — nobody is there at boot to type a passphrase) | ThinkPad `/etc`, `0400` | the wake secret and the Pi's LAN address. **The settings behind it — the account xpub, your Electrum onion, the node, your fee and sweep addresses, the switches — are sealed to the pair**, see below |
 | the artifact directory (ledger, open slips, plan chains, job log, chain log) | ThinkPad disk — **sealed between wakes**, see below | *during a job:* every open deposit and every forward since the last hand wipe. *Between wakes:* one `state.sealed` this machine cannot open by itself |
 
 The bottom four rows are the price of a machine that works while nobody
@@ -123,6 +123,56 @@ normal wake seals them again.
 
 If the *card* is what died, the store is gone. That is the design: a half
 you could recover from the vault would be a half the vault's captor has.
+
+### The same two halves also seal the vault's *settings*
+
+The keyfile row above used to be the worst row in this table, and it was
+worse than anything in the artifact directory. A ledger names the deposits
+since the last wipe. The **account xpub** names *all of them, forever* — it
+re-derives every address this intake has ever issued, and every one of those
+is on the public Bitcoin chain for as long as the chain exists. A wipe does
+not reach the chain. Neither does anything else you can do afterwards.
+
+So the keyfile is split. What stays readable is only what the machine needs
+*before* the wake note arrives: the wake keypair itself (it is what
+authenticates the note that brings the other half, so it cannot sit behind
+it), the Pi's LAN address, the artifact directory, the loopback RPC and Tor
+endpoints, the pairing code, and the delivery mode. Everything else — the
+xpub, the Electrum onion, the node, the wallet paths, the fee and sweep
+addresses, `allow_withdraw` and `allow_btc_forward` — is in a sealed section
+that opens with the pair, in RAM, on a machine that powers off minutes later.
+
+The Pi sends its half **once**, during `gs_doorbell pair`, inside the part of
+the ceremony that crosses encrypted after you have compared the code. The
+vault uses it to seal and does not keep it. Practical consequences:
+
+* **Pair both boxes with builds from the same checkout.** The ceremony
+  refuses a Pi too old to send a half, rather than writing your xpub in the
+  clear and looking like it worked.
+* **`--fee-sweep-on-idle-boot` is refused at pairing now.** An idle boot is
+  a boot nobody woke — a hand power-on, or a stranger's magic packet — so it
+  has no half and cannot read which wallet to sweep. Run the sweep by hand
+  instead: `gs_wake_agent --fee-sweep --unseal-state <hex>`.
+* **To read your own settings back**, at the machine, with the half:
+
+```
+gs_wake_agent --unseal-key <hex> --key /etc/gs_wake_thinkpad.key
+```
+
+  It prints them and changes nothing. It does not show the wake keypair,
+  which is not what you came for and would land in a scrollback.
+
+**This does not lose you anything you could not rebuild.** The one field
+somebody might want by hand is the xpub, and the xpub derives from the seed
+on the LUKS USB. And a seal that will not open refuses the job — which is
+what the sealed store above already does, under the same key, for the same
+two causes. There is no new way to be stuck.
+
+**Still in the clear on that machine**, and the next thing to fix:
+`/etc/gs-wake-spend.env` — `GS_BTC_SEED`, the wallet passwords, the API key.
+A child process reads them out of the unit's environment, so sealing them
+means the agent handing them to the child instead. §1's `--allow-btc-forward`
+row is scored on that, not on this.
 
 Telegram never gets: wallet path, RPC URL, view key, spend key, seed — and by
 default nothing else either, only which job finished and a 4-hex handle.

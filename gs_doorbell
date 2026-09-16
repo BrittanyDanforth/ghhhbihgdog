@@ -1247,7 +1247,22 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
     my_host = sock.getsockname()[0]
     try:
         agreed = proto.pair_initiator(
-            sock, sk, my_pub, {"host": my_host, "port": port},
+            sock, sk, my_pub,
+            # THIS CARD'S HALF OF THE VAULT'S STATE KEY, sent once, here
+            # (STAGE8_PLAN.md). The vault seals its settings with it during
+            # the ceremony and does not keep it -- keeping it would put both
+            # halves on the machine the seal exists to protect. It is
+            # derived from the secret generated four lines up, so this card
+            # can always re-derive it (`gs_doorbell state-key`) and nothing
+            # new has to be backed up.
+            #
+            # AFTER THE CODE COMPARISON, NOT IN THE REVEAL. pair_initiator
+            # sends this through _pair_config, which is boxed to the key the
+            # two operators just authenticated; the reveal is plaintext to
+            # whoever connects, and this is half of every container the pair
+            # will ever write.
+            {"host": my_host, "port": port,
+             "state_half": proto.derive_state_half(sk.encode().hex()).hex()},
             ask or ask_match, print)
     finally:
         try:

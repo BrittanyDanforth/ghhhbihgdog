@@ -6925,6 +6925,303 @@ check("the Pi's half is DERIVED from its long-term secret, so there is "
       != P.derive_state_half(TP.encode().hex())
       and len(P.derive_state_half(PI.encode().hex())) == P.STATE_HALF_BYTES)
 
+print("\n== STAGE 8: the SETTINGS are sealed to the pair too ==")
+# Stage 7 sealed what the vault writes. This seals most of what it was TOLD,
+# under the same two halves -- and the field that matters most is the account
+# xpub, because it is not a record of one job: it re-derives every deposit
+# address this intake has ever issued and finds all of them on the public
+# chain, retrospectively, past any wipe, for as long as the chain exists.
+_S8_PI = P.derive_state_half(PI.encode().hex())
+
+
+def _refused_pair_info(info):
+    """Whether the WIRE refuses this pairing info. Every value in it comes
+    off the LAN, so a new field has to be checked there like the rest."""
+    try:
+        P._pair_info({"info": info})
+        return False
+    except P.WakeError:
+        return True
+
+
+#: The settings a real pairing writes and new_env leaves out. Here so the
+#: checks below are about a keyfile that HAS something worth sealing: an
+#: xpub, a server, a node, a wallet path, a fee destination.
+#: A REAL INTAKE KEYFILE, not a sketch: the xpub turns BTC mode on, and the
+#: agent then validates the whole policy block against the merged settings.
+#: The first draft of this fixture left op_return_max_bytes out and the wake
+#: refused op_return_too_small -- which was the merge working correctly, on
+#: settings that were incomplete. A fixture that cannot complete a wake
+#: cannot prove the merge feeds one.
+_S8_SETTINGS = {
+    "btc_account_xpub": "xpub6CUGRUo" + "Z" * 100,
+    "btc_electrum": ["ssl://wq2vvptqyj4c7xkr.onion:50002"],
+    "btc_network": "main",
+    "btc_min_conf": 2,
+    "btc_returns_max": 2,
+    "op_return_max_bytes": 140,
+    "feerate_floor_sat_vb": 1,
+    "feerate_ceiling_sat_vb": 200,
+    "max_affiliate_bps": 0,
+    "thornode_url": "https://thornode.example.onion",
+    "wallet_file": "/var/lib/gs/view.wallet",
+    "rpc_daemon": "http://127.0.0.1:18081",
+    "usage_fee_addresses": ["4" + "a" * 94],
+    "allow_withdraw": False,
+    "daily_wake_budget": 12,
+}
+
+
+def _stage8_env(job="receive_and_quote", params=None, half=_SEAL_HALF,
+                clobber=None, extra=None):
+    """A vault whose keyfile is SEALED the way gs_wake_keys seals it.
+
+    Built with the real proto calls rather than a hand-rolled container, so
+    a change to either side of the format breaks this instead of passing.
+    """
+    d, kf, key, bell = new_env(job, params)
+    key2 = dict(key)
+    key2["state_half"] = half
+    key2.update(_S8_SETTINGS)
+    key2.update(extra or {})
+    clear = set(A.KEYFILE_CLEAR)
+    inner = {k: v for k, v in key2.items() if k not in clear}
+    outer = {k: v for k, v in key2.items() if k in clear}
+    outer["sealed"] = P.state_seal(
+        {"settings.json": json.dumps(inner, sort_keys=True)},
+        bytes.fromhex(half), _S8_PI, schema=P.SETTINGS_SCHEMA)
+    if clobber is not None:
+        outer["sealed"] = clobber
+    kf.chmod(0o600)
+    kf.write_text(json.dumps(P.lock_keyfile(outer, b"", role="thinkpad")))
+    kf.chmod(0o400)
+    return d, kf, key2, bell, outer, inner
+
+
+_8d, _8kf, _8key, _8bell, _8outer, _8inner = _stage8_env()
+# THE FILE ON THE DISK FIRST: this is what a seizure between wakes reads.
+_8disk = json.dumps(json.loads(_8kf.read_text()))
+check("stage8: the xpub is NOT in the keyfile on the disk -- the one field "
+      "that re-derives every deposit address this intake ever issued",
+      _8key.get("btc_account_xpub")
+      and _8key["btc_account_xpub"] not in _8disk)
+for _f in ("btc_electrum", "thornode_url", "wallet_file", "fee_address",
+           "rpc_daemon"):
+    _v = _8key.get(_f)
+    _txt = json.dumps(_v) if not isinstance(_v, str) else _v
+    check(f"stage8: ...nor {_f}",
+          not _v or (_txt not in _8disk and str(_v) not in _8disk))
+check("stage8: ...and neither are the FIELD NAMES, so the file does not "
+      "even say which settings this box was given",
+      "btc_account_xpub" not in _8disk and "fee_sweep_to" not in _8disk
+      and "allow_withdraw" not in _8disk)
+check("stage8: what IS readable is exactly the pre-M2 surface and nothing "
+      "else -- the list is KEYFILE_CLEAR and the file is checked against "
+      "it, not against a comment",
+      set(_8outer) - {"sealed"} <= set(A.KEYFILE_CLEAR)
+      and {"secret", "peer_public", "doorbell_url", "state_half"}
+      <= set(_8outer))
+check("stage8: the container names its OWN schema, so the store's bytes "
+      "and the keyfile's can never be handed to the wrong reader",
+      _8outer["sealed"]["schema"] == P.SETTINGS_SCHEMA
+      and P.SETTINGS_SCHEMA != P.STATE_SCHEMA
+      and P.SETTINGS_SCHEMA != P.KEYFILE_SCHEMA)
+# ...AND THEN A REAL WAKE THROUGH IT. The whole risk of this stage is a field
+# read before the merge; only driving a job proves there is none.
+#
+# WITH THE INTAKE OFF for this one, and the reason is the fixture rather than
+# the stage: an xpub turns BTC mode on, and BTC mode wants GS_BTC_SEED in the
+# unit's environment, which is a different subsystem's setup. Every other
+# sealed setting is still sealed and still has to be merged for this to
+# finish, so the merge is what is under test either way.
+_8wd, _8wkf, _8wkey, _8wbell, _, _ = _stage8_env(
+    extra={"btc_account_xpub": ""})
+_8o, _8e, _8t, _8dp = _sealed_run(_8wd, _8wkf, _8wbell)
+check("stage8: a wake on a sealed keyfile runs the job and finishes -- "
+      "every setting it needs is merged in after the note is opened",
+      _8e is None and _8o and _8o[0] == "done")
+check("stage8: ...and the job really ran, so this is not a refusal that "
+      "happened to exit zero", _8dp["_ran"])
+# THE MERGE ITSELF, driven directly: the clear half wins a collision, so a
+# `secret` smuggled into the sealed section cannot replace the one that
+# authenticated the note the half arrived in.
+_8merged = A.open_keyfile(_8outer, bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("stage8: the merge returns every sealed setting and drops the "
+      "container",
+      _8merged.get("btc_account_xpub") == _8key["btc_account_xpub"]
+      and "sealed" not in _8merged)
+_8evil = dict(_8outer)
+_8evil["sealed"] = P.state_seal(
+    {"settings.json": json.dumps({"secret": "00" * 32,
+                                   "btc_account_xpub": "xpubEVIL"})},
+    bytes.fromhex(_SEAL_HALF), _S8_PI, schema=P.SETTINGS_SCHEMA)
+_8ev = A.open_keyfile(_8evil, bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("stage8: the CLEAR half wins a collision -- a `secret` inside the "
+      "seal cannot replace the one that authenticated the note this half "
+      "arrived in",
+      _8ev["secret"] == _8outer["secret"] and _8ev["secret"] != "00" * 32
+      and _8ev["btc_account_xpub"] == "xpubEVIL")
+# A KEYFILE FROM BEFORE THIS STAGE IS UNTOUCHED, both ways round.
+_7d, _7kf, _7key, _7bell = _sealed_env()
+_7o, _7e, _7t, _ = _sealed_run(_7d, _7kf, _7bell)
+check("stage8: a stage-7 keyfile (a half, no sealed section) runs exactly "
+      "as it did -- nothing is silently required",
+      _7e is None and _7o and _7o[0] == "done")
+check("stage8: ...and open_keyfile hands such a keyfile straight back, "
+      "rather than inventing an empty settings dict",
+      A.open_keyfile(_7key, b"\x01" * 32, b"\x02" * 32) is _7key)
+# A SEAL THAT WILL NOT OPEN REFUSES THE JOB, and this is the check that
+# makes the stage safe to ship: the same two causes, the same key, and the
+# same refusal stage 7 already had -- so no new way to be stuck.
+_8bd, _8bkf, _, _8bbell, _, _ = _stage8_env(
+    clobber=P.state_seal({"settings.json": "{}"},
+                         bytes.fromhex(_SEAL_HALF), b"\x09" * 32,
+                         schema=P.SETTINGS_SCHEMA))
+_8bo, _8be, _ = run(_8bkf, deps_for(_8bd, _8bbell))
+check("stage8: a section sealed under ANOTHER pairing refuses the job and "
+      "names both causes and the way out",
+      _8bo is None and getattr(_8be, "code", None) == "keyfile_unreadable"
+      and "re-paired" in (getattr(_8be, "msg", "") or "")
+      and "--unseal-key" in (getattr(_8be, "msg", "") or ""))
+for _bad, _why in ((P.state_seal({"settings.json": "{}"},
+                                 bytes.fromhex(_SEAL_HALF), _S8_PI),
+                    "a container of the STORE's schema"),
+                   ({"schema": P.SETTINGS_SCHEMA, "salt": "zz", "box": "00"},
+                    "a salt that is not hex"),
+                   ("not a container", "a section that is not an object")):
+    _xd, _xkf, _, _xbell, _, _ = _stage8_env(clobber=_bad)
+    _xo, _xe, _ = run(_xkf, deps_for(_xd, _xbell))
+    check(f"stage8: ...and so does {_why}",
+          _xo is None
+          and getattr(_xe, "code", None) == "keyfile_unreadable")
+# THE HAND PATHS. Both boots that have no note -- the fee sweep and the
+# recovery CLI -- take the half on argv, and refuse clearly without it.
+_hd, _hkf, _hkey, _, _, _hinner = _stage8_env(
+    extra={"fee_rpc": "http://127.0.0.1:18083",
+           "fee_wallet_file": "/tmp/fee.wallet",
+           "fee_address": "9" + "f" * 94,
+           "fee_sweep_to": ["9" + "e" * 94]})
+_hno = None
+try:
+    A.run_fee_sweep_cli(types.SimpleNamespace(
+        key=str(_hkf), unseal_state="", dry_run=True), deps=deps_for(_hd, None))
+except A.Refused as e:
+    _hno = e
+check("stage8: `--fee-sweep` with no half refuses as keyfile_half_needed "
+      "and says where the hex comes from -- NOT 'this keyfile names no fee "
+      "wallet', which would be a true sentence about the wrong thing",
+      _hno is not None and _hno.code == "keyfile_half_needed"
+      and "state-key" in _hno.msg and _hno.power is False)
+check("stage8: ...and _by_hand with the right half opens it, so the flag "
+      "is usable and not just refusable",
+      A._by_hand(json.loads(json.dumps({
+          **{k: v for k, v in _hkey.items() if k in set(A.KEYFILE_CLEAR)},
+          "sealed": P.state_seal(
+              {"settings.json": json.dumps(_hinner, sort_keys=True)},
+              bytes.fromhex(_SEAL_HALF), _S8_PI,
+              schema=P.SETTINGS_SCHEMA)})),
+          _S8_PI.hex(), "a test")["fee_rpc"] == "http://127.0.0.1:18083")
+_ubuf = io.StringIO()
+with contextlib.redirect_stdout(_ubuf):
+    _urc = A.unseal_key_cli(types.SimpleNamespace(
+        key=str(_8kf), unseal_key=_S8_PI.hex()))
+_utxt = _ubuf.getvalue()
+check("stage8: `--unseal-key` prints the settings back, so a sealed "
+      "keyfile is not a way to lose a working install",
+      _urc == "opened" and _8key["btc_account_xpub"] in _utxt)
+check("stage8: ...and NOT the wake keypair, which is not what the operator "
+      "came for and would land in a scrollback",
+      _8key["secret"] not in _utxt and _8key["peer_public"] not in _utxt)
+check("stage8: ...and it does not write the settings back into the "
+      "keyfile: reading one is not un-sealing one",
+      "btc_account_xpub" not in _8kf.read_text())
+with contextlib.redirect_stdout(io.StringIO()):
+    _ubad = A.unseal_key_cli(types.SimpleNamespace(
+        key=str(_8kf), unseal_key="00" * 32))
+check("stage8: ...and the WRONG half opens nothing",
+      _ubad == "keyfile_unreadable")
+with contextlib.redirect_stdout(io.StringIO()):
+    _unone = A.unseal_key_cli(types.SimpleNamespace(
+        key=str(_7kf), unseal_key=_S8_PI.hex()))
+check("stage8: ...and a keyfile with no sealed section says so instead of "
+      "failing", _unone == "unsealed")
+# THE IDLE-BOOT SWEEP CANNOT WORK AND SAYS SO, rather than being a flag that
+# writes and then silently never fires.
+check("stage8: the pairing REFUSES --fee-sweep-on-idle-boot, because a boot "
+      "nobody woke has no half and cannot read which wallet to sweep",
+      "--fee-sweep-on-idle-boot cannot be honoured" in _kp_src)
+check("stage8: ...and the idle-boot hook itself says which it is on a "
+      "keyfile somebody hand-edited, rather than nothing",
+      'integrity_log("wake", "fee_sweep:sealed")' in _A_SRC)
+# THE PAIRING SENDS THE HALF, AND ONLY AFTER THE CODE COMPARISON.
+_pi_src = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
+#: .index() FINDS THE FIRST OCCURRENCE, and derive_state_half is called in
+#: three places in this file -- the M2 body, this pairing, and `state-key`.
+#: An ordering check on the bare name compared the M2's call to the pairing,
+#: which says nothing. The half has to be in the dict handed to
+#: pair_initiator, so that is what is looked at.
+_pi_call = _pi_src.split("proto.pair_initiator(")[1].split("ask or ask_match")[0]
+check("stage8: the Pi sends its half in the INFO it hands pair_initiator, "
+      "which crosses boxed to the key the two operators authenticated -- "
+      "not in the plaintext reveal, where it would be half of every "
+      "container this pair will ever write",
+      '"state_half": proto.derive_state_half(sk.encode().hex()).hex()'
+      in _pi_call
+      and "_pair_config" in open(os.path.join(REPO, "gs_wake_proto.py"),
+                                 encoding="utf-8").read())
+check("stage8: the wire validates it like every other field that comes off "
+      "the LAN, and PAIR_PROTO was bumped so an old Pi stops the ceremony "
+      "instead of shipping an unsealed keyfile",
+      P.PAIR_PROTO >= 6
+      and _refused_pair_info({"host": "10.0.0.1", "port": 9,
+                              "state_half": "nothex" * 8})
+      and _refused_pair_info({"host": "10.0.0.1", "port": 9,
+                              "state_half": "ab" * 31}))
+check("stage8: ...and the vault REFUSES to write a keyfile at all when the "
+      "Pi sent none, rather than writing the xpub in the clear",
+      "the Pi sent no half of the state key" in _kp_src
+      and "will not write them in the clear" in _kp_src)
+# THE TWO SIDES, DRIVEN AGAINST EACH OTHER. gs_wake_keys seals and the agent
+# opens; nothing in the tree checks that the two agree unless something
+# seals with one and opens with the other. A source check on each side
+# cannot: they would both pass while the formats drifted.
+_ks_payload = {"role": "thinkpad", "secret": TP.encode().hex(),
+               "peer_public": PI.public_key.encode().hex(),
+               "doorbell_url": "http://10.0.0.9:8770",
+               "artifact_dir": "/var/lib/gs", "tor_proxy": "socks5h://x:9050",
+               "rpc_primary": "http://127.0.0.1:18083",
+               "state_half": _SEAL_HALF, **_S8_SETTINGS}
+_ks_out = _K._seal_settings(dict(_ks_payload), _S8_PI.hex())
+check("stage8: the PAIRING's own seal is opened by the AGENT's own reader, "
+      "so the two sides cannot drift apart while both source checks pass",
+      A.open_keyfile(_ks_out, bytes.fromhex(_SEAL_HALF),
+                     _S8_PI) == {k: v for k, v in _ks_payload.items()})
+check("stage8: ...and what the pairing leaves readable is exactly "
+      "SETTINGS_CLEAR, checked against the dict it produced",
+      set(_ks_out) - {P.SETTINGS_FIELD} <= set(P.SETTINGS_CLEAR)
+      and "btc_account_xpub" not in _ks_out)
+check("stage8: the list of readable fields lives in ONE place, so the "
+      "pairing and the agent cannot hold different copies of it",
+      A.KEYFILE_CLEAR is P.SETTINGS_CLEAR
+      and "proto.SETTINGS_CLEAR" in _kp_src)
+# A DRY RUN STOPS BEFORE M1, so it never has a half. It must still work: it
+# is how an operator checks a fresh pairing, and the fields it prints (the
+# delivery mode, the pairing code) are readable for exactly that reason.
+_dd, _dkf, _, _dbell, _, _ = _stage8_env()
+_do, _de, _dtext = run(_dkf, deps_for(_dd, _dbell,
+                                      post_record=stub_post(_dbell)),
+                       dry_run=True)
+check("stage8: a DRY RUN on a sealed keyfile reaches its own stop -- "
+      "dry_run, not a refusal about the keyfile: it ends before the note, "
+      "so it never has a half, and everything it prints is in the readable "
+      "half by design",
+      _do is None and getattr(_de, "code", None) == "dry_run"
+      and not _de.power)
+check("stage8: ...and it still shows the pairing code, which is what an "
+      "operator runs a dry run to compare",
+      "aa" in _dtext.lower() or "code" in _dtext.lower()
+      or "doorbell" in _dtext.lower())
+
 # LAST LINE BEFORE THE RESULT, AND THAT MATTERS MORE THAN IT LOOKS.
 # fail_loudly_on_crash disarms itself the moment this is called, so every
 # check BELOW the call ran with no crash guard at all -- and the call used to

@@ -1208,6 +1208,54 @@ STATE_SALT_BYTES = 16
 #: The sealed store's schema; a reader that finds another refuses rather than
 #: guessing at bytes it does not understand.
 STATE_SCHEMA = "gs_wake_state_v1"
+#: The sealed SETTINGS section's schema (STAGE8_PLAN.md). Same halves, same
+#: primitive, its own salt -- and its own name, so a container of one kind
+#: handed to a reader of the other is refused at the header instead of
+#: failing at the MAC and being reported as "re-paired, or altered". Both
+#: readers take the schema they expect as an argument and compare it; there
+#: is no default that makes the wrong one succeed.
+#:
+#: NOT "KEYFILE_SCHEMA": that name is taken, 180 lines below, by the schema
+#: of the keyfile CONTAINER itself ("gs_wake_v2"). Two constants of one name
+#: in one module is not an error Python reports -- the second simply wins,
+#: and every lock_keyfile in the tree would have started writing a header
+#: this module's own unlock_keyfile refuses.
+SETTINGS_SCHEMA = "gs_wake_settings_v1"
+#: WHAT STAYS IN THE CLEAR IN THE VAULT'S KEYFILE, and every one of these is
+#: here because the agent reads it BEFORE the wake note that carries the
+#: other half has been opened. The list is the whole pre-M2 surface,
+#: measured rather than guessed:
+#:
+#:   load_key   role, delivery_public, deposit_in_chat (+ the container head)
+#:   run_once   artifact_dir, secret, peer_public, doorbell_url,
+#:              state_half, pair_fingerprint
+#:   preflight  tor_proxy, rpc_primary
+#:
+#: `secret` and `peer_public` are the file's whole reason to exist: they
+#: authenticate the note that brings the half, so they can never sit behind
+#: it. `delivery_public` and `deposit_in_chat` are the delivery MODE, which
+#: load_key refuses a malformed or ambiguous version of while the operator
+#: is present -- a check that becomes unreachable if the field is sealed.
+#: The rest are a LAN address, a directory and two loopback endpoints.
+#:
+#: ANYTHING NOT LISTED HERE IS SEALED. Stated that way round on purpose: a
+#: field added later is private by default, and one that needs to be
+#: readable has to be argued for here, in a list a reader of this public
+#: tree can check against the code.
+#:
+#: IT LIVES IN THE PROTOCOL MODULE because both boxes' tools need it and it
+#: is a format, not a policy: gs_wake_keys decides what to seal, the agent
+#: decides what to expect unsealed, and the two must be the same list. The
+#: first draft had the agent own it and gs_wake_keys load the agent as a
+#: module to read it -- which made a pairing execute the whole wake agent
+#: for one tuple.
+SETTINGS_CLEAR = ("schema", "version", "role", "secret", "peer_public",
+                  "doorbell_url", "artifact_dir", "state_half",
+                  "pair_fingerprint", "delivery_public", "deposit_in_chat",
+                  "tor_proxy", "rpc_primary")
+#: The keyfile member that holds everything else, and the name inside it.
+SETTINGS_FIELD = "sealed"
+SETTINGS_MEMBER = "settings.json"
 
 
 def derive_state_half(secret_hex: str) -> bytes:
@@ -1255,7 +1303,7 @@ def state_key(vault_half: bytes, pi_half: bytes, salt: bytes) -> bytes:
 
 
 def state_seal(members: dict, vault_half: bytes, pi_half: bytes,
-               salt: bytes = None) -> dict:
+               salt: bytes = None, schema: str = None) -> dict:
     """Seal `members` (name -> text) into one container.
 
     ONE container, not one file each: per-file sealing would leave the file
@@ -1264,6 +1312,14 @@ def state_seal(members: dict, vault_half: bytes, pi_half: bytes,
     and how many forwards each had, which is most of what the sealing is
     for. The header carries the schema and the salt in the clear because a
     reader needs them to try the key at all; it carries nothing else.
+
+    `schema` names WHICH container this is -- the artifact store or the
+    keyfile's sealed section (STAGE8_PLAN.md). Both are sealed under the
+    same two halves, each under its own salt, so the bytes of one handed to
+    the reader of the other would fail at the MAC and be reported as "this
+    is not the pairing that wrote it, or the file has been altered" -- two
+    causes, neither of them the real one. The header says which it is, and
+    the reader is told which it wants.
     """
     public, bindings = _nacl()
     import nacl.secret
@@ -1277,11 +1333,12 @@ def state_seal(members: dict, vault_half: bytes, pi_half: bytes,
     box = nacl.secret.SecretBox(state_key(vault_half, pi_half, _salt))
     raw = json.dumps(members, sort_keys=True,
                      separators=(",", ":")).encode()
-    return {"schema": STATE_SCHEMA, "salt": bytes(_salt).hex(),
+    return {"schema": schema or STATE_SCHEMA, "salt": bytes(_salt).hex(),
             "box": bytes(box.encrypt(raw)).hex()}
 
 
-def state_unseal(container: dict, vault_half: bytes, pi_half: bytes) -> dict:
+def state_unseal(container: dict, vault_half: bytes, pi_half: bytes,
+                 schema: str = None) -> dict:
     """The members back, or raise WakeError.
 
     ONE message for a wrong key and for a tampered file, because Poly1305
@@ -1292,9 +1349,10 @@ def state_unseal(container: dict, vault_half: bytes, pi_half: bytes) -> dict:
     import nacl.secret
     if not isinstance(container, dict):
         raise WakeError("the sealed state is not a JSON object")
-    if container.get("schema") != STATE_SCHEMA:
+    _want = schema or STATE_SCHEMA
+    if container.get("schema") != _want:
         raise WakeError(f"the sealed state is "
-                        f"{container.get('schema')!r}, not {STATE_SCHEMA}")
+                        f"{container.get('schema')!r}, not {_want}")
     try:
         salt = bytes.fromhex(container["salt"])
         sealed = bytes.fromhex(container["box"])
@@ -1640,7 +1698,13 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
 # floor (`deposit_min_sat`, sent by a vault paired with --btc-xpub, read by the
 # pager off its card). An old Pi refuses the field as unexpected and the
 # ceremony dies saying the MAC was refused; the version says which box is old.
-PAIR_PROTO = 5
+# 6 (STAGE8_PLAN.md): the Pi's info gained `state_half`, so the vault can seal
+# its settings during the ceremony instead of rewriting /etc at the first
+# wake. An old Pi sends none and a stage-8 vault has nothing to seal with --
+# which would silently ship an unsealed keyfile, the one outcome a privacy
+# stage must never have. The version stops the ceremony instead and names
+# which box is behind.
+PAIR_PROTO = 6
 PAIR_MAX_LINE = 8192
 #: The ceremony runs once, with a human at both ends. Generous, but bounded:
 #: a pairing socket that waits forever is a socket someone can leave open.
@@ -1823,9 +1887,29 @@ def _pair_info(body: dict) -> dict:
         raise WakeError("pairing message carries no info object")
     out = {}
     for k, v in sorted(info.items()):
-        if k not in ("host", "port", "mac", "broadcast", "deposit_min_sat"):
+        if k not in ("host", "port", "mac", "broadcast", "deposit_min_sat",
+                     "state_half"):
             raise WakeError("pairing info carries an unexpected field")
-        if k == "port":
+        if k == "state_half":
+            # THE PI'S HALF OF THE STATE KEY (STAGE8_PLAN.md), sent ONCE so
+            # the vault can seal its settings while the operator is standing
+            # at both boxes. The vault uses it and does not keep it: a copy
+            # on the vault's disk would be both halves on the machine the
+            # seal exists to protect.
+            #
+            # SAFE TO SEND HERE AND NOWHERE EARLIER. This exchange happens
+            # after both operators compared the code, boxed to the key that
+            # comparison authenticated -- see _pair_config, which exists
+            # because the MAC used to ride in the plaintext reveal. In the
+            # reveal this would have handed half of every future container
+            # to anyone who opened the pairing port during the ceremony.
+            if not isinstance(v, str) or len(v) != STATE_HALF_BYTES * 2:
+                raise WakeError("pairing info carries a bad state half")
+            try:
+                bytes.fromhex(v)
+            except ValueError:
+                raise WakeError("pairing info carries a bad state half")
+        elif k == "port":
             if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 65535:
                 raise WakeError("pairing info carries a bad port")
         elif k == "deposit_min_sat":

@@ -991,6 +991,20 @@ def _validate(args) -> None:
     elif args.fee_sweep_on_idle_boot:
         sys.exit("[!] --fee-sweep-on-idle-boot needs --fee-rpc: there is no "
                  "fee wallet to sweep.")
+    # ...AND IT CANNOT WORK AT ALL SINCE STAGE 8 (STAGE8_PLAN.md section 4).
+    # An idle boot is a boot with no wake note -- a hand power-on, or a
+    # stranger's magic packet -- so nothing brings the Pi's half, so the fee
+    # wallet's settings cannot be read on that boot. Refused HERE, while the
+    # operator is standing at the box, rather than shipped as a flag that
+    # takes, writes, and then silently never fires. The hand sweep does the
+    # same work and says so.
+    if args.fee_sweep_on_idle_boot:
+        sys.exit("[!] --fee-sweep-on-idle-boot cannot be honoured: this "
+                 "box's settings are sealed to the pair, and a boot nobody "
+                 "woke has no half of that key -- so it cannot read which "
+                 "fee wallet to sweep. Pair without the flag and run "
+                 "`gs_wake_agent --fee-sweep --unseal-state <hex>` at the "
+                 "machine instead; `gs_doorbell state-key` prints the hex.")
     if args.account_ceiling < 1:
         sys.exit("[!] --account-ceiling must be at least 1.")
     if not 1 <= args.daily_wake_budget <= 1000:
@@ -1032,6 +1046,48 @@ PAIR_MAX_STRAY = 10
 # as its first act, so the number here never applied. Two places setting the
 # same bound is one place quietly losing. The protocol owns it now
 # (PAIR_MSG_S, enforced as a whole-message deadline rather than a per-read one).
+
+
+def _seal_settings(payload: dict, pi_half_hex: str) -> dict:
+    """The payload with everything but KEYFILE_CLEAR moved into one sealed
+    member (STAGE8_PLAN.md).
+
+    Sealed HERE, during the ceremony, and not at the first wake: the Pi's
+    half crosses once, inside the configuration exchange that happens after
+    both operators compared the code, and this box uses it and drops it. The
+    alternative -- write it in the clear now, seal it at the first wake --
+    leaves the xpub readable for however long it is until somebody taps a
+    phone, and needs the agent to rewrite a 0400 file under /etc.
+
+    A DEAD MAN'S SWITCH ON THE SPLIT. If the sealing raises, nothing is
+    written: an unsealed keyfile written by a build that meant to seal one
+    is the single outcome this stage must not have, because it looks exactly
+    like success.
+    """
+    clear = set(proto.SETTINGS_CLEAR)
+    inner = {k: v for k, v in payload.items() if k not in clear}
+    out = {k: v for k, v in payload.items() if k in clear}
+    if not inner:
+        return payload
+    try:
+        vault = bytes.fromhex(str(payload["state_half"]))
+        pi = bytes.fromhex(str(pi_half_hex))
+        out[proto.SETTINGS_FIELD] = proto.state_seal(
+            {proto.SETTINGS_MEMBER: json.dumps(inner, sort_keys=True)},
+            vault, pi, schema=proto.SETTINGS_SCHEMA)
+        # READ IT BACK, with the same two halves, before anything relies on
+        # it -- the same rule the store's own close follows, and for the
+        # same reason: this is the only moment the Pi's half is in reach.
+        _back = proto.state_unseal(out[proto.SETTINGS_FIELD], vault, pi,
+                                   schema=proto.SETTINGS_SCHEMA)
+        if json.loads(_back[proto.SETTINGS_MEMBER]) != inner:
+            raise ValueError("the sealed settings do not read back")
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] this box could not seal its own settings ({e}), and "
+                 f"will not write them in the clear instead. Nothing was "
+                 f"written here; remove /etc/gs_wake_pi.key on the Pi and "
+                 f"pair again.")
+    return out
 
 
 def _listen(args):
@@ -1185,6 +1241,17 @@ def do_pair(args) -> int:
     if "host" not in info or "port" not in info:
         sys.exit("[!] the Pi did not send an address to fetch jobs from. "
                  "Nothing was written.")
+    # AND ITS HALF OF THE STATE KEY (STAGE8_PLAN.md). Without it this box
+    # would write every setting it was given -- the xpub above all -- in the
+    # clear onto a disk that unlocks itself, which is the outcome this stage
+    # exists to remove. PAIR_PROTO 6 already refuses a Pi too old to send
+    # one, so reaching this means a peer that answered the version and then
+    # left the field out: stop, and say which of the two it is.
+    if not info.get("state_half"):
+        sys.exit("[!] the Pi sent no half of the state key, so this box's "
+                 "settings could not be sealed and will not be written in "
+                 "the clear. Update the Pi and pair again. Nothing was "
+                 "written here; remove /etc/gs_wake_pi.key on the Pi first.")
 
     # FROM HERE ON A FAILURE LEAVES HALF A PAIRING: the Pi has agreed and is
     # writing its own file. Nothing below can plausibly fail, but if it does the
@@ -1276,6 +1343,20 @@ def do_pair(args) -> int:
         "fee_sweep_depth": int(args.fee_sweep_depth),
         "fee_sweep_on_idle_boot": bool(args.fee_sweep_on_idle_boot),
     }
+    # THE SETTINGS GO BEHIND THE PAIR (STAGE8_PLAN.md). Everything this box
+    # is told, less the handful of fields it must read BEFORE the wake note
+    # that carries the other half has been opened. The list of what stays
+    # readable lives in gs_wake_agent (KEYFILE_CLEAR) and is imported here
+    # rather than repeated, because two copies of a list like this drift and
+    # the drift is silent: a field the agent expects in the clear but the
+    # pairing sealed would fail at the first wake, hours later, with the
+    # operator 500 km away.
+    #
+    # THE XPUB IS WHY. A seized keyfile with it in the clear re-derives every
+    # deposit address this intake has ever issued and finds all of them on
+    # the public chain -- retrospectively, past the wipe, for as long as the
+    # chain exists. No record this box keeps is worth as much.
+    payload = _seal_settings(payload, info["state_half"])
     # kdf="none", deliberately and visibly. See the module docstring: a machine
     # that boots unattended cannot keep a passphrase from someone holding it.
     try:
