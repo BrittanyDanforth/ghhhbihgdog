@@ -403,8 +403,10 @@ check("...and kills the two lookalike workarounds by name, because both fail "
       "message=" in DOC and "memoless" in DOC)
 check("the pager's token never has a CLI flag, since argv is world-readable",
       '"--token"' not in _PAGER and "--token-file" in _PAGER)
-check("the pager is fail-closed on Tor, as section 4 requires",
-      "verify_tor(proxy)" in _PAGER)
+check("the pager is fail-closed on Tor, as section 4 requires -- on its own "
+      "circuit, not the bare proxy's default one",
+      "verify_tor(isolated_proxy(" in _PAGER
+      and "validate_proxy(args.tor_proxy)" in _PAGER)
 check("...and does NOT still call the doorbell operator procedure, now that "
       "it ships",
       "operator procedure" not in DOC and "not a\nshipped binary" not in DOC)

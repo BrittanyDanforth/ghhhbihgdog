@@ -66,6 +66,14 @@ not fixed by any of this.
 | bot token, chat id | Pi only | they can wake / spam `/depo` |
 | Mullvad account number | paper / Pi `/etc`, not GitHub | they can use your pipe |
 | mix / `run_pipeline` | ThinkPad, you present, USB plugged in | — |
+| **with `--allow-withdraw`:** spend wallet file + `GS_WALLET_PASSWORD` | ThinkPad disk + `/etc/gs-wake-spend.env` | **they can spend** |
+| **with `--allow-btc-forward`:** `GS_BTC_SEED` (+ passphrase) | `/etc/gs-wake-spend.env` on the ThinkPad | **they own every deposit address this intake ever issues** |
+| the vault's wake keyfile (unsealed by design — nobody is there at boot to type a passphrase) | ThinkPad `/etc`, `0400` | the wake secret, the Pi's address, the account xpub (so: every deposit address, past and future), your Electrum onion, your fee and sweep addresses |
+| the artifact directory (ledger, open slips, plan chains, job log, chain log) | ThinkPad disk | every open deposit, and every forward since the last hand wipe |
+
+The bottom four rows are the price of a machine that works while nobody
+is at it: an auto-unlocking disk decrypts itself for whoever powers it
+on. "Off" is not "sealed" — §6's ThinkPad row is scored on that.
 
 Telegram never gets: wallet path, RPC URL, view key, spend key, seed — and by
 default nothing else either, only which job finished and a 4-hex handle.
@@ -153,6 +161,24 @@ there:
 The wake keyfile is sealed. **The other three are not**, and no amount
 of work on the wake channel touches them. If you stop reading here,
 stop having read that.
+
+**Keep the journal out of the card's flash, on BOTH boxes.** The units
+in `systemd/` silence their own output, but systemd still records that a
+unit started and stopped, and when — which on the vault is a dated list
+of every wake, and of which ones were long enough to be a spend. Install
+the drop-in this repo ships, on the Pi and on the ThinkPad:
+
+```bash
+sudo install -D -m 0644 systemd/journald.conf.d/gs-volatile.conf \
+    /etc/systemd/journald.conf.d/gs-volatile.conf
+sudo systemctl restart systemd-journald
+sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+sudo rm -rf /var/log/journal        # the persistent store, if it exists
+```
+
+The journal then lives in `/run` and dies with the power. The cost is
+real: on the vault, a boot you want to read about must be read before it
+powers off. The file itself says the same thing at more length.
 
 **The fix is to encrypt the Pi, and it costs you something real.**
 Raspberry Pi OS does not do this out of the box; the standard way is
@@ -1431,7 +1457,11 @@ how many, not what kind of job, not a position in any queue (there is none).
 The busy window is a fact one shared vault cannot hide; it carries no
 identity. Labels, status words, "more remains" and chained legs are all
 owner-scoped, on the vault. The vault's ledger holds opaque tokens and small
-account numbers; the Pi persists nothing per person.
+account numbers — and, until the host-privacy pass, the outpoints
+(`txid:vout`) of each client's own payment, which nothing read: they are
+gone, and a record from before is stripped of them the next time a forward
+writes it. The slip likewise no longer names the forward's transaction ids.
+The Pi persists nothing per person.
 
 ### The pager's unit needs a `WorkingDirectory`, and the reason is not obvious
 
@@ -1474,7 +1504,7 @@ missing on a box where it is the only tamper-evidence there is.
 | Hotspot / SIM / towers | **Yes** — no cellular |
 | VPS host images a wallet | **Yes** — no wallet on Mullvad |
 | Door kick, Pi only | **Depends entirely on whether you encrypted the Pi (§3).** The wake keyfile is sealed with your passphrase, so the card alone no longer yields the wake key, your ThinkPad's MAC or your LAN layout — it yields Argon2id parameters and a salt. But an unencrypted card still hands over `/etc/wireguard/wg0.conf`, which is your **Mullvad private key**, and `/var/lib/tor`, which is your **guard set**. Those are your network identity and no work on the wake channel touches them. Wake traffic recorded off the switch stays sealed either way: each job note is boxed to a key the vault minted for that boot and then powered off with. Recovery is a two-box re-key (two commands, §8), plus a new Mullvad account |
-| Door kick, they take the ThinkPad | **Partly** — view-only if auto-unlock; spend USB elsewhere |
+| Door kick, they take the ThinkPad | **Depends on what you paired it to do.** Paired for watching only: view-only wallet, the open slips and the ledger — the spend USB is elsewhere, so they cannot spend. Paired with `--allow-withdraw` (§4b): the spend wallet file and its password are both on that disk, so **they can spend**. Paired with `--allow-btc-forward`: `GS_BTC_SEED` is in the unit's environment file, so **they own every intake deposit address**, past and future. The disk auto-unlocks — that is what lets the Pi wake it — so full-disk encryption does not bear on this row at all; see §1 |
 | Spend USB left in the laptop | **No** — you blew the split |
 | Stolen Telegram / bot token | **Partly, and it depends on `allow_withdraw`.** Without it they can wake and spam quotes, **not spend**, and the spam is bounded on the ThinkPad rather than on the stolen thing: a 24 h wake budget (12 by default) and an account ceiling (45) that refuses **minting** jobs once the wallet holds more subaddress accounts than the offline signer derives. Both live in the keyfile, so changing them needs physical access. **With `allow_withdraw` on, they can spend — to an address they type** (§4b), and the ceiling does not apply: it is checked for `receive_and_quote` only — the one remaining minting job — and a mix mints ~25 accounts of its own. That exemption is deliberate — refusing a withdrawal at 45 accounts would strand the money, and `airgap_tx_signer` already creates the accounts the offline wallet needs — but it means the ceiling bounds the cheap job and not the expensive one. What bounds a withdrawal is `allow_withdraw`, the wake budget, and the fact that one holds the pager for most of a day. They also get your vault powering on when they say |
 | Somebody on the switch during PAIRING | **Only if you compare the code.** The two boxes have never met, so nothing but you can tell the real peer from an impostor. Each commits to its key before seeing the other's, which is what stops an attacker grinding keys until the two codes agree — so the 8 characters you compare are worth 2^40 and a man in the middle has to guess once, in public, with you looking at it. If you do not actually compare them, this is unauthenticated key agreement and the software cannot tell |
@@ -1763,7 +1793,18 @@ that case destroy the pairing yourself, and re-key both boxes afterwards:
 ```bash
 shred -u /etc/gs_wake_thinkpad.key
 shred -u /var/lib/ghostspiral-marks/issued_*.json   # the intake's issued-index marks
+shred -u /etc/gs-wake-spend.env                     # the seed and the wallet passwords
+shred -u /var/lib/gs/spend.wallet /var/lib/gs/spend.wallet.keys   # if you paired --allow-withdraw
+shred -u /var/lib/gs/fee.wallet /var/lib/gs/fee.wallet.keys       # if you paired a fee wallet
 ```
+
+The third line matters more than the first: the keyfile is a pairing you
+can re-key, and `/etc/gs-wake-spend.env` is the BIP39 seed that owns
+every deposit address this intake has ever issued, beside the wallet
+passwords. `paranoia_mode` reaches neither — `/etc` is not one of its
+roots. Copy the seed somewhere you can restore from BEFORE you shred it,
+or you are destroying the money with the evidence; the wallet files are
+worth the same care.
 
 The second line is for a vault that ran the BTC intake: the marks name
 no address and no client, but they say an intake ran here and how many

@@ -5189,6 +5189,102 @@ check("...and re.M makes $ mean end-of-LINE, which is correct — this is "
       and _dz_offenders('re.finditer(r"^H=(x)$", t, flags=re.MULTILINE)') == [])
 
 
+print("\n== THE HOST-PRIVACY PASS: what a third party is told, and what a "
+      "seized disk reads ==")
+# THE TREE IS PUBLIC. Every constant this code sends or writes is a string an
+# adversary who has read the source knows to match, so each one below was a
+# way to file this operator's traffic (or this operator's disk) under one
+# heading.
+_ua_calls = []
+
+
+def _ua_capture(**kw):
+    _ua_calls.append(kw)
+
+    class _R:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"IsTor": True, "monero": {"btc": "0.004"}}
+    return _R()
+
+
+_ua_real_get, _ua_real_post = gs.requests.get, gs.requests.post
+gs.requests.get = lambda url, **kw: _ua_capture(url=url, **kw)
+gs.requests.post = lambda url, **kw: _ua_capture(url=url, **kw)
+try:
+    _P = {"http": "socks5h://x:y@127.0.0.1:9050",
+          "https": "socks5h://x:y@127.0.0.1:9050"}
+    gs.safe_get.__wrapped__("https://example.onion/a", _P)
+    gs.safe_post.__wrapped__("https://example.onion/b", {"k": 1}, _P)
+    gs._verify_tor_once.__wrapped__(_P)
+    gs.tor_recheck(_P)
+finally:
+    gs.requests.get, gs.requests.post = _ua_real_get, _ua_real_post
+check("every outbound request carries ONE fixed User-Agent -- safe_get, "
+      "safe_post, the Tor check and the Tor recheck alike -- so no third "
+      "party can file this host's traffic under 'that python-requests "
+      "client of version X'",
+      len(_ua_calls) == 4
+      and all((c.get("headers") or {}).get("User-Agent")
+              == gs.HTTP_HEADERS["User-Agent"] for c in _ua_calls)
+      and gs.HTTP_HEADERS["User-Agent"]
+      and "requests" not in gs.HTTP_HEADERS["User-Agent"].lower()
+      and "python" not in gs.HTTP_HEADERS["User-Agent"].lower())
+check("...and a keyed host still gets its key, beside that User-Agent "
+      "rather than instead of it",
+      "x-api-key" not in json.dumps(
+          [(c.get("headers") or {}) for c in _ua_calls]))
+_ua_keyed = []
+_ua_real_post2 = gs.requests.post
+os.environ["GS_SWAPKIT_API_KEY"] = "K"
+gs.requests.post = lambda url, **kw: (_ua_keyed.append(kw) or _ua_capture(
+    url=url, **kw))
+try:
+    gs.safe_post.__wrapped__(gs.SWAPKIT_API + "/v3/quote", {"k": 1}, _P)
+finally:
+    gs.requests.post = _ua_real_post2
+    os.environ.pop("GS_SWAPKIT_API_KEY", None)
+check("...proven: the quote host's request carries both",
+      len(_ua_keyed) == 1
+      and (_ua_keyed[0].get("headers") or {}).get("x-api-key") == "K"
+      and (_ua_keyed[0].get("headers") or {}).get("User-Agent")
+      == gs.HTTP_HEADERS["User-Agent"])
+# THE ORACLE'S QUERY WAS A TELL OF ITS OWN: it asked for bitcoin's price in
+# bitcoin, which is 1, beside the rate it actually reads.
+check("the price oracle asks for monero alone, in btc -- no second asset "
+      "nobody reads",
+      "ids=monero&" in gs.CG_PRICE_URL
+      and "bitcoin" not in gs.CG_PRICE_URL
+      and "vs_currencies=btc" in gs.CG_PRICE_URL)
+# THE CHAIN IS A FILE ON A DISK THAT UNLOCKS ITSELF TO BOOT.
+_cv = tempfile.mkdtemp(prefix="gs_chainver_")
+_cv_log = os.path.join(_cv, "integrity_chain.log")
+gs.integrity_log("stage0", "hello",
+                 log_path=__import__("pathlib").Path(_cv_log))
+_cv_raw = open(_cv_log).read().strip()
+# "<hash> | <ts>|<version>|<stage>|<message>" -- the hash and its separator
+# come off first, the way test_chain_redaction reads the same file.
+_cv_line = _cv_raw.split(" | ", 1)[1].split("|")
+check("a chain line carries NO toolchain version: four fields, and the "
+      "second is a dash, so a seized disk does not read which build ran "
+      "here (and a reader of the chain still finds four fields)",
+      len(_cv_line) == 4 and _cv_line[1] == "-"
+      and _cv_line[2] == "stage0" and _cv_line[3] == "hello"
+      and gs.VERSION not in _cv_raw)
+# A CRASHED RUN LEAVES ITS PLANS ON PURPOSE. What they hold is already the
+# hops and the amounts; the build that wrote them is not needed beside it.
+_pm_src = code_only(os.path.join(REPO, "GhostSpiral"))
+check("an unsigned plan's meta carries no toolchain version",
+      '"schema": "unsigned_v1",' in _pm_src
+      and '"version": VERSION' not in _pm_src)
+
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

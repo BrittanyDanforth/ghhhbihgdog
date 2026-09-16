@@ -6701,7 +6701,10 @@ def main(argv=None) -> int:
     # FAIL CLOSED ON TOR, BEFORE ANYTHING ELSE. OPSEC_SETUP.md section 4: "If
     # Tor is down, the bot does not start."
     proxy = validate_proxy(args.tor_proxy)
-    verify_tor(proxy)
+    # On its own circuit (the host-privacy pass): the check rode the bare
+    # proxy, Tor's default circuit, shared with any other uncredentialed
+    # stream on this box.
+    verify_tor(isolated_proxy(args.tor_proxy, "verify"))
     proxies = isolated_proxy(args.tor_proxy, "pager")
 
     token = load_token(args.token_file)

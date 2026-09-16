@@ -161,6 +161,17 @@ _silence_third_party_logging()
 
 VERSION = "10.5"
 CHECK_TOR_URL = "https://check.torproject.org/api/ip"
+#: ONE USER-AGENT ON EVERY REQUEST THIS TOOLCHAIN MAKES (the host-privacy
+#: pass). requests' default is "python-requests/<the installed version>":
+#: a stable, non-browser client badge that also names the library version
+#: on this box, sent to Telegram, the quote host, the oracle and the Tor
+#: check alike -- so one third party could file all of this host's traffic
+#: under one client, and a reader of the public tree knew which string to
+#: match. The bare "Mozilla/5.0" is the most common thing a script sends
+#: and says nothing about the box. Never a real browser's full string: a
+#: fake browser on a JSON endpoint is its own tell, and one that would
+#: have to be kept current.
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 INTEGRITY_LOG = Path("integrity_chain.log")
 #: Chain entries a signal handler wanted to write. See _shutdown_handler for
 #: why a handler must never take the chain lock itself.
@@ -771,7 +782,13 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
                 # REDACTED HERE, at the one place every tool passes through, so
                 # a call site added later cannot reintroduce the leak by being
                 # written the obvious way. See chain_safe.
-                line = f"{ts}|{VERSION}|{_stage}|{chain_safe(_msg)}"
+                # NO VERSION ON THE LINE (the host-privacy pass). The
+                # toolchain's release rode on every line of a file that
+                # lives on a disk that unlocks itself: a seizure read
+                # exactly which build ran here, which is which bugs to
+                # try. The field stays, as a dash, so a reader of the
+                # chain still finds four fields.
+                line = f"{ts}|-|{_stage}|{chain_safe(_msg)}"
                 h = hashlib.sha256((prev + line).encode()).hexdigest()
                 _append_chain_line(log_path, h, line)
                 prev = h
@@ -2060,7 +2077,8 @@ def _verify_tor_once(proxy: Dict[str, str]) -> dict:
     if not proxy:
         sys.exit("[!] Tor verification called without proxies — that request "
                  "would go clearnet. Aborting.")
-    r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy, allow_redirects=False)
+    r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy,
+                     allow_redirects=False, headers=HTTP_HEADERS)
     r.raise_for_status()
     return r.json()
 
@@ -2108,7 +2126,8 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
         sys.exit("[!] Tor recheck called without proxies — that request would go "
                  "clearnet. Aborting.")
     try:
-        r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy, allow_redirects=False)
+        r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy,
+                         allow_redirects=False, headers=HTTP_HEADERS)
         r.raise_for_status()
         if not r.json().get("IsTor"):
             integrity_log("tor", f"LEAK_mid_{stage}")
@@ -2380,7 +2399,8 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     # observing one actually reach the target. Any falsy value must abort.
     if not proxies:
         sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
-    r = requests.get(url, timeout=20, proxies=proxies, allow_redirects=False)
+    r = requests.get(url, timeout=20, proxies=proxies, allow_redirects=False,
+                     headers=HTTP_HEADERS)
     r.raise_for_status()
     return r.json()
 
@@ -2539,10 +2559,11 @@ def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
     if not proxies:      # proxies={} means DIRECT in requests -- see safe_get
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
     _mk = _HOST_HEADERS.get((urlparse(url).hostname or "").lower())
-    _hdrs = (_mk() or None) if _mk else None
+    _keyed = dict(_mk() or {}) if _mk else {}
+    _hdrs = {**HTTP_HEADERS, **_keyed}
     r = requests.post(url, json=payload, timeout=25, proxies=proxies,
                       allow_redirects=False, headers=_hdrs)
-    if _mk is not None and _hdrs is None and r.status_code in (401, 403):
+    if _mk is not None and not _keyed and r.status_code in (401, 403):
         # A keyed service answering an unkeyed request. Named, because
         # "HTTP 401" at the quote step reads as a network fault.
         sys.exit(f"[!] {urlparse(url).hostname} refused the request "
@@ -3453,8 +3474,11 @@ def env_or_argv(env_name: str, argv_value, label: str, cast=None,
 # ---------------------------------------------------------------------------
 #  Swap quote sanity: is this rate anywhere near reality?
 # ---------------------------------------------------------------------------
+#: monero alone (the host-privacy pass): the query asked for bitcoin's
+#: price in bitcoin too, a tell this code and nothing else wrote, and the
+#: oracle reads only the one rate.
 CG_PRICE_URL = ("https://api.coingecko.com/api/v3/simple/price"
-                "?ids=monero,bitcoin&vs_currencies=btc")
+                "?ids=monero&vs_currencies=btc")
 
 
 def btc_per_xmr_oracle(proxies: Optional[Dict[str, str]] = None, getter=None):

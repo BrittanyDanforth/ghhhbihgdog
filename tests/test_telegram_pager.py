@@ -657,10 +657,15 @@ def _pos(hay, needle):
     return hay.find(needle)
 
 
-check("the proxy is validated and Tor verified before the token is even read",
-      _pos(_src, "verify_tor(proxy)") >= 0
-      and _pos(_src, "verify_tor(proxy)")
-          < _pos(_src, "load_token(args.token_file)"))
+check("the proxy is validated and Tor verified before the token is even "
+      "read, and the check rides its OWN circuit rather than the bare "
+      "proxy's default one (the host-privacy pass)",
+      _pos(_src, "validate_proxy(args.tor_proxy)") >= 0
+      and _pos(_src, 'verify_tor(isolated_proxy(args.tor_proxy, "verify"))')
+      > _pos(_src, "validate_proxy(args.tor_proxy)")
+      and _pos(_src, 'verify_tor(isolated_proxy(args.tor_proxy, "verify"))')
+      < _pos(_src, "load_token(args.token_file)")
+      and "verify_tor(proxy)" not in _src)
 check("every Telegram call goes through safe_get/safe_post, which abort on a "
       "falsy proxies dict rather than connecting direct",
       "safe_get(url, proxies=self.proxies)" in _src

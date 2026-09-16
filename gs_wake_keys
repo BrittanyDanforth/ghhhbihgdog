@@ -752,9 +752,16 @@ def intake_floor_sat(args):
     if not getattr(args, "btc_xpub", ""):
         return None
     import gs_btc_tx as _btx
-    return int(_btx.forward_floor_sat(int(args.op_return_max_bytes),
-                                      int(args.feerate_ceiling_sat_vb),
-                                      int(proto.DEPOSIT_MIN_SAT)))
+    _exact = int(_btx.forward_floor_sat(int(args.op_return_max_bytes),
+                                        int(args.feerate_ceiling_sat_vb),
+                                        int(proto.DEPOSIT_MIN_SAT)))
+    # ROUNDED UP TO A THOUSAND SATOSHI (the host-privacy pass). The exact
+    # floor is this pair's fee ceiling and OP_RETURN policy in disguise --
+    # the arithmetic is public -- and the pager repeats the number to
+    # every client whose deposit falls under it. Up, never down: the
+    # vault refuses under its exact floor, and a pager floor at or above
+    # it takes nothing the vault would send back.
+    return -(-_exact // 1000) * 1000
 
 
 def intake_floor_lines(args) -> list:
@@ -1279,7 +1286,12 @@ def do_pair(args) -> int:
     # has no MAC rule, so 'a4:c3:f0:1b' would survive as 'a#:c#:f#:#b' -- with
     # the digit positions known, that is a handful of candidates. spoof_mac
     # already settled this: record THAT it happened, never the address.
-    integrity_log("wake", f"paired:{agreed['sas']}")
+    # ...AND NOT THE CODE EITHER (the host-privacy pass): the SAS is the
+    # pairing's fingerprint, and the same string sits in both keyfiles; a
+    # chain line carrying it tied this box's chain to the Pi's from
+    # whatever directory the pairing was run in. That it happened is
+    # enough.
+    integrity_log("wake", "paired")
 
     print()
     print(f"  [+] Paired. Code {agreed['sas']}.")

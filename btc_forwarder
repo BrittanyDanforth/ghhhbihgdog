@@ -2111,7 +2111,11 @@ def main(argv=None):
     except (ValueError, OSError) as e:
         raise Refused("bad_bundle", f"{type(e).__name__}: {e}")
     proxy = validate_proxy(args.tor_proxy)
-    verify_tor(proxy)
+    # On its own circuit, not the bare proxy's default one (the
+    # host-privacy pass): the Tor check is the first request of every
+    # forward, and it shared Tor's default circuit with any other
+    # uncredentialed stream on the box.
+    verify_tor(isolated_proxy(args.tor_proxy, "forward:verify"))
     integrity_log("forward", "start")
 
     # 1. what settled, and the server's fee estimate, in one session

@@ -6,7 +6,11 @@
 # over. That is strictly worse than the row OPSEC_SETUP.md §6 scores for
 # "they take the ThinkPad", which assumes the box is normally off.
 [Unit]
-Description=GhostSpiral wake agent (collect one job, run it, power off)
+# A neutral name, like the Pi's units (the host-privacy pass): the journal
+# keeps unit names and their start and stop times for as long as it is
+# persistent, and a name that says what this machine runs is one line of
+# `journalctl` on a seized disk. The paths below are yours to rename too.
+Description=Wake agent (collect one job, run it, power off)
 After=network-online.target systemd-random-seed.service
 Wants=network-online.target
 OnFailure=gs-wake-poweroff.service

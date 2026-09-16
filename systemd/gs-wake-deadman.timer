@@ -27,7 +27,7 @@
 # budget bounds the normal case; generous-but-bounded is the right shape for a
 # backstop that only runs when the thing that should have bounded it is dead.
 [Unit]
-Description=GhostSpiral wake deadman (power off even if the agent dies)
+Description=Wake deadman (power off even if the agent dies)
 
 [Timer]
 OnActiveSec=9300

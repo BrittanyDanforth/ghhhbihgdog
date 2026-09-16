@@ -4659,8 +4659,12 @@ _fl_args = _K.build_cli().parse_args(
     ["pair", "--out", os.path.join(_fw_dir2, "k.key"), "--artifact-dir",
      _fw_dir2] + _BTC_OK)
 _fl_lines = _K.intake_floor_lines(_fl_args)
-_fl_want = __import__("gs_btc_tx").forward_floor_sat(
+_fl_exact = __import__("gs_btc_tx").forward_floor_sat(
     int(_fl_args.op_return_max_bytes), int(_fl_args.feerate_ceiling_sat_vb))
+# ROUNDED UP TO A THOUSAND SATOSHI (the host-privacy pass): the exact floor
+# is the pair's fee ceiling and OP_RETURN policy in disguise, and the pager
+# repeats it to every client whose deposit falls under it.
+_fl_want = -(-_fl_exact // 1000) * 1000
 check("pairing/btc: the operator is told the intake floor at pairing -- the "
       "number the vault refuses under, the ceiling it follows from, that "
       "the pairing carries it to the pager, the flag that raises it and "
@@ -4677,11 +4681,15 @@ check("pairing/btc: the operator is told the intake floor at pairing -- the "
 # copied this number across by hand, and a deposit between the two was
 # accepted in the chat, paid, and refused by the vault after a wake.
 check("intake_floor_sat is the vault's own floor (forward_floor_sat at the "
-      "ceiling, the wire's floor under it) with --btc-xpub, None without",
+      "ceiling, the wire's floor under it) ROUNDED UP to a thousand "
+      "satoshi with --btc-xpub -- never under the exact floor, never more "
+      "than 999 sat over it -- and None without",
       _K.intake_floor_sat(_fl_args) == _fl_want
-      and _fl_want == __import__("gs_btc_tx").forward_floor_sat(
+      and _fl_want % 1000 == 0
+      and 0 <= _fl_want - __import__("gs_btc_tx").forward_floor_sat(
           int(_fl_args.op_return_max_bytes),
           int(_fl_args.feerate_ceiling_sat_vb), int(_K.proto.DEPOSIT_MIN_SAT))
+      < 1000
       and _K.intake_floor_sat(_K.build_cli().parse_args(
           ["pair", "--out", os.path.join(_fw_dir2, "k.key"),
            "--artifact-dir", _fw_dir2])) is None)
@@ -5132,21 +5140,25 @@ check("the forward's child is handed GS_BTC_ACCOUNT=0 for a keyfile without "
       "the field, off the argv", len(_ran) == 1
       and _ran[0][1].get("GS_BTC_ACCOUNT") == "0"
       and "--account" not in _ran[0][0])
-# THE OUTPOINTS OUR FORWARDS SPENT, accumulated on the record (STAGE5_PLAN.md
-# section 2): the ledger's copy of the once-per-outpoint rule, no amount.
+# THE LEDGER NAMES NO TRANSACTION (the host-privacy pass). The outpoints a
+# forward spent used to be accumulated on the record as "the ledger's copy"
+# of the once-per-outpoint rule; nothing read them, the forwarder keeps its
+# own list on the plan chain, and each was a public-chain transaction id of
+# the client's payment on a record the pay-out never retires.
 _ACC_IN = {**_ACC, "inputs": [{"tx_hash": "ab" * 32, "vout": 0, "value": 1},
                               {"tx_hash": "cd" * 32, "vout": 3, "value": 2}]}
 _oi, _ei, _rani, _ddi, _bbi = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC_IN)
-check("a sent forward's plan inputs are recorded on the ledger as outpoints "
-      "(txid:vout), sorted, without their values",
-      _ei is None and _rec_of(_ddi).get("forward_inputs")
-      == sorted(["ab" * 32 + ":0", "cd" * 32 + ":3"])
-      and "value" not in json.dumps(_rec_of(_ddi).get("forward_inputs")))
+check("a sent forward's plan inputs are NOT recorded on the ledger: the "
+      "record carries no outpoint, no txid, no value",
+      _ei is None and "forward_inputs" not in _rec_of(_ddi)
+      and "ab" * 32 not in json.dumps(_rec_of(_ddi))
+      and "cd" * 32 not in json.dumps(_rec_of(_ddi)))
 _oi2, _ei2, _rani2, _ddi2, _bbi2 = _fwd_run_plan(
     {**_FWD_REC, "forward_inputs": ["ef" * 32 + ":1"]}, _SEND_KEY, _ACC_IN)
-check("...and a later forward's inputs are UNIONED with what the record "
-      "already had", _rec_of(_ddi2).get("forward_inputs")
-      == sorted(["ab" * 32 + ":0", "cd" * 32 + ":3", "ef" * 32 + ":1"]))
+check("...and a record from before, carrying the outpoints, is STRIPPED of "
+      "them the next time a forward writes it",
+      _ei2 is None and "forward_inputs" not in _rec_of(_ddi2)
+      and "ef" * 32 not in json.dumps(_rec_of(_ddi2)))
 # THE XMR SIDE JUDGES THE REAL SWAP (STAGE5_PLAN.md 3.4): the pairs file the
 # watching jobs read is rewritten from the forward's plan once the money
 # moved -- the deposit-time figures kept beside it, written once.
@@ -5163,12 +5175,14 @@ _PLAN_Q = {"broadcast": True, "broadcast_outcome": "accepted",
            "expected_xmr": "1.31", "dest_xmr": _XMR_SAMPLE,
            "send_sat": 4980000, "txid": "ab" * 32}
 check("a plan that moved money and carries a quote rewrites the pair routed "
-      "to its destination: what was sent, what was quoted, the txid -- and "
-      "keeps the deposit-time figures beside them",
+      "to its destination: what was sent, what was quoted, and NO txid "
+      "(the host-privacy pass) -- and keeps the deposit-time figures "
+      "beside them",
       A._reconcile_pairs({"slip": str(_pp)}, _PLAN_Q) is True
       and json.loads(_pp.read_text())[0]["btc_in"] == "0.0498"
       and json.loads(_pp.read_text())[0]["expected_xmr"] == "1.31"
-      and json.loads(_pp.read_text())[0]["forwarded_txid"] == "ab" * 32
+      and "forwarded_txid" not in json.loads(_pp.read_text())[0]
+      and "ab" * 32 not in _pp.read_text()
       and json.loads(_pp.read_text())[0]["quoted_at_deposit"]
       == {"btc_in": "0.05", "expected_xmr": "1.5"})
 check("...the pair for another destination is untouched",
@@ -5192,8 +5206,7 @@ check("...a later forward (a returned deposit) rewrites again SUMMING what "
       "deposit-time figures are written ONCE",
       json.loads(_pp.read_text())[0]["expected_xmr"] == "1.51"
       and json.loads(_pp.read_text())[0]["btc_in"] == "0.0568"
-      and json.loads(_pp.read_text())[0]["forwarded_txids"]
-      == ["cd" * 32, "ab" * 32]
+      and "forwarded_txids" not in json.loads(_pp.read_text())[0]
       and json.loads(_pp.read_text())[0]["quoted_at_deposit"]
       == {"btc_in": "0.05", "expected_xmr": "1.5"})
 # STAGE 6: A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP. A bump spends
@@ -5210,7 +5223,7 @@ check("a bumped plan that names the one it replaces counts ALONE: the "
       A._reconcile_pairs({"slip": str(_ppb)}, _NEW, chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25"
       and json.loads(_ppb.read_text())[0]["btc_in"] == "0.0496"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ef" * 32])
+      and "forwarded_txids" not in json.loads(_ppb.read_text())[0])
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 check("...and when the network mined the ORIGINAL instead (the replacement "
@@ -5220,7 +5233,7 @@ check("...and when the network mined the ORIGINAL instead (the replacement "
                          {**_NEW, "superseded_by": "ab" * 32},
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.31"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ab" * 32])
+      and "forwarded_txids" not in json.loads(_ppb.read_text())[0])
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 check("...a returned deposit's second swap still SUMS with the first (no "
@@ -5244,7 +5257,7 @@ check("a forward a VERIFIED refund names drops out of what the watcher "
                          {**_NEW, "replaces": None, "refunds": [_RFV]},
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.25"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ef" * 32])
+      and "forwarded_txids" not in json.loads(_ppb.read_text())[0])
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 check("...an UNVERIFIED claim changes nothing: both still sum (a memo anyone "
@@ -5284,8 +5297,7 @@ check("...a verified refund that is NOT full (a streaming swap filled 60% "
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.043891566265"
       and json.loads(_ppb.read_text())[0]["btc_in"] == "0.07978"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"]
-      == ["ef" * 32, "ab" * 32])
+      and "forwarded_txids" not in json.loads(_ppb.read_text())[0])
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 check("...the same refund output recorded on the current plan AND on the "
@@ -5314,8 +5326,8 @@ check("...and when EVERY forward was refunded in full the DEPOSIT-time "
                           "refunds": [_RFV, {**_RFV, "of": "ef" * 32}]},
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == []
-      and json.loads(_ppb.read_text())[0]["forwarded_txid"] is None)
+      and "forwarded_txids" not in json.loads(_ppb.read_text())[0]
+      and "forwarded_txid" not in json.loads(_ppb.read_text())[0])
 # SELF-DOUBT OVER THE PARTIAL-REFUND FIX. ThorChain takes its outbound fee
 # from the unfilled part BEFORE refunding it, so the refund alone reads
 # the fill a fee's worth too high. At 0.003 BTC sent with a 0.0003 BTC
@@ -5407,8 +5419,8 @@ check("two partial refunds of the ONLY forward that together reach the FULL "
                                               "outbound_fee_sat": None}]})
       is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == []
-      and json.loads(_ppb.read_text())[0]["forwarded_txid"] is None)
+      and "forwarded_txids" not in json.loads(_ppb.read_text())[0]
+      and "forwarded_txid" not in json.loads(_ppb.read_text())[0])
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
                              "expected_xmr": "1"}]))
 check("...two parts that do NOT reach it (0.0009 + 0.0006 of 0.003) are a "
@@ -5421,7 +5433,7 @@ check("...two parts that do NOT reach it (0.0009 + 0.0006 of 0.003) are a "
                                               "outbound_fee_sat": None}]})
       is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "0.500000000000"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["a3" * 32])
+      and "a3" * 32 not in _ppb.read_text())
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.003",
                              "expected_xmr": "1"}]))
 check("...and the same output on the current plan with vout 0 and on the "
@@ -5450,19 +5462,21 @@ check("...refunded in full afterwards: the deposit-time quote is restored "
       A._reconcile_pairs({"slip": str(_ppb)},
                          {**_PLAN_Q, "refunds": [_RFV]}) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.5"
-      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.05"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == [])
+      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.05")
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
-check("the singular forwarded_txid names the RECORD the plural counts, not "
-      "the current file: a refunded current plan beside a counted "
-      "predecessor names the predecessor",
+check("a refunded CURRENT plan beside a counted predecessor is written "
+      "from the predecessor: its figures, and no transaction id anywhere "
+      "on the slip (the host-privacy pass took the txid fields off; the "
+      "figures are the whole observable now)",
       A._reconcile_pairs({"slip": str(_ppb)},
                          {**_NEW, "replaces": None,
                           "refunds": [{**_RFV, "of": "ef" * 32}]},
                          chain=[_PLAN_Q]) is True
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["ab" * 32]
-      and json.loads(_ppb.read_text())[0]["forwarded_txid"] == "ab" * 32)
+      and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.31"
+      and json.loads(_ppb.read_text())[0]["btc_in"] == "0.0498"
+      and "ab" * 32 not in _ppb.read_text()
+      and "ef" * 32 not in _ppb.read_text())
 # ONE SWAP PER OUTPOINT (stage 6, self-doubt pass). An evicted forward's
 # re-sign and a rejected re-send's fresh forward name nothing in
 # `replaces` -- the original was NOT in the network -- yet the original's
@@ -5479,7 +5493,8 @@ check("an evicted original and its re-sign spend the same outpoint: the "
       A._reconcile_pairs({"slip": str(_ppb)}, _P_E2, chain=[_P_E1]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.20"
       and json.loads(_ppb.read_text())[0]["btc_in"] == "0.0497"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["22" * 32])
+      and "11" * 32 not in _ppb.read_text()
+      and "22" * 32 not in _ppb.read_text())
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 _P_E3 = {**_PLAN_Q, "txid": "33" * 32, "ts": 300, "inputs": _IN_A,
@@ -5491,7 +5506,7 @@ check("three signatures over one outpoint and the MIDDLE one mined: the "
                          chain=[{**_P_E2, "superseded_by": "11" * 32},
                                 _P_E1]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "1.20"
-      and json.loads(_ppb.read_text())[0]["forwarded_txids"] == ["22" * 32])
+      and "22" * 32 not in _ppb.read_text())
 _ppb.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
                              "expected_xmr": "1.5"}]))
 check("...plans over DIFFERENT outpoints (a returned deposit's second "
@@ -5621,7 +5636,7 @@ check("a record WITHOUT the forward_sent mark but with a plan on disk that "
       and (_bb.result or {}).get("status") == "done"
       and (_bb.result or {}).get("phase") == "sent"
       and _rec_of(_dd).get("forward_sent") is True
-      and _rec_of(_dd).get("forward_inputs") == [])
+      and "forward_inputs" not in _rec_of(_dd))
 print("\n== a forward that found nothing settled says what it saw ==")
 
 

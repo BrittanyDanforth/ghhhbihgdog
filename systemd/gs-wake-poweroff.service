@@ -7,7 +7,7 @@
 # the wallet-password scratch file. gs_console's job watchdog records what a
 # straight kill cost: "a timed-out run left all of it on disk."
 [Unit]
-Description=GhostSpiral wake: stop the job cleanly, then power off
+Description=Wake: stop the job cleanly, then power off
 DefaultDependencies=no
 Before=shutdown.target
 

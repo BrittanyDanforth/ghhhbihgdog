@@ -8950,7 +8950,7 @@ def main():
 
         meta = {
             "schema": "unsigned_v1",
-            "version": VERSION,
+            # no "version": see _write_plans (the host-privacy pass)
             "created": int(time.time()) // 600 * 600,
             "rounds": len(fanout_plan) + len(dag_plan),
             # hop_fee_reserve(fee_xmr), NOT `per_round_fee` (a local of
@@ -9061,6 +9061,15 @@ def _write_plans(args, meta, fanout_plan, veil_plan, dag_plan) -> tuple:
     recognisable as a set -- and _stage5_cleanup erases every unsigned_*.json
     it is not explicitly told to keep, which is how a previous run's plans stop
     accumulating in the output directory.
+
+    THE META CARRIES NO TOOLCHAIN VERSION (the host-privacy pass). It held
+    `"version": VERSION`, and nothing read it: a complete run erases these
+    files, but a crashed one leaves them deliberately (_report_surviving_plans
+    names them so the operator can finish or wipe by hand), and what was left
+    on the disk then named the exact build that wrote it -- which is to say
+    which bugs to try -- beside the hops and amounts it already holds. The
+    10-minute `created` bucket stays: _stage5_cleanup and the operator both
+    read it.
     """
     outdir = Path(args.output)
     secure_mkdir(outdir)          # 0700, not 0755: listing leaks TX count/timing

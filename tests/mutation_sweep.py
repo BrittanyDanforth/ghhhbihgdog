@@ -1185,7 +1185,7 @@ MUTATIONS = [
 
  # section 4: "If Tor is down, the bot does not start."
  ("the pager starts without proving Tor is up", "gs_telegram_pager",
-  "    verify_tor(proxy)",
+  '    verify_tor(isolated_proxy(args.tor_proxy, "verify"))',
   "    pass",
   ["test_telegram_pager"]),
 
@@ -5452,10 +5452,10 @@ MUTATIONS = [
   '                and not key.get("thornode_url"):',
   '        if False:',
   ['test_wake_agent']),
- ('the forwarded outpoints are not recorded on the ledger', 'gs_wake_agent',
-  '            handles[handle]["forward_inputs"] = sorted(\n'
-  '                set(handles[handle].get("forward_inputs") or []) | _ins)',
-  '            handles[handle]["forward_inputs"] = sorted(_ins)',
+ ("a record from before keeps the client's outpoints on the ledger",
+  'gs_wake_agent',
+  '        handles[handle].pop("forward_inputs", None)',
+  '        pass',
   ['test_wake_agent']),
  ('the pairs file keeps the deposit-time quote after the forward',
   'gs_wake_agent',
@@ -6186,6 +6186,64 @@ MUTATIONS = [
   '    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb \\\n'
   '            <= 100000:',
   '    if not 1 <= args.feerate_floor_sat_vb <= args.feerate_ceiling_sat_vb:',
+  ['test_wake_agent']),
+ # HOST-PRIVACY PASS: what a seized vault reads, and what a third party is told.
+ ("the slip keeps the forwards' transaction ids beside the destination",
+  'gs_wake_agent',
+  '            pair.pop("forwarded_txids", None)\n'
+  '            pair.pop("forwarded_txid", None)',
+  '            pair["forwarded_txids"] = [p.get("txid") for p in counted]',
+  ['test_wake_agent']),
+ ('the chain line carries the toolchain version again', 'gs_common.py',
+  '                line = f"{ts}|-|{_stage}|{chain_safe(_msg)}"',
+  '                line = f"{ts}|{VERSION}|{_stage}|{chain_safe(_msg)}"',
+  ['test_chain_redaction', 'test_units']),
+ ('the pairing writes its code onto the chain', 'gs_wake_keys',
+  '    integrity_log("wake", "paired")',
+  '    integrity_log("wake", f"paired:{agreed[\'sas\']}")',
+  ['test_wake_agent']),
+ ('a crashed run leaves a plan naming the build that wrote it', 'GhostSpiral',
+  '            "schema": "unsigned_v1",\n'
+  '            # no "version": see _write_plans (the host-privacy pass)',
+  '            "schema": "unsigned_v1",\n'
+  '            "version": VERSION,',
+  ['test_units']),
+ ('every request wears the requests library and its version', 'gs_common.py',
+  '''HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}''',
+  '''HTTP_HEADERS = {}''',
+  ['test_units']),
+ ("the oracle asks for bitcoin's price in bitcoin (this code's own tell)",
+  'gs_common.py',
+  '                "?ids=monero&vs_currencies=btc")',
+  '                "?ids=monero,bitcoin&vs_currencies=btc")',
+  ['test_units']),
+ ("the vault's Tor check rides the bare proxy's default circuit",
+  'gs_wake_agent',
+  '        validate_proxy(key["tor_proxy"])\n'
+  '        _vt(isolated_proxy(key["tor_proxy"], "verify"))',
+  '        _vt(validate_proxy(key["tor_proxy"]))',
+  ['test_wake_agent']),
+ ("the forward's Tor check rides the bare proxy's default circuit",
+  'btc_forwarder',
+  '    verify_tor(isolated_proxy(args.tor_proxy, "forward:verify"))',
+  '    verify_tor(proxy)',
+  ['test_btc_forwarder']),
+ ("the pager's Tor check rides the bare proxy's default circuit",
+  'gs_telegram_pager',
+  '    verify_tor(isolated_proxy(args.tor_proxy, "verify"))',
+  '    verify_tor(proxy)',
+  ['test_telegram_pager', 'test_opsec_doc']),
+ ('the exact intake floor (the fee ceiling in disguise) reaches the chat',
+  'gs_wake_keys',
+  '    return -(-_exact // 1000) * 1000',
+  '    return _exact',
+  ['test_wake_agent']),
+ ("the dry run writes the Pi's address into the job log", 'gs_wake_agent',
+  '        print(f"      The doorbell answered at {key[\'doorbell_url\']} with "\n'
+  '              f"a {len(window)}-byte wake window.")',
+  '        agent_say(f"      The doorbell answered at {key[\'doorbell_url\']} '
+  'with "\n'
+  '                  f"a {len(window)}-byte wake window.")',
   ['test_wake_agent']),
 ]
 

@@ -1847,8 +1847,11 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
     "short" about a swap that delivered exactly what it quoted. So once a
     plan says the money moved and carries a quote, the pair routed to this
     deposit's destination is rewritten from it: what was sent, what was
-    quoted, the txids for the operator's reading -- the deposit-time
-    figures kept beside them as `quoted_at_deposit`, written once.
+    quoted -- the deposit-time figures kept beside them as
+    `quoted_at_deposit`, written once. No transaction id: the slip names
+    the deposit address and the XMR destination already, and a txid beside
+    them was the deposit's whole public-chain link on one file (the
+    host-privacy pass took it off).
 
     EVERY FORWARD OF THE DEPOSIT COUNTS. A returned deposit (a refund, a
     second payment) is forwarded again as a second swap to the SAME
@@ -2050,16 +2053,18 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
                 pair["btc_in"] = _q.get("btc_in", pair.get("btc_in"))
                 pair["expected_xmr"] = _q.get("expected_xmr",
                                               pair.get("expected_xmr"))
-                pair["forwarded_txids"] = []
-                pair["forwarded_txid"] = None
             else:
                 pair["btc_in"] = _fmt(Decimal(_sent) / Decimal(10 ** 8))
                 pair["expected_xmr"] = str(_exp)
-                pair["forwarded_txids"] = [p.get("txid") for p in counted]
-                # THE RECORD, not the current file: the current plan may
-                # be the refunded or superseded one, and a singular that
-                # names a forward the plural left out contradicts itself.
-                pair["forwarded_txid"] = kept[0].get("txid")
+            # NO TRANSACTION ID ON THE SLIP (the host-privacy pass). The
+            # rewrite named the forwards' txids here "for the operator's
+            # reading"; nothing read them, and a txid beside the deposit
+            # address and the XMR destination made the slip the complete
+            # public-chain link of the deposit, on a file that lives until
+            # the pay-out. The watcher needs the figures alone. A slip from
+            # before is stripped the next time it is rewritten.
+            pair.pop("forwarded_txids", None)
+            pair.pop("forwarded_txid", None)
             changed = True
         if changed:
             atomic_write_json(pairs, Path(path), perms=0o600)
@@ -2882,8 +2887,11 @@ def run_once(args, deps: dict = None) -> tuple:
         if _pf:
             agent_say(f"      Pairing code {_pf} -- the Pi's keyfile carries "
                       f"the same one if these two boxes were paired together.")
-        agent_say(f"      The doorbell answered at {key['doorbell_url']} with "
-                  f"a {len(window)}-byte wake window.")
+        # print, NOT agent_say (the host-privacy pass): the Pi's address is
+        # for the operator's eyes at the terminal, not for the job log on
+        # the disk, which the dry run had opened before this line.
+        print(f"      The doorbell answered at {key['doorbell_url']} with "
+              f"a {len(window)}-byte wake window.")
         # THE ISSUED-INDEX MARK, TRIED (self-doubt over the fix pass): a
         # mark this unit cannot write refuses EVERY deposit as
         # btc_issued_unrecorded, and beside a keyfile under /etc that was
@@ -2917,8 +2925,9 @@ def run_once(args, deps: dict = None) -> tuple:
         # quietly ceasing to arrive, at the moment money is waiting on it.
         _dp = (key.get("delivery_public") or "").strip()
         if _dp:
-            agent_say(f"      Slips will be SEALED to delivery key "
-                      f"{_dp[:16]}... — only gs_delivery.key opens them.")
+            # print, not agent_say: the key's prefix stays off the job log.
+            print(f"      Slips will be SEALED to delivery key "
+                  f"{_dp[:16]}... — only gs_delivery.key opens them.")
         elif key.get("deposit_in_chat"):
             agent_say("      Slips will be sent as PLAIN TEXT into the chat "
                       "(deposit_in_chat is set in this keyfile).")
@@ -3202,7 +3211,14 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         _verify_tor()
     else:
         from gs_common import validate_proxy, verify_tor as _vt
-        _vt(validate_proxy(key["tor_proxy"]))
+        # ON ITS OWN CIRCUIT (the host-privacy pass). The check rode the
+        # bare proxy -- Tor's default circuit, shared with any other
+        # uncredentialed stream of this process -- so the one request
+        # every job boot makes to check.torproject.org shared a circuit,
+        # and an exit, with whatever else went bare. validate_proxy
+        # keeps its format refusals; the request itself is isolated.
+        validate_proxy(key["tor_proxy"])
+        _vt(isolated_proxy(key["tor_proxy"], "verify"))
 
     handle = proto.new_handle()
     # EVERYTHING PAST THE LEDGER REPORTS BACK, including a refusal. An earlier
@@ -4696,24 +4712,23 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             str(artifact_dir / f"btc_forward_{handle}.json")
         handles[handle]["forward_sent"] = bool(
             _forward_outcome(artifact_dir, handle)[0])
-        # THE OUTPOINTS OUR FORWARDS SPENT, accumulated over every run
-        # (STAGE5_PLAN.md section 2): the invariant is one signature per
-        # OUTPOINT while a spend of it may be in the network, not one
-        # forward per handle. The forwarder keeps the same list from its
-        # plan chain; this is the ledger's copy, read by the pairs rewrite
-        # and by the operator. No amount, no txid.
+        # THE PAIRS REWRITE READS THE PLAN THE FORWARD JUST WROTE. The
+        # outpoints it spent were accumulated on the record too, as "the
+        # ledger's copy, read by the pairs rewrite and by the operator" --
+        # and nothing read them: the forwarder keeps its own list on the
+        # plan chain (STAGE5_PLAN.md section 2), and each entry was a
+        # public-chain transaction id of the client's payment, on a record
+        # the pay-out never retires, on a disk that unlocks itself. The
+        # host-privacy pass took them off: the ledger names no transaction,
+        # and a record from before is stripped the next time it is written.
+        handles[handle].pop("forward_inputs", None)
         try:
             _plan_now = _read_json(
                 artifact_dir / f"btc_forward_{handle}.json") or {}
-            _ins = {f"{i.get('tx_hash')}:{i.get('vout')}"
-                    for i in (_plan_now.get("inputs") or [])
-                    if isinstance(i, dict)}
-            handles[handle]["forward_inputs"] = sorted(
-                set(handles[handle].get("forward_inputs") or []) | _ins)
             _reconcile_pairs(handles[handle], _plan_now,
                              chain=_forward_chain(artifact_dir, handle))
         except Exception:                                    # noqa: BLE001
-            integrity_log("wake", "forward_inputs_unrecorded")
+            integrity_log("wake", "pairs_unreconciled")
     if _spent_pair is not None:
         for _rec in handles.values():
             if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:
