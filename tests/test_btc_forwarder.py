@@ -1460,6 +1460,23 @@ check("...and --bump-after 0 (the testnet drill's setting) replaces it at "
 check("...a negative --bump-after is refused",
       _refusal(Net(), "--reconcile", *_TN, "--bump-after", "-1",
                dry_run=False, outfile=_ofY)[3] == "bad_args")
+# THE WINDOW IS DRAWN, NOT THE FLAG'S EXACT NUMBER (the host-privacy
+# pass): a replacement at a fixed offset after the transaction it
+# replaces put every one of this host's bumps in one population, on a
+# pair of public transactions. Never BELOW the operator's setting: it is
+# a "has waited at least this long" bound, and bumping sooner would be
+# this tool overriding them into a second fee.
+_bw = sorted(F.BUMP_WINDOW(7200) for _ in range(400))
+check("the bump window is drawn per reconciliation: at or above the "
+      "operator's setting, never above it by more than the spread, and "
+      "genuinely spread (not one value repeated)",
+      _bw[0] >= 7200
+      and _bw[-1] <= 7200 + int(7200 * float(F.BUMP_SPREAD_MAX))
+      and len(set(_bw)) > 100
+      and _bw[-1] - _bw[0] > int(7200 * float(F.BUMP_SPREAD_MAX)) // 2)
+check("...and a window of 0 stays 0: the operator turned the bump off "
+      "and a drill must still replace at once",
+      F.BUMP_WINDOW(0) == 0 and F.BUMP_WINDOW(-5) == 0)
 # THE LOOK STILL LISTS THE INPUTS (a server whose mempool never saw the
 # original): not duplicated -- one input, not two of the same outpoint.
 _pD, _ofD, _hxD = _first_send()
@@ -3041,9 +3058,10 @@ check("the default limit jitter is 0..cap and not constant (a cap of 0 "
       all(0 <= d <= 5000 for d in _ldraws) and len(_ldraws) > 20
       and F._limit_jitter(0) == 0)
 _srcF = open(F.__file__, encoding="utf-8").read()
-check("all three draw from the system CSPRNG (secrets), never the random "
-      "module",
-      _srcF.count("secrets.randbelow(") == 3 and "import random" not in _srcF)
+check("all FOUR draws -- the fee jitter, the limit jitter, the limit's "
+      "margin and the bump window -- come from the system CSPRNG "
+      "(secrets), never the random module",
+      _srcF.count("secrets.randbelow(") == 4 and "import random" not in _srcF)
 # THE LIMIT'S RATIO TO THE QUOTE IS A BAND, NOT A NUMBER (self-doubt over
 # the fix): the jitter killed the "99 times an integer" test, but the limit
 # was still 0.99 of 0.90 of the quote -- 0.891 to five decimals, a public

@@ -206,9 +206,34 @@ def _limit_margin():
         max(0, LIMIT_MARGIN_MAX_BPS - LIMIT_MARGIN_MIN_BPS) + 1)
 
 
+#: THE BUMP WINDOW IS DRAWN TOO (the host-privacy pass). --bump-after is
+#: an exact number of seconds from the keyfile, so every replacement this
+#: host ever made appeared in the mempool at the SAME offset after the
+#: transaction it replaced -- 7200 s by default, on a chain where both
+#: transactions and both times are public. A replacement is already rare
+#: and already recognisable as one (same outpoints, higher fee); the
+#: offset is what made this host's replacements one population. The window
+#: is drawn per reconciliation from the band below, so the observed
+#: offsets are a spread and the mean is the operator's setting. NEVER
+#: BELOW the setting: it is a "has waited at least this long" bound, and
+#: bumping sooner than the operator asked would be this tool overriding
+#: them to pay a second fee.
+BUMP_SPREAD_MAX = Decimal("0.5")
+
+
+def _bump_window(bump_after_s):
+    """`bump_after_s` .. bump_after_s * (1 + BUMP_SPREAD_MAX), uniform in
+    whole seconds. Zero stays zero: the operator turned the bump off."""
+    base = max(0, int(bump_after_s))
+    if base <= 0:
+        return 0
+    return base + secrets.randbelow(int(base * BUMP_SPREAD_MAX) + 1)
+
+
 FEE_JITTER = _fee_jitter
 LIMIT_JITTER = _limit_jitter
 LIMIT_MARGIN_BPS = _limit_margin
+BUMP_WINDOW = _bump_window
 #: The slippage the arrival watcher accepts, mirrored from
 #: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
 ARRIVAL_TOLERANCE = Decimal("0.10")
@@ -1631,10 +1656,13 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # (stuck_forward says why).
     _est = (args.feerate_sat_vb if args.feerate_sat_vb
             else picture.get("fee_sat_vb"))
+    # The window is DRAWN, never the flag's exact number (BUMP_WINDOW): a
+    # replacement at a fixed offset after the transaction it replaces is
+    # this host's signature on a pair of public transactions.
     stuck, conflicts = stuck_forward(
         [plan] + [p for p in chain
                   if str(p.get("txid") or "").lower() != txid],
-        spends, ours, _est, args.bump_after)
+        spends, ours, _est, BUMP_WINDOW(args.bump_after))
 
     # MONEY THAT CAME BACK AGAIN IS KEPT (third self-doubt pass). A refund
     # was sent on again at a fresh quote, which is right the first time (a

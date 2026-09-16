@@ -1646,6 +1646,11 @@ class Pager:
     btc_network = "main"
     btc_poll_s = 600
     deposit_min_sat = proto.DEPOSIT_MIN_SAT
+    #: The hold before a first forward (the host-privacy pass). A class
+    #: default like the rest, so a fixture-built Pager draws one too rather
+    #: than raising -- and so the shipped behaviour is the private one even
+    #: on a path that forgot to set it.
+    btc_hold_max_s = 1800
 
     def __init__(self, args, token: str, key: dict, proxies: dict):
         self.args = args
@@ -1770,6 +1775,19 @@ class Pager:
         #: or stuck forward. At least the vault's --btc-bump-after.
         self.btc_recheck_s = int(getattr(args, "btc_recheck", 10800)
                                  or 10800)
+        #: THE HOLD BEFORE A FIRST FORWARD (the host-privacy pass). The
+        #: watcher started the forward on the tick that first saw the
+        #: deposit settle, so every one of this host's forwards went out a
+        #: fixed-shaped interval after its deposit's Nth confirmation --
+        #: this end's tick, the vault's 5-20 min jitter and nothing else --
+        #: and both the payment and the sweep that follows it are public.
+        #: A delay drawn per deposit from 0..this widens that into a band
+        #: and takes the chat's "sending it on" further from the chain
+        #: event it announces. Costs the client waiting; costs no wake (the
+        #: entry is looked at on the poll that was happening anyway). 0
+        #: turns it off.
+        self.btc_hold_max_s = max(0, int(getattr(args, "btc_hold_max", 1800)
+                                         or 0))
         #: How many of the day's courtesy pokes are kept for TAPS: a fee
         #: retry or a recheck this end starts by itself waits while fewer
         #: than that remain, so the automatic path cannot spend the last
@@ -5748,6 +5766,21 @@ class Pager:
             return False
         return True
 
+    def _btc_hold_draw(self) -> int:
+        """Seconds to hold a settled deposit before its FIRST forward is
+        started: 0..--btc-hold-max, uniform, from the system CSPRNG.
+
+        Drawn per deposit, not per install, and never written down: the
+        point is that the interval between a public payment confirming and
+        the public sweep that follows it is a band this host's forwards
+        share with nothing, rather than the same shape every time. 0 (the
+        flag off) is an honest answer and returns at once.
+
+        self.rng is random.SystemRandom -- the CSPRNG, and the same handle
+        every other draw in this file uses, so a test can pin it."""
+        _m = int(self.btc_hold_max_s)
+        return self.rng.randint(0, _m) if _m > 0 else 0
+
     def _btc_apply(self, h: str, r: dict) -> None:
         """Apply one look's answer to one entry and say what changed."""
         state = str(r.get("state") or "")
@@ -5792,6 +5825,17 @@ class Pager:
             else:
                 e["conf"], e["unconf"] = conf, unconf
                 _waiting = time.time() < float(e.get("retry_after") or 0.0)
+                # THE HOLD, DRAWN ONCE ON THE TICK THAT FIRST SEES IT
+                # SETTLE (the host-privacy pass; _btc_hold_draw). Not a
+                # retry's wait: a retry already has its own backoff and is
+                # gated on the reserve, and a first forward is what the
+                # day's budget is for. Nothing is said while it runs --
+                # the chat heard "received" and hears "sending it on"
+                # when the wake really starts, which is the point.
+                if state == "confirmed" and not e.get("forward_hold") \
+                        and not _waiting:
+                    e["forward_hold"] = time.time() + self._btc_hold_draw()
+                _holding = time.time() < float(e.get("forward_hold") or 0.0)
                 # A FEE RETRY, or the retry of a refused or failed forward,
                 # is a start nobody asked for: it leaves the reserve for
                 # taps (_btc_can_start), and it is not said -- the chat
@@ -5800,10 +5844,12 @@ class Pager:
                 _retry = (int(e.get("fee_tries") or 0) > 0
                           or int(e.get("stall_tries") or 0) > 0
                           or int(e.get("early_tries") or 0) > 0)
-                if state == "confirmed" and _waiting:
+                if state == "confirmed" and (_waiting or _holding):
                     # A `delayed` forward's retry is not due yet: the vault
                     # said so once, in its own words; nothing is said or
-                    # started until --btc-fee-retry has passed.
+                    # started until --btc-fee-retry has passed. Or the
+                    # deposit's own hold is still running, which is the
+                    # same shape and says nothing for the same reason.
                     e["state"] = "seen"
                 elif state == "confirmed" and self._btc_can_start(
                         background=_retry):
@@ -5840,6 +5886,10 @@ class Pager:
                     # silent, reserve-gated start.
                     e["state"] = "not_seen"
                     e.pop("early_tries", None)
+                    # ...and the hold with it: it was drawn for money that
+                    # is no longer here, and a payment that lands again is
+                    # a fresh deposit to this end.
+                    e.pop("forward_hold", None)
             if say and say in e["said"]:
                 say = None
             if say:
@@ -6606,6 +6656,18 @@ def build_cli():
                          "re-signed or replaced at today's rate (default "
                          "10800, floor 600). At least the vault's "
                          "--btc-bump-after, or the recheck finds no bump due.")
+    ap.add_argument("--btc-hold-max", type=int, default=1800,
+                    metavar="SECONDS",
+                    help="the longest this end holds a SETTLED deposit "
+                         "before starting its first forward; the actual "
+                         "hold is drawn per deposit from 0 to this "
+                         "(default 1800). The payment and the sweep that "
+                         "follows it are both public, so a fixed interval "
+                         "between them is this host's signature on every "
+                         "deposit it ever takes; a drawn one is a band. "
+                         "Costs the client that wait and costs no wake. 0 "
+                         "turns it off and forwards on the tick that sees "
+                         "the money settle.")
     ap.add_argument("--deposit-min-sat", type=int, default=0,
                     help="the smallest deposit the wizard takes, in satoshi. "
                          "Default: the vault's intake floor, which the "
@@ -6686,6 +6748,13 @@ def main(argv=None) -> int:
                      "to confirm.")
     if getattr(args, "deposit_min_sat", 0) < 0:
         sys.exit("[!] --deposit-min-sat cannot be negative.")
+    if getattr(args, "btc_hold_max", 1800) < 0:
+        sys.exit("[!] --btc-hold-max cannot be negative. 0 turns the hold "
+                 "off and forwards on the tick that sees the money settle.")
+    if getattr(args, "btc_hold_max", 1800) > 21600:
+        sys.exit("[!] --btc-hold-max over 6 h holds a client's money for "
+                 "most of a day before it is sent on, and a hold the client "
+                 "notices is its own kind of tell. Keep it under 21600.")
     if getattr(args, "btc_reserve", 2) < 0:
         sys.exit("[!] --btc-reserve cannot be negative. 0 disables it.")
     if getattr(args, "btc_reserve", 2) >= int(args.daily_cap):

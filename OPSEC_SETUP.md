@@ -2132,7 +2132,11 @@ decoration cannot push a memo past the policy.
 `--btc-bump-after` (default 7200, at most a week) is how long a forward may
 sit in the mempool before a run of the forward replaces it at today's rate
 (the bump, below); the pager's `--btc-recheck` must be at least this, or
-its rechecks never find one due.
+its rechecks never find one due. The window actually used is **drawn** per
+reconciliation from your setting up to half again as much, never below it:
+a replacement is public, so is the transaction it replaces, and at a fixed
+offset every bump this host ever made was one population. Your number is
+the floor and roughly the mean, not the offset an observer measures.
 
 `--btc-returns-max` (default 2, up to 1000) is how many ROUNDS of money
 that CAME BACK to a deposit address one deposit may have forwarded before
@@ -2320,6 +2324,16 @@ python3 gs_telegram_pager ... \
                            # the forward about it again, by itself, once per
                            # window (floor 600); at or above the vault's
                            # --btc-bump-after, or a bump is never found due
+    --btc-hold-max 1800    # the longest this end holds a SETTLED deposit
+                           # before starting its first forward; the actual
+                           # hold is drawn per deposit from 0 to this. The
+                           # payment confirming and the sweep that follows
+                           # it are both public, so a fixed gap between
+                           # them was this host's signature on every
+                           # deposit it took. Costs the client that wait,
+                           # costs no wake (the entry is looked at on the
+                           # poll that was happening anyway). 0 turns it
+                           # off; over 6 h is refused
     --deposit-min-sat N    # RAISES the wizard's floor. Its default is the
                            # vault's intake floor, which the pairing carries
                            # to this card: a too-small deposit is refused

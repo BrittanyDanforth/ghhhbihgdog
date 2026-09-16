@@ -4686,8 +4686,14 @@ check("flood: the window is real time, not the harness clock: the stamps "
 print("\n-- the watcher: one look per address, the transitions said once --")
 
 
-def _watch_pager(addr=_BTC_ADDR, h="B4A1", chat=111):
+def _watch_pager(addr=_BTC_ADDR, h="B4A1", chat=111, hold=0):
     p, seen, toasts, jobs = _tapper((chat,))
+    # THE HOLD BEFORE A FIRST FORWARD IS OFF HERE (the host-privacy pass).
+    # Every check below is about WHICH tick starts a forward and what is
+    # said; the hold is a separate guarantee with its own checks further
+    # down, and leaving it on would make each of these assert two things
+    # at once. `hold=` turns it back on for the checks that are about it.
+    p.btc_hold_max_s = int(hold)
     p._btc_register(h, addr, chat)
     return p, seen, jobs
 
@@ -6086,6 +6092,72 @@ check("a PROBE answered with a word this end lacks gets the one sentence: "
 # the entry landed on `seen`: looked at every tick instead of once a
 # window, the reserve and floor gates of the forwarded branch left behind
 # -- 144 circuits a day for a spent address.
+print("\n== THE HOST-PRIVACY PASS: a settled deposit is held a drawn while "
+      "before its first forward ==")
+# Both the payment confirming and the sweep that follows it are public, and
+# the sweep went out on the tick that first saw the payment settle -- so the
+# interval between two public events was this host's signature on every
+# deposit it ever took. It is drawn per deposit now, from 0..--btc-hold-max.
+_hd, _hds, _hdj = _watch_pager(hold=1800)
+_hd.rng = types.SimpleNamespace(randint=lambda a, b: 900)
+_hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
+                        "unconfirmed_sat": 0})
+check("the tick that first sees a deposit SETTLE does not start the "
+      "forward: it draws a hold, leaves the entry on seen, spends no wake "
+      "and says nothing (the chat heard 'received' already)",
+      _hdj == [] and _hds == []
+      and _hd.btc_open["B4A1"]["state"] == "seen"
+      and _hd.btc_open["B4A1"]["forward_hold"] > time.time())
+_hd_first = _hd.btc_open["B4A1"]["forward_hold"]
+_hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
+                        "unconfirmed_sat": 0})
+check("...a later tick inside the hold does not redraw it and still starts "
+      "nothing: the wait is the deposit's, not the tick's",
+      _hdj == [] and _hd.btc_open["B4A1"]["forward_hold"] == _hd_first)
+_hd.btc_open["B4A1"]["forward_hold"] = time.time() - 1
+_hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
+                        "unconfirmed_sat": 0})
+check("...and the first tick after it runs out starts the forward and says "
+      "'Sending it on now' -- so the sentence lands with the wake, not "
+      "with the confirmation it used to announce",
+      len(_hdj) == 1 and _hdj[0][1] == "forward_to_swap"
+      and _hdj[0][2] == {"handle": "B4A1"}
+      and _hd.btc_open["B4A1"]["state"] == "forwarding"
+      and any("Sending it on now" in t for t, _b in _hds))
+# THE MONEY LEFT BEFORE IT CONFIRMED: the hold was drawn for a payment that
+# is not there any more, and a payment that lands again is a fresh deposit.
+_hg, _hgs, _hgj = _watch_pager(hold=1800)
+_hg._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
+                        "unconfirmed_sat": 0})
+_hg.btc_open["B4A1"]["state"] = "seen"
+_hg._btc_apply("B4A1", {"state": "not_seen", "confirmed_sat": 0,
+                        "unconfirmed_sat": 0})
+check("a payment replaced out of the mempool takes its hold with it",
+      "forward_hold" not in _hg.btc_open["B4A1"])
+# THE DRAW ITSELF.
+_hz, _, _ = _watch_pager(hold=0)
+check("--btc-hold-max 0 draws nothing and forwards on the tick that sees "
+      "the money settle (the drill's setting, and what the suites above "
+      "run under)", _hz._btc_hold_draw() == 0)
+_hr, _, _ = _watch_pager(hold=1800)
+_hdraws = {_hr._btc_hold_draw() for _ in range(300)}
+check("...and with it set the hold is drawn from 0..the flag, spread, not "
+      "one value repeated",
+      all(0 <= d <= 1800 for d in _hdraws) and len(_hdraws) > 50)
+check("the shipped default holds (the private behaviour is what an "
+      "install that sets nothing gets), and the flag is bounded at both "
+      "ends",
+      pg.Pager.btc_hold_max_s == 1800
+      and pg.build_cli().parse_args([]).btc_hold_max == 1800)
+for _hbad, _hwhy in ((-1, "negative"), (21601, "over six hours")):
+    _hrc = None
+    try:
+        pg.main(["--chat-id", "1", "--btc-hold-max", str(_hbad)])
+    except SystemExit as _e:
+        _hrc = str(_e)
+    check(f"...a {_hwhy} --btc-hold-max is refused at start",
+          _hrc and "--btc-hold-max" in _hrc)
+
 print("\n== a refused start leaves a forwarded deposit forwarded ==")
 _fr, _frs, _frj = _watch_pager()
 _fr.limits.headroom = lambda: 9
