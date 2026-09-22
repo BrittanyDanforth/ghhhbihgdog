@@ -6720,7 +6720,7 @@ _mD = Path(tempfile.mkdtemp(prefix="mainseal_"))
 
 def _open_and_return(args, deps=None):
     A.state_open(_mD, _mV, _mPI)
-    A._STATE_KEY.update(vault=_mV, pi=_mPI, dir=_mD)
+    A._STATE_KEY.update(vault=_mV, pi=_mPI, dir=_mD, opened=True)
     return "done", "done", "abcd"
 
 
@@ -7824,7 +7824,7 @@ A.retire_job_log = lambda *a, **k: None
 A.integrity_log = lambda *a, **k: None
 def fake_run_once(args, deps=None):
     A.state_open(D, V, PI)
-    A._STATE_KEY.update(vault=V, pi=PI, dir=D)
+    A._STATE_KEY.update(vault=V, pi=PI, dir=D, opened=True)
     print("OPENED", flush=True)
     A.run_child(["sh", "-c", CHILD], {}, 120)
     return "done", "done", "abcd"
@@ -8011,8 +8011,9 @@ finally:
     _gsc_pat._SHUTDOWN_REQUESTED = _o_flag7
     A.RESULT_POST_BACKOFF_S = _o_bo7
 check("stage7/stop: report_back's backoff gives way to a stop -- ONE "
-      "attempt, not a minute of retries after the SIGTERM",
-      isinstance(_e7r, A.Stopping) and _rb7 == ["/result"])
+      "attempt, not a minute of retries after the SIGTERM -- and it RETURNS "
+      "rather than raising, so a finished job is not re-reported as failed",
+      _e7r is None and _rb7 == ["/result"])
 
 # main() catches it by name and powers off.
 _pc7 = []
@@ -8252,7 +8253,7 @@ def _joblog_run(outcome):
 
     def _ro(args, deps=None):
         A.state_open(_d, _JV, _JPI)
-        A._STATE_KEY.update(vault=_JV, pi=_JPI, dir=_d)
+        A._STATE_KEY.update(vault=_JV, pi=_JPI, dir=_d, opened=True)
         A._AGENT_LOG[0] = _d / A.JOB_LOG
         A.agent_say("memo: =:XMR.XMR:a-client-destination")
         if outcome == "done":
@@ -8401,6 +8402,220 @@ finally:
 check("stage8/route: `--dry-run --unseal-state <hex>` runs the DRY RUN with "
       "the half -- it used to write every sealed record out in plaintext",
       _rt8 == ["dry_run"])
+
+
+# ===========================================================================
+print("\n== stage 7, read again: a store that was never opened is never "
+      "closed ==")
+# The halves are recorded the moment M2 is read, and a refusal can still come
+# before state_open: a slow answer, a keyfile or secrets file that will not
+# open. main()'s finally then ran state_close on a directory with no
+# plaintext member, read it as a WIPED VAULT and deleted the container -- the
+# whole ledger. With the chain a member, it replaced the container with one
+# holding only this boot's chain lines instead. Found by the self-review of
+# this pass; driven here through the real wake and the real seal function.
+_nd7, _nkf7, _, _nbell7, _, _ = _stage8_env(
+    clobber={"schema": P.SETTINGS_SCHEMA, "salt": "zz", "box": "00"})
+(_nd7 / A.SEALED_FILE).write_text(json.dumps(P.state_seal(
+    {"gs_wake_state.json": '{"jobs": ["a job that was kept"]}',
+     "gs_wake_handles.json": '{"handles": {}, "owners": {}}'},
+    bytes.fromhex(_SEAL_HALF), _S8_PI)))
+(_nd7 / A.CHAIN_MEMBER).write_text(
+    _chain7(["1726090000|-|wake|this_boots_line"])[0] + "\n")
+_no7, _ne7, _ = run(_nkf7, deps_for(_nd7, _nbell7))
+_armed7 = A._STATE_KEY.get("vault") is not None
+A._seal_state_now()
+try:
+    _nm7 = P.state_unseal(json.loads((_nd7 / A.SEALED_FILE).read_text()),
+                          bytes.fromhex(_SEAL_HALF), _S8_PI)
+except Exception:                                            # noqa: BLE001
+    _nm7 = {}
+check("stage7/unopened: precondition -- the wake was refused AFTER the "
+      "halves were recorded and BEFORE the store was opened",
+      getattr(_ne7, "code", None) == "keyfile_unreadable" and _armed7)
+check("stage7/unopened: main()'s seal then leaves the container exactly as "
+      "it was -- it used to delete it, or replace it with one holding only "
+      "this boot's chain line",
+      "a job that was kept" in _nm7.get("gs_wake_state.json", "")
+      and A.CHAIN_MEMBER not in _nm7 and A._STATE_KEY == {})
+
+
+# ===========================================================================
+print("\n== the self-review of this pass: what its own fixes got wrong ==")
+import threading as _thr
+
+# A CHILD THAT FINISHES INSIDE ITS STOP GRACE IS RETURNED, not discarded.
+def _late_stop(delay):
+    _t = _thr.Timer(delay, lambda: setattr(_gsc_pat, "_SHUTDOWN_REQUESTED",
+                                           True))
+    _t.start()
+    return _t
+
+
+_o_flag_sr = _gsc_pat._SHUTDOWN_REQUESTED
+try:
+    _late_stop(1.5)
+    _sr1 = A.run_child(["sh", "-c", "trap 'exit 0' TERM; sleep 30 & wait"],
+                       {}, 60)
+finally:
+    _gsc_pat._SHUTDOWN_REQUESTED = _o_flag_sr
+check("review: a child that exits cleanly inside its stop grace has its "
+      "outcome RETURNED -- raising threw away a finished step and skipped "
+      "its bookkeeping", _sr1 == (0, False))
+_o_gr_sr = A.STOP_CHILD_GRACE_S
+A.STOP_CHILD_GRACE_S = 1
+try:
+    _late_stop(1.5)
+    _sr2 = A.run_child(["sh", "-c", "trap '' TERM; sleep 30"], {}, 60)
+finally:
+    _gsc_pat._SHUTDOWN_REQUESTED = _o_flag_sr
+    A.STOP_CHILD_GRACE_S = _o_gr_sr
+check("review: ...and one that ignores SIGTERM is killed after the grace and "
+      "reported KILLED, which the caller reads as a failed step",
+      _sr2[1] is True and _sr2[0] != 0)
+
+# THE LEDGER IS SAVED AFTER THE MONEY MOVED, even if the stop arrives then.
+_pd, _pruns, _prun0 = _ledger_env("postmix_")
+_led_raw = json.loads((_pd / A.HANDLES_FILE).read_text())
+(_pd / A.HANDLES_FILE).write_text(json.dumps(
+    {"handles": _led_raw, "owners": {OWNER: {"accounts": [9]}}}))
+
+
+def _prun(argv, env_extra, budget_s):
+    _gsc_pat._SHUTDOWN_REQUESTED = True          # the stop lands as it ends
+    return _prun0(argv, env_extra, budget_s)
+
+
+_acct_seq = iter([{9}, None, {9, 10}])
+_o_pw_pm = os.environ.get("GS_WALLET_PASSWORD")
+os.environ["GS_WALLET_PASSWORD"] = ""
+_o_il_pm = A.integrity_log
+A.integrity_log = lambda *a, **k: None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1,
+                                     "owner": OWNER},
+                        _k, _pd, "C4D5", _prun, "job-pm",
+                        accounts=lambda: next(_acct_seq),
+                        funded=lambda: (9, 4, _XMR_SAMPLE,
+                                        5_000_000_000_000))
+            _pm_err = None
+        except BaseException as e:                           # noqa: BLE001
+            _pm_err = type(e).__name__
+finally:
+    _gsc_pat._SHUTDOWN_REQUESTED = _o_flag_sr
+    A.integrity_log = _o_il_pm
+    if _o_pw_pm is None:
+        os.environ.pop("GS_WALLET_PASSWORD", None)
+    else:
+        os.environ["GS_WALLET_PASSWORD"] = _o_pw_pm
+_pm_led = json.loads((_pd / A.HANDLES_FILE).read_text())
+check("review: a stop that lands AFTER the mix does not skip the ledger -- "
+      "the deposit is marked spent and the minted account recorded as the "
+      "owner's; a _nap in that retry raised and lost both",
+      _pm_err is None
+      and _pm_led["handles"]["A3F1"].get("spent") is True
+      and 10 in _pm_led["owners"][OWNER]["accounts"])
+
+# AN EMPTY VALUE IS THE HAND COMMAND, REFUSED -- never a wake.
+_ew = []
+_sv_ew = (A.run_once, A.power_off, A.disarm_deadman, A.somebody_is_here,
+          A.retire_job_log, A.integrity_log)
+A.run_once = lambda a, deps=None: _ew.append("WAKE") or ("done", "done", "")
+A.power_off = lambda dry_run=False: _ew.append("power_off") or True
+A.disarm_deadman = lambda *a, **k: True
+A.somebody_is_here = lambda: ""
+A.retire_job_log = lambda *a, **k: None
+A.integrity_log = lambda *a, **k: None
+_ew_rc = {}
+try:
+    for _fl in ("--seal-secrets", "--unseal-state", "--unseal-key"):
+        _ew.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                _ew_rc[_fl] = (A.main(["--key", "/nonexistent", _fl, ""]),
+                               list(_ew))
+            except BaseException as e:                       # noqa: BLE001
+                _ew_rc[_fl] = (type(e).__name__, list(_ew))
+finally:
+    (A.run_once, A.power_off, A.disarm_deadman, A.somebody_is_here,
+     A.retire_job_log, A.integrity_log) = _sv_ew
+check("review: `--seal-secrets \"\"`, `--unseal-state \"\"` and "
+      "`--unseal-key \"\"` -- an unset shell variable -- never run a wake "
+      "and never power the box off",
+      all("WAKE" not in _v[1] and "power_off" not in _v[1]
+          for _v in _ew_rc.values()))
+
+# A STALE .new CANNOT CARRY ITS MODE ONTO THE SEALED FILE.
+_st_out = Path(_d0) / "stale.sealed"
+_st_new = _st_out.with_name(_st_out.name + ".new")
+_st_new.write_text("left by an earlier run")
+_st_new.chmod(0o644)
+with contextlib.redirect_stdout(io.StringIO()):
+    _st_rc = A.seal_secrets_cli(types.SimpleNamespace(
+        key=str(_kf9), seal_secrets=_S8_PI.hex(),
+        secrets_env=str(_env9), secrets_file=str(_st_out)))
+check("review: a stale .new left at 0644 does not make the sealed file 0644",
+      _st_rc == "sealed"
+      and oct(_st_out.stat().st_mode & 0o777) == "0o400")
+
+# THE CHAIN MERGE KEEPS A TORN LINE VISIBLY TORN.
+_torn = _chain7(["1726090000|-|wake|refused:doorbell_unreachable",
+                 "1726090600|-|wake|job_accepted"])
+_torn[-1] = _torn[-1][:len(_torn[-1]) - 6]          # a power cut mid-write
+_tcd, _tcg, _tcv = _chain_case7(_torn)
+check("review: a TORN line in the disk's tail stays torn after the merge -- "
+      "re-hashing it would erase the one damage an unkeyed chain can show",
+      _tcg[:3] == _CH7 and _tcv is False)
+_tcd2, _tcg2, _tcv2 = _chain_case7(_torn[:1])
+check("review: ...while the same tail without the torn line merges and "
+      "verifies", _tcv2 is True and len(_tcg2) == 4)
+
+
+# ===========================================================================
+print("\n== the self-review: a refusal after M2 is told to the Pi ==")
+# The handover is at-most-once, so M2 has taken the job. state_half_missing,
+# keyfile_unreadable and secrets_unreadable were bare refusals: the Pi was
+# never answered, and the pager held its one-job lock for the whole result
+# budget -- 16.5 hours for a withdrawal.
+for _m2c, _m2env, _m2why in (
+        ("keyfile_unreadable",
+         lambda: _stage8_env(clobber={"schema": P.SETTINGS_SCHEMA,
+                                      "salt": "zz", "box": "00"}),
+         "a keyfile whose sealed section will not open"),):
+    _m2d, _m2kf, _, _m2bell, _, _ = _m2env()
+    _m2dp = deps_for(_m2d, _m2bell)
+    _m2o, _m2e2, _ = run(_m2kf, _m2dp)
+    A._STATE_KEY.clear()
+    check(f"review/m2: {_m2why} refuses {_m2c} AND tells the doorbell "
+          f"'refused', so the pager is not left holding its lock",
+          getattr(_m2e2, "code", None) == _m2c
+          and _m2bell.result is not None
+          and _m2bell.result.get("status") == "refused")
+# The secrets file: a keyfile with a half, and a sealed secrets file sealed
+# under ANOTHER pairing, so it will not open.
+_m2sd, _m2skf, _, _m2sbell = _sealed_env()
+_m2sec = Path(_d0) / "otherpair.sealed"
+_m2sec.write_text(json.dumps(P.state_seal(
+    {P.SECRETS_MEMBER: json.dumps({"GS_WALLET_PASSWORD": "x"})},
+    bytes(32), bytes(32), schema=P.SECRETS_SCHEMA)))
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.run_once(types.SimpleNamespace(key=str(_m2skf), dry_run=False,
+                                         secrets_file=str(_m2sec)),
+                   {k: v for k, v in deps_for(_m2sd, _m2sbell).items()
+                    if not k.startswith("_")})
+    _m2se = None
+except A.Refused as e:
+    _m2se = e
+A._STATE_KEY.clear()
+A._SECRETS.clear()
+check("review/m2: a secrets file from another pairing refuses "
+      "secrets_unreadable AND tells the doorbell 'refused'",
+      getattr(_m2se, "code", None) == "secrets_unreadable"
+      and _m2sbell.result is not None
+      and _m2sbell.result.get("status") == "refused")
 
 
 # ===========================================================================

@@ -6515,9 +6515,9 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the sealed secrets are never opened, so the wake signs from the '
   'environment alone', 'gs_wake_agent',
-  '        _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),\n'
-  '                           _vault_half, _pi_half)',
-  '        _ns = 0',
+  '            _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),\n'
+  '                               _vault_half, _pi_half)',
+  '            _ns = 0',
   ['test_wake_agent']),
  ('the seed is read from the environment rather than the seal',
   'gs_wake_agent',
@@ -6548,8 +6548,8 @@ MUTATIONS = [
   '    found = dict(env)',
   ['test_wake_agent']),
  ('the sealed secrets land world-readable', 'gs_wake_agent',
-  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)',
-  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)',
+  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)',
+  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)',
   ['test_wake_agent']),
  ('a seed stays in RAM after a run that does not power the box off',
   'gs_wake_agent',
@@ -6683,9 +6683,9 @@ MUTATIONS = [
  #    the records stayed in plaintext on a machine that was then off.
  ("run_child's wait does not notice a stop request", 'gs_wake_agent',
   '            if shutdown_requested():\n'
-  '                _stop_child_now(p)',
+  '                # THE CHILD\'S OUTCOME IS RETURNED',
   '            if False:\n'
-  '                _stop_child_now(p)',
+  '                # THE CHILD\'S OUTCOME IS RETURNED',
   ['test_wake_agent']),
  ('a stop request still starts the next child', 'gs_wake_agent',
   '    _stop_if_asked()\n    if runner is not None:',
@@ -6773,9 +6773,9 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the chain tail is appended without re-chaining, so it no longer verifies',
   'gs_wake_agent',
-  '        prev = hashlib.sha256((prev + payload).encode()).hexdigest()\n'
-  '        out.append(f"{prev} | {payload}")',
-  '        out.append(ln)',
+  '            prev = hashlib.sha256((prev + payload).encode()).hexdigest()\n'
+  '            out.append(f"{prev} | {payload}")',
+  '            out.append(ln)',
   ['test_wake_agent']),
  ('the chain merge ignores the shared prefix and duplicates the history',
   'gs_wake_agent',
@@ -6825,6 +6825,59 @@ MUTATIONS = [
   'gs_wake_agent',
   '                    and not getattr(args, "dry_run", False):',
   '                    and True:',
+  ['test_wake_agent']),
+
+ # -- THE SELF-REVIEW OF THIS PASS: what its own fixes, and stage 7, got
+ #    wrong. The first is the worst thing found all day: a refusal between
+ #    M2 and state_open made main()'s seal DELETE the whole store.
+ ('a store that was never opened is closed, which deletes the container',
+  'gs_wake_agent',
+  '    if not _STATE_KEY.get("opened"):\n        _STATE_KEY.clear()\n'
+  '        return\n',
+  '',
+  ['test_wake_agent']),
+ ('the open is never recorded, so nothing is ever sealed', 'gs_wake_agent',
+  '        _STATE_KEY["opened"] = True\n',
+  '',
+  ['test_wake_agent']),
+ ("a child's clean exit inside its stop grace is thrown away",
+  'gs_wake_agent',
+  '                _killed = _stop_child_now(p)\n'
+  '                return (p.returncode if p.returncode is not None else -9), \\\n'
+  '                    _killed',
+  '                _stop_child_now(p)\n'
+  '                raise Stopping("the unit was asked to stop mid-job")',
+  ['test_wake_agent']),
+ ('a stop after the mix skips the ledger save', 'gs_wake_agent',
+  '                time.sleep(2)\n',
+  '                _nap(2)\n',
+  ['test_wake_agent']),
+ ('a stop during a finished job\'s report re-reports it as failed',
+  'gs_wake_agent',
+  '            except Stopping:\n'
+  '                integrity_log("wake", "result_stopped")\n'
+  '                return',
+  '            except Stopping:\n'
+  '                raise',
+  ['test_wake_agent']),
+ ('an empty --seal-secrets value runs a full wake', 'gs_wake_agent',
+  '            if getattr(args, "seal_secrets", None) is not None:',
+  '            if getattr(args, "seal_secrets", None):',
+  ['test_wake_agent']),
+ ("a stale .new carries its mode onto the sealed secrets", 'gs_wake_agent',
+  '        try:\n            tmp.unlink()\n        except FileNotFoundError:\n'
+  '            pass\n'
+  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)',
+  '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)',
+  ['test_wake_agent']),
+ ('the chain merge re-hashes a torn line and hides it', 'gs_wake_agent',
+  '        if held:\n',
+  '        if True:\n',
+  ['test_wake_agent']),
+ ('a refusal after M2 is never told to the Pi, which holds its lock for '
+  'the whole result budget', 'gs_wake_agent',
+  '            raise _reported(_key_clear, d, job_id, challenge, _m2e)\n',
+  '            raise _m2e\n',
   ['test_wake_agent']),
 ]
 

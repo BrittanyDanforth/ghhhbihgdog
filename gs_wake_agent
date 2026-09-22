@@ -1080,11 +1080,25 @@ def _merge_chain(path: Path, sealed_text: str) -> None:
     while k < min(len(sealed), len(disk)) and sealed[k] == disk[k]:
         k += 1
     prev = (sealed[-1].split(" | ", 1)[0].strip() if sealed else "0" * 64)
+    # Each disk line is checked against the DISK's own chain first. A line
+    # that held there is re-chained onto the history; one that did not --
+    # a torn last line from a power cut, an overwrite -- is copied as it
+    # is, so verify_integrity_chain still stops at it. Re-hashing it would
+    # erase the one kind of damage an unkeyed chain can show.
+    dprev = (disk[k - 1].split(" | ", 1)[0].strip() if k else "0" * 64)
     out = list(sealed)
     for ln in disk[k:]:
+        h_disk = ln.split(" | ", 1)[0].strip() if " | " in ln else ""
         payload = ln.split(" | ", 1)[1] if " | " in ln else ln
-        prev = hashlib.sha256((prev + payload).encode()).hexdigest()
-        out.append(f"{prev} | {payload}")
+        held = (h_disk == hashlib.sha256(
+            (dprev + payload).encode()).hexdigest())
+        dprev = h_disk
+        if held:
+            prev = hashlib.sha256((prev + payload).encode()).hexdigest()
+            out.append(f"{prev} | {payload}")
+        else:
+            out.append(ln)
+            prev = h_disk
     lock_fd = None
     try:
         lock_fd = os.open(str(path) + ".lock", os.O_WRONLY | os.O_CREAT,
@@ -1181,6 +1195,22 @@ def _seal_state_now() -> None:
     ciphertext never landed is a client's money with no bookkeeping.
     state_close returns -1 rather than raising, and says so."""
     if _STATE_KEY.get("vault") is None:
+        return
+    # A STORE THAT WAS NEVER OPENED IS NEVER CLOSED. The halves are recorded
+    # the moment M2 is read, and a refusal can still come between that and
+    # state_open -- a slow answer past the M1-M2 window, a keyfile or a
+    # secrets file that will not open. state_close on that directory finds
+    # no plaintext member, reads it as a wiped vault and DELETES THE
+    # CONTAINER -- the whole ledger, every open slip, every plan chain --
+    # or, with the chain a member, replaces it with one holding only this
+    # boot's chain lines. Nothing was opened, so nothing is closed.
+    #
+    # And an open that failed PART WAY is not closed either: sealing then
+    # would keep the members it had written and drop the rest. The
+    # plaintext it left is a privacy loss the operator can see and fix; the
+    # other way is a ledger nobody can get back.
+    if not _STATE_KEY.get("opened"):
+        _STATE_KEY.clear()
         return
     try:
         _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],
@@ -3425,8 +3455,17 @@ def run_child(argv: list, env_extra: dict, budget_s: int,
                 False
         except subprocess.TimeoutExpired:
             if shutdown_requested():
-                _stop_child_now(p)
-                raise Stopping("the unit was asked to stop mid-job")
+                # THE CHILD'S OUTCOME IS RETURNED, not thrown away. It had
+                # systemd's SIGTERM too, and what it did with it -- finished
+                # the step, wrote a partial record, exited -- is in its exit
+                # code and its files, which the caller already knows how to
+                # read. Raising here discarded a clean exit inside the grace
+                # and skipped the bookkeeping of a step that had happened.
+                # The stop is still honoured: the next spawn refuses
+                # (_stop_if_asked), a report stops retrying, a _nap ends.
+                _killed = _stop_child_now(p)
+                return (p.returncode if p.returncode is not None else -9), \
+                    _killed
             if time.monotonic() >= _end:
                 break
     # THE BUDGET IS SPENT: the watchdog's own stop, unchanged.
@@ -3446,13 +3485,13 @@ def run_child(argv: list, env_extra: dict, budget_s: int,
         return -9, True
 
 
-def _stop_child_now(p) -> None:
+def _stop_child_now(p) -> bool:
     """A stop request's end for a running child: its grace, then the kill,
     so the artifact directory is quiet before the records are sealed.
 
     SIGTERM to the GROUP first, though systemd has usually sent one: this
     also covers a stop the agent noticed some other way, and a second
-    SIGTERM costs a child nothing."""
+    SIGTERM costs a child nothing. Returns whether it had to be KILLED."""
     import signal
     try:
         os.killpg(p.pid, signal.SIGTERM)
@@ -3460,7 +3499,7 @@ def _stop_child_now(p) -> None:
         p.terminate()
     try:
         p.wait(timeout=STOP_CHILD_GRACE_S)
-        return
+        return False
     except subprocess.TimeoutExpired:
         pass
     try:
@@ -3471,6 +3510,7 @@ def _stop_child_now(p) -> None:
         p.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3817,30 +3857,43 @@ def run_once(args, deps: dict = None) -> tuple:
     # starting an empty ledger and re-issuing somebody's address.
     _vault_half, _ = state_halves(key)
     if _vault_half is not None:
+        # A REFUSAL HERE IS TOLD TO THE DOORBELL. The handover is
+        # at-most-once and M2 has already taken the job off the Pi; a
+        # note with no half, or a keyfile or secrets file that will
+        # not open, raised a bare Refused, so the Pi was never answered
+        # and the pager held its one-job lock -- every other command
+        # with it -- for the whole result budget: sixteen and a half
+        # hours for a withdrawal. slow_answer, below, already reported;
+        # these did not. The clear half of the keyfile is all
+        # report_back needs: the wake keypair and the doorbell.
+        _key_clear = key
         try:
-            _pi_half = proto.state_half_of(body)
-        except proto.WakeError:
-            raise Refused(
-                "state_half_missing",
-                "this machine's records are sealed to the pair, and the "
-                "note carries no half of the key. The Pi is running a "
-                "build from before that: update BOTH boxes, in the same "
-                "sitting, as the wire version says.")
-        _STATE_KEY["vault"], _STATE_KEY["pi"] = _vault_half, _pi_half
-        _STATE_KEY["dir"] = artifact_dir
-        # AND THE KEYFILE'S OWN SEALED SECTION, with the same two halves
-        # (STAGE8_PLAN.md). Here rather than at load, because the half only
-        # exists once the note has been opened -- which is the point: the
-        # xpub that names every deposit address this intake ever issued is
-        # not on the seized disk in a readable form. Rebinding `key` is the
-        # whole wiring; everything downstream takes it as a parameter.
-        key = open_keyfile(key, _vault_half, _pi_half)
-        # ...AND THE SPEND SECRETS (STAGE9_PLAN.md), if this box has sealed
-        # them. Same halves, same moment, same reason: the seed spends every
-        # deposit address the xpub above can find, and a machine taken
-        # between wakes should not be holding it in a readable file.
-        _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),
-                           _vault_half, _pi_half)
+            try:
+                _pi_half = proto.state_half_of(body)
+            except proto.WakeError:
+                raise Refused(
+                    "state_half_missing",
+                    "this machine's records are sealed to the pair, and the "
+                    "note carries no half of the key. The Pi is running a "
+                    "build from before that: update BOTH boxes, in the same "
+                    "sitting, as the wire version says.")
+            _STATE_KEY["vault"], _STATE_KEY["pi"] = _vault_half, _pi_half
+            _STATE_KEY["dir"] = artifact_dir
+            # AND THE KEYFILE'S OWN SEALED SECTION, with the same two halves
+            # (STAGE8_PLAN.md). Here rather than at load, because the half only
+            # exists once the note has been opened -- which is the point: the
+            # xpub that names every deposit address this intake ever issued is
+            # not on the seized disk in a readable form. Rebinding `key` is the
+            # whole wiring; everything downstream takes it as a parameter.
+            key = open_keyfile(key, _vault_half, _pi_half)
+            # ...AND THE SPEND SECRETS (STAGE9_PLAN.md), if this box has sealed
+            # them. Same halves, same moment, same reason: the seed spends every
+            # deposit address the xpub above can find, and a machine taken
+            # between wakes should not be holding it in a readable file.
+            _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),
+                               _vault_half, _pi_half)
+        except Refused as _m2e:
+            raise _reported(_key_clear, d, job_id, challenge, _m2e)
         integrity_log("wake", "secrets_opened" if _ns else "secrets_plain")
 
     elapsed = _clock() - sent_at
@@ -3937,6 +3990,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # through, which is every install from before this stage.
     if _STATE_KEY.get("vault") is not None:
         _n = state_open(artifact_dir, _STATE_KEY["vault"], _STATE_KEY["pi"])
+        # ONLY NOW is there anything to close. See _seal_state_now.
+        _STATE_KEY["opened"] = True
         integrity_log("wake", "state_opened" if _n else "state_empty")
     else:
         integrity_log("wake", "state_unsealed")
@@ -5660,7 +5715,11 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 _accts_after = _account_indices(key, injected=accounts)
                 if _accts_after is not None:
                     break
-                _nap(2)
+                # time.sleep, NOT _nap: the money has moved by here, and a
+                # stop that skipped the _save_handles below would lose the
+                # record of whose accounts the mix minted. Six seconds at
+                # most; the stop is honoured at the report after the save.
+                time.sleep(2)
             if _accts_after is not None:
                 _add_owner_accounts(led, _owner,
                                     set(_accts_after) - set(_accts_before))
@@ -6139,7 +6198,17 @@ def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
                       f"record. The job's artifacts are on this machine.")
             return
         if _i < RESULT_POST_ATTEMPTS - 1:
-            _sleep(RESULT_POST_BACKOFF_S[min(_i, len(RESULT_POST_BACKOFF_S) - 1)])
+            # A STOP ENDS THE RETRIES, AND ONLY THE RETRIES. Raising here
+            # threw a FINISHED job into run_once's handler, which reported it
+            # again as "failed" -- with no handle and no slip -- over the
+            # "done" the doorbell may already have taken. The records are
+            # sealed before any report; what is lost is a retry.
+            try:
+                _sleep(RESULT_POST_BACKOFF_S[
+                    min(_i, len(RESULT_POST_BACKOFF_S) - 1)])
+            except Stopping:
+                integrity_log("wake", "result_stopped")
+                return
     # THIS one really is a delivery problem. The job either happened or did
     # not, and the record of it is here.
     integrity_log("wake", "result_undeliverable")
@@ -6503,8 +6572,9 @@ def seal_secrets_cli(args) -> str:
         env = parse_env_file(raw.decode("utf-8"))
     except UnicodeDecodeError as e:
         _ln = raw[:e.start].count(b"\n") + 1
-        agent_say(f"  [!] line {_ln} of {src} is not valid UTF-8, and "
-                  f"systemd refuses such a file too. Nothing was written.")
+        agent_say(f"  [!] line {_ln} of {src} is not valid UTF-8. This "
+                  f"reads only valid UTF-8 (systemd refuses it in any key or "
+                  f"value, though not in a comment). Nothing was written.")
         return "unparseable"
     except ValueError as e:
         agent_say(f"  [!] {src} cannot be read the way systemd reads it: "
@@ -6549,8 +6619,10 @@ def seal_secrets_cli(args) -> str:
             del _acct
         if _ok is False:
             agent_say(f"  [!] GS_BTC_SEED in {src}, with the passphrase "
-                      f"beside it, is not a valid mnemonic or does not "
-                      f"derive the account xpub this pair watches. A "
+                      f"that file names (none, if it names none -- one set "
+                      f"elsewhere in the unit is not in what this seals), "
+                      f"is not a valid mnemonic or does not derive the "
+                      f"account xpub this pair watches. A "
                       f"deposit already refuses this seed; sealing it "
                       f"would only end in advice to shred the one copy "
                       f"you could still check. Nothing was written.")
@@ -6569,7 +6641,14 @@ def seal_secrets_cli(args) -> str:
                                   schema=proto.SECRETS_SCHEMA)
         if json.loads(back[proto.SECRETS_MEMBER]) != found:
             raise ValueError("the sealed copy does not read back")
-        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
+        # O_EXCL on a fresh name: a stale .new from an earlier run would keep
+        # ITS mode through O_TRUNC, and os.replace would carry that mode --
+        # 0644, say -- onto the sealed file.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
         with os.fdopen(_fd, "w") as fh:
             json.dump(container, fh, sort_keys=True)
             fh.flush()
@@ -6697,7 +6776,7 @@ def build_cli() -> argparse.ArgumentParser:
                          "gathered on the fee wallet to the addresses the "
                          "keyfile names, if it clears the threshold, then "
                          "stop. With --dry-run, say whether it would.")
-    ap.add_argument("--unseal-state", metavar="HEX", default="",
+    ap.add_argument("--unseal-state", metavar="HEX", default=None,
                     help="open this machine's sealed records BY HAND and "
                          "leave them as plaintext, then stop: no job, no "
                          "doorbell, no power-off. HEX is the Pi's half of "
@@ -6709,7 +6788,7 @@ def build_cli() -> argparse.ArgumentParser:
                          "--fee-sweep takes when this machine's SETTINGS are "
                          "sealed too: that boot has no note, so nothing "
                          "brings it a half.")
-    ap.add_argument("--seal-secrets", metavar="HEX", default="",
+    ap.add_argument("--seal-secrets", metavar="HEX", default=None,
                     help="put this machine's spend secrets -- the BTC seed, "
                          "the wallet passwords, the aggregator key -- behind "
                          "the pair, then stop. HEX is the Pi's half, the same "
@@ -6726,7 +6805,7 @@ def build_cli() -> argparse.ArgumentParser:
                          f"Absent means this box still uses the unit's "
                          f"EnvironmentFile, which is how every install from "
                          f"before this stage keeps working.")
-    ap.add_argument("--unseal-key", metavar="HEX", default="",
+    ap.add_argument("--unseal-key", metavar="HEX", default=None,
                     help="print this machine's sealed SETTINGS and stop -- "
                          "the xpub, the servers, the fee destinations, the "
                          "switches. HEX is the same half --unseal-state "
@@ -6768,7 +6847,12 @@ def main(argv=None) -> int:
             # OPSEC_SETUP.md name for a sealed box's sweep -- `--fee-sweep
             # --unseal-state <hex>` -- never swept anything: it wrote every
             # sealed record out in plaintext and stopped. Driven.
-            if getattr(args, "unseal_state", "") \
+            # `is not None`, not truthiness: an EMPTY value -- a shell
+            # variable that was never set, `--seal-secrets "$HALF"` -- is
+            # still the hand command, refused for its bad half with the box
+            # kept on. Truthiness read it as no flag at all and ran a full
+            # wake: the doorbell asked, a job taken.
+            if getattr(args, "unseal_state", None) is not None \
                     and not getattr(args, "fee_sweep", False) \
                     and not getattr(args, "dry_run", False):
                 # NOTHING ELSE RUNS ON THIS PATH, and it never powers the
@@ -6777,13 +6861,13 @@ def main(argv=None) -> int:
                 _keep_on = True
                 code = unseal_state_cli(args)
                 return 0 if code == "opened" else 1
-            if getattr(args, "seal_secrets", ""):
+            if getattr(args, "seal_secrets", None) is not None:
                 # SETUP, not recovery, but the same posture: the operator is
                 # at the machine, nothing is woken and nothing powers off.
                 _keep_on = True
                 code = seal_secrets_cli(args)
                 return 0 if code == "sealed" else 1
-            if getattr(args, "unseal_key", ""):
+            if getattr(args, "unseal_key", None) is not None:
                 # SAME PATH, SAME REASON as --unseal-state above: the
                 # operator is at the machine and nothing is woken or
                 # powered off. Ordered after it so that passing both
