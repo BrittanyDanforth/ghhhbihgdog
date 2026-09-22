@@ -829,7 +829,12 @@ try:
             (("--mac", "not-a-mac"), "a MAC that is not a MAC", "MAC address"),
             (("--broadcast", "999.1.1.1"),
              "a broadcast address that is not an address", "IPv4"),
-            (("--pair-port", "0"), "port 0 for the ceremony", "not a port")):
+            (("--pair-port", "0"), "port 0 for the ceremony", "not a port"),
+            # THE CROSS-CHECK RESTS ON TLS OR THE ONION KEY: over plain http
+            # any Tor exit could answer for THORNode.
+            (("--thornode", "http://thornode.example"),
+             "a plaintext http:// THORNode that is not an onion",
+             "https://")):
         _r = _keys_cli(*_extra)
         check(f"refuses {_why}",
               _r.returncode != 0 and _needle in (_r.stdout + _r.stderr))

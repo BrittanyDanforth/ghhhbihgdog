@@ -379,6 +379,27 @@ def _check_pin(pin):
     return p
 
 
+def thornode_url_ok(url) -> bool:
+    """Whether a THORNode base URL is one the inbound cross-check can rest
+    on: https:// (the check rests on TLS and the CA system), or http:// to
+    a .onion (it rests on the onion service's key, which the address
+    names). A plaintext http:// URL to anything else was accepted, and then
+    the one check against an aggregator naming its own inbound address was
+    only as good as whichever Tor exit carried it: any exit could echo the
+    aggregator's address, mark BTC halted, or move the dust threshold."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(str(url or ""))
+        host = (u.hostname or "").lower()
+    except ValueError:
+        return False
+    if not host or u.username or u.password:
+        return False
+    if u.scheme == "https":
+        return True
+    return u.scheme == "http" and host.endswith(".onion")
+
+
 def parse_server(spec):
     """'host', 'host:port' or 'host:port,pin' -> (host, port, pin), the TLS
     port by default and no pin unless one is given."""
@@ -605,6 +626,15 @@ class SocksTlsTransport:
             sock.close()
             raise
         return self
+
+    def extend(self, seconds):
+        """Push this session's ONE deadline out by `seconds`, from where it
+        stands -- for a caller whose work grows with what the server
+        listed (spends_of reads a transaction per history entry). Still a
+        deadline, not a per-read timeout: the caller bounds the total, and
+        a peer that drips bytes gains nothing it did not already have."""
+        if self._deadline is not None:
+            self._deadline += max(0.0, float(seconds))
 
     def _arm(self):
         """Re-arm the socket clock from the deadline before every operation,

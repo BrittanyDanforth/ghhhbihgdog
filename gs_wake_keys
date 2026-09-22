@@ -693,10 +693,12 @@ def _validate_btc(args) -> None:
         sys.exit("[!] --btc-bump-after must be 0..604800 seconds (a week).")
     if not 0 <= int(getattr(args, "btc_returns_max", 2)) <= 1000:
         sys.exit("[!] --btc-returns-max must be 0..1000.")
-    if args.thornode and not str(args.thornode).lower().startswith(
-            ("http://", "https://")):
-        sys.exit("[!] --thornode must be an http(s):// base URL.")
     import gs_btc_watch as _w
+    if args.thornode and not _w.thornode_url_ok(args.thornode):
+        sys.exit("[!] --thornode must be an https:// base URL, or http:// "
+                 "to a .onion: the cross-check of the inbound address rests "
+                 "on TLS or on the onion key, and over plain http any Tor "
+                 "exit could answer for THORNode.")
     for _s in (args.btc_electrum or []):
         try:
             _w.parse_server(_s)

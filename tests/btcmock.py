@@ -15,6 +15,7 @@ one to look), each on a fresh accept.
 """
 import hashlib
 import json
+import time
 import os
 import socket
 import ssl
@@ -153,6 +154,9 @@ def mock_socks(behaviour, scenario, tls_ctx=None, connections=1):
                 req = json.loads(raw.decode())
                 cap["methods_asked"].append(req.get("method"))
                 cap["requests"].append(req)
+                # A SLOW SERVER: Tor's round trip, per reply.
+                if scenario.get("delay"):
+                    time.sleep(float(scenario["delay"]))
                 out = reply(req)
                 if out is None:
                     return                       # hang up mid-request

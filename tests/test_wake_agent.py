@@ -9412,14 +9412,20 @@ _lk_t = _thr.Thread(target=A._merge_chain,
                     args=(_lkp, "b" * 64 + " | y|-|wake|history\n"))
 _lk_t.start()
 time.sleep(0.4)
+# THE MERGE MUST BE WAITING: with no lock it has already read, written and
+# replaced by now, and the line appended below would land AFTER it and
+# look kept -- which is how this check first passed without the lock.
+_lk_waited = _lk_t.is_alive() and _lkp.read_text() == ""
 with open(_lkp, "a") as _lf:
     _lf.write("c" * 64 + " | z|-|wake|written under the lock meanwhile\n")
 _fcntl.flock(_lk_fd, _fcntl.LOCK_UN)
 os.close(_lk_fd)
 _lk_t.join(10)
-check("review2: a line another writer appends while the merge waits for "
-      "the chain's lock is KEPT -- the merge reads only once it holds it",
-      "written under the lock meanwhile" in _lkp.read_text())
+check("review2: the merge WAITS for the chain's lock another writer holds, "
+      "and a line that writer appends meanwhile is KEPT -- it reads only "
+      "once it holds the lock",
+      _lk_waited and "written under the lock meanwhile" in _lkp.read_text()
+      and _lkp.read_text().startswith("b" * 64))
 
 # A COMMENT'S TRAILING BACKSLASH IS REFUSED ONLY WHERE IT MATTERS. Measured
 # from systemd 255's own load_env_file; before v254 the next line is

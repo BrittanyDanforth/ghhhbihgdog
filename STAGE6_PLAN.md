@@ -130,7 +130,7 @@ is. Fees that keep rising can bump more than once, each a plan in the
 chain naming what it replaces, each bounded by the cap.
 
 **Rule 6.** The Pi keeps `sent_at` and the last word in memory with the
-rest of the watch entry; the chain gets kinds (`forward_recheck` on the
+rest of the watch entry; the chain gets kinds (~~`forward_recheck`~~ -- gone: it named the job of a `poke` already chained, see OPSEC_SETUP's card table -- on the
 Pi, `reconcile_bumped`, `plan_recovered` on the vault); the chat gets the
 one sentence.
 
@@ -145,7 +145,15 @@ mempool) and neither `settled_new` nor `unsettled_new` applies first:
 
     due = (now - plan["ts"]) >= args.bump_after
           and picture.get("fee_sat_vb") is not None
-          and picture["fee_sat_vb"] > plan["feerate_target_sat_vb"]
+          and picture["fee_sat_vb"] * plan["vsize"] > plan["fee_sat"]
+
+~~`picture["fee_sat_vb"] > plan["feerate_target_sat_vb"]`~~ -- the rate
+the forward was AIMED at, not the rate it pays. The fee is sized against
+the vsize bound and the jitter only adds, so the real rate is above the
+target every time (by up to ~60% at the widest OP_RETURN policy), and an
+estimate one sat over the target replaced a forward already ahead of the
+market. The comparison is now against `fee_sat / vsize`; the target is
+the fallback only for a plan that does not record both.
 
 If `due`: kind `reconcile_bumped`; return
 `("forward", sorted(consumed - plan_inputs), "bumped", plan)`. The caller
@@ -278,8 +286,10 @@ The watch entry keeps the last forward word (`word`) beside `sent_at`.
   the recheck is due; otherwise to the XMR side as today.
 - `btc_tick`: a `sent` entry whose recheck is due and has not been started
   this window (`rechecked_at`) starts `forward_to_swap` through
-  `_btc_can_start()` and `start_job`, once per window; kind
-  `forward_recheck`. The forward's answer refreshes `sent_at` (a new
+  `_btc_can_start()` and `start_job`, once per window; ~~kind
+  `forward_recheck`~~ (the poke is chained, job-agnostic, and nothing else
+  is). The window is drawn per forward on the Pi, `--btc-recheck` to twice
+  that (the review of stages 2-6). The forward's answer refreshes `sent_at` (a new
   window) or ends the rechecks (`forwarded`).
 - A `sent` or `forwarded` entry forgotten after `DEPOSIT_PLACE_TTL_S` is
   also dropped from the sent set: an ask about a forward this end no

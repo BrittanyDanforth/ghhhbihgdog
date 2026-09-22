@@ -70,6 +70,18 @@ from embit.transaction import Transaction                    # noqa: E402
 #: listing hundreds of entries is either wrong about the address or trying
 #: to make this side fetch for ever.
 MAX_HISTORY = 200
+#: THE READ IS BUDGETED BY WHAT IT READS. One session had one 30 s deadline
+#: for the handshake, the history and a transaction.get PER ENTRY, one
+#: after another over Tor -- so a stranger who can read the address (it is
+#: in the chat) jammed every reconciliation for good with about sixty dust
+#: payments, some $30, long before MAX_HISTORY: every server ran out of
+#: deadline, reconcile failed history_unavailable, and a stuck forward was
+#: never bumped, a refund never sent on. Each entry now brings its own
+#: allowance, under a ceiling that keeps two servers' worth inside the
+#: forward job's 900 s budget (gs_wake_proto JOBS). Measured over Tor a
+#: round trip is 0.3-1 s; the allowance is twice the slow end.
+PER_ENTRY_S = 2.0
+READ_EXTENSION_MAX_S = 300.0
 
 #: A serialized transaction over this many BYTES is refused before any
 #: connection: the standard weight limit (400,000 WU) bounds a relayable
@@ -345,7 +357,7 @@ def _prev_address(raw, vout, net):
 
 def spends_of(address, servers, proxy_url, *, network="main",
               timeout=DEFAULT_TIMEOUT, transport_factory=None,
-              with_funding=False, on_truncated=None):
+              with_funding=False, on_truncated=None, keep_txids=()):
     """Every transaction in the address's history that SPENDS an output
     paying it, oldest first, with what each spend carried.
 
@@ -390,8 +402,15 @@ def spends_of(address, servers, proxy_url, *, network="main",
     inputs neither unspent nor consumed (history_inconsistent, nothing
     signed), and a spend in the window whose inputs are older than the
     window is still LISTED, with no inputs, so a spend that is not ours
-    is still the alarm it was."""
+    is still the alarm it was.
+
+    `keep_txids` ARE READ WHEREVER THEY SIT IN THE HISTORY: the caller's
+    own transactions -- its forwards and what funded them. A flood that
+    pushed our forward off the newest MAX_HISTORY left its inputs neither
+    unspent nor consumed, which is history_inconsistent on every run: safe,
+    and a jam all the same, bought with MAX_HISTORY dust payments."""
     spk = btx.address_script(address, network).data
+    _keep = {str(t).lower() for t in (keep_txids or ())}
     net = btx.network_of(network)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
@@ -404,8 +423,20 @@ def spends_of(address, servers, proxy_url, *, network="main",
                 entries = b.history(scripthash)
                 n_all, truncated = len(entries), False
                 if len(entries) > MAX_HISTORY:
-                    entries = entries[-MAX_HISTORY:]
+                    entries = ([e for e in entries[:-MAX_HISTORY]
+                                if e["tx_hash"] in _keep]
+                               + entries[-MAX_HISTORY:])
                     truncated = True
+                _ext = [0.0]
+
+                def _allow(n=1):
+                    """One more fetch's allowance, under the ceiling."""
+                    _step = min(PER_ENTRY_S * n,
+                                READ_EXTENSION_MAX_S - _ext[0])
+                    if _step > 0 and hasattr(transport, "extend"):
+                        transport.extend(_step)
+                        _ext[0] += _step
+                _allow(len(entries))
                 txs = [(e, b.transaction(e["tx_hash"])) for e in entries]
                 prevs = {}
                 if with_funding:
@@ -428,6 +459,7 @@ def spends_of(address, servers, proxy_url, *, network="main",
                             _prev = _vin.txid.hex()
                             if _prev in prevs or set(_prev) <= {"0"}:
                                 continue
+                            _allow()
                             try:
                                 prevs[_prev] = b.transaction(_prev)
                             except (BtcWatchError, OSError):
@@ -529,12 +561,18 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     one server configured the poll starts elsewhere, so the proof is a
     SECOND server's word and a server that lied about accepting cannot
     also be the one vouching that it propagated. With one server there is
-    nobody else to ask, and it is asked."""
+    nobody else to ask, and it is asked.
+
+    LEFT OUT, not moved to the end. It was rotated to the back, and the
+    poll fails over within itself -- so with the other server down the
+    accepting one was asked after all, listed its own claimed txid, and
+    the forward dropped the signed bytes as proven. Now nobody else
+    answering is "nobody could be asked", and the bytes are kept."""
     want = _check_txid(txid)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
-    if avoid and len(order) > 1 and order[0][0] == avoid:
-        order = order[1:] + order[:1]
+    if avoid and len(order) > 1:
+        order = [o for o in order if o[0] != avoid] or order
     if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)) \
             or wait_s < 0 or isinstance(interval_s, bool) \
             or not isinstance(interval_s, (int, float)) or interval_s <= 0:

@@ -3734,8 +3734,18 @@ class Pager:
                 # the welcome uses for the rest -- and only on an install
                 # that deletes at all: with --burn-after 0 nothing goes,
                 # and a sentence promising a deletion would be false.
+                # ...AND ONLY WHAT IT CAN KEEP. The burn list is memory, on
+                # purpose (a list of message ids on the card is a log of
+                # when the operator was active), so a restart inside the
+                # hold -- up to PAY_HOLD_MAX_S, a hundred and ninety times
+                # --burn-after -- leaves this message where it is for good.
+                # "then it is deleted" promised a deletion this end cannot
+                # make after one; the client is told the one thing that
+                # still works, which is deleting it themselves.
                 _stay = ("\nThis message stays until the payment is seen, "
-                         "then it is deleted like the rest."
+                         "then it is deleted like the rest — unless this "
+                         "end restarts before then. If it is still here "
+                         "after you have paid, delete it yourself."
                          if int(getattr(self, "burn_after", 0) or 0) > 0
                          else "")
                 # ONE RETRY, AND A FAILURE SENTENCE (the MED pass after the
@@ -4674,6 +4684,22 @@ class Pager:
                                  or self._btc_kept_due(_h)))
             if job in ("swap_status", "watch") and _ask_forward:
                 job = "forward_to_swap"
+                # A TAP DOES NOT CUT THE HOLD SHORT (the review of stages
+                # 2-6). The hold between a deposit settling and its sweep
+                # is the one thing that keeps the host's forwards from
+                # following public confirmations at the same short gap --
+                # and the usual flow is a client who taps the moment their
+                # own wallet shows the confirmation, which started the
+                # forward at once. The watcher starts it when the hold
+                # runs out; the tap is told so, with no number in it.
+                if self._btc_holding(_h):
+                    try:
+                        _cn = self._label(cid, _h)
+                    except BaseException:                    # noqa: BLE001
+                        _cn = "?"
+                    self.send(cid, f"{_cn}: confirmed. It is sent on "
+                                   f"shortly, by itself — nothing to do.")
+                    return
         self.start_job(cid, job, params)
 
     def handle_callback(self, cb: dict) -> None:
@@ -5212,9 +5238,36 @@ class Pager:
         anything, and the handle is learned from that answer."""
         return self.__dict__.setdefault("btc_sent", set())
 
+    def _btc_addr_ok(self, addr) -> bool:
+        """Whether this end's looks can read `addr`: a native-segwit address
+        of --btc-network. Always true with no watcher configured."""
+        if not self.btc_servers:
+            return True
+        try:
+            import gs_btc_watch as _w
+            _w._require_native_segwit(addr, _w._network(self.btc_network))
+            return True
+        except Exception:                                    # noqa: BLE001
+            return False
+
     def _btc_register(self, h: str, addr: str, chat_id: int) -> None:
         """Start watching `addr` for handle `h` on behalf of `chat_id`."""
         if not (isinstance(h, str) and proto.HANDLE_RE.match(h)) or not addr:
+            return
+        if not self._btc_addr_ok(addr):
+            # A DEPOSIT THIS END CANNOT LOOK AT (the review of stages 2-6):
+            # the vault is paired on another network than --btc-network
+            # here (a testnet rehearsal against the mainnet default, say).
+            # Watched, every look raised and was swallowed: no "received",
+            # no automatic forward, and the pay message held for two days
+            # after the client paid. Not watched, the details go with the
+            # timed burn like everything else and the tap asks the forward
+            # -- and the operator is told, here, what to fix.
+            print(f"  [!] a deposit address is not a {self.btc_network} "
+                  f"address, so this end cannot watch it: set --btc-network "
+                  f"to the network the vault is paired on. The tap still "
+                  f"asks the forward.")
+            integrity_log("pager", "address_unwatchable")
             return
         lock, opened = self._btc()
         with lock:
@@ -5335,6 +5388,7 @@ class Pager:
                 e["state"] = "sent"
                 e["word"] = "unsure"
                 e["sent_at"] = time.time()
+                e["recheck_after"] = self._btc_recheck_draw()
                 e.pop("retry_after", None)
                 e.pop("fee_tries", None)
                 return
@@ -5354,6 +5408,7 @@ class Pager:
                 e["state"] = "sent"
                 e["word"] = phase
                 e["sent_at"] = time.time()
+                e["recheck_after"] = self._btc_recheck_draw()
                 e.pop("retry_after", None)
                 e.pop("fee_tries", None)
                 return
@@ -5475,6 +5530,20 @@ class Pager:
                 # keeps the payment details in the chat until it is paid.
                 # The poke said what happened; the look keeps watching.
                 return
+            if out == "done" and phase == "short":
+                # UNDER WHAT WAS QUOTED: the vault sent nothing and said so
+                # (the poke rendered the `short` line). NOT stalled -- that
+                # was the rehearsal branch below, and a stalled entry is
+                # never looked at again, so a top-up that made the deposit
+                # whole was never sent on by itself. It goes back to
+                # watching as money seen, and is started again only when
+                # MORE has settled than this answer was about (_btc_apply).
+                e["state"] = "seen"
+                try:
+                    e["short_conf"] = max(0, int(e.get("conf") or 0))
+                except (TypeError, ValueError):
+                    e["short_conf"] = 0
+                return
             if out != "done":
                 # A REFUSAL OR A FAILURE ON A FIRST FORWARD IS TRIED AGAIN,
                 # BY ITSELF, A BOUNDED NUMBER OF TIMES (STALL_RETRIES). Most
@@ -5567,6 +5636,9 @@ class Pager:
     #: --btc-bump-after, or the recheck finds no bump due.
     btc_recheck_s = 10800
 
+    #: Ticks in a row whose every look failed before the watcher says so.
+    LOOK_FAIL_WARN_TICKS = 6
+
     #: How many times a fee retry's wait doubles before it stops growing:
     #: one, two, four, then eight times --btc-fee-retry (eight hours on the
     #: default), for as long as the vault keeps answering `delayed`.
@@ -5598,7 +5670,8 @@ class Pager:
             return False
         if e.get("word") == "unsure":
             return True
-        return now - float(e.get("sent_at") or now) >= float(self.btc_recheck_s)
+        return (now - float(e.get("sent_at") or now)
+                >= self._btc_recheck_after(e))
 
     def _btc_recheck_due(self, h: str, now=None) -> bool:
         """_recheck_due_entry for handle `h`, under the lock."""
@@ -5656,7 +5729,12 @@ class Pager:
                 # forward this end no longer remembers is the forward's
                 # question again, which answers truthfully at every stage.
                 self._btc_sent_set().discard(_h)
-                integrity_log("pager", "btc_watch_forgotten")
+                # NOTHING ON THE CHAIN FOR IT (the review of stages 2-6):
+                # "btc_watch_forgotten" was written exactly
+                # DEPOSIT_PLACE_TTL_S after the deposit opened or its
+                # forward went out -- a public constant -- so each line
+                # dated an earlier poke and named it an intake deposit,
+                # the timetable the chain's "no job word" rule removed.
             # ...AND THE FORWARDED ONES, WHILE THEY ARE KEPT (third
             # self-doubt pass): money that comes back AFTER the forward
             # mined -- a refund (ThorChain acts once the inbound has
@@ -5685,7 +5763,9 @@ class Pager:
             _due = [h for h, e in opened.items()
                     if self._recheck_due_entry(e, _now)
                     and _now - float(e.get("rechecked_at") or 0.0)
-                    >= float(self.btc_recheck_s)]
+                    >= self._btc_recheck_after(e)]
+        _failed = _answered = 0
+        _why = ""
         for h, e in snapshot:
             try:
                 if look is None:
@@ -5694,9 +5774,30 @@ class Pager:
                 r = look(e["addr"], list(self.btc_servers),
                          getattr(self.args, "tor_proxy", ""),
                          min_conf=self.btc_min_conf, network=self.btc_network)
-            except Exception:                                # noqa: BLE001
+            except Exception as ex:                          # noqa: BLE001
+                _failed += 1
+                _why = type(ex).__name__
                 continue
+            _answered += 1
             self._btc_apply(h, r)
+        # A WATCHER WHOSE EVERY LOOK FAILS SAYS SO, ONCE (the review of
+        # stages 2-6): each failure was swallowed, which is right for one
+        # bad circuit and wrong for a watcher that can never look -- a
+        # proxy or a server this end cannot use, which left every deposit
+        # unseen for as long as nobody tapped. After LOOK_FAIL_WARN_TICKS
+        # ticks in a row with looks and no answer, one terminal line and
+        # one chain kind, with the error's type and nothing of its text.
+        if _failed and not _answered:
+            self._look_fail_ticks = int(getattr(self, "_look_fail_ticks",
+                                                0) or 0) + 1
+            if self._look_fail_ticks == int(self.LOOK_FAIL_WARN_TICKS):
+                print(f"  [!] no look at the intake's addresses has "
+                      f"answered for {self._look_fail_ticks} ticks "
+                      f"({_why}): check --tor-proxy, --btc-electrum and "
+                      f"--btc-network.")
+                integrity_log("pager", "looks_failing")
+        elif _answered:
+            self._look_fail_ticks = 0
         # THE RECHECK, WHEN NOBODY TAPPED (stage 6). A forward the network
         # dropped, never propagated, or stopped confirming was invisible:
         # every tap after `sent` went to the XMR side, which answered
@@ -5730,7 +5831,9 @@ class Pager:
                     e = opened.get(h)
                     if e is not None:
                         e["rechecked_at"] = _now
-                integrity_log("pager", "forward_recheck")
+                # No kind of its own: start_job chained a job-agnostic
+                # `poke` for it, and "forward_recheck" beside that named
+                # the poke's job -- the word the chain does not carry.
                 break
 
     #: How many of the day's pokes a background start leaves for taps
@@ -5765,6 +5868,46 @@ class Pager:
         except BaseException:                                # noqa: BLE001
             return False
         return True
+
+    #: THE RECHECK WINDOW IS DRAWN HERE, per forward and per window: this
+    #: end decides when a recheck starts, so this is where the randomness
+    #: has to be. The vault drew its bump window (btc_forwarder BUMP_WINDOW)
+    #: and it changed nothing -- the Pi rechecked on a fixed --btc-recheck,
+    #: at or above the vault's window, so every reconciliation found the
+    #: bump due and every replacement went out at sent + --btc-recheck plus
+    #: the public wake jitter: a ~3 h grid anyone who has read this file
+    #: could lay over the chain's RBF pairs. Now each window is
+    #: --btc-recheck .. twice that, uniform, from the CSPRNG, drawn when the
+    #: forward's answer starts it and kept in memory with the entry, never
+    #: on the card. The number is the floor; the offset is the draw.
+    RECHECK_SPREAD = 1.0
+
+    def _btc_recheck_draw(self) -> float:
+        """This window's recheck delay: --btc-recheck plus up to
+        RECHECK_SPREAD of it, uniform, from the system CSPRNG."""
+        _b = int(self.btc_recheck_s)
+        if _b <= 0:
+            return float(_b)
+        return float(_b + self.rng.randint(0, int(_b * self.RECHECK_SPREAD)))
+
+    def _btc_recheck_after(self, e) -> float:
+        """The window an entry's recheck waits: its own draw, or the floor
+        for an entry that has none (learned after a restart)."""
+        try:
+            _w = float(e.get("recheck_after"))
+        except (TypeError, ValueError):
+            return float(self.btc_recheck_s)
+        return max(_w, float(self.btc_recheck_s))
+
+    def _btc_holding(self, h: str) -> bool:
+        """Whether a settled deposit's drawn hold is still running: the
+        watcher starts its first forward when it ends, and nothing else
+        may start it sooner. Under the lock."""
+        lock, opened = self._btc()
+        with lock:
+            e = opened.get(h)
+            return bool(e) and e.get("state") == "seen" \
+                and time.time() < float(e.get("forward_hold") or 0.0)
 
     def _btc_hold_draw(self) -> int:
         """Seconds to hold a settled deposit before its FIRST forward is
@@ -5820,10 +5963,39 @@ class Pager:
                 e["state"] = "forwarding"
                 e["said"].discard("confirmed")
                 self._btc_sent_set().discard(h)
-                integrity_log("pager", "btc_returned_seen")
+                # (No "btc_returned_seen" on the chain: the poke that
+                # follows is chained, job-agnostic, like every other.)
                 say, start = "confirmed", True
             else:
+                _was = e["state"]
                 e["conf"], e["unconf"] = conf, unconf
+                # MONEY UNDER THE FLOOR IS NOT A PAYMENT (the review of
+                # stages 2-6). The forwarded branch above already ignored
+                # it; this one did not, so anyone who knows an open
+                # deposit's address -- the server the vault asked a moment
+                # before issuing it, the servers this end polls, a reader
+                # of the chat -- sent it 546 sat and: the chat heard
+                # "received" about money that was not the client's, the
+                # pay message lost its hold and was deleted before the
+                # client paid, a full wake went on learning it was dust,
+                # and the vault's `short` stalled the entry, so the real
+                # payment was never sent on by itself. Under the pairing's
+                # floor, seen or settled, the address reads as unpaid.
+                _fl = int(self.deposit_min_sat or 0)
+                if state == "confirmed" and conf < _fl:
+                    state = "seen" if conf + unconf >= _fl else "not_seen"
+                elif state == "seen" and conf + unconf < _fl:
+                    state = "not_seen"
+                # ...AND AFTER A `short` ANSWER, ONLY MORE MONEY IS NEWS:
+                # the same settled sum would start the same forward and
+                # hear `short` again, a wake a tick. A top-up is sent on.
+                _short = e.get("short_conf")
+                if state == "confirmed" and isinstance(_short, int) \
+                        and not isinstance(_short, bool):
+                    if conf <= _short:
+                        state = "seen"
+                    else:
+                        e.pop("short_conf", None)
                 _waiting = time.time() < float(e.get("retry_after") or 0.0)
                 # THE HOLD, DRAWN ONCE ON THE TICK THAT FIRST SEES IT
                 # SETTLE (the host-privacy pass; _btc_hold_draw). Not a
@@ -5851,6 +6023,15 @@ class Pager:
                     # deposit's own hold is still running, which is the
                     # same shape and says nothing for the same reason.
                     e["state"] = "seen"
+                    # ...UNLESS THE CHAT HAS HEARD NOTHING YET: a payment
+                    # mined before the first look saw it in the mempool --
+                    # common, the look and a block are both ten minutes --
+                    # went from unpaid straight into the hold, and the
+                    # client heard nothing for up to --btc-hold-max. Said
+                    # once, with no figure, and no "confirmed": the wake
+                    # says that when it really starts.
+                    if _was == "not_seen" and "seen" not in e["said"]:
+                        say = "received"
                 elif state == "confirmed" and self._btc_can_start(
                         background=_retry):
                     # THE WAIT IS NOT DROPPED HERE: start_job below may
@@ -5905,6 +6086,11 @@ class Pager:
             if say == "seen":
                 self.send(chat, f"{_cn}: received — waiting for it to "
                                 f"confirm.",
+                          buttons=self._handle_buttons(h, "receive_and_quote",
+                                                       chat))
+            elif say == "received":
+                self.send(chat, f"{_cn}: received — it is sent on shortly, "
+                                f"by itself.",
                           buttons=self._handle_buttons(h, "receive_and_quote",
                                                        chat))
             elif say == "held":
@@ -6252,8 +6438,9 @@ class Pager:
             print(f"  [+] watching the intake's open deposits every "
                   f"{self.btc_poll_s}s over {len(self.btc_servers)} server(s); "
                   f"a forward that went out is asked about again after "
-                  f"{self.btc_recheck_s}s (set it at or above the vault's "
-                  f"--btc-bump-after); {self.btc_reserve} of the day's "
+                  f"{self.btc_recheck_s}s to twice that, drawn per window "
+                  f"(set it at or above the vault's --btc-bump-after); "
+                  f"{self.btc_reserve} of the day's "
                   f"pokes kept for taps.")
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s)"
               + (f", {len(self.allow_users)} allowlisted sender(s)"
@@ -6649,13 +6836,16 @@ def build_cli():
                          "(default 3600, floor 600)")
     ap.add_argument("--btc-recheck", type=int, default=10800,
                     metavar="SECONDS",
-                    help="how long after a forward went out this end asks "
-                         "the forward about it again -- by itself when nobody "
-                         "taps -- so one the network dropped, never "
-                         "propagated or stopped confirming is re-sent, "
-                         "re-signed or replaced at today's rate (default "
-                         "10800, floor 600). At least the vault's "
-                         "--btc-bump-after, or the recheck finds no bump due.")
+                    help="the SHORTEST wait after a forward went out before "
+                         "this end asks the forward about it again -- by "
+                         "itself when nobody taps -- so one the network "
+                         "dropped, never propagated or stopped confirming is "
+                         "re-sent, re-signed or replaced at today's rate. "
+                         "Each window is drawn from this to twice this, in "
+                         "memory, so a replacement's timing is not this "
+                         "number (default 10800, floor 600). At least the "
+                         "vault's --btc-bump-after, or the recheck finds no "
+                         "bump due.")
     ap.add_argument("--btc-hold-max", type=int, default=1800,
                     metavar="SECONDS",
                     help="the longest this end holds a SETTLED deposit "
@@ -6733,6 +6923,14 @@ def main(argv=None) -> int:
             _w._network(args.btc_network)
         except _w.BtcWatchError as e:
             sys.exit(f"[!] --btc-electrum / --btc-network: {e}")
+        # ...AND THE PROXY, AS THE LOOK WILL READ IT (the review of stages
+        # 2-6). validate_proxy takes a socks5h://user:pass@ URL; the look
+        # refuses one (the credential is its own, per circuit), so every
+        # look raised and the watcher never said "received", in silence.
+        try:
+            _w._socks_parts(getattr(args, "tor_proxy", ""), "btcwatch:probe")
+        except _w.BtcWatchError as e:
+            sys.exit(f"[!] --tor-proxy, for the intake's looks: {e}")
         if args.btc_min_conf < 1:
             sys.exit("[!] --btc-min-conf must be at least 1: an unconfirmed "
                      "deposit is never settled money.")

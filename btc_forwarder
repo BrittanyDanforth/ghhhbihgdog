@@ -219,11 +219,16 @@ def _limit_margin():
 #: bumping sooner than the operator asked would be this tool overriding
 #: them to pay a second fee.
 BUMP_SPREAD_MAX = Decimal("0.5")
+#: A plan's `ts` is int(time.time()) // STAMP_BUCKET_S * STAMP_BUCKET_S.
+STAMP_BUCKET_S = 600
 
 
 def _bump_window(bump_after_s):
     """`bump_after_s` .. bump_after_s * (1 + BUMP_SPREAD_MAX), uniform in
-    whole seconds. Zero stays zero: the operator turned the bump off."""
+    whole seconds. Zero stays zero: REPLACE AT ONCE -- the testnet drill's
+    setting (gs_wake_keys --btc-bump-after says so). It said "the operator
+    turned the bump off", and an operator who paired 0 on that word got a
+    replacement on every recheck."""
     base = max(0, int(bump_after_s))
     if base <= 0:
         return 0
@@ -1163,7 +1168,18 @@ def bump_due(plan, fee_sat_vb, bump_after_s, now=None):
     `bump_after_s` seconds (from the plan's own send stamp) AND the
     estimate is above the rate it pays. A plan that does not know its rate
     (one reconstructed from the chain) is never bumped: nothing here would
-    know what to pay more than. Pure; the clock may be injected."""
+    know what to pay more than. Pure; the clock may be injected.
+
+    "THE RATE IT PAYS" IS fee_sat / vsize, when the plan records both, and
+    not the rate it was aimed at. The target sits below the real rate every
+    time -- the fee is sized against the vsize BOUND, the jitter only adds,
+    and the target is the estimate rounded up -- by up to about 60% at the
+    widest OP_RETURN policy. Compared with the target, an estimate one sat
+    above it replaced a forward that already paid more than the market:
+    a few hundred sat more out of the client's deposit, and one more
+    same-outpoints RBF pair on the public chain, the shape the bump
+    comment itself calls recognisable. The target stays the fallback for a
+    plan from before the real rate was recorded."""
     paid = plan.get("feerate_target_sat_vb")
     ts = plan.get("ts")
     if isinstance(paid, bool) or not isinstance(paid, int) or paid < 1:
@@ -1172,8 +1188,22 @@ def bump_due(plan, fee_sat_vb, bump_after_s, now=None):
         return False
     if isinstance(fee_sat_vb, bool) or not isinstance(fee_sat_vb, int):
         return False
+    # THE STAMP IS THE START OF A TEN-MINUTE BUCKET (plans coarsen their
+    # time), so the forward may have gone out up to STAMP_BUCKET_S - 1
+    # seconds after it: measured from the bucket's start, a replacement
+    # could go out that much sooner than the operator asked -- the one
+    # bound the window promises. Measured from its END, it never does.
+    # 0 is the drill's "at once", and stays so.
     age = (now if now is not None else time.time()) - float(ts)
-    return age >= float(bump_after_s) and fee_sat_vb > paid
+    if float(bump_after_s) > 0:
+        age -= STAMP_BUCKET_S - 1
+    fee, vs = plan.get("fee_sat"), plan.get("vsize")
+    if all(isinstance(x, int) and not isinstance(x, bool) and x >= 1
+           for x in (fee, vs)):
+        above = fee_sat_vb * vs > fee
+    else:
+        above = fee_sat_vb > paid
+    return age >= float(bump_after_s) and above
 
 
 def _outpoints(items):
@@ -1345,6 +1375,7 @@ def stuck_forward(candidates, spends, ours, fee_sat_vb, bump_after_s,
                   if isinstance(p.get("ts"), (int, float))
                   and not isinstance(p.get("ts"), bool)]
         newest = {"feerate_target_sat_vb": c.get("feerate_target_sat_vb"),
+                  "fee_sat": c.get("fee_sat"), "vsize": c.get("vsize"),
                   "ts": max(stamps) if stamps else None}
         if not bump_due(newest, fee_sat_vb, bump_after_s, now=now):
             continue
@@ -1471,11 +1502,25 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     forgot (adopted as ours); anything else FAILS the run with the kind on
     the chain -- nothing is signed. Money come back but not yet settled is
     the word `returned` and a refusal: sent on when it settles."""
+    # OUR OWN TRANSACTIONS ARE READ WHEREVER THEY SIT in a history longer
+    # than the window: every forward in the plan chain and what funded its
+    # inputs. A dust flood that pushed them off the newest MAX_HISTORY left
+    # our forward's inputs neither unspent nor consumed -- the safe
+    # history_inconsistent, on every run, for good.
+    _chain0 = _chain_plans(args.outfile)
+    _keep = set()
+    for _p0 in [plan] + _chain0:
+        if _p0.get("txid"):
+            _keep.add(str(_p0["txid"]).lower())
+        for _i0 in (_p0.get("inputs") or []):
+            if isinstance(_i0, dict) and _i0.get("tx_hash"):
+                _keep.add(str(_i0["tx_hash"]).lower())
     try:
         _res = bcast_spends(address, servers, args.tor_proxy,
                             network=args.network, timeout=args.timeout,
                             with_funding=True,
-                            on_truncated=_history_truncated)
+                            on_truncated=_history_truncated,
+                            keep_txids=sorted(_keep))
     except watch.PinMismatch as e:
         raise Refused("pin_mismatch", str(e))
     except watch.BtcWatchError as e:
@@ -1487,7 +1532,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # alone -- the stage-5 shape -- is taken as knowing of no memo.
     spends, paid = (_res if isinstance(_res, tuple) and len(_res) == 2
                     else (_res, []))
-    chain = _chain_plans(args.outfile)
+    chain = _chain0
     ours = {str(p.get("txid") or "").lower() for p in chain
             if p.get("txid")}
     ours.add(str(plan.get("txid") or "").lower())
@@ -1750,6 +1795,14 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         plan["broadcast"] = True
         plan["tx_hex"], plan["tx_hex_reason"] = None, None
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
+        # THE NETWORK HAS NAMED THIS TRANSACTION AS THE RECORD: a
+        # superseded mark from an earlier run -- a lagging server that
+        # still listed the original a bump replaced -- is stale now. Left,
+        # the plan said both "listed" and "superseded by the original",
+        # and the pairs rewrite counted the original, which can never
+        # confirm, against the XMR that arrives from this one's quote.
+        plan.pop("superseded_by", None)
+        plan.pop("superseded_height", None)
         # A KEPT MARK IS THIS RUN'S TO MAKE, not a stale one's: money the
         # operator moved by hand is recorded above (returned_moved), and
         # money still here is written kept again below -- UNLESS this run
@@ -1803,8 +1856,16 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                   "are still unspent; the signed bytes were kept. Sending "
                   "the same transaction again.")
             # ...and, should every server refuse them, the fresh forward
-            # that follows leaves the kept money out (third element).
-            return "resend", plan["tx_hex"], list(_kept_ex)
+            # that follows leaves out the kept money AND every outpoint a
+            # listed forward of ours already spends (third element) -- the
+            # same list the evicted branch below re-signs against. It
+            # carried only the kept money: when the look and the history
+            # came from different servers (each fails over on its own), an
+            # outpoint our listed forward X spends read as unspent, and the
+            # rejected re-send's fresh forward signed over it again -- a
+            # second spend of an input we had already spent, the thing
+            # select_inputs' NEVER TWICE exists to stop.
+            return "resend", plan["tx_hex"], sorted(consumed | set(_kept_ex))
         integrity_log("forward", "evicted")
         print("  reconcile: our transaction is not listed and its inputs are "
               "still unspent, and no bytes were kept (it was listed once). "
@@ -1892,8 +1953,9 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
               f"of {sub['attempts']}) rejected the kept transaction (codes "
               f"{sub['codes']}); re-signing a fresh forward of the same "
               "money.")
-        # ...leaving out what came back past --returns-max (the
-        # reconciliation handed the list over with the bytes).
+        # ...leaving out what came back past --returns-max and what our
+        # listed forwards already spend (the reconciliation handed the
+        # list over with the bytes).
         return "forward", sorted(tuple(x) for x in (kept_exclude or ())), \
             "rejected"
     try:
@@ -2077,6 +2139,12 @@ def main(argv=None):
     # so a sending forward could pay whatever address a compromised
     # aggregator named with the one check against that never running. A
     # rehearsal may still run without it; a broadcast may not.
+    if args.thornode and not watch.thornode_url_ok(args.thornode):
+        raise Refused("bad_args", "--thornode must be https://, or http:// "
+                      "to a .onion: over plain http any Tor exit could answer "
+                      "for THORNode, and its inbound list is the one check "
+                      "against an aggregator naming its own address. Re-pair "
+                      "with --thornode https://... (gs_wake_keys).")
     if args.broadcast and not args.thornode:
         raise Refused("bad_args", "--broadcast needs --thornode: a forward "
                       "that sends pays the inbound address the aggregator "

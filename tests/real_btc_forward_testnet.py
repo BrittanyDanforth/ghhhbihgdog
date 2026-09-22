@@ -192,7 +192,7 @@ os.environ["GS_BTC_INDEX"] = "0"
 argv = ["--broadcast", "--tor-proxy", _TOR, "--network", "testnet",
         "--dest-from-receive-wallet", _bundle, "--outfile", _out,
         "--min-conf", "1", "--op-return-max-bytes", str(_POLICY),
-        "--seen-wait", "120", "--thornode", "http://thornode.stub.invalid"]
+        "--seen-wait", "120", "--thornode", "https://thornode.stub.invalid"]
 for s in _SERVERS:
     argv += ["--electrum", s]
 buf = io.StringIO()

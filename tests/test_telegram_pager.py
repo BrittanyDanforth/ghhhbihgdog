@@ -4605,7 +4605,11 @@ _hpay = [t for t, _b in _hs if "here is how to pay" in t]
 check("the intake's pay message is recorded on the watch entry by its id, "
       "and says it stays until the payment is seen",
       _he.get("pay_mid") == 4321 and len(_hpay) == 1
-      and "stays until the payment is seen" in _hpay[0])
+      and "stays until the payment is seen" in _hpay[0]
+      # ...and does not promise a deletion a restart makes impossible: the
+      # burn list is memory, and the hold is up to two days.
+      and "unless this end restarts" in _hpay[0]
+      and "delete it yourself" in _hpay[0])
 check("...and it is on the burn hold while the deposit is not_seen",
       _hp._btc_held_messages() == {(111, 4321)})
 _hp0, _hs0 = _depo_done_with_mid(_PLAIN_BTC, burn_after=0)
@@ -4907,7 +4911,14 @@ _rv3, _rs3, _rj3 = _watch_pager()
 _rv3.btc_servers = [("s.onion", 50002, None)]
 _rv3.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
 _rv3._btc_forward_result("B4A1", "done", "sent", 111)
-_rv3.btc_open.get("B4A1", {})["sent_at"] = time.time() - _rv3.btc_recheck_s - 1
+def _win(q, h="B4A1"):
+    """The recheck window an entry is actually waiting: its OWN draw
+    (--btc-recheck to twice that), not --btc-recheck. A test that means
+    "past the window" has to mean this one."""
+    return q._btc_recheck_after(q.btc_open.get(h, {}))
+
+
+_rv3.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_rv3) - 1
 _rv3.limits.headroom = lambda: 2
 _rv3.btc_tick(look=_look_returning("not_seen"))
 check("the automatic RECHECK leaves the reserve too: not started with two "
@@ -4921,7 +4932,7 @@ _rv4.btc_servers = [("s.onion", 50002, None)]
 _rv4.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
 _rv4.btc_reserve = 0
 _rv4._btc_forward_result("B4A1", "done", "sent", 111)
-_rv4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _rv4.btc_recheck_s - 1
+_rv4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_rv4) - 1
 _rv4.limits.headroom = lambda: 1
 _rv4.btc_tick(look=_look_returning("not_seen"))
 check("--btc-reserve 0 disables the reserve: the recheck starts with one "
@@ -5347,6 +5358,49 @@ check("after the forward reported SENT, /check on that deposit asks the XMR "
       "is kept as sent", _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
       and (_sp3.btc_open.get("B4A1") or {}).get("state") == "sent")
 
+print("\n-- a stranger's dust on an open deposit (the review of stages 2-6) --")
+# Anyone who knows an open deposit's address -- the server the vault asked
+# before issuing it, the servers this end polls, a reader of the chat --
+# sent it 546 sat: the chat heard "received", the pay message lost its hold
+# and was deleted before the client paid, a first forward spent a wake to
+# learn it was dust, and the vault's `short` stalled the entry for good.
+_dp, _ds, _dj = _watch_pager()
+_dp.btc_servers = [("s.onion", 50002, None)]
+_dp.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_dp.deposit_min_sat = 60000
+_dp.burn_after = 900
+_dp._btc_pay_message("B4A1", 55)
+_dp.btc_tick(look=_look_returning("seen", unconf=546))
+check("dust in the mempool under the pairing's floor is NOT 'received': "
+      "nothing said, the entry still unpaid, the pay message still held",
+      _ds == [] and _dp.btc_open["B4A1"]["state"] == "not_seen"
+      and (111, 55) in _dp._btc_held_messages())
+_dp.btc_tick(look=_look_returning("confirmed", conf=546))
+check("...and SETTLED dust starts nothing: no wake, nothing said, still "
+      "unpaid and held",
+      _dj == [] and _ds == [] and _dp.btc_open["B4A1"]["state"] == "not_seen"
+      and (111, 55) in _dp._btc_held_messages())
+_dp.btc_tick(look=_look_returning("confirmed", conf=546 + 5000000))
+check("...while the client's real payment beside it is sent on as ever",
+      _dj == [(111, "forward_to_swap", {"handle": "B4A1"})]
+      and _dp.btc_open["B4A1"]["state"] == "forwarding")
+# A `short` ANSWER IS NOT A STALL. It went to the rehearsal branch and the
+# entry went `stalled`, which nothing looks at again, so a top-up that made
+# the deposit whole was never sent on by itself.
+_dp._btc_forward_result("B4A1", "done", "short", 111)
+check("the vault's `short` puts the entry back to WATCHING as money seen, "
+      "remembering how much this answer was about -- not stalled",
+      _dp.btc_open["B4A1"]["state"] == "seen"
+      and _dp.btc_open["B4A1"].get("short_conf") == 546 + 5000000)
+_dp.btc_tick(look=_look_returning("confirmed", conf=546 + 5000000))
+check("...the SAME settled sum starts nothing again (it would hear `short` "
+      "again, a wake a tick)", len(_dj) == 1)
+_dp.btc_tick(look=_look_returning("confirmed", conf=546 + 6000000))
+check("...and a TOP-UP is sent on by itself",
+      len(_dj) == 2 and _dj[-1] == (111, "forward_to_swap",
+                                    {"handle": "B4A1"})
+      and "short_conf" not in _dp.btc_open["B4A1"])
+
 print("\n-- stage 6: the forward's question again, on a clock and on a "
       "word --")
 # STAGE6_PLAN.md 1(a): after `sent` or `unsure` every tap went to the XMR
@@ -5365,7 +5419,31 @@ _q.handle(_msg(111, 111, f"/check {_qlab}"))
 check("inside the recheck window a tap on a SENT deposit still asks the XMR "
       "side, and the entry remembers the word",
       _qj[-1][1] == "swap_status" and _q.btc_open.get("B4A1", {}).get("word") == "sent")
-_q.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q.btc_recheck_s - 1
+# THE WINDOW IS DRAWN ON THIS END, per forward and per window (the review
+# of stages 2-6). The vault drew its bump window and it changed nothing:
+# the Pi rechecked on a fixed --btc-recheck, so every replacement went out
+# at sent + --btc-recheck plus the public wake jitter.
+_R = _q.btc_recheck_s
+_w0 = _q.btc_open.get("B4A1", {}).get("recheck_after")
+check("the forward's answer draws THIS window's recheck delay, between "
+      "--btc-recheck and twice it, kept with the entry in memory",
+      isinstance(_w0, float) and _R <= _w0 <= 2 * _R)
+_draws = {pg.Pager._btc_recheck_draw(_q) for _ in range(200)}
+check("...from the CSPRNG across the whole band -- not one number an "
+      "observer could lay over the chain",
+      min(_draws) >= _R and max(_draws) <= 2 * _R and len(_draws) > 150
+      and max(_draws) - min(_draws) > _R // 2)
+_o_rng_q = _q.rng
+_q.rng = types.SimpleNamespace(randint=lambda a, b: b)
+_q._btc_forward_result("B4A1", "done", "sent", 111)
+_q.rng = _o_rng_q
+_q.btc_open.get("B4A1", {})["sent_at"] = time.time() - _R - 60
+check("...and it is the DRAW that is waited, not --btc-recheck: drawn at "
+      "the top of the band, a forward a minute past --btc-recheck is not "
+      "due yet, and is once the draw has passed",
+      _q._btc_recheck_due("B4A1") is False
+      and _q._btc_recheck_due("B4A1", now=time.time() + _R + 1) is True)
+_q.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_q) - 1
 _q.handle(_msg(111, 111, f"/check {_qlab}"))
 check("...past --btc-recheck the same tap asks the FORWARD (the "
       "reconciliation), the handle still on the sent list",
@@ -5396,7 +5474,7 @@ check("`forwarded` ENDS the rechecks: however old, the tap asks the XMR "
 _q2, _qs2, _qj2 = _watch_pager()
 _q2.btc_fee_retry_s = 3600
 _q2._btc_forward_result("B4A1", "done", "sent", 111)
-_q2.btc_open.get("B4A1", {})["sent_at"] = time.time() - 4 * 3600
+_q2.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_q2) - 1
 check("(setup) a sent entry past the window is due a recheck",
       _q2._btc_recheck_due("B4A1"))
 _q2._btc_forward_result("B4A1", "done", "delayed", 111)
@@ -5425,7 +5503,7 @@ _q4._btc_forward_result("B4A1", "done", "sent", 111)
 _q4.btc_tick(look=_look_returning("not_seen"))
 check("the tick starts nothing for a sent forward inside the window",
       _qj4 == [] and _qs4 == [])
-_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q4.btc_recheck_s - 1
+_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_q4) - 1
 _q4.btc_tick(look=_look_returning("not_seen"))
 check("...past the window, with the box free, the tick starts the forward "
       "itself (the recheck), ONCE, for the deposit's own chat, and stamps it",
@@ -5438,8 +5516,8 @@ check("...the forward's answer does NOT clear the start stamp: the automatic "
       "path starts one per window whatever word came back",
       "rechecked_at" in _q4.btc_open.get("B4A1", {}))
 # Time passes for both stamps: the answer came after the start.
-_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q4.btc_recheck_s - 1
-_q4.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - _q4.btc_recheck_s - 2
+_q4.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_q4) - 1
+_q4.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - _win(_q4) - 2
 _q4.btc_tick(look=_look_returning("not_seen"))
 check("...the forward's answer opens a new window, and the next one past it "
       "starts another", len(_qj4) == 2)
@@ -5464,7 +5542,7 @@ check("an `unsure` answer to the automatic recheck does not start another "
       "at the next tick: once per window, whatever the word",
       len(_qj7) == 1 and _q7._btc_recheck_due("B4A1")
       and "B4A1" not in _q7._btc_sent_set())
-_q7.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - _q7.btc_recheck_s - 1
+_q7.btc_open.get("B4A1", {})["rechecked_at"] = time.time() - _win(_q7) - 1
 _q7.btc_tick(look=_look_returning("not_seen"))
 check("...and a window after the last start it is asked again",
       len(_qj7) == 2)
@@ -5489,13 +5567,13 @@ check("a `sent` answer about a forward this end never watched (a restart) "
 _q8.handle(_msg(111, 111, f"/check {_q8._label(111, 'B4A1')}"))
 check("...inside the window the tap asks the XMR side, as for any sent one",
       _qj8[-1][1] == "swap_status")
-_q8.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q8.btc_recheck_s - 1
+_q8.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_q8) - 1
 _q8.handle(_msg(111, 111, f"/check {_q8._label(111, 'B4A1')}"))
 check("...past the window the tap asks the FORWARD again (the recheck "
       "applies after a restart)",
       _qj8[-1] == (111, "forward_to_swap", {"handle": "B4A1"}))
 _q8._btc_forward_result("B4A1", "done", "sent", 111)
-_q8.btc_open.get("B4A1", {})["sent_at"] = time.time() - _q8.btc_recheck_s - 1
+_q8.btc_open.get("B4A1", {})["sent_at"] = time.time() - _win(_q8) - 1
 _q8_n = len(_qj8)
 _q8.btc_tick(look=_look_returning("not_seen"))
 check("...and the tick starts the automatic recheck for it, for its own "
@@ -5683,6 +5761,44 @@ check("the intake's settings are command-line flags (never on the card): "
       and _a.btc_network == "testnet" and _a.btc_poll == 120
       and _a.deposit_min_sat == 60000
       and _cli.parse_args([]).btc_electrum == [])
+
+# A WATCHER THAT CAN NEVER LOOK SAYS SO (the review of stages 2-6). Each
+# failed look was swallowed -- right for one bad circuit, wrong for a proxy
+# the look refuses or a network the vault is not on, which left every
+# deposit unseen for as long as nobody tapped.
+_pxr = None
+try:
+    pg.main(["--chat-id", "1", "--btc-electrum", "s.onion",
+             "--tor-proxy", "socks5h://user:pass@127.0.0.1:9050"])
+except SystemExit as _e:
+    _pxr = str(_e)
+check("a --tor-proxy the intake's look would refuse (a credential in it) is "
+      "refused at START, where the operator is standing",
+      _pxr and "--tor-proxy" in _pxr and "credential" in _pxr)
+_nw, _nws, _nwj = _watch_pager(addr="tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+                               h="B4A2")
+_nw.btc_servers = [("s.onion", 50002, None)]
+_nw._btc_register("B4A3", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", 111)
+_nw._btc_register("B4A4", _BTC_ADDR, 111)
+check("a deposit address of ANOTHER network than --btc-network is not "
+      "watched (every look would fail in silence and the pay message stay "
+      "held for two days); one of this network is",
+      "B4A3" not in _nw.btc_open and "B4A4" in _nw.btc_open)
+_lf, _lfs, _lfj = _watch_pager()
+_lf.btc_servers = [("s.onion", 50002, None)]
+_lf.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_lf_out = io.StringIO()
+with contextlib.redirect_stdout(_lf_out):
+    for _ in range(_lf.LOOK_FAIL_WARN_TICKS + 3):
+        _lf.btc_tick(look=_look_returning(RuntimeError("no circuit")))
+check("...and a watcher whose every look fails for LOOK_FAIL_WARN_TICKS "
+      "ticks says so ONCE at the terminal, with the error's type and "
+      "nothing of its text",
+      _lf_out.getvalue().count("no look at the intake's addresses") == 1
+      and "RuntimeError" in _lf_out.getvalue()
+      and "no circuit" not in _lf_out.getvalue())
+_lf.btc_tick(look=_look_returning("not_seen"))
+check("...and one answer resets the count", _lf._look_fail_ticks == 0)
 
 print("\n-- the floor the pairing carried (the MED pass) --")
 # The wizard took any deposit down to the wire's floor unless the operator
@@ -6103,17 +6219,40 @@ _hd.rng = types.SimpleNamespace(randint=lambda a, b: 900)
 _hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
                         "unconfirmed_sat": 0})
 check("the tick that first sees a deposit SETTLE does not start the "
-      "forward: it draws a hold, leaves the entry on seen, spends no wake "
-      "and says nothing (the chat heard 'received' already)",
-      _hdj == [] and _hds == []
-      and _hd.btc_open["B4A1"]["state"] == "seen"
+      "forward: it draws a hold, leaves the entry on seen and spends no "
+      "wake",
+      _hdj == [] and _hd.btc_open["B4A1"]["state"] == "seen"
       and _hd.btc_open["B4A1"]["forward_hold"] > time.time())
+# ...AND SAYS "received" ONCE when that is the first the chat hears of it:
+# a payment mined before the first look saw it in the mempool went from
+# unpaid straight into the hold, and the client heard nothing for up to
+# --btc-hold-max (the review of stages 2-6). No figure, no "confirmed".
+check("...and, the chat having heard nothing yet (the payment was mined "
+      "before any look saw it), says 'received' ONCE, with no figure and "
+      "no 'confirmed' -- the wake says that when it starts",
+      len(_hds) == 1 and "received" in _hds[0][0]
+      and "confirmed" not in _hds[0][0]
+      and not any(c.isdigit() for c in _hds[0][0].split(":", 1)[1]))
 _hd_first = _hd.btc_open["B4A1"]["forward_hold"]
 _hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
                         "unconfirmed_sat": 0})
 check("...a later tick inside the hold does not redraw it and still starts "
-      "nothing: the wait is the deposit's, not the tick's",
-      _hdj == [] and _hd.btc_open["B4A1"]["forward_hold"] == _hd_first)
+      "nothing, and says nothing more: the wait is the deposit's, not the "
+      "tick's",
+      _hdj == [] and _hd.btc_open["B4A1"]["forward_hold"] == _hd_first
+      and len(_hds) == 1)
+# A TAP INSIDE THE HOLD DOES NOT CUT IT SHORT (the review of stages 2-6):
+# the client who taps the moment their own wallet shows the confirmation
+# started the forward at once, the gap the hold exists to remove.
+_hd.handle_owner["B4A1"] = 111
+_hd.handle_job["B4A1"] = "receive_and_quote"
+_hd.btc_servers = [("s.onion", 50002, None)]
+_hd.handle(_msg(111, 111, f"/check {_hd._label(111, 'B4A1')}"))
+check("a /check inside the hold starts NOTHING and says it goes by itself, "
+      "with no number -- the watcher starts it when the hold runs out",
+      _hdj == [] and _hd.btc_open["B4A1"]["state"] == "seen"
+      and "sent on shortly, by itself" in _hds[-1][0]
+      and not any(c.isdigit() for c in _hds[-1][0].split(":", 1)[1]))
 _hd.btc_open["B4A1"]["forward_hold"] = time.time() - 1
 _hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
                         "unconfirmed_sat": 0})

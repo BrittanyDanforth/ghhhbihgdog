@@ -1138,6 +1138,12 @@ _UNSPENT0 = [{"tx_hash": _H1, "vout": 0, "value": 200000,
 _p1, _of1, _hx1 = _first_send()
 _n1 = Net(utxos=[], spends=[_listed(_p1, _hx1)])
 _c, _o, _p, _ = _reconcile(_n1, _of1)
+check("the reconciliation names its OWN transactions to the history read "
+      "-- the forward and what funded its inputs -- so a dust flood that "
+      "pushes them off the window cannot jam it history_inconsistent",
+      _n1.spend_calls
+      and {_p1["txid"].lower(), _H1}
+      <= set(_n1.spend_calls[0].get("keep_txids") or ()))
 check("listed in a block, nothing new on the address: done, no quote, no "
       "send; the plan is brought up to date (seen, the height, a "
       "reconciliation stamp) and NOT rotated",
@@ -1390,7 +1396,7 @@ _pS, _ofS, _hxS = _first_send()            # accepted, seen in the mempool
 check("(setup) the first send paid the estimate and knows it",
       _pS["feerate_target_sat_vb"] == 10 and _pS["seen_height"] == 0
       and isinstance(_pS["ts"], int))
-_age_plan(_ofS, 3 * 3600)
+_age_plan(_ofS, 4 * 3600)
 _nS0 = Net(utxos=[], spends=[_listed(_pS, _hxS, height=0)], fee=10)
 _c, _o, _p, _ = _reconcile(_nS0, _ofS)
 check("listed in the mempool past the window, but today's estimate is NOT "
@@ -1480,7 +1486,7 @@ check("...and a window of 0 stays 0: the operator turned the bump off "
 # THE LOOK STILL LISTS THE INPUTS (a server whose mempool never saw the
 # original): not duplicated -- one input, not two of the same outpoint.
 _pD, _ofD, _hxD = _first_send()
-_age_plan(_ofD, 3 * 3600)
+_age_plan(_ofD, 4 * 3600)
 _nD = Net(utxos=_UNSPENT0, spends=[_listed(_pD, _hxD, height=0)], fee=30,
           submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nD, _ofD)
@@ -1491,7 +1497,7 @@ check("a server that still lists the original's inputs as unspent: the "
 # THE ESTIMATE OVER THE CEILING: the replacement is `delayed` like a first
 # forward would be; the original stands, the plan is not rotated.
 _pE, _ofE, _hxE = _first_send()
-_age_plan(_ofE, 3 * 3600)
+_age_plan(_ofE, 4 * 3600)
 _nE = Net(utxos=[], spends=[_listed(_pE, _hxE, height=0)], fee=500,
           submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nE, _ofE)
@@ -1508,12 +1514,15 @@ _nC0 = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 2_000_000,
 _cC, _oC, _pC, _ofC = run(_nC0, broadcast=True)
 check("(setup) a first send at the ceiling rate", _cC == F.EXIT_OK
       and _pC["feerate_target_sat_vb"] == 200)
-_age_plan(_ofC, 3 * 3600)
+_age_plan(_ofC, 4 * 3600)
+# 211: the forward aimed at 200 and REALLY pays 50800 / 241 = 210.8 sat/vB
+# (the fee is sized against the bound), and a bump is due only once the
+# estimate is above what it really pays (bump_due).
 _nC = Net(utxos=[], spends=[_listed(_pC, _nC0.submits[0]["raw_hex"],
                                     height=0,
                                     inputs=[{"tx_hash": _H1, "vout": 0,
                                              "value": 2_000_000}])],
-          fee=210, submit=_ACCEPTED, seen=_SEEN0)
+          fee=211, submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nC, _ofC)
 check("a forward already paying the ceiling cannot be replaced within the "
       "band: refused bump_over_ceiling with the word `delayed`, nothing "
@@ -1524,7 +1533,7 @@ check("a forward already paying the ceiling cannot be replaced within the "
       and len(F._plan_chain(_ofC)) == 1)
 # A REJECTED REPLACEMENT: the original stands, nothing rotated.
 _pR2, _ofR2, _hxR2 = _first_send()
-_age_plan(_ofR2, 3 * 3600)
+_age_plan(_ofR2, 4 * 3600)
 _nR2 = Net(utxos=[], spends=[_listed(_pR2, _hxR2, height=0)], fee=30,
            submit=_REJECTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nR2, _ofR2)
@@ -1542,7 +1551,7 @@ check("every server rejects the replacement: refused broadcast_rejected, "
 _pF, _ofF, _hxF = _first_send()
 check("(setup) the memo fits a policy one byte smaller", _pF["memo_bytes"]
       <= 119)
-_age_plan(_ofF, 3 * 3600)
+_age_plan(_ofF, 4 * 3600)
 _nF = Net(utxos=[], spends=[_listed(_pF, _hxF, height=0)], fee=30,
           submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nF, _ofF, "--op-return-max-bytes", "119",
@@ -1566,9 +1575,35 @@ check("bump_due is pure and refuses what it cannot compare: a reconstructed "
       and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1000}, 30, 7200,
                      now=5000) is False
       and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1000}, 30, 7200,
-                     now=8200) is True
+                     now=8800) is True
       and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1000}, 10, 7200,
-                     now=8200) is False)
+                     now=8800) is False)
+# THE STAMP IS A TEN-MINUTE BUCKET'S START: the forward went out up to 599 s
+# after it, so the age is measured from the bucket's END -- a replacement
+# never goes out sooner than --bump-after. The drill's 0 is still at once.
+check("bump_due never bumps sooner than the setting though the stamp is "
+      "coarsened: 7200 s after a bucket's start is not yet 7200 s after the "
+      "send; 7799 s is; and --bump-after 0 is still at once",
+      F.bump_due({"feerate_target_sat_vb": 10, "ts": 1200}, 30, 7200,
+                 now=1200 + 7200) is False
+      and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1200}, 30, 7200,
+                     now=1200 + 7799) is True
+      and F.bump_due({"feerate_target_sat_vb": 10, "ts": 1200}, 30, 0,
+                     now=1200) is True)
+# THE RATE IT PAYS, not the rate it aimed at. Target 10, but the fee was
+# sized against the vsize bound (274) and the real transaction is 240 vB:
+# it pays 2850 sat, 11.875 sat/vB. An estimate of 11 is BELOW that, and
+# replacing it paid 588 sat more of the client's deposit for a forward
+# already ahead of the market -- and put one more RBF pair on the chain.
+_paid_real = {"feerate_target_sat_vb": 10, "fee_sat": 2850, "vsize": 240,
+              "ts": 1000}
+check("bump_due compares today's estimate with what the forward REALLY pays "
+      "(fee/vsize): 11 sat/vB is not above 11.875, so no replacement -- it "
+      "used to compare with the target (10) and replace",
+      F.bump_due(_paid_real, 11, 7200, now=9000) is False
+      and F.bump_due(_paid_real, 12, 7200, now=9000) is True
+      and F.bump_due(dict(_paid_real, fee_sat=None), 11, 7200,
+                     now=9000) is True)
 _bnd1 = F.btx.vsize_upper_bound(1, [F.INBOUND_SPK_MAX,
                                      F.btx.op_return_script_len(120)])
 check("bump_floor never goes under the paid rate plus one, the operator's "
@@ -1589,7 +1624,7 @@ check("bump_floor never goes under the paid rate plus one, the operator's "
 # forward beside a stuck one.
 _H2U = [{"tx_hash": _H2, "vout": 0, "value": 300000, "confirmations": 5}]
 _pQ, _ofQ, _hxQ = _first_send()
-_age_plan(_ofQ, 3 * 3600)
+_age_plan(_ofQ, 4 * 3600)
 _nQ = Net(utxos=_H2U, spends=[_listed(_pQ, _hxQ, height=0)], fee=30,
           submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nQ, _ofQ)
@@ -1616,7 +1651,7 @@ check("(setup) money came back while the first forward sat at today's rate "
       and _p2["replaces"] is None and len(F._plan_chain(_ofP)) == 2
       and _p2["txid"] != _pP["txid"])
 _chainP = F._plan_chain(_ofP)
-_age_plan(str(_chainP[1]), 3 * 3600)                    # the rotated plan 1
+_age_plan(str(_chainP[1]), 4 * 3600)                    # the rotated plan 1
 _hxP2 = _nP1.submits[0]["raw_hex"]
 _nP2 = Net(utxos=[], spends=[_listed(_pP, _hxP, height=0),
                              _listed(_p2, _hxP2, height=0,
@@ -1642,7 +1677,7 @@ check("...fees rose: the ROTATED first forward, stuck behind the current "
 # replacement is priced to beat EVERY one of them, and the window is
 # measured from the newest attempt.
 _pV, _ofV, _hxV = _first_send()                          # F at 10
-_age_plan(_ofV, 3 * 3600)
+_age_plan(_ofV, 4 * 3600)
 _nV1 = Net(utxos=[], spends=[_listed(_pV, _hxV, height=0)], fee=12,
            submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _pV2, _ = _reconcile(_nV1, _ofV)
@@ -1659,7 +1694,7 @@ check("the server lists the ORIGINAL and not the replacement sent minutes "
       _c == F.EXIT_OK and _nV2.submits == [] and _nV2.posts == []
       and _p["superseded_by"] == _pV["txid"]
       and ("forward", "reconcile_bumped") not in _nV2.kinds)
-_age_plan(_ofV, 3 * 3600)                                # the replacement too
+_age_plan(_ofV, 4 * 3600)                                # the replacement too
 _nV3 = Net(utxos=[], spends=[_listed(_pV, _hxV, height=0)], fee=11,
            submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _pV3, _ = _reconcile(_nV3, _ofV)
@@ -1688,6 +1723,19 @@ check("...the ORIGINAL mined after all: the current plan (the second "
       and _p["superseded_height"] == 850010 and _p["txid"] == _pV3["txid"]
       and _nV4.submits == [] and _nV4.posts == []
       and ("forward", "reconcile_bumped") not in _nV4.kinds)
+# ...AND WHEN THE NETWORK THEN LISTS THE CURRENT PLAN'S OWN TRANSACTION (a
+# lagging server had listed the original; this one mined), the stale mark
+# goes: the plan said both "listed" and "superseded by the original", and
+# the pairs rewrite counted the original, which never confirms.
+_nV5 = Net(utxos=[], spends=[_listed(_pV3, _nV3.submits[0]["raw_hex"],
+                                     height=850011)], fee=11,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nV5, _ofV)
+check("...a plan marked superseded whose OWN transaction is then listed "
+      "sheds the stale mark: the network named it the record",
+      _c == F.EXIT_OK and _p["txid"] == _pV3["txid"]
+      and _p.get("seen_height") == 850011
+      and "superseded_by" not in _p and "superseded_height" not in _p)
 # THE REPLACED OUTPOINTS ARE SPENT WHOLE: an input worth spending at the
 # original's rate but dust at today's is still spent by the replacement --
 # it is committed either way, and the floor was sized over the same count.
@@ -1699,7 +1747,7 @@ _nM0 = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
 _cM, _oM, _pM, _ofM = run(_nM0, broadcast=True)
 check("(setup) a first send over two inputs, the small one worth spending "
       "at 10 sat/vB", _cM == F.EXIT_OK and len(_pM["inputs"]) == 2)
-_age_plan(_ofM, 3 * 3600)
+_age_plan(_ofM, 4 * 3600)
 _nM = Net(utxos=[], spends=[_listed(_pM, _nM0.submits[0]["raw_hex"], height=0,
                                     inputs=[{"tx_hash": _H1, "vout": 0,
                                              "value": 200000},
@@ -1790,6 +1838,18 @@ _r("inbound_unverified", Net(thornode=OSError("down")), "--thornode",
    "https://t")
 _r("inbound_unverified", Net(thornode={"not": "a list"}), "--thornode",
    "https://t")
+# THE CROSS-CHECK RESTS ON TLS OR ON AN ONION KEY (the review of stages
+# 2-6): a plaintext http:// THORNode was accepted, and then any Tor exit
+# could answer for it -- echo the aggregator's own address, mark BTC halted.
+_r("bad_args", Net(), "--thornode", "http://thornode.example")
+check("...an http:// THORNode that is not an onion is refused before any "
+      "look; https:// and http:// to a .onion are the two it can rest on",
+      F.watch.thornode_url_ok("https://thornode.example")
+      and F.watch.thornode_url_ok("http://abcdefghijklmnop.onion/")
+      and not F.watch.thornode_url_ok("http://thornode.example")
+      and not F.watch.thornode_url_ok("https://u:p@thornode.example")
+      and not F.watch.thornode_url_ok("ftp://thornode.example")
+      and not F.watch.thornode_url_ok(""))
 _r("below_thor_dust", Net(thornode=[{"chain": "BTC", "address": _INBOUND,
                                       "halted": False,
                                       "dust_threshold": "500000"}]),
@@ -2618,7 +2678,39 @@ check("...and when the kept bytes are RE-SENT and every server rejects "
       _c == F.EXIT_OK and _p["reconcile_reason"] == "rejected"
       and _nRj.submits[0]["raw_hex"] == _hxR3
       and [(i["tx_hash"], i["vout"]) for i in _p["inputs"]] == [(_H2, 1)]
-      and _p["excluded_outpoints"] == 1 and _p["carried_returned"] == 0)
+      # 3, as the evicted branch's above: the returned output AND the two
+      # outpoints our listed forwards spend. It was 1 -- the returned
+      # output alone -- which is the NEVER TWICE gap pinned just below.
+      and _p["excluded_outpoints"] == 3 and _p["carried_returned"] == 0)
+# NEVER TWICE, ON THE REJECTED RE-SEND AS WELL. The look and the history
+# fail over per call, so they can come from different servers: the look's
+# has not got our listed forward X in its mempool and shows X's input as
+# unspent. The evicted branch excluded every outpoint a listed forward of
+# ours spends; the rejected re-send's fresh forward excluded only the kept
+# money, and signed over X's input a second time.
+_HX = "ef" * 32
+_pX, _ofX, _hxX = _first_send(seen=_NOT_SEEN)
+check("(setup) the current forward kept its bytes (unseen)",
+      bool(_pX["tx_hex"]))
+_X = dict(_pX, txid="99" * 32, tx_hex=None,
+          inputs=[{"tx_hash": _HX, "vout": 0, "value": 150000,
+                   "confirmations": 5}])
+json.dump(_X, open(_ofX[:-5] + ".1.json", "w"))
+_nX = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 200000,
+                  "confirmations": 5},
+                 {"tx_hash": _HX, "vout": 0, "value": 150000,
+                  "confirmations": 5}],
+          spends=[{"txid": _X["txid"], "height": 0, "hex": _hxX,
+                   "inputs": [{"tx_hash": _HX, "vout": 0, "value": 150000}],
+                   "server": "s.onion"}],
+          fee=10, submit=[_REJECTED, _ACCEPTED], seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nX, _ofX)
+check("a rejected re-send's fresh forward does NOT sign again over an "
+      "outpoint a LISTED forward of ours already spends, though the look "
+      "(another server) shows it unspent -- the same exclusion the evicted "
+      "branch makes",
+      _c == F.EXIT_OK and _p["reconcile_reason"] == "rejected"
+      and [(i["tx_hash"], i["vout"]) for i in _p["inputs"]] == [(_H1, 0)])
 # UNDER the bound, a re-sign that carries returned money is COUNTED.
 _pC1, _ofC, _hxC1 = _first_send()
 _nC1 = Net(utxos=_RET, spends=[_listed(_pC1, _hxC1)], fee=10,
@@ -2872,7 +2964,7 @@ check("(setup) at the bound, the current forward in the mempool at today's "
       "rate: the return is kept and the mark names it",
       _c == F.EXIT_OK and _p.get("reconcile_reason") == "returned"
       and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
-_age_plan(_ofB, 3 * 3600)
+_age_plan(_ofB, 4 * 3600)
 _nB2 = Net(utxos=_RET3, spends=_lB + [_lB3u], fee=30, submit=_ACCEPTED,
            seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nB2, _ofB)
@@ -2908,7 +3000,7 @@ _c, _o, _p, _ = _reconcile(_nB21, _ofB2)
 check("(setup) kept at the bound, the forward in the mempool",
       _c == F.EXIT_OK
       and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
-_age_plan(_ofB2, 3 * 3600)
+_age_plan(_ofB2, 4 * 3600)
 _nB22 = Net(utxos=_RET3, spends=_lB2 + [_lB23u], fee=30, submit=_ACCEPTED,
             seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nB22, _ofB2, "--returns-max", "3")
@@ -2973,7 +3065,7 @@ check("(setup) an UNSETTLED return at the bound is kept, the mark naming it",
       _c == F.EXIT_OK
       and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]]
       and _p["returned_kept"]["settled"] is False)
-_age_plan(_ofB4, 3 * 3600)
+_age_plan(_ofB4, 4 * 3600)
 _nB42 = Net(utxos=_RET3U, spends=_lB4 + [_lB43u], fee=30, submit=_ACCEPTED,
             seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nB42, _ofB4, "--returns-max", "3")
@@ -2997,7 +3089,7 @@ _c, _o, _p, _ = _reconcile(_nB51, _ofB5)
 check("(setup) kept at the bound, the forward in the mempool, once more",
       _c == F.EXIT_OK
       and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
-_age_plan(_ofB5, 3 * 3600)
+_age_plan(_ofB5, 4 * 3600)
 _nB52 = Net(utxos=[], spends=_lB5 + [_lB53u, _rbf], fee=30)
 _c, _o, _p, _ = _reconcile(_nB52, _ofB5, "--feerate-ceiling", "10")
 check("the kept output moved by hand while the forward sits stuck under a "
@@ -3098,16 +3190,21 @@ F.FEE_JITTER = lambda bound: 0
 check("(setup) the first send paid the bound times the rate plus bound-1",
       _pJ["fee_sat"] == _pJ["vsize_bound"] * 10 + _pJ["vsize_bound"] - 1
       and _pJ["feerate_target_sat_vb"] == 10)
-_age_plan(_ofJ, 3 * 3600)
-_nJ1 = Net(utxos=[], spends=[_listed(_pJ, _hxJ, height=0)], fee=11,
+_age_plan(_ofJ, 4 * 3600)
+# 12: aimed at 10, it REALLY pays 2793 / 240 = 11.6 sat/vB, so an estimate
+# of 11 is not above it (bump_due) and 12 is.
+check("(setup) the jittered forward really pays between 11 and 12 sat/vB",
+      11 * _pJ["vsize"] < _pJ["fee_sat"] < 12 * _pJ["vsize"])
+_nJ1 = Net(utxos=[], spends=[_listed(_pJ, _hxJ, height=0)], fee=12,
            submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nJ1, _ofJ, "--feerate-ceiling", "11")
-check("stuck at 10 with the estimate at 11 and a ceiling of 11: the "
-      "replacement would have to pay 12 (one bound over a jittered fee), so "
-      "it is refused bump_over_ceiling (delayed) and the original stands",
+check("stuck at 10 (really 11.6) with the estimate at 12 and a ceiling of "
+      "11: the replacement would have to pay 12 (one bound over a jittered "
+      "fee), so it is refused bump_over_ceiling (delayed) and the original "
+      "stands",
       _c == F.EXIT_REFUSED and "bump_over_ceiling" in _o
       and _status_of(_ofJ) == "delayed" and _nJ1.submits == [])
-_nJ2 = Net(utxos=[], spends=[_listed(_pJ, _hxJ, height=0)], fee=11,
+_nJ2 = Net(utxos=[], spends=[_listed(_pJ, _hxJ, height=0)], fee=12,
            submit=_ACCEPTED, seen=_SEEN0)
 _c, _o, _p, _ = _reconcile(_nJ2, _ofJ)
 check("...under the default ceiling it is bumped at 12 sat/vB, paying at "

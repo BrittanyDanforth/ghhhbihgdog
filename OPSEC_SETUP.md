@@ -2341,11 +2341,17 @@ decoration cannot push a memo past the policy.
 `--btc-bump-after` (default 7200, at most a week) is how long a forward may
 sit in the mempool before a run of the forward replaces it at today's rate
 (the bump, below); the pager's `--btc-recheck` must be at least this, or
-its rechecks never find one due. The window actually used is **drawn** per
-reconciliation from your setting up to half again as much, never below it:
-a replacement is public, so is the transaction it replaces, and at a fixed
-offset every bump this host ever made was one population. Your number is
-the floor and roughly the mean, not the offset an observer measures.
+its rechecks never find one due. The window the vault uses is drawn per
+reconciliation from your setting up to half again as much, never below it
+-- ~~and that was said to be what an observer measures~~. It is not: a
+bump goes out when the Pi's recheck runs, and the Pi rechecked on a fixed
+`--btc-recheck` at or above this window, so every bump went out at *sent +
+--btc-recheck* plus the public wake jitter, a grid anyone who has read the
+code could lay over the chain's replacement pairs. **The draw that matters
+is now on the Pi**: each forward's recheck waits `--btc-recheck` to twice
+that, uniform, drawn from the CSPRNG when the forward's answer starts the
+window, kept in memory with the entry and never on the card. Both numbers
+are floors; the offset an observer measures is the Pi's draw.
 
 `--btc-returns-max` (default 2, up to 1000) is how many ROUNDS of money
 that CAME BACK to a deposit address one deposit may have forwarded before
@@ -2529,10 +2535,12 @@ python3 gs_telegram_pager ... \
     --btc-fee-retry 3600   # how long after the vault would not pay today's
                            # fee for a forward this end tries again, by
                            # itself (floor 600)
-    --btc-recheck 10800    # how long after a forward went out this end asks
-                           # the forward about it again, by itself, once per
-                           # window (floor 600); at or above the vault's
-                           # --btc-bump-after, or a bump is never found due
+    --btc-recheck 10800    # the SHORTEST wait after a forward went out
+                           # before this end asks the forward about it again,
+                           # by itself, once per window: each window is drawn
+                           # from this to twice this (floor 600); at or above
+                           # the vault's --btc-bump-after, or a bump is never
+                           # found due
     --btc-hold-max 1800    # the longest this end holds a SETTLED deposit
                            # before starting its first forward; the actual
                            # hold is drawn per deposit from 0 to this. The
@@ -2679,7 +2687,11 @@ swap per outpoint, the one the reconciliation found in the network. The
 phone hears `sent` for a bump — never a fee, a rate, a txid or a count of
 attempts — and `forwarded` once the forward that is the record is in a
 block. `--allow-btc-broadcast` needs `--thornode`:
-money does not move on the aggregator's word alone. `--btc-account N`
+money does not move on the aggregator's word alone. And the THORNode URL
+is `https://`, or `http://` to a `.onion` — the check rests on TLS or on
+the onion key; a plaintext clearnet URL is refused at pairing and by the
+forwarder, because over it any Tor exit could answer for THORNode.
+`--btc-account N`
 retires a chain: a vault whose ledger was wiped behind a used account, or
 paired to an account used before, refuses every deposit (`ledger_wiped`)
 until it is re-paired with the next account's xpub, because every address
@@ -2802,7 +2814,7 @@ there: `gs_doorbell`, which persists nothing but the keyfile, and
 | file | what it holds |
 |---|---|
 | `pager_state.json` | up to 200 wake timestamps in 5-minute buckets, plus the last one. `gs_common`'s own wipe-list calls this "a dated record of every time you woke the vault from a phone — which is exactly the correlation the jitters exist to break". |
-| `integrity_chain.log` | append-only, never rotated: `poke`, `collected`, `outcome:<out>`, `burn_signal`, `messages_burned`, `start` and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. |
+| `integrity_chain.log` | append-only, never rotated: `poke`, `collected`, `outcome:<out>`, `burn_signal`, `messages_burned`, `start`, the watcher's `looks_failing` and `address_unwatchable` (configuration, not a deposit) and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. The intake's per-deposit kinds went the same way: `btc_watch_forgotten` was written a public constant (two days) after a deposit opened or its forward went out, dating the poke before it, and `forward_recheck` / `btc_returned_seen` named the job of a poke already chained. |
 | `pager.log` | whatever the unit's `ExecStartPre` writes, plus anything you redirect there. |
 
 `paranoia_mode`'s search roots are the working directory, `$HOME`, and

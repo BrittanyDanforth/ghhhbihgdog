@@ -487,6 +487,13 @@ _r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
                _FT(history=[]), servers=_TWO, wait_s=0, avoid=_second)
 check("...avoid= naming a server that is not first changes nothing",
       _s["hosts"][0] == _first)
+_r, _s = _seen(_FT("down"), _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_TWO, wait_s=0, avoid=_first)
+check("...and with the OTHER server down, the accepting one is NOT asked "
+      "in its place: nobody could be asked, and the caller keeps the bytes "
+      "-- it used to fail over to it, which vouched for itself",
+      _s["hosts"] == [_second] and _r["seen"] is False
+      and _r["asked"] is False)
 _r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
                servers=_SERVERS, wait_s=0, avoid="s1.onion")
 check("...and with ONE server there is nobody else: it is asked anyway",
@@ -763,6 +770,71 @@ def _e2e(fn, scenario, *, behaviour="electrum", tls_ctx=None, pin=None,
         srv.close()
     return r, cap
 
+
+# THE HISTORY READ IS BUDGETED BY WHAT IT READS (the review of stages 2-6).
+# One session had one deadline for the handshake, the history and a
+# transaction.get per entry, one after another: about sixty dust payments
+# to the address -- which is in the chat -- ran every server out of it, and
+# every reconciliation failed history_unavailable for good. Driven through
+# the real transport and a server that takes 40 ms a reply, at a 1 s
+# deadline the 45 requests cannot fit in.
+_SPK0 = T.address_script(_A0, "main")
+_DUST, _DTXS = [], dict(_TXS)
+for _k in range(40):
+    _dt = T.build_unsigned([{"tx_hash": "%064x" % (_k + 1000), "vout": 0,
+                             "value": 2000}], [(546, _SPK0)])
+    _DUST.append({"tx_hash": _dt.txid().hex(), "height": 850100 + _k})
+    _DTXS[_dt.txid().hex()] = _dt.serialize().hex()
+
+
+def _flood(per_entry):
+    port, _c, srv = mock_socks("electrum", {"history": _HIST + _DUST,
+                                            "transactions": _DTXS,
+                                            "delay": 0.04})
+    proxy = f"socks5h://127.0.0.1:{port}"
+    _o = B.PER_ENTRY_S
+    B.PER_ENTRY_S = per_entry
+    try:
+        return B.spends_of(
+            _A0, [("s.example.onion", 50002)], proxy,
+            transport_factory=lambda h, p, t: W.SocksTlsTransport(
+                h, p, proxy, t, tls=False, timeout=1.0))
+    except W.BtcWatchError as e:
+        return e
+    finally:
+        B.PER_ENTRY_S = _o
+        srv.close()
+
+
+_fl = _flood(B.PER_ENTRY_S)
+check("a dust flood no longer runs the session out of its deadline: each "
+      "history entry brings its own allowance, and the spends come back",
+      isinstance(_fl, list) and [x["txid"] for x in _fl]
+      == [_SPEND1_ID, _SPEND2_ID])
+check("...NON-VACUITY: with no allowance the same read runs out of its one "
+      "deadline, as every reconciliation used to",
+      isinstance(_flood(0.0), W.BtcWatchError))
+check("...and the allowance has a ceiling that keeps two servers inside the "
+      "forward job's budget",
+      2 * (30 + B.READ_EXTENSION_MAX_S)
+      < __import__("gs_wake_proto").JOBS["forward_to_swap"]["budget_s"])
+# OUR OWN TRANSACTIONS ARE READ WHEREVER THEY SIT. A flood that pushed our
+# forward off the newest MAX_HISTORY left its inputs neither unspent nor
+# consumed: history_inconsistent, safe, on every run -- a jam all the same.
+_HIST_OLD = _HIST[:2] + [{"tx_hash": _FUND_ID, "height": 851000}] \
+    * (B.MAX_HISTORY + 1)
+_rk0, _, _ = _spends(_FT(history=_HIST_OLD, transactions=_TXS),
+                     on_truncated=lambda n: None)
+_rk1, _, _ = _spends(_FT(history=_HIST_OLD, transactions=_TXS),
+                     on_truncated=lambda n: None,
+                     keep_txids=[_SPEND1_ID, _FUND_ID])
+check("a spend of ours OLDER than the window is read all the same when the "
+      "caller names it, with the inputs it consumed -- and without the name "
+      "it falls off, as before",
+      [x["txid"] for x in _rk1] == [_SPEND1_ID]
+      and _rk1[0]["inputs"] == [{"tx_hash": _FUND_ID, "vout": 0,
+                                 "value": 300000}]
+      and _SPEND1_ID not in [x["txid"] for x in _rk0])
 
 _r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k), {})
 check("plaintext: the real SOCKS5 handshake, then the real subclass hands "
