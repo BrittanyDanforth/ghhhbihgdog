@@ -6515,8 +6515,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the sealed secrets are never opened, so the wake signs from the '
   'environment alone', 'gs_wake_agent',
-  '            _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),\n'
-  '                               _vault_half, _pi_half)',
+  '            _ns = open_secrets(_secrets_path(args), _vault_half, _pi_half)',
   '            _ns = 0',
   ['test_wake_agent']),
  ('the seed is read from the environment rather than the seal',
@@ -6537,7 +6536,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('--seal-secrets never reads its own container back before replacing the '
   'file', 'gs_wake_agent',
-  '        if json.loads(back[proto.SECRETS_MEMBER]) != found:\n'
+  '        if json.loads(back[proto.SECRETS_MEMBER]) != merged:\n'
   '            raise ValueError("the sealed copy does not read back")',
   '        if False:\n'
   '            raise ValueError("the sealed copy does not read back")',
@@ -6584,14 +6583,12 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('a comment ending in a backslash is read one way, though v252 and v255 '
   'read it two', 'gs_wake_agent',
-  '            if c in _SD_NEWLINE:\n'
-  '                raise ValueError(\n'
-  '                    f"line {line} is a comment ending in a backslash, and "',
-  '            if c in _SD_NEWLINE:\n'
-  '                state = "PRE_KEY"\n'
-  '                continue\n'
-  '                raise ValueError(\n'
-  '                    f"line {line} is a comment ending in a backslash, and "',
+  '    if _seen:\n'
+  '        try:\n'
+  '            _old = _parse_env_core(text, True, None)',
+  '    if False:\n'
+  '        try:\n'
+  '            _old = _parse_env_core(text, True, None)',
   ['test_wake_agent']),
  ('--seal-secrets seals under a typed half it never checked against the '
   "keyfile's sealed settings", 'gs_wake_agent',
@@ -6633,7 +6630,9 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('--fee-sweep powers the box off under the operator on a wrong or '
   'malformed half', 'gs_wake_agent',
+  '        # powered it off under them. None of these moved anything.\n'
   '        e.power = False\n        raise',
+  '        # powered it off under them. None of these moved anything.\n'
   '        raise',
   ['test_wake_agent']),
  ('`--fee-sweep --unseal-state <hex>` dumps the records in plaintext '
@@ -6682,7 +6681,7 @@ MUTATIONS = [
  #    build the poweroff unit's SIGTERM was ignored, its SIGKILL landed, and
  #    the records stayed in plaintext on a machine that was then off.
  ("run_child's wait does not notice a stop request", 'gs_wake_agent',
-  '            if shutdown_requested():\n'
+  '            if _term_asked():\n'
   '                # THE CHILD\'S OUTCOME IS RETURNED',
   '            if False:\n'
   '                # THE CHILD\'S OUTCOME IS RETURNED',
@@ -6773,7 +6772,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the chain tail is appended without re-chaining, so it no longer verifies',
   'gs_wake_agent',
-  '            prev = hashlib.sha256((prev + payload).encode()).hexdigest()\n'
+  '            prev = hashlib.sha256(_u8(prev + payload)).hexdigest()\n'
   '            out.append(f"{prev} | {payload}")',
   '            out.append(ln)',
   ['test_wake_agent']),
@@ -6902,6 +6901,106 @@ MUTATIONS = [
   '    if secrets.exists():\n',
   '    if False:\n',
   ['test_wake_endtoend']),
+ ('`--secrets-file ""` makes the opener read Path(\'\') while the check reads the default', 'gs_wake_agent',
+  '            _ns = open_secrets(_secrets_path(args), _vault_half, _pi_half)\n',
+  '            _ns = open_secrets(getattr(args, "secrets_file", SECRETS_FILE),\n                               _vault_half, _pi_half)\n',
+  ['test_wake_agent']),
+ ("--unseal-key's refusal names --unseal-state, the command that writes the records out", 'gs_wake_agent',
+  '        key = _by_hand(key, getattr(args, "unseal_key", ""), "this command",\n                       flag="--unseal-key")',
+  '        key = _by_hand(key, getattr(args, "unseal_key", ""), "this command")',
+  ['test_wake_agent']),
+ ("a half that is not 64 hex is refused as 'brings no half'", 'gs_wake_agent',
+  '    if not _typed:\n',
+  '    if True:\n',
+  ['test_wake_agent']),
+ ('a wrong half typed at the keyboard is blamed on a re-pairing, not a typo', 'gs_wake_agent',
+  '        if e.code == "keyfile_unreadable":\n            e.msg = (f"the half passed to',
+  '        if False:\n            e.msg = (f"the half passed to',
+  ['test_wake_agent']),
+ ('the hand fee sweep blames a wrong typed half on a re-pairing', 'gs_wake_agent',
+  '                if not _proven:\n',
+  '                if False:\n',
+  ['test_wake_agent']),
+ ("the keyfile a refusal's command names is not the one this run read", 'gs_wake_agent',
+  '    _KEY_PATH[0] = str(path)\n',
+  '',
+  ['test_wake_agent']),
+ ('--seal-secrets replaces the sealed file wholesale, dropping every secret not in the new plaintext', 'gs_wake_agent',
+  '    merged = dict(kept)\n',
+  '    merged = {}\n',
+  ['test_wake_agent']),
+ ('--seal-secrets overwrites a sealed file that does not open under this pair', 'gs_wake_agent',
+  '            return "existing_unreadable"\n        kept = {',
+  '            _oi = {}\n        kept = {',
+  ['test_wake_agent']),
+ ('a passphrase sealed alone is never proven against the sealed seed', 'gs_wake_agent',
+  '    if "GS_BTC_SEED" in merged and key.get("btc_account_xpub") and (\n',
+  '    if "GS_BTC_SEED" in found and key.get("btc_account_xpub") and (\n',
+  ['test_wake_agent']),
+ ("a sealed box's refusal sends the seed back to the EnvironmentFile, in the clear", 'gs_wake_agent',
+  '    return "" if _SECRETS else " in the agent unit\'s EnvironmentFile"\n',
+  '    return " in the agent unit\'s EnvironmentFile"\n',
+  ['test_wake_agent']),
+ ('one member that is not UTF-8 stops the whole seal, every wake', 'gs_wake_agent',
+  '            members[name] = (artifact_dir / name).read_bytes().decode(\n                "utf-8", "surrogateescape")\n',
+  '            members[name] = (artifact_dir / name).read_text()\n',
+  ['test_wake_agent']),
+ ('a chain on the disk that is not UTF-8 crashes state_open with the records half written', 'gs_wake_agent',
+  '        disk = [ln for ln in path.read_bytes().decode(\n            "utf-8", "surrogateescape").splitlines() if ln.strip()]\n',
+  '        disk = [ln for ln in path.read_text().splitlines() if ln.strip()]\n',
+  ['test_wake_agent']),
+ ('state_open writes a member back as locale text, not the bytes it was', 'gs_wake_agent',
+  '        with os.fdopen(_fd, "wb") as fh:\n            fh.write(_u8(text))\n',
+  '        with os.fdopen(_fd, "w") as fh:\n            fh.write(text)\n',
+  ['test_wake_agent']),
+ ("the chain merge reads and replaces without the chain's lock", 'gs_wake_agent',
+  '        fcntl.flock(lock_fd, fcntl.LOCK_EX)\n    except OSError:\n        lock_fd = None\n    try:\n        _merge_chain_locked(path, sealed_text)\n',
+  '        pass\n    except OSError:\n        lock_fd = None\n    try:\n        _merge_chain_locked(path, sealed_text)\n',
+  ['test_wake_agent']),
+ ('any comment ending in a backslash is refused, where every systemd reads it the same', 'gs_wake_agent',
+  '        if _old != out:\n            raise ValueError(\n',
+  '        if True:\n            raise ValueError(\n',
+  ['test_wake_agent']),
+ ("the pre-v254 reading is never tried, so a comment backslash that changes the unit's secrets is accepted", 'gs_wake_agent',
+  '                state = "COMMENT" if legacy else "PRE_KEY"\n',
+  '                state = "PRE_KEY"\n',
+  ['test_wake_agent']),
+ ('the stop message says the records are sealed when no store was open', 'gs_wake_agent',
+  '                     }.get(_SEAL_OUTCOME[0], "")\n',
+  '                     }.get(_SEAL_OUTCOME[0], " The records are sealed.")\n',
+  ['test_wake_agent']),
+ ('the stop message says the records are sealed when the seal failed', 'gs_wake_agent',
+  '        _SEAL_OUTCOME[0] = "failed" if _sealed < 0 else "sealed"\n',
+  '        _SEAL_OUTCOME[0] = "sealed"\n',
+  ['test_wake_agent']),
+ ('a stop between fee-sweep legs leaves the entry bundle in the clear', 'gs_wake_agent',
+  '        if _stopped is not None:\n            _retire_fee_bundle(artifact_dir)\n',
+  '        if _stopped is not None:\n',
+  ['test_wake_agent']),
+ ("a Ctrl-C kills the running mix like systemd's stop", 'gs_wake_agent',
+  "            if _term_asked():\n                # THE CHILD'S OUTCOME",
+  "            if shutdown_requested():\n                # THE CHILD'S OUTCOME",
+  ['test_wake_agent']),
+ ('a Ctrl-C does not stop the next step starting', 'gs_wake_agent',
+  '    if _STOP_SIGNAL["int"]:\n        raise Stopping("interrupted',
+  '    if False:\n        raise Stopping("interrupted',
+  ['test_wake_agent']),
+ ('a Ctrl-C powers the machine off under the person who pressed it', 'gs_wake_agent',
+  '        if not _keep_on and _STOP_SIGNAL["int"] and not _term_asked():\n',
+  '        if False:\n',
+  ['test_wake_agent']),
+ ('a stop leaves the child running: _stop_child_now does nothing', 'gs_wake_agent',
+  '    SIGTERM costs a child nothing. Returns whether it had to be KILLED."""\n    import signal\n',
+  '    SIGTERM costs a child nothing. Returns whether it had to be KILLED."""\n    return False\n    import signal\n',
+  ['test_wake_agent']),
+ ('a child that ignores SIGTERM is never killed after its grace', 'gs_wake_agent',
+  '        pass\n    try:\n        os.killpg(p.pid, signal.SIGKILL)\n    except Exception:                                        # noqa: BLE001\n        p.kill()\n    try:\n        p.wait(timeout=5)\n',
+  '        pass\n    try:\n        pass\n    except Exception:                                        # noqa: BLE001\n        pass\n    try:\n        p.wait(timeout=5)\n',
+  ['test_wake_agent']),
+ ('--unseal-key keeps the box on only once it has returned', 'gs_wake_agent',
+  '                _keep_on = True\n                code = unseal_key_cli(args)',
+  '                code = unseal_key_cli(args)\n                _keep_on = True',
+  ['test_wake_agent']),
 ]
 
 

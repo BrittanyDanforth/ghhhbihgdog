@@ -7869,7 +7869,20 @@ print("RC", A.main(["--key", "/nonexistent"]), flush=True)
 ''')
 
 
-def _stop7(child, grace):
+def _pid_alive(pidf):
+    """Whether the process whose pid the child wrote is still running."""
+    try:
+        _pid = int(Path(pidf).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(_pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _stop7(child, grace, pidf=None):
     """A wake with its store open and a real child, SIGTERMed. Returns
     (exited before the 20 s SIGKILL, seconds, plaintext left, record in the
     container)."""
@@ -7905,7 +7918,8 @@ def _stop7(child, grace):
     return ok, took, left, rec
 
 
-_ok7, _t7, _left7, _rec7 = _stop7("exec sleep 60", 10)
+_pid7 = Path(tempfile.mkdtemp(prefix="stop7pid_")) / "child.pid"
+_ok7, _t7, _left7, _rec7 = _stop7(f"echo $$ > {_pid7}; exec sleep 60", 10)
 check("stage7/stop: a SIGTERM mid-job ends the wake well inside the "
       "poweroff unit's 20 s -- it used to be ignored until the SIGKILL",
       _ok7 and _t7 < 15)
@@ -7914,10 +7928,22 @@ check("stage7/stop: ...with NO plaintext record left on the disk, and the "
       _ok7 and not _left7 and _rec7 == {"jobs": ["a client record"]})
 # A child that IGNORES SIGTERM -- a signer mid-broadcast may as well -- gets
 # its grace and is then killed, so the directory is quiet when it is sealed.
-_ok7s, _t7s, _left7s, _rec7s = _stop7("trap '' TERM; sleep 60", 1)
+_pid7s = Path(tempfile.mkdtemp(prefix="stop7pid_")) / "child.pid"
+_ok7s, _t7s, _left7s, _rec7s = _stop7(
+    f"echo $$ > {_pid7s}; trap '' TERM; sleep 60", 1)
 check("stage7/stop: ...and a child that ignores SIGTERM is killed after its "
       "grace, and the records are still sealed",
       _ok7s and not _left7s and _rec7s == {"jobs": ["a client record"]})
+# THE CHILD IS GONE, not just the wake. Every check above passed with
+# _stop_child_now reduced to nothing: the wake exited, sealed, and left the
+# child running -- in production a tool still writing a slip or a bundle
+# into the directory after its seal, in the clear, until the cgroup's
+# SIGKILL. The child writes its pid, and the pid is looked for.
+time.sleep(0.3)
+check("stage7/stop: ...and the CHILD is gone once the wake has exited, in "
+      "both cases -- one that took its SIGTERM and one that had to be "
+      "killed -- rather than left writing into a sealed directory",
+      _pid_alive(_pid7) is False and _pid_alive(_pid7s) is False)
 check("stage7/stop: the child's grace fits the poweroff unit's window with "
       "room for the seal: noticed within a second, the grace, a reap, the "
       "seal -- under the 20 s before SIGKILL",
@@ -8905,6 +8931,26 @@ try:
         check(f"stage9/power: {_why} on a keyfile whose half is malformed "
               f"does NOT power the machine off under the operator",
               "power_off" not in _pc9)
+    # ...AND A KEYFILE THAT DOES NOT LOAD AT ALL. For --unseal-key the loop
+    # above is vacuous: unseal_key_cli turns every refusal about the half
+    # into a return code, so nothing ever reached main()'s finally and the
+    # check passed with the flag set after the command as well as before.
+    # load_key raising is the one path that does reach it, for every hand
+    # command, so it is the one that shows WHEN the flag is set.
+    A.load_key = lambda p: (_ for _ in ()).throw(
+        A.Refused("keyfile_unreadable", "no keyfile here"))
+    for _fl, _why in ((["--unseal-state", _S8_PI.hex()], "--unseal-state"),
+                      (["--seal-secrets", _S8_PI.hex()], "--seal-secrets"),
+                      (["--unseal-key", _S8_PI.hex()], "--unseal-key")):
+        _pc9.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                A.main(["--key", "/nonexistent"] + _fl)
+            except BaseException:                            # noqa: BLE001
+                pass
+        check(f"stage9/power: {_why} with a keyfile that will not load "
+              f"does NOT power the machine off either",
+              "power_off" not in _pc9)
 finally:
     (A.power_off, A.disarm_deadman, A.somebody_is_here,
      A.retire_job_log, A.integrity_log, A.load_key) = _sv9
@@ -8945,7 +8991,7 @@ try:
                     secrets_file=str(_fsec9)), deps={})
             _fr9[_tag] = (None, None, list(_seen9))
         except A.Refused as e:
-            _fr9[_tag] = (e.code, e.power, list(_seen9))
+            _fr9[_tag] = (e.code, e.power, list(_seen9), e.msg)
 finally:
     A.load_key, A.preflight, A._AGENT_LOG[0] = _sv9f
     A._SECRETS.clear()
@@ -9182,6 +9228,352 @@ check("stage9/msg: a box that seals its secrets and has no seed in either "
       "place says so, instead of only 'set it in the EnvironmentFile'",
       _msgs9["neither"][0] == "btc_seed_unset"
       and "in neither them nor the environment" in _msgs9["neither"][1])
+
+# ===========================================================================
+print("\n== the hostile review of this pass: what survived it ==")
+
+# --secrets-file "" IS THE DEFAULT FILE, for the opener too. The early check
+# resolved "" to /etc/gs-wake-spend.sealed and open_secrets was handed ""
+# itself -- Path("."), not a file -- so a sealed seed sat beside a job that
+# signed from the environment.
+_hr_sd, _hr_skf, _, _hr_sbell = _sealed_env()
+_hr_sec = Path(_d0) / "hr_otherpair.sealed"
+_hr_sec.write_text(json.dumps(P.state_seal(
+    {P.SECRETS_MEMBER: json.dumps({"GS_WALLET_PASSWORD": "x"})},
+    bytes(32), bytes(32), schema=P.SECRETS_SCHEMA)))
+_o_sf_hr = A.SECRETS_FILE
+A.SECRETS_FILE = str(_hr_sec)
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.run_once(types.SimpleNamespace(key=str(_hr_skf), dry_run=False,
+                                         secrets_file=""),
+                   {k: v for k, v in deps_for(_hr_sd, _hr_sbell).items()
+                    if not k.startswith("_")})
+    _hr_se = None
+except A.Refused as e:
+    _hr_se = e
+finally:
+    A.SECRETS_FILE = _o_sf_hr
+    A._STATE_KEY.clear()
+    A._SECRETS.clear()
+    A._SECRETS_FROM[0] = None
+check("review2: `--secrets-file \"\"` opens THE DEFAULT sealed file like the "
+      "early check does -- it read Path('') and signed from the environment "
+      "beside a sealed seed",
+      getattr(_hr_se, "code", None) == "secrets_unreadable")
+
+# THE HAND REFUSALS NAME THE FLAG THAT WAS TYPED, and a typo before a
+# re-pairing.
+_hr8d, _hr8kf, _, _, _, _ = _stage8_env()
+_hr_msgs = {}
+for _tag, _h in (("none", ""), ("short", "ab" * 31), ("wrong", "00" * 32)):
+    _b = io.StringIO()
+    with contextlib.redirect_stdout(_b):
+        _c = A.unseal_key_cli(types.SimpleNamespace(key=str(_hr8kf),
+                                                    unseal_key=_h))
+    _hr_msgs[_tag] = (_c, _b.getvalue())
+check("review2: --unseal-key with NO half names --unseal-key, not "
+      "--unseal-state -- the command that writes every record out in the "
+      "clear",
+      "brings no half" in _hr_msgs["none"][1]
+      and "--unseal-key <hex>" in _hr_msgs["none"][1]
+      and "--unseal-state" not in _hr_msgs["none"][1])
+check("review2: ...a half one character pair short is named as THAT, with "
+      "its length, not as 'brings no half'",
+      "is not a half of the key" in _hr_msgs["short"][1]
+      and "62 character" in _hr_msgs["short"][1]
+      and "brings no half" not in _hr_msgs["short"][1]
+      and "--unseal-state" not in _hr_msgs["short"][1])
+check("review2: ...and a well-formed WRONG half is called a likely typo "
+      "before a re-pairing, and the printed commands carry --key",
+      _hr_msgs["wrong"][0] == "keyfile_unreadable"
+      and "typo" in _hr_msgs["wrong"][1]
+      and f"--key {_hr8kf}" in _hr_msgs["wrong"][1])
+check("review2: a typed half on the hand fee sweep that does not open the "
+      "sealed secrets is called a likely typo too -- the advice after it, "
+      "re-seal, needs the plaintext the operator was told to shred",
+      _fr9["wrong"][0] == "secrets_unreadable"
+      and "typo" in _fr9["wrong"][3])
+
+# --seal-secrets MERGES. It replaced the file wholesale, and every refusal
+# about a missing secret says "add it to the plaintext and re-seal", to an
+# operator who has shredded the plaintext: the fee password went in and the
+# seed and the spend password silently came out.
+_mg = Path(tempfile.mkdtemp(prefix="sealmerge_"))
+_mg_out = _mg / "spend.sealed"
+
+
+def _mg_seal(text, out=_mg_out):
+    _e = _mg / "one.env"
+    _e.write_text(text)
+    _b = io.StringIO()
+    with contextlib.redirect_stdout(_b):
+        _c = A.seal_secrets_cli(types.SimpleNamespace(
+            key=str(_kf9), seal_secrets=_S8_PI.hex(),
+            secrets_env=str(_e), secrets_file=str(out)))
+    return _c, _b.getvalue()
+
+
+def _mg_read(out=_mg_out):
+    return json.loads(P.state_unseal(json.loads(out.read_text()),
+                                     bytes.fromhex(_SEAL_HALF), _S8_PI,
+                                     schema=P.SECRETS_SCHEMA)[
+        P.SECRETS_MEMBER])
+
+
+_mg1 = _mg_seal(f'GS_BTC_SEED="{_FWD_MNEMONIC}"\nGS_WALLET_PASSWORD=pw1\n')
+_mg2 = _mg_seal("GS_FEE_WALLET_PASSWORD=fee2\n")
+check("review2: --seal-secrets with a file naming ONE secret adds it and "
+      "KEEPS the rest sealed, and says which it kept",
+      _mg1[0] == "sealed" and _mg2[0] == "sealed"
+      and _mg_read() == {"GS_BTC_SEED": _FWD_MNEMONIC,
+                         "GS_WALLET_PASSWORD": "pw1",
+                         "GS_FEE_WALLET_PASSWORD": "fee2"}
+      and "kept, unchanged" in _mg2[1] and "GS_BTC_SEED" in _mg2[1])
+_mg3 = _mg_seal("GS_WALLET_PASSWORD=pw9\n")
+check("review2: ...and a name the file DOES hold replaces the sealed value",
+      _mg3[0] == "sealed" and _mg_read()["GS_WALLET_PASSWORD"] == "pw9"
+      and _mg_read()["GS_BTC_SEED"] == _FWD_MNEMONIC)
+# A passphrase added alone is proven against the SEALED seed, not skipped.
+_mg4 = _mg_seal("GS_BTC_SEED_PASSPHRASE=not-the-one\n")
+check("review2: ...a passphrase sealed on its own is proven with the seed "
+      "already sealed, and a wrong one refused -- the pair together is what "
+      "derives the xpub",
+      _mg4[0] == "seed_mismatch"
+      and "GS_BTC_SEED_PASSPHRASE" not in _mg_read())
+_mg_other = _mg / "other.sealed"
+_mg_other.write_text(json.dumps(P.state_seal(
+    {P.SECRETS_MEMBER: json.dumps({"GS_WALLET_PASSWORD": "theirs"})},
+    bytes(32), bytes(32), schema=P.SECRETS_SCHEMA)))
+_mg_before = _mg_other.read_bytes()
+_mg5 = _mg_seal("GS_WALLET_PASSWORD=pw1\n", out=_mg_other)
+check("review2: ...and a sealed file that does not open under this pair is "
+      "NOT overwritten: refused, untouched, and told to move it aside",
+      _mg5[0] == "existing_unreadable"
+      and _mg_other.read_bytes() == _mg_before and "aside" in _mg5[1])
+A._SECRETS.clear()
+A._SECRETS_FROM[0] = None
+# And the refusals' main sentence no longer sends a sealed box's operator
+# to put a seed in the EnvironmentFile.
+A._SECRETS.update({"GS_WALLET_PASSWORD": "x"})
+try:
+    _hr_set = A._set_in() + "|" + A._reseal_hint("GS_BTC_SEED")
+finally:
+    A._SECRETS.clear()
+check("review2: on a box that seals its secrets, a missing seed is NOT to "
+      "be set 'in the agent unit's EnvironmentFile' -- which would put it "
+      "in the clear -- and the command it is given merges and carries --key",
+      "EnvironmentFile" not in _hr_set.split("|")[0]
+      and "--secrets-env" in _hr_set and "--key " in _hr_set
+      and "the rest stays sealed" in _hr_set)
+check("review2: NON-VACUITY -- on a box that does not, it still says the "
+      "EnvironmentFile, word for word",
+      A._set_in() == " in the agent unit's EnvironmentFile"
+      and A._reseal_hint("GS_BTC_SEED") == "")
+
+# A CHAIN THAT IS NOT UTF-8 DOES NOT STOP THE SEAL. A shred cut by a power
+# failure leaves random bytes; read_text() raised, and every later wake
+# crashed with the ledger in the clear.
+_u8d = Path(tempfile.mkdtemp(prefix="u8chain_"))
+(_u8d / "gs_wake_state.json").write_text('{"jobs": ["kept"]}')
+_u8raw = (b"\xff\xfe\x00garbage from a torn shred\n"
+          + b"0" * 64 + b" | 2026-01-01T00:00:00|-|wake|caf\xc3\xa9\n")
+(_u8d / A.CHAIN_MEMBER).write_bytes(_u8raw)
+_u8n = A.state_close(_u8d, _V7, _PI7)
+check("review2: state_close seals a directory whose chain is NOT UTF-8 -- "
+      "it returned -1 and left every record in the clear, every wake",
+      _u8n > 0 and not (_u8d / "gs_wake_state.json").exists()
+      and not (_u8d / A.CHAIN_MEMBER).exists())
+A.state_open(_u8d, _V7, _PI7)
+check("review2: ...and state_open gives the chain back BYTE FOR BYTE",
+      (_u8d / A.CHAIN_MEMBER).read_bytes() == _u8raw
+      and json.loads((_u8d / "gs_wake_state.json").read_text())
+      == {"jobs": ["kept"]})
+_u8p = _u8d / "merge_chain.log"
+_u8p.write_bytes(os.urandom(300) + b"\n")
+try:
+    A._merge_chain(_u8p, "a" * 64 + " | x|-|wake|sealed line\n")
+    _u8m = _u8p.read_bytes()
+except Exception as e:                                       # noqa: BLE001
+    _u8m = e
+check("review2: _merge_chain over a disk chain of RANDOM BYTES does not "
+      "raise, keeps the sealed history first, and keeps the bytes after it",
+      isinstance(_u8m, bytes) and _u8m.startswith(b"a" * 64 + b" | x|-|")
+      and len(_u8m) > 300)
+
+# THE MERGE READS UNDER THE LOCK. A line another writer appended between
+# the unlocked read and the replace was dropped.
+import fcntl as _fcntl
+_lkp = _u8d / "locked_chain.log"
+_lkp.write_text("")
+_lk_fd = os.open(str(_lkp) + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+_fcntl.flock(_lk_fd, _fcntl.LOCK_EX)
+_lk_t = _thr.Thread(target=A._merge_chain,
+                    args=(_lkp, "b" * 64 + " | y|-|wake|history\n"))
+_lk_t.start()
+time.sleep(0.4)
+with open(_lkp, "a") as _lf:
+    _lf.write("c" * 64 + " | z|-|wake|written under the lock meanwhile\n")
+_fcntl.flock(_lk_fd, _fcntl.LOCK_UN)
+os.close(_lk_fd)
+_lk_t.join(10)
+check("review2: a line another writer appends while the merge waits for "
+      "the chain's lock is KEPT -- the merge reads only once it holds it",
+      "written under the lock meanwhile" in _lkp.read_text())
+
+# A COMMENT'S TRAILING BACKSLASH IS REFUSED ONLY WHERE IT MATTERS. Measured
+# from systemd 255's own load_env_file; before v254 the next line is
+# swallowed too, so these read the same on every version.
+for _t, _want in (("#note \\\n#more\nA=x\n", {"A": "x"}),
+                  ("#note \\\n\nA=x\n", {"A": "x"}),
+                  (";n \\\n;m\nA=y\n", {"A": "y"})):
+    try:
+        _got = A.parse_env_file(_t)
+    except ValueError as e:
+        _got = ("refused", str(e))
+    check(f"review2/env: {_t!r} is read, not refused -- both versions give "
+          f"the unit the same thing", _got == _want)
+
+# THE STOP MESSAGE SAYS WHAT HAPPENED. It said "Stopped mid-job ... The
+# records are sealed" on every path: the no-job dwell, a hand fee sweep,
+# and right after the line saying the seal had failed.
+_sv_hr = (A.run_once, A.power_off, A.disarm_deadman, A.somebody_is_here,
+          A.retire_job_log, A.integrity_log, A.state_close)
+A.power_off = lambda dry_run=False: True
+A.disarm_deadman = lambda *a, **k: True
+A.somebody_is_here = lambda: ""
+A.retire_job_log = lambda *a, **k: None
+A.integrity_log = lambda *a, **k: None
+_hr_stop = {}
+try:
+    def _ro_nojob(args, deps=None):
+        raise A.Stopping("the unit was asked to stop")
+    A.run_once = _ro_nojob
+    _b = io.StringIO()
+    with contextlib.redirect_stdout(_b):
+        A.main(["--key", "/nonexistent"])
+    _hr_stop["nojob"] = _b.getvalue()
+
+    def _ro_badseal(args, deps=None):
+        A._STATE_KEY.update(vault=_V7, pi=_PI7, dir=Path(_d0), opened=True)
+        A._RUNNING[0] = "The job"
+        raise A.Stopping("the unit was asked to stop")
+    A.run_once = _ro_badseal
+    A.state_close = lambda *a: -1
+    _b = io.StringIO()
+    with contextlib.redirect_stdout(_b):
+        A.main(["--key", "/nonexistent"])
+    _hr_stop["badseal"] = _b.getvalue()
+finally:
+    (A.run_once, A.power_off, A.disarm_deadman, A.somebody_is_here,
+     A.retire_job_log, A.integrity_log, A.state_close) = _sv_hr
+    A._STATE_KEY.clear()
+check("review2: a stop with no store open and no job taken says neither -- "
+      "not 'The records are sealed', not 'mid-job'",
+      "Stopped:" in _hr_stop["nojob"]
+      and "sealed" not in _hr_stop["nojob"]
+      and "did not finish" not in _hr_stop["nojob"])
+check("review2: ...and one whose seal FAILED says the records could not be "
+      "sealed -- it said they were, on the line after saying they were not",
+      "could NOT be sealed" in _hr_stop["badseal"]
+      and "The records are sealed" not in _hr_stop["badseal"]
+      and "The job did not finish" in _hr_stop["badseal"])
+
+# A STOP BETWEEN FEE-SWEEP LEGS LEAVES NO BUNDLE, and says money may have
+# moved. The next leg's bundle was written and the stop raised at its spawn,
+# past both places that remove it.
+_fsd = Path(tempfile.mkdtemp(prefix="feestop_"))
+_fs_seq = [int(0.6 * 10 ** 12), int(0.6 * 10 ** 12), None]
+_o_flag_fs = _gsc_pat._SHUTDOWN_REQUESTED
+
+
+def _fs_run(argv, env, budget):
+    _gsc_pat._SHUTDOWN_REQUESTED = True        # the stop lands mid-leg
+    return 0, False                            # ...and the leg finishes
+
+
+_fs_out = io.StringIO()
+_o_fpw_fs = os.environ.get("GS_FEE_WALLET_PASSWORD")
+os.environ["GS_FEE_WALLET_PASSWORD"] = ""
+try:
+    with contextlib.redirect_stdout(_fs_out):
+        A.run_fee_sweep(_FS_KEY, _fsd, {
+            "fee_entry": lambda: ((0, 3, _FS_ADDR, _fs_seq.pop(0))
+                                  if _fs_seq and _fs_seq[0] else None),
+            "live_floor": lambda k, w: "0.0270",
+            "clock": lambda: 0.0, "extend_deadman": lambda s: True,
+            "run_child": _fs_run})
+    _fs_r = None
+except A.Stopping as e:
+    _fs_r = e
+finally:
+    _gsc_pat._SHUTDOWN_REQUESTED = _o_flag_fs
+    if _o_fpw_fs is None:
+        os.environ.pop("GS_FEE_WALLET_PASSWORD", None)
+    else:
+        os.environ["GS_FEE_WALLET_PASSWORD"] = _o_fpw_fs
+check("review2: a stop landing during a fee-sweep leg that then finishes "
+      "stops the sweep before the next leg, with NO entry bundle left on the "
+      "disk and the may-have-moved warning said",
+      isinstance(_fs_r, A.Stopping)
+      and not (_fsd / A.FEE_SWEEP_BUNDLE).exists()
+      and "stopped after 1 leg(s)" in _fs_out.getvalue()
+      and "may already have moved" in _fs_out.getvalue())
+
+# CTRL-C IS NOT systemd. A person pressing it at a hand run had the mix
+# SIGTERMed, SIGKILLed ten seconds later, and the machine powered off under
+# them. Driven with a real SIGINT through main().
+_HI = Path(tempfile.mkdtemp(prefix="sigint_")) / "harness.py"
+_HI.write_text('''
+import importlib.machinery, importlib.util, os, sys
+from pathlib import Path
+REPO, D = sys.argv[1], Path(sys.argv[2])
+sys.path.insert(0, REPO)
+ld = importlib.machinery.SourceFileLoader("gs_wake_agent", os.path.join(REPO, "gs_wake_agent"))
+sp = importlib.util.spec_from_loader(ld.name, ld); A = importlib.util.module_from_spec(sp); ld.exec_module(A)
+V, PI = bytes(range(32)), bytes(range(32, 64))
+A.power_off = lambda dry_run=False: (D / "POWERED_OFF").write_text("x") or True
+A.disarm_deadman = lambda *a, **k: (D / "DISARMED").write_text("x") or True
+A.somebody_is_here = lambda: ""
+A.retire_job_log = lambda *a, **k: None
+A.integrity_log = lambda *a, **k: None
+def fake_run_once(args, deps=None):
+    A.state_open(D, V, PI)
+    A._STATE_KEY.update(vault=V, pi=PI, dir=D, opened=True)
+    A._RUNNING[0] = "The job"
+    print("OPENED", flush=True)
+    A.run_child(["sh", "-c", f"sleep 2; echo x > {D}/STEP1_DONE"], {}, 120)
+    A.run_child(["sh", "-c", f"echo x > {D}/STEP2_RAN"], {}, 120)
+    return "done", "done", "abcd"
+A.run_once = fake_run_once
+print("RC", A.main(["--key", "/nonexistent"]), flush=True)
+''')
+_sid = Path(tempfile.mkdtemp(prefix="sigintd_"))
+(_sid / "state.sealed").write_text(json.dumps(P.state_seal(
+    {"gs_wake_state.json": '{"jobs": ["a client record"]}'}, _V7, _PI7)))
+_sip = subprocess.Popen([sys.executable, str(_HI), REPO, str(_sid)],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True)
+_si_ok = _sip.stdout.readline().strip() == "OPENED"
+time.sleep(0.5)
+_sip.send_signal(__import__("signal").SIGINT)
+try:
+    _si_rest = _sip.communicate(timeout=30)[0]
+except subprocess.TimeoutExpired:
+    _sip.kill()
+    _si_rest = _sip.communicate()[0]
+check("review2: a Ctrl-C lets the running step FINISH -- the agent does not "
+      "SIGTERM a mix on a keystroke -- and says so",
+      _si_ok and (_sid / "STEP1_DONE").exists()
+      and "left to finish" in _si_rest)
+check("review2: ...starts nothing after it, and the records are sealed",
+      not (_sid / "STEP2_RAN").exists() and "RC 1" in _si_rest
+      and not (_sid / "gs_wake_state.json").exists()
+      and (_sid / "state.sealed").exists())
+check("review2: ...and does NOT power the machine off under the person who "
+      "pressed it",
+      not (_sid / "POWERED_OFF").exists() and (_sid / "DISARMED").exists()
+      and "stays on" in _si_rest)
 
 # LAST LINE BEFORE THE RESULT, AND THAT MATTERS MORE THAN IT LOOKS.
 # fail_loudly_on_crash disarms itself the moment this is called, so every
