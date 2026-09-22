@@ -120,3 +120,23 @@ and is handed a note with no half is already refused by stage 7's
 * A vault seized **while a job is running**: the settings are in RAM. One
   job's window, same as stage 7.
 * Both boxes with the Pi's passphrase: everything, as before.
+
+## 8. Read again: what `load_key` derived from fields it could not see
+
+`load_key` builds `btc_issued_mark` — where the intake's issued-index mark
+lives — from `btc_issued_mark_dir` and the xpub's chain id. From this stage
+on **both are sealed**, so at load the mark fell back to its oldest place,
+beside the keyfile under `/etc`, which the unit mounts read-only; and "the
+clear half wins on a collision" then kept that fallback over the sealed
+directory. Under the shipped unit every deposit would have been refused
+`btc_issued_unrecorded` — the failure the marks' directory was added to
+end — and no check saw it, because the stage-8 fixture's xpub is a
+placeholder. `open_keyfile` now derives it again from the merged settings.
+
+The dry run the pairing tells the operator to run saw only the clear half,
+so every check that reads a sealed field (the intake, its mark, the fee
+wallet) was skipped **without a word**, and `--dry-run --unseal-state <hex>`
+ran the record dump instead. `--unseal-state` beside `--dry-run` or
+`--fee-sweep` is now that command's half; without one the dry run says what
+it could not check.
+

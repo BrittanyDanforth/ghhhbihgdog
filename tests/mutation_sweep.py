@@ -6364,7 +6364,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('only the ledger is sealed: the slips, bundles and forwards stay in the '
   'clear', 'gs_wake_agent',
-  'SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json",\n'
+  'SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json", CHAIN_MEMBER,\n'
+  '                "gs_wake_job.log",\n'
   '                "thor_pairs_*.json", "wallet_*.json",\n'
   '                "btc_forward_*.json", "gs_wake_status.json")',
   'SEALED_GLOBS = ("gs_wake_state.json",)',
@@ -6637,8 +6638,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('`--fee-sweep --unseal-state <hex>` dumps the records in plaintext '
   'instead of sweeping', 'gs_wake_agent',
-  '                    and not getattr(args, "fee_sweep", False):',
-  '                    and True:',
+  '                    and not getattr(args, "fee_sweep", False) \\\n',
+  '                    and True \\\n',
   ['test_wake_agent']),
  ('--fee-sweep with sealed secrets and no half falls back to the '
   'environment', 'gs_wake_agent',
@@ -6752,6 +6753,78 @@ MUTATIONS = [
   '    for _rec in _retire_after:\n'
   '        _retire_files(_rec)\n'
   '    _save_handles(artifact_dir, handles, led["owners"])\n',
+  ['test_wake_agent']),
+
+ # -- STAGE 7, READ AGAIN: the chain and the job log go into the store.
+ #    The chain held every wake's job kind on a ten-minute stamp; the job log
+ #    held the memo of every run that went wrong. Both sat beside the store.
+ ('the integrity chain stays in the clear beside the store', 'gs_wake_agent',
+  'SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json", CHAIN_MEMBER,',
+  'SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json",',
+  ['test_wake_agent']),
+ ('the job log of a run that went wrong stays in the clear', 'gs_wake_agent',
+  '                "gs_wake_job.log",\n',
+  '',
+  ['test_wake_agent']),
+ ("state_open keeps the disk's short chain and drops the sealed history",
+  'gs_wake_agent',
+  '        if name == CHAIN_MEMBER and _t.is_file():',
+  '        if False:',
+  ['test_wake_agent']),
+ ('the chain tail is appended without re-chaining, so it no longer verifies',
+  'gs_wake_agent',
+  '        prev = hashlib.sha256((prev + payload).encode()).hexdigest()\n'
+  '        out.append(f"{prev} | {payload}")',
+  '        out.append(ln)',
+  ['test_wake_agent']),
+ ('the chain merge ignores the shared prefix and duplicates the history',
+  'gs_wake_agent',
+  '    while k < min(len(sealed), len(disk)) and sealed[k] == disk[k]:\n'
+  '        k += 1\n',
+  '',
+  ['test_wake_agent']),
+ ("a clean run's log is sealed before it is shredded (main's finally)",
+  'gs_wake_agent',
+  '        retire_job_log(code, args.dry_run)\n        _seal_state_now()\n',
+  '        _seal_state_now()\n        retire_job_log(code, args.dry_run)\n',
+  ['test_wake_agent']),
+ ("a clean run's log is sealed before it is shredded (the done path)",
+  'gs_wake_agent',
+  '    retire_job_log(code)\n    _seal_state_now()\n',
+  '    _seal_state_now()\n    retire_job_log(code)\n',
+  ['test_wake_agent']),
+ ('after the seal, later lines write the job log back in the clear',
+  'gs_wake_agent',
+  '                _AGENT_LOG[0] = None\n            integrity_log("wake", "state_sealed")',
+  '                pass\n            integrity_log("wake", "state_sealed")',
+  ['test_wake_agent']),
+ ("the merge's transient is not on the wipe list", 'gs_common.py',
+  '    "integrity_chain.log.merge",\n',
+  '',
+  ['test_wake_agent', 'test_gitignore']),
+
+ # -- STAGE 8, READ AGAIN: what load_key derived from fields the seal hid.
+ ("the sealed keyfile's issued mark stays beside the keyfile under /etc",
+  'gs_wake_agent',
+  '    _md = merged.get("btc_issued_mark_dir")\n',
+  '    _md = None\n',
+  ['test_wake_agent']),
+ ('a dry run cannot take the half, so it never runs the intake checks',
+  'gs_wake_agent',
+  '    if args.dry_run and getattr(args, "unseal_state", ""):',
+  '    if False:',
+  ['test_wake_agent']),
+ ('a dry run on a sealed keyfile skips the intake checks in silence',
+  'gs_wake_agent',
+  '        if key.get(KEYFILE_SEALED) is not None:\n'
+  '            agent_say("  [*] This keyfile\'s settings are sealed',
+  '        if False:\n'
+  '            agent_say("  [*] This keyfile\'s settings are sealed',
+  ['test_wake_agent']),
+ ('`--dry-run --unseal-state <hex>` dumps the records in plaintext',
+  'gs_wake_agent',
+  '                    and not getattr(args, "dry_run", False):',
+  '                    and True:',
   ['test_wake_agent']),
 ]
 

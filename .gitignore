@@ -127,6 +127,7 @@ gs_wake_handles.json
 # same disk, so a copy of this file is half of somebody's ledger.
 state.sealed
 state.sealed.new
+integrity_chain.log.merge
 # The spend secrets, sealed (STAGE9_PLAN.md) and in plaintext. Both normally
 # live in /etc, which no wipe root reaches and no checkout contains -- but
 # --seal-secrets takes --secrets-env and --secrets-file, so an operator or a

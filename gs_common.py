@@ -10,7 +10,9 @@ OPSEC design principles
 -----------------------
 - All network I/O goes through Tor or aborts.
 - Every sensitive file is written 0600 (owner-only).
-- Integrity log uses SHA-256 hash-chain for tamper evidence.
+- Integrity log is a SHA-256 hash chain. It is UNKEYED: it shows an
+  accidental truncation or overwrite, not tampering by anyone who can
+  write the file and recompute it (see verify_integrity_chain).
 - CSPRNG (secrets module) for all security-critical randomness.
 - Timing jitter between operations to frustrate traffic analysis.
 - Proxy format validated before first use.
@@ -1099,6 +1101,11 @@ GS_ARTIFACT_FILE_PATTERNS = [
     "btc_forward_*.json",
     "exitplan_*.json", "exitplan_v1.json",
     "integrity_chain.log", "integrity.log",
+    # The vault's chain is sealed with its store now (gs_wake_agent
+    # _merge_chain), and the merge writes through this transient. A kill
+    # between its write and its rename leaves a plaintext copy of the
+    # whole chain; the wipe has to know its name.
+    "integrity_chain.log.merge",
     "*.blob", "*.signed", "*.unsigned",
     "signed_manifest_v1.json", "unsigned_manifest.json",
     # The wallet OUTPUT SET the signer exports so the offline wallet can sign

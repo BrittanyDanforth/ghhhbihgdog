@@ -6683,11 +6683,12 @@ check("...and the container does not leak the member NAMES either -- the "
       and set(json.loads(_sblob)) == {"schema", "salt", "box"})
 check("...and the job log, which holds the children's deposit address and "
       "memo, goes too on a clean run -- it was truncated only at the START "
-      "of the next boot, so it sat there for the weeks between wakes",
-      (_sd / "gs_wake_job.log").is_file()
-      and A.retire_job_log("done") is True
-      and not (_sd / "gs_wake_job.log").exists()
-      and A._AGENT_LOG[0] is None)
+      "of the next boot, so it sat there for the weeks between wakes -- "
+      "and now it goes BEFORE the job's early seal, so a clean wake ends "
+      "with it already gone and nothing left for main()'s finally to do",
+      not (_sd / "gs_wake_job.log").exists()
+      and A._AGENT_LOG[0] is None
+      and A.retire_job_log("done") is False)
 _jl2 = _sd / "gs_wake_job.log"
 A._AGENT_LOG[0] = _jl2
 _jl2.write_text("a refusal nobody else recorded\n")
@@ -6896,10 +6897,14 @@ check("sealed: ...and BOTH status files, because 'unlinked after one read' "
       "is only true of the paths that reach the unlink -- a killed probe "
       "leaves `unlocked` and `total` as exact decimals",
       {"gs_wake_status.json", "btc_forward_A1B2.status.json"} <= _mem)
-check("sealed: ...and NOT the fee sweep's entry bundle, the job log, the "
-      "chain, the inhibit mark or the container itself",
-      not ({"wallet_feesweep.json", "gs_wake_job.log", "integrity_chain.log",
-            ".gs_wake_inhibit", "state.sealed"} & _mem))
+check("sealed: ...and the JOB LOG and the CHAIN, which were kept out and "
+      "held the memo of every run that went wrong and the job kind of "
+      "every wake",
+      {"gs_wake_job.log", "integrity_chain.log"} <= _mem)
+check("sealed: ...and NOT the fee sweep's entry bundle, the inhibit mark or "
+      "the container itself",
+      not ({"wallet_feesweep.json", ".gs_wake_inhibit", "state.sealed"}
+           & _mem))
 # THE RECOVERY PATH: the Pi is dead, the operator is at the machine.
 _rd, _rkf, _rkey, _rbell = _sealed_env()
 _ro, _re, _rt, _ = _sealed_run(_rd, _rkf, _rbell)
@@ -8162,6 +8167,240 @@ check("stage7/heal: a paid-out deposit's files are shredded only AFTER the "
       "ledger on the disk says spent -- a kill between the two used to "
       "leave 'unspent' beside a deposit whose files were gone",
       _ospent7 == [True])
+
+
+# ===========================================================================
+print("\n== stage 7, read again: the integrity chain is sealed with the store ==")
+# The chain was kept out of the store as "an append-only audit file that
+# must stay readable without the Pi". It is not append-only against anybody
+# -- it is unkeyed -- and what it kept readable was a timetable: the job
+# kind of every wake on a ten-minute stamp, beside the store that had sealed
+# the same timetable out of the ledger.
+import hashlib as _hl7
+
+
+def _chain7(payloads, prev="0" * 64):
+    out = []
+    for _pl in payloads:
+        prev = _hl7.sha256((prev + _pl).encode()).hexdigest()
+        out.append(f"{prev} | {_pl}")
+    return out
+
+
+_CH7 = _chain7(["1726000000|-|wake|job_accepted:withdraw",
+                "1726000600|-|GhostSpiral|peel",
+                "1726001200|-|wake|job_done:withdraw"])
+_CV7, _CPI7 = bytes(range(32)), bytes(range(32, 64))
+
+
+def _chain_case7(disk_lines):
+    _d = Path(tempfile.mkdtemp(prefix="chain7_"))
+    (_d / A.SEALED_FILE).write_text(json.dumps(P.state_seal(
+        {A.CHAIN_MEMBER: "\n".join(_CH7) + "\n",
+         "gs_wake_state.json": "{}"}, _CV7, _CPI7)))
+    if disk_lines is not None:
+        (_d / A.CHAIN_MEMBER).write_text("\n".join(disk_lines) + "\n")
+    A.state_open(_d, _CV7, _CPI7)
+    _got = (_d / A.CHAIN_MEMBER).read_text().splitlines()
+    return _d, _got, _gsc_pat.verify_integrity_chain(_d / A.CHAIN_MEMBER)[0]
+
+
+_tail7 = _chain7(["1726090000|-|wake|refused:doorbell_unreachable"])
+_cd7a, _cg7a, _cv7a = _chain_case7(_tail7)
+check("stage7/chain: a tail written since the seal (an idle boot's, this "
+      "boot's lines before the note) is JOINED onto the sealed history, "
+      "which is kept whole, and the result verifies",
+      _cg7a[:3] == _CH7 and len(_cg7a) == 4
+      and _cg7a[3].endswith("refused:doorbell_unreachable") and _cv7a)
+_died7 = _CH7 + _chain7(["1726001800|-|wake|crash"],
+                        _CH7[-1].split(" | ")[0])
+_cd7b, _cg7b, _cv7b = _chain_case7(_died7)
+check("stage7/chain: a run that died holding the full history comes out "
+      "exactly as it was -- nothing duplicated, nothing lost",
+      _cg7b == _died7 and _cv7b)
+_cd7c, _cg7c, _cv7c = _chain_case7(None)
+check("stage7/chain: with no chain on the disk the sealed one is written "
+      "out as it was", _cg7c == _CH7 and _cv7c)
+A.state_close(_cd7b, _CV7, _CPI7)
+check("stage7/chain: and the close seals it: no chain left in the clear, "
+      "the whole of it inside the container",
+      not (_cd7b / A.CHAIN_MEMBER).exists()
+      and P.state_unseal(json.loads((_cd7b / A.SEALED_FILE).read_text()),
+                         _CV7, _CPI7)[A.CHAIN_MEMBER].splitlines()
+      == _died7)
+import fnmatch as _fn7
+check("stage7/chain: the merge's transient is on the wipe list, so a kill "
+      "between its write and its rename cannot leave a copy the wipe misses "
+      "-- matched against the patterns the wipe itself uses",
+      any(_fn7.fnmatch("integrity_chain.log.merge", _pat)
+          for _pat in _gsc_pat.GS_ARTIFACT_FILE_PATTERNS))
+
+
+# ===========================================================================
+print("\n== stage 7, read again: the job log of a run that went wrong ==")
+# retire_job_log shreds the log on a clean run and KEEPS it otherwise -- the
+# only record of why -- and the children write the deposit address and the
+# memo naming the client's XMR address into it. Kept out of the store, that
+# line sat in the clear on exactly the runs that went wrong.
+_JV, _JPI = bytes(range(32)), bytes(range(32, 64))
+
+
+def _joblog_run(outcome):
+    _d = Path(tempfile.mkdtemp(prefix="joblog7_"))
+    (_d / A.SEALED_FILE).write_text(json.dumps(P.state_seal(
+        {"gs_wake_state.json": "{}"}, _JV, _JPI)))
+
+    def _ro(args, deps=None):
+        A.state_open(_d, _JV, _JPI)
+        A._STATE_KEY.update(vault=_JV, pi=_JPI, dir=_d)
+        A._AGENT_LOG[0] = _d / A.JOB_LOG
+        A.agent_say("memo: =:XMR.XMR:a-client-destination")
+        if outcome == "done":
+            return "done", "done", "abcd"
+        if outcome == "failed_done_path":
+            # What the real done path does for a job that FAILED: it seals
+            # early, before the report, and lines still come after -- the
+            # report's own, then main()'s "Wake finished".
+            A._seal_state_now()
+            A.agent_say("a line written after the seal")
+            return "job_failed", "failed", "abcd"
+        raise A.Refused("synthetic_failure", "the job did not finish")
+
+    _sv = (A.run_once, A.power_off, A.disarm_deadman, A.somebody_is_here,
+           A.integrity_log, A._AGENT_LOG[0])
+    A.run_once = _ro
+    A.power_off = lambda dry_run=False: True
+    A.disarm_deadman = lambda *a, **k: True
+    A.somebody_is_here = lambda: ""
+    A.integrity_log = lambda *a, **k: None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            A.main(["--key", "/nonexistent"])
+    finally:
+        (A.run_once, A.power_off, A.disarm_deadman, A.somebody_is_here,
+         A.integrity_log, A._AGENT_LOG[0]) = _sv
+        A._STATE_KEY.clear()
+    _mem = P.state_unseal(json.loads((_d / A.SEALED_FILE).read_text()),
+                          _JV, _JPI)
+    return _d, _mem
+
+
+_jd_f, _jm_f = _joblog_run("failed")
+check("stage7/joblog: a run that went WRONG leaves no job log in the clear "
+      "-- it is inside the store, memo and all, for the operator to read "
+      "with --unseal-state",
+      not (_jd_f / A.JOB_LOG).exists()
+      and "a-client-destination" in _jm_f.get(A.JOB_LOG, ""))
+_jd_p, _jm_p = _joblog_run("failed_done_path")
+check("stage7/joblog: ...and after the seal nothing writes it back in the "
+      "clear -- a failed job's report and 'Wake finished' lines come AFTER "
+      "the done path's early seal, and used to recreate the file",
+      not (_jd_p / A.JOB_LOG).exists()
+      and "a-client-destination" in _jm_p.get(A.JOB_LOG, "")
+      and "written after the seal" not in _jm_p.get(A.JOB_LOG, ""))
+_jd_d, _jm_d = _joblog_run("done")
+check("stage7/joblog: a CLEAN run's log is shredded BEFORE the seal, so the "
+      "store never keeps what retire_job_log exists to destroy",
+      not (_jd_d / A.JOB_LOG).exists() and A.JOB_LOG not in _jm_d)
+# Through a real sealed wake that finishes: the done path seals early, and
+# must retire the log before it does.
+_jwd, _jwkf, _, _jwbell = _sealed_env()
+_jwo, _jwe, _ = run(_jwkf, deps_for(_jwd, _jwbell))
+A._STATE_KEY.clear()
+A._AGENT_LOG[0] = None
+_jwm = P.state_unseal(json.loads((_jwd / A.SEALED_FILE).read_text()),
+                      bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("stage7/joblog: a real sealed wake that finishes leaves its log "
+      "neither in the clear nor in the container",
+      _jwe is None and _jwo and _jwo[0] == "done"
+      and not (_jwd / A.JOB_LOG).exists() and A.JOB_LOG not in _jwm)
+
+
+# ===========================================================================
+print("\n== stage 8, read again: what load_key derived from sealed fields ==")
+# load_key builds btc_issued_mark from btc_issued_mark_dir and the xpub's
+# chain id. On a sealed keyfile both are behind the seal at load, so the
+# mark fell back beside the keyfile -- under /etc, read-only under the unit
+# -- and every deposit would have been refused btc_issued_unrecorded. The
+# stage-8 fixture's xpub is a placeholder, so no check here ever saw it.
+_mZ = _BTC_XPUB_OK
+_mD8 = Path(tempfile.mkdtemp(prefix="mark8_"))
+_mS8 = {"btc_account_xpub": _mZ, "btc_network": "main",
+        "btc_issued_mark_dir": str(_mD8 / "marks")}
+_mC8 = {"role": "thinkpad", "secret": NP.PrivateKey.generate().encode().hex(),
+        "peer_public": bytes(NP.PrivateKey.generate().public_key).hex(),
+        "doorbell_url": "http://127.0.0.1:1", "artifact_dir": str(_mD8),
+        "state_half": _SEAL_HALF}
+
+
+def _mk8(key, name):
+    _kf = _mD8 / name
+    _kf.write_text(json.dumps(P.lock_keyfile(key, b"", role="thinkpad")))
+    _kf.chmod(0o400)
+    return _kf
+
+
+_mk_plain = A.load_key(_mk8({**_mC8, **_mS8}, "plain.key"))
+_mk_sealed = A.open_keyfile(A.load_key(_mk8(dict(_mC8, sealed=P.state_seal(
+    {P.SETTINGS_MEMBER: json.dumps(_mS8)}, bytes.fromhex(_SEAL_HALF),
+    _S8_PI, schema=P.SETTINGS_SCHEMA)), "sealed.key")),
+    bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("stage8/mark: a SEALED keyfile names the same issued-index mark as the "
+      "same settings readable -- in the marks' directory, per chain, not "
+      "beside the keyfile under /etc",
+      _mk_sealed["btc_issued_mark"] == _mk_plain["btc_issued_mark"]
+      and _mk_sealed["btc_issued_mark"].startswith(str(_mD8 / "marks"))
+      and not _mk_sealed["btc_issued_mark"].endswith(".issued"))
+# THE DRY RUN, which the pairing tells the operator to run: on a sealed
+# keyfile it saw only the clear half and skipped every intake check without
+# a word. With the half it runs them; without, it says it did not.
+_dd8, _dkf8, _, _dbell8, _, _ = _stage8_env()
+
+
+def _dry8(half):
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        try:
+            A.run_once(types.SimpleNamespace(key=str(_dkf8), dry_run=True,
+                                             unseal_state=half),
+                       {k: v for k, v in deps_for(_dd8, _dbell8).items()
+                        if not k.startswith("_")})
+        except (A.Refused, P.WakeError) as e:
+            print(f"REFUSED {getattr(e, 'code', e)}")
+    return _buf.getvalue()
+
+
+_dry8_no = _dry8("")
+_dry8_yes = _dry8(_S8_PI.hex())
+check("stage8/dry: a dry run on a sealed keyfile with NO half says the "
+      "intake checks were not run, instead of skipping them in silence",
+      "were NOT run" in _dry8_no and "Issued-index mark" not in _dry8_no)
+check("stage8/dry: ...and with the half it runs them: the issued-index "
+      "mark is tried",
+      "Issued-index mark" in _dry8_yes and "were NOT run" not in _dry8_yes)
+# ...and `--dry-run --unseal-state <hex>` IS the dry run, not the record
+# dump -- the dump writes every sealed record out in plaintext.
+_rt8 = []
+_sv8r = (A.unseal_state_cli, A.run_once, A.power_off, A.disarm_deadman,
+         A.somebody_is_here, A.retire_job_log, A.integrity_log)
+A.unseal_state_cli = lambda a: _rt8.append("unseal_state") or "opened"
+A.run_once = lambda a, deps=None: _rt8.append("dry_run") or (
+    "dry_run", "", "")
+A.power_off = lambda dry_run=False: True
+A.disarm_deadman = lambda *a, **k: True
+A.somebody_is_here = lambda: ""
+A.retire_job_log = lambda *a, **k: None
+A.integrity_log = lambda *a, **k: None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.main(["--key", "/nonexistent", "--dry-run",
+                "--unseal-state", _S8_PI.hex()])
+finally:
+    (A.unseal_state_cli, A.run_once, A.power_off, A.disarm_deadman,
+     A.somebody_is_here, A.retire_job_log, A.integrity_log) = _sv8r
+check("stage8/route: `--dry-run --unseal-state <hex>` runs the DRY RUN with "
+      "the half -- it used to write every sealed record out in plaintext",
+      _rt8 == ["dry_run"])
 
 
 # ===========================================================================

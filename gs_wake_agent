@@ -107,11 +107,37 @@ HANDLES_FILE = "gs_wake_handles.json"
 #: only ever on the Pi. Opened after the wake note is authenticated, closed
 #: before the machine powers off.
 SEALED_FILE = "state.sealed"
-#: What goes in it: the records a later job, or the operator, needs. Not
-#: the job log (shredded at the end of a clean run instead), not the
-#: integrity chain (an append-only audit file that must stay readable
-#: without the Pi), not wallet_feesweep.json (written and retired inside
-#: one sweep, which may run on a boot that has no half at all).
+#: What goes in it: the records a later job, or the operator, needs, and
+#: the logs that name them. Not wallet_feesweep.json (written and retired inside one sweep, which may run
+#: on a boot that has no half at all).
+#:
+#: THE JOB LOG IS IN, and this list first kept it out as "shredded at the
+#: end of a clean run instead". That is true of a clean run and of nothing
+#: else: retire_job_log keeps it on a refusal, a failure or a crash --
+#: deliberately, it is the only record of why -- and the children write
+#: into it the BTC deposit address and the ThorChain memo naming the
+#: client's XMR address. So on exactly the runs that went wrong, that line
+#: sat in the clear beside a store sealed to hide it, until the next boot.
+#: A clean run still shreds it BEFORE anything is sealed (main()'s finally
+#: and the done path both retire it first); a run that went wrong has it
+#: sealed with the rest, readable with `--unseal-state`, and dropped by the
+#: next boot's truncation exactly as before.
+#:
+#: THE INTEGRITY CHAIN IS IN, and this list first kept it out as "an
+#: append-only audit file that must stay readable without the Pi". Neither
+#: half of that held up. It is not append-only against anybody: the chain is
+#: unkeyed, so whoever holds the disk can rewrite a line and recompute every
+#: hash below it, and can cut the tail off undetectably -- gs_common's own
+#: verify_integrity_chain says so. And what it kept readable was a timetable:
+#: `job_accepted:withdraw`, `job_done:forward_to_swap`, and some two hundred
+#: and eighty child call sites' steps, each on a ten-minute stamp, for every
+#: wake the machine ever ran -- the same timetable this store sealed out of
+#: the ledger, lined up for anyone to match against public swaps. The audit
+#: still works; it needs the half, like every other record here
+#: (`--unseal-state`). What stays in the clear is only what was written
+#: since the last seal: this boot's lines before the note, boots that bring
+#: no half, and the last wake's closing lines. state_open joins that tail
+#: onto the sealed history (_merge_chain) so nothing is lost.
 #:
 #: THE STATUS FILES ARE IN, and the first version of this list said they
 #: were not, "unlinked after one read". That is true of every path that
@@ -123,7 +149,12 @@ SEALED_FILE = "state.sealed"
 #: gs_wake_status.json changes no behaviour: every job that reads it
 #: unlinks it at its START (see _run_validated), so a member restored out
 #: of the store is cleared before it can be mistaken for this run's answer.
-SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json",
+#: The chain's name as gs_common writes it. It lands in the artifact
+#: directory because the unit's WorkingDirectory IS that directory; where
+#: the two differ, the chain is not here to seal and stays where it was.
+CHAIN_MEMBER = "integrity_chain.log"
+SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json", CHAIN_MEMBER,
+                "gs_wake_job.log",
                 "thor_pairs_*.json", "wallet_*.json",
                 "btc_forward_*.json", "gs_wake_status.json")
 #: ...less these, by exact name, for the reasons above.
@@ -920,6 +951,19 @@ def open_keyfile(key: dict, vault_half: bytes, pi_half: bytes) -> dict:
     merged = dict(inner)
     merged.update(key)
     merged.pop(KEYFILE_SEALED, None)
+    # WHAT load_key DERIVED FROM FIELDS IT COULD NOT SEE is derived again.
+    # btc_issued_mark is built at load from btc_issued_mark_dir and the
+    # xpub's chain id -- both SEALED on a keyfile from stage 8 on -- so at
+    # load it fell back to a mark beside the keyfile, under /etc, which the
+    # unit mounts read-only: every deposit refused btc_issued_unrecorded,
+    # the exact failure the marks' directory was added to end. And "the
+    # clear half wins" kept that fallback over anything the seal held.
+    # Driven: one set of settings named marks/issued_<chain>.json when
+    # readable and <keyfile>.issued when sealed.
+    _md = merged.get("btc_issued_mark_dir")
+    if isinstance(_md, str) and _md.strip():
+        merged["btc_issued_mark"] = str(Path(_md.strip())
+                                        / f"issued_{_xpub_id(merged)}.json")
     return merged
 
 
@@ -989,6 +1033,17 @@ def state_open(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
                           "the sealed records name a member that is not a "
                           "plain file name; refusing to write it.")
         _t = artifact_dir / name
+        if name == CHAIN_MEMBER and _t.is_file():
+            # NOT "a run that died, newer, left where it is" -- or not only.
+            # The chain on the disk is usually this boot's own lines from
+            # before the note, or an idle boot's, written onto a fresh file
+            # after the last seal shredded the old one; skipping the sealed
+            # copy for it would throw the whole history away at the next
+            # close. Joined instead: the history, then whatever the disk
+            # holds past it.
+            _merge_chain(_t, text)
+            n += 1
+            continue
         if _t.exists():
             continue
         _fd = os.open(str(_t), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -996,6 +1051,56 @@ def state_open(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
             fh.write(text)
         n += 1
     return n
+
+
+def _merge_chain(path: Path, sealed_text: str) -> None:
+    """Write the sealed chain back with the disk's newer lines after it.
+
+    ONE RULE covers both ways the two copies relate: the sealed history, and
+    then every line the disk holds past the prefix the two share,
+    re-chained onto the history's last hash. A fresh tail (this boot's lines
+    before the note, an idle boot's) shares nothing and is appended whole; a
+    run that died holding the full history shares all of it, and what comes
+    after is re-chained onto the same hashes it already had -- so the file
+    comes out as it was.
+
+    RE-CHAINING RESTS ON NOTHING, and nothing is lost by it: the chain is
+    unkeyed, so any writer could compute these hashes. What it keeps is the
+    thing the chain can actually do -- show where an accidental truncation
+    or overwrite broke it.
+
+    Under the chain's own lock, like every other write to it."""
+    import fcntl
+    sealed = [ln for ln in sealed_text.splitlines() if ln.strip()]
+    try:
+        disk = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    except OSError:
+        disk = []
+    k = 0
+    while k < min(len(sealed), len(disk)) and sealed[k] == disk[k]:
+        k += 1
+    prev = (sealed[-1].split(" | ", 1)[0].strip() if sealed else "0" * 64)
+    out = list(sealed)
+    for ln in disk[k:]:
+        payload = ln.split(" | ", 1)[1] if " | " in ln else ln
+        prev = hashlib.sha256((prev + payload).encode()).hexdigest()
+        out.append(f"{prev} | {payload}")
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(path) + ".lock", os.O_WRONLY | os.O_CREAT,
+                          0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        lock_fd = None
+    try:
+        tmp = path.with_name(path.name + ".merge")
+        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, "w") as fh:
+            fh.write("".join(ln + "\n" for ln in out))
+        os.replace(str(tmp), str(path))
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def state_close(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
@@ -1087,6 +1192,14 @@ def _seal_state_now() -> None:
                       "before the next wake.")
             integrity_log("wake", "state_unsealed_fail")
         else:
+            # THE JOB LOG WENT INTO THE STORE, so nothing may write it back
+            # in the clear: a later line (the report, "Wake finished", a
+            # power-off) goes to the terminal only -- under the unit, to
+            # nowhere, and the chain still carries its code.
+            if (_AGENT_LOG[0] is not None
+                    and Path(_AGENT_LOG[0]).parent.resolve()
+                    == Path(_STATE_KEY["dir"]).resolve()):
+                _AGENT_LOG[0] = None
             integrity_log("wake", "state_sealed")
     except Exception:                                        # noqa: BLE001
         # Bookkeeping must never be what keeps the box on, and a failure
@@ -3435,6 +3548,14 @@ def run_once(args, deps: dict = None) -> tuple:
     except OSError:
         pass
 
+    # A DRY RUN ON A SEALED KEYFILE SEES ONLY ITS CLEAR HALF, so every check
+    # below that reads a sealed field -- the intake, its issued-index mark,
+    # the fee wallet -- found nothing and said nothing: `if btc_mode(key)`
+    # is simply false without the xpub. The operator is at the machine
+    # (that is what a dry run is), so it takes the same half the fee sweep
+    # does; without one it says what it could not check.
+    if args.dry_run and getattr(args, "unseal_state", ""):
+        key = _by_hand(key, args.unseal_state, "this dry run")
     preflight(key, artifact_dir, args.dry_run, probes=d)
 
     # THE SEAL'S PRECONDITIONS ARE THE KEYFILE'S AND THE DISK'S, NOT THE
@@ -3532,6 +3653,12 @@ def run_once(args, deps: dict = None) -> tuple:
     if args.dry_run:
         agent_say("  [+] Dry run: keyfile, preflight, Tor and the doorbell "
                   "all check out.")
+        if key.get(KEYFILE_SEALED) is not None:
+            agent_say("  [*] This keyfile's settings are sealed to the pair, "
+                      "so the checks that read them -- the BTC intake and "
+                      "its issued-index mark, the fee wallet -- were NOT "
+                      "run. Add `--unseal-state <hex>` (the half from "
+                      "`gs_doorbell state-key`) to include them.")
         # THE PAIRING CODE, READ BACK. Both keyfiles record it and nothing
         # read either copy; printing the vault's here gives the operator a
         # way to confirm which ceremony this keyfile came from.
@@ -4034,6 +4161,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # already shredded and the container still held them -- and a power
     # cut there brought them back at the next state_open, which restores
     # any member it does not find on the disk.
+    # ...and a CLEAN run's log goes first, so this seal does not keep it.
+    retire_job_log(code)
     _seal_state_now()
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
                 plain=plain, phase=phase, poster=d.get("post_record"),
@@ -6633,14 +6762,15 @@ def main(argv=None) -> int:
             # both called power_off on a keyfile whose state_half is not
             # hex. Set first, the promise holds for a refusal and a crash.
             # --unseal-state IS TWO THINGS: a command of its own, and the
-            # half that --fee-sweep takes on a sealed box. With --fee-sweep
-            # beside it, it is the second. This branch used to win whenever
+            # half that --fee-sweep and --dry-run take on a sealed box. With
+            # either beside it, it is the second. This branch used to win whenever
             # the flag was present, so the exact command every refusal and
             # OPSEC_SETUP.md name for a sealed box's sweep -- `--fee-sweep
             # --unseal-state <hex>` -- never swept anything: it wrote every
             # sealed record out in plaintext and stopped. Driven.
             if getattr(args, "unseal_state", "") \
-                    and not getattr(args, "fee_sweep", False):
+                    and not getattr(args, "fee_sweep", False) \
+                    and not getattr(args, "dry_run", False):
                 # NOTHING ELSE RUNS ON THIS PATH, and it never powers the
                 # machine off: the operator is standing here, with the
                 # records open in front of them, which is the whole point.
@@ -6727,6 +6857,10 @@ def main(argv=None) -> int:
         # shred whose ciphertext never landed is a client's money with no
         # bookkeeping. state_close returns -1 rather than raising, and
         # says so.
+        # A CLEAN RUN'S LOG IS SHREDDED BEFORE THE SEAL, or the seal would
+        # keep what retire_job_log exists to destroy. A run that went wrong
+        # keeps it, and the seal puts it away (SEALED_GLOBS).
+        retire_job_log(code, args.dry_run)
         _seal_state_now()
         # THE SECRETS GO FROM RAM HERE, on every path out. The machine is
         # about to power off, which clears them anyway -- but --dry-run,
@@ -6736,7 +6870,6 @@ def main(argv=None) -> int:
         # from a log line.
         _SECRETS.clear()
         _SECRETS_FROM[0] = None
-        retire_job_log(code, args.dry_run)
         # EVERY path, including SystemExit from gs_common's own fail-closed
         # aborts, and including an unhandled exception.
         #

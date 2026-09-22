@@ -105,12 +105,13 @@ cleared before anything can mistake it for this run's answer.
 
 ### What is not, and why
 
-* `gs_wake_job.log` — written continuously by children, and the fix for it
-  is deletion, not encryption: it is shredded at the end of a clean run.
-* `integrity_chain.log` — a hash chain whose whole value is that it is
-  append-only and readable for an audit. It already carries no address, no
-  amount and (since the host-privacy pass) no version. Sealing it would make
-  the audit need the Pi.
+* ~~`gs_wake_job.log`~~ and ~~`integrity_chain.log`~~ — **both sealed now;
+  see §9.** They were listed here, and both reasons failed on a re-read.
+  The job log is shredded at the end of a *clean* run and deliberately
+  kept on every other — with the deposit address and the memo naming the
+  client's XMR address in it. The chain is not append-only against anybody
+  (it is unkeyed), and what it kept readable was the job kind of every
+  wake on a ten-minute stamp.
 * `.gs_wake_inhibit`, `.ghostspiral.lock` — marks and a lock. They hold no
   figure and no name; what they say is "a run is in progress here", which
   the presence of the directory says anyway.
@@ -178,3 +179,42 @@ fail loudly rather than mysteriously.
   RAM. The window is one job.
 * An adversary with both boxes and the Pi's passphrase has everything, and
   had everything before this stage too.
+
+## 9. Read again, end to end: what this stage left half-wired
+
+Every item was DRIVEN on the build this plan shipped as, and each is now a
+test in `tests/test_wake_agent.py` and an anchor in `tests/mutation_sweep.py`.
+
+* **A stop mid-job never sealed.** `gs-wake-poweroff.service` — the
+  deadman's action — sends SIGTERM, waits 20 seconds, sends SIGKILL.
+  `gs_common`'s handler only records a SIGTERM, and nothing in the agent
+  read the record, so the SIGKILL landed, `main()`'s finally never ran, and
+  the records `state_open` had written stayed in plaintext on a machine
+  that was then off: every overrun, every `TimeoutStartSec`, every
+  `systemctl stop`. The agent now waits in slices and stops its child when
+  asked (`run_child`, `_nap`), a stop raises `Stopping`, and the records are
+  sealed before the doorbell is told anything. Driven with a real signal:
+  sealed 1.1 s after the SIGTERM, 11 s with a child that ignores it.
+* **§3's premise — "the next wake seals what it finds" — was only true of a
+  wake that finishes.** `state_open` restores every member it does not find
+  on the disk and cannot tell "not written yet" from "shredded by a run that
+  then died", and a paid-out deposit's slip and bundle were shredded before
+  the ledger was saved and minutes before the seal. A finished job is now
+  sealed before it is reported, the ledger is written before the shred, and
+  each wake retires again what the ledger says was paid out.
+* **The job log and the chain** — see the struck lines in §3. The job log is
+  sealed with the store on a run that went wrong (a clean run still shreds
+  it first); the chain is sealed and `state_open` joins the lines written
+  since the last seal onto the sealed history, re-chained, so the audit is
+  whole and `--unseal-state` reads it.
+* **The checks were of `main()` stood in for by hand.** Every stage-7 wake
+  test re-sealed with `state_close` after `run_once`, so `main()`'s own
+  finally was never the thing under test — which is how an exit that skips
+  it went unseen. The seal is now driven through `main()`, and through a
+  real SIGTERM against a real child.
+
+What is still in the clear between wakes, stated: the lines the chain and
+the job log gained **after** the last seal (a wake's closing lines, an idle
+boot's refusal), the marks (`issued_*.json`, outside every seal on purpose),
+and the inhibit mark and locks.
+

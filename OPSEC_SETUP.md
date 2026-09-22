@@ -87,8 +87,11 @@ sends when it wakes the machine. Neither half opens anything alone.
 
 What that buys, and only this: a machine taken **between wakes**, with no
 Pi, is one `state.sealed` file — no ledger, no open slips, no plan chains,
-not even the *file names*, which were themselves a count of deposits and a
-list of handles. What it does **not** buy: a machine taken with the Pi, or
+no job log of a run that went wrong, no chain of every wake's job kind, not
+even the *file names*, which were themselves a count of deposits and a
+list of handles. The chain and the job log are read with `--unseal-state`
+like everything else; what they gained since the last seal (a wake's
+closing lines, an idle boot's refusal) is the one tail left in the clear. What it does **not** buy: a machine taken with the Pi, or
 taken mid-job while the records are open on the disk, reads everything.
 It is a clock-and-possession fix, not a safe.
 
@@ -1658,7 +1661,10 @@ Both halves are closed now, and both are worth keeping:
   and carries on.
 
 **If you write your own unit, set it.** Without it the chain is silently
-missing on a box where it is the only tamper-evidence there is.
+missing on a box where it is the only record there is. It is not evidence
+against tampering — it is unkeyed, so anyone who can write the card can
+rewrite it and recompute every hash below; what it shows is an accidental
+truncation or overwrite.
 
 ## 6. Bad situations (and whether this beats them)
 
@@ -1833,7 +1839,11 @@ effort on the swap and the phone.
       holds `state.sealed` and **no** `gs_wake_handles.json`,
       `gs_wake_state.json`, `wallet_*.json` or `thor_pairs_*.json`. If
       the plaintext is still there the seal did not happen, and the
-      agent said so on the way out (§1)
+      agent said so on the way out (§1). An `integrity_chain.log` there
+      holds only the lines written after the seal
+- [ ] `gs_wake_agent --dry-run --unseal-state <hex> --key ...` reports
+      the issued-index mark as **writable**. Without the half a sealed
+      keyfile's intake checks are skipped, and the dry run says so
 - [ ] You have run `gs_doorbell state-key` **once**, and written the hex
       it printed beside the LUKS USB with the `--unseal-state` command.
       It is the only way back into the records if the Pi dies (§1)
