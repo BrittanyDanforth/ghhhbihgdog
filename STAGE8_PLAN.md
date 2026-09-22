@@ -74,6 +74,12 @@ wake note, so they cannot open the seal — and they need `fee_rpc`,
 * `--fee-sweep` takes `--unseal-state <hex>`, the half the operator already
   has beside the LUKS USB. They are standing there; that is the whole
   premise of the flag.
+
+  **As first shipped, that command never swept.** `main()` tested
+  `--unseal-state` before `--fee-sweep`, so `--fee-sweep --unseal-state
+  <hex>` ran the recovery command instead: every sealed record written out
+  in plaintext, and no sweep. Found by STAGE9_PLAN.md §6's re-read; with
+  `--fee-sweep` beside it, `--unseal-state` is now the sweep's half.
 * **`--fee-sweep-on-idle-boot` is refused at pairing** when the keyfile is
   sealed, naming the trade and the hand command. It is off by default. A
   feature that silently never runs is worse than one that says no while the

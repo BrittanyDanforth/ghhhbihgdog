@@ -92,3 +92,67 @@ already refused before this stage existed.
   the guard against a wiped ledger reissuing an unpaid address. They name no
   address and no client; they say an intake ran here and how many addresses
   it handed out.
+
+## 6. Read again, end to end: what the first pass left half-wired
+
+Every item here was DRIVEN on the build this plan first shipped as, not
+reasoned about, and each is now a test in `tests/test_wake_agent.py` and an
+anchor in `tests/mutation_sweep.py`.
+
+* **`--seal-secrets` did not read the file the way systemd does.** It
+  stripped quote characters off both ends of a line and did nothing else.
+  Measured against systemd 255's own `load_env_file`: `"a\"b"` sealed as
+  `a\"b` (systemd gives `a"b`), `ends"` as `ends` (systemd keeps the quote),
+  `'it''s'` as `it''s` (systemd concatenates: `its`), and it could not see a
+  quoted value over two lines, a continuation line, or a bare carriage
+  return. A password with a quote or a backslash in it was sealed as a
+  DIFFERENT password, the read-back compared that value with itself, and the
+  operator was told to shred the original. It is now a port of systemd's
+  state machine, fuzzed against `load_env_file` over 200,000 generated files
+  with no difference. It refuses, by line number and never by value, what
+  systemd refuses (a NUL, a Unicode noncharacter) and the one construct two
+  systemd versions read differently (a comment ending in a backslash: v252,
+  Debian 12's, swallows the next line; v254 on does not).
+* **It sealed under a half it never checked.** The container was sealed
+  under whatever hex was typed and read back with the same hex, so a half one
+  character off passed, the operator was told to shred, and the next wake
+  refused every job `secrets_unreadable` -- with the only copy of the seed on
+  that disk under a key nobody holds. The typed half is now checked against
+  something the real one opens -- the keyfile's own sealed settings, or the
+  record store -- and refused when it does not open it. With nothing sealed
+  yet to check against, it seals and says so.
+* **It told the operator to shred a seed it had not proven**, and to "check
+  the seal works with a real job first" when the job an operator reaches for
+  first, a deposit, touches the seed and nothing else. The seed is now proven
+  against the pair's xpub before anything is written, and the output names
+  the job that exercises each secret it sealed.
+* **The hand commands powered the box off under the operator.** `main()` set
+  the flag that keeps the machine on only after `--unseal-state` or
+  `--seal-secrets` returned, so a keyfile whose half is malformed -- refused
+  above each command's own `try` -- powered it off mid-recovery. `--fee-sweep`
+  did the same on a wrong half. The flag is set first, and every refusal from
+  the fee sweep's half handling keeps the box on.
+* **`--fee-sweep --unseal-state <hex>` never swept.** `main()` tested
+  `--unseal-state` first, so the exact command every refusal and
+  `OPSEC_SETUP.md` name for a sealed box's sweep wrote every sealed record out
+  in plaintext and stopped. A stage-8 defect, found here because the driven
+  RAM check needed that command to reach the sweep.
+* **Two places signed from the environment beside a sealed file.** A wake on
+  a keyfile with no half never reached `open_secrets`; a `--fee-sweep` whose
+  half did not parse skipped it. Both now refuse -- the wake before the
+  doorbell is asked for anything, so the job is not taken. A malformed
+  `state_half` is refused there too, instead of after M2.
+* **The refusals named the wrong copy.** Every one said to fix the variable
+  in the EnvironmentFile; the sealed copy wins, so following that changed
+  nothing, and a sealed-away password reported "unset" invited the operator
+  to put it back in the clear. They now name the copy the machine read.
+* **The idle-boot sweep ran with its password out of reach** and refused it
+  "unset". It stands down and says why, and `--seal-secrets` says, while the
+  operator is there, that sealing the fee password stops it.
+
+Still true, and stated rather than fixed: **nothing prints the sealed
+secrets back.** `--unseal-key` prints the settings; there is no counterpart
+for the seed. That is deliberate in the sense that the seal is not a backup
+and the tool says so -- but it means a box whose plaintext has been shredded
+holds its seed only sealed, and it dies with the keyfile. Keep the seed words
+where you keep them.

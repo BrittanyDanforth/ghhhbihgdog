@@ -6374,9 +6374,9 @@ MUTATIONS = [
   '                "btc_forward_*.json")',
   ['test_wake_agent']),
  ('main() finishes without re-sealing what it opened', 'gs_wake_agent',
-  '                _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],\n'
-  '                                      _STATE_KEY["pi"])',
-  '                _sealed = 0',
+  '        _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],\n'
+  '                              _STATE_KEY["pi"])',
+  '        _sealed = 0',
   ['test_wake_agent']),
  # STAGE 8: the SETTINGS behind the same pair. The xpub is the one field that
  # re-derives every deposit address this intake ever issued, past any wipe.
@@ -6436,9 +6436,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('the fee sweep reports "no fee wallet" instead of asking for the half',
   'gs_wake_agent',
-  '    key = _by_hand(key, getattr(args, "unseal_state", ""),\n'
-  '                   "a fee sweep on a box nothing woke")',
-  '    key = dict(key)',
+  '        key = _by_hand(key, _hex, "a fee sweep on a box nothing woke")',
+  '        key = dict(key)',
   ['test_wake_agent']),
  ('--unseal-key prints the wake secret into the operator\'s scrollback',
   'gs_wake_agent',
@@ -6505,8 +6504,10 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('a secrets file that will not open FALLS BACK to the plaintext left '
   'beside it', 'gs_wake_agent',
+  '    except (proto.WakeError, KeyError, ValueError, TypeError) as e:\n'
   '        raise Refused(\n'
   '            "secrets_unreadable",',
+  '    except (proto.WakeError, KeyError, ValueError, TypeError) as e:\n'
   '        return 0\n'
   '        raise Refused(\n'
   '            "secrets_unreadable",',
@@ -6542,10 +6543,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('--seal-secrets seals whatever else the EnvironmentFile holds',
   'gs_wake_agent',
-  '        if _n in SECRETS_ALLOWED:\n'
-  '            found[_n] = _v.strip().strip(\'"\').strip("\'")',
-  '        if True:\n'
-  '            found[_n] = _v.strip()',
+  '    found = {_n: _v for _n, _v in env.items() if _n in SECRETS_ALLOWED}',
+  '    found = dict(env)',
   ['test_wake_agent']),
  ('the sealed secrets land world-readable', 'gs_wake_agent',
   '        _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)',
@@ -6553,8 +6552,206 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('a seed stays in RAM after a run that does not power the box off',
   'gs_wake_agent',
-  '        _SECRETS.clear()\n        retire_job_log(',
-  '        retire_job_log(',
+  '        _SECRETS.clear()\n        _SECRETS_FROM[0] = None\n',
+  '        _SECRETS_FROM[0] = None\n',
+  ['test_wake_agent']),
+
+ # -- STAGE 9, READ AGAIN END TO END. Each of these is a defect DRIVEN on the
+ #    shipped stage-9 build first; the mutation puts that build's behaviour
+ #    back, one guarantee at a time.
+ ('--seal-secrets reads the file with a line splitter again, not the way '
+  'systemd reads it', 'gs_wake_agent',
+  '        env = parse_env_file(raw.decode("utf-8"))',
+  '        env = {_l.partition("=")[0].strip(): _l.partition("=")[2].strip()'
+  '.strip(\'"\').strip("\'") for _l in raw.decode("utf-8").splitlines()'
+  ' if "=" in _l and not _l.strip().startswith("#")}',
+  ['test_wake_agent']),
+ ('the parser leaves an escaped quote or backslash escaped inside double '
+  'quotes', 'gs_wake_agent',
+  '            if c in _SD_NEED_ESCAPE:',
+  '            if False:',
+  ['test_wake_agent']),
+ ('the parser takes a NUL byte systemd refuses the whole file for',
+  'gs_wake_agent',
+  '    if "\\x00" in text:',
+  '    if False:',
+  ['test_wake_agent']),
+ ('the parser takes a noncharacter systemd refuses the whole file for',
+  'gs_wake_agent',
+  '        if _sd_rejects(k) or _sd_rejects(v):',
+  '        if False:',
+  ['test_wake_agent']),
+ ('a comment ending in a backslash is read one way, though v252 and v255 '
+  'read it two', 'gs_wake_agent',
+  '            if c in _SD_NEWLINE:\n'
+  '                raise ValueError(\n'
+  '                    f"line {line} is a comment ending in a backslash, and "',
+  '            if c in _SD_NEWLINE:\n'
+  '                state = "PRE_KEY"\n'
+  '                continue\n'
+  '                raise ValueError(\n'
+  '                    f"line {line} is a comment ending in a backslash, and "',
+  ['test_wake_agent']),
+ ('--seal-secrets seals under a typed half it never checked against the '
+  "keyfile's sealed settings", 'gs_wake_agent',
+  '            key = open_keyfile(key, vault, pi)\n'
+  '            _checked = "this machine\'s sealed settings"',
+  '            _checked = "this machine\'s sealed settings"',
+  ['test_wake_agent']),
+ ('--seal-secrets seals under a typed half it never checked against the '
+  'record store', 'gs_wake_agent',
+  '                proto.state_unseal(json.loads(_store.read_text()), vault, pi)',
+  '                pass',
+  ['test_wake_agent']),
+ ("--seal-secrets seals a seed that does not derive the pair's xpub, and "
+  "says to shred the plaintext", 'gs_wake_agent',
+  '        if _ok is False:',
+  '        if False:',
+  ['test_wake_agent']),
+ ('a seal that fails part way leaves its .new file behind while saying '
+  'nothing was written', 'gs_wake_agent',
+  '        try:\n            tmp.unlink()\n        except OSError:\n'
+  '            pass\n'
+  '        agent_say(f"  [!] the spend secrets could not be sealed "',
+  '        agent_say(f"  [!] the spend secrets could not be sealed "',
+  ['test_wake_agent']),
+ ('--seal-secrets does not say that sealing the fee password stops the '
+  'idle-boot sweep', 'gs_wake_agent',
+  '    if _fc and _fc.get("on_idle_boot"):',
+  '    if False:',
+  ['test_wake_agent']),
+ ('--unseal-state powers the box off under the operator when load_key or '
+  'the half refuses', 'gs_wake_agent',
+  '                _keep_on = True\n                code = unseal_state_cli(args)',
+  '                code = unseal_state_cli(args)\n                _keep_on = True',
+  ['test_wake_agent']),
+ ('--seal-secrets powers the box off under the operator when load_key or '
+  'the half refuses', 'gs_wake_agent',
+  '                _keep_on = True\n                code = seal_secrets_cli(args)',
+  '                code = seal_secrets_cli(args)\n                _keep_on = True',
+  ['test_wake_agent']),
+ ('--fee-sweep powers the box off under the operator on a wrong or '
+  'malformed half', 'gs_wake_agent',
+  '        e.power = False\n        raise',
+  '        raise',
+  ['test_wake_agent']),
+ ('`--fee-sweep --unseal-state <hex>` dumps the records in plaintext '
+  'instead of sweeping', 'gs_wake_agent',
+  '                    and not getattr(args, "fee_sweep", False):',
+  '                    and True:',
+  ['test_wake_agent']),
+ ('--fee-sweep with sealed secrets and no half falls back to the '
+  'environment', 'gs_wake_agent',
+  '            if _fh is None:\n                raise Refused(\n'
+  '                    "secrets_half_needed",',
+  '            if False:\n                raise Refused(\n'
+  '                    "secrets_half_needed",',
+  ['test_wake_agent']),
+ ('a sealed secrets file beside a keyfile with no half is signed past, '
+  'from the environment', 'gs_wake_agent',
+  '    if _vh0 is None and _sp0.is_file():',
+  '    if False:',
+  ['test_wake_agent']),
+ ('a malformed state_half is found only after M2 has taken the job',
+  'gs_wake_agent',
+  '    _vh0, _ = state_halves(key)',
+  '    _vh0 = None',
+  ['test_wake_agent']),
+ ('the idle-boot sweep runs with its password sealed away and calls it '
+  'unset', 'gs_wake_agent',
+  '    if Path(secrets_path).is_file():',
+  '    if False:',
+  ['test_wake_agent']),
+ ('a refusal about a sealed secret sends the operator to the '
+  'EnvironmentFile, which it does not read', 'gs_wake_agent',
+  '    if not _SECRETS:\n        return ""',
+  '    if True:\n        return ""',
+  ['test_wake_agent']),
+ ("a refusal about a sealed seed calls it the environment's",
+  'gs_wake_agent',
+  '        return (f"the sealed spend secrets "',
+  '        return ("the agent unit\'s environment "',
+  ['test_wake_agent']),
+ ('open_secrets does not record which file it opened', 'gs_wake_agent',
+  '    _SECRETS_FROM[0] = str(p)',
+  '    pass',
+  ['test_wake_agent']),
+
+ # -- STAGE 7, READ AGAIN: a stop mid-job must still seal. On the shipped
+ #    build the poweroff unit's SIGTERM was ignored, its SIGKILL landed, and
+ #    the records stayed in plaintext on a machine that was then off.
+ ("run_child's wait does not notice a stop request", 'gs_wake_agent',
+  '            if shutdown_requested():\n'
+  '                _stop_child_now(p)',
+  '            if False:\n'
+  '                _stop_child_now(p)',
+  ['test_wake_agent']),
+ ('a stop request still starts the next child', 'gs_wake_agent',
+  '    _stop_if_asked()\n    if runner is not None:',
+  '    if runner is not None:',
+  ['test_wake_agent']),
+ ('_nap sleeps through a stop request like time.sleep', 'gs_wake_agent',
+  '        _stop_if_asked()\n        _left = _end - time.monotonic()',
+  '        _left = _end - time.monotonic()',
+  ['test_wake_agent']),
+ ("the jitter's default sleep is a plain time.sleep again", 'gs_wake_agent',
+  '    _sleep = d.get("sleep", _nap)',
+  '    _sleep = d.get("sleep", time.sleep)',
+  ['test_wake_agent']),
+ ("report_back's backoff is a plain time.sleep again", 'gs_wake_agent',
+  '    _sleep = sleeper or _nap',
+  '    _sleep = sleeper or time.sleep',
+  ['test_wake_agent']),
+ ('a stop is reported to the doorbell BEFORE the records are sealed',
+  'gs_wake_agent',
+  '        if isinstance(e, Stopping):\n            _seal_state_now()',
+  '        if False:\n            _seal_state_now()',
+  ['test_wake_agent']),
+ ('the seal does not forget its key, so a second call deletes the container',
+  'gs_wake_agent',
+  '    finally:\n        _STATE_KEY.clear()\n\n\ndef load_state(',
+  '    finally:\n        pass\n\n\ndef load_state(',
+  ['test_wake_agent']),
+ ('main() does not catch a stop by name', 'gs_wake_agent',
+  '        except Stopping as e:',
+  '        except ZeroDivisionError as e:',
+  ['test_wake_agent']),
+ ("the child's stop grace outlasts the poweroff unit's 20 s", 'gs_wake_agent',
+  'STOP_CHILD_GRACE_S = 10',
+  'STOP_CHILD_GRACE_S = 30',
+  ['test_wake_agent']),
+
+ # -- STAGE 7, READ AGAIN: a retired record stays retired. state_open
+ #    restores whatever it does not find, and a run that died between a
+ #    shred and its seal brought a paid-out deposit's files back.
+ ('a wake does not retire what the ledger already says was paid out',
+  'gs_wake_agent',
+  '    _heal_retired(artifact_dir)\n',
+  '    pass\n',
+  ['test_wake_agent']),
+ ('the healing pass shreds whatever path a record names, outside the '
+  'directory too', 'gs_wake_agent',
+  '                        and Path(_p).resolve().parent == root\n',
+  '',
+  ['test_wake_agent']),
+ ("the healing pass shreds an OPEN deposit's files as well", 'gs_wake_agent',
+  '        if not (isinstance(rec, dict) and rec.get("spent") is True):',
+  '        if not isinstance(rec, dict):',
+  ['test_wake_agent']),
+ ('a finished job is reported before its records are sealed',
+  'gs_wake_agent',
+  '    _seal_state_now()\n'
+  '    report_back(key, job_id, challenge.hex(), status, handle, slip=slip,',
+  '    report_back(key, job_id, challenge.hex(), status, handle, slip=slip,',
+  ['test_wake_agent']),
+ ("a paid-out deposit's files are shredded before the ledger says spent",
+  'gs_wake_agent',
+  '    _save_handles(artifact_dir, handles, led["owners"])\n'
+  '    for _rec in _retire_after:\n'
+  '        _retire_files(_rec)\n',
+  '    for _rec in _retire_after:\n'
+  '        _retire_files(_rec)\n'
+  '    _save_handles(artifact_dir, handles, led["owners"])\n',
   ['test_wake_agent']),
 ]
 

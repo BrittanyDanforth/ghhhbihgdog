@@ -205,8 +205,13 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 #                   --key /etc/gs_wake_thinkpad.key        # here
 #
 # That writes /etc/gs-wake-spend.sealed (0400), which opens only with both
-# boxes. It does NOT destroy the plaintext -- check a real job works first,
-# then shred it and DELETE the EnvironmentFile= line below. With the sealed
+# boxes. It checks the half against what this machine already sealed, reads
+# the file exactly as systemd does, and proves the seed against the xpub
+# before writing anything. It does NOT destroy the plaintext: it prints the
+# job that uses each secret it sealed -- a deposit proves only the seed,
+# only a withdrawal opens the spend wallet, only a fee sweep the fee wallet.
+# Run each you rely on once from the seal, then shred the plaintext and
+# DELETE the EnvironmentFile= line below. With the sealed
 # file present the agent does not need this unit to carry anything, and a
 # variable left here would be a readable copy of what was just sealed.
 #

@@ -1772,6 +1772,18 @@ def main(argv=None):
         print(f"      python3 gs_wake_agent --unseal-state {_half} \\")
         print("          --key /etc/gs_wake_thinkpad.key")
         print()
+        # THE SAME HALF IS WHAT THREE MORE HAND COMMANDS TAKE, and this was
+        # the one place an operator reads it -- which named only the first.
+        # Sealing the spend secrets is a setup step every sealed box needs
+        # once, and it was documented nowhere this output points.
+        print("  The same half is what these take, at the vault:")
+        print("      --seal-secrets <hex>             seal the vault's spend "
+              "secrets")
+        print("      --unseal-key <hex>               print the sealed "
+              "settings")
+        print("      --fee-sweep --unseal-state <hex> run the fee sweep by "
+              "hand")
+        print()
         print("  It is DERIVED from this card's secret, so it is the same")
         print("  every time and a re-pairing changes it -- after which the")
         print("  records written under the old one cannot be opened.")

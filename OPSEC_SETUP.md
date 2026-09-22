@@ -190,8 +190,24 @@ gs_wake_agent --seal-secrets <hex> \
               --key /etc/gs_wake_thinkpad.key           # here
 ```
 
-That writes `/etc/gs-wake-spend.sealed` (0400). **It does not destroy the
-plaintext** — run a real job first, confirm it works, and only then:
+That writes `/etc/gs-wake-spend.sealed` (0400). Before it writes anything it:
+
+* **checks the half you typed** against what this machine has already sealed
+  with the Pi's real one — its own sealed settings, or its record store. A
+  mistyped half is refused and nothing is written. If the machine has sealed
+  nothing yet it says so, and the first wake is the check.
+* **reads the file exactly as systemd does** — quotes, backslash escapes, a
+  password that ends in a quote, a value over two lines. What it seals is
+  what the unit was running with. A file systemd would refuse, or one whose
+  meaning differs between systemd versions (a comment ending in a
+  backslash), is refused by line number, never by value.
+* **proves the seed** derives this pair's xpub, and refuses to seal one that
+  does not.
+
+**It does not destroy the plaintext.** It prints, for each secret it sealed,
+the job that actually uses it: a deposit proves only the seed, only a
+withdrawal opens the spend wallet, only a fee sweep opens the fee wallet. Run
+each one you rely on once from the seal, and only then:
 
 ```
 shred -u /etc/gs-wake-spend.env
@@ -202,9 +218,12 @@ A tool that sealed your seed and shredded the only copy of it would be the
 one failure in this whole design that costs money instead of privacy, so it
 prints the command and leaves the decision with you.
 
-Three things to know:
+Four things to know:
 
 * **No sealed file means the old behaviour**, unchanged. Nothing is required.
+* **The idle-boot fee sweep stops** once the fee wallet's password is
+  sealed: a boot nothing woke brings no half. `--seal-secrets` says so when
+  it applies; run `gs_wake_agent --fee-sweep --unseal-state <hex>` by hand.
 * **A sealed file that will not open refuses the job, and does not fall back
   to the environment.** That is stricter than everywhere else here, on
   purpose: if your seed is sealed you believe it is protected, and a box that
@@ -1947,6 +1966,7 @@ that case destroy the pairing yourself, and re-key both boxes afterwards:
 shred -u /etc/gs_wake_thinkpad.key
 shred -u /var/lib/ghostspiral-marks/issued_*.json   # the intake's issued-index marks
 shred -u /etc/gs-wake-spend.env                     # the seed and the wallet passwords
+shred -u /etc/gs-wake-spend.sealed                  # ...and their sealed copy, if you ran --seal-secrets
 shred -u /var/lib/gs/spend.wallet /var/lib/gs/spend.wallet.keys   # if you paired --allow-withdraw
 shred -u /var/lib/gs/fee.wallet /var/lib/gs/fee.wallet.keys       # if you paired a fee wallet
 ```
@@ -1958,6 +1978,13 @@ passwords. `paranoia_mode` reaches neither — `/etc` is not one of its
 roots. Copy the seed somewhere you can restore from BEFORE you shred it,
 or you are destroying the money with the evidence; the wallet files are
 worth the same care.
+
+**If you sealed the secrets and already shredded the plaintext, the seed on
+this box exists only sealed** — and nothing prints the sealed secrets back
+(`--unseal-key` prints the settings, not these). Its copy dies with the
+keyfile on the first line, because the vault's half of its key is in there.
+So the seed must already be wherever you keep the words; this disk is not
+that place, and `--seal-secrets` said so when you ran it.
 
 The first line has a second effect worth knowing, and here it is the one
 you want: the vault's keyfile holds its half of the state key (§1), so

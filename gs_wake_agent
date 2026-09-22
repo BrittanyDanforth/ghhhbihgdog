@@ -70,8 +70,8 @@ from gs_common import (                                      # noqa: E402
     daemon_fee_estimate, fee_estimate_per_tx, isolated_proxy,
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
     install_signal_handlers, resource_check, rpc_lock_scope,
-    scope_lock_taken, secure_delete_or_warn, secure_mkdir, terminal_safe,
-    wipe_covers,
+    scope_lock_taken, secure_delete_or_warn, secure_mkdir, shutdown_requested,
+    terminal_safe, wipe_covers,
 )
 import importlib.machinery, importlib.util                 # noqa: E402
 import gs_wake_proto as proto                                # noqa: E402
@@ -157,6 +157,10 @@ SECRETS_ALLOWED = ("GS_BTC_SEED", "GS_BTC_SEED_PASSPHRASE",
                    "GS_SWAPKIT_API_KEY")
 #: Opened after the note, RAM only, cleared in main()'s finally.
 _SECRETS = {}
+#: WHICH sealed file _SECRETS came out of, for the refusals about a secret:
+#: they have to name the copy this machine actually reads, and the sealed
+#: one wins over the EnvironmentFile. Cleared with _SECRETS.
+_SECRETS_FROM = [None]
 #: The two halves, once the note has been opened: the vault's from the
 #: keyfile, the Pi's from M2. main()'s finally needs them to re-seal, and
 #: it has no keyfile and no note -- the same shape as _LATE_GUARD. RAM
@@ -168,6 +172,58 @@ _STATE_KEY = {}
 STATUS_FILE = "gs_wake_status.json"
 INHIBIT_FILE = ".gs_wake_inhibit"
 DEADMAN_UNIT = "gs-wake-deadman.timer"
+
+
+class Stopping(BaseException):
+    """systemd asked this unit to stop while a job was running.
+
+    WHY THIS EXISTS. gs-wake-poweroff.service -- the deadman's action, and
+    OnFailure's -- says "stop the job cleanly, then power off": SIGTERM, 20
+    seconds, SIGKILL. gs_common's handler only RECORDS a SIGTERM (a handler
+    that does work deadlocked on the chain's flock; see _shutdown_handler),
+    and nothing in this file ever read the record. So the SIGTERM did
+    nothing, the SIGKILL landed, main()'s finally never ran, and the records
+    the store had opened stayed in PLAINTEXT on a machine that was then off
+    -- the exact seizure stage 7 exists for, on every overrun, every
+    TimeoutStartSec, every `systemctl stop`. Driven: a wake with its store
+    open and a real child running ignored SIGTERM for as long as it was
+    watched, and after the SIGKILL a client's record sat on the disk.
+
+    A BaseException, so no `except Exception` on the way up can swallow it
+    and carry on to the next step; main() catches it by name. It is raised
+    only where the agent waits (run_child, _nap), never from the handler.
+    """
+
+
+#: How long a child gets to stop after the agent notices a stop request.
+#: The child has already had systemd's SIGTERM (`systemctl kill` signals the
+#: whole unit); this is its grace before the agent kills it, so that the
+#: directory is quiet when the records are sealed. Sized to the poweroff
+#: unit's 20-second window: noticed within a second, 10 for the child, a
+#: second or two to reap it, and the seal -- milliseconds -- with room to
+#: spare before the SIGKILL. The child used to get the whole 20 and then
+#: take the unsealed records down with it.
+STOP_CHILD_GRACE_S = 10
+
+
+def _stop_if_asked() -> None:
+    """Raise Stopping if systemd has asked this unit to stop."""
+    if shutdown_requested():
+        raise Stopping("the unit was asked to stop")
+
+
+def _nap(seconds) -> None:
+    """time.sleep that a stop request ends. A plain sleep does not: PEP 475
+    resumes it after a handler that only records the signal, so a SIGTERM
+    during the jitter or a result-post backoff was noticed minutes late --
+    after the SIGKILL. In slices of at most a second."""
+    _end = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        _stop_if_asked()
+        _left = _end - time.monotonic()
+        if _left <= 0:
+            return
+        time.sleep(min(1.0, _left))
 
 
 class Refused(Exception):
@@ -742,6 +798,40 @@ def has_secret(name: str) -> bool:
     return name in _SECRETS or name in os.environ
 
 
+def _secret_home(name: str) -> str:
+    """Where this machine read `name` from, in words, for a refusal about
+    its VALUE (a seed that is not a mnemonic, or derives another xpub)."""
+    if name in _SECRETS:
+        return (f"the sealed spend secrets "
+                f"({_SECRETS_FROM[0] or SECRETS_FILE})")
+    return "the agent unit's environment"
+
+
+def _reseal_hint(name: str) -> str:
+    """The sentence a refusal about a spend secret is missing when this box
+    has sealed them, and "" when it has not -- so every message from before
+    stage 9 reads exactly as it did.
+
+    THE REFUSALS SENT THE OPERATOR TO THE WRONG COPY. Every one said "set"
+    or "fix" the variable in the EnvironmentFile. On a box that has sealed
+    its secrets, secret_of() reads the SEALED copy first, so an operator
+    who fixed a bad seed in the file as told changed nothing and got the
+    same refusal on the next wake; one told a sealed-away password was
+    "unset" would put it back in the clear, undoing the seal."""
+    if not _SECRETS:
+        return ""
+    where = _SECRETS_FROM[0] or SECRETS_FILE
+    if name in _SECRETS:
+        return (f" That value is the SEALED copy ({where}), which wins over "
+                f"the EnvironmentFile: editing that file alone changes "
+                f"nothing. Correct the plaintext, then re-seal with "
+                f"`gs_wake_agent --seal-secrets <hex>` at the machine.")
+    return (f" This machine seals its spend secrets ({where}) and {name} is "
+            f"in neither them nor the environment: add it to the plaintext "
+            f"and re-seal with `gs_wake_agent --seal-secrets <hex>` at the "
+            f"machine.")
+
+
 def open_secrets(path, vault_half: bytes, pi_half: bytes) -> int:
     """Load the sealed spend secrets into _SECRETS. Returns how many.
 
@@ -779,6 +869,7 @@ def open_secrets(path, vault_half: bytes, pi_half: bytes) -> int:
         # whatever GS_ variables it liked into every child's environment.
         if _k in SECRETS_ALLOWED and isinstance(_v, str):
             _SECRETS[_k] = _v
+    _SECRETS_FROM[0] = str(p)
     return len(_SECRETS)
 
 
@@ -964,6 +1055,48 @@ def state_close(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
         except Exception:                                    # noqa: BLE001
             continue
     return gone
+
+
+def _seal_state_now() -> None:
+    """Put the open records back in the store, ONCE, and forget the key.
+
+    main()'s finally calls this on every path out, and a stop request calls
+    it EARLIER, before the doorbell is told anything (run_once): reporting
+    can take a minute of backoff over Tor and the poweroff unit allows 20
+    seconds before its SIGKILL, so the seal cannot wait behind it.
+
+    ONCE, because state_close is not idempotent. Called again after it has
+    shredded every plaintext member, it finds nothing to keep and deletes
+    the container as a wiped vault's -- which would destroy the records it
+    just sealed. So _STATE_KEY is cleared here, on success and failure, and
+    a second call does nothing.
+
+    FAILS THE OTHER WAY FROM state_open, and it must: an unsealed directory
+    is a privacy loss the operator can still fix, while a shred whose
+    ciphertext never landed is a client's money with no bookkeeping.
+    state_close returns -1 rather than raising, and says so."""
+    if _STATE_KEY.get("vault") is None:
+        return
+    try:
+        _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],
+                              _STATE_KEY["pi"])
+        if _sealed < 0:
+            agent_say("  [!] THE RECORDS COULD NOT BE SEALED and are "
+                      "still readable on this disk. Nothing was "
+                      "destroyed. Look at the artifact directory "
+                      "before the next wake.")
+            integrity_log("wake", "state_unsealed_fail")
+        else:
+            integrity_log("wake", "state_sealed")
+    except Exception:                                        # noqa: BLE001
+        # Bookkeeping must never be what keeps the box on, and a failure
+        # here has already left the plaintext in place.
+        try:
+            integrity_log("wake", "state_unsealed_fail")
+        except Exception:                                    # noqa: BLE001
+            pass
+    finally:
+        _STATE_KEY.clear()
 
 
 def load_state(dirpath: Path) -> dict:
@@ -1433,7 +1566,8 @@ def build_fee_sweep_argv(key: dict, cfg: dict, bundle: str,
             "the machine has no fee-wallet password configured, so the fee "
             "wallet cannot be opened to sign. Nothing was spent. Set "
             "GS_FEE_WALLET_PASSWORD at the machine -- to an empty value if "
-            "the wallet genuinely has none, so that choice is on the record.")
+            "the wallet genuinely has none, so that choice is on the record."
+            + _reseal_hint("GS_FEE_WALLET_PASSWORD"))
     argv = [sys.executable, _tool("GhostSpiral"),
             "--tor-proxy", str(key.get("tor_proxy") or ""),
             "--rpc-primary", cfg["rpc"],
@@ -1643,18 +1777,50 @@ def run_fee_sweep_cli(args, deps: dict = None) -> str:
     # copy beside the LUKS USB that OPSEC_SETUP.md section 1 tells them to
     # keep. Refuse loudly rather than report "this keyfile names no fee
     # wallet", which would be a true sentence about the wrong thing.
-    key = _by_hand(key, getattr(args, "unseal_state", ""),
-                   "a fee sweep on a box nothing woke")
-    # THE FEE WALLET'S PASSWORD IS A SEALED SECRET TOO, and this boot has the
-    # half on its argv, so it can open them. Without this the sweep refused
-    # fee_password_unset on a box where the password is sealed and present --
-    # a true sentence about the wrong thing, again.
-    _fh = _half_bytes(getattr(args, "unseal_state", ""))
-    if _fh is not None:
-        _fv, _ = state_halves(key)
-        if _fv is not None:
-            open_secrets(getattr(args, "secrets_file", SECRETS_FILE),
-                         _fv, _fh)
+    _hex = getattr(args, "unseal_state", "")
+    _sp = Path(getattr(args, "secrets_file", "") or SECRETS_FILE)
+    try:
+        key = _by_hand(key, _hex, "a fee sweep on a box nothing woke")
+        # THE FEE WALLET'S PASSWORD IS A SEALED SECRET TOO. Opened only
+        # when a sealed file is THERE, and refused rather than skipped when
+        # it is there and cannot be opened. It was skipped: with no half on
+        # the argv (or one that did not parse) the sweep fell through to
+        # the environment -- the fallback open_secrets refuses on a woken
+        # boot -- and, the plaintext shredded as --seal-secrets tells the
+        # operator to, refused fee_wallet_password_unset with an
+        # instruction to put the password back in the EnvironmentFile. A
+        # true sentence about the wrong thing, and one that undoes the seal
+        # if it is followed.
+        if _sp.is_file():
+            _fv, _ = state_halves(key)
+            _fh = _half_bytes(_hex)
+            if _fv is None:
+                raise Refused(
+                    "secrets_unreadable",
+                    f"this machine has sealed spend secrets at {_sp}, and "
+                    f"its keyfile carries no half of the key they were "
+                    f"sealed under -- so they are from another pairing, or "
+                    f"the keyfile has been altered. Nothing is signed with "
+                    f"secrets this machine cannot read, and it will not "
+                    f"fall back to the environment.")
+            if _fh is None:
+                raise Refused(
+                    "secrets_half_needed",
+                    f"this machine's spend secrets are sealed to the pair "
+                    f"({_sp}), and a fee sweep on a box nothing woke brings "
+                    f"no half of the key. Print it on the Pi with "
+                    f"`gs_doorbell state-key` -- or take the copy beside "
+                    f"the LUKS USB -- and pass it here as "
+                    f"`--unseal-state <hex>`.")
+            open_secrets(_sp, _fv, _fh)
+    except Refused as e:
+        # THE OPERATOR IS STANDING HERE, and every refusal in this block is
+        # about a half they typed or a file they can look at: a missing
+        # half, a wrong one, a malformed keyfile half, a seal that will not
+        # open. keyfile_half_needed already kept the box on; its siblings
+        # powered it off under them. None of these moved anything.
+        e.power = False
+        raise
     artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
     secure_mkdir(artifact_dir, narrow_existing=False)
     _AGENT_LOG[0] = artifact_dir / JOB_LOG
@@ -1669,7 +1835,8 @@ def run_fee_sweep_cli(args, deps: dict = None) -> str:
                          bool(getattr(args, "dry_run", False)))
 
 
-def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
+def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict,
+                     secrets_path=SECRETS_FILE) -> bool:
     """A boot with no job is the fee sweep's moment, if the keyfile says so.
 
     Returns whether the keyfile asked for it. A misconfigured keyfile is said
@@ -1706,6 +1873,22 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict) -> bool:
         integrity_log("wake", "fee_sweep:misconfigured")
         return False
     if not (_fcfg and _fcfg["on_idle_boot"]):
+        return False
+    # ...AND THE SAME IS TRUE OF A SEALED FEE PASSWORD (STAGE9_PLAN.md).
+    # The pairing refuses this flag for a sealed keyfile, but --seal-secrets
+    # runs after pairing and a stage-7 keyfile's settings are readable, so
+    # this boot can find the sweep asked for and its password out of reach.
+    # It used to run anyway, fall through to the environment, and refuse
+    # fee_wallet_password_unset -- telling the operator to put back in the
+    # clear the password they had just sealed. Say which it is and stand
+    # down; the hand command has the half.
+    if Path(secrets_path).is_file():
+        agent_say("  [!] This machine's spend secrets are sealed to the "
+                  "pair and nothing woke this boot, so the fee wallet's "
+                  "password cannot be read from here. Run `gs_wake_agent "
+                  "--fee-sweep --unseal-state <hex>` at the machine "
+                  "instead.")
+        integrity_log("wake", "fee_sweep:secrets_sealed")
         return False
     run_fee_sweep(key, artifact_dir, d, False)
     return True
@@ -1820,7 +2003,7 @@ def _prove_btc_seed(key: dict) -> None:
             "the machine has no BTC seed configured, so no deposit address "
             "was issued: the forward could never sign for it. Nothing was "
             "published. Set GS_BTC_SEED in the agent unit's EnvironmentFile, "
-            "at the machine.")
+            "at the machine." + _reseal_hint("GS_BTC_SEED"))
     account_no = _btc_setting(key, "btc_account", 0, 0, 2 ** 31 - 1)
     account = None
     try:
@@ -1834,10 +2017,10 @@ def _prove_btc_seed(key: dict) -> None:
             integrity_log("wake", "btc_seed_invalid")
             raise Refused(
                 "btc_seed_invalid",
-                "the BTC seed in the agent unit's environment is not a valid "
-                "mnemonic, so no deposit address was issued: the forward "
-                "could never sign for it. Nothing was published. Fix "
-                "GS_BTC_SEED at the machine.")
+                f"the BTC seed in {_secret_home('GS_BTC_SEED')} is not a "
+                "valid mnemonic, so no deposit address was issued: the "
+                "forward could never sign for it. Nothing was published. Fix "
+                "GS_BTC_SEED at the machine." + _reseal_hint("GS_BTC_SEED"))
         ok = _btx.account_matches_xpub(account, str(key["btc_account_xpub"]))
     finally:
         del account
@@ -1845,14 +2028,15 @@ def _prove_btc_seed(key: dict) -> None:
         integrity_log("wake", "btc_seed_xpub_mismatch")
         raise Refused(
             "btc_seed_xpub_mismatch",
-            "the BTC seed in the agent unit's environment does not derive "
+            f"the BTC seed in {_secret_home('GS_BTC_SEED')} does not derive "
             f"the account xpub this pair watches (m/84'/coin'/{account_no}'), "
             "so no deposit address was issued: every deposit would settle "
             "on an address the forward refuses to sign for. Nothing was "
             "published. The xpub was exported under another purpose or "
             "account, or with another passphrase: re-pair with the wallet's "
             "native-segwit account xpub (gs_wake_keys prints its first "
-            "address to compare), or fix the seed at the machine.")
+            "address to compare), or fix the seed at the machine."
+            + _reseal_hint("GS_BTC_SEED"))
 
 
 def _issued_mark_path(key: dict):
@@ -3072,6 +3256,9 @@ def run_child(argv: list, env_extra: dict, budget_s: int,
     the artifact directory, inside paranoia_mode's sweep. Diagnostics survive
     for as long as the artifacts do and no longer.
     """
+    # A STOP REQUEST STARTS NOTHING NEW. Checked before the runner too, so
+    # a job's next step is not spawned into a unit systemd is taking down.
+    _stop_if_asked()
     if runner is not None:
         return runner(argv, env_extra, budget_s)
     env = dict(os.environ)
@@ -3113,23 +3300,64 @@ def run_child(argv: list, env_extra: dict, budget_s: int,
     finally:
         if sink is not None:
             sink.close()
-    try:
-        return p.wait(timeout=budget_s), False
-    except subprocess.TimeoutExpired:
-        import signal
+    # WAITED IN SLICES, so a stop request is seen within a second. One
+    # p.wait(budget_s) -- up to 16.5 hours for a withdrawal -- could not see
+    # it at all: the handler only records a SIGTERM, and a wait it
+    # interrupts is resumed.
+    _end = time.monotonic() + budget_s
+    while True:
         try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except Exception:                                    # noqa: BLE001
-            p.terminate()
-        try:
-            return p.wait(timeout=JOB_TERM_GRACE_S), False
+            return p.wait(timeout=max(0.0, min(1.0,
+                                               _end - time.monotonic()))), \
+                False
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except Exception:                                # noqa: BLE001
-                p.kill()
-            p.wait(timeout=30)
-            return -9, True
+            if shutdown_requested():
+                _stop_child_now(p)
+                raise Stopping("the unit was asked to stop mid-job")
+            if time.monotonic() >= _end:
+                break
+    # THE BUDGET IS SPENT: the watchdog's own stop, unchanged.
+    import signal
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except Exception:                                        # noqa: BLE001
+        p.terminate()
+    try:
+        return p.wait(timeout=JOB_TERM_GRACE_S), False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:                                    # noqa: BLE001
+            p.kill()
+        p.wait(timeout=30)
+        return -9, True
+
+
+def _stop_child_now(p) -> None:
+    """A stop request's end for a running child: its grace, then the kill,
+    so the artifact directory is quiet before the records are sealed.
+
+    SIGTERM to the GROUP first, though systemd has usually sent one: this
+    also covers a stop the agent noticed some other way, and a second
+    SIGTERM costs a child nothing."""
+    import signal
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except Exception:                                        # noqa: BLE001
+        p.terminate()
+    try:
+        p.wait(timeout=STOP_CHILD_GRACE_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except Exception:                                        # noqa: BLE001
+        p.kill()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -3155,7 +3383,9 @@ def run_once(args, deps: dict = None) -> tuple:
     _CHILD_STARTED[0] = False
     d = deps or {}
     _post = d.get("post_record", post_record)
-    _sleep = d.get("sleep", time.sleep)
+    # _nap, not time.sleep: the jitter is minutes long and runs with the
+    # store open, and a plain sleep does not notice a stop (see _nap).
+    _sleep = d.get("sleep", _nap)
     _clock = d.get("clock", time.monotonic)
     _rng = d.get("rng", random.SystemRandom())
     _child = d.get("run_child", None)
@@ -3207,6 +3437,38 @@ def run_once(args, deps: dict = None) -> tuple:
 
     preflight(key, artifact_dir, args.dry_run, probes=d)
 
+    # THE SEAL'S PRECONDITIONS ARE THE KEYFILE'S AND THE DISK'S, NOT THE
+    # NOTE'S, so they are checked HERE -- before the doorbell is asked for
+    # anything, because the handover is at-most-once and asking takes the
+    # job. Both used to be decided only after M2 had been opened:
+    #
+    #   * a malformed state_half refused state_half_malformed there, with
+    #     a client's job already taken off the Pi and not run;
+    #   * a sealed secrets file beside a keyfile with NO half was never
+    #     noticed at all. open_secrets is reached only when this pairing
+    #     seals, so the wake signed from whatever the environment still
+    #     held -- the exact fallback open_secrets refuses, taken silently
+    #     by the one path that skipped it.
+    #
+    # NOT A DEFENCE AGAINST ANYBODY, said so per AGENTS.md rule 1: whoever
+    # can write this disk can make it refuse, as they can make it do
+    # anything. It rests on no secret and claims none. What it guarantees
+    # is narrower and still worth it -- that the OPERATOR's sealed seed is
+    # never quietly swapped for a plaintext leftover by a path that forgot
+    # to open the seal.
+    _vh0, _ = state_halves(key)
+    _sp0 = Path(getattr(args, "secrets_file", "") or SECRETS_FILE)
+    if _vh0 is None and _sp0.is_file():
+        integrity_log("wake", "secrets_unreadable")
+        raise Refused(
+            "secrets_unreadable",
+            f"this machine has sealed spend secrets at {_sp0}, and its "
+            f"keyfile carries no half of the key they were sealed under -- "
+            f"so they are from another pairing, or the keyfile has been "
+            f"altered. Nothing is signed with secrets this machine cannot "
+            f"read, and it will not fall back to the environment. Nothing "
+            f"was asked of the doorbell, so the job is still waiting.")
+
     tp_sk = nacl.public.PrivateKey(bytes.fromhex(key["secret"]))
     pi_pk = nacl.public.PublicKey(bytes.fromhex(key["peer_public"]))
 
@@ -3234,7 +3496,9 @@ def run_once(args, deps: dict = None) -> tuple:
         # spends. No dwell: the sweep is hours, and a boot that does not
         # run one is left exactly as it was.
         if wstat == 0 and not args.dry_run:
-            _idle_boot_sweep(key, artifact_dir, d)
+            _idle_boot_sweep(key, artifact_dir, d,
+                             getattr(args, "secrets_file", "")
+                             or SECRETS_FILE)
         raise Refused("doorbell_unreachable",
                       "the doorbell did not hand over a wake window, so there "
                       "is nothing to bind this note to. Nothing was handed "
@@ -3385,7 +3649,9 @@ def run_once(args, deps: dict = None) -> tuple:
         # the sweep before the power-off. Off by default: the flag's help
         # says what a stranger's packet then costs. AFTER the dwell, so
         # the hostile-packet shape is unchanged when it does not run.
-        _idle_boot_sweep(key, artifact_dir, d)
+        _idle_boot_sweep(key, artifact_dir, d,
+                         getattr(args, "secrets_file", "")
+                         or SECRETS_FILE)
         raise Refused("no_job",
                       "the doorbell answered, and it has no job for this boot. "
                       "That is what a magic packet from anyone on the switch "
@@ -3501,6 +3767,12 @@ def run_once(args, deps: dict = None) -> tuple:
             job_id, job, params, challenge, _sleep, _rng, _verify_tor,
             _accounts, _child))
     except BaseException as e:
+        # A STOP IS SEALED BEFORE IT IS REPORTED. report_back can spend a
+        # minute on Tor and its backoff; the poweroff unit's SIGKILL comes
+        # 20 seconds after its SIGTERM. Reporting first is how the records
+        # were still plaintext when the power went.
+        if isinstance(e, Stopping):
+            _seal_state_now()
         # "refused" ONLY WHILE IT IS STILL TRUE. This reported "refused" for
         # everything raised in there, and the pager turns that word into
         # "refused before it started - nothing was spent and nothing moved."
@@ -3541,6 +3813,13 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         integrity_log("wake", "state_opened" if _n else "state_empty")
     else:
         integrity_log("wake", "state_unsealed")
+    # WHAT THE LEDGER SAYS WAS RETIRED STAYS RETIRED. state_open restores
+    # every member it does not find on the disk, and it cannot tell "never
+    # written out yet" from "shredded by a run that then died before its
+    # seal" -- so a power cut in that window brought a paid-out deposit's
+    # slip and bundle back from the older container. The ledger that says
+    # "spent" is newer than that container, so it decides.
+    _heal_retired(artifact_dir)
 
     state = load_state(artifact_dir)
     if job_id in {j.get("id") for j in state["jobs"]}:
@@ -3731,13 +4010,11 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         slip, plain = "", {}
     phase = _phase_of(job, artifact_dir, key=key, status=status,
                       owner=params.get("owner"), handle=handle)
-    report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
-                plain=plain, phase=phase, poster=d.get("post_record"),
-                sleeper=d.get("sleep"))
     # THE PROBE'S ANSWER IS READ ONCE AND THEN GONE. The status file holds
     # the probe's state word and figures; it was deleted only at the START
     # of the next probe, so between two probes it sat on the auto-unlocking
-    # disk. Removed here, after the one read that needed it.
+    # disk. Removed here, after the one read that needed it -- and BEFORE
+    # the seal below, so its figures are dropped rather than sealed away.
     if job in ("watch", "swap_status"):
         try:
             (artifact_dir / STATUS_FILE).unlink()
@@ -3749,6 +4026,18 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
             _forward_status_path(artifact_dir, handle).unlink()
         except OSError:
             pass
+    # SEALED BEFORE IT IS REPORTED, on a job that finished as on one that
+    # was stopped. Everything the job writes is written by here; the report
+    # that follows can take minutes over Tor (three attempts, 15 and 30
+    # seconds between). The seal used to wait for it in main()'s finally,
+    # so for those minutes a paid-out deposit's slip and bundle were
+    # already shredded and the container still held them -- and a power
+    # cut there brought them back at the next state_open, which restores
+    # any member it does not find on the disk.
+    _seal_state_now()
+    report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
+                plain=plain, phase=phase, poster=d.get("post_record"),
+                sleeper=d.get("sleep"))
     return code, status, handle
 
 
@@ -4164,6 +4453,51 @@ def _retire_files(rec: dict) -> None:
                 secure_delete_or_warn(Path(_p), f"a paid-out deposit's {_k}")
         except Exception:                                    # noqa: BLE001
             integrity_log("wake", f"retire_failed:{_k}")
+
+
+def _heal_retired(artifact_dir: Path) -> int:
+    """Retire again what a spent record's files left behind. Returns how
+    many records it touched. NEVER raises: a wake is not refused over
+    housekeeping.
+
+    Two ways to get here, both a run that died mid-way: shredded, then
+    brought back by state_open from a container sealed before the shred;
+    or marked spent and saved, then killed before the shred. Either way the
+    ledger says spent and the files say otherwise, and the files are the
+    who-sent-what line _retire_files exists to remove.
+
+    ONLY INSIDE THE ARTIFACT DIRECTORY. A record names its files by path,
+    and a ledger is a file: this runs on every wake, so it must not be able
+    to shred anything a damaged or hand-edited record happens to name. Not
+    a defence against whoever can write this disk -- they can delete what
+    they like without it -- a limit on what a bad record can cost."""
+    try:
+        root = artifact_dir.resolve()
+        handles = _load_handles(artifact_dir) or {}
+    except Exception:                                        # noqa: BLE001
+        return 0
+    touched = 0
+    for rec in handles.values():
+        if not (isinstance(rec, dict) and rec.get("spent") is True):
+            continue
+        mine = {}
+        for _k in ("slip", "bundle", "forward_plan"):
+            _p = rec.get(_k)
+            try:
+                if (isinstance(_p, str) and _p
+                        and Path(_p).resolve().parent == root
+                        and Path(_p).is_file()):
+                    mine[_k] = _p
+            except (OSError, ValueError):
+                continue
+        if not mine:
+            continue
+        mine["btc_index"] = rec.get("btc_index")
+        _retire_files(mine)
+        touched += 1
+    if touched:
+        integrity_log("wake", "retired_leftovers")
+    return touched
 
 
 def _subaddress_total(key: dict, acct: int, sub: int, injected=None):
@@ -4816,7 +5150,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                     "btc_seed_unset",
                     "the machine has no BTC seed configured, so the forward "
                     "cannot sign. Nothing was spent. Set GS_BTC_SEED in the "
-                    "agent unit's EnvironmentFile, at the machine.")
+                    "agent unit's EnvironmentFile, at the machine."
+                    + _reseal_hint("GS_BTC_SEED"))
             env_extra["GS_BTC_SEED"] = secret_of("GS_BTC_SEED")
             if has_secret("GS_BTC_SEED_PASSPHRASE"):
                 env_extra["GS_BTC_SEED_PASSPHRASE"] = \
@@ -4907,7 +5242,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                     "wallet cannot be opened. Nothing was spent. Set it at "
                     "the machine — and if the wallet genuinely has no "
                     "password, set it to an empty value so that choice is "
-                    "on the record rather than assumed.")
+                    "on the record rather than assumed."
+                    + _reseal_hint("GS_WALLET_PASSWORD"))
             env_extra["GS_WALLET_PASSWORD"] = secret_of("GS_WALLET_PASSWORD")
             # THE OPERATOR'S CUT, WHICH THIS PATH WAS NOT TAKING AT ALL.
             #
@@ -5162,13 +5498,21 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                              chain=_forward_chain(artifact_dir, handle))
         except Exception:                                    # noqa: BLE001
             integrity_log("wake", "pairs_unreconciled")
+    # THE LEDGER IS WRITTEN BEFORE ANYTHING IS SHREDDED. The files went
+    # first and _save_handles came after, so a run killed between the two
+    # left a ledger saying "unspent" beside a deposit whose files were gone
+    # -- and with the store sealed, the next state_open brought the files
+    # back from the older container: the whole record as it stood BEFORE a
+    # payout that had happened. Written first, the worst a kill can leave
+    # is "spent" with the files still there, which _heal_retired finishes.
+    _retire_after = []
     if _spent_pair is not None:
         for _rec in handles.values():
             if _rec.get("bundle") and _bundle_pair(_rec) == _spent_pair:
                 _rec["spent"] = True
                 # THE PAIR STAYS, THE FILES GO. See _retire_files.
                 _rec["pair"] = [int(_spent_pair[0]), int(_spent_pair[1])]
-                _retire_files(_rec)
+                _retire_after.append(_rec)
         # THE MIX'S ACCOUNTS ARE THE OWNER'S. Read after the child so the
         # fan-out, the decoys, the carrier and the change sweep it minted
         # are recorded as this owner's for the next leg. Unreadable on
@@ -5187,7 +5531,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 _accts_after = _account_indices(key, injected=accounts)
                 if _accts_after is not None:
                     break
-                time.sleep(2)
+                _nap(2)
             if _accts_after is not None:
                 _add_owner_accounts(led, _owner,
                                     set(_accts_after) - set(_accts_before))
@@ -5199,14 +5543,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                           "that change until the ledger is repaired by hand.")
         # THE WITHDRAWAL'S OWN BUNDLE NAMED THE ACCOUNT IT SPENT. Gone with
         # the job; the ledger keeps the pair.
-        if bundle:
-            try:
-                if Path(bundle).is_file():
-                    secure_delete_or_warn(Path(bundle),
-                                          "the withdrawal's entry bundle")
-            except Exception:                                # noqa: BLE001
-                integrity_log("wake", "retire_failed:withdraw_bundle")
     _save_handles(artifact_dir, handles, led["owners"])
+    for _rec in _retire_after:
+        _retire_files(_rec)
+    if _spent_pair is not None and bundle:
+        try:
+            if Path(bundle).is_file():
+                secure_delete_or_warn(Path(bundle),
+                                      "the withdrawal's entry bundle")
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", "retire_failed:withdraw_bundle")
     integrity_log("wake", f"job_done:{job}")
     return "done", "done", handle
 
@@ -5644,7 +5990,8 @@ def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
     # stopping at once because the same record would be refused again, and
     # the chain recording which of the three happened.
     _post = poster or post_record
-    _sleep = sleeper or time.sleep
+    # _nap: a backoff of up to a minute must not outlast a stop request.
+    _sleep = sleeper or _nap
     _status = 0
     for _i in range(RESULT_POST_ATTEMPTS):
         try:
@@ -5745,6 +6092,202 @@ def unseal_state_cli(args) -> str:
     return "opened"
 
 
+#: The character classes of systemd's env-file parser (src/basic/env-file.c
+#: and string-util.h). NEWLINE includes a bare carriage return.
+_SD_NEWLINE = "\n\r"
+_SD_WHITESPACE = " \t\n\r"
+_SD_COMMENTS = "#;"
+_SD_NEED_ESCAPE = '"\\`$'
+
+
+def _sd_rejects(text: str) -> bool:
+    """Would systemd refuse the whole file over this key or value? Its
+    push checks every one with utf8_is_valid, which also turns away the
+    Unicode noncharacters (U+FDD0..U+FDEF and anything ending FFFE/FFFF).
+    Measured: `A=x<U+FDD0>` fails load_env_file with EINVAL."""
+    for ch in text:
+        o = ord(ch)
+        if 0xFDD0 <= o <= 0xFDEF or (o & 0xFFFE) == 0xFFFE:
+            return True
+    return False
+
+
+def parse_env_file(text: str) -> dict:
+    """What systemd puts in a unit's environment from this EnvironmentFile.
+
+    A PORT OF systemd's OWN STATE MACHINE (parse_env_file_internal, v255),
+    not a reading of the man page -- because the reading that was here
+    before sealed a DIFFERENT value from the one the unit runs with, and
+    this is the one place in the design where that costs money. It stripped
+    quotes off both ends of a line and did nothing else, so against
+    libsystemd-shared-255's load_env_file, driven through ctypes:
+
+        line                         systemd      was sealed
+        GS_WALLET_PASSWORD="a\\"b"    a"b          a\\"b
+        GS_WALLET_PASSWORD="a\\\\b"   a\\b          a\\\\b
+        GS_WALLET_PASSWORD=a\\ b      "a b"        a\\ b
+        GS_WALLET_PASSWORD=ends"      ends"        ends
+        GS_WALLET_PASSWORD='it''s'    its          it''s
+
+    and it could not see a quoted value spanning two lines, a continuation
+    line, or a bare carriage return, which systemd treats as a newline. A
+    password manager's password with a quote or a backslash in it sealed
+    wrong, the read-back compared the wrong value with itself, and the
+    operator was told to shred the plaintext. The next withdrawal could not
+    open the wallet, and the only correct copy was gone.
+
+    PROVEN AGAINST systemd, not argued. While this was written it was
+    fuzzed against systemd 255's own load_env_file (libsystemd-shared,
+    through ctypes) over 200,000 generated files, with no difference; the
+    answers measured from that function are pinned as data in
+    tests/test_wake_agent.py, so every box runs them, library or not.
+
+    REFUSES, with ValueError naming a LINE and never a value, in the cases
+    where systemd refuses the file or where versions disagree:
+
+      * a NUL byte, or a Unicode noncharacter in a key or a value --
+        load_env_file fails the whole file (EBADMSG, EINVAL), so the unit
+        never started with it and there is no value to be faithful to;
+      * a comment line ending in a backslash. From v254 the next line is
+        read as an assignment; before v254 it was swallowed into the
+        comment. Debian 12 ships 252, so the same file gives the unit a
+        secret on one box and not on another. Which one this box runs is
+        not something to guess about a seed.
+
+    Invalid UTF-8 is the caller's to refuse: this takes text.
+    """
+    if "\x00" in text:
+        _ln = text[:text.index("\x00")].count("\n") + 1
+        raise ValueError(f"line {_ln} holds a NUL byte, which systemd "
+                         f"refuses the whole file for")
+    out = {}
+    state = "PRE_KEY"
+    key, value = [], None
+    last_key_ws = last_value_ws = None
+    line = 1
+
+    def push():
+        k = "".join(key[:last_key_ws] if last_key_ws is not None else key)
+        v = "".join(value or [])
+        if _sd_rejects(k) or _sd_rejects(v):
+            raise ValueError(f"the assignment ending on line {line} holds a "
+                             f"Unicode noncharacter, which systemd refuses "
+                             f"the whole file for")
+        out[k] = v
+
+    for c in text:
+        if state == "PRE_KEY":
+            if c in _SD_COMMENTS:
+                state = "COMMENT"
+            elif c not in _SD_WHITESPACE:
+                state = "KEY"
+                last_key_ws = None
+                key.append(c)
+            elif c in _SD_NEWLINE:
+                line += 1
+        elif state == "KEY":
+            if c in _SD_NEWLINE:
+                state = "PRE_KEY"
+                line += 1
+                key = []
+            elif c == "=":
+                state = "PRE_VALUE"
+                last_value_ws = None
+            else:
+                if c not in _SD_WHITESPACE:
+                    last_key_ws = None
+                elif last_key_ws is None:
+                    last_key_ws = len(key)
+                key.append(c)
+        elif state == "PRE_VALUE":
+            if c in _SD_NEWLINE:
+                push()
+                state = "PRE_KEY"
+                line += 1
+                key, value = [], None
+            elif c == "'":
+                state = "SINGLE_QUOTE_VALUE"
+                value = value if value is not None else []
+            elif c == '"':
+                state = "DOUBLE_QUOTE_VALUE"
+                value = value if value is not None else []
+            elif c == "\\":
+                state = "VALUE_ESCAPE"
+                value = value if value is not None else []
+            elif c not in _SD_WHITESPACE:
+                state = "VALUE"
+                value = value if value is not None else []
+                value.append(c)
+        elif state == "VALUE":
+            if c in _SD_NEWLINE:
+                if last_value_ws is not None:
+                    del value[last_value_ws:]
+                push()
+                state = "PRE_KEY"
+                line += 1
+                key, value = [], None
+            elif c == "\\":
+                state = "VALUE_ESCAPE"
+                last_value_ws = None
+            else:
+                if c not in _SD_WHITESPACE:
+                    last_value_ws = None
+                elif last_value_ws is None:
+                    last_value_ws = len(value)
+                value.append(c)
+        elif state == "VALUE_ESCAPE":
+            state = "VALUE"
+            if c not in _SD_NEWLINE:
+                value.append(c)
+            else:
+                line += 1
+        elif state == "SINGLE_QUOTE_VALUE":
+            if c == "'":
+                state = "PRE_VALUE"
+            else:
+                if c == "\n":
+                    line += 1
+                value.append(c)
+        elif state == "DOUBLE_QUOTE_VALUE":
+            if c == '"':
+                state = "PRE_VALUE"
+            elif c == "\\":
+                state = "DOUBLE_QUOTE_VALUE_ESCAPE"
+            else:
+                if c == "\n":
+                    line += 1
+                value.append(c)
+        elif state == "DOUBLE_QUOTE_VALUE_ESCAPE":
+            state = "DOUBLE_QUOTE_VALUE"
+            if c in _SD_NEED_ESCAPE:
+                value.append(c)
+            elif c != "\n":
+                value.append("\\")
+                value.append(c)
+            else:
+                line += 1
+        elif state == "COMMENT":
+            if c == "\\":
+                state = "COMMENT_ESCAPE"
+            elif c in _SD_NEWLINE:
+                state = "PRE_KEY"
+                line += 1
+        elif state == "COMMENT_ESCAPE":
+            if c in _SD_NEWLINE:
+                raise ValueError(
+                    f"line {line} is a comment ending in a backslash, and "
+                    f"systemd before v254 reads the line after it as more "
+                    f"comment while v254 and later read it as an "
+                    f"assignment. Remove the trailing backslash")
+            state = "COMMENT"
+    if state in ("PRE_VALUE", "VALUE", "VALUE_ESCAPE", "SINGLE_QUOTE_VALUE",
+                 "DOUBLE_QUOTE_VALUE", "DOUBLE_QUOTE_VALUE_ESCAPE"):
+        if state == "VALUE" and last_value_ws is not None:
+            del value[last_value_ws:]
+        push()
+    return out
+
+
 def seal_secrets_cli(args) -> str:
     """--seal-secrets: put the spend secrets behind the pair, by hand.
 
@@ -5774,32 +6317,119 @@ def seal_secrets_cli(args) -> str:
                   f"{proto.STATE_HALF_BYTES * 2} hex characters. Print it "
                   f"with `gs_doorbell state-key` on the Pi.")
         return "bad_half"
+    # THE HALF IS CHECKED AGAINST SOMETHING THE REAL ONE OPENS, before
+    # anything is sealed under it. It was not: the container was sealed
+    # under whatever hex was typed and read back with THE SAME hex, so a
+    # half one character off passed the read-back, the operator was told
+    # to shred the plaintext, and the next wake -- the Pi sending its real
+    # half -- refused secrets_unreadable on every job, with the only copy of
+    # the seed on this disk sealed under a key nobody holds. Driven.
+    #
+    # This machine already holds things sealed under the real half: the
+    # keyfile's own settings on every pairing since stage 8, and the record
+    # store once any job has run. Either one opening is proof; one failing
+    # is a wrong half, a re-pairing, or an altered container -- Poly1305
+    # cannot tell those apart, so the refusal names all three.
+    #
+    # WHAT THIS RESTS ON (AGENTS.md rule 1): the two halves, and nothing
+    # else -- it is the same MAC that guards the containers. It is NOT an
+    # oracle an adversary gains: they have this code and the seized disk,
+    # and can try a candidate half against the same containers directly;
+    # this check tells them nothing that trying would not, and a half is 32
+    # bytes. What it protects is the OPERATOR from their own typo.
+    _checked = ""
+    try:
+        if key.get(KEYFILE_SEALED) is not None:
+            key = open_keyfile(key, vault, pi)
+            _checked = "this machine's sealed settings"
+        else:
+            _store = (Path(key.get("artifact_dir") or ".").resolve()
+                      / SEALED_FILE)
+            if _store.is_file():
+                proto.state_unseal(json.loads(_store.read_text()), vault, pi)
+                _checked = "this machine's sealed records"
+    except (Refused, proto.WakeError, OSError, ValueError, TypeError):
+        agent_say("  [!] That half does not open what this machine has "
+                  "already sealed with the Pi's half: it is mistyped, from "
+                  "another pairing, or what it was checked against has been "
+                  "altered -- there is no telling which from here. Nothing "
+                  "was written and the plaintext is untouched. Print it "
+                  "again with `gs_doorbell state-key` on the Pi.")
+        return "wrong_half"
     src = Path(getattr(args, "secrets_env", "") or SECRETS_ENV_FILE)
     try:
-        lines = src.read_text().splitlines()
+        raw = src.read_bytes()
     except OSError as e:
         agent_say(f"  [!] cannot read {src} ({e.strerror}). That is the "
                   f"EnvironmentFile the unit uses today; point at it with "
                   f"--secrets-env if it is somewhere else.")
         return "no_source"
-    found = {}
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        _n, _, _v = line.partition("=")
-        _n = _n.strip()
-        # THE ALLOW-LIST ON THE WAY IN AS WELL AS OUT. An EnvironmentFile
-        # can hold anything; only the five this machine actually hands to a
-        # child are sealed, so the container cannot become a general-purpose
-        # smuggler for whatever else is in that file.
-        if _n in SECRETS_ALLOWED:
-            found[_n] = _v.strip().strip('"').strip("'")
+    # READ EXACTLY AS systemd READS IT, or not at all. Decoded as strict
+    # UTF-8 here rather than with read_text(), whose codec is the LOCALE's:
+    # under LANG=C that is ASCII, and a password with one accented letter
+    # would either fail or -- with a lenient codec -- seal different bytes.
+    # Neither refusal below repeats the offending bytes: they are part of a
+    # secret, and this prints to a terminal.
+    try:
+        env = parse_env_file(raw.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        _ln = raw[:e.start].count(b"\n") + 1
+        agent_say(f"  [!] line {_ln} of {src} is not valid UTF-8, and "
+                  f"systemd refuses such a file too. Nothing was written.")
+        return "unparseable"
+    except ValueError as e:
+        agent_say(f"  [!] {src} cannot be read the way systemd reads it: "
+                  f"{e}. Nothing was written, and the file is untouched.")
+        return "unparseable"
+    # THE ALLOW-LIST ON THE WAY IN AS WELL AS OUT. An EnvironmentFile can
+    # hold anything; only the five this machine actually hands to a child
+    # are sealed, so the container cannot become a general-purpose smuggler
+    # for whatever else is in that file.
+    found = {_n: _v for _n, _v in env.items() if _n in SECRETS_ALLOWED}
     if not found:
         agent_say(f"  [!] {src} names none of the spend secrets "
                   f"({', '.join(SECRETS_ALLOWED)}). Nothing was written.")
         return "nothing_to_seal"
+    # THE SEED IS PROVEN BEFORE ANYBODY IS TOLD TO SHRED IT. The advice
+    # below ends in `shred -u`, and a deposit already refuses a seed that
+    # does not derive this pair's xpub (btc_seed_xpub_mismatch) -- so a
+    # wrong seed sealed here costs nothing at once and everything later,
+    # when the plaintext that might have shown the mistake is gone. Checked
+    # the way _prove_btc_seed checks it, offline, from the values about to
+    # be sealed; the account key is derived and dropped.
+    _seed = ""
+    if "GS_BTC_SEED" in found and key.get("btc_account_xpub"):
+        _acct = None
+        try:
+            import gs_btc_tx as _btx
+            try:
+                _acct = _btx.account_from_mnemonic(
+                    found["GS_BTC_SEED"],
+                    str(key.get("btc_network") or "main"),
+                    found.get("GS_BTC_SEED_PASSPHRASE", ""),
+                    account=_btc_setting(key, "btc_account", 0, 0,
+                                         2 ** 31 - 1))
+                _ok = _btx.account_matches_xpub(
+                    _acct, str(key["btc_account_xpub"]))
+            except _btx.BtcTxError:
+                _ok = False
+        except Exception as e:                               # noqa: BLE001
+            _ok = None
+            _seed = f"NOT checked ({type(e).__name__})"
+        finally:
+            del _acct
+        if _ok is False:
+            agent_say(f"  [!] GS_BTC_SEED in {src}, with the passphrase "
+                      f"beside it, is not a valid mnemonic or does not "
+                      f"derive the account xpub this pair watches. A "
+                      f"deposit already refuses this seed; sealing it "
+                      f"would only end in advice to shred the one copy "
+                      f"you could still check. Nothing was written.")
+            return "seed_mismatch"
+        if _ok:
+            _seed = "proven: it derives this pair's account xpub"
     out = Path(getattr(args, "secrets_file", "") or SECRETS_FILE)
+    tmp = out.with_name(out.name + ".new")
     try:
         container = proto.state_seal(
             {proto.SECRETS_MEMBER: json.dumps(found, sort_keys=True)},
@@ -5810,7 +6440,6 @@ def seal_secrets_cli(args) -> str:
                                   schema=proto.SECRETS_SCHEMA)
         if json.loads(back[proto.SECRETS_MEMBER]) != found:
             raise ValueError("the sealed copy does not read back")
-        tmp = out.with_name(out.name + ".new")
         _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
         with os.fdopen(_fd, "w") as fh:
             json.dump(container, fh, sort_keys=True)
@@ -5818,21 +6447,71 @@ def seal_secrets_cli(args) -> str:
             os.fsync(fh.fileno())
         os.replace(str(tmp), str(out))
     except Exception as e:                                   # noqa: BLE001
-        agent_say(f"  [!] the spend secrets could not be sealed ({e}). "
-                  f"Nothing was written and {src} is untouched.")
+        # "NOTHING WAS WRITTEN" HAS TO BE TRUE. A write that failed part
+        # way left the .new file behind, and the sentence below said
+        # otherwise.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        agent_say(f"  [!] the spend secrets could not be sealed "
+                  f"({type(e).__name__}). Nothing was written and {src} is "
+                  f"untouched.")
         return "seal_failed"
     print()
     print(f"  {len(found)} secret(s) sealed into {out} (0400):")
     for _n in sorted(found):
         print(f"      {_n}")
     print()
-    print("  They now open only with this pair. The plaintext is STILL")
-    print(f"  there and this tool will not destroy it -- check the seal")
-    print("  works with a real job first, then, when you are sure:")
+    print("  They now open only with this pair. The Pi's half was checked "
+          "against")
+    print(f"  {_checked}." if _checked else
+          "  NOTHING: this machine has nothing sealed yet to check it "
+          "against,\n  so a mistyped half would only show at the next wake.")
+    print()
+    # WHICH JOB PROVES WHICH SECRET. "Check the seal works with a real job
+    # first" was the whole instruction, and the job an operator reaches for
+    # first -- a deposit -- touches the seed and nothing else. A spend
+    # password sealed wrong would pass that check and surface at the first
+    # withdrawal, after the shred. So the list says what each one needs.
+    _proves = {
+        "GS_BTC_SEED": _seed or "a deposit (it is proven against the xpub "
+                                "before an address is issued)",
+        "GS_BTC_SEED_PASSPHRASE": "proven with the seed" if _seed.startswith(
+            "proven") else "a deposit, with the seed",
+        "GS_WALLET_PASSWORD": "only a WITHDRAWAL opens the spend wallet",
+        "GS_FEE_WALLET_PASSWORD": "only a FEE SWEEP opens the fee wallet",
+        "GS_SWAPKIT_API_KEY": "a forward that asks the aggregator for a "
+                              "quote",
+    }
+    print("  The plaintext is STILL there and this tool will not destroy it.")
+    print("  Before you shred it, each sealed secret needs the job that")
+    print("  actually uses it to have run once from the seal:")
+    print()
+    for _n in sorted(found):
+        print(f"      {_n}: {_proves.get(_n, 'a job that uses it')}")
+    print()
+    print("  and then:")
     print()
     print(f"      shred -u {src}")
     print("      # and remove the EnvironmentFile= line from the unit")
     print()
+    # THE IDLE-BOOT SWEEP CANNOT OPEN THIS. It runs on a boot nothing woke,
+    # so no half arrives; it will say so and stand down. Said here, while
+    # the operator is present, rather than only in a job log they may not
+    # read -- the pairing refuses the flag for a sealed keyfile for the
+    # same reason, and this is the step that makes an unsealed one sealed.
+    try:
+        _fc = fee_sweep_config(key) if "GS_FEE_WALLET_PASSWORD" in found \
+            else None
+    except Exception:                                        # noqa: BLE001
+        _fc = None
+    if _fc and _fc.get("on_idle_boot"):
+        print("  THE IDLE-BOOT FEE SWEEP WILL STOP RUNNING. It runs on a boot")
+        print("  nothing woke, so no half arrives to open the fee wallet's")
+        print("  password. Run it by hand instead:")
+        print("      gs_wake_agent --fee-sweep --unseal-state <hex>")
+        print()
     print("  KEEP THE SEED SOMEWHERE ELSE TOO. This seals the copy on this")
     print("  disk; it is not a backup. A re-pairing changes the Pi's half")
     print("  and this file stops opening.")
@@ -5943,18 +6622,36 @@ def main(argv=None) -> int:
     _keep_on = False
     try:
         try:
-            if getattr(args, "unseal_state", ""):
+            # THE THREE HAND COMMANDS NEVER POWER THE MACHINE OFF, and the
+            # flag that says so is set BEFORE each one runs, not after it
+            # returns. It was after, which kept the promise only for the
+            # paths that returned: load_key and state_halves sit above each
+            # command's own try, so a keyfile with a malformed half raised
+            # Refused straight past it, and the finally below powered the
+            # box off under the operator standing at it, mid-recovery.
+            # Driven, before this fix: --unseal-state and --seal-secrets
+            # both called power_off on a keyfile whose state_half is not
+            # hex. Set first, the promise holds for a refusal and a crash.
+            # --unseal-state IS TWO THINGS: a command of its own, and the
+            # half that --fee-sweep takes on a sealed box. With --fee-sweep
+            # beside it, it is the second. This branch used to win whenever
+            # the flag was present, so the exact command every refusal and
+            # OPSEC_SETUP.md name for a sealed box's sweep -- `--fee-sweep
+            # --unseal-state <hex>` -- never swept anything: it wrote every
+            # sealed record out in plaintext and stopped. Driven.
+            if getattr(args, "unseal_state", "") \
+                    and not getattr(args, "fee_sweep", False):
                 # NOTHING ELSE RUNS ON THIS PATH, and it never powers the
                 # machine off: the operator is standing here, with the
                 # records open in front of them, which is the whole point.
-                code = unseal_state_cli(args)
                 _keep_on = True
+                code = unseal_state_cli(args)
                 return 0 if code == "opened" else 1
             if getattr(args, "seal_secrets", ""):
                 # SETUP, not recovery, but the same posture: the operator is
                 # at the machine, nothing is woken and nothing powers off.
-                code = seal_secrets_cli(args)
                 _keep_on = True
+                code = seal_secrets_cli(args)
                 return 0 if code == "sealed" else 1
             if getattr(args, "unseal_key", ""):
                 # SAME PATH, SAME REASON as --unseal-state above: the
@@ -5962,8 +6659,8 @@ def main(argv=None) -> int:
                 # powered off. Ordered after it so that passing both
                 # opens the records first, which is the one somebody in
                 # a hurry actually needs.
-                code = unseal_key_cli(args)
                 _keep_on = True
+                code = unseal_key_cli(args)
                 return 0 if code == "opened" else 1
             if getattr(args, "fee_sweep", False):
                 code = run_fee_sweep_cli(args)
@@ -5986,6 +6683,15 @@ def main(argv=None) -> int:
                 _keep_on = True
                 disarm_deadman()
                 return 0
+            return 1
+        except Stopping as e:
+            # systemd is taking the unit down (the deadman, a timeout, a
+            # `systemctl stop`). The child has been stopped and the records
+            # sealed; the finally below does the rest and powers off.
+            code = "stopped"
+            agent_say(f"  [!] Stopped mid-job ({e}). The records are "
+                      f"sealed; the job did not finish.")
+            integrity_log("wake", "stopped")
             return 1
         except proto.WakeError as e:
             code = "bad_note"
@@ -6021,27 +6727,7 @@ def main(argv=None) -> int:
         # shred whose ciphertext never landed is a client's money with no
         # bookkeeping. state_close returns -1 rather than raising, and
         # says so.
-        if _STATE_KEY.get("vault") is not None:
-            try:
-                _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],
-                                      _STATE_KEY["pi"])
-                if _sealed < 0:
-                    agent_say("  [!] THE RECORDS COULD NOT BE SEALED and are "
-                              "still readable on this disk. Nothing was "
-                              "destroyed. Look at the artifact directory "
-                              "before the next wake.")
-                    integrity_log("wake", "state_unsealed_fail")
-                else:
-                    integrity_log("wake", "state_sealed")
-            except Exception:                                # noqa: BLE001
-                # Bookkeeping must never be what keeps the box on, and a
-                # failure here has already left the plaintext in place.
-                try:
-                    integrity_log("wake", "state_unsealed_fail")
-                except Exception:                            # noqa: BLE001
-                    pass
-            finally:
-                _STATE_KEY.clear()
+        _seal_state_now()
         # THE SECRETS GO FROM RAM HERE, on every path out. The machine is
         # about to power off, which clears them anyway -- but --dry-run,
         # --fee-sweep and a refusal that keeps the box on all return through
@@ -6049,6 +6735,7 @@ def main(argv=None) -> int:
         # module dict in a process that keeps running is a seed one bug away
         # from a log line.
         _SECRETS.clear()
+        _SECRETS_FROM[0] = None
         retire_job_log(code, args.dry_run)
         # EVERY path, including SystemExit from gs_common's own fail-closed
         # aborts, and including an unhandled exception.

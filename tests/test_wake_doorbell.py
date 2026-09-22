@@ -1304,6 +1304,11 @@ check("state-key: ...and says the other half is the vault's, so nobody "
       "vault's own half" in _sk_txt)
 check("state-key: ...and warns that a re-pairing orphans the store",
       "re-pairing" in _sk_txt)
+check("state-key: ...and names the OTHER hand commands that take the same "
+      "half -- sealing the spend secrets is a setup step every sealed box "
+      "needs once, and this output named only the recovery one",
+      "--seal-secrets" in _sk_txt and "--unseal-key" in _sk_txt
+      and "--fee-sweep --unseal-state" in _sk_txt)
 # IT IS A SUBCOMMAND OF THE SAME CLI, and it reads a sealed keyfile like every
 # other read: no unsealed shortcut for the recovery path.
 check("state-key: the subcommand parses with the keyfile default",
