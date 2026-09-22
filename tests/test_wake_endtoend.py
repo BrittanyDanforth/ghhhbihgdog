@@ -263,7 +263,27 @@ def cycle(job, params, bay, info_out=None, key_extra=None, env=None,
         for _k in (env or {}):
             os.environ.pop(_k, None)
     t.join(timeout=30)
+    # EVERY CYCLE IS A FRESH PAIRING INTO THE SAME BAY, and a clean run
+    # seals the records before it reports back. The next pairing's halves
+    # cannot open that container, so the cycle ends the way an operator
+    # re-pairing has to: open the records with THIS pairing's half, which
+    # also retires the container. Between cycles they are plaintext, which
+    # is what the hand edits below read and write.
+    unseal_bay(bay, kf, pi)
     return pending.get("p"), out, err, ran, buf.getvalue()
+
+
+def unseal_bay(bay, kf, pi):
+    """--unseal-state with the Pi half of the pairing that sealed `bay`."""
+    if not (Path(bay) / "state.sealed").exists():
+        return None
+    with contextlib.redirect_stdout(io.StringIO()) as _ub:
+        rc = A.unseal_state_cli(types.SimpleNamespace(
+            key=str(kf),
+            unseal_state=P.derive_state_half(pi["secret"]).hex()))
+    assert rc == "opened", (rc, _ub.getvalue())
+    assert not (Path(bay) / "state.sealed").exists(), _ub.getvalue()
+    return rc
 
 
 _cwd0 = os.getcwd()
@@ -281,6 +301,12 @@ try:
                                         {"amount_sat": 5000000,
                                          "owner": "0123456789abcdef"}, _bay,
                                         info_out=_cinfo)
+    # What the vault holds after this one job, listed NOW: the queue-depth
+    # block below marks this deposit paid out by hand, and the next wake
+    # retires a paid-out record's files -- as it must -- so a listing taken
+    # there would be about that, not about what crossed to the Pi.
+    _bay_files_c1 = " ".join(sorted(os.path.basename(f)
+                                    for f in os.listdir(_bay)))
     check("the two boxes showed the SAME pairing code, and it is the one the "
           "operator compares",
           _cinfo.get("pi_sas") and _cinfo["pi_sas"] in _cinfo["vault_stdout"])
@@ -728,6 +754,9 @@ try:
             o2b, e2b = None, e
     _clk[0] = 10.0 ** 9          # release the doorbell's result window
     t2.join(timeout=30)
+    # The first boot sealed the records under this pairing; the second never
+    # got a note, so never opened them. Open them as the cycles do.
+    unseal_bay(_bay, kf2, pi2)
     check("the first boot gets the job and finishes it", o2a and o2a[1] == "done")
     check("...even though its result never arrived: an undeliverable M3 is not "
           "a failed job, and the job either happened or did not",
@@ -748,10 +777,11 @@ try:
           and "never reported back" in _e2.getvalue())
 
     print("\n== nothing readable crosses to the Pi ==")
-    _bay_files = " ".join(sorted(os.path.basename(f)
-                                 for f in os.listdir(_bay)))
     check("the bundles and the slip stayed on the VAULT",
-          "wallet_e2e_1.json" in _bay_files)
+          "wallet_e2e_1.json" in _bay_files_c1)
+    check("...and the next wake retired them once the deposit was paid out, "
+          "rather than keeping a who-sent-what line for a closed job",
+          "wallet_e2e_1.json" not in " ".join(os.listdir(_bay)))
     _report = io.StringIO()
     with contextlib.redirect_stdout(_report):
         DB.report(p1)
@@ -820,6 +850,42 @@ try:
           "matching half, and replacing this one silently breaks the pair in "
           "a way that looks exactly like a dead switch",
           _r.returncode != 0 and "already exists" in _r.stdout + _r.stderr)
+
+    # A RE-PAIRING OVER A SEALED STORE. Both halves of the state key are
+    # minted afresh by a pairing, so the old container never opens again;
+    # STAGE7_PLAN said the pairing "says so before it writes anything", and
+    # it paired, and every wake after it refused state_unreadable.
+    _sd = Path(tempfile.mkdtemp(prefix="wake_sealedbay_"))
+    (_sd / "state.sealed").write_text("{}")
+    _so = tempfile.mkdtemp(prefix="wake_sealedout_")
+    _r = subprocess.run(
+        [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+         "--out", _so, "--bind", "127.0.0.1", "--pair-port", str(free_port()),
+         "--artifact-dir", str(_sd)],
+        capture_output=True, text=True, timeout=60, cwd=_so, input="")
+    _rt = _r.stdout + _r.stderr
+    check("refuses to pair over a SEALED STORE the new pair could never "
+          "open, and names the way through: --unseal-state under the pair "
+          "that sealed it",
+          _r.returncode != 0 and "state_unreadable" in _rt
+          and "--unseal-state" in _rt and str(_sd / "state.sealed") in _rt)
+    check("...before it opens a socket, with nothing written",
+          "Waiting up to" not in _rt and os.listdir(_so) == []
+          and os.listdir(_sd) == ["state.sealed"])
+    _keysm = load("gs_wake_keys")
+    _sfile = Path(tempfile.mkdtemp(prefix="wake_sealedsec_")) / "spend.sealed"
+    _no_sec = _keysm.sealed_left_behind(str(_so), "k", str(_sfile))
+    _sfile.write_text("{}")
+    _with_sec = _keysm.sealed_left_behind(str(_so), "k", str(_sfile))
+    check("...the same for sealed SPEND SECRETS, which nothing opens by "
+          "hand: the operator is told to have the plaintext ready and to "
+          "--seal-secrets again after -- and a box with neither is not "
+          "refused",
+          _no_sec == "" and "--seal-secrets" in _with_sec
+          and str(_sfile) in _with_sec)
+    check("...and the names it looks for are the ones the agent writes",
+          _keysm.SEALED_STORE_NAME == A.SEALED_FILE
+          and _keysm.SECRETS_FILE_DEFAULT == A.SECRETS_FILE)
 
 
     print("\n== the MAC is detected, never typed ==")

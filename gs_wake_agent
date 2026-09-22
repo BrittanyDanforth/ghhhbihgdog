@@ -1021,8 +1021,13 @@ def state_open(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
             "boxes were re-paired since they were written -- the Pi's half "
             "of the key changes with its secret -- or the file has been "
             "altered. Nothing is run against a ledger that cannot be read. "
-            "To open it by hand: `gs_doorbell state-key` on the Pi, then "
-            "`gs_wake_agent --unseal-state <hex>` here.")
+            "To open it by hand, with BOTH halves it was sealed under: "
+            "`gs_wake_agent --unseal-state <hex> --key <keyfile>` here, "
+            "where the hex is `gs_doorbell state-key` on the Pi that sealed "
+            "them and the keyfile is the one that pairing wrote. After a "
+            "re-pairing both changed: the OLD keyfile you moved aside, and "
+            "the old half from the copy beside the LUKS USB. That also "
+            "retires the old container, so the new pair can seal them.")
     # A MEMBER ALREADY ON DISK IS A RUN THAT DIED, not something to
     # overwrite: it is newer than the seal. Left where it is, and rolled
     # into the next seal with the rest.
@@ -6284,9 +6289,34 @@ def unseal_state_cli(args) -> str:
     except Refused as e:
         agent_say(f"  [!] {e.msg}")
         return e.code
+    # THE OLD CONTAINER IS RETIRED once every record is on the disk, and
+    # that is what makes this the way through a RE-PAIRING. Left in place,
+    # the next wake -- under a new pair, whose halves cannot open it --
+    # refused state_unreadable, and named this command as the cure, for
+    # ever: the refusal's own recovery instruction did not recover. The
+    # records are complete on the disk now (state_open wrote every member
+    # it did not find there), so the container holds nothing they do not,
+    # and the next wake seals them again under whichever pair wakes it.
+    #
+    # THE ANSWER IS CHECKED, not assumed: secure_delete_or_warn says False
+    # rather than raising, and a container left behind is a pairing that
+    # refuses and a wake that refuses, so this does not report "opened".
+    _old = artifact_dir / SEALED_FILE
+    try:
+        _gone = secure_delete_or_warn(_old, "the retired sealed records")
+    except Exception:                                        # noqa: BLE001
+        _gone = False
+    if not _gone:
+        agent_say(f"  [!] {n} record(s) are written out in the clear at "
+                  f"{artifact_dir}, but {_old} could not be removed. A new "
+                  f"pairing refuses, and every wake under one refuses "
+                  f"state_unreadable, until it is: what it held is on the "
+                  f"disk now, so shred it by hand.")
+        return "not_retired"
     agent_say(f"  [+] {n} record(s) written out in the clear at "
-              f"{artifact_dir}. They are sealed again by the next wake; "
-              f"run paranoia_mode instead if this box is finished with.")
+              f"{artifact_dir}. The old container is retired; the next "
+              f"wake seals them again, under this pairing or a new one. "
+              f"Run paranoia_mode instead if this box is finished with.")
     return "opened"
 
 

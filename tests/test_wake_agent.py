@@ -6909,6 +6909,46 @@ check("sealed: ...and NOT the fee sweep's entry bundle, the inhibit mark or "
 _rd, _rkf, _rkey, _rbell = _sealed_env()
 _ro, _re, _rt, _ = _sealed_run(_rd, _rkf, _rbell)
 _r_pi = P.derive_state_half(PI.encode().hex()).hex()
+# The two refusals first: a good half now RETIRES the container, so after it
+# there would be nothing left for a wrong one to fail to open.
+_rbuf2 = io.StringIO()
+with contextlib.redirect_stdout(_rbuf2):
+    _rbad = A.unseal_state_cli(types.SimpleNamespace(
+        key=str(_rkf), unseal_state="00" * 32))
+check("--unseal-state: the WRONG half opens nothing and says which two "
+      "things it could be", _rbad == "state_unreadable")
+check("...and leaves the container exactly where it was",
+      (_rd / "state.sealed").is_file()
+      and not (_rd / "gs_wake_handles.json").exists())
+with contextlib.redirect_stdout(io.StringIO()):
+    _rjunk = A.unseal_state_cli(types.SimpleNamespace(
+        key=str(_rkf), unseal_state="nothex"))
+check("...and a half that is not 32 bytes of hex is named as that, not "
+      "tried", _rjunk == "bad_half")
+# THE ONE PATH THROUGH A RE-PAIRING. The next pairing's halves cannot open
+# this container, so if --unseal-state wrote the records out and left it,
+# every wake after a re-pairing refused state_unreadable -- and named this
+# very command as the cure, which cured nothing. It retires the container.
+# First with a shred that fails: that is not "opened".
+_sdw_r = A.secure_delete_or_warn
+A.secure_delete_or_warn = lambda p, what: False
+_rbuf3 = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_rbuf3):
+        _rkept = A.unseal_state_cli(types.SimpleNamespace(
+            key=str(_rkf), unseal_state=_r_pi))
+finally:
+    A.secure_delete_or_warn = _sdw_r
+check("--unseal-state whose container will not shred does NOT say 'opened' "
+      "(the exit status is not 0): the records are out, and the operator "
+      "is told a new pairing refuses until the container is gone",
+      _rkept == "not_retired"
+      and (_rd / "gs_wake_handles.json").is_file()
+      and "shred it by hand" in _rbuf3.getvalue())
+for _rn in list(_rd.iterdir()):
+    if _rn.name != "state.sealed" and _rn.is_file() \
+            and _rn.name in A._sealed_members(_rd):
+        _rn.unlink()
 _rbuf = io.StringIO()
 with contextlib.redirect_stdout(_rbuf):
     _rcode = A.unseal_state_cli(types.SimpleNamespace(
@@ -6917,17 +6957,13 @@ check("--unseal-state with the Pi's half writes the records back out in "
       "the clear, at the machine, with no doorbell and no power-off",
       _rcode == "opened"
       and (_rd / "gs_wake_handles.json").is_file())
-_rbuf2 = io.StringIO()
-with contextlib.redirect_stdout(_rbuf2):
-    _rbad = A.unseal_state_cli(types.SimpleNamespace(
-        key=str(_rkf), unseal_state="00" * 32))
-check("...the WRONG half opens nothing and says which two things it could "
-      "be", _rbad == "state_unreadable")
-with contextlib.redirect_stdout(io.StringIO()):
-    _rjunk = A.unseal_state_cli(types.SimpleNamespace(
-        key=str(_rkf), unseal_state="nothex"))
-check("...and a half that is not 32 bytes of hex is named as that, not "
-      "tried", _rjunk == "bad_half")
+check("...and RETIRES the container, so a re-pairing is not left with one "
+      "it can never open",
+      not (_rd / "state.sealed").exists())
+A._STATE_KEY.clear()
+check("...so the first wake under a NEW pair (other halves) opens nothing "
+      "and refuses nothing, and seals what it finds",
+      A.state_open(_rd, bytes(range(32)), bytes(range(1, 33))) == 0)
 # AN INSTALL FROM BEFORE THIS STAGE IS UNTOUCHED.
 _nd, _nkf, _nkey, _nbell = new_env()
 _no, _ne, _nt, _ndp = _sealed_run(_nd, _nkf, _nbell)

@@ -121,6 +121,12 @@ PAIR_PORT = 8769
 #: creates at every start and which sits outside every wipe root and
 #: outside the artifact dir. Tests pin the two names together.
 MARK_DIR_DEFAULT = "/var/lib/ghostspiral-marks"
+#: What the agent seals under the pair, by the names it reads them from:
+#: its SEALED_FILE, inside the artifact dir, and its SECRETS_FILE, which is
+#: the default the unit's ExecStart leaves in force. Tests pin the names
+#: together.
+SEALED_STORE_NAME = "state.sealed"
+SECRETS_FILE_DEFAULT = "/etc/gs-wake-spend.sealed"
 
 _SIOCGIFADDR = 0x8915
 _SIOCGIFHWADDR = 0x8927
@@ -1028,12 +1034,67 @@ def _validate(args) -> None:
                  f"and ProtectSystem=strict mounts read-only. Give an "
                  f"absolute path the unit may write ({MARK_DIR_DEFAULT} is "
                  f"its StateDirectory=).")
+    _left = sealed_left_behind(args.artifact_dir,
+                               os.path.join(args.out, THINKPAD_FILE))
+    if _left:
+        sys.exit(_left)
     if args.mac and not MAC_RE.match(args.mac):
         sys.exit(f"[!] --mac {args.mac!r} is not a MAC address.")
     if args.broadcast and not is_ipv4(args.broadcast):
         sys.exit(f"[!] --broadcast {args.broadcast!r} is not an IPv4 address.")
     if args.bind and not is_ipv4(args.bind):
         sys.exit(f"[!] --bind {args.bind!r} is not an IPv4 address.")
+
+
+def sealed_left_behind(artifact_dir, keyfile,
+                       secrets_file=SECRETS_FILE_DEFAULT):
+    """The refusal for a pairing over what the CURRENT pair sealed, or "".
+
+    A pairing mints both halves of the state key afresh -- the vault's at
+    random, the Pi's from its new secret -- so whatever the old pair sealed
+    never opens again. STAGE7_PLAN.md said this tool "says so before it
+    writes anything", and it did not: it paired, and every wake after that
+    refused state_unreadable (or secrets_unreadable), with open deposits in
+    the orphaned store that nobody could pay out.
+
+    NOT A DEFENCE, and it rests on nothing: anyone at this machine can move
+    the files aside. It is here for the operator, at the one moment they
+    are standing at both boxes with the old half still printable."""
+    lines = []
+    store = Path(artifact_dir) / SEALED_STORE_NAME
+    if store.exists():
+        lines += [
+            f"[!] {store} holds this box's records, sealed under the pair",
+            f"    it has now. A new pairing changes both halves of that key,",
+            f"    so they would never open again and every wake would refuse",
+            f"    state_unreadable -- with any open deposit in them unpaid.",
+            f"    Open them first, under the pair that sealed them:",
+            f"        gs_doorbell state-key --key /etc/gs_wake_pi.key"
+            f"   # on the Pi,",
+            f"            # or the hex you wrote beside the LUKS USB",
+            f"        gs_wake_agent --unseal-state <hex> --key {keyfile}",
+            f"            # the keyfile that pairing wrote, wherever it is now",
+            f"    That writes them out in the clear and retires the "
+            f"container;",
+            f"    the next wake seals them again under the new pair. If that",
+            f"    half is gone for good, so are these records: shred {store}",
+            f"    knowing that, and pair.",
+        ]
+    secrets = Path(secrets_file)
+    if secrets.exists():
+        lines += [
+            f"[!] {secrets} holds this box's spend secrets, sealed under the",
+            f"    pair it has now. A new pairing orphans it, and nothing opens",
+            f"    it by hand -- it is the seed -- so after pairing you seal",
+            f"    them again from the plaintext. Have the seed words, any",
+            f"    passphrase, the wallet passwords and the aggregator key in",
+            f"    hand, then move it aside, pair, run `gs_wake_agent",
+            f"    --seal-secrets <new hex>`, and shred the old file once a",
+            f"    job has run from the new one.",
+        ]
+    if not lines:
+        return ""
+    return "\n".join(lines + ["    Nothing was written, on either box."])
 
 
 #: How many connections that never speak the protocol we sit through before

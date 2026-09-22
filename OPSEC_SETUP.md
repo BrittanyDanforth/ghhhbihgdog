@@ -102,10 +102,18 @@ Two things follow that you have to actually do:
   says so, rather than starting on an empty ledger and re-issuing an
   address somebody has already paid. A pairing made before this stage keeps
   running unsealed; nothing turns on quietly, in either direction.
-* **A re-pairing orphans the store.** The Pi's half comes from the Pi's
-  secret, so `gs_doorbell pair` again — or a fresh SD card — changes it, and
-  the records written under the old one no longer open. Empty the vault's
-  artifact directory of open deposits *before* re-pairing, not after.
+* **A re-pairing would orphan the store, so the pairing refuses first.** A
+  pairing mints both halves afresh — the vault's at random, the Pi's from
+  its new secret — so `gs_doorbell pair` again, or a fresh SD card, makes
+  the old records unopenable. `gs_wake_keys pair` therefore refuses while
+  `state.sealed` is in the artifact directory, before it opens a socket,
+  and tells you to open it first with the two commands below, *under the
+  pair that sealed it* (the old keyfile, and the old half — from the old Pi,
+  or the hex you wrote beside the LUKS USB). That writes the records out and
+  retires the container; the first wake under the new pair seals them again.
+  It refuses the same way while `/etc/gs-wake-spend.sealed` is there: that
+  one nothing opens by hand, so have the plaintext secrets in hand, move it
+  aside, pair, and `--seal-secrets` again.
 
 **If the Pi dies and a deposit still has to be paid out**, you do not lose
 the records; you go and get the half by hand. Write these two beside the
@@ -121,8 +129,11 @@ gs_wake_agent --unseal-state <hex> --key /etc/gs_wake_thinkpad.key
 
 The second one writes the records back out in the clear and leaves them
 there — it is the "I am standing at the machine" path, so it does not wake
-anything, does not power anything off, and does not re-seal. The next
-normal wake seals them again.
+anything, does not power anything off, and does not re-seal. It *does*
+retire the old container once every record is on the disk, so a re-pairing
+after it is not left holding one it can never open; if the container will
+not shred it says so and exits non-zero. The next normal wake seals the
+records again, under whichever pair wakes it.
 
 If the *card* is what died, the store is gone. That is the design: a half
 you could recover from the vault would be a half the vault's captor has.

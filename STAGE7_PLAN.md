@@ -145,8 +145,14 @@ documented beside the LUKS USB in §1:
     gs_wake_agent --unseal-state <hex> --key ...      # opens the store, by hand, at the machine
 
 **A re-pairing makes an existing store unreadable**, because `pi_secret`
-changes. The pairing says so before it writes anything, and the door-coming-
-in wipe recipe already shreds the store with the rest.
+changes (and the vault's half is drawn afresh). ~~The pairing says so before
+it writes anything~~ — it did not, and it paired, and every wake after that
+refused `state_unreadable` while `--unseal-state` wrote the records out and
+left the container behind, so the refusal's own cure cured nothing. Now the
+pairing REFUSES while `state.sealed` (or the sealed spend secrets) is there,
+before it opens a socket, and `--unseal-state` retires the container once the
+records are out. The door-coming-in wipe recipe already shreds the store with
+the rest.
 
 ## 6. Compatibility: additive, and it turns on at the next pairing
 
