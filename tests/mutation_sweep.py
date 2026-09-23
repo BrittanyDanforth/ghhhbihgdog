@@ -5389,6 +5389,17 @@ MUTATIONS = [
   '                         STATUS_SHORT if hopeless else STATUS_DELAYED)',
   '                         STATUS_DELAYED)',
   ['test_btc_forwarder']),
+ ('short or delayed is decided on the look\'s total, dust and our own '
+  'spent inputs counted', 'btc_forwarder',
+  '            hopeless = sum(u["value"] for u in _cheapest) \\\n',
+  '            hopeless = picture["settled_sat"] \\\n',
+  ['test_btc_forwarder']),
+ ('short or delayed counts the inputs a listed forward of ours spent',
+  'btc_forwarder',
+  '                                            args.feerate_floor,\n'
+  '                                            exclude=exclude)',
+  '                                            args.feerate_floor)',
+  ['test_btc_forwarder']),
  ('an emptied address is never read for our own forward', 'btc_forwarder',
   '            if found is not None:\n                return found',
   '            if False:\n                return found',

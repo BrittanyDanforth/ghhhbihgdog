@@ -1047,6 +1047,26 @@ for _why, _net, _kind in (
     check(f"{_why}: refused {_kind} and the status word is 'short'",
           _c == F.EXIT_REFUSED and ("forward", f"refused:{_kind}") in _net.kinds
           and _p is None and _status_of(_of) == "short")
+# THE WORD IS DECIDED ON THE MONEY A FORWARD WOULD SPEND, not the look's
+# total. Two hundred 546 sat outputs sum to 109,200 -- far over the
+# one-input floor -- but with a 5 sat/vB floor each is dust even at the
+# cheapest rate this box pays (2 * 69 * 5 = 690), so no forward at any
+# rate this pair allows spends one. The sum said `delayed`: "nothing to
+# do" on the phone and a wake per retry, for ever.
+_nDs = Net(utxos=_storm)
+_c, _o, _p, _of = run(_nDs, "--feerate-floor", "5")
+check("dust at every rate this pair allows, however much of it: refused "
+      "nothing_economic and the status word is 'short', not 'delayed'",
+      _c == F.EXIT_REFUSED
+      and ("forward", "refused:nothing_economic") in _nDs.kinds
+      and _p is None and _status_of(_of) == "short")
+_nDd = Net(utxos=_storm)
+_c, _o, _p, _of = run(_nDd, "--feerate-floor", "1")
+check("NON-VACUITY: the same outputs with a 1 sat/vB floor are not dust at "
+      "that rate (138) and carry a forward there: 'delayed'",
+      _c == F.EXIT_REFUSED
+      and ("forward", "refused:nothing_economic") in _nDd.kinds
+      and _status_of(_of) == "delayed")
 _nm = Net(memo="=:XMR.XMR:" + _OTHER + ":0/1/0")
 _c, _o, _p, _of = run(_nm)
 check("a refusal that is not about the fee (memo_unbound) writes NO status "
@@ -1401,6 +1421,34 @@ check("RETURNED, not settled: refused returned_unsettled with the status "
       and _n7.submits == [] and _n7.posts == []
       and ("forward", "refused:returned_unsettled") in _n7.kinds
       and len(F._plan_chain(_of7)) == 1 and _p["seen"] is True)
+# (f2) listed IN THE MEMPOOL, and the server still lists the input it
+# spends as unspent -- the case `exclude` exists for. What came back is
+# 5,000 sat: under the one-input floor even at 1 sat/vB, so it is `short`
+# exactly as it is on an address holding nothing else. The look's total
+# (205,000) counted the forward's own input and said `delayed`.
+_p7b, _of7b, _hx7b = _first_send()
+_IN_STILL = {"tx_hash": _H1, "vout": 0, "value": 200000, "confirmations": 5}
+_n7b = Net(utxos=[_IN_STILL, {"tx_hash": _H2, "vout": 0, "value": 5000,
+                              "confirmations": 5}],
+           spends=[_listed(_p7b, _hx7b, height=0)], submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_n7b, _of7b)
+check("RETURNED, too small to send on, beside the listed forward's own input "
+      "still shown unspent: refused, nothing sent, and the status word is "
+      "'short' -- the excluded input is not money this forward carries",
+      _c == F.EXIT_REFUSED and ("forward", "reconcile_returned") in _n7b.kinds
+      and ("forward", "refused:fee_eats_deposit") in _n7b.kinds
+      and _n7b.submits == [] and _status_of(_of7b) == "short")
+_p7c, _of7c, _hx7c = _first_send()
+_n7c = Net(utxos=[_IN_STILL, {"tx_hash": _H2, "vout": 0, "value": 150000,
+                              "confirmations": 5}],
+           spends=[_listed(_p7c, _hx7c, height=0)], fee=500)
+_c, _o, _p, _ = _reconcile(_n7c, _of7c)
+check("NON-VACUITY: 150,000 sat back beside the same input, on a day the "
+      "estimate is over the ceiling, is still 'delayed' -- it forwards with "
+      "cheaper blocks", _c == F.EXIT_REFUSED
+      and ("forward", "refused:fee_out_of_band") in _n7c.kinds
+      and _n7c.submits == [] and _status_of(_of7c) == "delayed")
 # (g) a spend of the address that is NOT ours: the run fails, nothing signed.
 _p8, _of8, _hx8 = _first_send()
 _n8 = Net(utxos=[], spends=[_listed(_p8, _hx8),

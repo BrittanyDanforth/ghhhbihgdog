@@ -2513,10 +2513,23 @@ def main(argv=None):
         # what was quoted -- and no waiting changes that. Decided on the
         # one-input floor at the FLOOR rate, the same arithmetic the vault
         # accepts a deposit by.
+        # OVER THE MONEY A FORWARD AT THAT RATE WOULD SPEND, not the look's
+        # settled_sat: that total also counts the outpoints `exclude` names
+        # (a forward of ours the network lists has spent them, whatever a
+        # server says) and outputs that are dust even at the floor rate,
+        # and neither is money any forward carries. A 5,000 sat refund
+        # beside a listed forward's 200,000 sat input read as 205,000 and
+        # was `delayed` -- "nothing to do", a wake per retry, for ever --
+        # where the same 5,000 sat alone was `short`. The same selection
+        # the forward makes, at the floor rate: at any rate this pair
+        # allows, the dust line is no lower and the fee no smaller.
         if e.kind in DELAY_KINDS:
-            hopeless = picture["settled_sat"] < btx.forward_floor_sat(
-                args.op_return_max_bytes, args.feerate_floor,
-                args.min_send_sat)
+            _cheapest, _, _ = select_inputs(picture["utxos"], args.min_conf,
+                                            args.feerate_floor,
+                                            exclude=exclude)
+            hopeless = sum(u["value"] for u in _cheapest) \
+                < btx.forward_floor_sat(args.op_return_max_bytes,
+                                        args.feerate_floor, args.min_send_sat)
             write_status(args.outfile,
                          STATUS_SHORT if hopeless else STATUS_DELAYED)
         raise
