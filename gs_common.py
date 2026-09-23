@@ -1458,9 +1458,26 @@ def _wipe_name_matches(res: Path) -> bool:
     inherit that from here rather than each deciding.
     """
     if res.is_dir():
-        return any(fnmatch.fnmatch(res.name, pat)
-                   for pat in GS_ARTIFACT_DIR_PATTERNS)
-    return artifact_name_is_ours(res.name)
+        named = any(fnmatch.fnmatch(res.name, pat)
+                    for pat in GS_ARTIFACT_DIR_PATTERNS)
+    else:
+        named = artifact_name_is_ours(res.name)
+    if not named:
+        return False
+    # AND WHAT IS ALREADY THERE, judged the way the sweep will judge it: a
+    # `--outfile wallet_quotes.json` holding quotes was predicted "erased" by
+    # its name and then left by the sweep (no bundle schema) -- with no
+    # warning at either end. A path not written yet cannot be looked inside:
+    # a name only the content-checked pattern matches is then NOT promised,
+    # because the writers that ask before they write (exit_strategy_simulator,
+    # receive_watch) never write a bundle -- the one that does,
+    # create_receive_wallet, asks after.
+    try:
+        st = os.lstat(res)
+    except OSError:
+        return [p for p in GS_ARTIFACT_FILE_PATTERNS
+                if fnmatch.fnmatch(res.name, p)] != ["wallet_*.json"]
+    return _not_ours_reason(res, st) is None
 
 
 #: Patterns that name nothing but an ENDING: atomic_write's "<name>.tmp" and
@@ -1576,6 +1593,14 @@ def sweep_refusal(root: Path, match: Path, owners) -> Optional[tuple]:
         return ("is a symlink; neither the link nor what it points at is "
                 "touched", False, "link")
     if st.st_uid not in owners:
+        # ROOT'S IS PROBABLY OURS. `sudo paranoia_mode --dry-run` (or any tool
+        # run under sudo) leaves root-owned artifacts in the operator's own
+        # directories, and a later unprivileged wipe called that "another
+        # account" and reported success with them still on disk. Another
+        # ordinary account's file is not ours; root's needs sudo to go.
+        if st.st_uid == 0:
+            return ("belongs to root (left by a run under sudo?) -- run the "
+                    "wipe with sudo to remove it", True, "owner")
         return ("belongs to another account", False, "owner")
     if stat_module.S_ISREG(st.st_mode) and st.st_nlink > 1:
         return (f"has {st.st_nlink} names (hard links); overwriting it would "

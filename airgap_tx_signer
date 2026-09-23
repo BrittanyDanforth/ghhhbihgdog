@@ -639,9 +639,17 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
     # SLACK for pass 1 only. Large enough to clear any plausible fee (the
     # measured 1-in/2-out fee is ~0.0026 XMR; this is 0.02) and it is thrown
     # away -- pass 2 is the transaction that gets signed.
-    _SLACK = 20_000_000_000
+    #
+    # AT MOST HALF OF WHAT IS LEFT TO FORWARD. A fixed 0.02 refused any
+    # carrier holding less than that above its fixed destination -- and the
+    # second-to-last peel of a chain that distributes everything holds only
+    # the last destination's share plus one hop's headroom, often under 0.02
+    # at small balances (driven: 15 of 100 seeds at 1 XMR, 40% at 0.2). The
+    # chain stopped part-way with the rest on a carrier. Half of the remainder
+    # is still many times the fee: the planner leaves every hop its headroom.
+    _SLACK = min(20_000_000_000, (unlocked - fixed) // 2)
     probe_forward = unlocked - fixed - _SLACK
-    if probe_forward <= 0:
+    if _SLACK <= 0 or probe_forward <= 0:
         raise RuntimeError(
             f"source subaddress {tx_acct}/{src_index} has only "
             f"{unlocked - fixed} atomic units above its fixed destination, "
@@ -663,11 +671,14 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
     # 1200 piconero of dust, the case this loop exists to make rarer. Driven:
     # probe, a usable build 1200 under, a retry that costs more -> RAISED.
     #
-    # So: retries are priced at the HIGHER of the two fees (a redraw that
-    # costs what the probe cost -- six of seven, measured -- is then exact),
-    # and a retry that fails leaves the best build already in hand. Only a
-    # FIRST exact build that fails, with nothing in hand, is priced a little
-    # higher and tried again, and after that it fails closed as before.
+    # So a retry that fails leaves the best build already in hand. Retries
+    # are still priced at the fee the last build came back with: wallet2
+    # prices a two-output build at its own estimate, so after a probe that
+    # drew HIGH the next build at that lower figure is exact (pricing at the
+    # higher of the two instead left every retry the same dust -- driven, by
+    # the review of this change). Only a FIRST exact build that fails, with
+    # nothing in hand, is priced a little higher and tried again, and after
+    # that it fails closed as before.
     result, residue = None, None
     for _try in range(_EXACT_CONSUME_TRIES):
         forward = unlocked - fixed - fee
@@ -694,7 +705,7 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
             break
         if result is None or abs(fee - got) < residue:
             result, residue = attempt, abs(fee - got)
-        fee = max(fee, got)
+        fee = got
     if result is None:                                       # unreachable
         raise RuntimeError("no build was produced for the exact-consume peel")
     if residue:
@@ -1055,17 +1066,39 @@ _XMR_ADDR_IN_TEXT = re.compile(r"[1-9A-HJ-NP-Za-km-z]{95,106}")
 #: monero-wallet-cli's own decode of a loaded set (simplewallet.cpp,
 #: accept_loaded_tx): "Loaded N transactions, for T, fee F, sending A1 to X1,
 #: sending A2 to X2, C change to Y, with min ring size R, ... Is this okay?"
-#: -- or "no change". Amounts are print_money: twelve decimals. The change
-#: amount is taken off its destination before the "sending" list is printed.
-_CLI_SEND = re.compile(r"sending (\d+\.\d{12}) to ([1-9A-HJ-NP-Za-km-z]{95,106})",
-                       re.I)
+#: -- or "no change". The change amount is taken off its destination before
+#: the "sending" list is printed.
+#:
+#: AMOUNTS ARE print_money, WHOSE DECIMALS ARE THE WALLET'S DISPLAY UNIT: twelve
+#: for "monero", nine for "millinero" and so on (`set unit`). Requiring twelve
+#: refused every set an offline wallet with another unit signed -- driven on a
+#: real regtest wallet-cli. print_money only inserts a point into the atomic
+#: integer, so taking the point out gives piconero whatever the unit.
+#: Written out in full rather than assembled, so tests/test_units' audit of
+#: every shipped pattern can read them.
+_CLI_SEND = re.compile(
+    r"sending (\d+(?:\.\d+)?) to ([1-9A-HJ-NP-Za-km-z]{95,106})", re.I)
 _CLI_CHANGE = re.compile(
-    r"(\d+\.\d{12}) change to ([1-9A-HJ-NP-Za-km-z]{95,106})", re.I)
+    r"(\d+(?:\.\d+)?) change to ([1-9A-HJ-NP-Za-km-z]{95,106})", re.I)
+_CLI_LOADED = re.compile(
+    r"Loaded (\d+) transactions?, for (\d+(?:\.\d+)?), fee (\d+(?:\.\d+)?)",
+    re.I)
+
+
+def _cli_pico(amount: str) -> int:
+    """A print_money amount, in any display unit, as piconero."""
+    return int(amount.replace(".", ""))
+
 
 #: The most change an exact-consume peel may carry. It is built to leave
-#: none; what a fee that moved between two builds leaves is a few hundred
-#: piconero (measured: 0.0000012). Anything near this is not drift.
+#: none; what a fee that moved between two builds leaves is about a million
+#: piconero (measured: 0.0000012 XMR). Anything near this is not drift.
 CONSUME_CHANGE_MAX = Decimal("0.0001")
+
+#: The most fee one transaction may burn when the plan names no estimate.
+#: Mainnet's priority-4 fee on a many-output fan-out is a few hundredths of
+#: an XMR; this is a bound on a tampered set, not a price.
+FEE_CAP_PER_TX = Decimal("0.1")
 
 
 def _plan_expectations(plan: List[dict], idx: int) -> dict:
@@ -1110,7 +1143,8 @@ def _plan_expectations(plan: List[dict], idx: int) -> dict:
     return out
 
 
-def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int) -> None:
+def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int,
+                             fee_per_round=None) -> None:
     """Refuse if wallet-cli says it is paying anything the PLAN does not.
 
     THE ONE THING THAT CAN DECODE THE BLOB IS WALLET-CLI ITSELF.
@@ -1139,6 +1173,14 @@ def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int) -> None:
         exact-consume peel, and on a transfer whose plan names `change_to`,
         that address -- otherwise a transfer's change is said to be
         unverified, because nothing offline can say which address is ours.
+
+    AND THE FEE IS BOUNDED. Exact destinations and amounts leave the free
+    parts -- a sweep's amount, a fan-out's change, a peel's forward -- free to
+    be moved into the FEE, which burns them: nothing above looked at "fee F".
+    It may be at most ten times the plan's own per-transaction estimate
+    (`fee_per_round` in the plan's meta), or FEE_CAP_PER_TX per transaction
+    when the plan names none. A bound, public like everything else: what it
+    limits is how much a swapped blob can destroy, not who can swap one.
 
     An output naming full addresses that this cannot read as that list is
     REFUSED: a format this does not understand cannot be vouched for. One
@@ -1173,7 +1215,7 @@ def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int) -> None:
 
     sends = {}
     for amt, addr in _CLI_SEND.findall(text):
-        sends[addr] = sends.get(addr, Decimal(0)) + Decimal(amt)
+        sends[addr] = sends.get(addr, 0) + _cli_pico(amt)
     if not sends:
         _refuse("unparsed", "Its output names addresses, but not as the "
                 "'sending <amount> to <address>' list this checks, so what "
@@ -1192,12 +1234,30 @@ def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int) -> None:
     # request: a plan amount with more than twelve decimals was sent as
     # int(amount * 10**12), and that integer is what wallet-cli prints.
     _atomic = lambda d: int(d * Decimal(10 ** 12))           # noqa: E731
+    _xmr = lambda p: Decimal(p) / Decimal(10 ** 12)         # noqa: E731
     for addr, want in exp["fixed"].items():
-        if _atomic(sends.get(addr, Decimal(-1))) != _atomic(want):
-            _refuse("amount", f"It sends {sends.get(addr)} XMR to "
+        if sends.get(addr, -1) != _atomic(want):
+            _refuse("amount", f"It sends {_xmr(sends.get(addr, 0))} XMR to "
                     f"{scrub_address(addr)}; the plan says {want}.")
-    changes = [(Decimal(a), x) for a, x in _CLI_CHANGE.findall(text)]
-    change_total = sum((a for a, _x in changes), Decimal(0))
+    changes = [(_cli_pico(a), x) for a, x in _CLI_CHANGE.findall(text)]
+    change_total = _xmr(sum(a for a, _x in changes))
+    _loaded = _CLI_LOADED.search(text)
+    if not _loaded:
+        _refuse("unparsed", "Its output names its destinations but not the "
+                "'Loaded N transactions, for T, fee F' line, so the fee it "
+                "would burn cannot be checked.")
+    _ntx, _fee = int(_loaded.group(1)), _xmr(_cli_pico(_loaded.group(3)))
+    try:
+        _per = (Decimal(str(fee_per_round)) * 10
+                if fee_per_round not in (None, "") else FEE_CAP_PER_TX)
+        if not _per.is_finite() or _per <= 0:
+            _per = FEE_CAP_PER_TX
+    except (ArithmeticError, ValueError, TypeError):
+        _per = FEE_CAP_PER_TX
+    if _fee > _per * max(1, _ntx):
+        _refuse("fee", f"It pays {_fee} XMR in fees for {_ntx} "
+                f"transaction(s); the most this plan allows is "
+                f"{_per * max(1, _ntx)}.")
     if changes and exp["kind"] == "sweep":
         _refuse("change", "A sweep makes no change, and this sends "
                 f"{change_total} XMR as change to "
@@ -1664,7 +1724,7 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
               f"needs it (phase_create writes it).")
 
 
-def phase_sign(args, plan: List[dict]):
+def phase_sign(args, plan: List[dict], meta: dict = None):
     """PHASE 2: Sign unsigned TXs on offline machine with wallet-cli.
 
     Uses monero-wallet-cli's sign_transfer command which reads unsigned
@@ -1847,7 +1907,8 @@ def phase_sign(args, plan: List[dict]):
             # See _check_wallet_cli_agrees: the manifest hash cannot catch a
             # blob swap, and this is the only decoder available offline.
             _check_wallet_cli_agrees(
-                (result.stdout or "") + (result.stderr or ""), plan, idx)
+                (result.stdout or "") + (result.stderr or ""), plan, idx,
+                fee_per_round=(meta or {}).get("fee_per_round"))
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"
@@ -2033,7 +2094,7 @@ def main():
     if args.phase == "create":
         phase_create(args, plan, meta)
     elif args.phase == "sign":
-        phase_sign(args, plan)
+        phase_sign(args, plan, meta)
 
 
 if __name__ == "__main__":

@@ -223,12 +223,8 @@ SCHEMA = {
     "btc_entry":    ("addr_re", BTC_RE),
     "receive_wallet": ("re", PATH_RE),
     "pairs_file":   ("re", PATH_RE),
-    #: ONE AMOUNT PER SWAP, space- or comma-separated, quoted in one click.
-    #: It was a single amount, and the page's "Number of swaps" asks for up to
-    #: eight: each click wrote the whole pairs file afresh, so the second
-    #: quote replaced the first and the watch and the run then waited for the
-    #: last swap alone -- the others landing unmixed on the entry address.
-    "swap_btc":     ("dec_list", (DEC_RE, 8)),
+    #: ONE AMOUNT: one receive bundle takes one swap (see quote_problems).
+    "swap_btc":     ("re", DEC_RE),
     "btc_amount":   ("re", DEC_RE),
     #: HOW MUCH XMR THIS RUN IS WAITING FOR, and the console could not say it.
     #:
@@ -402,20 +398,6 @@ def clean(params: dict) -> dict:
                                 f"{s[:16]}…")
                 elif s:
                     out[k] = s
-            elif kind == "dec_list":
-                # Amounts, so NOT de-duplicated: two swaps of 0.05 are two
-                # swaps. Normalised to one space-separated string, which is
-                # the shape GS_SWAP_AMOUNTS takes.
-                _rx, _cap = spec
-                raw = v if isinstance(v, list) else re.split(r"[\s,]+", str(v))
-                items = [str(t).strip() for t in raw if str(t).strip()]
-                bad = [t for t in items if not _rx.match(t)]
-                if bad:
-                    errs.append(f"{k} is not a valid amount: {bad[0][:24]}")
-                elif len(items) > _cap:
-                    errs.append(f"{k}: at most {_cap} amounts, one per swap")
-                elif items:
-                    out[k] = " ".join(items)
             elif kind == "list_re":
                 # Accept a JSON array or a newline/comma separated string, so
                 # the field works whether the page sends a list or raw text.
@@ -489,8 +471,8 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
             why.append(
                 f"{p.get('pairs_file') or DEFAULT_PAIRS_FILE} holds {_np} "
                 f"swap(s) paying this receive address and 'Number of swaps' "
-                f"is {_n}. Quote all {_n} together in step 2, or type the "
-                f"total you are expecting in 'Total XMR expected'.")
+                f"is {_n}. Set 'Number of swaps' to what was quoted, or type "
+                f"the total you are expecting in 'Total XMR expected'.")
     else:
         if not p.get("btc_entry"):
             why.append("Send mode needs a BTC entry address (bech32).")
@@ -873,6 +855,13 @@ ACTION_SECRETS = {
 _JOB_SEQ = [0]
 
 
+def mode_dropped_env(params: dict) -> tuple:
+    """GS_ variables a child must not get in this mode, from any source."""
+    if params.get("mode") == "receive":
+        return ("GS_BTC_ENTRY", "GS_BTC_AMOUNT")
+    return ()
+
+
 def secret_env(params: dict) -> dict:
     """Values passed to a child through the ENVIRONMENT, never on its argv.
 
@@ -1052,7 +1041,8 @@ def job_timeout_for(params):
     return _estimate
 
 
-def start(argv, label, action_id=None, extra_env=None, timeout_s=None):
+def start(argv, label, action_id=None, extra_env=None, timeout_s=None,
+          drop_env=()):
     with LOCK:
         _JOB_SEQ[0] += 1
         seq = _JOB_SEQ[0]
@@ -1082,6 +1072,12 @@ def start(argv, label, action_id=None, extra_env=None, timeout_s=None):
             for _k, _v in (extra_env or {}).items():
                 if _k in _allowed:
                     env[_k] = _v
+            # WHAT THIS RUN MUST NOT HAVE, whichever way it came: a receive
+            # run's send-mode fields are kept out of secret_env, and a value
+            # the shell exported (GS_BTC_ENTRY) reached it through the
+            # allow-list all the same.
+            for _k in drop_env or ():
+                env.pop(_k, None)
             # stdin=DEVNULL: a job must never be able to WAIT FOR A HUMAN.
             # Children inherited the console's fd 0, so receive_watch's
             # `if pick is None and sys.stdin.isatty()` was True for a job
@@ -1570,15 +1566,14 @@ def limits_badge(p: dict) -> str:
 
 
 def quote_floor_xmr(p: dict):
-    """The least XMR ONE swap of this quote may deliver, or None if unknown.
+    """The least XMR this quote may deliver, or None if unknown.
 
     The run's minimum is limits_badge's figure -- the shipped mix_minimum_xmr
-    at these settings and this many swaps -- and each swap is one chunk of it,
-    so a swap below its equal share is refused before the sender is told to
-    pay. thor_swap_preparer gates the worst arrival it will accept (after
-    slippage) against this, per swap, and the run re-checks the real total at
-    stage 0. At the fallback fee, like the panel: an understatement at
-    priorities above 1, so a floor and never a promise.
+    at these settings -- so a swap that cannot be mixed is refused before the
+    sender is told to pay. thor_swap_preparer gates the worst arrival it will
+    accept (after slippage) against this, and the run re-checks the real
+    total at stage 0. At the fallback fee, like the panel: an understatement
+    at priorities above 1, so a floor and never a promise.
     """
     try:
         g = _ghost()
@@ -1586,15 +1581,14 @@ def quote_floor_xmr(p: dict):
         w = max(1, int(p.get("wallets") or 10))
         prio = int(p.get("fee_priority") or 1)
         fee = g.FALLBACK_FEE_BY_PRIORITY.get(prio, g.FALLBACK_FEE_XMR)
-        n = max(1, int(p.get("split") or 1))
         pct = None
         if p.get("usage_fee"):
             _p = p.get("usage_fee_pct")
             pct = _D(str(_p)) if _p else g.USAGE_FEE_PCT
-        total = g.mix_minimum_xmr(fee, w, dag_mixing=bool(p.get("dag_mixing")),
-                                  exit_set=bool(p.get("exit_to")), chunks=n,
-                                  usage_pct=pct)
-        return (total / n).quantize(g.DUST_XMR, rounding=_UP)
+        return g.mix_minimum_xmr(fee, w, dag_mixing=bool(p.get("dag_mixing")),
+                                 exit_set=bool(p.get("exit_to")), chunks=1,
+                                 usage_pct=pct).quantize(g.DUST_XMR,
+                                                         rounding=_UP)
     except Exception:                                        # noqa: BLE001
         return None
 
@@ -1602,17 +1596,22 @@ def quote_floor_xmr(p: dict):
 def quote_problems(p: dict) -> list:
     """Why the quote step must not run with these settings; [] if it may."""
     why = []
-    amounts = str(p.get("swap_btc") or "").split()
     n = max(1, int(p.get("split") or 1))
-    if not amounts:
+    if not str(p.get("swap_btc") or "").strip():
         why.append("Enter the BTC amount the sender will pay.")
-    elif len(amounts) != n:
+    # ONE RECEIVE ADDRESS, ONE SWAP. thor_swap_preparer refuses two swaps to
+    # one destination -- the aggregator would be told they are one person's
+    # -- so this step can only ever quote one, and each click writes the
+    # whole quote file: quoting a second swap to the same address replaced
+    # the first, and the watch and the run waited for the last one only.
+    # Several swaps are several receive addresses, each its own run.
+    if n > 1:
         why.append(
-            f"'Number of swaps' is {n} and {len(amounts)} amount(s) were "
-            f"entered. Put one amount per swap in the amount box, all of them "
-            f"(e.g. '0.05 0.03'): each quote writes the whole quote file, so "
-            f"swaps quoted one at a time replace each other and the watch and "
-            f"the run wait for the last one only.")
+            f"'Number of swaps' is {n}, and one receive address takes one "
+            f"swap: the quote tool refuses to tell the aggregator that two "
+            f"swaps go to the same address, and each quote replaces the last "
+            f"in the quote file. For {n} swaps, make {n} receive addresses and "
+            f"run each on its own; set 'Number of swaps' to 1 here.")
     if quote_floor_xmr(p) is None:
         why.append(
             "The mixing minimum could not be computed here (GhostSpiral did "
@@ -2398,7 +2397,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(
                 {"jid": start(argv, act["label"], action_id=aid,
                               extra_env=secret_env(c["params"]),
-                              timeout_s=job_timeout_for(c["params"]))}))
+                              timeout_s=job_timeout_for(c["params"]),
+                              drop_env=mode_dropped_env(c["params"]))}))
         if self.path.startswith("/stop/"):
             return self._send(200, json.dumps({"stopped": stop(self.path[6:])}))
         self._send(404, json.dumps({"error": "not found"}))
@@ -2659,8 +2659,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         above, so the 95-character Monero address is never retyped — the one field where a typo
         is irreversible. The memo is checked to actually name your address before any
         instructions are printed.
-        <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay
-          <span class="d">one per swap, all together: 0.05 0.03 — as many as 'Number of swaps' in step 3</span></label>
+        <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay</label>
           <input id="swap_btc" autocomplete="off" spellcheck="false" placeholder="0.05">
           <span class="d limits"></span></div>
         <div class="f"><label for="pairs_file">Save quote to</label>
@@ -3405,7 +3404,11 @@ def main():
     def _leave(signum, _frame):
         raise SystemExit(128 + signum)
     for _sig in ("SIGTERM", "SIGHUP"):
-        if hasattr(signal, _sig):
+        # NOT OVER nohup: a console started under it has SIGHUP ignored on
+        # purpose, and replacing that made a hangup kill the console -- and
+        # orphan its running jobs -- where it used to be ignored.
+        if hasattr(signal, _sig) and (signal.getsignal(getattr(signal, _sig))
+                                      is signal.SIG_DFL):
             signal.signal(getattr(signal, _sig), _leave)
     try:
         srv.serve_forever()

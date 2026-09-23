@@ -140,6 +140,11 @@ def load(n):
     ld.exec_module(m)
     return m
 which = sys.argv[1]
+# THE DISPOSITION A TERMINAL GIVES AN INTERACTIVE PROGRAM, set here rather than
+# inherited: a suite started in the background (`nohup ... &`, a sweep) hands
+# its children SIGINT IGNORED, Python then installs no KeyboardInterrupt
+# handler, and "does Ctrl-C still work" read BROKEN for code that was fine.
+signal.signal(signal.SIGINT, signal.default_int_handler)
 before = core()
 m = load(which)
 imported = core()
@@ -1038,6 +1043,8 @@ _SIG_PROBE = r'''
 import os, signal, sys, time
 sys.path.insert(0, %r)
 import gs_common as C
+# See _CORE_PROBE_SRC: the terminal's disposition, not the launcher's.
+signal.signal(signal.SIGINT, signal.default_int_handler)
 if sys.argv[1] == "with":
     C.install_signal_handlers()
 try:

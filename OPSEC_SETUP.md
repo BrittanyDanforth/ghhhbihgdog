@@ -703,7 +703,10 @@ unsigned set and prints what it pays before it asks "Is this okay?". The
 signer refuses unless that list is the plan's destinations exactly — none
 missing, none extra — at the plan's amounts, with change only where the plan
 allows it: none on a sweep, dust at most on a peel, and on a fan-out the
-spending account's own subaddress 0, which the plan names. The manifest's
+spending account's own subaddress 0, which the plan names — and a fee of at
+most ten times the plan's own estimate, so the free parts (a sweep's amount,
+a fan-out's change) cannot be burned instead. Amounts are read in whatever
+unit the offline wallet displays (`set unit`). The manifest's
 hash cannot do this: it sits beside the blob it covers. The check rests on the
 plan being the one you made — whoever can rewrite the plan and its
 fingerprint rewrites what it is compared against — so the staging media is

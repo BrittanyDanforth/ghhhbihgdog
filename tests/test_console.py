@@ -369,6 +369,47 @@ def test_tor_port_autodetect():
     check("there is a /api/detect-tor endpoint", '"/api/detect-tor"' in src)
 
 
+def test_the_console_respects_nohup_and_keeps_send_fields_out_of_receive():
+    """Two things the review of the tor/exit change found. The SIGHUP handler
+    replaced nohup's SIG_IGN, so a hangup killed a console started under
+    nohup -- and orphaned its jobs -- where it used to be ignored. And a
+    GS_BTC_ENTRY exported in the shell still reached a RECEIVE run through
+    the allow-list, although secret_env no longer sends the page's copy."""
+    import tempfile as _tf2, time as _t2, signal
+    d = _tf2.mkdtemp(prefix="nohup_")
+    code = ("import signal, sys, importlib.machinery, importlib.util, os\n"
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+            f"sys.argv = ['gs_console', '--port', '0']\n"
+            f"ld = importlib.machinery.SourceFileLoader('gc', {os.path.join(REPO, 'gs_console')!r})\n"
+            "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('gc', ld))\n"
+            "ld.exec_module(m)\n"
+            "m.main()\n")
+    p = subprocess.Popen([sys.executable, "-c", code], cwd=d,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        _t2.sleep(3)
+        p.send_signal(signal.SIGHUP)
+        _t2.sleep(1)
+        check("a console started under nohup survives a hangup",
+              p.poll() is None)
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    c = load_console()
+    check("a receive run drops GS_BTC_ENTRY/GS_BTC_AMOUNT whatever their "
+          "source", set(c.mode_dropped_env({"mode": "receive"}))
+          == {"GS_BTC_ENTRY", "GS_BTC_AMOUNT"}
+          and c.mode_dropped_env({"mode": "send"}) == ())
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("...and the /run/ handler applies it",
+          "drop_env=mode_dropped_env(c[\"params\"])" in src
+          and "for _k in drop_env or ():" in src)
+
+
 def test_started_tor_gets_no_secrets_and_does_not_outlive_the_console():
     """Start Tor handed tor the console's whole environment -- the wallet
     spend password and the exit address among it -- and tor, which takes
@@ -435,10 +476,10 @@ def test_started_tor_gets_no_secrets_and_does_not_outlive_the_console():
 def test_the_quote_step_gates_and_keeps_every_swap():
     """The quote step passed no --min-out-xmr, so a deposit too small to mix
     was quoted and paid; and each click wrote the whole quote file, so
-    quoting the swaps of an N-swap receive one at a time left the watch and
-    the run waiting for the last swap only. Also: the aggregator key and the
-    watch's expected total never reached the children that read them, and a
-    send run's Bitcoin address reached receive runs."""
+    quoting several swaps to one receive address left the watch and the run
+    waiting for the last only. Also: the aggregator key and the watch's
+    expected total never reached the children that read them, and a send
+    run's Bitcoin address reached receive runs."""
     import tempfile as _tf
     from decimal import Decimal as _D
     c = load_console()
@@ -452,27 +493,19 @@ def test_the_quote_step_gates_and_keeps_every_swap():
     check("the quote carries --min-out-xmr", "--min-out-xmr" in argv)
     check("...at the figure the panel shows (the shipped mix_minimum_xmr)",
           _D(argv[argv.index("--min-out-xmr") + 1]) == want1)
-    p3 = c.clean(dict(base, swap_btc="0.05 0.03, 0.04", split=3))["params"]
-    check("several amounts are one quote: normalised, never de-duplicated",
-          p3.get("swap_btc") == "0.05 0.03 0.04"
-          and c.clean(dict(base, swap_btc="0.05 0.05"))["params"]
-          .get("swap_btc") == "0.05 0.05")
-    check("...and they reach thor as its amounts",
-          c.secret_env(p3).get("GS_SWAP_AMOUNTS") == "0.05 0.03 0.04")
-    a3 = c.ACTIONS["swap_quote"]["build"](p3)
-    want3 = g.mix_minimum_xmr(g.FALLBACK_FEE_BY_PRIORITY[1], 10,
-                              dag_mixing=False, exit_set=False, chunks=3)
-    check("with N swaps each one is gated at its share of the N-swap minimum",
-          _D(a3[a3.index("--min-out-xmr") + 1]) * 3 >= want3
-          and _D(a3[a3.index("--min-out-xmr") + 1]) * 3 - want3 < _D("0.001"))
-    check("the quote step runs when the amounts match the swaps",
-          c.quote_problems(p3) == [])
-    pbad = c.clean(dict(base, swap_btc="0.05", split=3))["params"]
-    check("one amount for three swaps is refused, and says why",
-          any("one at a time" in w for w in c.quote_problems(pbad)))
-    check("nine amounts is refused by the schema",
-          c.clean({"swap_btc": " ".join(["0.01"] * 9)})["params"]
+    check("the quote step runs for one swap to one receive address",
+          c.quote_problems(p1) == [])
+    # ONE RECEIVE ADDRESS, ONE SWAP. thor_swap_preparer refuses two swaps to
+    # one destination, so several amounts, or 'Number of swaps' above one,
+    # were a quote step that could never succeed; and each click replaced
+    # the quote file, so quoting them one at a time waited for the last only.
+    check("several amounts in the box are refused by the schema",
+          c.clean(dict(base, swap_btc="0.05 0.03"))["params"]
           .get("swap_btc") is None)
+    pbad = c.clean(dict(base, swap_btc="0.05", split=3))["params"]
+    check("'Number of swaps' above one is refused at the quote, and says why",
+          any("one receive address takes one swap" in w
+              for w in c.quote_problems(pbad)))
     _real_ghost = c._ghost
     try:
         c._ghost = lambda: (_ for _ in ()).throw(ImportError("no GhostSpiral"))

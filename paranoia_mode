@@ -773,6 +773,34 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
         return True
 
     _done = set()
+    # EVERY NAME OF ONE FILE, IN THIS SWEEP, IS NOT A STRANGER'S HARD LINK.
+    # The Pi's chain retirement hard-links integrity_chain.log to .retired
+    # for an instant, and a kill in that instant leaves both names; the
+    # hard-link rule then left both, as failures. When every name the inode
+    # has is a match here, all of them are ours and it goes.
+    _names = {}
+    for _r in search_roots:
+        if not _r.is_dir():
+            continue
+        for _pat in file_patterns:
+            try:
+                _ms = list(_r.glob(_pat)) + list(_r.glob(f"*/{_pat}"))
+            except OSError:
+                continue
+            for _m in _ms:
+                try:
+                    _st = os.lstat(_m)
+                except OSError:
+                    continue
+                _names.setdefault((_st.st_dev, _st.st_ino), set()).add(_m)
+
+    def _all_names_here(p: Path) -> bool:
+        try:
+            _st = os.lstat(p)
+        except OSError:
+            return False
+        return len(_names.get((_st.st_dev, _st.st_ino), ())) >= _st.st_nlink
+
     #: Set when the wake pairing is among the casualties. NAMED IN THE SUMMARY,
     #: because losing it is the one wipe result that presents as a hardware
     #: fault: the next magic packet produces a correct fail-closed refusal that
@@ -795,6 +823,8 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
                 if not artifact_name_is_ours(f.name):
                     continue
                 why = sweep_refusal(root, f, owners)
+                if why and why[2] == "hard_link" and _all_names_here(f):
+                    why = None
                 if why:
                     _leave(f, why)
                     continue

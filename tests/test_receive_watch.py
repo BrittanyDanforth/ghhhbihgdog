@@ -1215,6 +1215,42 @@ _w, _o = _block(_NOW - rw.QUOTE_STALE_S)
 check("the boundary is QUOTE_STALE_S, shared with gs_unseal",
       _w is False and rw.QUOTE_STALE_S == 20 * 60)
 
+# ---------------------------------------------------------------------------
+# --result-json RECORDS THE ARRIVAL AMOUNT and is free-form, so a path the
+# wipe never reaches must be SAID. Driven: a directory outside every root
+# (not the cwd, not $HOME, not the checkout), with the cwd moved elsewhere.
+# ---------------------------------------------------------------------------
+print("\n== the result file says when the wipe will not reach it ==")
+import contextlib as _cl8, io as _io8, types as _ty8     # noqa: E402
+_rj_out = tempfile.mkdtemp(prefix="rj_outside_")
+_rj_cwd = tempfile.mkdtemp(prefix="rj_cwd_")
+_rj_home = tempfile.mkdtemp(prefix="rj_home_")
+_rj_saved = (os.getcwd(), os.environ.get("HOME"))
+try:
+    os.chdir(_rj_cwd)
+    os.environ["HOME"] = _rj_home
+    with _cl8.redirect_stdout(_io8.StringIO()) as _rjo:
+        rw._write_result_json(
+            _ty8.SimpleNamespace(result_json=os.path.join(_rj_out,
+                                                          "arrived.json")),
+            {"state": "funded", "unlocked": Decimal("1"), "total": Decimal("1"),
+             "ticks": 1})
+    check("result-json outside every root: it says the wipe will NOT find it",
+          "outside every directory paranoia_mode" in _rjo.getvalue()
+          and "ARRIVAL AMOUNT" in _rjo.getvalue())
+    with _cl8.redirect_stdout(_io8.StringIO()) as _rjo2:
+        rw._write_result_json(
+            _ty8.SimpleNamespace(result_json=os.path.join(_rj_home,
+                                                          "gs_wake_status.json")),
+            {"state": "funded", "unlocked": Decimal("1"), "total": Decimal("1"),
+             "ticks": 1})
+    check("NON-VACUITY: a result file the wipe does reach draws no warning",
+          "paranoia_mode" not in _rjo2.getvalue())
+finally:
+    os.chdir(_rj_saved[0])
+    if _rj_saved[1] is not None:
+        os.environ["HOME"] = _rj_saved[1]
+
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     for f in FAILURES:

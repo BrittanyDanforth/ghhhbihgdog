@@ -739,7 +739,7 @@ try:
     check("wipe/reason: ONE name rule -- wipe_miss_reason no longer carries a "
           "second copy that hard-codes the FILE patterns",
           _gcs.count("for pat in GS_ARTIFACT_DIR_PATTERNS)") == 1
-          and _gcs.count("return artifact_name_is_ours(res.name)") == 1
+          and _gcs.count("named = artifact_name_is_ours(res.name)") == 1
           and "named = _wipe_name_matches(res)" in _gcs)
 finally:
     if _prev_home is None:
@@ -762,6 +762,15 @@ finally:
 # ---------------------------------------------------------------------------
 _pm5 = _load("paranoia_mode")
 _pm5.integrity_log = lambda *a, **k: None
+
+
+def _rd5(p):
+    """The bytes, or None if a mutation deleted them: a check that fails, not
+    a suite that crashes before it can say which guarantee broke."""
+    try:
+        return Path(p).read_bytes()
+    except OSError:
+        return None
 _box5 = Path(tempfile.mkdtemp(prefix="wipelink_"))
 _saved5 = (os.environ.get("HOME"), os.getcwd(), gs.TOOLCHAIN_DIR)
 try:
@@ -827,8 +836,7 @@ try:
     with contextlib.redirect_stdout(io.StringIO()) as _real5:
         _f5 = _pm5.wipe_gs_artifacts(dry=False, extra_dirs=[str(_S5)])
     _r5 = _real5.getvalue()
-    _lost5 = [n for n, b in _keep5.items()
-              if not (_H5 / n).exists() or (_H5 / n).read_bytes() != b]
+    _lost5 = [n for n, b in _keep5.items() if _rd5(_H5 / n) != b]
     check(f"sweep/link: nothing of the user's is touched -- wallet, keys, "
           f"notes, their own look-alike files (lost: {_lost5})", _lost5 == [])
     check("sweep/link: the planted link is left as it was",
@@ -838,7 +846,7 @@ try:
           and "through the symlink" in _r5)
     check("sweep/link: a second name (hard link) of a user's file is left "
           "rather than overwritten in place",
-          (_H5 / "notes.txt").read_bytes() == b"my notes"
+          _rd5(_H5 / "notes.txt") == b"my notes"
           and "hard links" in _r5)
     check("sweep/link: ...and both of those count as NOT wiped (they may be "
           "ours and they are still on disk)", _f5 == 2)
@@ -851,11 +859,51 @@ try:
     # asked directly, with owners that do not include the file's.
     _o5 = _box5 / "thor_pairs.json"
     _o5.write_bytes(b"[]")
-    _rf5 = gs.sweep_refusal(_box5, _o5, {os.geteuid() + 4242})
-    check("sweep/owner: another account's file is refused",
-          _rf5 is not None and "another account" in _rf5[0])
+    # Another ORDINARY account's file is not ours and is left, quietly; a
+    # ROOT-owned one in the operator's tree is most likely a sudo run's, and
+    # is left as a FAILURE that says to use sudo -- it used to be "another
+    # account" and the wipe reported success with it on disk.
+    _e5 = os.geteuid()
+    if _e5 == 0:
+        _rr5 = gs.sweep_refusal(_box5, _o5, {4242})
+        check("sweep/owner: a root-owned artifact, wiped unprivileged, counts "
+              "as NOT wiped and says to use sudo",
+              _rr5 is not None and _rr5[1] is True and "sudo" in _rr5[0])
+        os.chown(_o5, 4242, 4242)
+        _rf5 = gs.sweep_refusal(_box5, _o5, {0})
+        os.chown(_o5, 0, 0)
+    else:
+        _rf5 = gs.sweep_refusal(_box5, _o5, {_e5 + 4242})
+    check("sweep/owner: another ordinary account's file is left, and not a "
+          "failure", _rf5 is not None and "another account" in _rf5[0]
+          and _rf5[1] is False)
     check("sweep/owner: NON-VACUITY -- the operator's own is taken",
-          gs.sweep_refusal(_box5, _o5, {os.geteuid()}) is None)
+          gs.sweep_refusal(_box5, _o5, {_e5}) is None)
+    # EVERY NAME OF ONE FILE IN THIS SWEEP: the Pi's chain retirement
+    # hard-links the chain to .retired for an instant; killed there, both
+    # names are ours, and the hard-link rule left both as failures.
+    _hl = _box5 / "hl"
+    _hl.mkdir()
+    (_hl / "integrity_chain.log").write_bytes(b"x" * 64)
+    os.link(_hl / "integrity_chain.log", _hl / "integrity_chain.log.retired")
+    with contextlib.redirect_stdout(io.StringIO()) as _hlo:
+        _hlf = _pm5.wipe_gs_artifacts(dry=False, extra_dirs=[str(_hl)])
+    check("sweep/link: a chain and its .retired hard link, both ours, both go",
+          not (_hl / "integrity_chain.log").exists()
+          and not (_hl / "integrity_chain.log.retired").exists()
+          and "hard links" not in _hlo.getvalue())
+    # AND THE PREDICTION AGREES WITH THE CONTENT CHECK: a wallet_*.json that
+    # is not a bundle is not promised to the writer that made it.
+    _wq = _box5 / "cwd" / "wallet_quotes.json"
+    check("roots: a not-yet-written wallet_*.json is not promised (the "
+          "writers that ask first never write a bundle)",
+          not gs.wipe_will_erase(_wq))
+    _wq.write_text('[{"deposit": "bc1q"}]')
+    check("roots: ...nor is one on disk that holds no bundle",
+          not gs.wipe_will_erase(_wq))
+    _wq.write_text('{"schema": "gs_receive_wallet_v1"}')
+    check("roots: NON-VACUITY -- a real bundle there IS promised",
+          gs.wipe_will_erase(_wq))
     # secure_delete_tree itself, the primitive GhostSpiral and the agent use.
     _v5 = _box5 / "victim"
     _v5.mkdir()
@@ -863,7 +911,7 @@ try:
     os.symlink(_v5, _box5 / "tree_link")
     check("tree: a link to a directory is refused, and its target kept",
           gs.secure_delete_tree(_box5 / "tree_link") is False
-          and (_v5 / "keep").read_bytes() == b"k")
+          and _rd5(_v5 / "keep") == b"k")
     _t5 = _box5 / "tree"
     (_t5 / "sub").mkdir(parents=True)
     (_t5 / "sub" / "a").write_bytes(b"a")
@@ -871,7 +919,7 @@ try:
     os.symlink(_v5 / "keep", _t5 / "file_link")
     check("tree: a real tree goes, links inside it unlinked, never followed",
           gs.secure_delete_tree(_t5) is True and not _t5.exists()
-          and (_v5 / "keep").read_bytes() == b"k")
+          and _rd5(_v5 / "keep") == b"k")
     _t6 = _box5 / "tree6"
     _t6.mkdir()
     check("tree: owner_uid that does not own the root is refused",

@@ -1830,9 +1830,17 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     # Peel 0 spends from ENTRY and needs the same per-hop headroom as every
     # later hop, so it comes off the balance before anything is distributed.
     cap = bal - hop_headroom
+    # WHAT THE CHAIN CAN HAND OUT: the balance less each hop's own headroom,
+    # not `usable`. compute_fee_budget's reserve also holds back every DAG hop
+    # and exit sweep the outputs will pay -- and compute_fanout_amounts
+    # already builds those into each amount (min_exit_fundable), so in a
+    # fan-out they are counted twice and come back as change the change sweep
+    # moves. A peel chain has no change: the doubled reserve rode the chain to
+    # the LAST destination, up to +0.77 XMR (3x the mean) at priority 4.
+    base = max(usable, bal - hop_headroom * Decimal(fanout_count))
     for frac in PEEL_BUDGET_FRACTIONS:
         trial = compute_fanout_amounts(
-            usable, fanout_count, fee_xmr, dag_enabled, rng,
+            base, fanout_count, fee_xmr, dag_enabled, rng,
             spend_fraction=frac)
         frac = None if frac == Decimal("1") else frac
         if not trial:
@@ -7923,7 +7931,8 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
             # it does not pay, and the last one sweeps. The rest arrives on
             # the LAST destination, on top of its own share.
             integrity_log("stage4", f"peel_distribution_shrunk:{_frac}")
-            _rest = usable - sum(_fitted, Decimal(0))
+            _rest = (bal - _hop_fee * Decimal(fanout_count)
+                     - sum(_fitted, Decimal(0)))
             print(f"  [!] The peel chain could not carry the full "
                   f"distribution: {fanout_count} hops need "
                   f"{_hop_fee * (fanout_count - 1)} XMR of headroom on top of "

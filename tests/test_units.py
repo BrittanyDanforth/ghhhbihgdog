@@ -3049,17 +3049,16 @@ class _R:
 _usable = Decimal("9.5")
 _base = ghost.compute_fanout_amounts(_usable, 6, Decimal("0.0024"), False, _R())
 
-
-def usable_minus(amts):
-    """What a peel plan leaves undistributed -- and so hands the last hop."""
-    return _usable - sum(amts, Decimal(0))
 _fit, _frac = ghost.fit_peel_distribution(
     _base, Decimal("10"), _usable, 6, Decimal("0.0024"), False, _R(), _HR)
-check("fit_peel_distribution: a fundable chain distributes ALL of usable "
-      "(frac None), not the fan-out's 0.9 -- the rest would ride the chain "
-      "to the last destination",
-      _frac is None and sum(_fit, Decimal(0)) > sum(_base, Decimal(0))
-      and usable_minus(_fit) < Decimal("0.001"))
+check("fit_peel_distribution: a fundable chain distributes everything but "
+      "its hops' own headroom (frac None) -- not the fan-out's 0.9 of usable, "
+      "and not usable either, whose DAG/exit reserve the amounts already "
+      "carry: whatever is left rides the chain to the LAST destination",
+      _frac is None and sum(_fit, Decimal(0)) > _usable
+      and (Decimal("10") - _HR)
+      - ghost.peel_entry_requirement(_fit, ghost.peel_carrier_reserves(_fit, _HR))
+      < Decimal("0.001"))
 check("fit_peel_distribution: ...and the result really is affordable",
       ghost.peel_entry_requirement(_fit, ghost.peel_carrier_reserves(_fit, _HR))
       <= Decimal("10") - _HR)

@@ -37,7 +37,7 @@ that produced this file.
 
 Each entry is (name, file, find, replace, [suites that must go red]).
 """
-import os, re, shutil, subprocess, sys, tempfile
+import os, re, shutil, signal, subprocess, sys, tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1160,7 +1160,7 @@ MUTATIONS = [
  # decoder available offline, and its confirmation is auto-answered "y".
  ("the signer stops cross-checking what wallet-cli says it signed",
   "airgap_tx_signer",
-  '            _check_wallet_cli_agrees(\n                (result.stdout or "") + (result.stderr or ""), plan, idx)',
+  '            _check_wallet_cli_agrees(\n                (result.stdout or "") + (result.stderr or ""), plan, idx,\n                fee_per_round=(meta or {}).get("fee_per_round"))',
   '            pass',
   ["test_signer_schema"]),
 
@@ -2003,8 +2003,8 @@ MUTATIONS = [
  # "both" -- "no name like yours is ever swept", the opposite of the truth.
  ("wipe_miss_reason goes back to judging a directory by the file patterns",
   "gs_common.py",
-  '    if res.is_dir():\n        return any(fnmatch.fnmatch(res.name, pat)\n                   for pat in GS_ARTIFACT_DIR_PATTERNS)\n    return artifact_name_is_ours(res.name)',
-  '    return artifact_name_is_ours(res.name)',
+  '    if res.is_dir():\n        named = any(fnmatch.fnmatch(res.name, pat)\n                    for pat in GS_ARTIFACT_DIR_PATTERNS)\n    else:\n        named = artifact_name_is_ours(res.name)\n',
+  '    named = artifact_name_is_ours(res.name)\n',
   ["test_opsec_guarantees", "test_gitignore"]),
 
  # --result-json is free-form like the two --outfiles that DO warn, and it
@@ -7631,8 +7631,8 @@ MUTATIONS = [
   '                                           + []},',
   ['test_console']),
  ('one amount is quoted for several swaps', 'gs_console',
-  '    elif len(amounts) != n:\n',
-  '    elif False:\n',
+  '    if n > 1:\n        why.append(\n            f"\'Number of swaps\' is {n}, and one receive address takes one "',
+  '    if False:\n        why.append(\n            f"\'Number of swaps\' is {n}, and one receive address takes one "',
   ['test_console']),
  ('a quote file short of swaps is run anyway', 'gs_console',
   '        if _np is not None and _np != _n and not p.get("expect_total_xmr"):\n',
@@ -7699,7 +7699,7 @@ MUTATIONS = [
   '        _refuse("extra"',
   ['test_signer_schema']),
  ('the signer signs a blob paying the wrong amount', 'airgap_tx_signer',
-  '        if _atomic(sends.get(addr, Decimal(-1))) != _atomic(want):\n',
+  '        if sends.get(addr, -1) != _atomic(want):\n',
   '        if False:\n',
   ['test_signer_schema']),
  ('the signer signs a sweep that makes change', 'airgap_tx_signer',
@@ -7738,8 +7738,8 @@ MUTATIONS = [
   '                  f"XMR stays on ENTRY, which "\n',
   ['test_dag_entry']),
  ('the exact-consume retry is priced at the lower fee', 'airgap_tx_signer',
-  '        fee = max(fee, got)',
-  '        fee = got',
+  '        fee = got\n',
+  '        fee = max(fee, got)\n',
   ['test_signer_schema']),
  ('a failed consume retry throws away the usable build', 'airgap_tx_signer',
   '            if result is not None:\n'
@@ -7774,6 +7774,61 @@ MUTATIONS = [
   '    if True:\n'
   '        sys.exit(_head + " Fix the wallet-rpc connection and run again — "',
   ['test_swap_arrival']),
+ # ---- wt17b: what the review of 8e138f6 found --------------------------
+ ('the consume probe takes a fixed 0.02 and stops a tight peel chain',
+  'airgap_tx_signer',
+  '    _SLACK = min(20_000_000_000, (unlocked - fixed) // 2)\n',
+  '    _SLACK = 20_000_000_000\n',
+  ['test_signer_schema']),
+ ('the peel chain distributes usable, and the doubled reserve rides to the '
+  'last hop', 'GhostSpiral',
+  '    base = max(usable, bal - hop_headroom * Decimal(fanout_count))\n',
+  '    base = usable\n',
+  ['test_units']),
+ ('the signer reads amounts in twelve decimals only', 'airgap_tx_signer',
+  '    return int(amount.replace(".", ""))\n',
+  '    return int(Decimal(amount) * 10 ** 12)\n',
+  ['test_signer_schema']),
+ ('the signer lets a blob burn the free parts as fee', 'airgap_tx_signer',
+  '    if _fee > _per * max(1, _ntx):\n',
+  '    if False:\n',
+  ['test_signer_schema']),
+ ('the fee cap ignores the plan\'s own estimate', 'airgap_tx_signer',
+  '        _per = (Decimal(str(fee_per_round)) * 10\n'
+  '                if fee_per_round not in (None, "") else FEE_CAP_PER_TX)\n',
+  '        _per = FEE_CAP_PER_TX\n',
+  ['test_signer_schema']),
+ ('a root-owned artifact is "another account\'s" and the wipe says success',
+  'gs_common.py',
+  '        if st.st_uid == 0:\n'
+  '            return ("belongs to root',
+  '        if False:\n'
+  '            return ("belongs to root',
+  ['test_opsec_guarantees']),
+ ('the chain and its .retired link are left as a stranger\'s hard link',
+  'paranoia_mode',
+  '                if why and why[2] == "hard_link" and _all_names_here(f):\n'
+  '                    why = None\n',
+  '                pass\n',
+  ['test_opsec_guarantees']),
+ ('the wipe promises a file whose content it will refuse', 'gs_common.py',
+  '    return _not_ours_reason(res, st) is None',
+  '    return True',
+  ['test_opsec_guarantees']),
+ ('a not-yet-written wallet_*.json is promised by its name', 'gs_common.py',
+  '        return [p for p in GS_ARTIFACT_FILE_PATTERNS\n'
+  '                if fnmatch.fnmatch(res.name, p)] != ["wallet_*.json"]',
+  '        return True',
+  ['test_opsec_guarantees']),
+ ('the console\'s SIGHUP handler overrides nohup', 'gs_console',
+  '        if hasattr(signal, _sig) and (signal.getsignal(getattr(signal, _sig))\n'
+  '                                      is signal.SIG_DFL):\n',
+  '        if hasattr(signal, _sig):\n',
+  ['test_console']),
+ ('a shell-exported GS_BTC_ENTRY reaches a receive run', 'gs_console',
+  '        return ("GS_BTC_ENTRY", "GS_BTC_AMOUNT")\n',
+  '        return ()\n',
+  ['test_console']),
 ]
 
 
@@ -7790,6 +7845,18 @@ MUTATIONS = [
 #: The sweep's premise is that the copy behaves like the original. 0755 on the
 #: temp root is what makes that true; the repo inside keeps whatever modes
 #: copytree gave it.
+def _interactive_sigint():
+    """preexec_fn for every suite this runs: SIGINT back to its default.
+
+    A sweep is the kind of thing started with `nohup ... &`, and a background
+    job inherits SIGINT IGNORED -- so every suite that delivers SIGINT to a
+    child and expects KeyboardInterrupt went red in the CONTROL run, and the
+    sweep refused to start over a launcher's disposition (test_listed_bugs,
+    RED(3), three core-dump probes). The full runner wraps each suite in
+    `timeout`, which resets it; this is the same thing done here."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 def _traversable_tmp(prefix):
     tmp = tempfile.mkdtemp(prefix=prefix)
     os.chmod(tmp, 0o755)
@@ -7831,7 +7898,8 @@ def run(idx, name, fname, find, repl, suites):
     for suite in suites:
         try:
             p = subprocess.run([sys.executable, f"tests/{suite}.py"], cwd=dst,
-                               capture_output=True, text=True, timeout=900)
+                               capture_output=True, text=True, timeout=900,
+                               preexec_fn=_interactive_sigint)
             out = p.stdout + p.stderr
         except subprocess.TimeoutExpired:
             # A HUNG SUITE IS NOT A CATCH EITHER, and letting the exception
@@ -7897,9 +7965,16 @@ def control(suites) -> dict:
     for suite in sorted(suites):
         try:
             p = subprocess.run([sys.executable, f"tests/{suite}.py"], cwd=dst,
-                               capture_output=True, text=True, timeout=900)
+                               capture_output=True, text=True, timeout=900,
+                               preexec_fn=_interactive_sigint)
             m = re.findall(r"(\d+) passed, (\d+) failed", p.stdout + p.stderr)
             out[suite] = int(m[-1][1]) if m else -1
+            # WHICH checks, when it is red: "RED(3)" alone sent the reader
+            # off to reproduce a failure the control had already seen.
+            if out[suite] != 0:
+                for _ln in (p.stdout + p.stderr).splitlines():
+                    if "FAIL" in _ln and "ok " not in _ln[:6]:
+                        print(f"           {suite}: {_ln.strip()[:160]}")
         except subprocess.TimeoutExpired:
             out[suite] = -1
     shutil.rmtree(tmp, ignore_errors=True)

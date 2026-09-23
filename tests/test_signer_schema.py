@@ -259,6 +259,12 @@ ck("a carrier that cannot cover its fixed destination is refused",
    "does not cover" in _raises(_RPC(1_000_000_000_000)))
 ck("a carrier with too little to probe with is refused",
    "probe" in _raises(_RPC(1_500_000_000_001)))
+# THE SECOND-TO-LAST PEEL OF A CHAIN THAT DISTRIBUTES EVERYTHING holds only the
+# last share plus a hop's headroom: 0.0196 XMR here, under the old fixed 0.02
+# probe slack, which refused it and stopped the chain part-way (driven: 15 of
+# 100 seeds at 1 XMR). The probe takes at most half of what is left.
+ck("a carrier 0.0196 XMR above its fixed payment still builds, exactly",
+   _raises(_RPC(1_519_628_000_000)) == "")
 ck("a probe that reports no fee is refused rather than guessed",
    "no fee" in _raises(_RPC(5_000_000_000_000, fee=0)))
 
@@ -284,23 +290,27 @@ class _DriftRPC:
                 "unsigned_txset": "00"}
 
 
-# probe; a build 1200 under its price (usable, dust); a redraw that costs more
-# than that lower figure. Retried at the lower fee this RAISED and the peel
-# chain stopped; retried at the higher one it is exact.
+# The probe drew HIGH (wallet2 prices a two-output build at its estimate, so
+# the exact builds all cost less than the probe): priced at what the last
+# build really cost, the retry is exact. Priced at the higher of the two it
+# left the same dust on every retry.
 _dr = _DriftRPC(5_000_000_000_000,
-                [2_635_200_000, 2_634_000_000, 2_635_200_000])
+                [2_634_000_000, 2_632_800_000, 2_632_800_000])
 _dres = _raises(_dr)
-ck("a retry priced at the HIGHER fee comes back exact instead of raising",
-   _dres == "" and _dr.builds[-1][1] == 2_635_200_000
+ck("after a probe that drew high, the retry at the real fee is exact",
+   _dres == "" and _dr.builds[-1][1] == 2_632_800_000
    and sum(int(d["amount"]) for d in _dr.builds[-1][0]["destinations"])
    + _dr.builds[-1][1] == 5_000_000_000_000)
-# ...and a retry that fails anyway leaves the build already in hand.
+# ...and a redraw that costs MORE than the figure it was priced at no longer
+# raises out of the loop: the usable build already in hand is returned.
 _dr2 = _DriftRPC(5_000_000_000_000,
-                 [2_635_200_000, 2_634_000_000, 2_636_400_000, 2_636_400_000,
-                  2_636_400_000])
+                 [2_635_200_000, 2_634_000_000, 2_635_200_000])
 import io as _io5, contextlib as _cl5                          # noqa: E402
 with _cl5.redirect_stdout(_io5.StringIO()) as _o5:
-    _res2 = a._build_exact_consume(_dr2, CONSUME, _dests, 5, 1, 1)
+    try:
+        _res2 = a._build_exact_consume(_dr2, CONSUME, _dests, 5, 1, 1)
+    except Exception:                                        # noqa: BLE001
+        _res2 = None            # the defect: a check that fails, not a crash
 ck("a failed retry returns the best usable build rather than raising",
    _res2 is not None and _res2.get("fee") == 2_634_000_000)
 ck("...and says it leaves dust", "dust" in _o5.getvalue())
@@ -468,6 +478,16 @@ ck("0.1 of a planned 1.5, and 1.4 elsewhere, is REFUSED",
                     ("1.400000000000", _EVIL)]))[0] == "REFUSED")
 ck("the right destination at the WRONG AMOUNT alone is refused too",
    _agrees(_loaded([("1.400000000000", _HON)]))[0] == "REFUSED")
+# AN EXTRA DESTINATION ON ITS OWN: the plan's payment exact, and more money
+# out of the same inputs to someone else. The amount checks above cannot see
+# it; only the destination set can.
+ck("the plan's exact payment PLUS an extra destination is refused",
+   _agrees(_loaded([("1.500000000000", _HON),
+                    ("1.000000000000", _EVIL)]))[0] == "REFUSED")
+ck("...and so is a sweep that also pays someone else",
+   _agrees(_loaded([("1.999970000000", _HON), ("1.000000000000", _EVIL)]),
+           plan=[{"src_index": 2, "dst": _HON, "sweep": True}])[0]
+   == "REFUSED")
 _sweep = [{"src_index": 2, "dst": _HON, "sweep": True}]
 ck("a sweep to the planned address signs, whatever amount it moves",
    _agrees(_loaded([("2.999970000000", _HON)]), plan=_sweep)[0] == "ALLOWED")
@@ -512,11 +532,58 @@ ck("...and it tells the operator the hash detects corruption, not tampering",
    "corruption, not tampering" in _msg)
 ck("an entry the plan has no destinations for is not second-guessed",
    _agrees(_loaded([("1.0", _EVIL)]), plan=[{}], idx=0)[0] == "ALLOWED")
+# THE DISPLAY UNIT. print_money prints the wallet's unit ("set unit"): nine
+# decimals in millinero. Requiring twelve refused every set such a wallet
+# signed (driven on a real regtest wallet-cli).
+_milli = (f"Loaded 1 transactions, for 3000.000000000, fee 0.030000000, "
+          f"sending 1500.000000000 to {_HON}, no change, with min ring size "
+          f"16, no payment ID. Is this okay?  (Y/Yes/N/No): ")
+ck("a wallet showing millinero signs the plan's exact amount",
+   _agrees(_milli)[0] == "ALLOWED")
+ck("...and the wrong amount in millinero is still refused",
+   _agrees(_milli.replace("sending 1500.000000000", "sending 1400.000000000"))[0]
+   == "REFUSED")
+
+
+# THE FEE IS BOUNDED. Exact destinations leave the free parts (a sweep's
+# amount, a fan-out's change) free to be moved into the fee and burned.
+def _with_fee(fee, body):
+    return body.replace("fee 0.000030000000", f"fee {fee}")
+
+
+_sw = [{"src_index": 2, "dst": _HON, "sweep": True}]
+ck("a sweep that burns 9.9 XMR as fee is refused",
+   _agrees(_with_fee("9.900000000000",
+                     _loaded([("0.099970000000", _HON)])), plan=_sw)[0]
+   == "REFUSED")
+_st, _msg = _agrees(_with_fee("9.900000000000",
+                              _loaded([("0.099970000000", _HON)])), plan=_sw)
+ck("...naming the fee", "in fees" in _msg)
+ck("a fee within the plan's own estimate x10 signs",
+   a._check_wallet_cli_agrees.__code__.co_argcount >= 4
+   and _agrees(_with_fee("0.000030000000",
+                         _loaded([("2.999970000000", _HON)])), plan=_sw)[0]
+   == "ALLOWED")
+import io as _io6, contextlib as _cl6                          # noqa: E402
+try:
+    with _cl6.redirect_stdout(_io6.StringIO()):
+        a._check_wallet_cli_agrees(
+            _with_fee("0.000500000000", _loaded([("2.999500000000", _HON)])),
+            _sw, 0, fee_per_round="0.00004")
+    _capped = "ALLOWED"
+except SystemExit:
+    _capped = "REFUSED"
+ck("the cap follows the plan's fee_per_round when it names one "
+   "(0.0005 > 10 x 0.00004)", _capped == "REFUSED")
+ck("a decode with no 'Loaded ... fee' line is refused, not waved through",
+   _agrees(f"sending 1.500000000000 to {_HON}, no change. Is this okay?")[0]
+   == "REFUSED")
 _sg = open(os.path.join(REPO, "airgap_tx_signer")).read()
 ck("the cross-check is actually wired into the signing loop, with the PLAN",
    "_check_wallet_cli_agrees(" in _sg
    and _sg.count("_check_wallet_cli_agrees(") >= 2
-   and '(result.stdout or "") + (result.stderr or ""), plan, idx)' in _sg)
+   and '(result.stdout or "") + (result.stderr or ""), plan, idx,' in _sg
+   and 'fee_per_round=(meta or {}).get("fee_per_round"))' in _sg)
 ck("...and it reads BOTH streams, since wallet-cli's prompt may be on either",
    "(result.stdout or \"\") + (result.stderr or \"\")" in _sg)
 
