@@ -252,6 +252,29 @@ check("C: wallet password NOT anywhere in argv (ps-visible)",
       not any(SECRET_PW in str(tok) for tok in _argv))
 check("C: no --password flag used at all", "--password" not in _argv)
 check("C: uses --password-file instead", "--password-file" in _argv)
+# monero-wallet-cli's OWN files (the review of the uncovered dimensions): with
+# no --log-file it logs beside the name it was started as -- the working
+# directory, the artifact directory under the unit -- and its ring database
+# defaults to ~/.shared-ringdb, and the unit sets HOME to that same directory.
+# Neither sealed nor wiped, both appended by every wake.
+def _after(flag):
+    return _argv[_argv.index(flag) + 1] if flag in _argv else None
+
+
+_rdb = _after("--shared-ringdb-dir")
+check("C: wallet-cli's log goes into the RAM scratch directory with the ring "
+      "database, not beside it in the working directory",
+      bool(_rdb) and _after("--log-file") == os.path.join(
+          _rdb, "wallet-cli.log"))
+check("C: ...and its ring database to a scratch directory outside the "
+      "signer's own directory and the working one, not ~/.shared-ringdb",
+      bool(_rdb) and os.path.isdir(_rdb)
+      and not _rdb.startswith(str(_sign_dir))
+      and not _rdb.startswith(os.getcwd())
+      and ".gs_ringdb_" in _rdb)
+check("C: ...and every wallet-cli the signer starts gets both",
+      open(os.path.join(REPO, "airgap_tx_signer"), encoding="utf-8").read()
+      .count("args.wallet_cli, *_cli_state_args()") == 4)
 check("C: the password file actually carried the secret",
       captured.get("pw_content") == SECRET_PW)
 check("C: password file securely erased after signing",

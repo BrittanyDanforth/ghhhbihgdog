@@ -1149,6 +1149,19 @@ check("a CORRUPT ledger starts a new one and SAYS SO",
 check("...naming both backstops that start over: the replay guard and the "
       "24 h wake budget",
       "replay guard" in _t2 and "wake budget" in _t2)
+# ...AND IN THE JOB LOG, which is where the unit's output goes: it sends
+# stdout to /dev/null, so a print() of this reached nobody on a real boot.
+_ld_log = _ld / "job.log"
+_ld_saved = A._AGENT_LOG[0]
+A._AGENT_LOG[0] = _ld_log
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.load_state(_ld)
+finally:
+    A._AGENT_LOG[0] = _ld_saved
+check("...and it is written to the JOB LOG, not only to a stdout the unit "
+      "discards", _ld_log.is_file()
+      and "does not parse" in _ld_log.read_text())
 
 
 print("\n== one handle names one watchable address, or none ==")
@@ -1556,7 +1569,7 @@ import decimal as _dec                                        # noqa: E402
 _AGENT_SRC = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
 
 
-def _dispatch_withdraw(env_pw, amount_atomic=5_000_000_000_000):
+def _dispatch_withdraw(env_pw, amount_atomic=5_000_000_000_000, depth=1):
     """Drive the real withdraw dispatch. Returns (Refused-code or "", seen)."""
     _s2 = []
 
@@ -1574,7 +1587,7 @@ def _dispatch_withdraw(env_pw, amount_atomic=5_000_000_000_000):
         else:
             os.environ["GS_WALLET_PASSWORD"] = env_pw
         with contextlib.redirect_stdout(io.StringIO()):
-            A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+            A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": depth},
                         _k, _wdir, "A3F1", _cap, "job-x",
                         funded=lambda: (9, 4, _XMR_SAMPLE, amount_atomic))
     except A.Refused as _e:
@@ -1650,6 +1663,81 @@ check("dispatch/floor: ...and it is the SAME floor _phase_of chains on and the "
       "quote step is told -- the LIVE one, so the three cannot drift",
       'Decimal(live_min_out_xmr(key))' in _AGENT_SRC
       and _AGENT_SRC.count("live_min_out_xmr(key)") >= 3)
+# THE FLOOR OF THE DEPTH ASKED FOR (the review of the uncovered dimensions):
+# a twenty-hop withdrawal of an arrival above the three-wallet floor and
+# under the twenty-wallet one ran GhostSpiral, which minted ~25 accounts
+# nobody owns before finding the amount too small to fan out.
+_o_lf = A.live_floor_xmr
+A.live_floor_xmr = lambda key, w: "0.0121" if int(w) <= 3 else "0.0576"
+try:
+    _between = int(Decimal("0.0348") * 10 ** 12)
+    _deep, _seen_deep = _dispatch_withdraw("hunter2", _between,
+                                           depth=max(P.WITHDRAW_DEPTHS))
+    _shallow, _seen_sh = _dispatch_withdraw("hunter2", _between,
+                                            depth=min(P.WITHDRAW_DEPTHS))
+finally:
+    A.live_floor_xmr = _o_lf
+check("dispatch/floor: a DEEP withdrawal of an arrival above the shallowest "
+      "floor and under its own is refused before the spend wallet is "
+      "unlocked and before GhostSpiral mints a single account",
+      _deep == "below_depth_minimum" and _seen_deep == [])
+check("...while the same arrival at the shallowest depth runs",
+      _shallow == "" and len(_seen_sh) == 1)
+# THE MIX'S ACCOUNTS ARE THE OWNER'S ON EVERY EXIT (the review of the
+# uncovered dimensions). A run that failed after the fan-out moved the
+# owner's money onto new accounts saved the ledger with the owner holding
+# only the account it emptied; and a wallet that could not list its accounts
+# BEFORE the mix was passed over, so nothing the mix made was ever theirs.
+_OWN9 = "ab" * 16
+
+
+def _attr_run(rc, accounts_seq):
+    _dd = Path(tempfile.mkdtemp(prefix="attr_"))
+    (_dd / A.HANDLES_FILE).write_text(json.dumps(
+        {"handles": {}, "owners": {_OWN9: {"accounts": [9]}}}))
+    _it = iter(accounts_seq)
+    _ran = []
+    _o = (os.environ.get("GS_WALLET_PASSWORD"), A.integrity_log,
+          A.time.sleep)
+    os.environ["GS_WALLET_PASSWORD"] = "pw"
+    A.integrity_log = lambda *a, **k: None
+    A.time.sleep = lambda s: None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                _r = A._dispatch(
+                    "withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1,
+                                 "owner": _OWN9},
+                    dict(_k, artifact_dir=str(_dd)), _dd, "C4D6",
+                    lambda a, e, b: (_ran.append(a), (rc, False))[1], "job",
+                    funded=lambda: (9, 4, _XMR_SAMPLE, 5_000_000_000_000),
+                    accounts=lambda: next(_it, None))
+            except A.Refused as e:
+                _r = ("refused", e.code)
+    finally:
+        if _o[0] is None:
+            os.environ.pop("GS_WALLET_PASSWORD", None)
+        else:
+            os.environ["GS_WALLET_PASSWORD"] = _o[0]
+        A.integrity_log, A.time.sleep = _o[1], _o[2]
+    _own = json.loads((_dd / A.HANDLES_FILE).read_text())["owners"]
+    return _r, _own.get(_OWN9, {}).get("accounts"), _ran
+
+
+_ra, _acc_a, _ = _attr_run(1, [{0, 9}, {0, 9, 10, 11, 12, 13}])
+check("attribution: a withdrawal that FAILED after the mix started still "
+      "records the accounts the mix minted as the owner's -- their money "
+      "may be on them",
+      _ra[0] == "job_failed" and _acc_a == [9, 10, 11, 12, 13])
+_rb, _acc_b, _ran_b = _attr_run(0, [None, None, None])
+check("attribution: a wallet that cannot list its accounts BEFORE the mix "
+      "is a refusal before anything is written or run -- not a mix whose "
+      "every new account goes unattributed",
+      _rb == ("refused", "owner_accounts_unreadable") and _ran_b == []
+      and _acc_b == [9])
+_rc2, _acc_c, _ran_c = _attr_run(0, [None, {0, 9}, {0, 9, 14}])
+check("...and one busy answer is asked again rather than refused",
+      _rc2[0] == "done" and len(_ran_c) == 1 and _acc_c == [9, 14])
 # THE MIRROR IS THE FALLBACK, NOT THE FLOOR. It was computed at a fee sixty
 # times today's, so it refused deposits under ~0.18 XMR and abandoned
 # leftovers up to that. The live helper asks the daemon; without one (as
@@ -4248,9 +4336,21 @@ try:
     _XMR = 10 ** 12
     _c1, _r1, _o1 = _sweep([int(0.6 * _XMR), None])
     check("sweep/run: 0.6 XMR unlocked against a 0.5 threshold runs ONE "
-          "GhostSpiral child under the depth's own budget",
+          "GhostSpiral child under the depth's own budget WITH the margin a "
+          "withdrawal gets -- the bare figure left nothing for a slow chain, "
+          "and the budget is a kill",
           _c1 == "done" and len(_r1) == 1
-          and _r1[0][2] == P.WITHDRAW_DEPTHS[2][1])
+          and _r1[0][2] == int(P.WITHDRAW_DEPTHS[2][1]
+                               * P.WITHDRAW_BUDGET_MARGIN)
+          and _r1[0][2] > P.WITHDRAW_DEPTHS[2][1])
+    _fs_tss = int(re.search(r"^TimeoutStartSec=(\d+)", open(os.path.join(
+        REPO, "systemd", "gs-wake-agent.service")).read(), re.M).group(1))
+    check("sweep/run: the DEEPEST leg, margin and all, fits the sweep's wall "
+          "-- a leg that cannot fit never starts -- and the backstop armed "
+          "for the wall stays inside the unit's own timeout",
+          int(P.WITHDRAW_DEPTHS[max(P.WITHDRAW_DEPTHS)][1]
+              * P.WITHDRAW_BUDGET_MARGIN) < A.FEE_SWEEP_WALL_S
+          and A.FEE_SWEEP_WALL_S + 600 < _fs_tss)
     # THE BACKSTOP OUTLASTS THE SWEEP. The shipped deadman is 9300 s and a
     # leg at depth 2 runs past it: an idle-boot sweep was a mix the vault
     # powered off in the middle of. Armed ONCE, for the whole wall, before
@@ -4936,6 +5036,29 @@ finally:
 check("...driven: with GS_SWAPKIT_API_KEY set it is in the forward's env",
       _e2 is None and bool(_ran2)
       and _ran2[0][1].get("GS_SWAPKIT_API_KEY") == "k-test")
+# ...AND THE DEPOSIT'S QUOTE, which is the step that asks the aggregator on
+# EVERY deposit (the review of the uncovered dimensions): run_child strips
+# every GS_ variable and only the forward was handed the key, so a keyed
+# SwapKit refused every deposit at its quote.
+_sk_d, _sk_kf, _, _sk_bell = new_env()
+_sk_dp = deps_for(_sk_d, _sk_bell)
+os.environ["GS_SWAPKIT_API_KEY"] = "k-quote"
+try:
+    _sk_o, _sk_e, _ = run(_sk_kf, _sk_dp)
+finally:
+    os.environ.pop("GS_SWAPKIT_API_KEY", None)
+_sk_q = [e for a, e in _sk_dp["_ran"] if "GS_SWAP_AMOUNTS" in e]
+check("...driven: a deposit's QUOTE step gets the key too, and the step "
+      "before it (the wallet) does not",
+      _sk_e is None and len(_sk_q) == 1
+      and _sk_q[0].get("GS_SWAPKIT_API_KEY") == "k-quote"
+      and all("GS_SWAPKIT_API_KEY" not in e for a, e in _sk_dp["_ran"]
+              if "GS_SWAP_AMOUNTS" not in e))
+_sk_d2, _sk_kf2, _, _sk_bell2 = new_env()
+_sk_dp2 = deps_for(_sk_d2, _sk_bell2)
+run(_sk_kf2, _sk_dp2)
+check("...and with no key set, none is invented",
+      all("GS_SWAPKIT_API_KEY" not in e for a, e in _sk_dp2["_ran"]))
 _o2, _e2, _ran2 = _fwd_run(_FWD_REC, {**_FWD_KEY, "feerate_floor_sat_vb": 3,
                                       "feerate_ceiling_sat_vb": 50,
                                       "max_affiliate_bps": 10})
@@ -6037,6 +6160,38 @@ def _btc_dispatch(d, runner, handle, unused, amount=5000000, key=None,
     return out, code, asked, kinds
 
 
+# A STOP BETWEEN STEPS ENDS THE JOB BEFORE THE NEXT STEP'S PREPARATION (the
+# review of the uncovered dimensions): run_child already refuses to spawn,
+# and the lookups check for themselves -- but the preparation in between (the
+# bundle, the ledger record, the allocator) ran first. Driven on the intake,
+# where that preparation is the most: the allocator is not even entered.
+_sb_d, _sb_runs, _sb_runner = _btc_env("stopbetween_")
+
+
+def _sb_runner_stop(argv, env_extra, budget_s):
+    r = _sb_runner(argv, env_extra, budget_s)
+    A._STOP_SIGNAL["term"] = True
+    return r
+
+
+_sb_calls = []
+_sb_real_alloc = A._allocate_btc_index
+A._allocate_btc_index = lambda *a, **k: (_sb_calls.append(1),
+                                         _sb_real_alloc(*a, **k))[1]
+try:
+    _sb_out = _btc_dispatch(_sb_d, _sb_runner_stop, "B5C1", True)
+    _sb_stopped = False
+except A.Stopping:
+    _sb_stopped = True
+finally:
+    A._allocate_btc_index = _sb_real_alloc
+    A._STOP_SIGNAL["term"] = False
+check("stop: a stop during the intake's first step ends the job at the top "
+      "of the next -- the address allocator is not even entered, and the "
+      "quote never runs",
+      _sb_stopped and _sb_calls == [] and len(_sb_runs) == 1)
+
+
 def _rec4(d, h):
     """The raw record, or {} -- a copy that never saves the ledger must read
     RED on the checks, not die with no RESULT line."""
@@ -6157,6 +6312,51 @@ def _mk_read():
         return {}
 
 
+# A STOP ENDS THE LOOKUPS (the review of the uncovered dimensions): each is
+# a Tor circuit's wait, up to BTC_INDEX_GAP of them, and the SIGKILL follows
+# systemd's SIGTERM by 20 s. Asked before each one, so nothing is looked up
+# -- and nothing issued, no mark written -- once a stop is asked.
+_st_looks = []
+A._STOP_SIGNAL["term"] = True
+try:
+    A._allocate_btc_index(_MK, {}, unused=lambda a: _st_looks.append(a)
+                          or True)
+    _st_raised = False
+except A.Stopping:
+    _st_raised = True
+finally:
+    A._STOP_SIGNAL["term"] = False
+check("stop: a stop asked before the intake's address lookups ends them -- "
+      "none is made, no mark is written",
+      _st_raised and _st_looks == [] and not _mk_file.exists())
+_st_d, _st_kf, _, _st_bell = new_env()
+
+
+def _st_child(argv, env_extra, budget):
+    A._STOP_SIGNAL["term"] = True
+    return 0, False
+
+
+_st_ran = []
+_st_e = None
+try:
+    _st_dp = deps_for(_st_d, _st_bell, run_child=lambda a, e, b: (
+        _st_ran.append(a), _st_child(a, e, b))[1])
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            A.run_once(types.SimpleNamespace(key=str(_st_kf), dry_run=False),
+                       {k: v for k, v in _st_dp.items()
+                        if not k.startswith("_")})
+        except A.Stopping as e:
+            _st_e = e
+        except A.Refused as e:
+            _st_e = e
+finally:
+    A._STOP_SIGNAL["term"] = False
+    A._STATE_KEY.clear()
+check("stop: a stop asked during a job's first step ends the job as a STOP "
+      "at the top of the next step, and the second step never runs",
+      isinstance(_st_e, A.Stopping) and len(_st_ran) == 1)
 _i0 = A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
 _mk = _mk_read()
 _mk_text = _mk_file.read_text() if _mk_file.exists() else ""
@@ -6905,6 +7105,32 @@ check("sealed: ...and NOT the fee sweep's entry bundle, the inhibit mark or "
       "the container itself",
       not ({"wallet_feesweep.json", ".gs_wake_inhibit", "state.sealed"}
            & _mem))
+# WHAT A MIX THAT DID NOT FINISH LEAVES (the review of the uncovered
+# dimensions): GhostSpiral keeps its plans -- the entry address the swap
+# memo names, every hop and amount, the fee address with the cut -- on any
+# ending but a complete run, and none of them was a member.
+_mx = Path(tempfile.mkdtemp(prefix="mixleft_"))
+(_mx / "gs_wake_handles.json").write_text('{"handles": {}}')
+(_mx / "unsigned_fanout_ab12.json").write_text('{"dests": ["8BBB 1.23"]}')
+(_mx / "unsigned_dag_ab12.json").write_text('{"dests": ["8CCC 0.5"]}')
+(_mx / ".chain_once_c73b42c7028a").write_text("")
+(_mx / "signer_progress.json").write_text("{}")
+(_mx / "tx_staging" / "dag" / "signed").mkdir(parents=True)
+(_mx / "tx_staging" / "dag" / "unsigned_manifest.json").write_text(
+    '{"dst": "8DDD", "amt": "0.7"}')
+(_mx / "tx_staging" / "dag" / "signed" / "tx_0.signed").write_text("blob")
+_mxn = A.state_close(_mx, bytes(range(32)), bytes(range(32, 64)))
+_mx_left = sorted(p.name for p in _mx.iterdir())
+check("sealed: an incomplete mix's plans, its chain marker and its progress "
+      "go into the store, and its staging TREE is shredded -- a seizure "
+      "between wakes reads none of the mix graph",
+      _mxn > 0 and _mx_left == ["state.sealed"])
+A.state_open(_mx, bytes(range(32)), bytes(range(32, 64)))
+check("...and the plans come back out on the next open (GhostSpiral's own "
+      "next run erases them, as it always did)",
+      (_mx / "unsigned_fanout_ab12.json").is_file()
+      and (_mx / ".chain_once_c73b42c7028a").is_file()
+      and not (_mx / "tx_staging").exists())
 # THE RECOVERY PATH: the Pi is dead, the operator is at the machine.
 _rd, _rkf, _rkey, _rbell = _sealed_env()
 _ro, _re, _rt, _ = _sealed_run(_rd, _rkf, _rbell)
@@ -7172,9 +7398,64 @@ for _bad, _why in ((P.state_seal({"settings.json": "{}"},
                    ("not a container", "a section that is not an object")):
     _xd, _xkf, _, _xbell, _, _ = _stage8_env(clobber=_bad)
     _xo, _xe, _ = run(_xkf, deps_for(_xd, _xbell))
+    # A SECTION THAT IS NOT AN OBJECT IS NOW REFUSED AT LOAD, before any job
+    # is taken: the file is stamped as a sealed keyfile (format version 2),
+    # which promises an object there, so it reads as altered.
     check(f"stage8: ...and so does {_why}",
           _xo is None
-          and getattr(_xe, "code", None) == "keyfile_unreadable")
+          and getattr(_xe, "code", None) in (
+              ("keyfile_unreadable", "keyfile_schema")
+              if _bad == "not a container" else ("keyfile_unreadable",)))
+
+# THE STAMP (the review of the uncovered dimensions): a vault keyfile with a
+# sealed section is format version 2, so every build from before -- each
+# reads only a 1 -- refuses it rather than running on its clear half alone.
+_vd, _vkf, _vkey, _vbell, _vouter, _ = _stage8_env()
+_vc = json.loads(_vkf.read_text())
+check("stamp: a sealed vault keyfile is written as format version 2",
+      _vc["version"] == P.KEYFILE_VERSION_SEALED == 2)
+_vold = dict(_vc)
+_vold["version"] = 1
+check("stamp: ...one written as 1 by this build before the stamp still opens",
+      P.unlock_keyfile(_vold).get("sealed") is not None)
+_vnos = json.loads(json.dumps(_vc))
+_vnos["plain"].pop("sealed")
+_vnoh = json.loads(json.dumps(_vc))
+_vnoh["plain"].pop("state_half")
+for _vbad, _vwhy in ((_vnos, "no sealed section"), (_vnoh, "no half")):
+    try:
+        P.unlock_keyfile(_vbad)
+        _vr = None
+    except P.WakeError as e:
+        _vr = e
+    check(f"stamp: a version-2 keyfile with {_vwhy} is refused as altered",
+          _vr is not None and "altered" in str(_vr))
+check("stamp: a PI keyfile (passphrase-sealed) is never a 2",
+      P.lock_keyfile({"role": "pi", "secret": "11" * 32}, b"pw",
+                     kdf="interactive")["version"] == P.KEYFILE_VERSION)
+# ...AND THIS BUILD REFUSES A HALF-LESS KEYFILE THAT STILL CARRIES A SEALED
+# SECTION (a version-1 file, as this build wrote before the stamp), and a
+# sealed store beside a keyfile with no half: both ran on nothing before.
+_vnh1 = dict(_vouter)
+_vnh1.pop("state_half", None)
+_hd1, _hkf1, _, _hbell1 = new_env()[0:4]
+_hkf1.chmod(0o600)
+_hkf1.write_text(json.dumps({"schema": P.KEYFILE_SCHEMA, "version": 1,
+                             "role": "thinkpad", "kdf": "none",
+                             "plain": _vnh1}))
+_hkf1.chmod(0o400)
+_ho1, _he1, _ = run(_hkf1, deps_for(_hd1, _hbell1))
+check("halfless: a keyfile with sealed settings and no half refuses before "
+      "the job is taken -- it ran on its clear half alone",
+      _ho1 is None and getattr(_he1, "code", None) == "state_half_missing"
+      and _hbell1.collected_at is None)
+_hd2, _hkf2, _, _hbell2 = new_env()[0:4]
+(Path(_hd2) / A.SEALED_FILE).write_text("{}")
+_ho2, _he2, _ = run(_hkf2, deps_for(_hd2, _hbell2))
+check("halfless: a sealed store beside a keyfile with no half refuses "
+      "before the job is taken -- it ran on an EMPTY ledger",
+      _ho2 is None and getattr(_he2, "code", None) == "state_unreadable"
+      and _hbell2.collected_at is None)
 # THE HAND PATHS. Both boots that have no note -- the fee sweep and the
 # recovery CLI -- take the half on argv, and refuse clearly without it.
 _hd, _hkf, _hkey, _, _, _hinner = _stage8_env(
@@ -7281,12 +7562,15 @@ try:
             _ibd, {})
 finally:
     A.integrity_log = _o_ilog
-check("stage8: the idle-boot hook on a sealed keyfile does NOT run, says "
-      "which it is, and names the hand command -- rather than reporting no "
-      "fee wallet, or saying nothing at all",
-      _ib_ran is False and "fee_sweep:sealed" in _ib_kinds
-      and "--unseal-state" in _ib_buf.getvalue()
-      and "sealed to the pair" in _ib_buf.getvalue())
+# QUIET NOW (the review of the uncovered dimensions): this is reached by
+# EVERY idle boot of a sealed keyfile, fee wallet or none, and the pairing
+# refuses the on-idle-boot switch with a seal -- so the warning and its chain
+# line landed on every hand power-on, about a sweep nobody could have asked
+# for. The hand command is documented where a sealed box's sweep lives.
+check("stage8: the idle-boot hook on a sealed keyfile does NOT run -- and "
+      "says nothing and chains nothing, since no sweep can have been asked "
+      "for on one",
+      _ib_ran is False and _ib_kinds == [] and _ib_buf.getvalue() == "")
 # THE PAIRING SENDS THE HALF, AND ONLY AFTER THE CODE COMPARISON.
 _pi_src = open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read()
 #: .index() FINDS THE FIRST OCCURRENCE, and derive_state_half is called in
@@ -8441,6 +8725,62 @@ check("stage8/dry: a dry run on a sealed keyfile with NO half says the "
 check("stage8/dry: ...and with the half it runs them: the issued-index "
       "mark is tried",
       "Issued-index mark" in _dry8_yes and "were NOT run" not in _dry8_yes)
+# ...AND ON THE BOOT THE DOCS SEND THE OPERATOR TO (the review of the
+# uncovered dimensions): a hand boot, where the doorbell is not listening.
+# The dry run ended at doorbell_unreachable one branch before every check.
+_dry8_off = io.StringIO()
+with contextlib.redirect_stdout(_dry8_off):
+    try:
+        A.run_once(types.SimpleNamespace(key=str(_dkf8), dry_run=True,
+                                         unseal_state=_S8_PI.hex()),
+                   {k: v for k, v in deps_for(
+                       _dd8, _dbell8,
+                       post_record=lambda u, p, r, timeout=30: (0, b"")
+                   ).items() if not k.startswith("_")})
+        _dry8_offe = None
+    except (A.Refused, P.WakeError) as e:
+        _dry8_offe = e
+check("stage8/dry: with NO doorbell listening -- a hand boot -- the dry run "
+      "still runs its checks and says the doorbell was not reached, and it "
+      "ends as a dry run, not as doorbell_unreachable",
+      getattr(_dry8_offe, "code", None) == "dry_run"
+      and _dry8_offe.power is False
+      and "Issued-index mark" in _dry8_off.getvalue()
+      and "did not answer" in _dry8_off.getvalue()
+      and "wake window" not in _dry8_off.getvalue())
+# THE FEE WALLET, WHICH THE DRY RUN PROMISED AND NOTHING CHECKED.
+_fwd = Path(tempfile.mkdtemp(prefix="dryfee_"))
+_fdd, _fdkf, _, _fdbell, _, _ = _stage8_env(
+    extra={"fee_rpc": "http://127.0.0.1:18083",
+           "fee_wallet_file": str(_fwd / "fee.wallet"),
+           "fee_address": "9" + "f" * 94,
+           "fee_sweep_to": ["9" + "e" * 94]})
+
+
+def _dryfee():
+    _b = io.StringIO()
+    with contextlib.redirect_stdout(_b):
+        try:
+            A.run_once(types.SimpleNamespace(key=str(_fdkf), dry_run=True,
+                                             unseal_state=_S8_PI.hex()),
+                       {k: v for k, v in deps_for(_fdd, _fdbell).items()
+                        if not k.startswith("_")})
+        except (A.Refused, P.WakeError):
+            pass
+    return _b.getvalue()
+
+
+_dfm = _dryfee()
+(_fwd / "fee.wallet").write_text("x")
+(_fwd / "fee.wallet.keys").write_text("x")
+_dfo = _dryfee()
+check("dry/fee: a fee wallet whose files are not where the keyfile says is "
+      "named -- a sweep would relay a fan-out and fail at signing",
+      "[!] Fee wallet:" in _dfm and "not on this disk" in _dfm)
+check("dry/fee: ...and one that is, is said to be",
+      "Fee wallet: its settings are whole" in _dfo and "[!] Fee wallet" not in _dfo)
+check("dry/fee: ...and the dry run names no path of it on the terminal",
+      str(_fwd) not in _dfm and str(_fwd) not in _dfo)
 # ...and `--dry-run --unseal-state <hex>` IS the dry run, not the record
 # dump -- the dump writes every sealed record out in plaintext.
 _rt8 = []
@@ -8573,12 +8913,102 @@ finally:
     else:
         os.environ["GS_WALLET_PASSWORD"] = _o_pw_pm
 _pm_led = json.loads((_pd / A.HANDLES_FILE).read_text())
+# ON A STOP THE WALLET IS NOT ASKED (the review of this pass): it can take
+# a minute and a half to answer, and systemd's SIGKILL comes twenty seconds
+# after its stop, before the seal. The accounts the mix started from are on
+# the ledger from before it ran, and the NEXT wake records what it minted.
 check("review: a stop that lands AFTER the mix does not skip the ledger -- "
-      "the deposit is marked spent and the minted account recorded as the "
-      "owner's; a _nap in that retry raised and lost both",
+      "the deposit is marked spent, and the accounts the mix started from "
+      "are on it for the next wake; the wallet is not asked on a stop",
       _pm_err is None
       and _pm_led["handles"]["A3F1"].get("spent") is True
-      and 10 in _pm_led["owners"][OWNER]["accounts"])
+      and _pm_led["owners"][OWNER].get(A.PENDING_MIX_FIELD) == [9]
+      and 10 not in _pm_led["owners"][OWNER]["accounts"])
+# THE MARK IS ON THE DISK WHILE THE MIX RUNS: a power cut or a SIGKILL then
+# runs no Python, and a mark held only in memory died with it.
+_hk_d, _hk_runs, _hk_run0 = _ledger_env("hardkill_")
+_hk_raw = json.loads((_hk_d / A.HANDLES_FILE).read_text())
+(_hk_d / A.HANDLES_FILE).write_text(json.dumps(
+    {"handles": _hk_raw, "owners": {OWNER: {"accounts": [9]}}}))
+_hk_seen = {}
+_hk_calls = []
+
+
+def _hk_run(argv, env_extra, budget_s):
+    _hk_seen["during"] = json.loads(
+        (_hk_d / A.HANDLES_FILE).read_text())["owners"][OWNER].get(
+        A.PENDING_MIX_FIELD)
+    A._STOP_SIGNAL["term"] = True             # systemd stops the unit
+    return 143, False                         # ...and the mix exits killed
+
+
+_o_pw_hk = os.environ.get("GS_WALLET_PASSWORD")
+os.environ["GS_WALLET_PASSWORD"] = ""
+_o_il_hk = A.integrity_log
+A.integrity_log = lambda *a, **k: None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1,
+                                     "owner": OWNER},
+                        _k, _hk_d, "C4D6", _hk_run, "job-hk",
+                        accounts=lambda: (_hk_calls.append(1), {9})[1],
+                        funded=lambda: (9, 4, _XMR_SAMPLE,
+                                        5_000_000_000_000))
+        except BaseException:                                # noqa: BLE001
+            pass
+finally:
+    A._STOP_SIGNAL["term"] = False
+    A.integrity_log = _o_il_hk
+    if _o_pw_hk is None:
+        os.environ.pop("GS_WALLET_PASSWORD", None)
+    else:
+        os.environ["GS_WALLET_PASSWORD"] = _o_pw_hk
+check("attribution: the accounts a mix starts from are ON THE DISK while it "
+      "runs -- a power cut then keeps them for the next wake",
+      _hk_seen.get("during") == [9])
+check("attribution: ...and a stop mid-mix asks the wallet NOTHING after it -- "
+      "the one read is the one before the mix; the seal is not held back "
+      "behind a wallet that may take a minute to answer",
+      len(_hk_calls) == 1)
+# THE NEXT WAKE SETTLES IT, before anything of its own mints.
+_rv_d, _rv_runs, _rv_run = _ledger_env("recover_")
+_rv_raw = json.loads((_rv_d / A.HANDLES_FILE).read_text())
+(_rv_d / A.HANDLES_FILE).write_text(json.dumps(
+    {"handles": _rv_raw,
+     "owners": {OWNER: {"accounts": [9], A.PENDING_MIX_FIELD: [0, 9]}}}))
+_rv_led = A._load_ledger(_rv_d)
+check("attribution: the mark survives a load of the ledger",
+      _rv_led["owners"][OWNER].get(A.PENDING_MIX_FIELD) == [0, 9])
+_o_il_rv = A.integrity_log
+A.integrity_log = lambda *a, **k: None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            A._dispatch("swap_status", {"handle": "A3F1", "owner": OWNER},
+                        _k, _rv_d, "A3F1", _rv_run, "job-rv",
+                        accounts=lambda: {0, 9, 11, 12})
+        except BaseException:                                # noqa: BLE001
+            pass
+finally:
+    A.integrity_log = _o_il_rv
+_rv_after = json.loads((_rv_d / A.HANDLES_FILE).read_text())["owners"][OWNER]
+check("attribution: the next wake, whatever its job, records what the cut-off "
+      "mix minted as the owner's and clears the mark",
+      {11, 12} <= set(_rv_after["accounts"])
+      and A.PENDING_MIX_FIELD not in _rv_after)
+_pm_l2 = A._load_ledger(_pd)
+_o_il_pm2 = A.integrity_log
+A.integrity_log = lambda *a, **k: None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pm_rec = A._recover_pending_mixes(_k, lambda: {9, 10}, _pm_l2)
+finally:
+    A.integrity_log = _o_il_pm2
+check("review: ...and the next wake records what that mix minted as the "
+      "owner's, and clears the mark",
+      _pm_rec is True and 10 in _pm_l2["owners"][OWNER]["accounts"]
+      and A.PENDING_MIX_FIELD not in _pm_l2["owners"][OWNER])
 
 # AN EMPTY VALUE IS THE HAND COMMAND, REFUSED -- never a wake.
 _ew = []
@@ -9276,7 +9706,8 @@ check("review2: --unseal-key with NO half names --unseal-key, not "
       "--unseal-state -- the command that writes every record out in the "
       "clear",
       "brings no half" in _hr_msgs["none"][1]
-      and "--unseal-key <hex>" in _hr_msgs["none"][1]
+      and "`--unseal-key --key" in _hr_msgs["none"][1]
+      and "asks for it without echo" in _hr_msgs["none"][1]
       and "--unseal-state" not in _hr_msgs["none"][1])
 check("review2: ...a half one character pair short is named as THAT, with "
       "its length, not as 'brings no half'",
@@ -9580,6 +10011,388 @@ check("review2: ...and does NOT power the machine off under the person who "
       "pressed it",
       not (_sid / "POWERED_OFF").exists() and (_sid / "DISARMED").exists()
       and "stays on" in _si_rest)
+
+# THE HALF IS ASKED FOR, NOT TYPED ON THE COMMAND LINE (the review of the
+# uncovered dimensions). On argv it landed in the shell's history on the disk
+# the seal exists for, and in /proc for as long as the run lasted -- a hand
+# fee sweep is hours -- and with that disk the half opens everything sealed.
+_hp_seen = {}
+_hp_sv = (A.unseal_state_cli, A.power_off, A.disarm_deadman,
+          A.somebody_is_here, A.retire_job_log, A.integrity_log, sys.stdin)
+A.unseal_state_cli = lambda a: _hp_seen.update(half=a.unseal_state) or "opened"
+A.power_off = lambda dry_run=False: True
+A.disarm_deadman = lambda *a, **k: True
+A.somebody_is_here = lambda: ""
+A.retire_job_log = lambda *a, **k: None
+A.integrity_log = lambda *a, **k: None
+_hp_out = io.StringIO()
+try:
+    sys.stdin = io.StringIO("ab" * 32 + "\n")
+    with contextlib.redirect_stdout(_hp_out):
+        _hp_rc = A.main(["--key", "/nonexistent", "--unseal-state"])
+    _hp_piped = _hp_seen.get("half")
+    _hp_argv = io.StringIO()
+    sys.stdin = io.StringIO("")
+    with contextlib.redirect_stdout(_hp_argv):
+        A.main(["--key", "/nonexistent", "--unseal-state", "cd" * 32])
+finally:
+    (A.unseal_state_cli, A.power_off, A.disarm_deadman, A.somebody_is_here,
+     A.retire_job_log, A.integrity_log, sys.stdin) = _hp_sv
+check("half/prompt: `--unseal-state` with NO value reads the half from the "
+      "prompt (here a pipe) -- nothing on argv -- and says nothing about it",
+      _hp_rc == 0 and _hp_piped == "ab" * 32
+      and "ON THE COMMAND LINE" not in _hp_out.getvalue())
+check("half/prompt: ...and a half typed ON argv still works but is named "
+      "for what it is -- in the shell's history on this disk -- without "
+      "repeating it",
+      "ON THE COMMAND LINE" in _hp_argv.getvalue()
+      and "cd" * 32 not in _hp_argv.getvalue()
+      and _hp_seen.get("half") == "cd" * 32)
+check("half/prompt: the three flags that take the half all ask when given "
+      "with no value",
+      all(getattr(A.build_cli().parse_args(["--key", "k", _f]),
+                  _f.lstrip("-").replace("-", "_")) == A.HALF_ASK
+          for _f in ("--unseal-state", "--seal-secrets", "--unseal-key")))
+
+
+class _HpTty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+import getpass as _hp_gp                                     # noqa: E402
+_hp_gpsv, _hp_insv = _hp_gp.getpass, sys.stdin
+_hp_calls = []
+_hp_gp.getpass = lambda prompt="": (_hp_calls.append(prompt), "ef" * 32)[1]
+try:
+    sys.stdin = _HpTty("")
+    _hp_tty = A._ask_half("--unseal-key")
+finally:
+    _hp_gp.getpass, sys.stdin = _hp_gpsv, _hp_insv
+import signal as _hp_sig                                     # noqa: E402
+_hp_seen_sig = {}
+_hp_gp.getpass = lambda prompt="": (_hp_seen_sig.update(
+    h=_hp_sig.getsignal(_hp_sig.SIGINT)), "")[1]
+_hp_marker = lambda *a: None                                 # noqa: E731
+_hp_prev = _hp_sig.signal(_hp_sig.SIGINT, _hp_marker)
+try:
+    sys.stdin = _HpTty("")
+    A._ask_half("--unseal-state")
+    _hp_after = _hp_sig.getsignal(_hp_sig.SIGINT)
+finally:
+    _hp_gp.getpass, sys.stdin = _hp_gpsv, _hp_insv
+    _hp_sig.signal(_hp_sig.SIGINT, _hp_prev)
+check("half/prompt: Ctrl-C ENDS the prompt -- Python's own handler is in "
+      "place while it waits, not the stop handler that only records it -- "
+      "and the stop handler is put back after",
+      _hp_seen_sig.get("h") is _hp_sig.default_int_handler
+      and _hp_after is _hp_marker)
+check("half/prompt: at a terminal it is read with getpass -- NOT echoed -- "
+      "and the prompt names the flag, never a value",
+      _hp_tty == "ef" * 32 and len(_hp_calls) == 1
+      and "--unseal-key" in _hp_calls[0] and "ef" not in _hp_calls[0])
+
+# ===========================================================================
+print("\n== the store writes out only what it seals ==")
+# The header's schema is compared, not authenticated, and the settings and the
+# secrets are sealed under the same two halves: relabelled as the store, they
+# opened and wrote settings.json / secrets.json out -- names state_close never
+# seals or shreds.
+_rl = Path(tempfile.mkdtemp(prefix="relabel_"))
+_rl_vh, _rl_ph = bytes.fromhex(_SEAL_HALF), _S8_PI
+_rl_c = P.state_seal({"settings.json": json.dumps({"btc_account_xpub": "xpubRL"}),
+                      "gs_wake_state.json": "{}"},
+                     _rl_vh, _rl_ph, schema=P.SETTINGS_SCHEMA)
+_rl_c["schema"] = P.STATE_SCHEMA
+(_rl / A.SEALED_FILE).write_text(json.dumps(_rl_c))
+try:
+    A.state_open(_rl, _rl_vh, _rl_ph)
+    _rl_e = None
+except A.Refused as e:
+    _rl_e = e
+check("relabel: a settings container relabelled as the store is refused, "
+      "and NOTHING is written out -- not the setting, not the member beside it",
+      getattr(_rl_e, "code", None) == "state_unreadable"
+      and not (_rl / "settings.json").exists()
+      and not (_rl / "gs_wake_state.json").exists())
+_rl2 = Path(tempfile.mkdtemp(prefix="relabel2_"))
+(_rl2 / A.SEALED_FILE).write_text(json.dumps(P.state_seal(
+    {"gs_wake_state.json": "{}", "thor_pairs_A3F1.json": "{}",
+     A.CHAIN_MEMBER: "", A.JOB_LOG_PREV: "==== day 1 -- x ====\n"},
+    _rl_vh, _rl_ph)))
+check("relabel: NON-VACUITY -- a store of real members still opens",
+      A.state_open(_rl2, _rl_vh, _rl_ph) >= 3
+      and (_rl2 / "thor_pairs_A3F1.json").exists())
+
+
+# ===========================================================================
+print("\n== a hand fee sweep that ran powers off, unless somebody is there ==")
+# STAGE9_PLAN and a comment in main() said a hand --fee-sweep returns without
+# powering anything off; it powers off when it ends, like a wake, and the
+# inhibit file -- touched WHILE it runs, since preflight refuses to start with
+# it present -- is what keeps the machine on. The claims were fixed to match;
+# this pins the behaviour they now describe.
+_hs_dir = Path(tempfile.mkdtemp(prefix="handsweep_"))
+_hs_sv = (A.run_fee_sweep_cli, A.power_off, A.disarm_deadman,
+          A.integrity_log, A.retire_job_log, dict(A._LATE_GUARD))
+_hs_off = []
+
+
+def _hs_run(touch):
+    def _sweep(args):
+        A._LATE_GUARD["dir"] = _hs_dir
+        A._LATE_GUARD["rpc"] = ""
+        if touch:
+            (_hs_dir / A.INHIBIT_FILE).write_text("")
+        return "done"
+    A.run_fee_sweep_cli = _sweep
+    _hs_off.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        A.main(["--key", "/nonexistent", "--fee-sweep"])
+    try:
+        (_hs_dir / A.INHIBIT_FILE).unlink()
+    except FileNotFoundError:
+        pass
+    return list(_hs_off)
+
+
+A.power_off = lambda dry_run=False: _hs_off.append("off") or True
+A.disarm_deadman = lambda *a, **k: True
+A.integrity_log = lambda *a, **k: None
+A.retire_job_log = lambda *a, **k: None
+try:
+    _hs_plain = _hs_run(False)
+    _hs_inh = _hs_run(True)
+finally:
+    (A.run_fee_sweep_cli, A.power_off, A.disarm_deadman, A.integrity_log,
+     A.retire_job_log, _lg) = _hs_sv
+    A._LATE_GUARD.clear()
+    A._LATE_GUARD.update(_lg)
+check("handsweep: a hand --fee-sweep that ran powers the machine off when it "
+      "ends, as its --help and OPSEC_SETUP now say", _hs_plain == ["off"])
+check("handsweep: ...and does NOT when the inhibit file appeared while it ran",
+      _hs_inh == [])
+
+
+# ===========================================================================
+print("\n== 'more left' is judged at the depth asked for ==")
+# Against the shallowest floor, a deep withdrawal chained into a leg the vault
+# then refused below_depth_minimum: a wake spent, the reason left here.
+_mf_sv = (A.live_floor_xmr, A.live_min_out_xmr)
+A.live_min_out_xmr = lambda k: "0.10"
+A.live_floor_xmr = lambda k, w: str(Decimal("0.01") * w)
+try:
+    _mf_deep = max(P.WITHDRAW_DEPTHS)
+    _mf_w = A.withdraw_wallets(_mf_deep)
+    _mf = (A._more_floor({}, _mf_deep), A._more_floor({}, min(P.WITHDRAW_DEPTHS)),
+           A._more_floor({}, None))
+finally:
+    A.live_floor_xmr, A.live_min_out_xmr = _mf_sv
+check("more: the floor for the next leg is the DEPTH's floor, the same one "
+      "a withdrawal is refused below; the shallowest's when none is named",
+      _mf[0] == Decimal("0.01") * _mf_w and _mf_w != A._MIN_OUT_WALLETS
+      and _mf[1] == Decimal("0.10") and _mf[2] == Decimal("0.10"))
+check("more: ...and a finished withdrawal hands its note's depth to the "
+      "question", "depth=params.get(\"depth\"))" in open(
+          os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read())
+
+
+# ===========================================================================
+print("\n== a note that fails its schema is still answered ==")
+# It authenticated and echoed this boot's challenge, so it is the Pi's own
+# job, taken off it at-most-once -- and the Pi was never answered, holding
+# its one-job lock for the whole result window.
+_vj_d, _vj_kf, _, _ = new_env()
+_vj_bell = DB.Pending({"secret": PI.encode().hex(),
+                      "peer_public": TP.public_key.encode().hex()},
+                     "swap_status",
+                     with_owner({"handle": "A3F1", "from_a_newer_pi": 1}),
+                     clock=lambda: 0.0)
+_vj_o, _vj_e, _ = run(_vj_kf, deps_for(_vj_d, _vj_bell))
+check("schema: a note the vault cannot validate is refused as a bad note "
+      "AND the doorbell is told 'refused', so the pager lets go",
+      _vj_o is None and isinstance(_vj_e, P.WakeError)
+      and _vj_bell.result is not None
+      and _vj_bell.result.get("status") == "refused")
+
+
+# ===========================================================================
+print("\n== a failed run's log survives the next boot ==")
+# A run that went wrong keeps its log in the store "so the operator can read
+# it with --unseal-state" -- and the NEXT boot destroyed it: it truncated a
+# fresh log at start, state_open saw one on the disk and left the sealed copy
+# where it was, and the close sealed the fresh one over it. The pager's own
+# automatic wakes come next, and they are usually clean.
+_pl_d, _pl_kf, _pl_key, _pl_bell = _sealed_env()
+
+
+def _pl_fail(argv, env_extra, budget):
+    if "create_receive_wallet" in " ".join(argv):
+        (_pl_d / "wallet_recv_1.json").write_text("{}")
+        return 0, False
+    A.agent_say("CHILD SAID: the aggregator refused the quote (pl-7731)")
+    return 1, False
+
+
+_pl_o1, _pl_e1, _, _ = _sealed_run(_pl_d, _pl_kf, _pl_bell,
+                                   run_child=_pl_fail)
+_pl_bell2 = DB.Pending({"secret": PI.encode().hex(),
+                        "peer_public": TP.public_key.encode().hex()},
+                       "receive_and_quote",
+                       with_owner({"amount_sat": 5000000}),
+                       clock=lambda: 0.0)
+
+
+def _pl_ok(argv, env_extra, budget):
+    if "create_receive_wallet" in " ".join(argv):
+        (_pl_d / "wallet_recv_2.json").write_text("{}")
+    return 0, False
+
+
+_pl_o2, _pl_e2, _, _ = _sealed_run(_pl_d, _pl_kf, _pl_bell2, run_child=_pl_ok)
+_pl_members = P.state_unseal(json.loads((_pl_d / A.SEALED_FILE).read_text()),
+                             bytes.fromhex(_SEAL_HALF),
+                             _S8_PI) \
+    if (_pl_d / A.SEALED_FILE).is_file() else {}
+_pl_prev = _pl_members.get(A.JOB_LOG_PREV, "")
+check("joblog: (setup) the first run failed and the second finished clean",
+      (_pl_o1 is None or _pl_o1[0] != "done") and _pl_o2
+      and _pl_o2[0] == "done")
+check("joblog: after a CLEAN wake, the failed run's log is still in the "
+      "store -- kept apart, where a clean run does not reach",
+      "pl-7731" in _pl_prev and A.JOB_LOG not in _pl_members)
+check("joblog: ...under a header saying what it is",
+      "did not finish cleanly" in _pl_prev)
+check("joblog: ...and it is sealed at rest: no log of either run on the disk",
+      not (_pl_d / A.JOB_LOG_PREV).exists()
+      and not (_pl_d / A.JOB_LOG).exists())
+# A CRASHED RUN'S PLAINTEXT LOG was truncated at the next boot.
+_cr = Path(tempfile.mkdtemp(prefix="crashlog_"))
+(_cr / A.JOB_LOG).write_text("CRASHED MID-RUN (cr-4410)\n")
+A._keep_leftover_log(_cr)
+check("joblog: a log left on the disk by a boot that neither sealed nor "
+      "finished cleanly is KEPT at the next boot's start, not truncated",
+      "cr-4410" in (_cr / A.JOB_LOG_PREV).read_text()
+      and (_cr / A.JOB_LOG).read_text() == ""
+      and oct(os.stat(_cr / A.JOB_LOG_PREV).st_mode)[-3:] == "600")
+A._keep_leftover_log(_cr)
+check("joblog: ...and an empty one adds nothing",
+      (_cr / A.JOB_LOG_PREV).read_text().count("==== day ") == 1)
+# SHREDDED ONLY ONCE KEPT: a copy that could not be written keeps the original.
+_cr2 = Path(tempfile.mkdtemp(prefix="crashlog2_"))
+(_cr2 / A.JOB_LOG).write_text("KEEP ME (cr-5521)\n")
+_cr2_sv = A._prev_write
+A._prev_write = lambda *a, **k: False
+try:
+    A._keep_leftover_log(_cr2)
+finally:
+    A._prev_write = _cr2_sv
+check("joblog: a leftover whose copy could not be written is NOT shredded "
+      "for it -- the boot truncates it as it always did, nothing worse",
+      not (_cr2 / A.JOB_LOG_PREV).exists())
+# NEVER THROUGH A LINK.
+_cr3 = Path(tempfile.mkdtemp(prefix="crashlog3_"))
+(_cr3 / "target").write_text("not a log (cr-7788)\n")
+os.symlink(str(_cr3 / "target"), str(_cr3 / A.JOB_LOG))
+A._keep_leftover_log(_cr3)
+check("joblog: a job log that is a LINK is removed, not truncated through -- "
+      "what it pointed at is untouched",
+      (_cr3 / "target").read_text() == "not a log (cr-7788)\n"
+      and not (_cr3 / A.JOB_LOG).is_symlink()
+      and (_cr3 / A.JOB_LOG).read_text() == "")
+# BOUNDED: by age, then by size.
+_today = int(time.time()) // 86400
+_old = (A._PREV_HEAD + f"{_today - A.JOB_LOG_PREV_DAYS - 1} -- old ====\n"
+        .encode() + b"ancient (pr-0001)\n")
+_new = A._prev_part("recent", b"recent (pr-0002)")
+A._prev_write(_cr, A._prev_parts(_old) + [_new])
+_pw = (_cr / A.JOB_LOG_PREV).read_text()
+check(f"joblog: a part older than {A.JOB_LOG_PREV_DAYS} days is dropped, a "
+      f"recent one kept", "pr-0001" not in _pw and "pr-0002" in _pw)
+_big = [A._prev_part(f"p{_i}", (b"x" * 100000) + f" (sz-{_i})".encode())
+        for _i in range(5)]
+A._prev_write(_cr, _big)
+_pb = (_cr / A.JOB_LOG_PREV).read_bytes()
+check("joblog: past the size cap the OLDEST go first, and the file stays "
+      "under it", len(_pb) <= A.JOB_LOG_PREV_MAX and b"sz-4" in _pb
+      and b"sz-0" not in _pb)
+# ONLY WHERE THE NEXT WAKE SEALS IT: a pairing that never seals would keep
+# a memo naming a client's address in the clear for good.
+_ns = Path(tempfile.mkdtemp(prefix="nosealog_"))
+(_ns / A.JOB_LOG).write_text("FAILED (ns-3141)\n")
+(_ns / A.JOB_LOG_PREV).write_text("==== day 1 -- old ====\nold (ns-2718)\n")
+A._keep_leftover_log(_ns, keep=False)
+check("joblog: on a pairing that does not seal, nothing is kept -- the "
+      "leftover and any earlier boots' log are shredded, as before",
+      not (_ns / A.JOB_LOG_PREV).exists()
+      and (_ns / A.JOB_LOG).read_text() == "")
+# ...DRIVEN: a vault that does not seal, a failed wake, then another --
+# nothing of the first is kept in the clear.
+_nsd, _nskf, _, _nsb = new_env()
+
+
+def _ns_fail(argv, env_extra, budget):
+    if "create_receive_wallet" in " ".join(argv):
+        (_nsd / "wallet_recv_1.json").write_text("{}")
+        return 0, False
+    A.agent_say("QUOTE FAILED (ns-driven-77)")
+    return 1, False
+
+
+run(_nskf, deps_for(_nsd, _nsb, run_child=_ns_fail))
+(_nsd / A.JOB_LOG).write_text((_nsd / A.JOB_LOG).read_text()
+                              if (_nsd / A.JOB_LOG).exists() else "x\n")
+_nsb2 = DB.Pending({"secret": PI.encode().hex(),
+                    "peer_public": TP.public_key.encode().hex()},
+                   "receive_and_quote", with_owner({"amount_sat": 5000000}),
+                   clock=lambda: 0.0)
+run(_nskf, deps_for(_nsd, _nsb2))
+check("joblog: DRIVEN on a vault that does not seal -- a failed wake, then "
+      "another: no earlier boots' log is kept in the clear",
+      not (_nsd / A.JOB_LOG_PREV).exists()
+      and "ns-driven-77" not in ((_nsd / A.JOB_LOG).read_text()
+                                  if (_nsd / A.JOB_LOG).exists() else ""))
+# THE FAILED RUN'S LOG SURVIVES THE CAP: trimmed to its end, header kept,
+# not dropped whole for the small leftover beside it.
+_cp = Path(tempfile.mkdtemp(prefix="caplog_"))
+_big = A._prev_part("sealed by a run that did not finish cleanly",
+                    b"x" * 300000 + b"\nTHE REASON (cap-9001)\n")
+_small = A._prev_part("left on the disk by an earlier boot",
+                      b"Wake finished: job_failed")
+A._prev_write(_cp, [_big, _small])
+_cpt = (_cp / A.JOB_LOG_PREV).read_bytes()
+check("joblog: a failed run's long log is trimmed to its END -- where the "
+      "reason is -- and keeps its header, instead of being dropped",
+      b"cap-9001" in _cpt and b"did not finish cleanly" in _cpt
+      and b"job_failed" in _cpt and len(_cpt) <= A.JOB_LOG_PREV_MAX)
+check("joblog: ...and a trimmed part still parses as a part",
+      len(A._prev_parts(_cpt)) == 2)
+_dup = A._prev_part("x", b"the same (dup-1)")
+_dup2 = (_dup[0] + 1, _dup[1].replace(str(_dup[0]).encode(),
+                                      str(_dup[0] + 1).encode(), 1))
+A._prev_write(_cp, [_dup, _dup2, _dup])
+check("joblog: a part merged in twice (a boot killed between open and close) "
+      "is kept ONCE, whatever day its header says",
+      (_cp / A.JOB_LOG_PREV).read_bytes().count(b"dup-1") == 1)
+# THE HAND OPEN DOES NOT PRUNE: a person opening the store to read an old
+# failure must get it, not have it pruned on the way out.
+_ho = Path(tempfile.mkdtemp(prefix="handopen_"))
+_ho_old = (A._PREV_HEAD + f"{int(time.time()) // 86400 - 30} -- old ====\n"
+           .encode() + b"three weeks ago (ho-1618)\n")
+(_ho / A.SEALED_FILE).write_text(json.dumps(P.state_seal(
+    {A.JOB_LOG_PREV: _ho_old.decode(), "gs_wake_state.json": "{}"},
+    bytes.fromhex(_SEAL_HALF), _S8_PI)))
+A.state_open(_ho, bytes.fromhex(_SEAL_HALF), _S8_PI)
+check("joblog: opening the store does not prune -- a month-old failure is "
+      "written out for the person who opened it",
+      b"ho-1618" in (_ho / A.JOB_LOG_PREV).read_bytes())
+A._prune_prev_log(_ho)
+check("joblog: ...pruning is the close's, going back in",
+      not (_ho / A.JOB_LOG_PREV).exists())
+check("joblog: the earlier boots' log is a sealed member",
+      any(__import__("fnmatch").fnmatch(A.JOB_LOG_PREV, _g)
+          for _g in A.SEALED_GLOBS))
+
 
 # LAST LINE BEFORE THE RESULT, AND THAT MATTERS MORE THAN IT LOOKS.
 # fail_loudly_on_crash disarms itself the moment this is called, so every

@@ -571,6 +571,13 @@ import nacl.public as _NP2
 
 _dbm = load("gs_doorbell")
 _P2 = __import__("gs_wake_proto")
+# THE LOSER OF EACH RACE CREATES THE OPERATOR'S HOLD FILE (a second boot
+# signed as the vault is what a copy of it looks like), and the default is the
+# Pi's real one. Each trial gets its own scratch path: a run on a Pi must not
+# hold that Pi's wakes, and a hold left by one trial would refuse BOTH boots
+# of the next, which the double-handover count below would read as a pass.
+_hold_dir2 = tempfile.mkdtemp(prefix="gs_hold_")
+_P2.HOLD_FILE_DEFAULT = os.path.join(_hold_dir2, "wakes.held")
 _pi2, _tp2 = _NP2.PrivateKey.generate(), _NP2.PrivateKey.generate()
 _k2 = {"secret": _pi2.encode().hex(),
        "peer_public": _tp2.public_key.encode().hex()}
@@ -582,9 +589,10 @@ def _m1_for(_pend, _eph):
                      "challenge": "11" * 32, "window": _pend.window.hex()})
 
 
-_both, _trials = 0, 25
+_both, _one, _trials = 0, 0, 25
 for _i in range(_trials):
-    _pend = _dbm.Pending(_k2, "swap_status", {"handle": "A3F1"}, clock=lambda: 0.0)
+    _pend = _dbm.Pending(_k2, "swap_status", {"handle": "A3F1"}, clock=lambda: 0.0,
+                         hold_file=os.path.join(_hold_dir2, f"held_{_i}"))
     _ra = _m1_for(_pend, _NP2.PrivateKey.generate())
     _rb = _m1_for(_pend, _NP2.PrivateKey.generate())
     _got = []
@@ -603,8 +611,17 @@ for _i in range(_trials):
     _t1.start(); _t2.start(); _t1.join(); _t2.join()
     if len(_got) == 2:
         _both += 1
+    if len(_got) == 1:
+        _one += 1
 check(f"handover: two boots racing for one job -- exactly one wins, every "
       f"time ({_both} double-handovers in {_trials} trials)", _both == 0)
+check(f"handover: NON-VACUITY -- and one DOES win every time ({_one} of "
+      f"{_trials}); a race nobody wins would pass the count above",
+      _one == _trials)
+check("handover: ...and every race held the wakes behind it, each in its own "
+      "file", all(os.path.exists(os.path.join(_hold_dir2, f"held_{_j}"))
+                  for _j in range(_trials))
+      and not os.path.exists(_P2.HOLD_FILE_DEFAULT))
 check("handover: ...and the loser is RECORDED, so the CLI's own warning can "
       "still print", "m1_second_ephemeral" in _pend.events)
 # NON-VACUITY: the lock must not break the retry it exists alongside. A

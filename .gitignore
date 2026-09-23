@@ -57,6 +57,7 @@ unsigned_monero_tx
 signed_monero_tx
 gs_sign_*/
 gs_impout_*/
+.gs_ringdb_*/
 # Monero's own logs. Clean at the default level, but monero-wallet-cli.log
 # carries the full wallet address at --log-level 2, and monerod's log is
 # created world-readable (0644).
@@ -128,6 +129,8 @@ gs_wake_handles.json
 state.sealed
 state.sealed.new
 integrity_chain.log.merge
+integrity_chain.log.retired
+integrity_chain.log.new
 # The spend secrets, sealed (STAGE9_PLAN.md) and in plaintext. Both normally
 # live in /etc, which no wipe root reaches and no checkout contains -- but
 # --seal-secrets takes --secrets-env and --secrets-file, so an operator or a
@@ -151,6 +154,8 @@ gs_wake_status.json
 # whatever thor_swap_preparer printed, which includes the BTC deposit address
 # and the ThorChain memo -- and the memo names the destination XMR address.
 gs_wake_job.log
+gs_wake_job.prev.log
+gs_wake_job.prev.log.new
 # integrity_log_once's run-scoped dedupe marker. It holds one line per
 # chain event kind -- redacted now, but still the run's event vocabulary,
 # and it is written next to the plans.

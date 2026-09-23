@@ -714,6 +714,57 @@ def _ceremony(i_ask=lambda s: True, r_ask=lambda s: True, tamper=None,
     return res
 
 
+# THE PI'S HALF RIDES TO A KEY THAT DIES WITH THE CEREMONY (PAIR_PROTO 7,
+# the review of the uncovered dimensions). Sealed between the two long-term
+# keys, a recording of the ceremony off the switch plus the vault's keyfile
+# taken later -- its secret is in the clear by design -- opened the half with
+# no wake at all. Driven: the Pi's config record is captured off the wire.
+class _Tap:
+    def __init__(self, s):
+        self._s, self.sent = s, []
+
+    def sendall(self, b):
+        self.sent.append(bytes(b))
+        return self._s.sendall(b)
+
+    def __getattr__(self, n):
+        return getattr(self._s, n)
+
+
+_tisk, _trsk = _NP.PrivateKey.generate(), _NP.PrivateKey.generate()
+_ta, _tb = _socket.socketpair()
+_ta.settimeout(20)
+_tb.settimeout(20)
+_tap = _Tap(_ta)
+_tres = {}
+_tt = _threading.Thread(target=lambda: _tres.update(r=P.pair_responder(
+    _tb, _trsk, _trsk.public_key.encode(), _VINFO, lambda s: True,
+    lambda m: None)))
+_tt.start()
+_tres["i"] = P.pair_initiator(_tap, _tisk, _tisk.public_key.encode(),
+                              {**_PINFO, "state_half": "ab" * 32},
+                              lambda s: True, lambda m: None)
+_tt.join(30)
+_ta.close()
+_tb.close()
+_pc_recs = [b for b in _tap.sent if len(b) == P.RECORD_LEN]
+_opened_static = None
+for _b in _pc_recs:
+    try:
+        _opened_static = P.open_record(_trsk, _tisk.public_key, _b, P.TAG_PC)
+    except P.WakeError:
+        pass
+check("pairing: the Pi's config -- its half of the state key among it -- is "
+      "NOT sealed between the long-term keys: the vault's long-term secret "
+      "(in its keyfile, in the clear) does not open the recorded record",
+      _pc_recs and _opened_static is None)
+check("...while the vault, holding its ceremony key, read it -- the half "
+      "arrived", isinstance(_tres.get("r"), dict)
+      and _tres["r"]["peer_info"].get("state_half") == "ab" * 32)
+check("PAIR_PROTO was bumped for the ceremony key: a 6 and a 7 would agree to "
+      "pair and then fail to open each other's configuration",
+      P.PAIR_PROTO >= 7)
+
 _r = _ceremony()
 check("both boxes derive the SAME code from the two public keys",
       isinstance(_r["i"], dict) and isinstance(_r["r"], dict)
@@ -817,7 +868,12 @@ def _hostname(sock, pub, ask):
     # that check -- they run their own code -- so driving this through
     # _pair_config would only ever test our sender-side guard and would leave
     # the RECEIVER's guard, the one that actually has to hold, unexercised.
-    rec = P.seal(_evilsk, _NP.PublicKey(peer), P.TAG_PC,
+    # PAIR_PROTO 7: the vault's ceremony key arrives first, and the config
+    # is sealed to it -- an attacker who wants the vault to read theirs has
+    # to do the same.
+    _pe = P.open_record(_evilsk, _NP.PublicKey(peer), P._pair_read_record(sock),
+                        P.TAG_PE)
+    rec = P.seal(_evilsk, _NP.PublicKey(bytes.fromhex(_pe["eph"])), P.TAG_PC,
                  {"info": {"host": "evil.example.com", "port": 41337}})
     sock.sendall(rec)
     got = P._pair_read_record(sock)
@@ -967,8 +1023,9 @@ check("_pair_config validates its OWN info before sending it",
       "_pair_info({\"info\": my_info})" in src)
 _pc_body = src.split("def _pair_config")[1].split("\ndef ")[0]
 check("...and aborts the peer rather than leaving it holding a keyfile "
-      "(both on my own bad info and on the peer's)",
-      _pc_body.count("_pair_abort(sock, \"info\")") == 2)
+      "(on my own bad info, on the peer's, and -- PAIR_PROTO 7 -- on a "
+      "ceremony key that does not open)",
+      _pc_body.count("_pair_abort(sock, \"info\")") == 3)
 check("PAIR_ABORT['info'] is no longer dead code",
       "_pair_abort(sock, \"info\")" in src and "\"info\":" in src)
 

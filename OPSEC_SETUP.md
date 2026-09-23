@@ -95,6 +95,54 @@ closing lines, an idle boot's refusal) is the one tail left in the clear. What i
 taken mid-job while the records are open on the disk, reads everything.
 It is a clock-and-possession fix, not a safe.
 
+**And the next wake undoes it for whoever holds a copy of the disk.** The
+vault's wake keyfile is plaintext (nobody is there at boot to type a
+passphrase), so a copy of the ThinkPad's disk can speak as the vault — and
+the note the Pi sends at a wake carries the Pi's half. Someone who takes the
+ThinkPad, or images it and puts it back, and is on your LAN at the next wake
+— yours, or a forward or recheck the pager starts by itself — is handed the
+half, and with the vault's own half opens the records, the sealed settings
+and the sealed seed. No protocol change closes that: everything the vault
+holds before that note is on its disk in the clear. Not waking closes it:
+
+```
+# on the Pi, the moment the ThinkPad may have been taken, imaged or handled:
+touch /var/lib/gs/wakes.held
+```
+
+While that file is there the pager starts nothing — not a tap, not a
+chained leg, not a fee retry, not a recheck; `/status` answers `held` — and
+the doorbell sends no magic packet and hands its note to nothing that
+answers. It looks again right before the note is sealed, so a wake already
+counting down to its packet stops too. It rests on no secret: the path is
+in this public repository, and removing the file takes the Pi's card, which
+is a different compromise from the one it answers. The doorbell creates the
+same file **by itself** when two different boots sign as the vault inside
+one wake, and the chat is told everything is held: that is the shape a copy
+of the disk answering takes (the other reading — the ThinkPad booting twice
+— is yours to rule out before you lift it). If it cannot write the file the
+pager holds in memory until it restarts and says so, and it refuses to start
+at all while the file's directory is missing or read-only — a hold nobody
+can place is not a control. A note signed as the vault that arrives
+**before** the magic packet is refused and reported: only something already
+switched on can send one.
+
+**The automatic hold is best-effort; yours is the control.** It needs the
+real ThinkPad to reach the doorbell after the copy did. Someone on your LAN
+with a copy of the disk can take the job first and keep the doorbell's few
+connection slots busy until the window closes, so the real one never
+arrives and nothing looks wrong. Only the hold you place rests on anything.
+
+Lift it (`rm /var/lib/gs/wakes.held`) only once the ThinkPad has been
+checked and, if there is any doubt, **paired again**: open the store under
+the old pair (the two commands below), pair (§4), then shred the old Pi
+keyfile and your old copy of the half. The copy of the disk then holds a
+keyfile nothing answers and records sealed under a half that no longer
+exists anywhere. **If any wake ran between the moment the ThinkPad may have
+been handled and the hold**, assume the copy has the half: treat the
+settings and the seed as read, move the funds to a new seed and a new
+account xpub, and pair again.
+
 Two things follow that you have to actually do:
 
 * **Both boxes get updated in the same sitting.** A vault paired for
@@ -109,23 +157,33 @@ Two things follow that you have to actually do:
   `state.sealed` is in the artifact directory, before it opens a socket,
   and tells you to open it first with the two commands below, *under the
   pair that sealed it* (the old keyfile, and the old half — from the old Pi,
-  or the hex you wrote beside the LUKS USB). That writes the records out and
+  or your copy inside the LUKS USB). That writes the records out and
   retires the container; the first wake under the new pair seals them again.
   It refuses the same way while `/etc/gs-wake-spend.sealed` is there: that
   one nothing opens by hand, so have the plaintext secrets in hand, move it
   aside, pair, and `--seal-secrets` again.
 
 **If the Pi dies and a deposit still has to be paid out**, you do not lose
-the records; you go and get the half by hand. Write these two beside the
-LUKS USB, because you will want them on the day the Pi does not boot:
+the records; you go and get the half by hand. Keep these two commands, and
+a copy of the half `state-key` prints, **inside the LUKS USB's encrypted
+volume** — never on paper beside it: with this vault's disk, which unlocks
+itself, the half opens every sealed record, the sealed settings and the
+sealed seed. You will want them on the day the Pi does not boot:
 
 ```
 # on the Pi (or the SD card in any reader), asks for the card's passphrase:
 gs_doorbell state-key --key /etc/gs_wake_pi.key
 
-# then at the ThinkPad, with the hex it printed:
-gs_wake_agent --unseal-state <hex> --key /etc/gs_wake_thinkpad.key
+# then at the ThinkPad; it ASKS for the half, without echo:
+gs_wake_agent --unseal-state --key /etc/gs_wake_thinkpad.key
 ```
+
+**The half is never typed on the vault's command line.** Each of the four
+commands that take it (`--unseal-state`, `--seal-secrets`, `--unseal-key`,
+`--fee-sweep --unseal-state`) asks for it without echo, or reads one line
+from a pipe. Given on argv it still works, and the tool says where it now
+is: in the shell's history on the disk the seal exists for, and readable in
+`/proc` for as long as the run lasts — a hand fee sweep is hours.
 
 The second one writes the records back out in the clear and leaves them
 there — it is the "I am standing at the machine" path, so it does not wake
@@ -163,14 +221,26 @@ vault uses it to seal and does not keep it. Practical consequences:
 * **Pair both boxes with builds from the same checkout.** The ceremony
   refuses a Pi too old to send a half, rather than writing your xpub in the
   clear and looking like it worked.
+* **Never run an older agent against this keyfile — and it will not let
+  you.** A keyfile with a sealed section is written as format version 2.
+  Every build from before reads only a 1, and none of them opens the sealed
+  section, so under one of them the vault would run on the clear half
+  alone: no xpub to tell its own addresses from anyone else's, no spend
+  switch, no fee address. They refuse a 2 instead. This build refuses the
+  same way when the file carries a sealed section and no half (altered, or
+  restored in part), and when `state.sealed` sits beside a keyfile with no
+  half — which would otherwise have run on an empty ledger and re-issued an
+  address somebody has already paid. It rests on no secret: whoever can
+  write this disk can make it do anything. What it rules out is an
+  operator's own restore or downgrade running quietly on nothing.
 * **`--fee-sweep-on-idle-boot` is refused at pairing now.** An idle boot is
   a boot nobody woke — a hand power-on, or a stranger's magic packet — so it
   has no half and cannot read which wallet to sweep. Run the sweep by hand
-  instead: `gs_wake_agent --fee-sweep --unseal-state <hex>`.
+  instead: `gs_wake_agent --fee-sweep --unseal-state` (it asks for the half).
 * **To read your own settings back**, at the machine, with the half:
 
 ```
-gs_wake_agent --unseal-key <hex> --key /etc/gs_wake_thinkpad.key
+gs_wake_agent --unseal-key --key /etc/gs_wake_thinkpad.key   # asks for the half
 ```
 
   It prints them and changes nothing. It does not show the wake keypair,
@@ -200,8 +270,8 @@ only after the wake note. So they go behind the pair too.
 
 ```
 gs_doorbell state-key --key /etc/gs_wake_pi.key         # on the Pi
-gs_wake_agent --seal-secrets <hex> \
-              --key /etc/gs_wake_thinkpad.key           # here
+gs_wake_agent --seal-secrets \
+              --key /etc/gs_wake_thinkpad.key           # here; asks for the half
 ```
 
 That writes `/etc/gs-wake-spend.sealed` (0400). Before it writes anything it:
@@ -237,7 +307,7 @@ Four things to know:
 * **No sealed file means the old behaviour**, unchanged. Nothing is required.
 * **The idle-boot fee sweep stops** once the fee wallet's password is
   sealed: a boot nothing woke brings no half. `--seal-secrets` says so when
-  it applies; run `gs_wake_agent --fee-sweep --unseal-state <hex>` by hand.
+  it applies; run `gs_wake_agent --fee-sweep --unseal-state` by hand.
 * **A sealed file that will not open refuses the job, and does not fall back
   to the environment.** That is stricter than everywhere else here, on
   purpose: if your seed is sealed you believe it is protected, and a box that
@@ -692,11 +762,12 @@ argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
 `GS_USAGE_FEE_ADDRESS` and `GS_USAGE_FEE_PCT` (see below),
 `GS_SWAPKIT_API_KEY` (the quote aggregator's key, if your account needs one;
 it is sent only to that host and never appears on argv — **and it is an
-account name on every quote**: each BTC forward's quote carries the exact
-amount that appears on-chain seconds later and the client's XMR
+account name on every quote**: each deposit's quote and each BTC
+forward's quote carries the exact amount that appears on-chain and the XMR
 destination, so under a key the aggregator, or whoever obtains its logs,
-holds every forward this host made, every deposit address and every
-destination as one list. A per-quote circuit hides the IP, not the key.
+holds every deposit and forward this host made, every deposit address and
+every destination as one list. (The wake hands it to both steps; before, only
+the forward had it, so a keyed account refused every deposit at its quote.) A per-quote circuit hides the IP, not the key.
 Leave it unset if your aggregator allows; the quote itself still names
 amount and destination, and only quoting from your own THORNode would
 remove the aggregator from the path), and
@@ -1280,6 +1351,17 @@ fee onto the mixing wallet any more. What remains is history: a cut an
 spend it as a deposit. Sweep such accounts off at the desk before pairing;
 `gs_wake_keys pair` says so.
 
+**A mix a wake did not see the end of is settled by the next one.** Before a
+chat withdrawal's mix starts, the accounts the wallet holds are written to
+the owner's ledger record (sealed with the store). A run that finishes, or
+fails without being stopped, records what it minted as that owner's there
+and then. One that is stopped, loses power or is killed leaves the record,
+and the next wake — whatever its job, before it mints anything — gives the
+owner what appeared since. It rests on one thing: nothing minting accounts on
+that wallet in between. A mix run **by hand** on the vault after a cut-off
+wake would be counted as the owner's too; the next wake says it settled one,
+and that is the line to check the ledger against.
+
 **Address reuse is the wrong worry here, and this document used to make it
 the main one.** Outputs to one Monero address are not linkable on-chain —
 each gets a one-time key — and the fee address is never published, unlike a
@@ -1406,7 +1488,11 @@ job and it powers off. Two ways to get a sweep:
 
 - By hand: power the vault on, run `gs_wake_agent --fee-sweep --key ...`
   from the desk. The agent's preflight applies (inhibit file, lock, Tor,
-  resources), and a person at the keyboard stops the power-off.
+  resources). A sweep that runs powers the machine off when it ends, like a
+  wake — it takes hours, and you may have walked away — unless
+  `.gs_wake_inhibit` is in the artifact directory by then. Touch it *while
+  the sweep runs* if you mean to keep working, not before: preflight
+  refuses to start anything with it there. A refusal keeps the machine on.
 - On an idle boot: with `--fee-sweep-on-idle-boot` paired, a boot that has
   **no job** runs the sweep, then powers off. That is *both* idle boots: a
   hand power-on, which finds no doorbell at all (the doorbell listens only
@@ -1540,9 +1626,16 @@ records, and what the chat is told:
   a client paying the address they were shown once more — which only the
   reconciliation that reads the chain can tell from a stranger's payment
   and send on. The chain goes with the wipe (`btc_forward_*.json` is in
-  its patterns). The job log is truncated at
-  every boot, so it holds the run in progress and no more — read it before
-  the next wake if a run needs looking at. The vault's job ledger keeps ids
+  its patterns). The job log starts empty at every boot and is shredded at
+  the end of a clean run. What a run that did **not** finish cleanly wrote —
+  a failure, a refusal, a crash — is kept, sealed with the store, in
+  `gs_wake_job.prev.log`, for 14 days or 256 KiB, whichever ends first (a
+  long log is cut to its end, where the reason is); clean runs after it
+  (the pager's own rechecks, usually) do not touch it. Only on a pairing
+  that seals: a vault that never seals shreds it at the next boot as it
+  always did, rather than keep a memo in the clear.
+  Read it with `gs_wake_agent --unseal-state`. It used to be truncated by
+  the very next boot, before anyone could type that command. The vault's job ledger keeps ids
   and ten-minute buckets, not job words.
 
 **What is still true, and worth knowing.** Labels are four hex characters
@@ -1624,11 +1717,11 @@ than two days with nothing on its address stops counting there too, while a
 funded one keeps its place at any age (and "could not ask" counts as
 funded). Nothing else is forgotten — a late payment is still its owner's to
 withdraw; only the reserve lets go. While the vault is busy with someone
-else's job every command is refused with "busy … try again in about T",
-where T is the Pi's own persisted ceiling on the running wake (the same one
-the "working" line quoted), never a count and never whose. The chat whose
-job it is hears "yours is still running". `/status` answers "wait" in both
-cases. A withdrawal with several arrivals chains leg to leg only while
+else's job every command is refused with "busy … try again later", with no
+figure: the only figure the Pi has is the running job's own window, and the
+windows are public constants a job apart — "about 17h" was a withdrawal. The
+chat whose job it is hears "yours is still running". `/status` answers
+"wait" in both cases. A withdrawal with several arrivals chains leg to leg only while
 nobody else was refused during it; otherwise it yields after the leg and says
 "more remains — /withdraw again", so the waiter gets a turn. The places are
 process memory: a restart forgets them and may admit one deposit too many,
@@ -1638,10 +1731,12 @@ later" sentence from the vault that it would have heard from the Pi, not
 "refused, it does not say why".
 
 **What one client can learn about another, stated plainly.** That the shared
-vault is busy, for up to about T, and that the service is full. Not who, not
-how many, not what kind of job, not a position in any queue (there is none).
-The busy window is a fact one shared vault cannot hide; it carries no
-identity. Labels, status words, "more remains" and chained legs are all
+vault is busy, and that the service is full. Not who, not how many, not a
+position in any queue (there is none). **How long it stays busy can be
+watched**, by asking `/status` now and then, and a window of many hours is a
+withdrawal: one shared vault cannot hide the length of its busy windows, so
+the kind of a long job is not a secret from the others. No answer announces
+it; it takes watching. Labels, status words, "more remains" and chained legs are all
 owner-scoped, on the vault. The vault's ledger holds opaque tokens and small
 account numbers — and, until the host-privacy pass, the outpoints
 (`txid:vout`) of each client's own payment, which nothing read: they are
@@ -1860,12 +1955,16 @@ effort on the swap and the phone.
       the plaintext is still there the seal did not happen, and the
       agent said so on the way out (§1). An `integrity_chain.log` there
       holds only the lines written after the seal
-- [ ] `gs_wake_agent --dry-run --unseal-state <hex> --key ...` reports
+- [ ] `gs_wake_agent --dry-run --unseal-state --key ...` reports
       the issued-index mark as **writable**. Without the half a sealed
       keyfile's intake checks are skipped, and the dry run says so
-- [ ] You have run `gs_doorbell state-key` **once**, and written the hex
-      it printed beside the LUKS USB with the `--unseal-state` command.
+- [ ] You have run `gs_doorbell state-key` **once**, and kept the hex it
+      printed INSIDE the LUKS USB's encrypted volume, with the
+      `--unseal-state` command — not on paper beside it.
       It is the only way back into the records if the Pi dies (§1)
+- [ ] You know the hold: `touch /var/lib/gs/wakes.held` on the Pi the
+      moment the ThinkPad may have been taken, imaged or handled, and
+      `/status` then answers `held`. Try it once, then `rm` it (§1)
 - [ ] `gs-wake-deadman.timer` is **active** — the agent refuses to run a
       job on a box that cannot turn itself off
 - [ ] `sleep.target suspend.target hibernate.target hybrid-sleep.target`
@@ -2832,9 +2931,18 @@ there: `gs_doorbell`, which persists nothing but the keyfile, and
 
 | file | what it holds |
 |---|---|
-| `pager_state.json` | up to 200 wake timestamps in 5-minute buckets, plus the last one. `gs_common`'s own wipe-list calls this "a dated record of every time you woke the vault from a phone — which is exactly the correlation the jitters exist to break". |
-| `integrity_chain.log` | append-only, never rotated: `poke`, `collected`, `outcome:<out>`, `burn_signal`, `messages_burned`, `start`, the watcher's `looks_failing` and `address_unwatchable` (configuration, not a deposit) and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. The intake's per-deposit kinds went the same way: `btc_watch_forgotten` was written a public constant (two days) after a deposit opened or its forward went out, dating the poke before it, and `forward_recheck` / `btc_returned_seen` named the job of a poke already chained. |
+| `pager_state.json` | the last 24 hours' wake stamps in 5-minute buckets — the daily cap reads them, and nothing older is written back — the update cursor, and while a wake is in flight the latest moment it can still be running: the **longest job's** window, whatever is running, because each job's own window is a public constant and on the card it named the job. (A restart mid-wake therefore holds for that long; the restart message says so. If you *know* nothing is running — the ThinkPad is off in front of you — start the pager once with `--clear-restart-hold`.) `gs_common`'s own wipe-list calls this "a dated record of every time you woke the vault from a phone — which is exactly the correlation the jitters exist to break". |
+| `integrity_chain.log` | **kept for `--chain-keep-days` (7 by default), then retired**: older lines go, and what is kept starts at an anchor line carrying the last retired hash, so it still verifies and a head you noted inside the window still matches (note it more often than the window, or it is retired with its lines). What it holds: `poke`, `collected` (for every job, beside the outcome — it used to be written only by the long jobs, at the moment of collection, so a card taken mid-wake said a withdrawal was running), `outcome:<out>`, `burn_signal`, `messages_burned`, `start`, the watcher's `looks_failing` and `address_unwatchable` (configuration, not a deposit) and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. The intake's per-deposit kinds went the same way: `btc_watch_forgotten` was written a public constant (two days) after a deposit opened or its forward went out, dating the poke before it, and `forward_recheck` / `btc_returned_seen` named the job of a poke already chained. |
 | `pager.log` | whatever the unit's `ExecStartPre` writes, plus anything you redirect there. |
+
+**What the window still gives, stated plainly.** Inside the kept window each
+wake's `poke` and `outcome` stamps give when it ran and roughly how long, and
+the lengths are public constants a job apart — so the kind. Retiring is what
+bounds that; nothing on a card anyone can read can hide it for a wake that is
+kept. Each file's own inode times (modification and change time) also record
+the exact second of its **last** write, under the ten- and five-minute stamps
+inside it. The change time cannot be set from user space, so it is stated
+here rather than papered over with a `touch`.
 
 `paranoia_mode`'s search roots are the working directory, `$HOME`, and
 `$HOME/ghostspiral`, at depth 0–1. `/var/lib/gs` is in none of them from an

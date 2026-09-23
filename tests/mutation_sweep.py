@@ -980,7 +980,7 @@ MUTATIONS = [
  # An incompatible wire change with no version bump lets two boxes agree to
  # pair and then fail at wake time.
  ("PAIR_PROTO is not bumped for the wire break", "gs_wake_proto.py",
-  "PAIR_PROTO = 6",
+  "PAIR_PROTO = 7",
   "PAIR_PROTO = 2",
   ["test_wake_protocol"]),
 
@@ -1580,8 +1580,8 @@ MUTATIONS = [
  # for real, while --help said "do everything except run a job".
  ("--dry-run goes back to spending a wake and running the real job",
   "gs_wake_agent",
-  "    if args.dry_run:\n        agent_say(",
-  "    if False:\n        agent_say(",
+  "    if args.dry_run:\n        _dry_run_report(key, window)\n",
+  "    if False:\n        _dry_run_report(key, window)\n",
   ["test_listed_bugs"]),
 
  # The inhibit file means "a person is at this machine", and the moment they
@@ -2469,7 +2469,8 @@ MUTATIONS = [
  # constant back.
  ("the spending budget goes back to a hand-typed constant that fits nothing",
   "gs_wake_proto.py",
-  '        "budget_s": int(max(t for _w, t in WITHDRAW_DEPTHS.values()) * 1.25),',
+  '        "budget_s": int(max(t for _w, t in WITHDRAW_DEPTHS.values())\n'
+  '                        * WITHDRAW_BUDGET_MARGIN),',
   '        "budget_s": 21600,',
   ["test_wake_agent"]),
 
@@ -2478,8 +2479,8 @@ MUTATIONS = [
  # hop-delay term IS a ceiling; this one is not.
  ("the spending budget fits its worst case exactly, with no margin",
   "gs_wake_proto.py",
-  "WITHDRAW_DEPTHS.values()) * 1.25),",
-  "WITHDRAW_DEPTHS.values()) * 1.0),",
+  "WITHDRAW_BUDGET_MARGIN = 1.25\n",
+  "WITHDRAW_BUDGET_MARGIN = 1.0\n",
   ["test_wake_agent"]),
 
  # A depth row whose claimed seconds no longer match GhostSpiral's own
@@ -2795,9 +2796,8 @@ MUTATIONS = [
  # 9900 -- a hand-copied duration that stopped being true and nothing noticed.
  ("the working message goes back to a duration nobody can wait out",
   "gs_telegram_pager",
-  "            _hold = (proto.result_budget_s(job)\n"
-  '                     + getattr(doorbell(), "FETCH_WINDOW_S", 0))',
-  "            _hold = 9900",
+  "            _hold = self._hold_for(job)\n",
+  "            _hold = 9900\n",
   ["test_telegram_pager"]),
 
  # The only notification that a spend finished, after up to sixteen hours and
@@ -3153,8 +3153,7 @@ MUTATIONS = [
   "gs_telegram_pager",
   '        _mid = msg.get("message_id")\n'
   '        if isinstance(_mid, int) and not isinstance(_mid, bool):\n'
-  '            with _BURN_LOCK:\n'
-  '                self.burn.append((cid, _mid, time.time()))',
+  '            self._burn_record(int(cid), _mid)',
   '        _mid = msg.get("message_id")',
   ["test_telegram_pager"]),
 
@@ -3315,8 +3314,8 @@ MUTATIONS = [
  # money still sitting there.
  ("the chain goes back to abandoning what a fee could not be taken from",
   "gs_wake_agent",
-  "            _floor = Decimal(live_min_out_xmr(key))",
-  '            _floor = Decimal(proto.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)',
+  '        return Decimal(live_min_out_xmr(key))\n    return Decimal(live_floor_xmr(key, _wd))\n',
+  '        return Decimal(proto.MIX_MINIMUM_XMR_WITH_CUT_MIRROR)\n    return Decimal(live_floor_xmr(key, _wd))\n',
   ["test_wake_agent"]),
 
  # ---- a label belongs to the chat it was issued to ----------------------
@@ -4211,14 +4210,14 @@ MUTATIONS = [
   ['test_stability_pass']),
 
  ('the accounts a mix minted are asked for once', 'gs_wake_agent',
-  '            for _try in range(3):\n                _accts_after = _account_indices(key, injected=accounts)',
-  '            for _try in range(1):\n                _accts_after = _account_indices(key, injected=accounts)',
-  ['test_stability_pass']),
+  '    for _try in range(3):\n        _got = _account_indices(key, injected=accounts)',
+  '    for _try in range(1):\n        _got = _account_indices(key, injected=accounts)',
+  ['test_stability_pass', 'test_wake_agent']),
 
  ('unreadable accounts after a mix go unsaid', 'gs_wake_agent',
-  '            else:\n                integrity_log("wake", "owner_accounts_unreadable")',
-  '            else:\n                pass',
-  ['test_stability_pass']),
+  '    integrity_log("wake", "owner_accounts_unreadable")\n    agent_say("  [!] could not read the wallet\'s accounts after the mix; "',
+  '    return\n    agent_say("  [!] could not read the wallet\'s accounts after the mix; "',
+  ['test_stability_pass', 'test_wake_agent']),
 
  ('a failed withdrawal leaves its entry bundle on the disk', 'gs_wake_agent',
   '            if job == "withdraw" and bundle:\n                try:\n                    if Path(bundle).is_file():',
@@ -5708,10 +5707,8 @@ MUTATIONS = [
   '                               "has no meaning for")',
   ['test_plain_slip', 'test_wake_doorbell']),
  ('the wire-break words are not rendered to the chat', 'gs_telegram_pager',
-  'EVENT_VOCAB = ("m1_second_ephemeral", "result_refused",\n'
-  '               "m1_no_window_field", "m1_stale_window",\n'
-  '               "result_phase_unknown")',
-  'EVENT_VOCAB = ("m1_second_ephemeral", "result_refused")',
+  'EVENT_VOCAB = ("m1_second_ephemeral", "wakes_held", "hold_failed",\n               "m1_before_wake", "result_refused",\n               "m1_no_window_field", "m1_stale_window",\n               "result_phase_unknown")',
+  'EVENT_VOCAB = ("m1_second_ephemeral", "wakes_held", "hold_failed",\n               "m1_before_wake", "result_refused")',
   ['test_telegram_pager']),
  ('a chat id that is not a number leaks the one-job lock for the life of '
   'the process', 'gs_telegram_pager',
@@ -6287,10 +6284,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('a keyfile from before this stage is switched INTO sealing',
   'gs_wake_agent',
-  '    if raw is None or raw == "":\n'
-  '        return None, None',
-  '    if False:\n'
-  '        return None, None',
+  '    if raw is None or raw == "":\n',
+  '    if False:\n',
   ['test_wake_agent']),
  ('a malformed half in the keyfile runs unsealed instead of refusing',
   'gs_wake_agent',
@@ -6345,12 +6340,15 @@ MUTATIONS = [
   'SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json", CHAIN_MEMBER,\n'
   '                "gs_wake_job.log",\n'
   '                "thor_pairs_*.json", "wallet_*.json",\n'
-  '                "btc_forward_*.json", "gs_wake_status.json")',
+  '                "btc_forward_*.json", "gs_wake_status.json",\n'
+  '                "unsigned_*.json", ".chain_once_*",\n'
+  '                "signer_progress.json", "broadcast_progress.json",\n'
+  '                "gs_wake_job.prev.log")',
   'SEALED_GLOBS = ("gs_wake_state.json",)',
   ['test_wake_agent']),
  ("a killed probe's exact figures are left in the clear", 'gs_wake_agent',
-  '                "btc_forward_*.json", "gs_wake_status.json")',
-  '                "btc_forward_*.json")',
+  '                "btc_forward_*.json", "gs_wake_status.json",\n',
+  '                "btc_forward_*.json",\n',
   ['test_wake_agent']),
  ('main() finishes without re-sealing what it opened', 'gs_wake_agent',
   '        _sealed = state_close(_STATE_KEY["dir"], _STATE_KEY["vault"],\n'
@@ -6423,12 +6421,15 @@ MUTATIONS = [
   '    _shown = sorted(k for k in key if k not in ("secret", "peer_public"))',
   '    _shown = sorted(key)',
   ['test_wake_agent']),
- ('the idle-boot sweep says nothing at all on a sealed keyfile',
+ ('the idle-boot hook warns and chains on every hand boot of a sealed '
+  'keyfile, about a sweep nobody could have asked for',
   'gs_wake_agent',
   '    if key.get(KEYFILE_SEALED) is not None:\n'
-  '        agent_say("  [!] This machine\'s settings are sealed to the pair and "',
-  '    if False:\n'
-  '        agent_say("  [!] This machine\'s settings are sealed to the pair and "',
+  '        return False\n'
+  '    try:\n'
+  '        _fcfg = fee_sweep_config(key)\n',
+  '    try:\n'
+  '        _fcfg = fee_sweep_config(key)\n',
   ['test_wake_agent']),
  ('the pairing takes an idle-boot sweep it can never run', 'gs_wake_keys',
   '    if args.fee_sweep_on_idle_boot:\n'
@@ -6450,7 +6451,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('PAIR_PROTO was not bumped, so an old Pi ships an unsealed keyfile',
   'gs_wake_proto.py',
-  'PAIR_PROTO = 6',
+  'PAIR_PROTO = 7',
   'PAIR_PROTO = 5',
   ['test_wake_agent']),
  # STAGE 9: the secrets the vault SIGNS with, behind the same pair. The xpub
@@ -6793,10 +6794,10 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('a dry run on a sealed keyfile skips the intake checks in silence',
   'gs_wake_agent',
-  '        if key.get(KEYFILE_SEALED) is not None:\n'
-  '            agent_say("  [*] This keyfile\'s settings are sealed',
-  '        if False:\n'
-  '            agent_say("  [*] This keyfile\'s settings are sealed',
+  '    if key.get(KEYFILE_SEALED) is not None:\n'
+  '        agent_say("  [*] This keyfile\'s settings are sealed',
+  '    if False:\n'
+  '        agent_say("  [*] This keyfile\'s settings are sealed',
   ['test_wake_agent']),
  ('`--dry-run --unseal-state <hex>` dumps the records in plaintext',
   'gs_wake_agent',
@@ -6826,8 +6827,8 @@ MUTATIONS = [
   '                raise Stopping("the unit was asked to stop mid-job")',
   ['test_wake_agent']),
  ('a stop after the mix skips the ledger save', 'gs_wake_agent',
-  '                time.sleep(2)\n',
-  '                _nap(2)\n',
+  '        if _try < 2:\n            time.sleep(2)\n',
+  '        if _try < 2:\n            _nap(2)\n',
   ['test_wake_agent']),
  ('a stop during a finished job\'s report re-reports it as failed',
   'gs_wake_agent',
@@ -7103,6 +7104,438 @@ MUTATIONS = [
   '    return str(host).lower().endswith(".onion") or bool(pin)',
   '    return True',
   ['test_btc_forwarder']),
+ # ---- the uncovered dimensions, fixed (wt16) --------------------------------
+ ('a withdrawal deeper than the balance can carry starts and dies mid-mix',
+  'gs_wake_agent',
+  '        if _wd != _MIN_OUT_WALLETS \\\n'
+  '                and _fxmr < Decimal(live_floor_xmr(key, _wd)):\n',
+  '        if False:\n',
+  ['test_wake_agent']),
+ ('an unreadable wallet before the mix is passed over, so nothing it mints '
+  'is recorded as the owner\'s', 'gs_wake_agent',
+  '        if _owner and _accts_before is None:\n',
+  '        if False:\n',
+  ['test_wake_agent']),
+ ('a failed or stopped withdrawal forgets the accounts its mix minted',
+  'gs_wake_agent',
+  '            if job == "withdraw" and _owner and _accts_before is not None \\\n                    and not _term_asked():\n',
+  '            if False:\n',
+  ['test_wake_agent']),
+ ('a killed round\'s unsigned transactions and progress files stay in the '
+  'clear', 'gs_wake_agent',
+  '                "unsigned_*.json", ".chain_once_*",\n'
+  '                "signer_progress.json", "broadcast_progress.json",\n',
+  '',
+  ['test_wake_agent']),
+ ('a killed round\'s staging trees are left for the next seal to miss',
+  'gs_wake_agent',
+  '    _shred_mix_trees(artifact_dir)\n',
+  '    pass\n',
+  ['test_wake_agent']),
+ ('a flag given with no value hands "-" on as the half instead of asking',
+  'gs_wake_agent',
+  '        if _v == HALF_ASK:\n',
+  '        if False:\n',
+  ['test_wake_agent']),
+ ('a half typed on argv goes unremarked', 'gs_wake_agent',
+  '        elif str(_v).strip():\n',
+  '        elif False:\n',
+  ['test_wake_agent']),
+ ('the half is echoed as it is typed', 'gs_wake_agent',
+  '            return getpass.getpass(f"  The Pi\'s half for {flag} "\n',
+  '            return input(f"  The Pi\'s half for {flag} "\n',
+  ['test_wake_agent']),
+ ('a retried send\'s lost first copy is never burned', 'gs_telegram_pager',
+  '            if chat_id > 0 and self._max_clients() <= 1 \\\n',
+  '            if False \\\n',
+  ['test_telegram_pager']),
+ ('in a group, other people\'s messages are swept as gaps', 'gs_telegram_pager',
+  '            if chat_id > 0 and self._max_clients() <= 1 \\\n',
+  '            if self._max_clients() <= 1 \\\n',
+  ['test_telegram_pager']),
+ ('the Pi\'s ceremony info is sealed to the vault\'s long-term key again',
+  'gs_wake_proto.py',
+  '        _pair_send_record(sock, seal(my_sk, _veph, send_tag,\n',
+  '        _pair_send_record(sock, seal(my_sk, peer_pub, send_tag,\n',
+  ['test_wake_protocol']),
+ # ---- the operator's hold (finding #3) --------------------------------------
+ ('the hold fails OPEN when its existence cannot be told', 'gs_wake_proto.py',
+  '    except FileNotFoundError:\n'
+  '        return False\n'
+  '    except OSError:\n'
+  '        return True\n',
+  '    except FileNotFoundError:\n'
+  '        return False\n'
+  '    except OSError:\n'
+  '        return False\n',
+  ['test_wake_doorbell', 'test_telegram_pager']),
+ ('an empty hold path switches the hold off', 'gs_wake_proto.py',
+  '    p = str(path or "") or HOLD_FILE_DEFAULT\n'
+  '    try:\n'
+  '        os.lstat(p)\n',
+  '    p = str(path or "")\n'
+  '    if not p:\n'
+  '        return False\n'
+  '    try:\n'
+  '        os.lstat(p)\n',
+  ['test_wake_doorbell']),
+ ('the hold file is created world-readable', 'gs_wake_proto.py',
+  '                     | getattr(os, "O_NOFOLLOW", 0), 0o600)\n',
+  '                     | getattr(os, "O_NOFOLLOW", 0), 0o644)\n',
+  ['test_wake_doorbell']),
+ ('wire text reaches the hold file on the card', 'gs_wake_proto.py',
+  '        os.write(fd, (re.sub(r"[^a-z0-9_]", "", str(why or "operator"))\n',
+  '        os.write(fd, (str(why or "operator")\n',
+  ['test_wake_doorbell']),
+ ('a note is sealed to whatever answers while the wakes are held',
+  'gs_doorbell',
+  '            if proto.wakes_held(self.hold_file):\n'
+  '                self.events.append("m1_held")\n',
+  '            if False:\n'
+  '                self.events.append("m1_held")\n',
+  ['test_wake_doorbell']),
+ ('a second boot signed as the vault leaves every later wake open',
+  'gs_doorbell',
+  '                if proto.hold_wakes(self.hold_file, "m1_second_ephemeral"):\n',
+  '                if False:\n',
+  ['test_wake_doorbell', 'test_wake_endtoend']),
+ ('a held box still binds and sends the magic packet', 'gs_doorbell',
+  '    if proto.wakes_held(_hold):\n'
+  '        raise Doorbell(\n',
+  '    if False:\n'
+  '        raise Doorbell(\n',
+  ['test_wake_doorbell', 'test_wake_endtoend']),
+ ('a hold that lands during the pre-WOL delay is not seen', 'gs_doorbell',
+  '            _held_late = proto.wakes_held(_hold)\n',
+  '            _held_late = False\n',
+  ['test_wake_doorbell']),
+ ('a hold before collection keeps the packet repeating', 'gs_doorbell',
+  '                _held_now = (pending.collected_at is None\n'
+  '                             and proto.wakes_held(_hold))\n',
+  '                _held_now = False\n',
+  ['test_wake_doorbell']),
+ ('a held wake is reported as "poking again is safe"', 'gs_doorbell',
+  '    if out == "expired_uncollected" and any(\n',
+  '    if False and any(\n',
+  ['test_wake_doorbell']),
+ ('state-key prints the half inside the command line again', 'gs_doorbell',
+  '        print("      python3 gs_wake_agent --unseal-state \\\\")\n',
+  '        print(f"      python3 gs_wake_agent --unseal-state {_half} \\\\")\n',
+  ['test_wake_doorbell']),
+ ('the pager starts a tap or a forward while the wakes are held',
+  'gs_telegram_pager',
+  '        if self._wakes_held():\n'
+  '            return HELD_ANSWER\n',
+  '        if False:\n'
+  '            return HELD_ANSWER\n',
+  ['test_telegram_pager']),
+ ('/status says "wait" for a hold only the operator can lift',
+  'gs_telegram_pager',
+  '            if self._wakes_held():\n'
+  '                _why = "held"\n',
+  '            if False:\n'
+  '                _why = "held"\n',
+  ['test_telegram_pager']),
+ ('a wake the hold refused is answered "try again later"', 'gs_telegram_pager',
+  '            if self._wakes_held():\n'
+  '                self.send(chat_id, f"{chat_name(job)}: nothing ran — "\n',
+  '            if False:\n'
+  '                self.send(chat_id, f"{chat_name(job)}: nothing ran — "\n',
+  ['test_telegram_pager']),
+ ('a wake the hold stopped before collection is "never picked up"',
+  'gs_telegram_pager',
+  '        elif out == "expired_uncollected" and any(\n'
+  '                _e in _ev for _e in ("m1_held", "held_before_collection")):\n',
+  '        elif False:\n',
+  ['test_telegram_pager']),
+ ('the hold is logged to the chain on every tick', 'gs_telegram_pager',
+  '        if _h != bool(getattr(self, "_held_logged", False)):\n',
+  '        if True:\n',
+  ['test_telegram_pager']),
+ # ---- the uncovered dimensions, fixed (wt16, second half) -----------------
+ ('another client is told how long the running job holds -- which names it',
+  'gs_telegram_pager',
+  '            return BUSY_ANSWER_MINE\n'
+  '        return BUSY_ANSWER\n',
+  '            return BUSY_ANSWER_MINE\n'
+  '        return BUSY_ANSWER + str(int(getattr(self.limits, '
+  '"in_flight_until", 0) or 0) % 7)\n',
+  ['test_multi_client']),
+ ('the card records the running job\'s own hold, which names the job',
+  'gs_telegram_pager',
+  '            self._set_in_flight(True, until=time.time() + max(\n'
+  '                self._hold_for(_j) for _j in proto.JOBS))\n',
+  '            self._set_in_flight(True, until=time.time() + _hold)\n',
+  ['test_telegram_pager']),
+ ('"collected" is chained only by the long jobs', 'gs_telegram_pager',
+  '            if getattr(pending, "collected_at", None) is not None:\n'
+  '                integrity_log("pager", "collected")\n',
+  '            if False:\n'
+  '                integrity_log("pager", "collected")\n',
+  ['test_telegram_pager']),
+ ('the state file writes back wake stamps older than the cap reads',
+  'gs_telegram_pager',
+  '            self.pokes = [t for t in self.pokes if _now - t < self.KEEP_S]\n',
+  '            pass\n',
+  ['test_telegram_pager']),
+ ('the last poke stays on the card for good', 'gs_telegram_pager',
+  '            _lp = (self.last_poke if _now - self.last_poke\n                   < max(self.KEEP_S,\n                         int(getattr(self, "min_interval", 0) or 0))\n                   else 0.0)\n',
+  '            _lp = self.last_poke\n',
+  ['test_telegram_pager']),
+ ('the pager never retires its chain at start', 'gs_telegram_pager',
+  '        self.retire_chain(force=True)\n',
+  '        pass\n',
+  ['test_telegram_pager']),
+ ('the chain is retired on every tick', 'gs_telegram_pager',
+  '        if not force and (_now - float(getattr(self, "_chain_retired_at",\n',
+  '        if False and (_now - float(getattr(self, "_chain_retired_at",\n',
+  ['test_telegram_pager']),
+ ('--chain-keep-days 0 still retires', 'gs_telegram_pager',
+  '        if _keep <= 0:\n'
+  '            return 0\n'
+  '        _now = time.time()\n',
+  '        if False:\n'
+  '            return 0\n'
+  '        _now = time.time()\n',
+  ['test_telegram_pager']),
+ ('a retired chain\'s anchor is not accepted, so what is kept stops verifying',
+  'gs_common.py',
+  '    _anchored = _chain_anchor_of(lines[0])\n',
+  '    _anchored = ""\n',
+  ['test_telegram_pager']),
+ ('the anchor does not carry the last retired hash', 'gs_common.py',
+  '        last_h = lines[k - 1].split(" | ", 1)[0].strip()\n',
+  '        last_h = "0" * 64\n',
+  ['test_telegram_pager']),
+ ('a retired copy a crash left on the card is never shredded', 'gs_common.py',
+  '    for _left in (old, tmp):\n',
+  '    for _left in ():\n',
+  ['test_telegram_pager']),
+ ('the retired lines stay on the card beside the kept ones', 'gs_common.py',
+  '    if not secure_delete_or_warn(old, "the retired integrity chain"):\n'
+  '        return -1\n',
+  '    if False:\n'
+  '        return -1\n',
+  ['test_telegram_pager']),
+ ('a keyfile with sealed settings and no half runs on its clear half',
+  'gs_wake_agent',
+  '        if key.get(KEYFILE_SEALED) is not None:\n'
+  '            raise Refused(\n'
+  '                "state_half_missing",\n',
+  '        if False:\n'
+  '            raise Refused(\n'
+  '                "state_half_missing",\n',
+  ['test_wake_agent']),
+ ('a sealed store beside a keyfile with no half runs on an empty ledger',
+  'gs_wake_agent',
+  '    if _vh0 is None and (artifact_dir / SEALED_FILE).exists():\n',
+  '    if False:\n',
+  ['test_wake_agent']),
+ ('a sealed vault keyfile is stamped 1, so an older agent runs it on its '
+  'clear half', 'gs_wake_proto.py',
+  '    if not passphrase and payload.get(SETTINGS_FIELD) is not None:\n'
+  '        head["version"] = KEYFILE_VERSION_SEALED\n',
+  '    if False:\n'
+  '        head["version"] = KEYFILE_VERSION_SEALED\n',
+  ['test_wake_agent']),
+ ('a version-2 keyfile without its sealed section or half opens',
+  'gs_wake_proto.py',
+  '        if _ver == KEYFILE_VERSION_SEALED and (\n',
+  '        if False and (\n',
+  ['test_wake_agent']),
+ ('a dry run on a hand boot stops at doorbell_unreachable before its checks',
+  'gs_wake_agent',
+  '        if wstat == 0 and args.dry_run:\n'
+  '            _dry_run_report(key, None)\n',
+  '        if False:\n'
+  '            _dry_run_report(key, None)\n',
+  ['test_wake_agent']),
+ ('the dry run promises a fee-wallet check and runs none', 'gs_wake_agent',
+  '    else:\n'
+  '        _dry_fee_check(key)\n',
+  '    else:\n'
+  '        pass\n',
+  ['test_wake_agent']),
+ ('a keyed aggregator refuses every deposit at its quote', 'gs_wake_agent',
+  '            # quote while the forwards that never came would have worked.\n'
+  '            if secret_of("GS_SWAPKIT_API_KEY"):\n',
+  '            # quote while the forwards that never came would have worked.\n'
+  '            if False:\n',
+  ['test_wake_agent']),
+ ('a fee-sweep leg is killed on the bare depth figure', 'gs_wake_agent',
+  '    leg_budget = int(proto.WITHDRAW_DEPTHS[cfg["depth"]][1]\n'
+  '                     * proto.WITHDRAW_BUDGET_MARGIN)\n',
+  '    leg_budget = int(proto.WITHDRAW_DEPTHS[cfg["depth"]][1])\n',
+  ['test_wake_agent']),
+ ('a crashed run\'s log is truncated at the next boot', 'gs_wake_agent',
+  '        elif _lp.is_file() and not _lp.is_symlink() and _lp.stat().st_size:\n',
+  '        elif False:\n',
+  ['test_wake_agent']),
+ ('a failed run\'s sealed log is shadowed by the next boot\'s fresh one',
+  'gs_wake_agent',
+  '        if name == JOB_LOG and _t.exists():\n'
+  '            _sealed_job = _u8(text)\n',
+  '        if False:\n'
+  '            _sealed_job = _u8(text)\n',
+  ['test_wake_agent']),
+ ('the earlier boots\' log is kept for ever', 'gs_wake_agent',
+  '            parts = [p for p in parts if p[0] >= _keep]\n',
+  '            pass\n',
+  ['test_wake_agent']),
+ ('past the cap the newest log goes, not the oldest', 'gs_wake_agent',
+  '            parts.pop(0)\n',
+  '            parts.pop()\n',
+  ['test_wake_agent']),
+ ('a stop does not end the intake\'s address lookups', 'gs_wake_agent',
+  '        _stop_if_asked()\n'
+  '        try:\n'
+  '            return _live(addr)\n',
+  '        try:\n'
+  '            return _live(addr)\n',
+  ['test_wake_agent']),
+ ('a stop is not checked between a job\'s steps', 'gs_wake_agent',
+  '        _stop_if_asked()\n'
+  '        env_extra = {}\n',
+  '        env_extra = {}\n',
+  ['test_wake_agent']),
+ ('a note that fails its schema is never answered, so the Pi holds its lock',
+  'gs_wake_agent',
+  '        raise _reported(key, d, _bad_jid, challenge, _ve)\n',
+  '        raise _ve\n',
+  ['test_wake_agent']),
+ ('a corrupt ledger is said only to a stdout the unit discards',
+  'gs_wake_agent',
+  '            agent_say(f"  [!] {p} exists but does not parse "\n',
+  '            print(f"  [!] {p} exists but does not parse "\n',
+  ['test_wake_agent']),
+ ('wallet-cli logs into the artifact directory and keeps its ring database '
+  'in HOME', 'airgap_tx_signer',
+  '    return ["--log-file", os.path.join(_RINGDB_DIR[0], "wallet-cli.log"),\n'
+  '            "--shared-ringdb-dir", _RINGDB_DIR[0]]\n',
+  '    return []\n',
+  ['test_integration']),
+ ('a container relabelled as the store writes out names the close never '
+  'seals', 'gs_wake_agent',
+  '    if not all(isinstance(_nm, str) and _is_sealed_member(_nm)\n'
+  '               for _nm in members):\n',
+  '    if False:\n',
+  ['test_wake_agent']),
+ # ---- the hostile reviews of wt16, what they left standing ----------------
+ ('a note signed as the vault takes the job before the magic packet',
+  'gs_doorbell',
+  '            if not self.armed:\n',
+  '            if False:\n',
+  ['test_wake_doorbell']),
+ ('run_wake builds its Pending already armed, so the pre-WOL delay hands '
+  'over', 'gs_doorbell',
+  '    pending = Pending(key, job, params, clock=clock, hold_file=_hold,\n'
+  '                      armed=False)\n',
+  '    pending = Pending(key, job, params, clock=clock, hold_file=_hold,\n'
+  '                      armed=True)\n',
+  ['test_wake_doorbell']),
+ ('a hold the doorbell could not write goes unsaid', 'gs_doorbell',
+  '                    self.events.append("hold_failed")\n',
+  '                    pass\n',
+  ['test_wake_doorbell']),
+ ('a second boot with no hold file written does not hold the pager',
+  'gs_telegram_pager',
+  '            self._hold_latched = True\n',
+  '            pass\n',
+  ['test_telegram_pager']),
+ ('the latched hold is never read', 'gs_telegram_pager',
+  '        _h = (bool(getattr(self, "_hold_latched", False))\n'
+  '              or proto.wakes_held(getattr(self, "hold_file", None)))\n',
+  '        _h = proto.wakes_held(getattr(self, "hold_file", None))\n',
+  ['test_telegram_pager']),
+ ('a held deposit is told it goes "as soon as this end is free"',
+  'gs_telegram_pager',
+  '            elif say == "held" and self._wakes_held():\n',
+  '            elif False:\n',
+  ['test_telegram_pager']),
+ ('the pager starts with a hold file nobody can place', 'gs_telegram_pager',
+  '    if not _hf.parent.is_dir() or not os.access(str(_hf.parent), os.W_OK):\n',
+  '    if False:\n',
+  ['test_telegram_pager']),
+ ('--clear-restart-hold clears nothing', 'gs_telegram_pager',
+  '            _pager._set_in_flight(False)\n',
+  '            pass\n',
+  ['test_telegram_pager']),
+ ('on a shared bot, other chats\' message ids are burned as gaps',
+  'gs_telegram_pager',
+  "            if chat_id > 0 and self._max_clients() <= 1 \\\n",
+  "            if chat_id > 0 \\\n",
+  ['test_telegram_pager']),
+ ('a --min-interval over a day is forgotten across a restart',
+  'gs_telegram_pager',
+  '                   < max(self.KEEP_S,\n'
+  '                         int(getattr(self, "min_interval", 0) or 0))\n',
+  '                   < self.KEEP_S\n',
+  ['test_telegram_pager']),
+ ('the verifier says an anchored chain was retired on purpose', 'gs_common.py',
+  '                   "here -- removed by the Pi\'s retention, or by anyone who "\n',
+  '                   "here -- retired on purpose, and nothing else "\n',
+  ['test_telegram_pager']),
+ ('a second name for the live chain is shredded, overwriting the chain',
+  'gs_common.py',
+  '            if _same:\n'
+  '                _left.unlink()\n',
+  '            if False:\n'
+  '                _left.unlink()\n',
+  ['test_telegram_pager']),
+ ('the accounts a mix starts from are held only in memory', 'gs_wake_agent',
+  '        if _owner:\n'
+  '            _mark_pending_mix(led, _owner, _accts_before)\n',
+  '        if False:\n'
+  '            _mark_pending_mix(led, _owner, _accts_before)\n',
+  ['test_wake_agent']),
+ ('a stop mid-mix waits on the wallet before the seal', 'gs_wake_agent',
+  '                    and not _term_asked():\n'
+  '                _attribute_mix_accounts(key, accounts, led, _owner,\n',
+  '                    and True:\n'
+  '                _attribute_mix_accounts(key, accounts, led, _owner,\n',
+  ['test_wake_agent']),
+ ('a stop after the mix waits on the wallet before the seal', 'gs_wake_agent',
+  '        if _owner and _accts_before is not None and not _term_asked():\n',
+  '        if _owner and _accts_before is not None:\n',
+  ['test_wake_agent']),
+ ('a cut-off mix is never settled by the next wake', 'gs_wake_agent',
+  '    if _recover_pending_mixes(key, accounts, led):\n',
+  '    if False:\n',
+  ['test_wake_agent']),
+ ('the pending mark is dropped when the ledger is read', 'gs_wake_agent',
+  '            if isinstance(_pm, list):\n',
+  '            if False:\n',
+  ['test_wake_agent']),
+ ('a vault that never seals keeps failed logs in the clear', 'gs_wake_agent',
+  '        if not keep:\n',
+  '        if False:\n',
+  ['test_wake_agent']),
+ ('every vault keeps the earlier boots\' log, sealing or not', 'gs_wake_agent',
+  '    _keep_leftover_log(artifact_dir,\n'
+  '                       keep=key.get("state_half") not in (None, ""))\n',
+  '    _keep_leftover_log(artifact_dir, keep=True)\n',
+  ['test_wake_agent']),
+ ('a part merged in twice is kept twice', 'gs_wake_agent',
+  '            if _b.strip() and _k not in _seen:\n',
+  '            if _b.strip():\n',
+  ['test_wake_agent']),
+ ('a long failed log is dropped whole under the cap', 'gs_wake_agent',
+  '                if len(_b) > JOB_LOG_PREV_PART_MAX:\n',
+  '                if False:\n',
+  ['test_wake_agent']),
+ ('opening the store by hand prunes what it was opened to read',
+  'gs_wake_agent',
+  '                    + _prev_parts(_disk), prune=False)\n',
+  '                    + _prev_parts(_disk))\n',
+  ['test_wake_agent']),
+ ('"more left" is judged at the shallowest depth', 'gs_wake_agent',
+  '                      depth=params.get("depth"))\n',
+  '                      depth=None)\n',
+  ['test_wake_agent']),
+ ('Ctrl-C at the half prompt only sets a flag', 'gs_wake_agent',
+  '        _prev_int = signal.signal(signal.SIGINT, signal.default_int_handler)\n',
+  '        _prev_int = None\n',
+  ['test_wake_agent']),
 ]
 
 

@@ -390,10 +390,25 @@ def send_wol(mac: str, broadcast: str, port: int, sock_factory=None) -> int:
 class Pending:
     """One job, its single M2, and the windows. Process memory only."""
 
-    def __init__(self, key: dict, job: str, params: dict, clock=time.monotonic):
+    def __init__(self, key: dict, job: str, params: dict, clock=time.monotonic,
+                 hold_file=None, armed=True):
         self.key = key
         self.job = job
         self.params = params
+        #: THE OPERATOR'S HOLD (proto.HOLD_FILE_DEFAULT). Read again right
+        #: before M2 is sealed, because a wake can sit in its pre-WOL delay
+        #: for a quarter of an hour, and that is exactly when an operator who
+        #: has just learned the vault was handled reaches for it.
+        self.hold_file = hold_file or proto.HOLD_FILE_DEFAULT
+        #: WHETHER THE MAGIC PACKET HAS GONE OUT (the review of the hold).
+        #: run_wake binds BEFORE its pre-WOL delay, and the fetch window was
+        #: open from construction -- so for up to a quarter of an hour before
+        #: this box had woken anything, any M1 signed as the vault took the
+        #: job, and the Pi's half with it. The only thing that can answer
+        #: before the packet is something that was already on: the vault
+        #: switched on by hand, or a copy of its disk polling the port. Both
+        #: wait for the packet now. False only from run_wake; arm() sets it.
+        self.armed = bool(armed)
         self.job_id = proto.new_job_id()
         self.clock = clock
         self.opened = clock()
@@ -513,6 +528,7 @@ class Pending:
         for 10 min". This makes the code do what that sentence says.
         """
         self.opened = self.clock()
+        self.armed = True
 
     def fetch_open(self) -> bool:
         return (self.clock() - self.opened) < FETCH_WINDOW_S
@@ -587,9 +603,42 @@ class Pending:
                 # recorded -- and it is the one event _report_events exists
                 # to surface.
                 self.events.append("m1_second_ephemeral")
+                # AND EVERY LATER WAKE IS HELD. Since the window nonce, this
+                # is not a replay: a replayed note from this window has the
+                # same ephemeral and is a retry above, and one from another
+                # window is refused on its window field before the lock. Two
+                # DIFFERENT boots signed as the vault inside one window --
+                # the vault booting twice, or a second holder of its key,
+                # which is what a copy of its disk is. In the second case
+                # whichever of them took the job has this card's half of the
+                # state key, and the next wake would hand it over again. A
+                # hold costs the operator one `rm` after a look at the vault;
+                # not holding costs the seal.
+                if proto.hold_wakes(self.hold_file, "m1_second_ephemeral"):
+                    self.events.append("wakes_held")
+                else:
+                    # SAID, so the pager can hold in memory instead: a hold
+                    # that could not be written is otherwise a warning on a
+                    # terminal the unit sends to /dev/null, and the next
+                    # start hands the half over again.
+                    self.events.append("hold_failed")
                 raise Doorbell("job already handed over to a different boot")
+            if not self.armed:
+                # NOTHING WAS WOKEN YET. See `armed`. Recorded, because an
+                # authenticated note before the packet is either the vault
+                # switched on by hand or a copy of it -- worth a line, not a
+                # hold (a hand boot is ordinary).
+                self.events.append("m1_before_wake")
+                raise Doorbell("no wake has been sent yet")
             if not self.fetch_open():
                 raise Doorbell("fetch window closed")
+            # NOTHING IS SEALED WHILE THE WAKES ARE HELD, and this is the
+            # check that matters: everything before it is the magic packet,
+            # which gives nobody anything. Refused like any other note, so
+            # the boot that sent it is told 204 and powers off with nothing.
+            if proto.wakes_held(self.hold_file):
+                self.events.append("m1_held")
+                raise Doorbell("wakes are held on this box")
             # THE PI'S HALF OF THE VAULT'S STATE KEY RIDES HERE
             # (STAGE7_PLAN.md). The vault's disk unlocks itself, so its
             # records cannot be sealed under anything the vault keeps; they
@@ -1042,6 +1091,14 @@ def build_cli() -> argparse.ArgumentParser:
                    help="skip the pre-WOL delay. The vault still applies its "
                         "own mandatory 5-20 min jitter; this only removes the "
                         "decorrelation between your poke and the power spike.")
+    w.add_argument("--hold-file", default=proto.HOLD_FILE_DEFAULT,
+                   metavar="PATH",
+                   help="while this file exists nothing wakes the vault: no "
+                        "magic packet, and no job handed to anything that "
+                        "answers. Create it the moment the vault may have "
+                        "been taken, imaged or handled; remove it once it has "
+                        "been paired again (default %(default)s, the same "
+                        "file the pager reads)")
     # Deliberately NO --job / --amount / --count flags: the job is read from
     # stdin so it never lands in /proc/<pid>/cmdline. tests/test_cli_flags.py
     # asserts these flags do not exist. There is NO --passphrase either, for
@@ -1051,7 +1108,7 @@ def build_cli() -> argparse.ArgumentParser:
     # halves, one of which lives only on this card. If the vault has to be
     # opened with no Pi to wake it -- the operator is at the machine, the Pi
     # is dead, a deposit has to be paid out -- this prints that half, and
-    # `gs_wake_agent --unseal-state <hex>` takes it. It asks for the
+    # `gs_wake_agent --unseal-state` asks for it. It asks for the
     # passphrase like every other read of this keyfile, and prints to the
     # terminal only.
     k = sub.add_parser("state-key",
@@ -1414,7 +1471,18 @@ def run_wake(args, key: dict, job: str, params: dict,
     NEVER RAISES INTO THE WAKE. A callback that throws must not lose a job
     that is running: the exception is swallowed and the wait continues.
     """
-    pending = Pending(key, job, params, clock=clock)
+    _hold = getattr(args, "hold_file", None) or proto.HOLD_FILE_DEFAULT
+    # HELD: NOTHING IS SENT AT ALL. See proto.HOLD_FILE_DEFAULT. Before the
+    # bind, so a held box does not even open the port the vault would look
+    # for.
+    if proto.wakes_held(_hold):
+        raise Doorbell(
+            f"wakes are held on this box: {_hold} is there. NOT sending the "
+            f"magic packet. Remove it only once the vault has been checked "
+            f"and, if it may have been handled, paired again "
+            f"(OPSEC_SETUP.md section 1).")
+    pending = Pending(key, job, params, clock=clock, hold_file=_hold,
+                      armed=False)
 
     def _fire(word):
         if on_event is None:
@@ -1453,6 +1521,15 @@ def run_wake(args, key: dict, job: str, params: dict,
                   f"magic packet, so the poke and the power spike are not the "
                   f"same instant.")
             sleep(delay)
+        # AGAIN AFTER THE DELAY, which can be a quarter of an hour. Under
+        # on_m1's lock like the other check; with `armed` still False nothing
+        # can have been collected, so a raise here hands nothing over.
+        with pending._lock:
+            _held_late = proto.wakes_held(_hold)
+        if _held_late:
+            raise Doorbell(
+                f"wakes were held on this box while this one waited to "
+                f"start ({_hold} appeared). NOT sending the magic packet.")
         sent = send_wol(key["target_mac"], key.get("wol_broadcast",
                                                    "255.255.255.255"),
                         int(key.get("wol_port", 9)), sock_factory=sock_factory)
@@ -1477,6 +1554,18 @@ def run_wake(args, key: dict, job: str, params: dict,
         _said = False
         _last_wol = clock()
         while not pending.finished():
+            # A HOLD BEFORE COLLECTION ENDS THE WAIT: no more magic packets,
+            # and on_m1 would refuse the note anyway. After collection the
+            # job is the vault's, and the only thing left to do is hear how
+            # it went. UNDER on_m1's LOCK, so a note being sealed as the
+            # file appears is either finished (and heard out) or refused.
+            with pending._lock:
+                _held_now = (pending.collected_at is None
+                             and proto.wakes_held(_hold))
+                if _held_now:
+                    pending.events.append("held_before_collection")
+            if _held_now:
+                break
             if not _said and pending.collected_at is not None:
                 _said = True
                 _fire("collected")
@@ -1540,14 +1629,40 @@ def _report_events(pending: Pending) -> None:
     """
     second = pending.events.count("m1_second_ephemeral")
     if second:
+        # NOT A REPLAY, AND THIS USED TO OFFER ONE AS THE COMFORTING READING:
+        # "the job went to a boot that cannot read it, and nothing ran". The
+        # window nonce closed that: a replayed note from this window carries
+        # the same ephemeral and is served as a retry, and one from another
+        # window is refused on its window field. What is left is two boots
+        # that both hold the vault's key -- and since M2 carries this card's
+        # half of the state key, the one that took the job may be able to
+        # read everything the vault has sealed.
         print(f"  [!] {second} further AUTHENTICATED wake note(s) arrived from "
               f"a different boot after this job was handed over.")
-        print(f"      Only something holding the vault's key can produce one. "
-              f"Either the vault booted twice, or a note captured on the LAN "
-              f"was replayed — in which case the job went to a boot that "
-              f"cannot read it, and nothing ran.")
+        print(f"      Only something holding the vault's key can produce one: "
+              f"the vault booted twice, or something else holds a copy of "
+              f"its key -- a copy of its disk is enough. In that case "
+              f"whichever of them took the job also took this box's half "
+              f"of the state key.")
         print(f"      The vault refuses a repeated job id on its own ledger, "
               f"so this cannot have run the job twice. CHECK THE VAULT.")
+        if "wakes_held" in pending.events:
+            print(f"      Every later wake is now HELD ({pending.hold_file}). "
+                  f"Remove it only once you know it was the vault booting "
+                  f"twice; otherwise pair again first (OPSEC_SETUP.md "
+                  f"section 1).")
+        else:
+            print(f"      The hold file ({pending.hold_file}) could NOT be "
+                  f"created: hold the wakes by hand before anything else "
+                  f"wakes the vault.")
+    _early = pending.events.count("m1_before_wake")
+    if _early:
+        print(f"  [!] {_early} note(s) signed as the vault asked for this job "
+              f"BEFORE the magic packet went out, and were refused.")
+        print(f"      Only something already switched on can do that: the "
+              f"vault booted by hand, or a copy of its disk on the LAN. If "
+              f"nobody switched it on, hold every wake ({pending.hold_file}) "
+              f"and check it (OPSEC_SETUP.md section 1).")
     retry = pending.events.count("m1_retry")
     if retry:
         print(f"  [*] {retry} wake note(s) repeated a boot this box had already "
@@ -1729,6 +1844,15 @@ def report(pending: Pending) -> int:
         print(f"  [!] Vault ran job {pending.job} and it FAILED. The reason is "
               f"on the vault.")
         return 1
+    if out == "expired_uncollected" and any(
+            e in pending.events for e in ("m1_held",
+                                          "held_before_collection")):
+        print(f"  [!] Wakes were HELD on this box ({pending.hold_file}) "
+              f"before job {pending.job} was handed over. Nothing was "
+              f"handed over and nothing ran.")
+        print(f"      Remove the file only once the vault has been checked "
+              f"and, if it may have been handled, paired again.")
+        return 1
     if out == "expired_uncollected":
         print(f"  [!] Nothing collected job {pending.job} within "
               f"{FETCH_WINDOW_S // 60} min.")
@@ -1769,20 +1893,26 @@ def main(argv=None):
         print("  which is in the vault's keyfile. Either alone opens")
         print("  nothing. At the vault:")
         print()
-        print(f"      python3 gs_wake_agent --unseal-state {_half} \\")
+        # THE COMMAND DOES NOT CARRY THE HALF. It is printed above, once,
+        # to be typed at the prompt the command gives: pasted onto the
+        # command line it would sit in the vault's shell history, on the
+        # disk the seal exists for.
+        print("      python3 gs_wake_agent --unseal-state \\")
         print("          --key /etc/gs_wake_thinkpad.key")
+        print("      (it asks for the half, without echo)")
         print()
         # THE SAME HALF IS WHAT THREE MORE HAND COMMANDS TAKE, and this was
         # the one place an operator reads it -- which named only the first.
         # Sealing the spend secrets is a setup step every sealed box needs
         # once, and it was documented nowhere this output points.
         print("  The same half is what these take, at the vault:")
-        print("      --seal-secrets <hex>             seal the vault's spend "
-              "secrets")
-        print("      --unseal-key <hex>               print the sealed "
-              "settings")
-        print("      --fee-sweep --unseal-state <hex> run the fee sweep by "
-              "hand")
+        print("      --seal-secrets             seal the vault's spend secrets")
+        print("      --unseal-key               print the sealed settings")
+        print("      --fee-sweep --unseal-state run the fee sweep by hand")
+        print("  Each ASKS for the half, without echo: typed on the command")
+        print("  line it would land in the vault's shell history, on the")
+        print("  disk the seal exists for. Keep your copy of it INSIDE the")
+        print("  LUKS USB, never on paper beside it.")
         print()
         print("  It is DERIVED from this card's secret, so it is the same")
         print("  every time and a re-pairing changes it -- after which the")

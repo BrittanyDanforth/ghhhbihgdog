@@ -446,8 +446,13 @@ finally:
 _eptext = "\n".join(_eps)
 check("events: a second signed request for the job reaches the CHAT, not just "
       "a terminal", "second signed request" in _eptext)
-check("events: ...and says what it means for what follows",
-      "nothing ran" in _eptext and "Check before assuming" in _eptext)
+# NOT "IN WHICH CASE NOTHING RAN" ANY MORE (the review of the hold): what
+# else spoke for the other end can run the job, and holds its half by then.
+check("events: ...and says what it means for what follows -- without the "
+      "comforting 'nothing ran' a copy of the other end makes false",
+      "something other than the other end" in _eptext
+      and "Check it before anything else starts" in _eptext
+      and "nothing ran" not in _eptext.split("\n")[0])
 check("events: ...before the outcome, since it changes how that reads",
       _eps and "second signed request" in _eps[0])
 check("events: ...and the outcome still arrives after it",
@@ -1693,7 +1698,9 @@ print("\n== what the state file says about when you were awake ==")
 _stdir = tempfile.mkdtemp(prefix="stamps_")
 _stp = os.path.join(_stdir, "state.json")
 _sl = pg.Limits(__import__("pathlib").Path(_stp), 300, 12)
-_t_odd = 1755900123.456789
+# RECENT: a save keeps only the last day's stamps (the review of the
+# uncovered dimensions), so a fixed date would now be pruned, not bucketed.
+_t_odd = float(int(time.time()) - 3600) + 23.456789
 _sl.last_poke = _t_odd
 _sl.pokes = [_t_odd, _t_odd + 7, _t_odd + 61]
 _sl.save()
@@ -4072,9 +4079,26 @@ check("burn/threads: the lock is not held while a delete is on the wire",
       _held == [False])
 check("burn/threads: every mutation of the list is under the one lock, and "
       "both sweeps rebuild it through _replace_burn",
-      _SRC_PG_EARLY.count("with _BURN_LOCK:") >= 6
+      # 5: the two appends -- a sent message, an operator's -- now go
+      # through ONE recorder, _burn_record, which holds the lock (driven
+      # just below).
+      _SRC_PG_EARLY.count("with _BURN_LOCK:") >= 5
       and _SRC_PG_EARLY.count("self._replace_burn(snapshot, keep)") == 2
       and "self.burn = keep\n" not in _SRC_PG_EARLY)
+class _LockedList(list):
+    def append(self, x):
+        _lk_seen.append(pg._BURN_LOCK.locked())
+        super().append(x)
+
+
+_lk_seen = []
+_bl3 = _BurnPager(burn_after=1)
+_bl3.p.burn = _LockedList()
+_bl3.p._remember(111, {"result": {"message_id": 40}})
+_bl3.p._remember(111, {"result": {"message_id": 43}})
+check("burn/threads: ...driven: every append the recorder makes -- the "
+      "message and the ids of a gap -- happens WITH the lock held",
+      len(_lk_seen) == 4 and all(_lk_seen))
 check("burn/threads: whoami subscribes to both update kinds, so Telegram's "
       "remembered allowed_updates does not drop taps around it",
       _SRC_PG_EARLY.count("%22callback_query%22") == 2)
@@ -4224,11 +4248,430 @@ check("hold: the deposit wizard's pre-check applies the hold too, so a "
       "conversation is not walked through its questions to be refused at "
       "the confirm",
       _SRC_PG_EARLY.count("self.limits.why_not() or self._hold_why()") == 2)
-check("hold: start_job records the moment from the same figure the working "
-      "message quotes, so the two cannot drift",
-      "self._set_in_flight(True, until=time.time() + _hold)" in _SRC_PG_EARLY
-      and _SRC_PG_EARLY.index("_hold = (proto.result_budget_s(job)")
-      < _SRC_PG_EARLY.index("self._set_in_flight(True, until=time.time() + _hold)"))
+# THE CARD GETS THE LONGEST JOB'S WINDOW, WHATEVER RUNS (the review of the
+# uncovered dimensions). The windows are public constants a job apart, so the
+# job's own window on the card -- bucketed or not -- named the job: a card
+# taken mid-wake said a withdrawal was moving money right now.
+_cw, _cws = _room_pager([111], [])
+_cw_saves = []
+_cw.limits = types.SimpleNamespace(
+    why_not=lambda: "", record=lambda: None, recent=lambda: [],
+    headroom=lambda: 12, daily_cap=12, offset=0, in_flight=False,
+    in_flight_until=0.0,
+    save=lambda: _cw_saves.append((_cw.limits.in_flight,
+                                   _cw.limits.in_flight_until)))
+
+
+class _CwDone:
+    result = {"status": "done", "handle": "", "slip": "", "plain": {},
+              "phase": ""}
+    events = []
+    collected_at = 1.0
+
+    def outcome(self):
+        return "done"
+
+
+_cw_saved = pg._DOORBELL[0]
+_cw_db = types.SimpleNamespace(run_wake=lambda *a, **k: _CwDone(),
+                               FETCH_WINDOW_S=600, PRE_WOL_MAX_S=900)
+try:
+    pg._DOORBELL[0] = _cw_db
+    _cw_t0 = time.time()
+    with contextlib.redirect_stdout(io.StringIO()):
+        _cw.start_job(111, "swap_status", {"handle": "A3F1"})
+        for _ in range(300):
+            if not _cw.busy.locked():
+                break
+            time.sleep(0.02)
+finally:
+    pg._DOORBELL[0] = _cw_saved
+_cw_on = [u for on, u in _cw_saves if on]
+_cw_long = max(P.result_budget_s(j) for j in P.JOBS) + 600 + 900
+check("hold: a SHORT job puts the LONGEST job's window on the card -- the "
+      "card no longer says which job is running",
+      len(_cw_on) == 1
+      and _cw_t0 + _cw_long - 5 <= _cw_on[0] <= time.time() + _cw_long + 5)
+check("hold: ...while the chat that asked is still quoted its OWN job's "
+      "figure: it knows its job",
+      any("checking now" in _t and "up to 55 min" in _t for _t in _cws))
+check("hold: ...and the bit is cleared when the job reports",
+      _cw_saves and _cw_saves[-1] == (False, 0.0))
+
+# "collected" IS CHAINED FOR EVERY JOB, BESIDE THE OUTCOME. It was chained by
+# the milestone callback, which only the long jobs have -- the kind itself
+# said "one of the long jobs", at the moment of collection.
+_cl_logs = []
+_cl_real = pg.integrity_log
+pg.integrity_log = lambda *a, **k: _cl_logs.append(a)
+try:
+    _cl, _cls = _room_pager([111], [])
+    pg.doorbell = lambda: types.SimpleNamespace(
+        run_wake=lambda a, k, j, p, on_event=None: _CwDone())
+    with contextlib.redirect_stdout(io.StringIO()):
+        _cl.poke(111, "swap_status", {"handle": "A3F1"})
+    _cl_short = list(_cl_logs)
+    _cl_logs.clear()
+    _cb = _cl._milestone(111, "withdraw")
+    _cb("collected")
+    _cl_cb = list(_cl_logs)
+finally:
+    pg.integrity_log = _cl_real
+    pg.doorbell = _real_doorbell
+check("chain: a SHORT job's collection is chained too, right before its "
+      "outcome",
+      ("pager", "collected") in _cl_short
+      and _cl_short.index(("pager", "collected"))
+      == _cl_short.index(("pager", "outcome:done")) - 1)
+check("chain: ...and the long jobs' milestone no longer chains its own "
+      "line at the moment of collection", _cl_cb == [])
+
+# THE STATE FILE KEEPS ONLY WHAT THE CAP READS. Stamps were pruned when
+# something asked and written back by every save between.
+_sf = __import__("pathlib").Path(_tf_st.mkdtemp(prefix="pgsf_")) / "s.json"
+_sl = pg.Limits(_sf, 300, 12)
+_sl.pokes = [time.time() - 3 * 86400, time.time() - 2 * 86400,
+             time.time() - 600]
+_sl.last_poke = time.time() - 3 * 86400
+_sl.save()
+_sd = json.loads(_sf.read_text())
+check("state: a save writes back only the last day's stamps, and no "
+      "last_poke older than that",
+      len(_sd["pokes"]) == 1 and _sd["last_poke"] == 0)
+_sl.last_poke = time.time() - 60
+_sl.save()
+# An interval well over the stamp bucket: the saved stamp rounds DOWN to its
+# five minutes, so against a 300 s interval "a minute ago" could read as six.
+check("state: NON-VACUITY -- a recent last_poke is kept, so the interval "
+      "still holds across a restart",
+      json.loads(_sf.read_text())["last_poke"] > 0
+      and pg.Limits(_sf, 3600, 12).why_not().startswith("wait"))
+
+# ...AND KEEPS last_poke FOR AS LONG AS THE INTERVAL READS IT (the review of
+# the hold): --min-interval can exceed a day, and a restart was a way round.
+_sl2 = pg.Limits(_sf, 172800, 12)
+_sl2.pokes, _sl2.last_poke = [], time.time() - 1.5 * 86400
+_sl2.save()
+check("state: with a --min-interval over a day, a restart still waits it out",
+      pg.Limits(_sf, 172800, 12).why_not().startswith("wait"))
+
+# A SECOND BOOT AND NO HOLD FILE: HELD IN MEMORY (the review of the hold).
+_lt, _lts = _room_pager([111], [])
+_lt.hold_file = os.path.join(tempfile.mkdtemp(prefix="gs_lt_"), "wakes.held")
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None: _EventPending(
+        ["job_collected", "m1_second_ephemeral", "hold_failed"]))
+try:
+    with contextlib.redirect_stdout(io.StringIO()) as _lt_out:
+        _lt.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+finally:
+    pg.doorbell = _real_doorbell
+check("hold latch: a second boot with no hold file written holds IN MEMORY "
+      "-- the next start is refused -- and says so at the terminal and in "
+      "the chat", _lt._hold_why() == pg.HELD_ANSWER
+      and not os.path.exists(_lt.hold_file)
+      and "could NOT be written" in _lt_out.getvalue()
+      and any("could not hold itself" in _t for _t in _lts))
+_ltn, _ = _room_pager([111], [])
+_ltn.hold_file = _lt.hold_file
+check("hold latch: NON-VACUITY -- another process (a restart) is not latched",
+      _ltn._hold_why() == "")
+# A BURN IS NOT A CHAIN LINE ANY MORE: a line per burn dated the chat, and
+# the long jobs' "picked up" line burning mid-wake dated a withdrawal.
+check("chain: burning messages writes nothing to the chain",
+      '"messages_burned"' not in _SRC_PG_EARLY)
+# THE GAP RULE ONLY ON A ONE-PERSON BOT: a bot's message ids run across all
+# its private chats, so on a shared one the ids between are other people's.
+for _mc, _want in ((1, [(111, 11), (111, 12)]), (2, [])):
+    _gr, _ = _room_pager([111, 222], [])
+    _gr.max_clients = _mc
+    _gr._burn_record(111, 10)
+    _gr._burn_record(111, 13)
+    check(f"burn gaps: max_clients={_mc} fills {_want or 'nothing'}",
+          [(c, m) for c, m, _t in _gr.burn if m not in (10, 13)] == _want)
+# THE RESTART HOLD, LIFTED BY A PERSON, and THE HOLD MUST BE PLACEABLE.
+_mh_saved = (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
+             pg.load_token, pg.doorbell, pg.integrity_log, pg.Pager.run)
+pg.validate_proxy = lambda u: "socks5h://x"
+pg.verify_tor = lambda p: None
+pg.isolated_proxy = lambda u, tag: {"https": "socks5h://x"}
+pg.load_token = lambda f: "123456:TOKEN"
+pg.doorbell = lambda: types.SimpleNamespace(
+    load_key=lambda p: {"secret": "11" * 32, "role": "pi"},
+    FETCH_WINDOW_S=600, PRE_WOL_MAX_S=900)
+pg.integrity_log = lambda *a, **k: None
+pg.Pager.run = lambda self: 0
+_mh_d = tempfile.mkdtemp(prefix="gs_mh_")
+_mh_state = os.path.join(_mh_d, "state.json")
+
+
+def _mh_boot(extra):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as _o:
+            pg.main(["--key", "k", "--chat-id", "111", "--state", _mh_state]
+                    + extra)
+        return _o.getvalue()
+    except SystemExit as e:
+        return f"EXIT {e}"
+
+
+try:
+    _mh_bad = _mh_boot(["--hold-file", "/nonexistent_gs_dir/wakes.held"])
+    _lh3 = pg.Limits(pg.Path(_mh_state), 300, 12)
+    _lh3.in_flight, _lh3.in_flight_until = True, time.time() + 50000
+    _lh3.save()
+    _mh_clr = _mh_boot(["--hold-file", os.path.join(_mh_d, "wakes.held"),
+                        "--clear-restart-hold"])
+    _mh_after = json.loads(open(_mh_state).read())
+finally:
+    (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy, pg.load_token,
+     pg.doorbell, pg.integrity_log, pg.Pager.run) = _mh_saved
+check("main: a --hold-file whose directory is missing refuses to start, "
+      "saying no hold could then be placed",
+      _mh_bad.startswith("EXIT") and "--hold-file" in _mh_bad
+      and "could not be placed" in _mh_bad)
+check("main: --clear-restart-hold forgets the recorded wake, says so, and "
+      "starts", not _mh_clr.startswith("EXIT")
+      and "--clear-restart-hold" in _mh_clr
+      and _mh_after.get("in_flight") is False)
+
+# THE PI'S CHAIN IS KEPT FOR A WINDOW, THEN RETIRED BEHIND AN ANCHOR.
+print("\n== the Pi's chain is kept for a window ==")
+import gs_common as _gc                                      # noqa: E402
+_chd = __import__("pathlib").Path(_tf_st.mkdtemp(prefix="pgch_"))
+_chp = _chd / "integrity_chain.log"
+# Ten days of links, written in the chain's own format (the clock is not
+# patched: time.time is every thread's).
+_ch_prev = "0" * 64
+with open(_chp, "w") as _chf:
+    for _dd in range(10, 0, -1):
+        for _k in ("poke", "outcome:done"):
+            _ln = f"{int(1_700_000_000 - _dd * 86400) // 600 * 600}|-|pager|{_k}"
+            _ch_prev = __import__("hashlib").sha256(
+                (_ch_prev + _ln).encode()).hexdigest()
+            _chf.write(f"{_ch_prev} | {_ln}\n")
+check("chain: (setup) the hand-written links verify as the real ones do",
+      _gc.verify_integrity_chain(_chp)[0] is True)
+_ch_before = _chp.read_text().splitlines()
+_ch_n = _gc.retire_chain_before(1_700_000_000.0 - 7 * 86400 + 1, log_path=_chp)
+_ch_after = _chp.read_text().splitlines()
+check(f"chain: links older than the window are retired ({_ch_n} of "
+      f"{len(_ch_before)})", _ch_n == 8 and len(_ch_after) == 13)
+check("chain: ...the rest are kept VERBATIM, hashes and all, so a head noted "
+      "off the box inside the window still matches",
+      _ch_after[1:] == _ch_before[8:])
+check("chain: ...behind an anchor carrying the last retired hash",
+      _ch_after[0] == _ch_before[7].split(" | ")[0] + " | anchor")
+_ch_ok = _gc.verify_integrity_chain(_chp)
+check("chain: ...and what is kept verifies, and says it starts at an anchor",
+      _ch_ok[0] is True and "ANCHOR" in _ch_ok[2])
+check("chain: ...without claiming the removal was on purpose -- it cannot "
+      "know, the chain has no key",
+      "on purpose" not in _ch_ok[2] and "anyone who" in _ch_ok[2])
+_gc.integrity_log("pager", "poke", log_path=_chp)
+check("chain: a new line chains on after it",
+      _gc.verify_integrity_chain(_chp)[0] is True)
+check("chain: the retired copy is not left on the card",
+      not (_chd / "integrity_chain.log.retired").exists()
+      and not (_chd / "integrity_chain.log.new").exists())
+check("chain: retiring again with nothing old is a no-op",
+      _gc.retire_chain_before(1_700_000_000.0 - 7 * 86400 + 1,
+                              log_path=_chp) == 0)
+_ch_all = _gc.retire_chain_before(time.time() + 86400, log_path=_chp)
+_ch_one = len(_chp.read_text().splitlines())
+_ch_v1 = _gc.verify_integrity_chain(_chp)[0]
+# Appended UNCONDITIONALLY, so a copy where verification is broken fails the
+# check below rather than crashing the lines after it.
+_gc.integrity_log("pager", "poke", log_path=_chp)
+check("chain: retiring past an anchor keeps a single anchor, and the chain "
+      "still verifies and grows",
+      _ch_all == 13 and _ch_one == 1 and _ch_v1 is True
+      and _gc.verify_integrity_chain(_chp)[0] is True)
+_ch_lines = _chp.read_text().splitlines() + ["", ""]
+_chp.write_text(_ch_lines[0] + "\n" + _ch_lines[1].replace("poke", "pokE")
+                + "\n")
+check("chain: NON-VACUITY -- an edited kept line still fails verification",
+      _gc.verify_integrity_chain(_chp)[0] is False)
+_chp2 = _chd / "mid.log"
+_gc.integrity_log("pager", "poke", log_path=_chp2)
+_chp2.write_text(_chp2.read_text() + ("f" * 64) + " | anchor\n")
+check("chain: an anchor anywhere but the first line is not an anchor",
+      _gc.verify_integrity_chain(_chp2)[0] is False)
+(_chd / "left.log.retired").write_text("old lines\n")
+_gc.integrity_log("pager", "poke", log_path=_chd / "left.log")
+_gc.retire_chain_before(0, log_path=_chd / "left.log")
+check("chain: a retired copy a crash left behind is shredded on the next try",
+      not (_chd / "left.log.retired").exists())
+# ...BUT A RETIRED COPY WITH NO CHAIN BESIDE IT IS THE CHAIN: a crash between
+# the two renames left it at the retired name, and shredding it would take
+# the kept lines with the old.
+_gc.integrity_log("pager", "poke", log_path=_chd / "gone.log")
+os.replace(_chd / "gone.log", _chd / "gone.log.retired")
+_gc.retire_chain_before(0, log_path=_chd / "gone.log")
+check("chain: a chain found only at the retired name is PUT BACK, not "
+      "shredded", (_chd / "gone.log").is_file()
+      and not (_chd / "gone.log.retired").exists()
+      and _gc.verify_integrity_chain(_chd / "gone.log")[0] is True)
+# A DEATH BETWEEN THE LINK AND THE SWAP leaves .retired as a second NAME for
+# the live chain: unlinked, never shredded -- shredding it overwrites the
+# chain itself.
+_gc.integrity_log("pager", "poke", log_path=_chd / "twin.log")
+_twin_before = (_chd / "twin.log").read_text()
+os.link(_chd / "twin.log", _chd / "twin.log.retired")
+_gc.retire_chain_before(0, log_path=_chd / "twin.log")
+check("chain: a retired name that is the live chain's own second name is "
+      "unlinked, and the chain is untouched",
+      (_chd / "twin.log").read_text() == _twin_before
+      and not (_chd / "twin.log.retired").exists())
+# THE PAGER RUNS IT: at start, then at most hourly; 0 keeps everything.
+_rc, _ = _room_pager([111], [])
+_rc.chain_keep_s = 7 * 86400
+_rc_calls = []
+_rc_real = pg.retire_chain_before
+pg.retire_chain_before = lambda cut: (_rc_calls.append(cut), 0)[1]
+try:
+    _rc.retire_chain(force=True)
+    _rc.retire_chain()
+    _rc._chain_retired_at -= pg.Pager.CHAIN_RETIRE_EVERY_S + 1
+    _rc.retire_chain()
+    _rc.chain_keep_s = 0
+    _rc._chain_retired_at = 0.0
+    _rc.retire_chain(force=True)
+finally:
+    pg.retire_chain_before = _rc_real
+check("chain: the pager retires at start and then at most hourly, and "
+      "--chain-keep-days 0 retires nothing",
+      len(_rc_calls) == 2
+      and abs(_rc_calls[0] - (time.time() - 7 * 86400)) < 60)
+check("chain: the flag defaults to a week, and run() retires before the "
+      "first poll",
+      pg.build_cli().parse_args(["--key", "k", "--chat-id", "1"])
+      .chain_keep_days == 7
+      and "self.retire_chain(force=True)" in _SRC_PG_EARLY
+      and _SRC_PG_EARLY.index("self.retire_chain(force=True)")
+      < _SRC_PG_EARLY.index("while not shutdown_requested():"))
+
+# ---- THE OPERATOR'S HOLD: NOTHING STARTS WHILE THE FILE IS THERE ---------
+#
+# The vault's keyfile is plaintext by design, so a copy of its disk answers
+# the NEXT wake as the vault -- and M2 carries this card's half of the state
+# key. The control is not waking: while the hold file exists nothing starts,
+# a tap or a forward this end would start by itself alike.
+print("\n== the operator's hold ==")
+_ohd = tempfile.mkdtemp(prefix="gs_hold_")
+_ohf = os.path.join(_ohd, "wakes.held")
+_op, _os_ = _room_pager([111], [])
+_op.hold_file = _ohf
+_op._hold_until = 0.0
+_ologs = []
+_real_il = pg.integrity_log
+pg.integrity_log = lambda *a, **k: _ologs.append(a)
+try:
+    _op.handle(_msg(111, 111, "/status"))
+    check("hold file: NON-VACUITY -- absent, /status is 'ready'",
+          _os_ == ["ready"] and _ologs == [])
+    open(_ohf, "w").close()
+    _os_.clear()
+    _op._status_at = {}
+    _op.handle(_msg(111, 111, "/status"))
+    check("hold file: present, /status says 'held' -- not 'wait', which "
+          "promises an end only the operator can bring", _os_ == ["held"])
+    _os_.clear()
+    _ostarted = []
+    _op.poke = lambda *a, **k: _ostarted.append(a)
+    _op.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
+    check("hold file: start_job refuses, with the held sentence, taking no "
+          "lock and starting nothing",
+          _os_ == [f"no: {pg.HELD_ANSWER}"] and not _op.busy.locked()
+          and _ostarted == [])
+    check("hold file: the automatic path is refused too -- a forward, a fee "
+          "retry, a recheck", not _op._btc_can_start()
+          and not _op._btc_can_start(background=True))
+    check("hold file: its coming is logged to the chain ONCE, not once a "
+          "tick", _ologs.count(("pager", "wakes_held")) == 1)
+    os.unlink(_ohf)
+    _os_.clear()
+    _op._status_at = {}
+    _op.handle(_msg(111, 111, "/status"))
+    check("hold file: removed, everything is ready again, and its going is "
+          "logged once", _os_ == ["ready"] and _op._btc_can_start()
+          and _ologs.count(("pager", "wakes_released")) == 1)
+    # FAILS CLOSED: whether it is there cannot be told -> held.
+    _op.hold_file = os.path.join(_ohd, "afile", "wakes.held")
+    open(os.path.join(_ohd, "afile"), "w").close()
+    check("hold file: a path whose existence cannot be told holds",
+          _op._hold_why() == pg.HELD_ANSWER)
+finally:
+    pg.integrity_log = _real_il
+check("hold file: the chat's sentence names no path, no machine and no "
+      "reason -- the transcript is on somebody else's server",
+      "/" not in pg.HELD_ANSWER and "held" in pg.HELD_ANSWER
+      and not re.search(r"\b(vault|thinkpad|keyfile|wallet|tor|disk|"
+                        r"copy|image|pair)\b", pg.HELD_ANSWER, re.I))
+check("hold file: the pager's flag defaults to the same file the doorbell "
+      "reads",
+      pg.build_cli().parse_args(["--key", "k", "--chat-id", "1"]).hold_file
+      == pg.proto.HOLD_FILE_DEFAULT == "/var/lib/gs/wakes.held")
+# A HOLD THAT LANDS BETWEEN THE CHECK AND THE PACKET is not "try again later".
+_oq, _oqs = _room_pager([111], [])
+_oq.hold_file = _ohf
+open(_ohf, "w").close()
+
+
+def _raise_held(*a, **k):
+    raise RuntimeError("wakes are held on this box")
+
+
+pg.doorbell = lambda: types.SimpleNamespace(run_wake=_raise_held)
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _oq.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+finally:
+    pg.doorbell = _real_doorbell
+check("hold file: a wake the doorbell refused because the hold appeared says "
+      "so, not 'try again later' -- later is exactly as held",
+      len(_oqs) == 1 and pg.HELD_ANSWER in _oqs[0]
+      and "Try again" not in _oqs[0])
+_oqs.clear()
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _EventPending(["held_before_collection"], out="expired_uncollected"))
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _oq.poke(111, "withdraw", {"exit_to": ["4" + "1" * 94], "depth": 1})
+finally:
+    pg.doorbell = _real_doorbell
+check("hold file: ...and one the hold stopped before collection says the "
+      "same, not 'never picked up'",
+      any(pg.HELD_ANSWER in _t for _t in _oqs)
+      and not any("never picked up" in _t for _t in _oqs))
+os.unlink(_ohf)
+_oqs.clear()
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _EventPending([], out="expired_uncollected"))
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _oq.poke(111, "withdraw", {"exit_to": ["4" + "1" * 94], "depth": 1})
+finally:
+    pg.doorbell = _real_doorbell
+check("hold file: NON-VACUITY -- an ordinary uncollected wake still says "
+      "'never picked up'",
+      any("never picked up" in _t for _t in _oqs)
+      and not any(pg.HELD_ANSWER in _t for _t in _oqs))
+# THE DOORBELL'S OWN HOLD (a second boot signed as the other end) is said.
+_oe, _oes = _room_pager([111], [])
+pg.doorbell = lambda: types.SimpleNamespace(
+    run_wake=lambda a, k, j, p, on_event=None:
+        _EventPending(["job_collected", "m1_second_ephemeral", "wakes_held"]))
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _oe.poke(111, "receive_and_quote", {"amount_sat": 5000000})
+finally:
+    pg.doorbell = _real_doorbell
+check("hold file: a hold the doorbell made on a second boot reaches the chat, "
+      "so the refusals that follow read as on purpose",
+      any("held at this end" in _t for _t in _oes))
 
 # ---- A WITHDRAWAL'S LABEL IS NOT A DEPOSIT'S ------------------------------
 #
@@ -4793,6 +5236,15 @@ _bp.btc_tick(look=_look_returning("confirmed", conf=5000000))
 check("the day's wake budget spent: likewise held, nothing started",
       _bj == [] and _bp.btc_open["B4A1"]["state"] == "seen"
       and len(_bs) == 1 and "as soon as this end is free" in _bs[0][0])
+# THE HELD DEPOSIT IS NOT "as soon as this end is free".
+_hdp, _hds, _hdj = _watch_pager()
+_hdp.hold_file = os.path.join(tempfile.mkdtemp(prefix="gs_hdp_"), "w.held")
+open(_hdp.hold_file, "w").close()
+_hdp.btc_tick(look=_look_returning("confirmed", conf=5000000))
+check("hold: a deposit confirmed while everything is held says it is held, "
+      "not that it goes 'as soon as this end is free'",
+      _hdj == [] and len(_hds) == 1 and "held at this end" in _hds[0][0]
+      and "as soon as this end is free" not in _hds[0][0])
 # A START THAT WAS REFUSED AFTER ALL (a tap took the lock between the check
 # and the call, the one-person rule): start_job says so in the chat and
 # answers False, and the entry goes back to "seen" so the next tick retries
@@ -5357,6 +5809,31 @@ check("after the forward reported SENT, /check on that deposit asks the XMR "
       "side (swap_status): the forward has nothing more to say; the entry "
       "is kept as sent", _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
       and (_sp3.btc_open.get("B4A1") or {}).get("state") == "sent")
+
+print("\n-- the copies a lost reply leaves (the review of the uncovered "
+      "dimensions) --")
+# send() goes through safe_post, which retries on its own: a POST that
+# reached Telegram and lost its reply was posted again, and only the last
+# attempt's id was recorded -- the first copy of an address or a memo stayed
+# in the transcript for good. In a private chat ids are sequential across
+# both sides, so an id never seen between two that were is one of ours or
+# the operator's, and both belong on the list.
+_gb, _ = _room_pager((111,), ())
+_gb.burn = []
+_gb._remember(111, {"result": {"message_id": 10}})
+_gb._remember(111, {"result": {"message_id": 13}})
+check("burn/gap: in a PRIVATE chat, the ids between two recorded ones (a "
+      "lost-reply copy, or the operator's own message) go on the burn list",
+      sorted(m for c, m, _t in _gb.burn if c == 111) == [10, 11, 12, 13])
+_gb._remember(-1001, {"result": {"message_id": 50}})
+_gb._remember(-1001, {"result": {"message_id": 55}})
+check("burn/gap: ...never in a GROUP, where the ids between are other "
+      "people's messages", sorted(m for c, m, _t in _gb.burn
+                                  if c == -1001) == [50, 55])
+_gb._remember(111, {"result": {"message_id": 13 + _gb.MAX_BURN_GAP + 5}})
+check("burn/gap: ...and a gap wider than MAX_BURN_GAP is not swept (a "
+      "restart's first id is not a sweep of the chat's history)",
+      len([m for c, m, _t in _gb.burn if c == 111]) == 5)
 
 print("\n-- each address on its own schedule (the review of stages 2-6) --")
 # Every open address was looked at back to back, in one order, every

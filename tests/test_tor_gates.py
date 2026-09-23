@@ -139,7 +139,30 @@ check("recheck: ...and it never issues the request in that case",
 # report on the wrong path entirely and pass while the run leaked.
 _msg, _log, _seen = drive(gs.tor_recheck, PROXY, "relay",
                           payload={"IsTor": True})
-check("recheck: the probe is sent THROUGH the proxy", _seen["proxies"] == PROXY)
+# ...AND ON A STREAM OF ITS OWN (the review of stages 2-6): the bare proxy
+# dict is Tor's default circuit, shared with whatever else carried it, so
+# gs_common gives the check its own SOCKS credential. Same endpoint, same
+# scheme; a credential added, never a different proxy.
+
+
+def _same_endpoint_own_stream(seen, given):
+    from urllib.parse import urlparse as _up
+    _s = _up((seen or {}).get("https") or (seen or {}).get("http") or "")
+    _g = _up(given.get("https") or given.get("http") or "")
+    return (_s.scheme == _g.scheme == "socks5h"
+            and (_s.hostname, _s.port) == (_g.hostname, _g.port)
+            and bool(_s.username))
+
+
+check("recheck: the probe is sent THROUGH the proxy, on a stream of its own",
+      _same_endpoint_own_stream(_seen["proxies"], PROXY))
+_own = {"http": "socks5h://mine:x@127.0.0.1:9050",
+        "https": "socks5h://mine:x@127.0.0.1:9050"}
+_msg, _log, _seen_own = drive(gs.tor_recheck, _own, "relay",
+                              payload={"IsTor": True})
+check("recheck: ...and a proxy that already carries a credential is used "
+      "exactly as given -- that is the caller's own isolation",
+      _seen_own["proxies"] == _own)
 check("recheck: ...to the Tor project's checker", _seen["url"] == gs.CHECK_TOR_URL)
 check("recheck: ...with a timeout, so a hung probe cannot stall a relay",
       _seen["timeout"])
@@ -174,7 +197,8 @@ check("verify: ...and records the failure by exception TYPE, not its text",
       any("verify_fail" in m for m in _log))
 
 _msg, _log, _seen = drive(gs.verify_tor, PROXY, payload={"IsTor": True})
-check("verify: the probe goes through the proxy", _seen["proxies"] == PROXY)
+check("verify: the probe goes through the proxy, on a stream of its own",
+      _same_endpoint_own_stream(_seen["proxies"], PROXY))
 
 
 # ==========================================================================

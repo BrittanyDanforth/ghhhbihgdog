@@ -2543,6 +2543,29 @@ check("...and an EMPTY proxy still fails closed before anything is sent",
       _gone and "clearnet" in _gone)
 
 
+# THE REWRITE'S OWN REFUSAL NAMED A VARIABLE IT DID NOT HAVE: `out` lives in
+# cmd_new, so a vault keyfile that could not be rewritten died with a
+# NameError instead of saying the delivery key was written and what to do.
+_rw_d = Path(tempfile.mkdtemp())
+_rw_sv = _DK.atomic_write_json
+_DK.atomic_write_json = lambda *a, **k: (_ for _ in ()).throw(
+    PermissionError(13, "Permission denied"))
+try:
+    _DK._rewrite_vault_key(_rw_d / "vault.key",
+                           {"role": "thinkpad", "secret": "11" * 32},
+                           out=_rw_d / "gs_delivery.key")
+    _rw_msg = None
+except SystemExit as e:
+    _rw_msg = str(e)
+except NameError as e:
+    _rw_msg = f"NameError: {e}"
+finally:
+    _DK.atomic_write_json = _rw_sv
+check("delivery: a vault keyfile that cannot be rewritten says so, naming "
+      "the delivery key it DID write -- not a NameError",
+      _rw_msg is not None and "NameError" not in _rw_msg
+      and "gs_delivery.key" in _rw_msg and "does not know about it" in _rw_msg)
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

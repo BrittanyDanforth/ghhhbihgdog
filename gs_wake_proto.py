@@ -230,6 +230,10 @@ TAG_M3 = b"GSWAKE-v1-M3".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "it is done"
 #: being replayed as the other.
 TAG_PC = b"GSWAKE-v2-PC".ljust(TAG_LEN, b"\0")   # Pi -> ThinkPad   "my address"
 TAG_PV = b"GSWAKE-v2-PV".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "my MAC"
+#: PAIR_PROTO 7: the vault's ceremony-only key, sent before the Pi's config
+#: so the Pi's half of the state key is sealed to a key that dies with the
+#: ceremony (see _pair_config).
+TAG_PE = b"GSWAKE-v2-PE".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "seal to this"
 #: The sealed slip. NOT a record on the wire -- it is a payload that TRAVELS
 #: inside M3 and then onward through the Pi and Telegram to a machine that
 #: holds a key neither of them has. It gets its own tag for the same reason M1
@@ -628,7 +632,7 @@ def seal(sender_secret, recipient_public, tag: bytes, body: dict) -> bytes:
     No nonce parameter, deliberately -- see the header.
     """
     public, bindings = _nacl()
-    if tag not in (TAG_M1, TAG_M2, TAG_M3, TAG_PC, TAG_PV):
+    if tag not in (TAG_M1, TAG_M2, TAG_M3, TAG_PC, TAG_PV, TAG_PE):
         raise WakeError("refusing to seal a record with an unknown tag")
     # sort_keys so the same body always produces the same inner length; the
     # padding makes the WIRE length constant regardless, but a deterministic
@@ -1291,6 +1295,71 @@ def state_half_of(body: dict) -> bytes:
     return _hexfield(body, "state_half", STATE_HALF_BYTES)
 
 
+#: THE OPERATOR'S HOLD ON EVERY WAKE (OPSEC_SETUP.md section 1).
+#:
+#: The half above rides in M2, and M2 goes to whatever authenticates as the
+#: vault -- which is anything holding a copy of the vault's disk, because that
+#: keyfile is plaintext by design (gs_wake_keys says why). No protocol change
+#: closes that: everything the vault holds before M2 is on its disk in the
+#: clear. What closes it is not waking: while this file exists on the Pi, the
+#: doorbell sends no magic packet and seals no M2, and the pager starts
+#: nothing -- a tap or a forward it would start by itself alike.
+#:
+#: IT RESTS ON NO SECRET, AND NEEDS NONE. The code is public and so is the
+#: path; what it controls is the Pi's own behaviour, and removing it takes
+#: write access to the Pi's card, which is a different compromise from the
+#: one it answers. Its existence tells whoever reads the card that the
+#: operator suspected the vault -- the file's whole purpose, so not a leak.
+#:
+#: NOTHING ON THE WIRE CREATES OR REMOVES IT, except one event: a second boot
+#: that authenticates as the vault inside one wake window (see gs_doorbell's
+#: on_m1). Only a holder of the vault's key can cause that, and it is the
+#: shape a copy of the vault's disk answering a wake takes.
+HOLD_FILE_DEFAULT = "/var/lib/gs/wakes.held"
+
+
+def wakes_held(path=None) -> bool:
+    """True while the hold file is there -- or while whether it is there
+    cannot be told. FAILS CLOSED: a directory that cannot be read is not
+    evidence the operator never held the wakes, and a dangling symlink or a
+    directory by that name is there. An empty path is the default, never
+    "off": there is no switch that disables the check."""
+    import os
+    p = str(path or "") or HOLD_FILE_DEFAULT
+    try:
+        os.lstat(p)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def hold_wakes(path=None, why: str = "") -> bool:
+    """Create the hold file (0600, never through a link). True if it is there
+    afterwards, whoever made it. `why` is one word from the caller's own
+    vocabulary, written so the operator reading the card sees what held it;
+    never anything from the wire."""
+    import os
+    p = str(path or "") or HOLD_FILE_DEFAULT
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        return True
+    except OSError:
+        return os.path.lexists(p)
+    try:
+        os.write(fd, (re.sub(r"[^a-z0-9_]", "", str(why or "operator"))
+                      or "operator").encode() + b"\n")
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return True
+
+
 def state_key(vault_half: bytes, pi_half: bytes, salt: bytes) -> bytes:
     """The container key: one half from each box, and a per-store salt.
 
@@ -1464,6 +1533,17 @@ KEYFILE_SCHEMA = "gs_wake_v2"
 #: opening; that is luck, and it is why this is fixed now rather than at the
 #: next bump, when it would not be.
 KEYFILE_VERSION = 1
+#: ...AND 2 FOR A VAULT KEYFILE WHOSE SETTINGS ARE SEALED (the review of the
+#: uncovered dimensions). Every build from before this one reads a keyfile
+#: only if it says 1, and none of them opens the sealed section -- a stage-8
+#: build opens it only when state_half is there, and older ones do not know
+#: it exists -- so a sealed keyfile under an older agent ran on its clear
+#: half alone, silently: no xpub to tell its own addresses from others', no
+#: spend switch, no fee address. Stamped 2, it is refused by every one of
+#: them, which is the only refusal that can reach code already written.
+#: A version-1 file with a sealed section (written by this build before the
+#: stamp) still opens here.
+KEYFILE_VERSION_SEALED = 2
 
 #: Argon2id profiles, by name, recorded IN the file. A file derived under one
 #: profile must always be derived under that profile, so the reader takes the
@@ -1558,6 +1638,8 @@ def lock_keyfile(payload: dict, passphrase: bytes, kdf: str = DEFAULT_KDF,
     if not isinstance(payload, dict):
         raise WakeError("keyfile payload must be an object")
     head = {"schema": KEYFILE_SCHEMA, "version": KEYFILE_VERSION, "role": role}
+    if not passphrase and payload.get(SETTINGS_FIELD) is not None:
+        head["version"] = KEYFILE_VERSION_SEALED
     if not passphrase:
         head["kdf"] = "none"
         head["plain"] = payload
@@ -1606,15 +1688,34 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
             f"The v1 format was plaintext on disk and is not read any more: "
             f"pair the two boxes again, which generates a fresh key on each "
             f"of them and carries no secret between machines.")
-    if container.get("version") != KEYFILE_VERSION:
+    _ver = container.get("version")
+    if isinstance(_ver, bool) or _ver not in (KEYFILE_VERSION,
+                                              KEYFILE_VERSION_SEALED):
         raise WakeError(f"keyfile is format version "
-                        f"{container.get('version')!r}, not {KEYFILE_VERSION}")
+                        f"{container.get('version')!r}, not {KEYFILE_VERSION} "
+                        f"or {KEYFILE_VERSION_SEALED}")
     kdf = container.get("kdf")
     if kdf == "none":
         payload = container.get("plain")
         if not isinstance(payload, dict):
             raise WakeError("keyfile says kdf=none but carries no payload")
+        # A 2 IS A PROMISE THE FILE CARRIES ITS SEALED SECTION AND ITS HALF.
+        # One without either has been altered, or half-restored: running it
+        # would be running on the clear half alone, which the stamp exists to
+        # stop.
+        if _ver == KEYFILE_VERSION_SEALED and (
+                not isinstance(payload.get(SETTINGS_FIELD), dict)
+                or not payload.get("state_half")):
+            raise WakeError(
+                "this keyfile says its settings are sealed (format version "
+                f"{KEYFILE_VERSION_SEALED}) and it does not carry the sealed "
+                "section and its half of the key. It has been altered or "
+                "half-restored. Pair again rather than run on half a "
+                "keyfile.")
         return payload
+    if _ver != KEYFILE_VERSION:
+        raise WakeError(f"keyfile is format version {_ver!r}, and only a "
+                        f"vault keyfile is ever {KEYFILE_VERSION_SEALED}")
     if kdf != "argon2id":
         raise WakeError(f"keyfile names an unknown KDF {kdf!r}")
     if not passphrase:
@@ -1711,7 +1812,17 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
 # which would silently ship an unsealed keyfile, the one outcome a privacy
 # stage must never have. The version stops the ceremony instead and names
 # which box is behind.
-PAIR_PROTO = 6
+# 7 (the review of the uncovered dimensions): the Pi's config, which carries
+# its half of the state key, is sealed to a key the vault makes for the
+# ceremony and drops after it, instead of between the two long-term keys.
+# Between the long-term keys, a recording of the ceremony off the switch plus
+# the vault's keyfile seized months later -- both keys in it are in the clear
+# by design -- opened the half with no wake and no LAN presence after the
+# seizure: M2 was given a per-boot ephemeral key for exactly this, and the
+# record that carries the same secret at pairing was not. A 6 and a 7 would
+# agree to pair and then fail to open each other's configuration, so the
+# version stops them at the commit step instead.
+PAIR_PROTO = 7
 PAIR_MAX_LINE = 8192
 #: The ceremony runs once, with a human at both ends. Generous, but bounded:
 #: a pairing socket that waits forever is a socket someone can leave open.
@@ -1905,11 +2016,17 @@ def _pair_info(body: dict) -> dict:
             # seal exists to protect.
             #
             # SAFE TO SEND HERE AND NOWHERE EARLIER. This exchange happens
-            # after both operators compared the code, boxed to the key that
-            # comparison authenticated -- see _pair_config, which exists
-            # because the MAC used to ride in the plaintext reveal. In the
-            # reveal this would have handed half of every future container
-            # to anyone who opened the pairing port during the ceremony.
+            # after both operators compared the code -- see _pair_config,
+            # which exists because the MAC used to ride in the plaintext
+            # reveal. In the reveal this would have handed half of every
+            # future container to anyone who opened the pairing port during
+            # the ceremony. WHAT IT RESTS ON (PAIR_PROTO 7): the Pi's record
+            # is sealed to the vault's CEREMONY key, which the vault drops
+            # when the ceremony ends, and which reached the Pi inside a
+            # record between the two long-term keys the comparison
+            # authenticated -- so nobody between the boxes could swap it,
+            # and a recording of the ceremony plus the vault's keyfile taken
+            # later opens nothing.
             if not isinstance(v, str) or len(v) != STATE_HALF_BYTES * 2:
                 raise WakeError("pairing info carries a bad state half")
             try:
@@ -2112,9 +2229,10 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
             f"({e}). Nothing was written on either box.") from e
     rec = seal(my_sk, peer_pub, send_tag, {"info": my_info})
 
-    def _accept(got: bytes) -> dict:
+    def _accept(got: bytes, opener=None) -> dict:
         try:
-            return _pair_info(open_record(my_sk, peer_pub, got, recv_tag))
+            return _pair_info(open_record(opener or my_sk, peer_pub, got,
+                                          recv_tag))
         except WakeError:
             # Best-effort: revives PAIR_ABORT["info"], which this exchange
             # had otherwise left as dead code. After local pre-validation
@@ -2124,8 +2242,19 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
             raise
 
     if first:
-        # The initiator has to speak first or both sides read forever.
-        _pair_send_record(sock, rec)
+        # THE PI: the vault's ceremony key first (PAIR_PROTO 7), inside a
+        # record between the long-term keys the comparison authenticated,
+        # and this box's config -- its half of the state key among it --
+        # sealed to THAT key, not to the vault's long-term one.
+        try:
+            _pe = open_record(my_sk, peer_pub, _pair_read_record(sock),
+                              TAG_PE)
+            _veph = public.PublicKey(_hexfield(_pe, "eph", 32))
+        except WakeError:
+            _pair_abort(sock, "info")
+            raise
+        _pair_send_record(sock, seal(my_sk, _veph, send_tag,
+                                     {"info": my_info}))
         return _accept(_pair_read_record(sock))
     # THE RESPONDER VALIDATES BEFORE IT ANSWERS. This read the peer's record,
     # sent its own, and only THEN opened what it had been given -- so on a
@@ -2142,7 +2271,15 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
     # validate their own info before sealing, and PAIR_PROTO was matched at
     # the commit step); only a wire fault after the code comparison reaches
     # it, and closing that would take a final acknowledgement round.
-    peer = _accept(_pair_read_record(sock))
+    # THE VAULT: a key for this ceremony only, sent first; the Pi's config
+    # is opened with it, and it is gone when this returns.
+    _eph = public.PrivateKey.generate()
+    try:
+        _pair_send_record(sock, seal(my_sk, peer_pub, TAG_PE,
+                                     {"eph": bytes(_eph.public_key).hex()}))
+        peer = _accept(_pair_read_record(sock), opener=_eph)
+    finally:
+        del _eph
     _pair_send_record(sock, rec)
     return peer
 
@@ -2668,6 +2805,14 @@ WITHDRAW_DEPTHS = {
     3: (20, 46560),    # 12.9h
 }
 
+#: WHAT A MIX'S KILL BUDGET ADDS TO ITS DEPTH'S FIGURE. The seconds above
+#: bound the hop delays exactly; the chain's confirmations are an ESTIMATE
+#: nothing here bounds, and a budget too short SIGKILLs a mix mid-spend. The
+#: withdrawal's budget (JOBS below) and every fee-sweep leg take the same
+#: margin -- the sweep's legs took the bare figure (the review of the
+#: uncovered dimensions), so a slow chain killed the host's own mix.
+WITHDRAW_BUDGET_MARGIN = 1.25
+
 #: HOP COUNT -> the depth key the wire carries. Derived, never written twice.
 #:
 #: THE CHAT TALKS IN HOPS AND THE WIRE TALKS IN KEYS, and for two turns the
@@ -3120,7 +3265,8 @@ JOBS = {
         # the job also hangs, and the deadman still fires; a budget too short
         # SIGKILLs a mix mid-spend, which is the one failure nothing here can
         # undo.
-        "budget_s": int(max(t for _w, t in WITHDRAW_DEPTHS.values()) * 1.25),
+        "budget_s": int(max(t for _w, t in WITHDRAW_DEPTHS.values())
+                        * WITHDRAW_BUDGET_MARGIN),
     },
 }
 

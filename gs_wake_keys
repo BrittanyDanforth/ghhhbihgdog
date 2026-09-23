@@ -43,8 +43,18 @@ So this file says `"kdf": "none"` and stores its payload as plain JSON, rather
 than dressing plaintext up as a ciphertext. What that costs is bounded and is
 stated here rather than discovered: someone who takes this laptop can
 
-  * impersonate this vault to the doorbell -- and collect a queued job, which
-    tells them a job was queued and nothing else;
+  * impersonate this vault to the doorbell -- and collect a queued job. That
+    USED to tell them a job was queued and nothing else. Since the sealed
+    store (stages 7-9) it tells them far more: M2 carries the Pi's half of
+    the state key, so whoever holds a copy of this disk and is on the Pi's
+    LAN at the NEXT wake -- the operator's, or a recheck the pager starts
+    by itself -- is handed the half, and with this file's own half it opens
+    the sealed settings, the record store and the sealed seed. No protocol
+    change closes that: everything this box holds before M2 is on this disk
+    in the clear. The control is the operator's: on the Pi, hold every wake
+    (`touch /var/lib/gs/wakes.held`) the moment this laptop may have been
+    taken, imaged or handled, and re-pair before waking it again
+    (OPSEC_SETUP.md section 1);
   * decrypt recorded M1 and M3 records -- an ephemeral public key, a random
     challenge, a job id and a four-character label. No address, no amount, no
     memo: those are in M2, which is sealed to a per-boot ephemeral key that
@@ -1023,7 +1033,7 @@ def _validate(args) -> None:
                  "box's settings are sealed to the pair, and a boot nobody "
                  "woke has no half of that key -- so it cannot read which "
                  "fee wallet to sweep. Pair without the flag and run "
-                 "`gs_wake_agent --fee-sweep --unseal-state <hex>` at the "
+                 "`gs_wake_agent --fee-sweep --unseal-state` at the "
                  "machine instead; `gs_doorbell state-key` prints the hex.")
     if args.account_ceiling < 1:
         sys.exit("[!] --account-ceiling must be at least 1.")
@@ -1085,8 +1095,8 @@ def sealed_left_behind(artifact_dir, keyfile,
             f"    Open them first, under the pair that sealed them:",
             f"        gs_doorbell state-key --key /etc/gs_wake_pi.key"
             f"   # on the Pi,",
-            f"            # or the hex you wrote beside the LUKS USB",
-            f"        gs_wake_agent --unseal-state <hex> --key {keyfile}",
+            f"            # or your copy inside the LUKS USB",
+            f"        gs_wake_agent --unseal-state --key {keyfile}",
             f"            # the keyfile that pairing wrote, wherever it is now",
             f"    That writes them out in the clear and retires the "
             f"container;",
@@ -1103,7 +1113,8 @@ def sealed_left_behind(artifact_dir, keyfile,
             f"    them again from the plaintext. Have the seed words, any",
             f"    passphrase, the wallet passwords and the aggregator key in",
             f"    hand, then move it aside, pair, run `gs_wake_agent",
-            f"    --seal-secrets <new hex>`, and shred the old file once a",
+            f"    --seal-secrets` (it asks for the new half), and shred the "
+            f"old file once a",
             f"    job has run from the new one.",
         ]
     if not lines:
@@ -1468,10 +1479,15 @@ def do_pair(args) -> int:
     print("      gs_wake_agent runs at boot with nobody here, on a disk that")
     print("      unlocks itself so that it can. A passphrase this machine")
     print("      stores in order to type to itself is not a passphrase.")
-    print("      What it costs is bounded: someone holding this laptop can")
-    print("      impersonate it to the doorbell and collect a queued job.")
-    print("      They cannot read a past job - those were sealed to a key")
-    print("      that only existed in the RAM of a machine now powered off.")
+    print("      What it costs: someone holding this laptop, or a copy of its")
+    print("      disk, can impersonate it to the doorbell at the NEXT wake --")
+    print("      and that wake hands them the Pi's half of the state key,")
+    print("      which opens this box's sealed settings, records and seed.")
+    print("      If this laptop may have been taken, imaged or handled, hold")
+    print("      every wake on the Pi at once (touch /var/lib/gs/wakes.held)")
+    print("      and re-pair before waking it again. They cannot read a PAST")
+    print("      job - those were sealed to a key that only existed in the")
+    print("      RAM of a machine now powered off.")
     print("      They also have your wallet, which is the larger problem.")
     print()
     print("      The Pi's keyfile IS sealed with your passphrase. Its SD card")

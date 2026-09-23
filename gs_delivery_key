@@ -404,7 +404,7 @@ def cmd_new(args) -> int:
     # whose file was never written seals every future slip to nothing, and the
     # failure does not surface until a swap is quoted.
     key["delivery_public"] = dpub
-    _rewrite_vault_key(vault_path, key)
+    _rewrite_vault_key(vault_path, key, out=out)
 
     integrity_log("delivery", "key_minted")
     print()
@@ -424,8 +424,11 @@ def cmd_new(args) -> int:
     return 0
 
 
-def _rewrite_vault_key(path: Path, payload: dict) -> None:
-    """Put delivery_public into the vault's keyfile, atomically, still 0400."""
+def _rewrite_vault_key(path: Path, payload: dict, out=None) -> None:
+    """Put delivery_public into the vault's keyfile, atomically, still 0400.
+    `out` is where the delivery key was written, for the refusal's text:
+    it named a variable of the caller's, so a rewrite that failed died with
+    a NameError instead of saying what to do."""
     container = proto.lock_keyfile(payload, b"", role=payload.get("role", ""))
     try:
         # atomic_write_json replaces by rename, so there is no window where the

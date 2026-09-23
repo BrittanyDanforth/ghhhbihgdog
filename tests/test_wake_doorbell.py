@@ -66,6 +66,15 @@ def load(name):
 DB = load("gs_doorbell")
 import nacl.public as NP                                     # noqa: E402
 
+# THE OPERATOR'S HOLD FILE DEFAULTS TO THE PI'S REAL ONE, and a second boot
+# creates it. Every doorbell in this file holds into scratch instead: a run on
+# a Pi must not hold that Pi's wakes, and one Bell's hold must not refuse the
+# next Bell's vault.
+_HOLD_REAL = P.HOLD_FILE_DEFAULT
+_HOLD_DIR = tempfile.mkdtemp(prefix="gs_hold_")
+P.HOLD_FILE_DEFAULT = os.path.join(_HOLD_DIR, "wakes.held")
+_BELLS = [0]
+
 TP = NP.PrivateKey.generate()
 PI = NP.PrivateKey.generate()
 #: The PAYLOAD. What lands on the SD card is the sealed container around it;
@@ -86,10 +95,14 @@ KDF = "interactive"
 class Bell:
     """A doorbell on a real ephemeral port, with an injected clock."""
 
-    def __init__(self, job="receive_and_quote", params=None, t=1000.0):
+    def __init__(self, job="receive_and_quote", params=None, t=1000.0,
+                 hold=None):
         self.t = [t]
+        _BELLS[0] += 1
+        self.hold = hold or os.path.join(_HOLD_DIR, f"held_{_BELLS[0]}")
         self.pending = DB.Pending(KEY, job, params or {"amount_sat": 5000000},
-                                  clock=lambda: self.t[0])
+                                  clock=lambda: self.t[0],
+                                  hold_file=self.hold)
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         self.port = s.getsockname()[1]
@@ -1323,6 +1336,294 @@ except SystemExit:
     _sk_refused = True
 check("state-key: an UNSEALED card is refused here too — the recovery path "
       "is not a way around the passphrase", _sk_refused)
+_sk_half = P.derive_state_half(KEY["secret"]).hex()
+check("state-key: the half is printed ONCE, on its own line, and the command "
+      "beneath it does not carry it -- pasted onto a command line it would "
+      "sit in the vault's shell history, on the disk the seal exists for",
+      _sk_txt.count(_sk_half) == 1
+      and "--unseal-state \\\n" in _sk_txt
+      and "asks for the half" in _sk_txt)
+
+
+print("\n== the operator's hold: nothing wakes, nothing is handed over ==")
+# gs_wake_keys says it plainly: the vault's keyfile is plaintext, so a copy of
+# its disk can answer the NEXT wake as the vault -- and M2 carries this card's
+# half of the state key. No protocol change closes that; not waking does.
+check("hold: the default is the Pi's state directory, which the pager's unit "
+      "can write (ReadWritePaths) and where its WorkingDirectory is",
+      _HOLD_REAL == "/var/lib/gs/wakes.held"
+      and "ReadWritePaths=/var/lib/gs\n" in open(os.path.join(
+          REPO, "systemd", "gs-telegram-pager.service.example")).read())
+check("hold: the wake CLI takes it, defaulting to the same file",
+      DB.build_cli().parse_args(["wake", "--key", "k"]).hold_file
+      == P.HOLD_FILE_DEFAULT)
+_hd = Path(tempfile.mkdtemp(prefix="gs_holdt_"))
+check("hold: absent is not held", not P.wakes_held(str(_hd / "x")))
+(_hd / "there").write_text("")
+check("hold: present is held", P.wakes_held(str(_hd / "there")))
+os.symlink(str(_hd / "nowhere"), str(_hd / "dangling"))
+check("hold: a dangling symlink by that name is held -- it is THERE",
+      P.wakes_held(str(_hd / "dangling")))
+check("hold: FAILS CLOSED -- a path whose existence cannot be told (a "
+      "component that is a file) is held, not waved through",
+      P.wakes_held(str(_hd / "there" / "wakes.held")))
+Path(P.HOLD_FILE_DEFAULT).write_text("")
+check("hold: an empty path is the default file, never 'off' -- with the "
+      "default there, '' and None both hold",
+      P.wakes_held("") is True and P.wakes_held(None) is True)
+os.unlink(P.HOLD_FILE_DEFAULT)
+check("hold: ...and NON-VACUITY, with it gone neither does",
+      P.wakes_held("") is False and P.wakes_held(None) is False)
+check("hold: creating it gives a 0600 file naming what held it",
+      P.hold_wakes(str(_hd / "made"), "m1_second_ephemeral")
+      and (os.stat(_hd / "made").st_mode & 0o777) == 0o600
+      and (_hd / "made").read_text() == "m1_second_ephemeral\n")
+check("hold: ...and nothing from the caller but [a-z0-9_] reaches the card",
+      P.hold_wakes(str(_hd / "made2"), "../x\ny Z")
+      and (_hd / "made2").read_text() == "xy\n")
+os.symlink(str(_hd / "target"), str(_hd / "linked"))
+check("hold: an existing link is not written through -- it already holds, "
+      "and its target is never created",
+      P.hold_wakes(str(_hd / "linked"), "x")
+      and not os.path.lexists(_hd / "target"))
+check("hold: a file that cannot be created says so (False), so the report "
+      "can tell the operator to hold by hand",
+      P.hold_wakes(str(_hd / "no_such_dir" / "wakes.held"), "x") is False)
+
+# ON_M1: THE CHECK THAT MATTERS. Everything before it is a magic packet.
+hb = Bell()
+Path(hb.hold).write_text("")
+_heph, _hchal = NP.PrivateKey.generate(), P.new_challenge()
+_hs, _hbody = hb.post("/wake", m1_for(_heph, _hchal, hb.pending.window))
+check("hold: an authenticated M1 while held gets 204 and NO note",
+      _hs == 204 and _hbody == b"" and hb.pending._issued == {}
+      and hb.pending.collected_at is None)
+check("hold: ...recorded as m1_held",
+      hb.pending.events.count("m1_held") == 1)
+os.unlink(hb.hold)
+_hs2, _hbody2 = hb.post("/wake", m1_for(_heph, _hchal, hb.pending.window))
+hb.close()
+check("hold: NON-VACUITY -- the same note, the hold lifted, is handed the job",
+      _hs2 == 200 and len(_hbody2) == P.RECORD_LEN
+      and hb.pending.collected_at is not None)
+
+# A SECOND BOOT SIGNED AS THE VAULT HOLDS EVERY LATER WAKE.
+hs = Bell()
+hs.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                        hs.pending.window))
+hs.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                        hs.pending.window))
+hs.close()
+_hsb = io.StringIO()
+with contextlib.redirect_stdout(_hsb):
+    DB.report(hs.pending)
+check("hold: a second authenticated boot CREATES the hold file",
+      os.path.exists(hs.hold) and "wakes_held" in hs.pending.events
+      and Path(hs.hold).read_text() == "m1_second_ephemeral\n")
+check("hold: ...and the report says every later wake is held, and no longer "
+      "offers a replay as the comforting reading -- the window nonce ruled "
+      "that out, and whichever boot took the job took the half",
+      "now HELD" in _hsb.getvalue() and "replayed" not in _hsb.getvalue()
+      and "half" in _hsb.getvalue())
+hn = Bell(hold=str(_hd / "no_such_dir" / "wakes.held"))
+hn.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                        hn.pending.window))
+hn.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                        hn.pending.window))
+hn.close()
+_hnb = io.StringIO()
+with contextlib.redirect_stdout(_hnb):
+    DB.report(hn.pending)
+check("hold: ...and when the file cannot be made, the report says to hold "
+      "by hand rather than claiming a hold that is not there",
+      "wakes_held" not in hn.pending.events
+      and "could NOT be created" in _hnb.getvalue())
+
+
+# NOTHING IS HANDED OVER BEFORE THE MAGIC PACKET (the review of the hold).
+# run_wake binds before its pre-WOL delay and the fetch window was open from
+# construction, so for up to a quarter of an hour an M1 signed as the vault
+# took the job -- and a hold placed then reported "nothing ran" over a job,
+# and a half, already handed over.
+_pa = DB.Pending(KEY, "swap_status", {"handle": "A3F1"}, clock=lambda: 0.0,
+                 hold_file=str(_hd / "arm_hold"), armed=False)
+_pa_eph, _pa_chal = NP.PrivateKey.generate(), P.new_challenge()
+try:
+    _pa.on_m1(m1_for(_pa_eph, _pa_chal, _pa.window))
+    _pa_e = None
+except DB.Doorbell as e:
+    _pa_e = e
+check("arm: an authenticated note before the magic packet is REFUSED and "
+      "recorded -- nothing is sealed to it",
+      _pa_e is not None and _pa._issued == {} and _pa.collected_at is None
+      and "m1_before_wake" in _pa.events)
+_pa.arm()
+check("arm: NON-VACUITY -- the same note after the packet is handed the job",
+      len(_pa.on_m1(m1_for(_pa_eph, _pa_chal, _pa.window))) == P.RECORD_LEN
+      and _pa.collected_at is not None)
+_pab = io.StringIO()
+with contextlib.redirect_stdout(_pab):
+    DB._report_events(_pa)
+check("arm: ...and the report names it: only something already switched on "
+      "can do that", "BEFORE the magic packet" in _pab.getvalue()
+      and "hold every wake" in _pab.getvalue())
+# ...and run_wake really builds its Pending unarmed: a note posted during
+# the pre-WOL delay is refused, one after the packet is taken.
+_ra_seen = {}
+
+
+class _ArmSpy(DB.Pending):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        _ra_seen["p"] = self
+
+
+#: A clock only the sleeps move: the note below is posted at t=0, with the
+#: fetch window open by its own measure -- so the refusal it gets can only
+#: be the one this is about. (A clock that ran on by itself closed the
+#: window first, and the check passed with the gate removed.)
+_ra_t = [0.0]
+
+
+def _ra_sleep(s):
+    _p = _ra_seen.get("p")
+    if _p is not None and "during" not in _ra_seen:
+        try:
+            _p.on_m1(m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                            _p.window))
+            _ra_seen["during"] = "taken"
+        except DB.Doorbell:
+            _ra_seen["during"] = "refused"
+        _ra_seen["open"] = _p.fetch_open()
+    _ra_t[0] += s
+
+
+_ra_real = DB.Pending
+DB.Pending = _ArmSpy
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        DB.run_wake(type("A", (), {"no_jitter": False,
+                                   "hold_file": str(_hd / "arm_hold")})(),
+                    KEY, "swap_status", {"handle": "A3F1"},
+                    server_factory=lambda a, h: _IdleSrv(),
+                    sock_factory=lambda: FakeSock(), sleep=_ra_sleep,
+                    rng=type("R", (), {"randint": lambda self, a, b: 5})(),
+                    clock=lambda: _ra_t[0])
+finally:
+    DB.Pending = _ra_real
+check("arm: run_wake refuses a note that arrives during its pre-WOL delay "
+      "-- with its fetch window open, so the refusal is the gate's",
+      _ra_seen.get("during") == "refused" and _ra_seen.get("open") is True
+      and "m1_before_wake" in _ra_seen["p"].events)
+# A HOLD THE DOORBELL COULD NOT WRITE IS SAID, so the pager can hold in
+# memory instead of handing the half over again at the next start.
+_hf_b = Bell(hold=str(_hd / "no_such_dir2" / "wakes.held"))
+_hf_b.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                           _hf_b.pending.window))
+_hf_b.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                           _hf_b.pending.window))
+_hf_b.close()
+check("hold: a hold the doorbell could not write is recorded as hold_failed",
+      "hold_failed" in _hf_b.pending.events
+      and "wakes_held" not in _hf_b.pending.events)
+
+
+class _HArgs:
+    no_jitter = True
+
+    def __init__(self, hold):
+        self.hold_file = hold
+
+
+# RUN_WAKE: held before it starts -> not even a bind.
+_hbind = []
+_hpk = []
+Path(_hd / "held_rw").write_text("")
+try:
+    DB.run_wake(_HArgs(str(_hd / "held_rw")), KEY, "swap_status",
+                {"handle": "A3F1"},
+                server_factory=lambda a, h: (_hbind.append(1), _IdleSrv())[1],
+                sock_factory=lambda: (_hpk.append(1), FakeSock())[1])
+    _hre = None
+except DB.Doorbell as e:
+    _hre = e
+check("hold: a held box sends NO magic packet and does not even bind",
+      _hre is not None and "held" in str(_hre) and _hbind == [] and _hpk == [])
+
+
+# RUN_WAKE: the hold appears during the pre-WOL delay.
+class _HArgsJ(_HArgs):
+    no_jitter = False
+
+
+_hpk2 = []
+
+
+def _hold_while_waiting(s):
+    Path(_hd / "held_late").write_text("")
+
+
+class _HRng:
+    def randint(self, a, b):
+        return 5
+
+
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        DB.run_wake(_HArgsJ(str(_hd / "held_late")), KEY, "swap_status",
+                    {"handle": "A3F1"},
+                    server_factory=lambda a, h: _IdleSrv(),
+                    sock_factory=lambda: (_hpk2.append(1), FakeSock())[1],
+                    sleep=_hold_while_waiting, rng=_HRng())
+    _hre2 = None
+except DB.Doorbell as e:
+    _hre2 = e
+check("hold: held during the pre-WOL delay -- which can be a quarter of an "
+      "hour -- still sends no packet",
+      _hre2 is not None and "held" in str(_hre2) and _hpk2 == [])
+
+# RUN_WAKE: the hold appears after the packet, before collection.
+_ht = [7000.0]
+_hsent = []
+
+
+class _HSock:
+    def setsockopt(self, *a):
+        pass
+
+    def sendto(self, pkt, addr):
+        _hsent.append(_ht[0])
+        return len(pkt)
+
+    def close(self):
+        pass
+
+
+def _hsleep(s):
+    _ht[0] += s
+    if _ht[0] - 7000.0 >= 30:
+        Path(_hd / "held_mid").touch()
+
+
+with contextlib.redirect_stdout(io.StringIO()):
+    _hp3 = DB.run_wake(_HArgs(str(_hd / "held_mid")), KEY, "swap_status",
+                       {"handle": "A3F1"},
+                       server_factory=lambda a, h: _IdleSrv(),
+                       sock_factory=lambda: _HSock(), sleep=_hsleep,
+                       clock=lambda: _ht[0])
+check("hold: held after the packet and before collection, the wait ENDS -- "
+      "no repeated packet, nothing collected",
+      len(_hsent) == 1 and _hp3.collected_at is None
+      and "held_before_collection" in _hp3.events
+      and "wake_resent" not in _hp3.events
+      and _ht[0] - 7000.0 < DB.WOL_RESEND_S)
+_hrb = io.StringIO()
+with contextlib.redirect_stdout(_hrb):
+    _hrc = DB.report(_hp3)
+check("hold: ...and the report says the hold stopped it, not 'poking again "
+      "is safe' -- later is exactly as held",
+      _hrc == 1 and "HELD" in _hrb.getvalue()
+      and "poking again is safe" not in _hrb.getvalue())
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

@@ -142,7 +142,7 @@ deposits could not be paid out. Two commands exist for it, and both are
 documented beside the LUKS USB in §1:
 
     gs_doorbell state-key --key /etc/gs_wake_pi.key   # prints pi_half (asks the passphrase)
-    gs_wake_agent --unseal-state <hex> --key ...      # opens the store, by hand, at the machine
+    gs_wake_agent --unseal-state --key ...            # opens the store, by hand; asks for the half
 
 **A re-pairing makes an existing store unreadable**, because `pi_secret`
 changes (and the vault's half is drawn afresh). ~~The pairing says so before
@@ -213,14 +213,40 @@ test in `tests/test_wake_agent.py` and an anchor in `tests/mutation_sweep.py`.
   it first); the chain is sealed and `state_open` joins the lines written
   since the last seal onto the sealed history, re-chained, so the audit is
   whole and `--unseal-state` reads it.
+* **...and the sealed job log did not survive the next boot.** That boot
+  truncated a fresh log at start, `state_open` saw one on the disk and left
+  the sealed copy where it was, and the close sealed the fresh one over it;
+  a crashed run's plaintext log went at the same truncation. Both now land
+  in `gs_wake_job.prev.log`, a sealed member, each under a header, pruned at
+  14 days and 256 KiB. Clean runs do not touch it. Driven: a failed wake,
+  then a clean one, and the failure's own line is in the store.
 * **The checks were of `main()` stood in for by hand.** Every stage-7 wake
   test re-sealed with `state_close` after `run_once`, so `main()`'s own
   finally was never the thing under test — which is how an exit that skips
   it went unseen. The seal is now driven through `main()`, and through a
   real SIGTERM against a real child.
 
+* **A mix that did not finish left its whole graph beside the store.**
+  GhostSpiral keeps its plans (`unsigned_*.json`: the entry address the
+  swap memo names, every hop and amount, the fee address with the cut), a
+  `.chain_once_*` marker and its progress files on any ending but a
+  complete run, and a killed round leaves `tx_staging/` with its manifests.
+  None was a member, and nothing else removed them until a later run got
+  past its own stage 4. The flat files are members now; the staging trees
+  are shredded when the store closes (`MIX_TREES`). Driven.
+
 What is still in the clear between wakes, stated: the lines the chain and
 the job log gained **after** the last seal (a wake's closing lines, an idle
-boot's refusal), the marks (`issued_*.json`, outside every seal on purpose),
-and the inhibit mark and locks.
+boot's refusal, and the output of a fee sweep that did not finish cleanly —
+a sweep opens no store, so its log waits for the next wake to carry it into
+the sealed `gs_wake_job.prev.log`; a clean sweep's is shredded), the marks (`issued_*.json`, outside every seal on purpose),
+the inhibit mark and locks, and — outside the artifact directory, so outside
+this store — the Monero wallet file (encrypted under a password stage 9
+seals). monero-wallet-cli's own two files used to be on that list, and inside
+the directory: its log (it writes beside the name it was started as, which
+was the working directory) and its ring database (`~/.shared-ringdb`, and the
+unit sets HOME to the artifact directory). The signer now puts both in a
+scratch directory in RAM (`/dev/shm` where it is writable), removed when it
+exits. A log of **the job itself**, when a run did not finish cleanly, is
+kept sealed in `gs_wake_job.prev.log` (see above).
 

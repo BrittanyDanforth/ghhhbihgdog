@@ -43,7 +43,7 @@ afterwards (`OPSEC_SETUP.md` §5), so unlike stage 8 this cannot be sealed
 during the ceremony. It is one command, once, at the machine:
 
     gs_doorbell state-key --key /etc/gs_wake_pi.key        # on the Pi
-    gs_wake_agent --seal-secrets <hex> --key /etc/gs_wake_thinkpad.key
+    gs_wake_agent --seal-secrets --key /etc/gs_wake_thinkpad.key   # asks for the half
 
 This is worth stating plainly, because it resolves the objection that held
 this stage back: the concern was that a sealed seed needs the recovery path
@@ -74,8 +74,11 @@ leftover instead would make the seal decorative, and they would never learn.
   still a file, and one swapped for another would otherwise put whatever
   `GS_` variables it liked into every child's environment.
 * `_SECRETS.clear()` in `main`'s finally, on every path out — including
-  `--dry-run`, `--fee-sweep` and a refusal that keeps the box on, which all
-  return through it without powering anything off.
+  `--dry-run`, the hand commands and a refusal that keeps the box on, which
+  all return through it without powering anything off. (A hand `--fee-sweep`
+  that runs is not one of them: it powers off when it ends, like a wake,
+  unless the inhibit file is there by then -- touched while it runs, since
+  preflight refuses to start with it present. This line said otherwise.)
 
 And it adds no way to be stuck that stage 7 did not: if the seal will not
 open, the *store* will not open either, under the same key, and the job was

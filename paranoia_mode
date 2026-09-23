@@ -749,7 +749,11 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
 #   gs_impout_* -- the multi-round output-import dir: holds the wallet
 #                  OUTPUT-SET blob, i.e. the holdings picture.
 #   .gs_pw_*    -- the wallet password in plaintext.
-GS_TEMP_PREFIXES = ("gs_sign_", "gs_impout_", ".gs_pw_")
+#   .gs_ringdb_* -- monero-wallet-cli's ring database and log, which the
+#                  signer keeps in RAM rather than in HOME or the working
+#                  directory; removed at exit, so only a killed signer leaves
+#                  one (the rings this wallet spent with).
+GS_TEMP_PREFIXES = ("gs_sign_", "gs_impout_", ".gs_pw_", ".gs_ringdb_")
 
 #: The RAM-backed scratch root, as a name rather than a literal buried in
 #: _wipe_targeted_temp_roots.

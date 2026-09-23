@@ -846,7 +846,9 @@ check("gs_delivery_key confirms the file opens BEFORE it shreds the copy",
 # ===========================================================================
 print("\n== a re-pair must not orphan the delivery key in silence ==")
 _ag_src_rp = open(os.path.join(REPO, "gs_wake_agent"), encoding="utf-8").read()
-_dry = _ag_src_rp.split("if args.dry_run:")[1].split("raise Refused")[0]
+# The dry run's report is its own function now (_dry_run_report), so that a
+# hand boot -- where the doorbell is not listening -- reaches it too.
+_dry = _ag_src_rp.split("def _dry_run_report(")[1].split("\ndef ")[0]
 check("re-pair: --dry-run reports WHICH delivery mode is in force — it is the "
       "command the pairing tells the operator to run",
       "delivery_public" in _dry and "deposit_in_chat" in _dry)

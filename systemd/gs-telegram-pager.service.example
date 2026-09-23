@@ -18,7 +18,10 @@
 # Nothing in the tools depends on them: the pager takes --key, --chat-id and
 # --state as arguments, and reads its token from the environment. If this box
 # must not be identifiable by what is on it, rename the unit, the directory
-# and the log, and pass the new paths. Doing that breaks nothing.
+# and the log, and pass the new paths -- --hold-file included: the pager
+# refuses to start if the directory of its hold file (default
+# /var/lib/gs/wakes.held) is missing or unwritable, because then the hold
+# that stops every wake could not be placed. Nothing else depends on them.
 #
 # FIND YOUR CHAT ID FIRST. --chat-id wants a number an unallowlisted chat
 # cannot get out of the bot, because the bot answers unknown chats with

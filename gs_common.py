@@ -1136,6 +1136,10 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # between its write and its rename leaves a plaintext copy of the
     # whole chain; the wipe has to know its name.
     "integrity_chain.log.merge",
+    # ...and the Pi's retirement of its chain (retire_chain_before) writes
+    # the kept lines through .new and moves the old file to .retired before
+    # shredding it; a kill between leaves one of them, holding the lines.
+    "integrity_chain.log.retired", "integrity_chain.log.new",
     "*.blob", "*.signed", "*.unsigned",
     "signed_manifest_v1.json", "unsigned_manifest.json",
     # The wallet OUTPUT SET the signer exports so the offline wallet can sign
@@ -1201,6 +1205,10 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # thor_swap_preparer printed: the BTC deposit address and the ThorChain
     # memo, which names the destination XMR address in plain text.
     "gs_wake_job.log",
+    # ...and the logs of boots that did not finish cleanly, kept (sealed at
+    # rest) so a failure can still be read after the next wake; in the
+    # clear on a boot that opened no store.
+    "gs_wake_job.prev.log", "gs_wake_job.prev.log.new",
     # integrity_log_once's run-scoped dedupe marker, written into the
     # --output directory beside the plans. It was in NEITHER this list nor
     # .gitignore, so an incomplete run -- which keeps its marker by design,
@@ -1261,6 +1269,10 @@ GS_ARTIFACT_DIR_PATTERNS = [
     # phase now sweeps them by prefix (_wipe_targeted_temp_roots); this pattern
     # only catches a copy left in the cwd or under $HOME.
     "gs_impout_*",
+    # airgap_tx_signer's scratch for monero-wallet-cli's ring database and
+    # log (prefix=".gs_ringdb_"), in RAM like the two above; left behind only
+    # by a signer killed before its exit handler ran.
+    ".gs_ringdb_*",
 ]
 
 
@@ -1525,7 +1537,18 @@ def verify_integrity_chain(log_path: Path = INTEGRITY_LOG) -> tuple:
         return (False, None, f"{log_path} is empty")
     prev = "0" * 64
     nolock = 0
-    for i, raw in enumerate(lines, start=1):
+    # A CHAIN THAT STARTS AT AN ANCHOR had its older links removed: by the
+    # Pi's retention (retire_chain_before), which carries the last removed
+    # link's hash forward -- or by anyone who can write the file, since
+    # nothing here is keyed. Accepting it costs nothing this function ever
+    # had: such a writer could already rewrite the chain from the root. What
+    # it must not do is SAY which of the two happened, because it cannot
+    # know; the reason below states only what is there.
+    _anchored = _chain_anchor_of(lines[0])
+    _first = 1
+    if _anchored:
+        prev, _first = _anchored, 2
+    for i, raw in enumerate(lines[_first - 1:], start=_first):
         if " | " not in raw:
             return (False, i, f"line {i} is not a chain line (no ' | ' separator)")
         h, payload = raw.split(" | ", 1)
@@ -1538,12 +1561,150 @@ def verify_integrity_chain(log_path: Path = INTEGRITY_LOG) -> tuple:
         if "!nolock" in payload:
             nolock += 1
         prev = h
-    reason = f"{len(lines)} links verified"
+    reason = f"{len(lines) - (_first - 1)} links verified"
+    if _anchored:
+        reason += ("; it starts at an ANCHOR: the links before it are not "
+                   "here -- removed by the Pi's retention, or by anyone who "
+                   "can write this file (the chain has no key). A head you "
+                   "noted off the box is proof only while that line is "
+                   "still in it; one from before the anchor cannot be "
+                   "checked")
     if nolock:
         reason += (f"; {nolock} written without the lock (concurrent writers "
                    f"can fork a chain legitimately)")
     reason += "; NOTE: tail truncation is undetectable by design"
     return (True, None, reason)
+
+
+#: The first line of a chain whose older links were retired: the last retired
+#: link's hash, then this word where a link carries "ts|-|stage|msg". No link
+#: can be one -- every link's payload starts with its stamp's digits.
+CHAIN_ANCHOR = "anchor"
+
+
+def _chain_anchor_of(line: str) -> str:
+    """The prev hash an anchor line carries, or "" for any other line."""
+    if " | " not in (line or ""):
+        return ""
+    h, payload = line.split(" | ", 1)
+    h = h.strip()
+    if payload.strip() == CHAIN_ANCHOR and re.fullmatch(r"[0-9a-f]{64}", h):
+        return h
+    return ""
+
+
+def retire_chain_before(cutoff: float, log_path: Path = INTEGRITY_LOG) -> int:
+    """Drop every link stamped before `cutoff`; keep the rest VERBATIM behind
+    one anchor line carrying the last dropped link's hash. Returns how many
+    links went: 0 for nothing to do, -1 when it could not.
+
+    FOR THE BOX THAT MUST HOLD NOTHING (the review of the uncovered
+    dimensions). The vault's chain is sealed with its store between wakes;
+    the Pi has no second half to seal under, and its chain was append-only
+    for the life of the card: a poke and an outcome for every wake since
+    install, whose stamps give each one's time and rough length -- and the
+    lengths are public constants a job apart, so the kind. Bounding what is
+    kept is the only control that holds against a reader of the card.
+
+    THE KEPT LINES KEEP THEIR HASHES, so a head the operator noted off the
+    box still matches while it is inside the window; one noted before the
+    window is gone with the lines it named. Under the chain's own lock, and
+    the old file is overwritten before it is unlinked (on flash, best
+    effort, like every wipe here).
+    """
+    log_path = Path(log_path)
+    old = Path(str(log_path) + ".retired")
+    tmp = Path(str(log_path) + ".new")
+    try:
+        lock_fd = os.open(Path(str(log_path) + ".lock"),
+                          os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError:
+        return -1
+    dropped = 0
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # UNDER THE LOCK, like everything else here: another retirement's
+        # half-made copy is not a leftover while that retirement is running.
+        #
+        # A CRASH BETWEEN THE RENAMES BELOW leaves one of these. The retired
+        # copy holds the very lines this exists to take off the card -- but
+        # if the chain itself is MISSING it is the chain, and goes back.
+        if not log_path.exists() and old.is_file() and not old.is_symlink():
+            os.replace(old, log_path)
+        for _left in (old, tmp):
+            if not (_left.exists() or _left.is_symlink()):
+                continue
+            # A SECOND NAME FOR THE LIVE CHAIN (a death between the link and
+            # the swap below) is unlinked, never shredded: shredding it would
+            # overwrite the chain itself.
+            try:
+                _same = (_left.is_file() and log_path.is_file()
+                         and os.path.samefile(_left, log_path))
+            except OSError:
+                _same = False
+            if _same:
+                _left.unlink()
+            else:
+                secure_delete_or_warn(_left, "a retired integrity chain")
+        try:
+            raw = log_path.read_bytes()
+        except FileNotFoundError:
+            return 0
+        lines = raw.decode("utf-8", "surrogateescape").splitlines()
+        start = 1 if (lines and _chain_anchor_of(lines[0])) else 0
+        k = start
+        while k < len(lines):
+            try:
+                ts = int(lines[k].split(" | ", 1)[1].split("|", 1)[0])
+            except (IndexError, ValueError):
+                # A line this cannot date is kept, and so is all after it:
+                # retirement drops a PREFIX, never a line from the middle.
+                break
+            if ts >= cutoff:
+                break
+            k += 1
+        dropped = k - start
+        if dropped <= 0:
+            return 0
+        last_h = lines[k - 1].split(" | ", 1)[0].strip()
+        new = (f"{last_h} | {CHAIN_ANCHOR}\n"
+               + "".join(ln + "\n" for ln in lines[k:]))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(new.encode("utf-8", "surrogateescape"))
+            f.flush()
+            os.fsync(f.fileno())
+        # THE CHAIN'S NAME IS NEVER MISSING (the review of the hold). It was
+        # renamed away and then the new one renamed in, and a death between
+        # left no chain: the pager's next "start" line made a fresh one from
+        # the root, and this shredded the retired copy -- kept lines and
+        # all. A second NAME for the old file first, then one atomic swap:
+        # at every instant the chain's name is the old file or the new one.
+        try:
+            os.link(log_path, old)
+        except OSError:
+            # No hard links here (a FAT card): the old two-step, with the
+            # file put back if the second step fails.
+            os.replace(log_path, old)
+            try:
+                os.replace(tmp, log_path)
+            except OSError:
+                os.replace(old, log_path)
+                raise
+        else:
+            os.replace(tmp, log_path)
+    except OSError:
+        return -1
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
+    if not secure_delete_or_warn(old, "the retired integrity chain"):
+        return -1
+    return dropped
 
 
 def _append_chain_line(log_path: Path, h: str, line: str) -> None:

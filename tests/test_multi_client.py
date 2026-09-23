@@ -19,6 +19,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import os
 import socket
 import sys
@@ -648,15 +649,21 @@ _bp._running = 111
 _bp.limits.in_flight_until = time.time() + 7200
 _mine = _bp._busy_answer(111)
 _other = _bp._busy_answer(222)
-check("the chat whose job runs hears 'yours'; another chat hears a bounded "
-      "'busy for about', with a figure and nothing else",
+check("the chat whose job runs hears 'yours'; another chat hears 'busy', and "
+      "nothing else",
       _mine == pg.BUSY_ANSWER_MINE
-      and _other.startswith("no: busy right now") and "about 2h" in _other
+      and _other.startswith("no: busy right now")
       and "yours" not in _other and "report" not in _other)
-_bp.limits.in_flight_until = 0.0
-check("...and with no hold on record the figure is the public worst case, not "
-      "a guess about anyone",
-      pg._hold_words(P.result_budget_s("withdraw")) in _bp._busy_answer(222))
+# NO FIGURE (the review of the uncovered dimensions): "about 2h" was the
+# running job's own window, and the windows are public constants a job apart,
+# so another client was told the KIND of job. The answer is the same whatever
+# is running.
+_bp.limits.in_flight_until = time.time() + 60000
+_other_long = _bp._busy_answer(222)
+check("...with no figure in it, and the SAME words whatever window is on "
+      "record -- a withdrawal's and a check's are not told apart",
+      not re.search(r"\d", _other) and _other == _other_long
+      and "about" not in _other)
 _bp.busy.acquire()
 _bs.clear()
 _bp.start_job(222, "swap_status", {"handle": "A3F1"})

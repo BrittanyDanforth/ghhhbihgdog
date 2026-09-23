@@ -201,8 +201,8 @@ ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, s
 # them. Once, at the machine, after pairing:
 #
 #     gs_doorbell state-key --key /etc/gs_wake_pi.key      # on the Pi
-#     gs_wake_agent --seal-secrets <hex> \
-#                   --key /etc/gs_wake_thinkpad.key        # here
+#     gs_wake_agent --seal-secrets \
+#                   --key /etc/gs_wake_thinkpad.key        # here; asks
 #
 # That writes /etc/gs-wake-spend.sealed (0400), which opens only with both
 # boxes. It checks the half against what this machine already sealed, reads

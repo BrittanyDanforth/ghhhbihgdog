@@ -92,7 +92,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gs_common import (                                      # noqa: E402
     integrity_log, install_signal_handlers, shutdown_requested,
     isolated_proxy, safe_get, safe_post, validate_proxy, verify_tor,
-    atomic_write_json, terminal_safe,
+    atomic_write_json, terminal_safe, retire_chain_before,
 )
 import gs_wake_proto as proto                                # noqa: E402
 
@@ -613,13 +613,21 @@ FEE_ANSWER = f"{USAGE_FEE_LABEL} usage fee. Not the network fee."
 #: goes to the chat that started the job. Said to a different chat it promised
 #: a message that would never come, and said that somebody else's job was
 #: running. Now: YOURS is running (only to the chat whose job it is), or this
-#: is busy for about so long (a ceiling from this box's own persisted hold,
-#: never a count, never a name), or this is full (no figure at all: the only
-#: true one would be a fact about other people's runs).
+#: is busy (no figure), or this is full (no figure either: the only true one
+#: would be a fact about other people's runs).
+#:
+#: "BUSY FOR ABOUT T" WAS A FACT ABOUT OTHER PEOPLE'S RUNS (the review of the
+#: uncovered dimensions). T was the running wake's own hold, and the holds
+#: are public constants a job apart -- "about 17h" is a withdrawal, "about
+#: 1h" a check -- so another client was told what kind of job was running,
+#: against the one thing 4f promises they are not told. The length of a busy
+#: window can still be WATCHED, from /status, and OPSEC_SETUP.md 4f says so;
+#: what this no longer does is announce it.
 BUSY_ANSWER_MINE = ("no: yours is still running. One at a time — it reports "
                     "here when it finishes.")
 BUSY_ANSWER = ("no: busy right now with something that cannot be interrupted "
-               "from here. Try again in about {when}.")
+               "from here. Try again later — /status says 'ready' once it is "
+               "free.")
 #: ...AND "FULL" IS THE PROTOCOL'S OWN SENTENCE, so the vault's refusal for
 #: capacity (phase "full", when this box's memory of the places was wrong)
 #: and this box's own refusal from memory are the same words.
@@ -646,14 +654,35 @@ FULL_ANSWER = proto.PHASE_LINES["full"]
 #: A DICT KEYED ON A FIXED TUPLE, so the vault cannot put text in a chat: this
 #: box renders its own sentence for a word the doorbell chose from a set it
 #: also fixes. Same rule as PHASE_LINES.
-EVENT_VOCAB = ("m1_second_ephemeral", "result_refused",
+EVENT_VOCAB = ("m1_second_ephemeral", "wakes_held", "hold_failed",
+               "m1_before_wake", "result_refused",
                "m1_no_window_field", "m1_stale_window",
                "result_phase_unknown")
 EVENT_LINES = {
+    # NOT "IN WHICH CASE NOTHING RAN" (the review of the hold): whatever
+    # else spoke for the other end can run the job itself, and holds the
+    # other end's half of its records by now. What the reader needs is that
+    # it happened and that everything is being held.
     "m1_second_ephemeral":
-        "A second signed request for this job arrived from somewhere else. "
-        "It may have gone to the wrong place, in which case nothing ran. "
-        "Check before assuming either way.",
+        "A second signed request for this job arrived from somewhere else: "
+        "something other than the other end may be speaking for it. Check "
+        "it before anything else starts.",
+    # THE DOORBELL HELD EVERY LATER WAKE ON THAT EVENT (gs_doorbell's on_m1):
+    # a second boot speaking for the other end is what a copy of it looks
+    # like. Said, because from here on every tap is refused and the reader
+    # must know that is on purpose and that asking again will not lift it.
+    "wakes_held":
+        "Everything is now held at this end until the other end has been "
+        "checked. Nothing will start before then.",
+    # THE HOLD COULD NOT BE WRITTEN, so this process holds in memory until
+    # it restarts -- and the reader must place the real one by hand.
+    "hold_failed":
+        "This end could not hold itself on its own: it is holding until it "
+        "restarts. Place the hold by hand before then.",
+    "m1_before_wake":
+        "Something signed as the other end asked for this job before this "
+        "end had called it, and was refused. If nobody switched the other "
+        "end on by hand, check it before anything else starts.",
     "result_refused":
         "An answer came back for this job and was refused — it named the "
         "wrong job, or arrived after one was already in. Treat what follows "
@@ -696,6 +725,14 @@ SPEED_ANSWER = "Lighter is faster — see /withdraw."
 # of what this has to do. tests/test_depo_wizard.py caps these three at 40
 # characters for exactly this reason and caught a 191-character draft.
 EXIT_ANSWER = "Per withdrawal — see /withdraw."
+
+#: THE OPERATOR'S HOLD, as the chat hears it (proto.HOLD_FILE_DEFAULT). No
+#: path and no reason: the chat is a transcript on somebody else's server,
+#: and "the operator suspects the other machine was handled" is a sentence
+#: about the arrangement. What the reader needs is that nothing will start
+#: and that asking again will not change that.
+HELD_ANSWER = ("everything is held at this end, and nothing can start until "
+               "that hold is lifted there.")
 
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
@@ -1258,11 +1295,29 @@ class Limits:
     #: whose own docstring says the real bound is the vault's keyfile.
     STAMP_BUCKET_S = 300
 
+    #: The longest any stamp is kept on the card: the daily cap's window,
+    #: which is the only thing that reads them.
+    KEEP_S = 86400
+
     def save(self) -> None:
         with self._lk():
+            # ONLY WHAT THE CAP READS (the review of the uncovered
+            # dimensions). The stamps were pruned to a day only when
+            # something ASKED -- why_not, headroom -- and every save between
+            # (the update cursor moves on every message) wrote the rest back:
+            # a quiet week left the last wakes on the card until the next
+            # one, and last_poke stayed there for good.
+            _now = time.time()
+            self.pokes = [t for t in self.pokes if _now - t < self.KEEP_S]
+            # ...and last_poke for as long as the interval gate reads it,
+            # which --min-interval can make longer than a day.
+            _lp = (self.last_poke if _now - self.last_poke
+                   < max(self.KEEP_S,
+                         int(getattr(self, "min_interval", 0) or 0))
+                   else 0.0)
             atomic_write_json(
                 {"offset": self.offset,
-                 "last_poke": _bucket(self.last_poke, self.STAMP_BUCKET_S),
+                 "last_poke": _bucket(_lp, self.STAMP_BUCKET_S),
                  "pokes": [_bucket(t, self.STAMP_BUCKET_S)
                            for t in self.pokes[-200:]],
                  "in_flight": bool(getattr(self, "in_flight", False)),
@@ -1712,6 +1767,19 @@ class Pager:
         #: started may still be running, or 0. Set by announce_restart from
         #: the persisted state; read by start_job and /status.
         self._hold_until = 0.0
+        #: THE OPERATOR'S HOLD (proto.HOLD_FILE_DEFAULT). While that file is
+        #: there nothing starts -- a tap, a chained leg, a fee retry, a
+        #: recheck -- and the doorbell refuses besides. Read on every check
+        #: and never cached: the moment it appears is the moment it works.
+        self.hold_file = (getattr(args, "hold_file", None)
+                          or proto.HOLD_FILE_DEFAULT)
+        self._held_logged = False
+        #: How long this card keeps its integrity chain (retire_chain), in
+        #: seconds; 0 keeps every line for the life of the card.
+        _ck = getattr(args, "chain_keep_days", None)
+        self.chain_keep_s = (self.CHAIN_KEEP_DAYS if _ck is None
+                             else max(0, int(_ck))) * 86400
+        self._chain_retired_at = 0.0
         #: HOW MANY PEOPLE CAN SPEND. Senders where there are senders, chats
         #: otherwise -- a private chat id is a Telegram ACCOUNT, and Telegram
         #: gives one account one chat with a given bot however many devices it
@@ -2958,11 +3026,45 @@ class Pager:
         try:
             mid = ((res or {}).get("result") or {}).get("message_id")
             if isinstance(mid, int) and not isinstance(mid, bool):
-                with _BURN_LOCK:
-                    self.burn.append((int(chat_id), mid, time.time()))
+                self._burn_record(int(chat_id), mid)
                 _LAST_MID.mid = mid
         except Exception:                                    # noqa: BLE001
             pass
+
+    #: The widest run of unseen ids the gap rule fills in one go.
+    MAX_BURN_GAP = 16
+
+    def _burn_record(self, chat_id: int, mid: int) -> None:
+        """Put one message on the burn list -- and, in a PRIVATE chat, every
+        id between it and the last one this process saw there.
+
+        THE COPIES NOBODY RECORDED (the review of the uncovered dimensions).
+        send() posts through safe_post, which retries on its own: a POST
+        that reached Telegram and lost its reply over Tor is posted again,
+        and only the last attempt's id comes back to be recorded. The first
+        copy -- the pay message's address and amount, a memo naming the
+        client's XMR address -- stayed in the transcript for good. In a
+        one-to-one chat ids are sequential across both sides, so an id this
+        process never saw between two it did is one of its own lost copies
+        or the operator's own message, and both belong on the list. Not in
+        a group: there the ids between are other people's. Memory, like the
+        list; bounded, so a restart's first id is not a sweep of history."""
+        with _BURN_LOCK:
+            _now = time.time()
+            _hi = self.__dict__.setdefault("_burn_hi", {})
+            _last = _hi.get(chat_id)
+            # AND ONLY ON A ONE-PERSON BOT: a bot's message ids are counted
+            # across ALL its private chats, so on a shared one the ids
+            # between two of this chat's are other people's messages, and
+            # every one would be a failed delete out of the tick's budget.
+            if chat_id > 0 and self._max_clients() <= 1 \
+                    and isinstance(_last, int) \
+                    and 1 < mid - _last <= self.MAX_BURN_GAP + 1:
+                for _gap in range(_last + 1, mid):
+                    self.burn.append((chat_id, _gap, _now))
+            if not isinstance(_last, int) or mid > _last:
+                _hi[chat_id] = mid
+            self.burn.append((chat_id, mid, _now))
 
     def delete_message(self, chat_id: int, message_id: int) -> bool:
         """Ask Telegram to remove one message. False if it would not.
@@ -3238,7 +3340,9 @@ class Pager:
         def _say(word):
             if word != "collected":
                 return
-            integrity_log("pager", "collected")
+            # NOT CHAINED HERE: poke chains "collected" for every job, at the
+            # end (see there). Chained from this callback it was a line only
+            # the long jobs wrote, at the moment of collection.
             self.send(chat_id,
                       f"{chat_name(job)}: picked up — it is running now. "
                       f"Nothing else to do; I will say when it is finished.")
@@ -3267,6 +3371,12 @@ class Pager:
             # chat; the detail to the terminal, where the operator is.
             print(f"  [!] {chat_name(job)} failed to start: "
                   f"{_redact(e)[:200]}")
+            # HELD BETWEEN THE CHECK AND THE PACKET is not "try again later":
+            # later is exactly as held.
+            if self._wakes_held():
+                self.send(chat_id, f"{chat_name(job)}: nothing ran — "
+                                   f"{HELD_ANSWER}")
+                return
             self.send(chat_id, f"{chat_name(job)}: failed to start — nothing "
                                f"ran. Try again later.")
             return
@@ -3291,6 +3401,21 @@ class Pager:
         # channel into a chat. Sent BEFORE the outcome branch, because it
         # changes how that outcome should be read.
         _ev = getattr(pending, "events", None) or []
+        # A SECOND BOOT AND NO HOLD FILE (the review of the hold): the
+        # doorbell could not write it -- a read-only card, a state directory
+        # moved -- and the next start would hand the half over again. Held
+        # here, in memory, until a person restarts this process.
+        if "m1_second_ephemeral" in _ev and "wakes_held" not in _ev:
+            self._hold_latched = True
+            try:
+                integrity_log("pager", "hold_latched")
+            except Exception:                                # noqa: BLE001
+                pass
+            print(f"  [!] A second boot signed as the vault answered this "
+                  f"wake and the hold file ({self.hold_file}) could NOT be "
+                  f"written. Holding every wake in memory until this pager "
+                  f"restarts: place the hold by hand now "
+                  f"(OPSEC_SETUP.md section 1).")
         _notes = [EVENT_LINES[_e] for _e in EVENT_VOCAB if _e in _ev]
         if _notes:
             # GUARDED LIKE THE OUTCOME WRITE BELOW, and it was not: this sits
@@ -3314,6 +3439,15 @@ class Pager:
             # "outcome:withdraw:done" for every run, at ten-minute stamps: a
             # timetable of spends against probes, for the life of the card.
             # Kinds only, and job-agnostic kinds.
+            #
+            # AND "collected" FOR EVERY JOB, HERE, BESIDE IT (the review of
+            # the uncovered dimensions). It was chained from the milestone
+            # callback, which exists only for jobs whose budget passes
+            # MILESTONE_FLOOR_S -- so the kind itself said "one of the long
+            # jobs", and a card taken mid-wake said a withdrawal was running.
+            # Now a wake in flight shows only its "poke".
+            if getattr(pending, "collected_at", None) is not None:
+                integrity_log("pager", "collected")
             integrity_log("pager", f"outcome:{out}")
         except Exception:                                    # noqa: BLE001
             print("  [!] could not write the integrity chain for this "
@@ -4033,6 +4167,13 @@ class Pager:
                      if job == "withdraw" else "")
             self.send(chat_id, f"{chat_name(job)}: failed.{_tail}",
                       buttons=MENU_BUTTONS)
+        elif out == "expired_uncollected" and any(
+                _e in _ev for _e in ("m1_held", "held_before_collection")):
+            # THE HOLD STOPPED IT BEFORE ANYTHING WAS HANDED OVER, which is
+            # the one uncollected ending where "nothing ran" is this end's
+            # own doing and certain -- and where "try again" is wrong.
+            self.send(chat_id, f"{chat_name(job)}: nothing ran — "
+                               f"{HELD_ANSWER}", buttons=MENU_BUTTONS)
         elif out == "expired_uncollected":
             # ONE TRUE THING, NOT TWO. This job was never handed over, so THIS
             # attempt cannot have started anything. That is what the pager
@@ -4294,8 +4435,7 @@ class Pager:
         # allowlisted is an action taken on behalf of somebody who was refused.
         _mid = msg.get("message_id")
         if isinstance(_mid, int) and not isinstance(_mid, bool):
-            with _BURN_LOCK:
-                self.burn.append((cid, _mid, time.time()))
+            self._burn_record(int(cid), _mid)
         # A LIVE CONVERSATION GETS FIRST REFUSAL on the message, because a bare
         # "2" is an answer and not a command. It hands back anything starting
         # with "/" (and drops itself when it does), so a real command is never
@@ -4504,6 +4644,10 @@ class Pager:
             # ...AND THE RESTART HOLD IS "wait" TOO: the vault may be busy.
             # ...AND A FULL SERVICE, for a chat with no deposit in flight, so
             # /status never says "ready" and then refuses.
+            # ...AND THE OPERATOR'S HOLD IS ITS OWN WORD, FIRST: "wait"
+            # promises an end that only the operator can bring.
+            if self._wakes_held():
+                _why = "held"
             self.send(cid, _why if _why
                       else ("wait" if (self.busy.locked() or self._hold_why()
                                        or self._full_for(cid,
@@ -5013,14 +5157,19 @@ class Pager:
             # operator does in that gap is send another command, and get "no:
             # something is already running" -- the exact experience this
             # message was added to prevent.
-            _hold = (proto.result_budget_s(job)
-                     + getattr(doorbell(), "FETCH_WINDOW_S", 0))
-            if not getattr(self.args, "no_jitter", False):
-                _hold += getattr(doorbell(), "PRE_WOL_MAX_S", 0)
-            # THE SAME FIGURE IS THE HOLD A RESTART KEEPS. It is the latest
-            # moment this wake can still be running, and announce_restart
-            # reads it back to refuse every command until then.
-            self._set_in_flight(True, until=time.time() + _hold)
+            _hold = self._hold_for(job)
+            # THE CARD GETS THE LONGEST HOLD OF ANY JOB, NOT THIS ONE'S (the
+            # review of the uncovered dimensions). announce_restart reads it
+            # back to refuse every command until the wake can no longer be
+            # running -- and the holds are public constants a job apart, so
+            # this job's own hold on the card, even rounded to the stamp
+            # bucket, WAS the job: a card taken mid-wake said a withdrawal
+            # was moving money right now. The cost is a restart's hold: a
+            # pager that dies during a short job refuses for the longest
+            # job's window, which announce_restart says. The chat that asked
+            # is still quoted its own job's figure below; it knows its job.
+            self._set_in_flight(True, until=time.time() + max(
+                self._hold_for(_j) for _j in proto.JOBS))
             _how = (f"{_hold // 3600 + 1}h" if _hold >= 3600
                     else f"{max(1, _hold // 60)} min")
             # THE NUMBER IS A LOCK WINDOW, AND IT READ AS AN ESTIMATE.
@@ -5181,6 +5330,15 @@ class Pager:
         if now - last >= self.IGNORED_LOG_EVERY_S or now < last:
             seen[kind] = now
             integrity_log("pager", kind)
+
+    def _hold_for(self, job: str) -> int:
+        """How long one wake of `job` can hold this box: the vault's result
+        budget, the doorbell's fetch window, and its pre-WOL delay."""
+        _h = (proto.result_budget_s(job)
+              + getattr(doorbell(), "FETCH_WINDOW_S", 0))
+        if not getattr(self.args, "no_jitter", False):
+            _h += getattr(doorbell(), "PRE_WOL_MAX_S", 0)
+        return int(_h)
 
     def _set_in_flight(self, on: bool, until: float = 0.0) -> None:
         """Persist the one bit that says a wake is between start and result,
@@ -6129,6 +6287,12 @@ class Pager:
                                 f"by itself.",
                           buttons=self._handle_buttons(h, "receive_and_quote",
                                                        chat))
+            elif say == "held" and self._wakes_held():
+                # NOT "as soon as this end is free" (the review of the
+                # hold): the operator's hold has no end this box can see.
+                self.send(chat, f"{_cn}: confirmed. {HELD_ANSWER[0].upper()}"
+                                f"{HELD_ANSWER[1:-1]}; it is sent on after "
+                                f"that.")
             elif say == "held":
                 self.send(chat, f"{_cn}: confirmed. Something else is running "
                                 f"here; it is sent on as soon as this end is "
@@ -6296,20 +6460,13 @@ class Pager:
     def _busy_answer(self, cid: int) -> str:
         """The "not now" for a chat while a wake holds the lock.
 
-        The chat whose job it is hears that; any other chat hears "busy for
-        about T" where T is this box's own persisted hold on the running wake
-        -- a ceiling, never a count, never whose. When no hold is known (a
-        test harness, a wake older than the state file) the public worst
-        case for any job is quoted instead, which is a constant of the
-        software and a fact about nobody.
+        The chat whose job it is hears that; any other chat hears "busy",
+        with no figure: every figure this box has is the running job's own
+        hold, and the holds name the job (see BUSY_ANSWER).
         """
         if self._running == cid:
             return BUSY_ANSWER_MINE
-        _until = float(getattr(self.limits, "in_flight_until", 0.0) or 0.0)
-        _left = _until - time.time()
-        if _left <= 0:
-            _left = float(proto.result_budget_s("withdraw"))
-        return BUSY_ANSWER.format(when=_hold_words(_left))
+        return BUSY_ANSWER
 
     def _full_for(self, cid: int, job: str) -> bool:
         """Whether this chat's `job` is refused for capacity. Only a NEW
@@ -6414,10 +6571,54 @@ class Pager:
                       "would stay in the room. Make it\n"
                       "      an admin there, or use a private chat.")
 
+    #: The default for --chain-keep-days.
+    CHAIN_KEEP_DAYS = 7
+    #: How often a running pager looks for lines to retire.
+    CHAIN_RETIRE_EVERY_S = 3600
+
+    def retire_chain(self, force: bool = False) -> int:
+        """Retire this card's chain lines older than chain_keep_s (see
+        gs_common.retire_chain_before). At start, then at most hourly.
+        Never raises: bookkeeping about bookkeeping costs nothing else."""
+        _keep = int(getattr(self, "chain_keep_s", 0) or 0)
+        if _keep <= 0:
+            return 0
+        _now = time.time()
+        if not force and (_now - float(getattr(self, "_chain_retired_at",
+                                                0.0) or 0.0)
+                          < self.CHAIN_RETIRE_EVERY_S):
+            return 0
+        self._chain_retired_at = _now
+        try:
+            _n = retire_chain_before(_now - _keep)
+        except Exception:                                    # noqa: BLE001
+            _n = -1
+        if _n < 0:
+            print("  [!] could not retire the integrity chain's old lines; "
+                  "they stay on the card until the next try.")
+        return _n
+
+    def _wakes_held(self) -> bool:
+        """The operator's hold file is there (or cannot be ruled out). Its
+        comings and goings go to the chain once each, not once a tick."""
+        _h = (bool(getattr(self, "_hold_latched", False))
+              or proto.wakes_held(getattr(self, "hold_file", None)))
+        if _h != bool(getattr(self, "_held_logged", False)):
+            self._held_logged = _h
+            try:
+                integrity_log("pager", "wakes_held" if _h
+                              else "wakes_released")
+            except Exception:                                # noqa: BLE001
+                pass
+        return _h
+
     def _hold_why(self) -> str:
-        """The refusal while a wake from before a restart may still be
-        running, or "". Clears the hold, and the persisted bit with it, once
-        the window it names has passed."""
+        """The refusal while the operator holds every wake, or while a wake
+        from before a restart may still be running, or "". Clears the
+        restart hold, and the persisted bit with it, once the window it
+        names has passed; the operator's hold only its owner lifts."""
+        if self._wakes_held():
+            return HELD_ANSWER
         _until = float(getattr(self, "_hold_until", 0.0) or 0.0)
         if not _until:
             return ""
@@ -6485,6 +6686,13 @@ class Pager:
         self.publish_commands()
         self._check_group_rights()
         self.announce_restart()
+        self.retire_chain(force=True)
+        if self._wakes_held():
+            print(f"  [!] Every wake is HELD: {self.hold_file} is there. "
+                  f"Nothing will start -- not a tap, not a forward -- until "
+                  f"it is removed. Remove it only once the other machine "
+                  f"has been checked and, if it may have been handled, "
+                  f"paired again (OPSEC_SETUP.md section 1).")
         if self.btc_servers:
             # THE WATCHER, on its own thread: a look over Tor takes up to a
             # circuit's worth of time per address and must not hold the
@@ -6601,10 +6809,14 @@ class Pager:
                                if self.burn_now
                                else "; the rest are past Telegram's 48h "
                                     "window")))
-            _burned = self.burn_expired(self.burn_after)
-            if _burned:
-                integrity_log("pager", "messages_burned")
+            # NOT CHAINED ANY MORE (the review of the hold): every message
+            # burns burn_after seconds after it was sent, so a line per burn
+            # was a timeline of the chat on the card -- and the long jobs'
+            # "picked up" line, burning mid-wake, dated a withdrawal in
+            # flight. The count is still said at the terminal on a signal.
+            self.burn_expired(self.burn_after)
             self.retry_wizard_deletes()
+            self.retire_chain()
         # SAY WHAT IS BEING ABANDONED. The other way this process can end is a
         # signal -- `systemctl restart`, or an operator with a terminal -- and
         # it reaches here with the same consequence the poll-failure exit was
@@ -6928,6 +7140,30 @@ def build_cli():
                          "itself waits while fewer than that remain, so the "
                          "automatic path cannot spend the last wake a "
                          "client's question needs (default 2; 0 disables)")
+    ap.add_argument("--chain-keep-days", type=int,
+                    default=Pager.CHAIN_KEEP_DAYS, metavar="DAYS",
+                    help="how long this card keeps its integrity chain. "
+                         "Older lines are retired behind an anchor that "
+                         "carries their last hash, so what is kept still "
+                         "verifies. Within the window the chain gives each "
+                         "wake's time and rough length -- and the lengths "
+                         "name the job. Default %(default)s; 0 keeps every "
+                         "line for the life of the card. Note the chain's "
+                         "head off the box more often than this, or the "
+                         "head you noted is retired with its lines")
+    ap.add_argument("--clear-restart-hold", action="store_true",
+                    help="forget the in-flight wake this card recorded before "
+                         "a restart, instead of refusing every command until "
+                         "the longest job's window has passed. Only when you "
+                         "KNOW nothing is running -- the vault is off")
+    ap.add_argument("--hold-file", default=proto.HOLD_FILE_DEFAULT,
+                    metavar="PATH",
+                    help="while this file exists nothing starts and nothing "
+                         "wakes: taps are refused and no forward, fee retry "
+                         "or recheck begins. Create it the moment the vault "
+                         "may have been taken, imaged or handled; remove it "
+                         "once it has been paired again (default "
+                         "%(default)s, the same file gs_doorbell reads)")
     ap.add_argument("--alert-chat", type=int, default=None, metavar="CHAT_ID",
                     help="an allowlisted chat that hears one line, at most "
                          "hourly, when a forward for some OTHER chat failed: "
@@ -7011,6 +7247,9 @@ def main(argv=None) -> int:
                  "notices is its own kind of tell. Keep it under 21600.")
     if getattr(args, "btc_reserve", 2) < 0:
         sys.exit("[!] --btc-reserve cannot be negative. 0 disables it.")
+    if getattr(args, "chain_keep_days", 0) < 0:
+        sys.exit("[!] --chain-keep-days cannot be negative. 0 keeps every "
+                 "line.")
     if getattr(args, "btc_reserve", 2) >= int(args.daily_cap):
         sys.exit(f"[!] --btc-reserve {int(args.btc_reserve)} at or above "
                  f"--daily-cap {int(args.daily_cap)} leaves nothing for the "
@@ -7221,12 +7460,40 @@ def main(argv=None) -> int:
     # an operator's unit may not have one, and a full or read-only card would
     # do it anyway on a unit that does. A pager that answers is worth more
     # than a chain line about a pager that did not start.
+    # THE HOLD MUST BE PLACEABLE, or it is not a control (the review of the
+    # hold). A directory that is missing or read-only makes both holds
+    # impossible -- the operator's `touch` and the doorbell's own on a second
+    # boot -- and the second fails silently, at the one moment it exists for.
+    # Refused here, where the operator is standing, rather than found out
+    # then. Renaming the state directory is fine; move --hold-file with it.
+    _hf = Path(getattr(args, "hold_file", None) or proto.HOLD_FILE_DEFAULT)
+    if not _hf.parent.is_dir() or not os.access(str(_hf.parent), os.W_OK):
+        sys.exit(f"[!] --hold-file {_hf}: its directory does not exist or "
+                 f"this process cannot write to it, so the hold that stops "
+                 f"every wake (OPSEC_SETUP.md section 1) could not be placed "
+                 f"-- not by you, and not by the doorbell when a second boot "
+                 f"answers as the vault. Point --hold-file into the pager's "
+                 f"own state directory.")
     try:
         integrity_log("pager", "start")
     except Exception as e:                                   # noqa: BLE001
         print(f"  [!] integrity chain unavailable ({type(e).__name__}); "
               f"starting anyway. Check the working directory in the unit.")
     _pager = Pager(args, token, key, proxies)
+    # THE RESTART HOLD, LIFTED BY A PERSON (the review of the hold). The card
+    # now keeps the longest job's window for every job, so a pager that died
+    # during a five-minute check refuses everything for most of a day. The
+    # operator who KNOWS nothing is running -- the vault is off, they are
+    # looking at it -- clears it here, at the Pi, on purpose.
+    if getattr(args, "clear_restart_hold", False):
+        try:
+            _pager._set_in_flight(False)
+            integrity_log("pager", "restart_hold_cleared")
+        except Exception:                                    # noqa: BLE001
+            pass
+        print("  [!] --clear-restart-hold: the wake this card says may still "
+              "be running is taken to be over. If the vault is in fact "
+              "still on, the next command wakes a busy machine.")
     # SIGUSR1 BURNS THE CHAT. Registered here rather than in __init__ because
     # a Pager built by a test must not install a process-wide handler -- the
     # same rule _report_surviving_plans follows in GhostSpiral.

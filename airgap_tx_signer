@@ -1253,6 +1253,39 @@ def _pw_scratch_dir(fallback: str = None) -> str:
     return fallback or tempfile.gettempdir()
 
 
+#: The scratch directory monero-wallet-cli's ring database goes to, made once
+#: per process in RAM where there is RAM to use (see _cli_state_args).
+_RINGDB_DIR = []
+
+
+def _cli_state_args() -> list:
+    """monero-wallet-cli's OWN files, kept off the vault's disk (the review of
+    the uncovered dimensions). Every call below passes these.
+
+    Its log: with no --log-file it writes monero-wallet-cli.log beside the
+    executable it was started as -- and it is started by bare name, so that
+    is the working directory, which under the agent's unit is the artifact
+    directory. Outside every seal, appended by every wake, for the life of
+    the disk: a dated line for each time this box signed. Into the same
+    scratch directory instead -- in RAM, gone with it -- and not /dev/null,
+    whose directory the log rotation would go looking through.
+
+    Its ring database: --shared-ringdb-dir defaults to ~/.shared-ringdb, and
+    the agent's unit sets HOME to the artifact directory, so the rings this
+    wallet spent with were written there -- neither sealed nor on the wipe
+    list. Pointed at a scratch directory in RAM (/dev/shm where it is
+    writable), removed when this process exits and gone at power-off either
+    way. What that costs is the ring database's own purpose, reusing a ring
+    across a chain split, on a signer that never stays up for one."""
+    if not _RINGDB_DIR:
+        _d = tempfile.mkdtemp(prefix=".gs_ringdb_", dir=_pw_scratch_dir())
+        _RINGDB_DIR.append(_d)
+        import atexit
+        atexit.register(lambda: secure_delete_tree(Path(_d)))
+    return ["--log-file", os.path.join(_RINGDB_DIR[0], "wallet-cli.log"),
+            "--shared-ringdb-dir", _RINGDB_DIR[0]]
+
+
 def _offline_account_count(wallet_file: str, args) -> int:
     """How many accounts the OFFLINE wallet has, via wallet-cli's `account`.
 
@@ -1267,7 +1300,7 @@ def _offline_account_count(wallet_file: str, args) -> int:
         os.close(pw_fd)
     try:
         r = subprocess.run(
-            [args.wallet_cli, "--wallet-file", wallet_file,
+            [args.wallet_cli, *_cli_state_args(), "--wallet-file", wallet_file,
              "--password-file", pw_path, "--command", "account"],
             capture_output=True, text=True, timeout=300,
             input=f"{args.wallet_password or ''}\n" + "y\n" * 3)
@@ -1334,7 +1367,7 @@ def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
         os.close(pw_fd)
     try:
         subprocess.run(
-            [args.wallet_cli, "--wallet-file", wallet_file,
+            [args.wallet_cli, *_cli_state_args(), "--wallet-file", wallet_file,
              "--password-file", pw_path],
             capture_output=True, text=True,
             timeout=max(600, missing * 5),
@@ -1412,7 +1445,8 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
                 finally:
                     os.close(_pfd)
                 _r = subprocess.run(
-                    [args.wallet_cli, "--wallet-file", wallet_file,
+                    [args.wallet_cli, *_cli_state_args(),
+                     "--wallet-file", wallet_file,
                      "--password-file", _ipw,
                      "--command", "import_outputs", str(_blob_path)],
                     capture_output=True, text=True, timeout=300, cwd=_iw,
@@ -1618,7 +1652,7 @@ def phase_sign(args, plan: List[dict]):
             pw_files.append(pw_path)
 
             cmd = [
-                args.wallet_cli,
+                args.wallet_cli, *_cli_state_args(),
                 "--wallet-file", wallet_file,
                 "--password-file", pw_path,
                 "--command", "sign_transfer",

@@ -70,8 +70,9 @@ from gs_common import (                                      # noqa: E402
     daemon_fee_estimate, fee_estimate_per_tx, isolated_proxy,
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
     install_signal_handlers, resource_check, rpc_lock_scope,
-    scope_lock_taken, secure_delete_or_warn, secure_mkdir, shutdown_requested,
-    terminal_safe, wipe_covers,
+    scope_lock_taken, secure_delete_or_warn, secure_delete_tree,
+    secure_mkdir, secure_write_bytes, shutdown_requested, terminal_safe,
+    wipe_covers,
 )
 import importlib.machinery, importlib.util                 # noqa: E402
 import gs_wake_proto as proto                                # noqa: E402
@@ -153,10 +154,33 @@ SEALED_FILE = "state.sealed"
 #: directory because the unit's WorkingDirectory IS that directory; where
 #: the two differ, the chain is not here to seal and stays where it was.
 CHAIN_MEMBER = "integrity_chain.log"
+#:
+#: AND WHAT A MIX THAT DID NOT FINISH LEAVES (the review of the uncovered
+#: dimensions). GhostSpiral writes its plans into this directory -- the
+#: fan-out, the veil and the DAG, `unsigned_*.json` -- with a `.chain_once_*`
+#: marker and progress files beside them, and keeps them on any ending but
+#: a complete run: a skipped round, a failed broadcast, the budget's kill, a
+#: stop. They name the entry address the public swap memo names, every hop
+#: with its exact amount, and the fee address with the cut -- the whole mix
+#: graph, which the stage-8 seal took out of the keyfile, back in the clear
+#: until some later run got past its own stage 4. Sealed now like the rest:
+#: GhostSpiral's _stage5_cleanup erases old plans, markers and progress at
+#: its next run anyway, so one restored out of the store changes nothing.
+#: Its staging TREES (tx_staging/, signed_blobs/) cannot be members -- the
+#: store holds files -- and are shredded at close instead (MIX_TREES).
 SEALED_GLOBS = ("gs_wake_state.json", "gs_wake_handles.json", CHAIN_MEMBER,
                 "gs_wake_job.log",
                 "thor_pairs_*.json", "wallet_*.json",
-                "btc_forward_*.json", "gs_wake_status.json")
+                "btc_forward_*.json", "gs_wake_status.json",
+                "unsigned_*.json", ".chain_once_*",
+                "signer_progress.json", "broadcast_progress.json",
+                "gs_wake_job.prev.log")
+#: GhostSpiral's per-round staging directories, left behind only when a
+#: round was killed before its own finally ran. They hold the round's
+#: manifests (destinations and amounts) and the view-key-encrypted blobs;
+#: GhostSpiral's own policy is that a killed round's staging has no resume
+#: value and is worse kept than lost, and its next run shreds them too.
+MIX_TREES = ("tx_staging", "signed_blobs")
 #: ...less these, by exact name, for the reasons above.
 SEALED_SKIP = ("wallet_feesweep.json",)
 #: THE KEYFILE'S OWN SEALED SECTION (STAGE8_PLAN.md), under the same two
@@ -835,6 +859,15 @@ def load_key(path: Path) -> dict:
     return k
 
 
+def _is_sealed_member(name: str) -> bool:
+    """Whether `name` is one state_close would seal: the one rule both
+    directions read, so state_open cannot write a name the close never
+    takes back."""
+    import fnmatch
+    return name not in SEALED_SKIP and any(
+        fnmatch.fnmatchcase(name, _p) for _p in SEALED_GLOBS)
+
+
 def _sealed_members(dirpath: Path) -> list:
     """Every plaintext member present in `dirpath`, sorted. Names only --
     the caller reads them. A directory entry that is not a file (a stray
@@ -897,7 +930,7 @@ def _reseal_hint(name: str) -> str:
     # value and everything else sealed is kept, so a file holding this one
     # name is enough -- the plaintext of the rest was shredded, as the seal
     # tells the operator to.
-    _cmd = (f"`gs_wake_agent --seal-secrets <hex> {_key_flag()} "
+    _cmd = (f"`gs_wake_agent --seal-secrets {_key_flag()} "
             f"--secrets-env <file>` at the machine, with a plaintext file "
             f"that names it; the rest stays sealed as it is. Then shred "
             f"that file")
@@ -959,7 +992,8 @@ def open_secrets(path, vault_half: bytes, pi_half: bytes) -> int:
             "cannot read, and it will NOT fall back to the environment: "
             "that would make the seal decorative. After a re-pairing, move "
             f"{p} aside and seal them again from the plaintext, at the "
-            f"machine: `gs_wake_agent --seal-secrets <hex> {_key_flag()}`.")
+            f"machine: `gs_wake_agent --seal-secrets {_key_flag()}` (it "
+            f"asks for the half).")
     _SECRETS.clear()
     for _k, _v in inner.items():
         # THE ALLOW-LIST, applied on the way IN. A sealed file is still a
@@ -1010,7 +1044,8 @@ def open_keyfile(key: dict, vault_half: bytes, pi_half: bytes) -> dict:
             "altered. Nothing is run against settings that cannot be read: "
             "this machine would not know which addresses are its own. To "
             "read them by hand: `gs_doorbell state-key` on the Pi, then "
-            f"`gs_wake_agent --unseal-key <hex> {_key_flag()}` here.")
+            f"`gs_wake_agent --unseal-key {_key_flag()}` here (it asks for "
+            f"the half).")
     # THE CLEAR HALF WINS ON A COLLISION, and a collision is a malformed
     # keyfile rather than a choice: `secret` inside the seal must never be
     # able to replace the secret that authenticated the note this half
@@ -1045,6 +1080,19 @@ def state_halves(key: dict, pi_half: bytes = None) -> tuple:
     """
     raw = key.get("state_half")
     if raw is None or raw == "":
+        # NO HALF IS "THIS PAIRING DOES NOT SEAL" ONLY IF NOTHING IS SEALED
+        # (the review of the uncovered dimensions). A keyfile with a sealed
+        # section and no half ran on its clear half alone, silently: open_
+        # keyfile is reached only through the half. Altered, or restored in
+        # part; either way not a keyfile to run.
+        if key.get(KEYFILE_SEALED) is not None:
+            raise Refused(
+                "state_half_missing",
+                "this machine's keyfile carries sealed settings and no half "
+                "of the key they were sealed under, so it has been altered "
+                "or restored in part. Nothing is run on half a keyfile: "
+                "this machine would not know which addresses are its own. "
+                "Pair again.")
         return None, None
     try:
         vault = bytes.fromhex(str(raw))
@@ -1089,22 +1137,50 @@ def state_open(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
             "of the key changes with its secret -- or the file has been "
             "altered. Nothing is run against a ledger that cannot be read. "
             "To open it by hand, with BOTH halves it was sealed under: "
-            "`gs_wake_agent --unseal-state <hex> --key <keyfile>` here, "
+            "`gs_wake_agent --unseal-state --key <keyfile>` here (it asks "
+            "for the half), "
             "where the hex is `gs_doorbell state-key` on the Pi that sealed "
             "them and the keyfile is the one that pairing wrote. After a "
             "re-pairing both changed: the OLD keyfile you moved aside, and "
-            "the old half from the copy beside the LUKS USB. That also "
+            "the old half from the copy inside the LUKS USB. That also "
             "retires the old container, so the new pair can seal them.")
     # A MEMBER ALREADY ON DISK IS A RUN THAT DIED, not something to
     # overwrite: it is newer than the seal. Left where it is, and rolled
     # into the next seal with the rest.
+    # ONLY NAMES THE CLOSE WOULD SEAL, ALL CHECKED BEFORE ONE IS WRITTEN
+    # (the review of the uncovered dimensions). The schema label in the
+    # header is compared, not authenticated, and the keyfile's sealed
+    # settings and the sealed secrets are under the same two halves:
+    # relabelled as the store, either opened here and wrote settings.json or
+    # secrets.json out -- a name state_close never seals or shreds, so the
+    # xpub or the seed stayed on the disk in the clear. Only someone who can
+    # write this disk can relabel a file, and they can change this code too;
+    # what this rules out is the store writing out what it cannot take back.
+    if not all(isinstance(_nm, str) and _is_sealed_member(_nm)
+               for _nm in members):
+        raise Refused("state_unreadable",
+                      "the sealed records name a member this machine never "
+                      "seals: another kind of container relabelled as the "
+                      "store, or an altered file. Nothing was written out.")
     n = 0
+    _sealed_prev = _sealed_job = None
     for name, text in members.items():
         if "/" in name or "\\" in name or name in ("", ".", ".."):
             raise Refused("state_unreadable",
                           "the sealed records name a member that is not a "
                           "plain file name; refusing to write it.")
         _t = artifact_dir / name
+        # THE LOGS ARE JOINED, NOT SHADOWED (see JOB_LOG_PREV): the sealed
+        # log is a run that did not finish cleanly, and this boot's fresh
+        # one on the disk is not newer than it in any way that matters.
+        if name == JOB_LOG_PREV:
+            _sealed_prev = _u8(text)
+            n += 1
+            continue
+        if name == JOB_LOG and _t.exists():
+            _sealed_job = _u8(text)
+            n += 1
+            continue
         if name == CHAIN_MEMBER and _t.is_file():
             # NOT "a run that died, newer, left where it is" -- or not only.
             # The chain on the disk is usually this boot's own lines from
@@ -1122,6 +1198,20 @@ def state_open(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
         with os.fdopen(_fd, "wb") as fh:
             fh.write(_u8(text))
         n += 1
+    if _sealed_prev is not None or _sealed_job is not None:
+        # OLDEST FIRST: what was already kept, then the run the last seal
+        # held, then whatever this boot found left on the disk after it.
+        _dp = artifact_dir / JOB_LOG_PREV
+        try:
+            _disk = _dp.read_bytes() if _dp.is_file() else b""
+        except OSError:
+            _disk = b""
+        _prev_write(artifact_dir,
+                    _prev_parts(_sealed_prev or b"")
+                    + ([_prev_part("sealed by a run that did not finish "
+                                   "cleanly", _sealed_job)]
+                       if _sealed_job and _sealed_job.strip() else [])
+                    + _prev_parts(_disk), prune=False)
     return n
 
 
@@ -1210,6 +1300,21 @@ def _merge_chain_locked(path: Path, sealed_text: str) -> None:
     os.replace(str(tmp), str(path))
 
 
+def _shred_mix_trees(artifact_dir: Path) -> None:
+    """Shred GhostSpiral's staging trees a killed round left (MIX_TREES).
+    Never raises: a tree that will not go is said, and chained."""
+    for _d in MIX_TREES:
+        _t = artifact_dir / _d
+        try:
+            if _t.is_dir() and not _t.is_symlink():
+                if not secure_delete_tree(_t):
+                    integrity_log("wake", f"retire_failed:{_d}")
+                    agent_say(f"  [!] {_t} could not be shredded; it holds a "
+                              f"killed round's manifests. Run paranoia_mode.")
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", f"retire_failed:{_d}")
+
+
 def state_close(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
     """Seal every member back into the store and shred the plaintext.
 
@@ -1220,6 +1325,12 @@ def state_close(artifact_dir: Path, vault_half: bytes, pi_half: bytes) -> int:
     which is a client's money stuck. So the plaintext goes only after the
     new container is on disk AND has been read back with the same key.
     """
+    # THE MIX'S STAGING TREES GO FIRST, whatever the seal then does: they
+    # are not members (the store holds files) and have no use kept.
+    _shred_mix_trees(artifact_dir)
+    # THE EARLIER BOOTS' LOG IS PRUNED HERE, going into the store -- not on
+    # the way out of it, where a person opening it by hand wants all of it.
+    _prune_prev_log(artifact_dir)
     names = _sealed_members(artifact_dir)
     p = artifact_dir / SEALED_FILE
     if not names:
@@ -1383,11 +1494,16 @@ def load_state(dirpath: Path) -> dict:
         # says nothing; a file that EXISTS and will not parse is a fact the
         # operator needs, because the replay and wake-budget backstops both
         # start over from it.
+        # agent_say, NOT print (the review of the uncovered dimensions): the
+        # unit sends stdout to /dev/null, so the one sentence this branch
+        # exists to say reached nobody on the path that actually runs.
         if p.exists():
-            print(f"  [!] {p} exists but does not parse ({type(e).__name__}). "
-                  f"Starting a NEW ledger: the local replay guard and the "
-                  f"24 h wake budget both begin again from zero this boot. "
-                  f"The doorbell's one-job-per-process rule still holds.")
+            agent_say(f"  [!] {p} exists but does not parse "
+                      f"({type(e).__name__}). "
+                      f"Starting a NEW ledger: the local replay guard and the "
+                      f"24 h wake budget both begin again from zero this "
+                      f"boot. The doorbell's one-job-per-process rule still "
+                      f"holds.")
             integrity_log("wake", "ledger_unreadable")
         return {"jobs": [], "wakes": []}
 
@@ -1720,8 +1836,13 @@ FEE_SWEEP_BUNDLE = "wallet_feesweep.json"
 #: by the boot's wall clock -- the unit stops the agent at 17 h, and a leg
 #: must have its whole budget left to start. At depths 2 and 3 that is one leg
 #: per boot; the rest is the NEXT boot's, which asks the same question again.
+#:
+#: THE WALL IS A WITHDRAWAL'S BUDGET AND TEN MINUTES, so the deepest leg --
+#: which now carries the same margin a withdrawal does -- still fits once,
+#: and the deadman armed for it (the wall and ten more) stays inside the
+#: unit's TimeoutStartSec.
 FEE_SWEEP_MAX_LEGS = 3
-FEE_SWEEP_WALL_S = 57600
+FEE_SWEEP_WALL_S = proto.JOBS["withdraw"]["budget_s"] + 600
 
 
 def fee_sweep_config(key: dict):
@@ -1864,7 +1985,11 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
         return "not_configured"
     wallets = withdraw_wallets(cfg["depth"])
     floor = Decimal(d.get("live_floor", live_floor_xmr)(key, wallets))
-    leg_budget = int(proto.WITHDRAW_DEPTHS[cfg["depth"]][1])
+    # THE SAME MARGIN A WITHDRAWAL GETS (see proto.WITHDRAW_BUDGET_MARGIN):
+    # this is a kill budget, and the bare depth figure leaves nothing for a
+    # slow chain's confirmations.
+    leg_budget = int(proto.WITHDRAW_DEPTHS[cfg["depth"]][1]
+                     * proto.WITHDRAW_BUDGET_MARGIN)
     _jl = artifact_dir / JOB_LOG
     try:
         _watched = sys.stdout.isatty()
@@ -2057,8 +2182,8 @@ def _by_hand(key: dict, half_hex: str, what: str,
     except ValueError:
         pi = b""
     _get = (f"Print it on the Pi with `gs_doorbell state-key` -- or take "
-            f"the copy beside the LUKS USB -- and pass it as `{flag} <hex> "
-            f"{_key_flag()}`.")
+            f"the copy inside the LUKS USB -- and run `{flag} "
+            f"{_key_flag()}`, which asks for it without echo.")
     if vault is None:
         raise Refused(
             "keyfile_half_needed",
@@ -2100,7 +2225,7 @@ def run_fee_sweep_cli(args, deps: dict = None) -> str:
     # (STAGE8_PLAN.md §4) the fee wallet's settings are behind a half that
     # nothing here has. The operator is standing at the machine -- that is
     # the whole premise of this flag -- so they can hand it over, from the
-    # copy beside the LUKS USB that OPSEC_SETUP.md section 1 tells them to
+    # copy inside the LUKS USB that OPSEC_SETUP.md section 1 tells them to
     # keep. Refuse loudly rather than report "this keyfile names no fee
     # wallet", which would be a true sentence about the wrong thing.
     _hex = getattr(args, "unseal_state", "")
@@ -2139,9 +2264,9 @@ def run_fee_sweep_cli(args, deps: dict = None) -> str:
                     f"this machine's spend secrets are sealed to the pair "
                     f"({_sp}), and a fee sweep on a box nothing woke brings "
                     f"no half of the key. Print it on the Pi with "
-                    f"`gs_doorbell state-key` -- or take the copy beside "
-                    f"the LUKS USB -- and pass it here as "
-                    f"`--unseal-state <hex>`.")
+                    f"`gs_doorbell state-key` -- or take the copy inside "
+                    f"the LUKS USB -- and run this with `--unseal-state`, "
+                    f"which asks for it.")
             try:
                 open_secrets(_sp, _fv, _fh)
             except Refused as _oe:
@@ -2202,12 +2327,16 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict,
     # names no fee wallet", a true sentence about the wrong thing. The
     # pairing refuses the two together, so reaching this means a keyfile
     # somebody edited: say which it is, once, rather than nothing.
+    #
+    # AND IT SAYS SO ONLY WHEN THERE IS SOMETHING TO SAY (the review of the
+    # uncovered dimensions). This is reached by EVERY idle boot of a sealed
+    # keyfile -- whether it has a fee wallet cannot be read from here, and
+    # the pairing refuses --fee-sweep-on-idle-boot with a seal -- so the
+    # warning and its chain line landed on every hand power-on of every such
+    # box, fee wallet or none: a line nobody could act on, in the one log
+    # read to find out what went wrong. Nothing here can have been asked
+    # for; the hand command is where a sweep of a sealed box lives.
     if key.get(KEYFILE_SEALED) is not None:
-        agent_say("  [!] This machine's settings are sealed to the pair and "
-                  "nothing woke this boot, so the fee wallet cannot be read "
-                  "from here. Run `gs_wake_agent --fee-sweep --unseal-state "
-                  f"<hex> {_key_flag()}` at the machine instead.")
-        integrity_log("wake", "fee_sweep:sealed")
         return False
     try:
         _fcfg = fee_sweep_config(key)
@@ -2229,7 +2358,7 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict,
         agent_say("  [!] This machine's spend secrets are sealed to the "
                   "pair and nothing woke this boot, so the fee wallet's "
                   "password cannot be read from here. Run `gs_wake_agent "
-                  "--fee-sweep --unseal-state <hex>` at the machine "
+                  "--fee-sweep --unseal-state` at the machine "
                   "instead.")
         integrity_log("wake", "fee_sweep:secrets_sealed")
         return False
@@ -2550,6 +2679,12 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None,
         """Fresh or not -- and "could not ask" is a REFUSAL of the deposit,
         never a guess: an address that might have been used already is two
         people's money on one line."""
+        # A STOP ENDS THE LOOKUPS (the review of the uncovered dimensions):
+        # each is a Tor circuit's worth of waiting, up to BTC_INDEX_GAP of
+        # them, and systemd's SIGKILL follows its SIGTERM by 20 seconds.
+        # Nothing is published before an address is fresh, so stopping here
+        # hands out nothing.
+        _stop_if_asked()
         try:
             return _live(addr)
         except Exception:                                    # noqa: BLE001
@@ -3544,6 +3679,155 @@ def _withdraw_fee_argv(key: dict, dests=(), owned=()) -> list:
 #: Where a woken job's children write. NOT the journal. 0600, in the artifact
 #: directory, so paranoia_mode wipes it with the rest of the run.
 JOB_LOG = "gs_wake_job.log"
+#: THE LOGS OF BOOTS THAT DID NOT FINISH CLEANLY (the review of the uncovered
+#: dimensions). A clean run's log is shredded before its seal; a run that went
+#: wrong kept its log in the store "so the operator can read it with
+#: --unseal-state" -- and the NEXT boot destroyed it before anyone could: it
+#: truncated a fresh log at start, state_open saw one on the disk and left the
+#: sealed copy where it was, and the close sealed the fresh one over it. A
+#: crashed run's plaintext log went at the same truncation. Both land here
+#: instead, each under a header, and it is a sealed member like the rest.
+#: Clean runs do not touch it -- the pager's own automatic wakes are usually
+#: clean, and they came next. Bounded: a part goes after JOB_LOG_PREV_DAYS,
+#: and the oldest go first past JOB_LOG_PREV_MAX bytes.
+JOB_LOG_PREV = "gs_wake_job.prev.log"
+JOB_LOG_PREV_DAYS = 14
+JOB_LOG_PREV_MAX = 256 * 1024
+_PREV_HEAD = b"==== day "
+
+
+def _prev_parts(blob: bytes) -> list:
+    """[(day, header+text bytes)] out of a JOB_LOG_PREV body."""
+    out = []
+    for _chunk in (b"\n" + (blob or b"")).split(b"\n" + _PREV_HEAD)[1:]:
+        _part = _PREV_HEAD + _chunk
+        try:
+            _day = int(_chunk.split(b" ", 1)[0])
+        except ValueError:
+            _day = 0
+        out.append((_day, _part.rstrip(b"\n") + b"\n"))
+    return out
+
+
+def _prev_part(label: str, text: bytes) -> tuple:
+    _day = int(time.time()) // 86400
+    return (_day, _PREV_HEAD + f"{_day} -- {label} ====\n".encode()
+            + text.rstrip(b"\n") + b"\n")
+
+
+#: No one part may take more than this of JOB_LOG_PREV_MAX: a failed run's
+#: long log is TRIMMED to its tail -- where the reason is -- and keeps its
+#: header, rather than being dropped whole for the small leftover beside it.
+JOB_LOG_PREV_PART_MAX = JOB_LOG_PREV_MAX // 2
+
+
+def _prev_body_of(part: bytes) -> bytes:
+    """A part without its header line: what two copies of it share."""
+    return part.split(b"\n", 1)[1] if b"\n" in part else b""
+
+
+def _prev_write(artifact_dir: Path, parts: list, prune: bool = True) -> bool:
+    """Write JOB_LOG_PREV from `parts`, oldest first. True once written (or
+    nothing was left to write). Never raises: keeping a log must not cost
+    the wake.
+
+    THE SAME PART ONCE (the review of this pass): a boot killed between the
+    store's open and its close merged the history into itself at the next
+    open, one more copy each time; a part is its text, whatever day its
+    header says. PRUNED only when `prune` -- never on the way OUT to a
+    person (--unseal-state), who opened the store to read exactly this. And
+    written beside and renamed over, so a kill mid-write loses nothing."""
+    try:
+        _seen, _uniq = set(), []
+        for _d, _b in reversed(parts):
+            _k = _prev_body_of(_b)
+            if _b.strip() and _k not in _seen:
+                _seen.add(_k)
+                _uniq.append((_d, _b))
+        parts = list(reversed(_uniq))
+        if prune:
+            _keep = int(time.time()) // 86400 - JOB_LOG_PREV_DAYS
+            parts = [p for p in parts if p[0] >= _keep]
+            _trim = []
+            for _d, _b in parts:
+                if len(_b) > JOB_LOG_PREV_PART_MAX:
+                    _head, _, _rest = _b.partition(b"\n")
+                    _b = (_head + b"\n[... the start of this log was cut; "
+                          b"its end is kept ...]\n"
+                          + _rest[-(JOB_LOG_PREV_PART_MAX - len(_head) - 64):])
+                _trim.append((_d, _b))
+            parts = _trim
+            while len(parts) > 1 and sum(len(b) for _d, b in parts) \
+                    > JOB_LOG_PREV_MAX:
+                parts.pop(0)
+        _body = b"".join(b for _d, b in parts)
+        _p = artifact_dir / JOB_LOG_PREV
+        if not _body:
+            if _p.is_file():
+                secure_delete_or_warn(_p, "the earlier boots' log")
+            return True
+        _tmp = artifact_dir / (JOB_LOG_PREV + ".new")
+        secure_write_bytes(_tmp, _body, mode=0o600)
+        os.replace(_tmp, _p)
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def _prune_prev_log(artifact_dir: Path) -> None:
+    """Age and size rules on the JOB_LOG_PREV on the disk, if there is one."""
+    _p = artifact_dir / JOB_LOG_PREV
+    try:
+        if _p.is_file():
+            _prev_write(artifact_dir, _prev_parts(_p.read_bytes()))
+    except OSError:
+        pass
+
+
+def _keep_leftover_log(artifact_dir: Path, keep: bool = True) -> None:
+    """At the start of a boot: a job log still on the disk is one no seal
+    and no clean finish took -- a run that crashed, the lines a failed run
+    wrote after its seal, an idle boot's refusal -- so it goes to
+    JOB_LOG_PREV, not to a truncation. Then a fresh, empty log.
+
+    ONLY ON A PAIRING THAT SEALS (`keep`; the review of this pass). The
+    point of keeping it is that the next wake seals it; a box that never
+    seals would keep the memo naming a client's address in the clear for
+    good. There the old rule holds -- shredded -- and so does any earlier
+    boots' log still lying there. And pruned on every boot, not only when a
+    new leftover arrives, so a run of clean boots does not keep an old one
+    past its days."""
+    _lp = artifact_dir / JOB_LOG
+    try:
+        if not keep:
+            for _old in (_lp, artifact_dir / JOB_LOG_PREV):
+                if _old.is_file() and not _old.is_symlink():
+                    secure_delete_or_warn(_old, "an earlier boot's job log")
+        elif _lp.is_file() and not _lp.is_symlink() and _lp.stat().st_size:
+            _old = _lp.read_bytes()
+            _prev = artifact_dir / JOB_LOG_PREV
+            _have = _prev.read_bytes() if _prev.is_file() else b""
+            # SHREDDED ONLY ONCE IT IS KEPT: a card too full to take the
+            # copy keeps the original, and the truncation below is the old
+            # behaviour, not a new loss.
+            if _prev_write(artifact_dir, _prev_parts(_have) + [_prev_part(
+                    "left on the disk by an earlier boot", _old)]):
+                secure_delete_or_warn(_lp, "an earlier boot's job log")
+        else:
+            _prune_prev_log(artifact_dir)
+        if _lp.is_symlink():
+            # NEVER THROUGH A LINK: the truncation below would empty
+            # whatever it points at.
+            _lp.unlink()
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        _fd = os.open(str(_lp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                      | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(_fd)
+    except OSError:
+        pass
+
 
 #: Filled in by run_once once the keyfile names the artifact directory.
 _AGENT_LOG: list = [None]
@@ -3727,6 +4011,126 @@ def _stop_child_now(p) -> bool:
 # ---------------------------------------------------------------------------
 #  One wake
 # ---------------------------------------------------------------------------
+def _dry_run_report(key: dict, window) -> None:
+    """What a dry run can say about this machine without taking a job.
+    `window` is the doorbell's wake window, or None when it did not answer
+    (a hand boot, which is the ordinary one)."""
+    if window is not None:
+        agent_say("  [+] Dry run: keyfile, preflight, Tor and the doorbell "
+                  "all check out.")
+    else:
+        # THE BOOT THE DOCS SEND THE OPERATOR TO (the review of the uncovered
+        # dimensions). The doorbell listens only while the Pi is waking this
+        # machine, so a dry run on a hand boot found nobody -- and ended at
+        # doorbell_unreachable one branch before every check below, the
+        # issued-index mark the checklist asks about among them.
+        agent_say("  [+] Dry run: keyfile, preflight and Tor check out.")
+        agent_say("  [*] The doorbell did not answer. It listens only while "
+                  "the Pi is waking this machine, so on a hand boot that is "
+                  "expected; the checks that do not need it follow.")
+    if key.get(KEYFILE_SEALED) is not None:
+        agent_say("  [*] This keyfile's settings are sealed to the pair, "
+                  "so the checks that read them -- the BTC intake and "
+                  "its issued-index mark, the fee wallet -- were NOT "
+                  "run. Add `--unseal-state` (it asks for the half "
+                  "`gs_doorbell state-key` prints) to include them.")
+    else:
+        _dry_fee_check(key)
+    # THE PAIRING CODE, READ BACK. Both keyfiles record it and nothing
+    # read either copy; printing the vault's here gives the operator a
+    # way to confirm which ceremony this keyfile came from.
+    _pf = (key.get("pair_fingerprint") or "").strip()
+    if _pf:
+        agent_say(f"      Pairing code {_pf} -- the Pi's keyfile carries "
+                  f"the same one if these two boxes were paired together.")
+    # print, NOT agent_say (the host-privacy pass): the Pi's address is
+    # for the operator's eyes at the terminal, not for the job log on
+    # the disk, which the dry run had opened before this line.
+    if window is not None:
+        print(f"      The doorbell answered at {key['doorbell_url']} with "
+              f"a {len(window)}-byte wake window.")
+    # THE ISSUED-INDEX MARK, TRIED (self-doubt over the fix pass): a
+    # mark this unit cannot write refuses EVERY deposit as
+    # btc_issued_unrecorded, and beside a keyfile under /etc that was
+    # the shipped layout -- read-only under ProtectSystem=strict --
+    # with nothing before the first client saying so. This is the
+    # command the pairing tells the operator to run, so it says.
+    if btc_mode(key):
+        _ok, _what = _mark_probe(key)
+        if _ok:
+            agent_say(f"      Issued-index mark: writable ({_what}).")
+        else:
+            agent_say(f"  [!] Issued-index mark: NOT writable ({_what}). "
+                      "Every deposit would be refused "
+                      "btc_issued_unrecorded under this unit. Its "
+                      "directory must be one the unit may write "
+                      "(StateDirectory=ghostspiral-marks in the shipped "
+                      "unit; the pairing's --mark-dir names it): re-pair "
+                      "with --mark-dir, or fix the unit.")
+    # WHERE A SLIP WILL GO, said here because this is the command the
+    # pairing tells the operator to run, and because the answer changes
+    # SILENTLY under them.
+    #
+    # A re-pair rebuilds this keyfile from scratch, and do_pair's payload
+    # has thirteen fields of which delivery_public is not one -- correctly,
+    # since a fresh pairing mints a fresh vault keypair and a delivery key
+    # minted against the old one can no longer open anything. But
+    # seal_slip_for_delivery answers a missing key with "" and never
+    # raises, and the chat reply on that path is "depo ready · slip A3F1"
+    # -- byte-identical to what an operator who never configured a delivery
+    # key has always seen. There was no signal at all beyond the blob
+    # quietly ceasing to arrive, at the moment money is waiting on it.
+    _dp = (key.get("delivery_public") or "").strip()
+    if _dp:
+        # print, not agent_say: the key's prefix stays off the job log.
+        print(f"      Slips will be SEALED to delivery key "
+              f"{_dp[:16]}... — only gs_delivery.key opens them.")
+    elif key.get("deposit_in_chat"):
+        agent_say("      Slips will be sent as PLAIN TEXT into the chat "
+                  "(deposit_in_chat is set in this keyfile).")
+    else:
+        agent_say("      Slips will STAY ON THIS MACHINE: this keyfile "
+                  "names no delivery key. If you")
+        agent_say("      set one up before a re-pair, it is now orphaned "
+                  "— pairing mints a new vault")
+        agent_say("      keypair, so mint a new one with "
+                  "`gs_delivery_key new` or you will find out at")
+        agent_say("      the moment a swap is quoted and you cannot reach "
+                  "this box.")
+    agent_say("      NOT proven: that the two keyfiles are a matched "
+              "pair. Testing that needs a real")
+    agent_say("      note, and a real note TAKES THE JOB — the handover "
+              "is at-most-once. So this")
+    agent_say("      stops here rather than spending your poke to tell "
+              "you it worked.")
+
+
+def _dry_fee_check(key: dict) -> None:
+    """THE FEE WALLET, TRIED, which the dry run promised and no path ran
+    (the review of the uncovered dimensions): its settings whole, and the
+    wallet the sweep signs with on this disk. Nothing is opened; a sweep is
+    the only thing that reads the wallet, and it is hours."""
+    try:
+        _cfg = fee_sweep_config(key)
+    except Refused as e:
+        agent_say(f"  [!] Fee wallet: {e.msg}")
+        return
+    if _cfg is None:
+        agent_say("      Fee wallet: none paired.")
+        return
+    _wf = Path(_cfg["wallet_file"])
+    _missing = [str(p) for p in (_wf, Path(str(_wf) + ".keys"))
+                if not p.is_file()]
+    if _missing:
+        agent_say(f"  [!] Fee wallet: {len(_missing)} of its two files is "
+                  f"not on this disk where the keyfile says -- a sweep "
+                  f"would relay a fan-out and fail at signing. Fix the path "
+                  f"or pair again.")
+    else:
+        agent_say("      Fee wallet: its settings are whole and its files "
+                  "are where the keyfile says.")
+
+
 def run_once(args, deps: dict = None) -> tuple:
     """Do at most one job. Returns (code, status, handle).
 
@@ -3789,15 +4193,11 @@ def run_once(args, deps: dict = None) -> tuple:
     # ONE BOOT'S LOG, NOT THE SERVICE'S HISTORY. The children print the
     # deposit address, the memo and the amounts, and this file was opened
     # O_APPEND by every boot: every deposit the service ever quoted, in the
-    # clear, on a disk that auto-unlocks, until a hand-run wipe. Truncated at
-    # each boot instead, so what it holds is the run in progress and the last
-    # one -- read it before the next wake if a run needs looking at.
-    try:
-        _fd = os.open(str(_AGENT_LOG[0]),
-                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.close(_fd)
-    except OSError:
-        pass
+    # clear, on a disk that auto-unlocks, until a hand-run wipe. A fresh one
+    # at each boot instead -- and what an earlier boot left in it is kept,
+    # sealed, in JOB_LOG_PREV rather than truncated away (see there).
+    _keep_leftover_log(artifact_dir,
+                       keep=key.get("state_half") not in (None, ""))
 
     # A DRY RUN ON A SEALED KEYFILE SEES ONLY ITS CLEAR HALF, so every check
     # below that reads a sealed field -- the intake, its issued-index mark,
@@ -3830,6 +4230,20 @@ def run_once(args, deps: dict = None) -> tuple:
     # to open the seal.
     _vh0, _ = state_halves(key)
     _sp0 = _secrets_path(args)
+    # ...AND A SEALED STORE BESIDE A KEYFILE WITH NO HALF, which ran on an
+    # EMPTY ledger: the replay record, the issued deposits and the owners'
+    # accounts are all inside it, so a deposit could be handed an address
+    # somebody has already paid. Same rule, same moment -- before the job is
+    # taken off the Pi.
+    if _vh0 is None and (artifact_dir / SEALED_FILE).exists():
+        integrity_log("wake", "state_unreadable")
+        raise Refused(
+            "state_unreadable",
+            f"this machine's records are sealed ({artifact_dir / SEALED_FILE}) "
+            f"and its keyfile carries no half of the key they were sealed "
+            f"under -- so they are from another pairing, or the keyfile has "
+            f"been altered. Nothing is run against a ledger it cannot read. "
+            f"Nothing was asked of the doorbell, so the job is still waiting.")
     if _vh0 is None and _sp0.is_file():
         integrity_log("wake", "secrets_unreadable")
         raise Refused(
@@ -3869,6 +4283,12 @@ def run_once(args, deps: dict = None) -> tuple:
         # run one is left exactly as it was.
         if wstat == 0 and not args.dry_run:
             _idle_boot_sweep(key, artifact_dir, d, _secrets_path(args))
+        if wstat == 0 and args.dry_run:
+            _dry_run_report(key, None)
+            raise Refused("dry_run",
+                          "dry run complete; the doorbell was not listening, "
+                          "nothing was collected and nothing ran.",
+                          power=False)
         raise Refused("doorbell_unreachable",
                       "the doorbell did not hand over a wake window, so there "
                       "is nothing to bind this note to. Nothing was handed "
@@ -3900,80 +4320,7 @@ def run_once(args, deps: dict = None) -> tuple:
     # job. The first genuine poke is the test of that, and it is one the
     # operator can watch.
     if args.dry_run:
-        agent_say("  [+] Dry run: keyfile, preflight, Tor and the doorbell "
-                  "all check out.")
-        if key.get(KEYFILE_SEALED) is not None:
-            agent_say("  [*] This keyfile's settings are sealed to the pair, "
-                      "so the checks that read them -- the BTC intake and "
-                      "its issued-index mark, the fee wallet -- were NOT "
-                      "run. Add `--unseal-state <hex>` (the half from "
-                      "`gs_doorbell state-key`) to include them.")
-        # THE PAIRING CODE, READ BACK. Both keyfiles record it and nothing
-        # read either copy; printing the vault's here gives the operator a
-        # way to confirm which ceremony this keyfile came from.
-        _pf = (key.get("pair_fingerprint") or "").strip()
-        if _pf:
-            agent_say(f"      Pairing code {_pf} -- the Pi's keyfile carries "
-                      f"the same one if these two boxes were paired together.")
-        # print, NOT agent_say (the host-privacy pass): the Pi's address is
-        # for the operator's eyes at the terminal, not for the job log on
-        # the disk, which the dry run had opened before this line.
-        print(f"      The doorbell answered at {key['doorbell_url']} with "
-              f"a {len(window)}-byte wake window.")
-        # THE ISSUED-INDEX MARK, TRIED (self-doubt over the fix pass): a
-        # mark this unit cannot write refuses EVERY deposit as
-        # btc_issued_unrecorded, and beside a keyfile under /etc that was
-        # the shipped layout -- read-only under ProtectSystem=strict --
-        # with nothing before the first client saying so. This is the
-        # command the pairing tells the operator to run, so it says.
-        if btc_mode(key):
-            _ok, _what = _mark_probe(key)
-            if _ok:
-                agent_say(f"      Issued-index mark: writable ({_what}).")
-            else:
-                agent_say(f"  [!] Issued-index mark: NOT writable ({_what}). "
-                          "Every deposit would be refused "
-                          "btc_issued_unrecorded under this unit. Its "
-                          "directory must be one the unit may write "
-                          "(StateDirectory=ghostspiral-marks in the shipped "
-                          "unit; the pairing's --mark-dir names it): re-pair "
-                          "with --mark-dir, or fix the unit.")
-        # WHERE A SLIP WILL GO, said here because this is the command the
-        # pairing tells the operator to run, and because the answer changes
-        # SILENTLY under them.
-        #
-        # A re-pair rebuilds this keyfile from scratch, and do_pair's payload
-        # has thirteen fields of which delivery_public is not one -- correctly,
-        # since a fresh pairing mints a fresh vault keypair and a delivery key
-        # minted against the old one can no longer open anything. But
-        # seal_slip_for_delivery answers a missing key with "" and never
-        # raises, and the chat reply on that path is "depo ready · slip A3F1"
-        # -- byte-identical to what an operator who never configured a delivery
-        # key has always seen. There was no signal at all beyond the blob
-        # quietly ceasing to arrive, at the moment money is waiting on it.
-        _dp = (key.get("delivery_public") or "").strip()
-        if _dp:
-            # print, not agent_say: the key's prefix stays off the job log.
-            print(f"      Slips will be SEALED to delivery key "
-                  f"{_dp[:16]}... — only gs_delivery.key opens them.")
-        elif key.get("deposit_in_chat"):
-            agent_say("      Slips will be sent as PLAIN TEXT into the chat "
-                      "(deposit_in_chat is set in this keyfile).")
-        else:
-            agent_say("      Slips will STAY ON THIS MACHINE: this keyfile "
-                      "names no delivery key. If you")
-            agent_say("      set one up before a re-pair, it is now orphaned "
-                      "— pairing mints a new vault")
-            agent_say("      keypair, so mint a new one with "
-                      "`gs_delivery_key new` or you will find out at")
-            agent_say("      the moment a swap is quoted and you cannot reach "
-                      "this box.")
-        agent_say("      NOT proven: that the two keyfiles are a matched "
-                  "pair. Testing that needs a real")
-        agent_say("      note, and a real note TAKES THE JOB — the handover "
-                  "is at-most-once. So this")
-        agent_say("      stops here rather than spending your poke to tell "
-                  "you it worked.")
+        _dry_run_report(key, window)
         raise Refused("dry_run",
                       "dry run complete; nothing was collected and nothing "
                       "ran.", power=False)
@@ -4054,7 +4401,23 @@ def run_once(args, deps: dict = None) -> tuple:
     # job_id and can be REPORTED. Order is safe: the body is already
     # authenticated and already bound to this boot's challenge, and
     # validate_job only reads a closed, typed schema out of it.
-    job_id, job, params = proto.validate_job(body)
+    #
+    # AND A NOTE THAT FAILS IT IS STILL TOLD TO THE PI (the review of the
+    # uncovered dimensions). It authenticated and echoed this boot's
+    # challenge, so it is the Pi's own job, taken off it at-most-once -- and
+    # the WakeError went straight up to main's bad_note, the Pi was never
+    # answered, and the pager held its one-job lock for the whole result
+    # window: sixteen and a half hours for a withdrawal, on the one failure
+    # that says the two boxes are on different builds. Its job_id is all a
+    # report needs; a note without a well-formed one cannot be answered.
+    try:
+        job_id, job, params = proto.validate_job(body)
+    except proto.WakeError as _ve:
+        try:
+            _bad_jid = proto.job_id_of(body)
+        except proto.WakeError:
+            raise _ve
+        raise _reported(key, d, _bad_jid, challenge, _ve)
 
     # THE PI'S HALF OF THE STATE KEY, OUT OF THE AUTHENTICATED NOTE
     # (STAGE7_PLAN.md). Recorded for main()'s finally, which re-seals and
@@ -4398,7 +4761,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     else:
         slip, plain = "", {}
     phase = _phase_of(job, artifact_dir, key=key, status=status,
-                      owner=params.get("owner"), handle=handle)
+                      owner=params.get("owner"), handle=handle,
+                      depth=params.get("depth"))
     # THE PROBE'S ANSWER IS READ ONCE AND THEN GONE. The status file holds
     # the probe's state word and figures; it was deleted only at the START
     # of the next probe, so between two probes it sat on the auto-unlocking
@@ -4451,9 +4815,24 @@ _PHASE_OF_STATE = {
 }
 
 
+def _more_floor(key: dict, depth=None) -> Decimal:
+    """What an arrival must hold for the NEXT leg to mix at `depth`: the
+    same floor _dispatch refuses a withdrawal below (the review of this
+    pass). Judged against the shallowest instead, a deep withdrawal chained
+    into a leg the vault then refused below_depth_minimum -- a wake spent,
+    and the reason left on this machine."""
+    try:
+        _wd = withdraw_wallets(depth) if depth is not None else None
+    except Exception:                                        # noqa: BLE001
+        _wd = None
+    if _wd is None or _wd == _MIN_OUT_WALLETS:
+        return Decimal(live_min_out_xmr(key))
+    return Decimal(live_floor_xmr(key, _wd))
+
+
 def _phase_of(job: str, artifact_dir: Path, reader=None,
               key: dict = None, status: str = "", owner=None,
-              handle: str = "") -> str:
+              handle: str = "", depth=None) -> str:
     """The one word a status probe earned, or "". NEVER raises.
 
     A DONE FORWARD ANSWERS FROM ITS PLAN: `sent` when a server took the
@@ -4542,7 +4921,7 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
                 # as below: locked dust is not more.
                 _locked = _locked_value(key, owned_accounts=_owned)
                 if (_locked is not None
-                        and _locked >= Decimal(live_min_out_xmr(key))):
+                        and _locked >= _more_floor(key, depth)):
                     return "more_locked"
                 return ""
             # ...AND IT HAS TO BE BIG ENOUGH TO MIX, or the next leg is a wake
@@ -4570,7 +4949,7 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             # units, spelled the same way here so the two cannot disagree
             # about what a piconero is.
             _left_xmr = Decimal(str(_left[3])) / Decimal(10 ** 12)
-            _floor = Decimal(live_min_out_xmr(key))
+            _floor = _more_floor(key, depth)
             return "more_left" if _left_xmr >= _floor else ""
         except Exception:                                    # noqa: BLE001
             # The wallet could not be asked. "" is honest: the operator is
@@ -5017,6 +5396,10 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     budget = proto.JOBS[job]["budget_s"]
     led = _load_ledger(artifact_dir)
     handles = led["handles"]
+    # A MIX AN EARLIER WAKE DID NOT SEE THE END OF, SETTLED FIRST -- before
+    # this job mints anything, so the difference is still that mix's.
+    if _recover_pending_mixes(key, accounts, led):
+        _save_handles(artifact_dir, handles, led["owners"])
     # WHOSE JOB. Off the validated note, never off a chat: the vault holds an
     # opaque token and a ledger of what that token's money created. Never
     # absent on the wire -- a hand-poked job carries HOST_OWNER (the
@@ -5123,6 +5506,54 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 "nothing was spent — a mix has a floor, and one arrival on "
                 "its own is under it. Send more in and withdraw once, or "
                 "take it out by hand at the machine.")
+        # ...AND BIG ENOUGH FOR THE DEPTH ASKED FOR, not only the shallowest
+        # (the review of the uncovered dimensions). The floor above is the
+        # three-wallet one -- the deposit gate's, and the "more left"
+        # chain's, where no depth is known yet -- and a twenty-hop
+        # withdrawal of an arrival between the two floors passed it,
+        # unlocked the spend wallet, and ran GhostSpiral, which minted one
+        # account per output plus its decoys -- some twenty-five -- before
+        # finding the amount too small to fan out. Nobody owns those
+        # accounts, they count against the ceiling every client's deposit
+        # is refused at, and each retry at the same depth added as many
+        # again. The depth is in the note; its floor is asked here, where
+        # refusing still costs nothing.
+        _wd = withdraw_wallets(params["depth"])
+        if _wd != _MIN_OUT_WALLETS \
+                and _fxmr < Decimal(live_floor_xmr(key, _wd)):
+            integrity_log("wake", "withdraw_below_depth_minimum")
+            raise Refused(
+                "below_depth_minimum",
+                "what is here is enough to mix, but not at the depth asked "
+                "for: more hops need more to split. Nothing was spent. Ask "
+                "again with fewer hops, or send more in first.")
+        # THE WALLET'S ACCOUNTS BEFORE THE MIX, read BEFORE anything is
+        # written or unlocked. Every account the mix adds is this owner's
+        # money at work (see _account_indices); the difference is recorded
+        # after the run so the next leg chases the owner's own change and the
+        # ledger's answer stays whole. UNREADABLE IS A REFUSAL (the review of
+        # the uncovered dimensions): read as None and passed over, the mix
+        # ran, and everything it minted -- the owner's change among it --
+        # was never recorded as theirs, with no line anywhere saying so.
+        # Here refusing still costs nothing.
+        _accts_before = (_read_accounts_patiently(key, accounts)
+                         if _owner else None)
+        if _owner and _accts_before is None:
+            integrity_log("wake", "owner_accounts_unreadable")
+            raise Refused(
+                "owner_accounts_unreadable",
+                "the wallet could not say which accounts it holds, so a mix "
+                "now could not record what it creates as this owner's. "
+                "Nothing was spent; ask again in a few minutes.")
+        # ...AND WRITTEN DOWN BEFORE THE MIX STARTS (the review of this
+        # pass): held only in memory, it died with a power cut, an OOM kill
+        # or the SIGKILL that follows a stop, and what the mix had minted
+        # then held this owner's money with no owner in the ledger. On the
+        # ledger, sealed with it, the next wake settles it
+        # (_recover_pending_mixes) whatever ended this one.
+        if _owner:
+            _mark_pending_mix(led, _owner, _accts_before)
+            _save_handles(artifact_dir, handles, led["owners"])
         # A BUNDLE IS WRITTEN, and it is the same 0600 file in the same swept
         # directory every other job's bundle already lives in -- not a new
         # class of artifact. GhostSpiral's receive mode reads a
@@ -5156,12 +5587,6 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # nothing it can be sure of, and a handle marked spent about money
         # still sitting there is the lie in the other direction.
         _spent_pair = (int(_fa), int(_fs))
-        # THE WALLET'S ACCOUNTS BEFORE THE MIX. Every account the mix adds is
-        # this owner's money at work (see _account_indices); the difference
-        # is recorded on success so the next leg chases the owner's own
-        # change and the ledger's answer stays whole.
-        _accts_before = (_account_indices(key, injected=accounts)
-                         if _owner else None)
     elif job == "forward_to_swap":
         # THE DEPOSIT THIS HANDLE NAMES: its bundle is the swap's XMR
         # destination, its btc_index the address the client paid. Both from
@@ -5418,6 +5843,11 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     _reuse_idx = None
     before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
     for i, argv in enumerate(steps):
+        # BETWEEN STEPS, BEFORE THE WORK THAT PREPARES THE NEXT ONE (the
+        # review of the uncovered dimensions). run_child refuses to spawn once
+        # a stop is asked -- but the intake's address lookups over Tor and
+        # its mark write ran first, past the SIGKILL.
+        _stop_if_asked()
         env_extra = {}
         if job == "receive_and_quote" and i == 0 and _reuse:
             continue
@@ -5483,6 +5913,14 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # million times the intended swap, quoted without complaint.
             env_extra["GS_SWAP_AMOUNTS"] = proto.sat_to_btc(
                 params["amount_sat"])
+            # ...AND THE AGGREGATOR'S KEY, IF THIS MACHINE HAS ONE (the review
+            # of the uncovered dimensions). This step IS the quote; run_child
+            # strips every GS_ variable and only the forward below was handed
+            # it, so on a keyed SwapKit every deposit was refused at its
+            # quote while the forwards that never came would have worked.
+            if secret_of("GS_SWAPKIT_API_KEY"):
+                env_extra["GS_SWAPKIT_API_KEY"] = \
+                    secret_of("GS_SWAPKIT_API_KEY")
             # `admitted` IS A TEN-MINUTE BUCKET, like every stamp on this
             # disk, and it is what lets an unpaid deposit stop holding a
             # place (DEPOSIT_PLACE_TTL_S): the reserve gate reads it beside
@@ -5843,6 +6281,19 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                                               "the withdrawal's entry bundle")
                 except Exception:                            # noqa: BLE001
                     integrity_log("wake", "retire_failed:withdraw_bundle")
+            # ...AND THE ACCOUNTS THE MIX MINTED ARE STILL THIS OWNER'S: a
+            # failed run may have moved their money onto them already.
+            # Nothing is marked spent -- that stays a finished run's word.
+            #
+            # NOT ON A STOP (the review of this pass): the wallet can take
+            # seconds to answer -- a minute and a half, busy with the mix
+            # just killed -- and the SIGKILL comes twenty seconds after
+            # systemd's stop, before the seal. The record written before
+            # the mix stays, and the next wake settles it.
+            if job == "withdraw" and _owner and _accts_before is not None \
+                    and not _term_asked():
+                _attribute_mix_accounts(key, accounts, led, _owner,
+                                        _accts_before)
             _save_handles(artifact_dir, handles, led["owners"])
             return "job_failed", "failed", handle
 
@@ -5908,34 +6359,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # fan-out, the decoys, the carrier and the change sweep it minted
         # are recorded as this owner's for the next leg. Unreadable on
         # either side means nothing is recorded, never a guess.
-        if _owner and _accts_before is not None:
-            # ASKED AGAIN BEFORE GIVING UP, AND SAID OUT LOUD WHEN IT CANNOT
-            # BE. _account_indices swallows the RPC error into None, and a
-            # None here meant the accounts the mix just minted were never
-            # recorded as this owner's -- so their own change could never be
-            # found by their next leg, silently. Three tries a few seconds
-            # apart cover a wallet-rpc that is busy; a wallet that still
-            # cannot be asked is written to the chain and the terminal, so
-            # the host knows which run left accounts unattributed.
-            _accts_after = None
-            for _try in range(3):
-                _accts_after = _account_indices(key, injected=accounts)
-                if _accts_after is not None:
-                    break
-                # time.sleep, NOT _nap: the money has moved by here, and a
-                # stop that skipped the _save_handles below would lose the
-                # record of whose accounts the mix minted. Six seconds at
-                # most; the stop is honoured at the report after the save.
-                time.sleep(2)
-            if _accts_after is not None:
-                _add_owner_accounts(led, _owner,
-                                    set(_accts_after) - set(_accts_before))
-            else:
-                integrity_log("wake", "owner_accounts_unreadable")
-                agent_say("  [!] could not read the wallet's accounts after "
-                          "the mix, so what it minted is not recorded as "
-                          "this owner's. Their next withdrawal will not see "
-                          "that change until the ledger is repaired by hand.")
+        if _owner and _accts_before is not None and not _term_asked():
+            _attribute_mix_accounts(key, accounts, led, _owner, _accts_before)
         # THE WITHDRAWAL'S OWN BUNDLE NAMED THE ACCOUNT IT SPENT. Gone with
         # the job; the ledger keeps the pair.
     _save_handles(artifact_dir, handles, led["owners"])
@@ -6015,6 +6440,14 @@ def _load_ledger(d: Path) -> dict:
                     if isinstance(a, int) and not isinstance(a, bool)
                     and a > 0]
             owners[k] = {"accounts": sorted(set(_acc))}
+            # A MIX'S STARTING ACCOUNTS, while what it minted is unrecorded
+            # (_mark_pending_mix). Kept only as a list of plain integers --
+            # account 0 among them, which a wallet always has.
+            _pm = r.get(PENDING_MIX_FIELD)
+            if isinstance(_pm, list):
+                owners[k][PENDING_MIX_FIELD] = sorted(
+                    {a for a in _pm if isinstance(a, int)
+                     and not isinstance(a, bool) and a >= 0})
     return {"handles": handles, "owners": owners}
 
 
@@ -6023,6 +6456,99 @@ def _owner_accounts(led: dict, owner) -> set:
     if not owner:
         return set()
     return set((led.get("owners") or {}).get(owner, {}).get("accounts") or [])
+
+
+def _read_accounts_patiently(key: dict, accounts=None):
+    """_account_indices, asked three times a few seconds apart before it is
+    taken as unreadable: a wallet-rpc busy right after a refresh or a mix
+    answers the second time. time.sleep, not _nap -- see the callers."""
+    for _try in range(3):
+        _got = _account_indices(key, injected=accounts)
+        if _got is not None:
+            return _got
+        if _try < 2:
+            time.sleep(2)
+    return None
+
+
+def _attribute_mix_accounts(key: dict, accounts, led: dict, owner,
+                            before) -> None:
+    """Record every account the mix minted as `owner`'s: the wallet's
+    accounts now, less `before`. ONE job runs per boot, so the difference
+    is this owner's money at work -- its fan-out, decoys, carrier, change.
+
+    ON EVERY EXIT AFTER THE MIX STARTED, not only a finished one (the
+    review of the uncovered dimensions). A run that failed or was stopped
+    after the fan-out had moved the owner's money onto new accounts saved
+    the ledger with the owner holding only the account it had emptied:
+    their next withdrawal found nothing of theirs, and the money sat on
+    accounts no owner -- not even the host's token -- could reach.
+
+    ASKED AGAIN BEFORE GIVING UP, AND SAID OUT LOUD WHEN IT CANNOT BE: a
+    wallet that still cannot be asked is written to the chain and the
+    terminal, so the host knows which run left accounts unattributed.
+    time.sleep, not _nap, inside: the money has moved by here, and a stop
+    that skipped the save after this would lose the record of whose
+    accounts the mix minted. Six seconds at most."""
+    _after = _read_accounts_patiently(key, accounts)
+    if _after is not None:
+        _add_owner_accounts(led, owner, set(_after) - set(before))
+        _clear_pending_mix(led, owner)
+        return
+    integrity_log("wake", "owner_accounts_unreadable")
+    agent_say("  [!] could not read the wallet's accounts after the mix; "
+              "what it minted is recorded as this owner's at the next wake "
+              "(the accounts before it are on the ledger).")
+
+
+#: The owner's record field that holds the accounts a mix started from,
+#: until what it minted has been recorded.
+PENDING_MIX_FIELD = "mix_before"
+
+
+def _mark_pending_mix(led: dict, owner, before) -> None:
+    """Write down the accounts a mix is about to start from."""
+    _o = led.setdefault("owners", {}).setdefault(owner, {"accounts": []})
+    _o[PENDING_MIX_FIELD] = sorted(int(i) for i in before
+                                   if isinstance(i, int)
+                                   and not isinstance(i, bool))
+
+
+def _clear_pending_mix(led: dict, owner) -> None:
+    _o = (led.get("owners") or {}).get(owner)
+    if isinstance(_o, dict):
+        _o.pop(PENDING_MIX_FIELD, None)
+
+
+def _recover_pending_mixes(key: dict, accounts, led: dict) -> bool:
+    """At the start of a wake, before anything mints: every owner whose mix
+    an earlier wake did not see the end of -- a stop, a power cut, a wallet
+    that would not answer -- is given what that mix minted, and the mark
+    goes. True if the ledger changed. No mark, no wallet call.
+
+    RESTS ON ONE ASSUMPTION, stated: nothing minted accounts on this wallet
+    between that wake and this one. The machine is off between wakes; a
+    mix run BY HAND on it in between would have its accounts given to the
+    owner too, and the line below says so, so the operator can check."""
+    _pend = [(o, r) for o, r in (led.get("owners") or {}).items()
+             if isinstance(r, dict) and isinstance(r.get(PENDING_MIX_FIELD),
+                                                   list)]
+    if not _pend:
+        return False
+    _now = _read_accounts_patiently(key, accounts)
+    if _now is None:
+        integrity_log("wake", "owner_accounts_unreadable")
+        return False
+    for _o, _r in _pend:
+        _before = set(_r.get(PENDING_MIX_FIELD) or [])
+        _add_owner_accounts(led, _o, set(_now) - _before)
+        _clear_pending_mix(led, _o)
+    integrity_log("wake", "owner_accounts_recovered")
+    agent_say(f"  [*] {len(_pend)} earlier mix(es) did not see their end on "
+              f"a wake; the accounts they minted are now recorded as their "
+              f"owner's. If anything was run BY HAND on this wallet since, "
+              f"check the ledger.")
+    return True
 
 
 def _add_owner_accounts(led: dict, owner, idxs) -> None:
@@ -6992,8 +7518,8 @@ def seal_secrets_cli(args) -> str:
             "proven") else "a deposit, with the seed",
         "GS_WALLET_PASSWORD": "only a WITHDRAWAL opens the spend wallet",
         "GS_FEE_WALLET_PASSWORD": "only a FEE SWEEP opens the fee wallet",
-        "GS_SWAPKIT_API_KEY": "a forward that asks the aggregator for a "
-                              "quote",
+        "GS_SWAPKIT_API_KEY": "a deposit's quote, or a forward that asks "
+                              "the aggregator for one",
     }
     print("  The plaintext is STILL there and this tool will not destroy it.")
     print("  Before you shred it, each sealed secret needs the job that")
@@ -7021,7 +7547,7 @@ def seal_secrets_cli(args) -> str:
         print("  THE IDLE-BOOT FEE SWEEP WILL STOP RUNNING. It runs on a boot")
         print("  nothing woke, so no half arrives to open the fee wallet's")
         print("  password. Run it by hand instead:")
-        print(f"      gs_wake_agent --fee-sweep --unseal-state <hex> "
+        print(f"      gs_wake_agent --fee-sweep --unseal-state "
               f"{_key_flag()}")
         print()
     print("  KEEP THE SEED SOMEWHERE ELSE TOO. This seals the copy on this")
@@ -7035,7 +7561,7 @@ def unseal_key_cli(args) -> str:
 
     The recovery path of STAGE8_PLAN.md section 5, and the reason a sealed
     keyfile is not a way to lose a working install: the operator standing
-    at the machine, with the half from the Pi or from beside the LUKS USB,
+    at the machine, with the half from the Pi or from inside the LUKS USB,
     can read back everything the pairing put away.
 
     PRINTS, and does not rewrite the keyfile. Putting the settings back in
@@ -7080,20 +7606,30 @@ def build_cli() -> argparse.ArgumentParser:
                     help="do not ask the doorbell for a job: mix what has "
                          "gathered on the fee wallet to the addresses the "
                          "keyfile names, if it clears the threshold, then "
-                         "stop. With --dry-run, say whether it would.")
-    ap.add_argument("--unseal-state", metavar="HEX", default=None,
+                         "stop. A sweep that RUNS powers the machine off "
+                         "when it ends, like a wake -- it takes hours, and "
+                         "nobody may be here by then -- unless the inhibit "
+                         "file (.gs_wake_inhibit in the artifact directory) "
+                         "is there by then: touch it WHILE it runs, not "
+                         "before (preflight refuses to start with it "
+                         "there). A refusal keeps the machine on. With "
+                         "--dry-run, say whether it would.")
+    ap.add_argument("--unseal-state", metavar="HEX", nargs="?", const=HALF_ASK,
+                    default=None,
                     help="open this machine's sealed records BY HAND and "
                          "leave them as plaintext, then stop: no job, no "
-                         "doorbell, no power-off. HEX is the Pi's half of "
-                         "the key, which `gs_doorbell state-key` prints on "
-                         "the Pi. For the case the records must be read "
+                         "doorbell, no power-off. Asks for the Pi's half of "
+                         "the key -- `gs_doorbell state-key` prints it on "
+                         "the Pi -- without echoing it; give HEX here only "
+                         "if you accept it landing in shell history. For the case the records must be read "
                          "with no Pi to wake this box -- the card is dead "
                          "and a deposit still has to be paid out. They are "
                          "sealed again by the next ordinary wake. Also what "
                          "--fee-sweep takes when this machine's SETTINGS are "
                          "sealed too: that boot has no note, so nothing "
                          "brings it a half.")
-    ap.add_argument("--seal-secrets", metavar="HEX", default=None,
+    ap.add_argument("--seal-secrets", metavar="HEX", nargs="?", const=HALF_ASK,
+                    default=None,
                     help="put this machine's spend secrets -- the BTC seed, "
                          "the wallet passwords, the aggregator key -- behind "
                          "the pair, then stop. HEX is the Pi's half, the same "
@@ -7110,7 +7646,8 @@ def build_cli() -> argparse.ArgumentParser:
                          f"Absent means this box still uses the unit's "
                          f"EnvironmentFile, which is how every install from "
                          f"before this stage keeps working.")
-    ap.add_argument("--unseal-key", metavar="HEX", default=None,
+    ap.add_argument("--unseal-key", metavar="HEX", nargs="?", const=HALF_ASK,
+                    default=None,
                     help="print this machine's sealed SETTINGS and stop -- "
                          "the xpub, the servers, the fee destinations, the "
                          "switches. HEX is the same half --unseal-state "
@@ -7126,6 +7663,67 @@ def build_cli() -> argparse.ArgumentParser:
     return ap
 
 
+#: What the three half-taking flags hold when given with no value: ask.
+HALF_ASK = "-"
+
+
+def _ask_half(flag: str) -> str:
+    """The Pi's half, typed at a prompt that does not echo -- or one line
+    from stdin when it is piped (`gs_doorbell state-key` on the Pi, carried
+    over by hand, or through a pipe the operator trusts).
+
+    NEVER ON THE COMMAND LINE IF IT CAN BE HELPED (the review of the
+    uncovered dimensions). On argv it lands in the shell's history file on
+    this disk -- the disk that unlocks itself, the one the seal exists for
+    -- and in /proc/<pid>/cmdline, world-readable, for as long as the run
+    lasts: a hand fee sweep is hours. With the half and this disk, the
+    sealed store, the sealed settings and the sealed seed all open."""
+    import getpass
+    import signal
+    # CTRL-C MUST END THE PROMPT (the review of this pass). main() installs
+    # the stop handlers first, and they only record the signal -- so a
+    # Ctrl-C here set a flag while getpass went on waiting. Python's own
+    # handler is put back for the length of the prompt: the interrupt
+    # raises, and the command refuses for want of a half, box kept on.
+    try:
+        _prev_int = signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError):
+        _prev_int = None
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return getpass.getpass(f"  The Pi's half for {flag} "
+                                   f"(64 hex, not echoed): ").strip()
+        return (sys.stdin.readline() if sys.stdin else "").strip()
+    except (EOFError, KeyboardInterrupt, OSError):
+        return ""
+    finally:
+        if _prev_int is not None:
+            try:
+                signal.signal(signal.SIGINT, _prev_int)
+            except (ValueError, OSError):
+                pass
+
+
+def _halves_from_prompt(args) -> None:
+    """Resolve the half-taking flags once, in main(): HALF_ASK is asked
+    for; a value typed on argv is used, and the operator is told where it
+    now is. Nothing here repeats the value."""
+    for _attr, _flag in (("unseal_state", "--unseal-state"),
+                         ("seal_secrets", "--seal-secrets"),
+                         ("unseal_key", "--unseal-key")):
+        _v = getattr(args, _attr, None)
+        if _v is None:
+            continue
+        if _v == HALF_ASK:
+            setattr(args, _attr, _ask_half(_flag))
+        elif str(_v).strip():
+            agent_say(f"  [!] The Pi's half was given ON THE COMMAND LINE "
+                      f"({_flag} <hex>): it is in this shell's history on "
+                      f"this disk, and readable in /proc while this runs. "
+                      f"Remove it from the history now, and next time give "
+                      f"{_flag} with no value -- it asks, without echo.")
+
+
 def main(argv=None) -> int:
     install_signal_handlers()
     _STOP_SIGNAL.update(term=False, int=False, said=False)
@@ -7133,6 +7731,7 @@ def main(argv=None) -> int:
     _SEAL_OUTCOME[0] = None
     _RUNNING[0] = ""
     args = build_cli().parse_args(argv)
+    _halves_from_prompt(args)
     code = "unknown"
     #: Set by a Refused(power=False): the machine stays on. Read by the
     #: finally, which is the one place the power-off is decided.
@@ -7270,11 +7869,14 @@ def main(argv=None) -> int:
         retire_job_log(code, args.dry_run)
         _seal_state_now()
         # THE SECRETS GO FROM RAM HERE, on every path out. The machine is
-        # about to power off, which clears them anyway -- but --dry-run,
-        # --fee-sweep and a refusal that keeps the box on all return through
-        # this finally without powering anything off, and a seed left in a
-        # module dict in a process that keeps running is a seed one bug away
-        # from a log line.
+        # about to power off, which clears them anyway -- but --dry-run, the
+        # hand commands and a refusal that keeps the box on all return
+        # through this finally without powering anything off, and a seed
+        # left in a module dict in a process that keeps running is a seed
+        # one bug away from a log line. (A hand --fee-sweep that RAN does
+        # power off, unless the inhibit file is there -- see its --help.
+        # This comment said it did not, which the review of the uncovered
+        # dimensions caught.)
         _SECRETS.clear()
         _SECRETS_FROM[0] = None
         # EVERY path, including SystemExit from gs_common's own fail-closed

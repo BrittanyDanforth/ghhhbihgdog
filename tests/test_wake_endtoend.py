@@ -59,6 +59,11 @@ def check(name, cond):
 import gs_wake_proto as P                                    # noqa: E402
 from srcutil import fail_loudly_on_crash                     # noqa: E402
 
+# THE OPERATOR'S HOLD FILE DEFAULTS TO THE PI'S REAL ONE, and the second-boot
+# section below creates it: a run on a Pi must not hold that Pi's wakes.
+P.HOLD_FILE_DEFAULT = os.path.join(tempfile.mkdtemp(prefix="gs_hold_"),
+                                   "wakes.held")
+
 _finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS),
                                  "test_wake_endtoend.py")
 
@@ -775,6 +780,28 @@ try:
           "nothing reported back",
           "different boot" in _e2.getvalue()
           and "never reported back" in _e2.getvalue())
+    # A SECOND BOOT SIGNED AS THE VAULT IS WHAT A COPY OF ITS DISK LOOKS
+    # LIKE, and whichever boot took the job took the Pi's half with it. The
+    # doorbell holds every later wake, and the next one really is refused
+    # before anything is sent.
+    check("...and the doorbell HELD every later wake behind it, and says so",
+          os.path.exists(P.HOLD_FILE_DEFAULT)
+          and "wakes_held" in hold["p"].events
+          and "now HELD" in _e2.getvalue())
+    FakeWOL.sent = []
+    try:
+        DB.run_wake(types.SimpleNamespace(no_jitter=True), pi2,
+                    "receive_and_quote",
+                    {"amount_sat": 5000000, "owner": "0123456789abcdef"},
+                    sock_factory=lambda: FakeWOL(),
+                    sleep=lambda s: None, clock=lambda: 0.0)
+        _held_e = None
+    except DB.Doorbell as e:
+        _held_e = e
+    check("...and the next wake is refused BEFORE a magic packet goes out",
+          _held_e is not None and "held" in str(_held_e)
+          and FakeWOL.sent == [])
+    os.unlink(P.HOLD_FILE_DEFAULT)
 
     print("\n== nothing readable crosses to the Pi ==")
     check("the bundles and the slip stayed on the VAULT",
