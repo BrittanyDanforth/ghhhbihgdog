@@ -28,6 +28,7 @@ known to a third party -- do not treat the swap destination as private.
 """
 from __future__ import annotations
 import argparse, json, os, sys, time, re
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List
@@ -327,7 +328,10 @@ def main():
     ap.add_argument("--tor-proxy",
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
-                    help="GPG recipient for encrypted output")
+                    help="GPG recipient for encrypted output. Prefer "
+                         "GS_GPG_RECIPIENT=... : an argv recipient -- your "
+                         "email or key id -- is world-readable in "
+                         "/proc/<pid>/cmdline for the whole run.")
     ap.add_argument("--max-slippage", type=decimal_arg, default=Decimal("0.25"),
                     help="refuse a quote deviating more than this fraction from the "
                          "price oracle (default 0.25 = 25%%). A 5%% deviation still "
@@ -361,6 +365,14 @@ def main():
                          "quoted, paid, and then stuck.")
     ap.add_argument("--outfile", default="thor_pairs_batch.json")
     args = ap.parse_args()
+    # THE RECIPIENT NAMES THE OPERATOR -- an email, a key id -- and was argv
+    # only, readable by every account for the whole run (the host-privacy
+    # review). The environment first, as for every other identifying value.
+    # (gpg itself is still handed it on ITS argv for the moment it runs:
+    # python-gnupg builds that command line, and replacing it would drop the
+    # operator's own gpg.conf trust settings.)
+    args.gpg_recipient = env_or_argv("GS_GPG_RECIPIENT", args.gpg_recipient,
+                                     "The GPG recipient")
 
     # The BTC amounts move off the command line for the same reason the wallet
     # password and the BTC entry address did: /proc/<pid>/cmdline is 0444, so
@@ -897,8 +909,12 @@ def main():
         # is worth saying differently from "you never had gpg", and it is why
         # the preflight does not replace this.
         try:
+            # --throw-keyids: the file names no key. A .gpg bundle said whose
+            # key opens it to anyone holding it, keyring or not (driven:
+            # "encrypted with ECDH key, ID ..." from an empty keyring).
             enc = gnupg.GPG().encrypt(json.dumps(pairs, indent=2),
-                                      args.gpg_recipient)
+                                      args.gpg_recipient,
+                                      extra_args=["--throw-keyids"])
         except Exception as e:                               # noqa: BLE001
             integrity_log("thor", f"gpg_broke_late:{type(e).__name__}")
             sys.exit(

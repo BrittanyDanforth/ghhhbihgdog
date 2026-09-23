@@ -17,6 +17,7 @@ What that yields today, in the clear, from one seized laptop:
 | `thor_pairs_<h>.json` | the deposit address, the amount, and the memo — which names the client's XMR address in full |
 | `wallet_<hex>.json` | the XMR subaddress each deposit lands on |
 | `btc_forward_<h>.json` + its rotated chain | the client's own payment outpoints, the txid of the forward, the ThorChain vault it paid, the memo again, and the signed bytes while they are kept |
+| `btc_forward_<h>.signed.json` | the txid of every forward sent for the deposit, written before it was sent (the newest 64) |
 | `gs_wake_state.json` | a 24-hour wake timetable, and the last 200 job ids |
 
 That is the whole intake since the last hand-run wipe: who paid what, when,

@@ -82,6 +82,7 @@ import json
 import os
 import re
 import sys
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 import random
 import threading
 import time

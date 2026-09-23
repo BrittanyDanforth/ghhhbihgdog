@@ -106,6 +106,7 @@ import os
 import re
 import secrets
 import sys
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -499,7 +500,12 @@ def validate_memo(memo, dest_xmr):
     return text
 
 
-_LIMIT_RE = re.compile(r"^[0-9]+(?:[eE][0-9]+)?\Z")
+#: BOUNDED, both halves. The limit is in 1e8 base units, so no real one needs
+#: more than twenty digits or a two-digit exponent -- and an unbounded one was
+#: a CPU bomb in 119 bytes: int(Decimal("1e2000000")) takes time quadratic in
+#: the exponent (56 s driven), and whoever answers as the aggregator chooses
+#: it. The forward was refused in the end, after the job's whole budget.
+_LIMIT_RE = re.compile(r"^[0-9]{1,20}(?:[eE][0-9]{1,2})?\Z")
 _BPS_RE = re.compile(r"^[0-9]{1,4}\Z")
 
 
@@ -552,6 +558,7 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
         raise Refused("memo_bad_limit",
                       "the memo's output limit field is not a number; "
                       "refusing to rewrite a memo this tool cannot read")
+    # Bounded by _LIMIT_RE, so this converts at once (at most ~1e119).
     quoted = int(Decimal(lim_text)) if lim_text else 0
     # THE FLOOR: the expected output less the margin drawn for this
     # forward, clamped to 0..LIMIT_MARGIN_MAX_BPS (the arrival tolerance,
@@ -924,6 +931,99 @@ def write_status(outfile, state):
     atomic_write_json({"state": state}, status_path(outfile))
 
 
+#: EVERY TRANSACTION THIS TOOL SENDS, BY TXID, RECORDED BEFORE ITS BYTES
+#: LEAVE THE BOX: btc_forward_<h>.signed.json beside the plan, sealed and
+#: wiped with it (btc_forward_*.json). Txids only -- a transaction is read
+#: from a file only from a plan (_plan_file).
+#:
+#: A spend of the deposit address that no plan named was judged ours by its
+#: memo, an OP_RETURN naming this deposit's destination. That memo is on
+#: the chain in every forward this tool made, for anyone to read, and
+#: whoever holds the seed can write it. Kerckhoffs: a thief with a leaked
+#: seed who knew this code paid himself with our memo attached, and the
+#: alarm this tool exists to raise ("the seed has leaked") became "forward
+#: found on chain" -- a reconstructed plan the agent read as `sent`, or a
+#: plan marked superseded by the theft and `forwarded` once it mined. A
+#: txid cannot be copied: nobody without our exact bytes makes one we
+#: recorded. So a spend no plan names is ours only when this record names
+#: it, and the record is on disk before the broadcast, so the case the
+#: memo rule was for -- sent, then killed before the plan was written --
+#: is still found.
+SIGNED_SCHEMA = "gs_btc_signed_v1"
+#: The newest this many are kept. The record only matters between a send
+#: and its plan; every older txid is in the plan chain too.
+SIGNED_KEEP = 64
+_TXID_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+
+def signed_path(outfile):
+    """Where the record of sent txids goes: beside the plan, under the
+    same wipe and seal patterns."""
+    return Path(outfile).with_suffix(".signed.json")
+
+
+def _read_signed(outfile):
+    """The txids in the record, oldest first, each 64 lowercase hex; the
+    file yields nothing else. [] when there is none; raises (OSError,
+    ValueError) for one that is there and unreadable."""
+    try:
+        with open(signed_path(outfile), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return []
+    if not isinstance(doc, dict) or doc.get("schema") != SIGNED_SCHEMA \
+            or not isinstance(doc.get("txids"), list):
+        raise ValueError("not a record of this tool's sent transactions")
+    return [t for t in doc["txids"] if isinstance(t, str) and _TXID_RE.match(t)]
+
+
+def signed_txids(outfile):
+    """The set of txids this tool recorded before sending. An unreadable
+    record is empty, which makes a spend it named FOREIGN -- the safe
+    side: an alarm to check, not a theft passed as a forward."""
+    try:
+        return set(_read_signed(outfile))
+    except (OSError, ValueError):
+        integrity_log("forward", "signed_record_unreadable")
+        return set()
+
+
+def record_signed(outfile, txid):
+    """Add `txid` to the record, synced to disk, BEFORE its bytes are
+    handed to any server. Fails closed: a record that cannot be written is
+    a refusal, and nothing is sent."""
+    txid = str(txid).lower()
+    if not _TXID_RE.match(txid):
+        raise Refused("signed_record_failed",
+                      "the transaction has no txid to record; nothing was "
+                      "sent")
+    try:
+        have = _read_signed(outfile)
+    except (OSError, ValueError):
+        # What it held is in the plan chain, save a send that died before
+        # its plan -- which then reads as foreign: an alarm to check, the
+        # safe side. A fresh record, said on the chain.
+        integrity_log("forward", "signed_record_reset")
+        have = []
+    keep = [t for t in have if t != txid][-(SIGNED_KEEP - 1):] + [txid]
+    path = signed_path(outfile)
+    try:
+        atomic_write_json({"schema": SIGNED_SCHEMA, "txids": keep}, path)
+        # ...and the NAME synced too: the rename is what makes the record
+        # exist, and a power cut straight after the broadcast is the case
+        # it is for.
+        _dfd = os.open(str(path.parent), os.O_RDONLY
+                       | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(_dfd)
+        finally:
+            os.close(_dfd)
+    except OSError as e:
+        raise Refused("signed_record_failed",
+                      f"the record of what this tool sends could not be "
+                      f"written ({e.strerror or e}); nothing was sent")
+
+
 #: The data of an OP_RETURN script laid out as this tool lays one out (one
 #: push, direct or OP_PUSHDATA1), or None for any other script: ONE reader,
 #: gs_btc_tx's, shared with the history reader (gs_btc_broadcast), so the
@@ -945,15 +1045,19 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
     through. So the address's history is read (read-only) and its LAST
     spend examined:
 
-      - its OP_RETURN carries a memo naming THIS deposit's destination:
-        it is our forward. The plan is reconstructed from the transaction
+      - its txid is one this tool recorded before sending it
+        (record_signed) and its memo names THIS deposit's destination: it
+        is our forward. The plan is reconstructed from the transaction
         itself (txid, inputs and their values, what reached the inbound,
         the fee, the memo), marked `reconstructed`, and the run reports
         done -- the agent reads `sent` off it and the ledger catches up;
       - anything else emptied the address: a spend this tool did not
         sign. Nothing is signed; the run FAILS with the kind on the chain,
         and the operator reads the job log at the machine. Only a leaked
-        seed does this.
+        seed does this -- or, once, a build without the record that died
+        between sending and writing its plan. OUR MEMO IS NOT ENOUGH: it
+        is on the chain in every forward this tool made, and whoever holds
+        the seed can copy it onto a theft (SIGNED_SCHEMA).
       - no spend at all (never paid): None, and the caller answers as it
         always did. "Could not ask" is likewise None, with a kind.
 
@@ -984,14 +1088,20 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
             except UnicodeDecodeError:
                 memo = None
             break
-    ours = bool(memo) and instruction_field_safe(memo) \
+    memo_ours = bool(memo) and instruction_field_safe(memo) \
         and _memo_fields_bind(memo, dest_xmr)
-    if not ours:
+    sent_here = str(last["txid"]).lower() in signed_txids(outfile)
+    if not (sent_here and memo_ours):
         integrity_log("forward", "foreign_spend")
+        why = ("it carries this deposit's own memo, but this box never "
+               "recorded sending it -- and that memo is on the chain in "
+               "every forward of ours, for whoever holds the seed to copy"
+               if memo_ours else
+               "its memo does not name this deposit's destination")
         print("[!] the deposit address was EMPTIED by a transaction this "
-              "tool did not sign: its memo does not name this deposit's "
-              f"destination (txid {last['txid']}). Nothing is signed. If "
-              "no operator moved it by hand, the seed has leaked.")
+              f"tool did not sign: {why} (txid {last['txid']}). Nothing is "
+              "signed. If no operator moved it by hand, the seed has "
+              "leaked.")
         raise SystemExit(EXIT_FAILED)
     net = btx.network_of(network)
     paid = [o for o in tx.vout if _op_return_data(o.script_pubkey.data)
@@ -1506,9 +1616,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                                   new one.
 
     A spend of the address that is not in our plan chain is examined: an
-    OP_RETURN naming this destination is a forward of ours the chain
-    forgot (adopted as ours); anything else FAILS the run with the kind on
-    the chain -- nothing is signed. Money come back but not yet settled is
+    txid this tool recorded before sending it (record_signed) is a forward
+    of ours the chain forgot (adopted as ours); anything else FAILS the run
+    with the kind on the chain -- nothing is signed. A memo naming this
+    destination is not enough: every forward of ours put it on the chain
+    for whoever holds the seed to copy (SIGNED_SCHEMA). Money come back but not yet settled is
     the word `returned` and a refusal: sent on when it settles."""
     # OUR OWN TRANSACTIONS ARE READ WHEREVER THEY SIT in a history longer
     # than the window: every forward in the plan chain and what funded its
@@ -1618,14 +1730,16 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                                for i in (_p.get("inputs") or [])
                                if isinstance(i, dict)])
     _kept_ops -= _signed_ops
+    _sent_here = signed_txids(args.outfile)
     listed = {s["txid"]: s for s in spends}
     for s in spends:
         if s["txid"] in ours:
             continue
         _memo, mine = _memo_is_ours(s["hex"], dest_xmr)
-        if mine:
+        if mine and str(s["txid"]).lower() in _sent_here:
             # A FORWARD OF OURS THE CHAIN FORGOT: a signature this tool
-            # made whose plan was lost. It is ours; its inputs are gone.
+            # made and recorded before sending, whose plan was lost. It is
+            # ours; its inputs are gone.
             integrity_log("forward", "adopted_spend")
             ours.add(s["txid"])
             continue
@@ -1673,10 +1787,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                   "operator's hand, as documented. Nothing to send.")
             continue
         integrity_log("forward", "foreign_spend")
+        _why = ("it carries this deposit's own memo, but this box never "
+                "recorded sending it -- and that memo is on the chain in "
+                "every forward of ours, for whoever holds the seed to copy"
+                if mine else
+                "its memo does not name this deposit's destination")
         print("[!] the deposit address was spent by a transaction this "
-              "tool did not sign: its memo does not name this deposit's "
-              f"destination (txid {s['txid']}). Nothing is signed. If no "
-              "operator moved it by hand, the seed has leaked.")
+              f"tool did not sign: {_why} (txid {s['txid']}). Nothing is "
+              "signed. If no operator moved it by hand, the seed has "
+              "leaked.")
         raise SystemExit(EXIT_FAILED)
     consumed = {(i["tx_hash"], int(i["vout"]))
                 for s in spends if s["txid"] in ours for i in s["inputs"]}
@@ -1926,6 +2045,7 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     stale (a policy or a fee the network no longer takes) and its inputs
     are still ours, so a fresh forward at today's fee follows."""
     txid = str(plan.get("txid") or "").lower()
+    record_signed(args.outfile, txid)
     integrity_log("forward", "resending")
     try:
         sub = bcast_submit(tx_hex, txid, address, servers, args.tor_proxy,
@@ -2483,6 +2603,10 @@ def main(argv=None):
                           f"{int(age)} s passed since the quote, over the "
                           f"{args.quote_max_age} s this box allows between "
                           "quoting and sending; nothing was sent")
+        # ON DISK BEFORE THE BYTES LEAVE: the one mark that tells this
+        # forward, found on the chain with no plan, from a copy of its memo
+        # (SIGNED_SCHEMA says why).
+        record_signed(args.outfile, txid)
         integrity_log("forward", "sending")
         try:
             sub = bcast_submit(tx.serialize().hex(), txid, address, servers,

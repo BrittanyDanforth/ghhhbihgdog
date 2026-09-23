@@ -1251,6 +1251,77 @@ finally:
     if _rj_saved[1] is not None:
         os.environ["HOME"] = _rj_saved[1]
 
+# A TYPED TOTAL STANDS WITHOUT THE FILE. One receive address takes one swap,
+# so several swaps are several receive wallets; with the console's shared
+# quote file the second quote replaced the first, and this refused the first
+# wallet's watch ("none of the swap pairs are routed to this address") even
+# with the total typed -- which the run itself takes over the file. Driven
+# through main(), stopped at the Tor check that follows the pairs step.
+import io as _io8, contextlib as _cl8                          # noqa: E402
+
+
+class _Stop8(Exception):
+    pass
+
+
+def _watch8(pairs_rows, typed):
+    _A = "8" + "A" * 94
+    _pf = os.path.join(_scratch, "pairs8.json")
+    if pairs_rows is None:
+        if os.path.exists(_pf):
+            os.unlink(_pf)
+    else:
+        with open(_pf, "w") as _f:
+            json.dump([{"schema": "thor_pairs_v1", "dest_xmr": _d,
+                        "expected_xmr": "1.0"} for _d in pairs_rows], _f)
+    _saved = (rw.load_receive_bundle, rw.verify_tor, rw.integrity_log,
+              sys.argv, os.environ.get("GS_EXPECT_XMR"))
+
+    def _tor(*a, **k):
+        raise _Stop8()
+    rw.load_receive_bundle = lambda p: {"address": _A, "account_index": 1,
+                                        "subaddress_index": 1}
+    rw.verify_tor = _tor
+    rw.integrity_log = lambda *a, **k: None
+    sys.argv = ["receive_watch", "--receive-wallet", "wallet_a.json",
+                "--tor-proxy", "socks5h://127.0.0.1:9050", "--pairs", _pf]
+    if typed:
+        os.environ["GS_EXPECT_XMR"] = "1.0"
+    else:
+        os.environ.pop("GS_EXPECT_XMR", None)
+    _o = _io8.StringIO()
+    try:
+        with _cl8.redirect_stdout(_o):
+            rw.main()
+        return "RAN", _o.getvalue()
+    except _Stop8:
+        return "PAST_PAIRS", _o.getvalue()
+    except SystemExit as e:
+        return "EXIT", f"{e}"
+    except Exception as e:                                   # noqa: BLE001
+        return "CRASH", f"{type(e).__name__}: {e}"
+    finally:
+        (rw.load_receive_bundle, rw.verify_tor, rw.integrity_log,
+         sys.argv) = _saved[:4]
+        if _saved[4] is None:
+            os.environ.pop("GS_EXPECT_XMR", None)
+        else:
+            os.environ["GS_EXPECT_XMR"] = _saved[4]
+
+
+_B8 = "8" + "B" * 94
+_st8, _o8 = _watch8([_B8], typed=True)
+check("watch: a typed total goes on past a quote file holding only another "
+      "address's swap, and says the file was not used",
+      _st8 == "PAST_PAIRS" and "waiting for the total you typed" in _o8)
+_st8b, _o8b = _watch8(None, typed=True)
+check("watch: ...and past a quote file that is not there",
+      _st8b == "PAST_PAIRS" and "not used" in _o8b)
+_st8c, _o8c = _watch8([_B8], typed=False)
+check("watch: NON-VACUITY -- with nothing typed, another address's quote is "
+      "still refused: there is nothing else to wait for",
+      _st8c == "EXIT" and "are routed to" in _o8c)
+
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     for f in FAILURES:

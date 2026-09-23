@@ -1048,6 +1048,48 @@ def test_half_minted_receive():
          crw.integrity_log_once) = _hm_saved
 
 
+def test_gpg_recipient_stays_off_argv_and_out_of_the_file():
+    # THE RECIPIENT NAMES THE OPERATOR, and it was argv only: world-readable
+    # in /proc/<pid>/cmdline for the whole run. And the .gpg bundle named the
+    # key that opens it to anyone holding it (the host-privacy review).
+    import types as _ty
+    _calls = []
+
+    class _Enc:
+        ok, status = True, "encryption ok"
+
+        def __str__(self):
+            return "-----BEGIN PGP MESSAGE-----\nx\n-----END PGP MESSAGE-----"
+
+    class _GPG:
+        def __init__(self, *a, **k):
+            pass
+
+        def encrypt(self, data, recipients, **kw):
+            _calls.append((recipients, kw))
+            return _Enc()
+
+    _fake = _ty.ModuleType("gnupg")
+    _fake.GPG = _GPG
+    _saved = sys.modules.get("gnupg")
+    sys.modules["gnupg"] = _fake
+    os.environ["GS_GPG_RECIPIENT"] = "alice@example.org"
+    try:
+        r = ThorRun(memo=f"=:XMR.XMR:{DEST}:0/1/0:t:0")
+        code, msg, text, out = r.run()
+    finally:
+        os.environ.pop("GS_GPG_RECIPIENT", None)
+        if _saved is None:
+            sys.modules.pop("gnupg", None)
+        else:
+            sys.modules["gnupg"] = _saved
+    check("gpg: the recipient comes from GS_GPG_RECIPIENT, not argv",
+          code == 0 and _calls and _calls[0][0] == "alice@example.org"
+          and "alice@example.org" not in " ".join(sys.argv))
+    check("gpg: ...and the bundle names no key (--throw-keyids)",
+          _calls and "--throw-keyids" in (_calls[0][1].get("extra_args") or []))
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

@@ -30,6 +30,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tests"))
 
+# REAL WIPES RUN IN THIS SUITE, each in a sandboxed HOME. Under sudo the
+# sweep also searches the invoking account's own home (gs_common.sudo_home),
+# which no sandboxed HOME covers: `sudo python3 tests/...` would wipe the
+# developer's real artifacts. Tests that want sudo set it themselves.
+os.environ.pop("SUDO_UID", None)
 PASS = 0
 FAIL = 0
 FAILS = []
@@ -143,6 +148,13 @@ _d = tempfile.mkdtemp(prefix="wipechain_")
 # wipe here must not reach into the checkout the other suites are running in.
 _tc2 = gs.TOOLCHAIN_DIR
 gs.TOOLCHAIN_DIR = Path(tempfile.mkdtemp(prefix="wipechain_tc_"))
+# ...NOR INTO THE DEVELOPER'S HOME. $HOME is a sweep root too, and this wipe
+# is real: it ran against the real one, so the suite shredded whatever
+# bundles and pairs files the person running it had there. And under sudo
+# the invoking account's home is a root as well (gs_common.sudo_home), so
+# SUDO_UID goes for the whole suite.
+_home2 = os.environ.get("HOME")
+os.environ["HOME"] = tempfile.mkdtemp(prefix="wipechain_home_")
 try:
     os.chdir(_d)
     Path("integrity_chain.log").write_text("h | an earlier run\n")
@@ -178,7 +190,12 @@ finally:
     os.chdir(_cwd)
     __import__("shutil").rmtree(_d, ignore_errors=True)
     __import__("shutil").rmtree(gs.TOOLCHAIN_DIR, ignore_errors=True)
+    __import__("shutil").rmtree(os.environ["HOME"], ignore_errors=True)
     gs.TOOLCHAIN_DIR = _tc2
+    if _home2 is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _home2
 
 # ---------------------------------------------------------------------------
 # 3. Relay egress must be re-checked before EVERY submit, not on a timer.
@@ -218,10 +235,13 @@ ats = _load("airgap_tx_signer")
 check("password: there is ONE chooser for where it may be staged",
       callable(getattr(ats, "_pw_scratch_dir", None)))
 if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
-    check("password: it prefers tmpfs over the disk-backed default",
-          ats._pw_scratch_dir() == "/dev/shm")
+    check("password: it prefers tmpfs over the disk-backed default -- a "
+          "private directory INSIDE /dev/shm, never the shared root itself",
+          os.path.dirname(ats._pw_scratch_dir()) == "/dev/shm"
+          and ats._pw_scratch_dir() != "/dev/shm")
     check("password: ...even when a disk fallback is offered",
-          ats._pw_scratch_dir("/var/tmp") == "/dev/shm")
+          os.path.dirname(ats._pw_scratch_dir("/var/tmp")) == "/dev/shm")
+    ats._drop_private_scratch(ats._pw_scratch_dir())
 else:
     print("  skip  /dev/shm unavailable; tmpfs preference not checked")
 # code_only: comments and docstrings blanked. The first version of these two
@@ -892,6 +912,98 @@ try:
           not (_hl / "integrity_chain.log").exists()
           and not (_hl / "integrity_chain.log.retired").exists()
           and "hard links" not in _hlo.getvalue())
+    # ...BUT ONLY NAMES THE SWEEP TAKES ON THEIR OWN. Lifting the hard-link
+    # refusal used to skip the content check after it, and names were
+    # counted by path: (i) a user's own keystore called wallet_*.json with a
+    # second name in ~/Documents was shredded, content check and all; (ii)
+    # a checkout symlinked as ~/ghostspiral found one name twice, and a
+    # thor_pairs.json hard-linked to ~/private/deep/notes.txt was zeroed.
+    _h6 = _box5 / "h6"
+    (_h6 / "Documents").mkdir(parents=True)
+    (_h6 / "wallet_eth_backup.json").write_bytes(b'{"crypto": "MINE"}')
+    os.link(_h6 / "wallet_eth_backup.json",
+            _h6 / "Documents" / "wallet_eth_backup.json")
+    (_h6 / "private" / "deep").mkdir(parents=True)
+    (_h6 / "private" / "deep" / "notes.txt").write_bytes(b"MY NOTES")
+    (_h6 / "code" / "gs").mkdir(parents=True)
+    os.symlink(_h6 / "code" / "gs", _h6 / "ghostspiral")
+    os.link(_h6 / "private" / "deep" / "notes.txt",
+            _h6 / "code" / "gs" / "thor_pairs.json")
+    # (iii) a second name in ANOTHER directory, one the sweep reaches only
+    # through a link: ~/deeplink -> ~/private/deep holds the other name of
+    # ~/gs2/thor_pairs.json. Counted, the two made "every name here" and the
+    # file under ~/private/deep went with it.
+    (_h6 / "gs2").mkdir()
+    (_h6 / "private" / "deep" / "thor_pairs_keep.json").write_bytes(b"KEEP")
+    os.link(_h6 / "private" / "deep" / "thor_pairs_keep.json",
+            _h6 / "gs2" / "thor_pairs.json")
+    os.symlink(_h6 / "private" / "deep", _h6 / "deeplink")
+    _hsave6 = os.environ.get("HOME")
+    os.environ["HOME"] = str(_h6)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as _o6:
+            _pm5.wipe_gs_artifacts(dry=False,
+                                   extra_dirs=[str(_h6 / "code" / "gs")])
+    finally:
+        os.environ["HOME"] = _hsave6
+    check("sweep/link: a user's wallet_*.json with a second name inside the "
+          "sweep is left for its content, not shredded as 'every name here'",
+          _rd5(_h6 / "wallet_eth_backup.json") == b'{"crypto": "MINE"}'
+          and _rd5(_h6 / "Documents" / "wallet_eth_backup.json")
+          == b'{"crypto": "MINE"}')
+    check("sweep/link: a name found twice through a symlinked checkout is ONE "
+          "name: its other name outside the sweep survives",
+          _rd5(_h6 / "private" / "deep" / "notes.txt") == b"MY NOTES"
+          and "hard links" in _o6.getvalue())
+    check("sweep/link: a second name reached only THROUGH a link is not one "
+          "the sweep takes: the file it names survives",
+          _rd5(_h6 / "private" / "deep" / "thor_pairs_keep.json") == b"KEEP")
+    # UNDER SUDO THE OPERATOR'S HOME IS SEARCHED. sudo's env_reset sets
+    # HOME to root's, so the remedy the owner rule names -- "run the wipe
+    # with sudo" -- searched /root and reported success with the file still
+    # in the operator's tree. The home comes from the password database for
+    # SUDO_UID, never from HOME; driven as root with that lookup stood in.
+    import pwd as _pwd7
+    _h7 = _box5 / "h7"
+    (_h7 / "gs").mkdir(parents=True)
+    (_h7 / "gs" / "thor_pairs.json").write_bytes(b"[]")
+    (_box5 / "rooth7").mkdir()
+    (_box5 / "cwd7").mkdir()
+    _real_gpu7 = _pwd7.getpwuid
+    _env7 = {k: os.environ.get(k) for k in ("HOME", "SUDO_UID")}
+    _cwd7 = os.getcwd()
+    try:
+        _pwd7.getpwuid = lambda u: (types.SimpleNamespace(pw_dir=str(_h7))
+                                    if u == 4242 else _real_gpu7(u))
+        os.environ["HOME"] = str(_box5 / "rooth7")
+        os.chdir(_box5 / "cwd7")
+        os.environ.pop("SUDO_UID", None)
+        with contextlib.redirect_stdout(io.StringIO()) as _o7a:
+            _pm5.wipe_gs_artifacts(dry=True, extra_dirs=[])
+        os.environ["SUDO_UID"] = "4242"
+        _sh7 = gs.sudo_home()
+        if os.geteuid() == 0:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _f7 = _pm5.wipe_gs_artifacts(dry=False, extra_dirs=[])
+    finally:
+        _pwd7.getpwuid = _real_gpu7
+        os.chdir(_cwd7)
+        for _k7, _v7 in _env7.items():
+            if _v7 is None:
+                os.environ.pop(_k7, None)
+            else:
+                os.environ[_k7] = _v7
+    check("sweep/sudo: NON-VACUITY -- with HOME at root's and no SUDO_UID, "
+          "the operator's tree is not searched",
+          str(_h7 / "gs" / "thor_pairs.json") not in _o7a.getvalue())
+    if os.geteuid() == 0:
+        check("sweep/sudo: under sudo (HOME reset to root's) the operator's "
+              "home is searched and a root-owned artifact in it goes",
+              _sh7 == _h7 and not (_h7 / "gs" / "thor_pairs.json").exists()
+              and _f7 == 0)
+    else:
+        check("sweep/sudo: not root, so no sudo home is added",
+              _sh7 is None)
     # AND THE PREDICTION AGREES WITH THE CONTENT CHECK: a wallet_*.json that
     # is not a bundle is not promised to the writer that made it.
     _wq = _box5 / "cwd" / "wallet_quotes.json"
@@ -951,6 +1063,54 @@ finally:
         os.environ["HOME"] = _saved5[0]
     __import__("shutil").rmtree(_box5, ignore_errors=True)
 
+
+# ---------------------------------------------------------------------------
+# NO __pycache__. Python wrote one beside the tools on their first run --
+# /opt/ghostspiral/__pycache__, outside $HOME and /tmp, so outside the wipe
+# -- and its birth time and mtimes dated the first run as root; a .pyc of a
+# lazily imported module said which features had been used (the host-
+# privacy review). Every entry point sets sys.dont_write_bytecode before its
+# first import, and the wipe reaches the toolchain's own directory for one
+# an older run left.
+# ---------------------------------------------------------------------------
+import shutil as _sh8, subprocess as _sp8                       # noqa: E402
+_ENTRY8 = ("GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
+           "btc_forwarder", "create_receive_wallet", "exit_strategy_simulator",
+           "gs_console", "gs_delivery_key", "gs_doorbell", "gs_telegram_pager",
+           "gs_unseal", "gs_wake_agent", "gs_wake_keys", "paranoia_mode",
+           "receive_watch", "thor_swap_preparer")
+_cp8 = Path(tempfile.mkdtemp(prefix="nopyc_")) / "tree"
+_sh8.copytree(REPO, _cp8, ignore=_sh8.ignore_patterns(
+    ".git", "__pycache__", "tests"))
+_env8 = {k: v for k, v in os.environ.items()
+         if k not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")}
+_env8["HOME"] = str(_cp8.parent)
+# NON-VACUITY: this interpreter does write bytecode here when not told not to.
+_sp8.run([sys.executable, "-c", "import sys; sys.path.insert(0, '.'); "
+          "import gs_common"], cwd=_cp8, env=_env8, capture_output=True,
+         timeout=120)
+_ctl8 = (_cp8 / "__pycache__").is_dir()
+_sh8.rmtree(_cp8 / "__pycache__", ignore_errors=True)
+for _t8 in _ENTRY8:
+    _sp8.run([sys.executable, _t8, "--help"], cwd=_cp8, env=_env8,
+             capture_output=True, timeout=120)
+_left8 = sorted(str(p.relative_to(_cp8)) for p in _cp8.rglob("__pycache__"))
+check("pycache: NON-VACUITY -- an import that is not told otherwise writes "
+      "one here", _ctl8)
+check(f"pycache: no entry point leaves a __pycache__ behind (left: "
+      f"{_left8})", _left8 == [])
+_tcs8 = gs.TOOLCHAIN_DIR
+try:
+    gs.TOOLCHAIN_DIR = _cp8
+    (_cp8 / "__pycache__").mkdir()
+    (_cp8 / "__pycache__" / "gs_common.cpython-311.pyc").write_bytes(b"x")
+    with contextlib.redirect_stdout(io.StringIO()) as _o8:
+        _pm5.wipe_pycache(True)
+finally:
+    gs.TOOLCHAIN_DIR = _tcs8
+check("pycache: ...and the wipe reaches one an older run left in the "
+      "toolchain's own directory", str(_cp8 / "__pycache__") in _o8.getvalue())
+_sh8.rmtree(_cp8.parent, ignore_errors=True)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

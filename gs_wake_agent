@@ -58,6 +58,7 @@ import re
 import stat
 import subprocess
 import sys
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 import time
 from decimal import Decimal, InvalidOperation
 import traceback
@@ -719,7 +720,14 @@ def _no_redirect_opener():
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
 
-        _OPENER[0] = urllib.request.build_opener(_RefuseRedirect)
+        # AND NO PROXY FROM THE ENVIRONMENT (the host-privacy pass, the
+        # loopback finding's twin here): build_opener adds a ProxyHandler
+        # that reads HTTP_PROXY / http_proxy, so a unit or a shell that set
+        # one sent the doorbell's records -- and the fact of this machine
+        # being awake -- to that proxy instead of across the LAN. An empty
+        # map is "no proxy", whatever the environment says.
+        _OPENER[0] = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _RefuseRedirect)
     return _OPENER[0]
 
 
@@ -2519,21 +2527,79 @@ def _issued_mark_path(key: dict):
 
 
 def _xpub_id(key: dict) -> str:
-    """Which CHAIN a mark is about: gs_btc_watch.chain_id -- a short digest
-    of the chain's FIRST ADDRESS, never the xpub itself (it derives every
-    deposit address). A mark left behind by a wipe names no address, no
-    amount and no client. From the address and not the xpub's text
-    (self-doubt over the fix pass): an xpub and a zpub of one account are
-    one chain, and a re-pair that pasted the other encoding read as a
-    fresh chain and handed index 0 out again. An xpub that derives
-    nothing (refused elsewhere) gets a digest of its text, so this never
-    raises and a mark is still a mark."""
+    """Which CHAIN a mark is about: gs_btc_watch.chain_id -- keyed by the
+    account's chain code, never the xpub itself (it derives every deposit
+    address) and never a plain digest of an address (a paid address is
+    public, and a digest of one is a lookup away: see chain_id). A mark
+    left behind by a wipe names no address, no amount and no client, to
+    anyone who cannot already derive them all. An xpub and a zpub of one
+    account are one chain (self-doubt over the fix pass: a re-pair that
+    pasted the other encoding read as a fresh chain and handed index 0 out
+    again). An xpub that derives nothing (refused elsewhere) gets a digest
+    of its text, so this never raises and a mark is still a mark."""
     xpub = str(key.get("btc_account_xpub") or "")
     try:
         import gs_btc_watch as _w
         return _w.chain_id(xpub, str(key.get("btc_network") or "main"))
     except Exception:                                        # noqa: BLE001
         return hashlib.sha256(("xpub:" + xpub).encode()).hexdigest()[:16]
+
+
+def _legacy_xpub_id(key: dict) -> str:
+    """The id a mark for this chain carried before it was keyed (a digest
+    of address 0), read only to find and replace such a mark: a vault
+    updated in place still knows what it handed out. Falls back as
+    _xpub_id does, to the same text digest."""
+    xpub = str(key.get("btc_account_xpub") or "")
+    try:
+        import gs_btc_watch as _w
+        return _w.legacy_chain_id(xpub, str(key.get("btc_network") or "main"))
+    except Exception:                                        # noqa: BLE001
+        return hashlib.sha256(("xpub:" + xpub).encode()).hexdigest()[:16]
+
+
+#: The mark's times, and its directory's, are set back to this bucket after
+#: each write -- the integrity chain's ten minutes (gs_common.integrity_log).
+#: The exact second of the last write is the second a client was handed an
+#: address. The CTIME cannot be moved by an unprivileged call and still
+#: says it; that is the chain log's limit too, said rather than hidden.
+ISSUED_MARK_BUCKET_S = 600
+
+
+def _blur_mark_times(p: Path) -> None:
+    """mtime and atime of the mark and its directory to the bucket. Never
+    raises: the mark is written, and a clock it could not blur is no reason
+    to refuse the deposit it records."""
+    ts = int(time.time()) // ISSUED_MARK_BUCKET_S * ISSUED_MARK_BUCKET_S
+    for _q in (p, p.parent):
+        try:
+            os.utime(_q, (ts, ts), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+
+
+def _read_mark_text(q: Path) -> str:
+    """The mark's text, read WITHOUT MOVING ITS ATIME where the kernel
+    allows (O_NOATIME: the owner may): the times are set back to the
+    bucket, and under relatime the first read after that set the atime to
+    the second -- the second of the next deposit asked for, a refused one
+    included. Raises what open raises (FileNotFoundError is "no mark")."""
+    try:
+        fd = os.open(str(q), os.O_RDONLY | getattr(os, "O_NOATIME", 0))
+    except PermissionError:
+        fd = os.open(str(q), os.O_RDONLY)
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _legacy_mark_path(key: dict, p: Path):
+    """Where a mark for this chain sat under its unkeyed id, when that is
+    another file than `p` (a marks directory names the file by the id; a
+    mark beside the keyfile has one name either way): or None."""
+    _new, _old = _xpub_id(key), _legacy_xpub_id(key)
+    if _old != _new and p.name == f"issued_{_new}.json":
+        return p.with_name(f"issued_{_old}.json")
+    return None
 
 
 def _read_issued_mark(key: dict):
@@ -2546,33 +2612,68 @@ def _read_issued_mark(key: dict):
     p = _issued_mark_path(key)
     if p is None:
         return None
+    # THE UNKEYED MARK TOO (the host-privacy pass keyed the id): a vault
+    # updated in place has its mark under the old id, in the old file, and
+    # read as "no mark" its wiped ledger would hand address 0 out again --
+    # the one thing the mark is for. Either id is this chain's; where both
+    # files exist the higher count stands (a mark is a floor). What was
+    # found under the old id is written again under the new and the old
+    # file erased, so the name a paid address hashes to does not outlive
+    # the update.
+    _ids = (_xpub_id(key), _legacy_xpub_id(key))
+    _old = _legacy_mark_path(key, p)
+    best, _from = None, None
+    for _q in (p, _old):
+        if _q is None:
+            continue
+        try:
+            d = json.loads(_read_mark_text(_q))
+        except FileNotFoundError:
+            continue
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("wake", "btc_issued_mark_unreadable")
+            raise Refused("btc_issued_mark_unreadable",
+                          f"the issued-index mark ({_q}) exists and cannot be "
+                          f"read ({type(e).__name__}); it is what tells a "
+                          "wiped ledger from a fresh one, so no address was "
+                          "issued. Fix or remove it at the machine.") from e
+        if not isinstance(d, dict) or d.get("xpub_id") not in _ids:
+            continue
+        # ...AND SAYS A COUNT (self-doubt over the fix pass): a mark whose
+        # `issued` is not a whole number under the hardened bound escaped
+        # as an uncaught ValueError -- a crash, the box powered off -- or
+        # as btc_config_malformed, blaming an xpub that was fine.
+        _n = d.get("issued")
+        if isinstance(_n, bool) or not isinstance(_n, int) \
+                or not 0 <= _n < 0x80000000:
+            integrity_log("wake", "btc_issued_mark_unreadable")
+            raise Refused("btc_issued_mark_unreadable",
+                          f"the issued-index mark ({_q}) does not carry a "
+                          "whole number of issued addresses; it is what tells "
+                          "a wiped ledger from a fresh one, so no address was "
+                          "issued. Fix or remove it at the machine.")
+        if best is None or _n > best["issued"]:
+            best, _from = d, _q
+    if best is not None and (_from != p or best.get("xpub_id") != _ids[0]
+                             or (_old is not None and _old.exists())):
+        _migrate_issued_mark(key, p, _old, best["issued"])
+    return best
+
+
+def _migrate_issued_mark(key: dict, p: Path, old, issued: int) -> None:
+    """The mark under the keyed id, the unkeyed one erased. NEVER raises:
+    what was read stands either way, and the next issue writes it again."""
+    from gs_common import integrity_log_once as _once
     try:
-        d = json.loads(p.read_text())
-    except FileNotFoundError:
-        return None
-    except Exception as e:                                   # noqa: BLE001
-        integrity_log("wake", "btc_issued_mark_unreadable")
-        raise Refused("btc_issued_mark_unreadable",
-                      f"the issued-index mark beside the keyfile ({p}) exists "
-                      f"and cannot be read ({type(e).__name__}); it is what "
-                      "tells a wiped ledger from a fresh one, so no address "
-                      "was issued. Fix or remove it at the machine.") from e
-    if not isinstance(d, dict) or d.get("xpub_id") != _xpub_id(key):
-        return None
-    # ...AND SAYS A COUNT (self-doubt over the fix pass): a mark whose
-    # `issued` is not a whole number under the hardened bound escaped as
-    # an uncaught ValueError -- a crash, the box powered off -- or as
-    # btc_config_malformed, blaming an xpub that was fine.
-    _n = d.get("issued")
-    if isinstance(_n, bool) or not isinstance(_n, int) \
-            or not 0 <= _n < 0x80000000:
-        integrity_log("wake", "btc_issued_mark_unreadable")
-        raise Refused("btc_issued_mark_unreadable",
-                      f"the issued-index mark ({p}) does not carry a whole "
-                      "number of issued addresses; it is what tells a wiped "
-                      "ledger from a fresh one, so no address was issued. Fix "
-                      "or remove it at the machine.")
-    return d
+        atomic_write_json({"account": int(key.get("btc_account") or 0),
+                           "xpub_id": _xpub_id(key), "issued": int(issued)},
+                          p, perms=0o600)
+        if old is not None and not secure_delete_or_warn(
+                old, "the issued-index mark under its old, unkeyed name"):
+            _once("wake", "btc_issued_mark_legacy_left")
+        _blur_mark_times(p)
+    except Exception:                                        # noqa: BLE001
+        _once("wake", "btc_issued_mark_legacy_left")
 
 
 def _mark_probe(key: dict) -> tuple:
@@ -2618,6 +2719,16 @@ def _write_issued_mark(key: dict, issued: int) -> None:
                       "issued: that record is what stops a wiped ledger "
                       "handing one address to two people. Nothing was "
                       "published.") from e
+    # Recorded; now what the record's NAME and TIMES say. A mark still
+    # under the unkeyed id is erased (its count is folded into this one by
+    # the read before every write), and the times go back to the bucket.
+    _old = _legacy_mark_path(key, p)
+    if _old is not None and (_old.exists() or _old.is_symlink()):
+        if not secure_delete_or_warn(
+                _old, "the issued-index mark under its old, unkeyed name"):
+            from gs_common import integrity_log_once as _once
+            _once("wake", "btc_issued_mark_legacy_left")
+    _blur_mark_times(p)
 
 
 def _allocate_btc_index(key: dict, handles: dict, unused=None,

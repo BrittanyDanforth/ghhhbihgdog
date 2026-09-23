@@ -4681,6 +4681,17 @@ check("...silent when there is no mark; and a mark is read by CHAIN, not by "
       "the account number typed (the same xpub under another --btc-account "
       "is the same chain, and still said)",
       _note2.getvalue().count("deposit address(es)") == 1)
+_mk_pair_l = tempfile.mkdtemp(prefix="gs_markdir_l_")
+_lcid_ok = getattr(__import__("gs_btc_watch"), "legacy_chain_id",
+                   __import__("gs_btc_watch").chain_id)(_BTC_XPUB_OK, "main")
+Path(_mk_pair_l, f"issued_{_lcid_ok}.json").write_text(json.dumps(
+    {"account": 0, "xpub_id": _lcid_ok, "issued": 4}))
+_note3 = io.StringIO()
+with contextlib.redirect_stdout(_note3):
+    _pairs_btc(_BTC_OK + ["--mark-dir", _mk_pair_l])
+check("...and a mark still under the id from before it was keyed is read "
+      "at pairing too: four addresses, said",
+      "4 deposit address(es)" in _note3.getvalue())
 # AN INTAKE PAIR THAT COULD NEVER FORWARD. The default OP_RETURN policy is
 # the 80-byte standard, and no swap memo fits it: the documented recipe
 # paired an intake that refused every forward with memo_overflow, for
@@ -6433,9 +6444,9 @@ _xpub1 = _btx_s.account_from_mnemonic(_FWD_MNEMONIC, "main", "", 1) \
         "embit.networks", fromlist=["NETWORKS"]).NETWORKS["main"]["xpub"]) \
     .to_base58()
 _W_ = __import__("gs_btc_watch")
-check("the chain id is a digest of the chain's FIRST ADDRESS, not the xpub's "
-      "text: an xpub and a zpub of one account are ONE chain, another "
-      "account another; sixteen hex characters that name no address",
+check("the chain id is the CHAIN's, not the xpub's text: an xpub and a "
+      "zpub of one account are ONE chain, another account another; sixteen "
+      "hex characters that name no address",
       _xpub1 != _zpub1 and _xpub1.startswith("xpub")
       and A._xpub_id({**_MK, "btc_account_xpub": _xpub1}) == A._xpub_id(_MK)
       == _W_.chain_id(_zpub1, "main") == _W_.chain_id(_xpub1, "main")
@@ -6452,6 +6463,115 @@ check("...an xpub that derives nothing: chain_id refuses, and the agent's id "
       _cj == "refused"
       and re.fullmatch(r"[0-9a-f]{16}",
                        A._xpub_id({**_MK, "btc_account_xpub": "xpubjunk"})))
+# THE ID IS KEYED (the host-privacy pass). It was sha256("addr0:" + the
+# first address) -- and a paid address is public: THORChain lists every
+# BTC sender, so whoever took the vault hashed candidates until one named
+# the mark the wipe leaves on purpose, and had this box's deposit 0 and a
+# count. Now an HMAC under the account's chain code, which no address
+# carries. The formula is pinned: a changed one orphans every mark, and an
+# orphaned mark is a wiped ledger handing address 0 out again.
+import hashlib as _hl_mk
+import hmac as _hm_mk
+_hd_mk = __import__("embit.bip32", fromlist=["HDKey"]).HDKey.from_base58(_zpub1)
+_plain_mk = set()
+for _i_mk in range(8):
+    _a_mk = _W_.derive_receive_address(_zpub1, _i_mk, "main")
+    for _pre_mk in ("addr0:", "addr:", ""):
+        _plain_mk.add(_hl_mk.sha256((_pre_mk + _a_mk).encode())
+                      .hexdigest()[:16])
+_lcid_fn = getattr(_W_, "legacy_chain_id", None)
+check("the chain id is KEYED by the chain code: HMAC-SHA256(chain code, "
+      "tag + account key), and no plain digest of any of the chain's "
+      "addresses -- the old addr0 one among them -- is it",
+      A._xpub_id(_MK) == _hm_mk.new(
+          _hd_mk.chain_code, b"gs-issued-mark-v2:" + _hd_mk.key.sec(),
+          _hl_mk.sha256).hexdigest()[:16]
+      and A._xpub_id(_MK) not in _plain_mk)
+check("...the old digest is kept as legacy_chain_id, the same for an xpub "
+      "and a zpub, and only to find a mark written under it",
+      _lcid_fn is not None
+      and _lcid_fn(_zpub1, "main") == _lcid_fn(_xpub1, "main")
+      == _hl_mk.sha256(("addr0:" + _addr1_0).encode()).hexdigest()[:16]
+      and getattr(A, "_legacy_xpub_id", lambda k: None)(_MK)
+      == _lcid_fn(_zpub1, "main"))
+_lg_dir = Path(tempfile.mkdtemp(prefix="issuedlegacy_"))
+_lg_new = _lg_dir / f"issued_{A._xpub_id(_MK)}.json"
+_lg_old = _lg_dir / f"issued_{_lcid_fn(_zpub1, 'main') if _lcid_fn else 'x'}.json"
+_KL = {**_MK, "btc_issued_mark": str(_lg_new)}
+_lg_old.write_text(json.dumps({"account": 1, "xpub_id": _lg_old.stem[7:],
+                               "issued": 2}))
+try:
+    A._allocate_btc_index(_KL, {}, unused=_fresh_mk)
+    _lgk = None
+except A.Refused as _e:
+    _lgk = _e.code
+check("A MARK FROM BEFORE THE ID WAS KEYED still guards a vault updated in "
+      "place: its wiped ledger, behind the two addresses the old mark "
+      "counts, is refused ledger_wiped -- address 0 is not handed out again",
+      _lgk == "ledger_wiped")
+check("...and the read moved it: the file named by the address digest is "
+      "gone, the same count under the keyed name and id",
+      not _lg_old.exists()
+      and _mk_of(_lg_new) == {"account": 1, "xpub_id": A._xpub_id(_MK),
+                              "issued": 2})
+_lg_new.write_text(json.dumps({"account": 1, "xpub_id": A._xpub_id(_MK),
+                               "issued": 1}))
+_lg_old.write_text(json.dumps({"account": 1, "xpub_id": _lg_old.stem[7:],
+                               "issued": 3}))
+_lg_i = A._allocate_btc_index(_KL, {"H1": {"btc_index": 0}},
+                              unused=_fresh_mk)
+check("...both names present (an update that died between the two): the "
+      "HIGHER count stands -- the ledger knows index 0, the old mark says "
+      "three, so index 3 is issued -- and the old name is erased",
+      _lg_i == 3 and not _lg_old.exists()
+      and _mk_of(_lg_new).get("issued") == 4)
+_mk_file.write_text(json.dumps({"account": 1,
+                                "xpub_id": _lg_old.stem[7:], "issued": 2}))
+try:
+    A._allocate_btc_index(_MK, {}, unused=_fresh_mk)
+    _lgb = None
+except A.Refused as _e:
+    _lgb = _e.code
+check("...a mark BESIDE THE KEYFILE (one name either way) that carries the "
+      "old id: still this chain's (ledger_wiped), and rewritten with the "
+      "keyed id",
+      _lgb == "ledger_wiped" and _mk_read().get("xpub_id") == A._xpub_id(_MK)
+      and _mk_read().get("issued") == 2)
+_lg_other = _lg_dir / "issued_0123456789abcdef.json"
+_lg_other.write_text(json.dumps({"account": 7, "xpub_id": "0123456789abcdef",
+                                 "issued": 9}))
+A._allocate_btc_index(_KL, {"H1": {"btc_index": 3}}, unused=_fresh_mk)
+check("...another chain's mark in the same directory is not this chain's "
+      "and is left alone",
+      _mk_of(_lg_other).get("issued") == 9)
+_lg_old.write_text(json.dumps({"account": 1, "xpub_id": _lg_old.stem[7:],
+                               "issued": 1}))
+try:
+    A._write_issued_mark(_KL, 6)
+except Exception:                                            # noqa: BLE001
+    pass
+check("...a WRITE erases a mark left under the old name as well (the read "
+      "before it moves one, and this is the second chance), keeping its own",
+      not _lg_old.exists() and _mk_of(_lg_new).get("issued") == 6)
+A._allocate_btc_index(_KL, {"H1": {"btc_index": 6}}, unused=_fresh_mk)
+_bk_now = time.time()
+_lg_st, _lg_dst = os.stat(_lg_new), os.stat(_lg_dir)
+check("THE MARK'S TIMES ARE THE BUCKET (the host-privacy pass): the second "
+      "it was last written is the second a client was handed an address, "
+      "so its mtime and its directory's go back to a ten-minute bucket, "
+      "like the integrity chain's",
+      int(_lg_st.st_mtime) % 600 == 0 and int(_lg_dst.st_mtime) % 600 == 0
+      and _bk_now - 600 <= _lg_st.st_mtime <= _bk_now
+      and _lg_st.st_mtime == _lg_st.st_atime)
+try:
+    A._allocate_btc_index(_KL, {}, unused=_fresh_mk)       # ledger_wiped
+except A.Refused:
+    pass
+check("...and a deposit that only READS the mark (refused as wiped) leaves "
+      "its atime at the bucket: under relatime a plain read set it to the "
+      "second of the refused request",
+      os.stat(_lg_new).st_atime == _lg_st.st_atime
+      and os.stat(_lg_new).st_mtime == _lg_st.st_mtime)
 for _bad in ("three", True, 2 ** 40, -1, None, 1.5):
     _mk_file.write_text(json.dumps({"account": 1, "xpub_id": A._xpub_id(_MK),
                                     "issued": _bad}))

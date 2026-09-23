@@ -68,6 +68,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 import time
 from pathlib import Path
 

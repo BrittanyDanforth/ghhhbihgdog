@@ -930,6 +930,134 @@ check(f"isolation: EVERY newnym call in the toolchain names its tor "
 check("isolation: ...and the walker really found the calls it checked",
       _total >= 15)
 
+# ---------------------------------------------------------------------------
+# LOOPBACK CALLS TAKE NOTHING FROM THE ENVIRONMENT AND FOLLOW NO REDIRECT.
+# Driven over real sockets (the host-privacy review): with HTTP_PROXY set,
+# a loopback submit_transfer / get_fee_estimate / get_info went to that
+# proxy in the clear; and a 307 from whatever held the wallet-rpc port sent
+# the same JSON-RPC body -- transfer_split's destinations -- on to a host of
+# its choosing, from this machine's own address, the Tor proxy unused.
+# ---------------------------------------------------------------------------
+import http.server as _hs9, threading as _th9, subprocess as _sp9  # noqa: E402
+
+_HITS9 = {"proxy": 0, "target": 0, "redirected": 0}
+
+
+def _srv9(kind, status=200, location=None):
+    class _H(_hs9.BaseHTTPRequestHandler):
+        def _any(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            _HITS9[kind] += 1
+            self.send_response(status)
+            if location:
+                self.send_header("Location", location)
+            _body = b'{"result": {}}'
+            self.send_header("Content-Length", str(len(_body)))
+            self.end_headers()
+            self.wfile.write(_body)
+        do_POST = do_GET = _any
+
+        def log_message(self, *a):
+            pass
+    _s = _hs9.HTTPServer(("127.0.0.1", 0), _H)
+    _th9.Thread(target=_s.serve_forever, daemon=True).start()
+    return _s, _s.server_address[1]
+
+
+_px9, _ppx9 = _srv9("proxy")
+_tg9, _ptg9 = _srv9("target")
+_rd9, _prd9 = _srv9("redirected")
+_rx9, _prx9 = _srv9("target", 307, f"http://127.0.0.1:{_prd9}/json_rpc")
+_ENV9_KEYS = ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+              "NO_PROXY", "no_proxy", "http://127.0.0.1_proxy")
+_env9 = {k: os.environ.get(k) for k in _ENV9_KEYS}
+
+
+def _loopback9():
+    """The three loopback calls, then (proxy hits, target hits)."""
+    _HITS9.update(target=0, redirected=0, proxy=0)
+    _tgt = f"http://127.0.0.1:{_ptg9}"
+    gs.daemon_fee_estimate(_tgt, None)
+    gs.check_daemon_relay_egress(_tgt)
+    try:
+        bcast._single_post(_tgt + "/json_rpc", {"method": "submit_transfer"},
+                           None)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return _HITS9["proxy"], _HITS9["target"]
+
+
+try:
+    for _k in _env9:
+        os.environ.pop(_k, None)
+    os.environ["HTTP_PROXY"] = os.environ["http_proxy"] = \
+        f"http://127.0.0.1:{_ppx9}"
+    _lp9, _lt9 = _loopback9()
+    check("loopback: fee estimate, relay egress and the relay's submit go "
+          "DIRECT, never to the proxy HTTP_PROXY names",
+          _lp9 == 0 and _lt9 >= 3)
+    for _k in _env9:
+        os.environ.pop(_k, None)
+    os.environ["ALL_PROXY"] = f"http://127.0.0.1:{_ppx9}"
+    _lp9, _lt9 = _loopback9()
+    check("loopback: ...nor to the one ALL_PROXY names (the two schemes "
+          "named as none left 'all' open)", _lp9 == 0 and _lt9 >= 3)
+    os.environ.pop("ALL_PROXY", None)
+    os.environ["http://127.0.0.1_proxy"] = f"http://127.0.0.1:{_ppx9}"
+    _lp9, _lt9 = _loopback9()
+    check("loopback: ...nor to one named for the host itself",
+          _lp9 == 0 and _lt9 >= 3)
+    os.environ.pop("http://127.0.0.1_proxy", None)
+    # THE WAKE AGENT'S DOORBELL POST: urllib's opener reads HTTP_PROXY too.
+    os.environ["HTTP_PROXY"] = os.environ["http_proxy"] = \
+        f"http://127.0.0.1:{_ppx9}"
+    _HITS9.update(target=0, redirected=0, proxy=0)
+    _A9 = load("gs_wake_agent")
+    _A9._OPENER[0] = None
+    _st9, _ = _A9.post_record(f"http://127.0.0.1:{_ptg9}", "/result", b"x" * 8,
+                              timeout=10)
+    check("loopback: the vault's post to the doorbell goes to the doorbell, "
+          "never to the proxy HTTP_PROXY names",
+          _HITS9["proxy"] == 0 and _HITS9["target"] == 1 and _st9 == 200)
+    _HITS9.update(target=0, redirected=0, proxy=0)
+    _st9r, _ = _A9.post_record(f"http://127.0.0.1:{_prx9}", "/result",
+                               b"x" * 8, timeout=10)
+    check("loopback: ...and follows no redirect the doorbell's port answers",
+          _HITS9["redirected"] == 0 and _HITS9["proxy"] == 0
+          and _st9r == 307)
+    for _k in ("ALL_PROXY", "all_proxy"):
+        os.environ.pop(_k, None)
+    os.environ["HTTP_PROXY"] = os.environ["http_proxy"] = \
+        f"http://127.0.0.1:{_ppx9}"
+    _HITS9.update(target=0, redirected=0, proxy=0)
+    try:
+        # monero-python calls the rpc while it is being built, so the
+        # refusal can come from the constructor: either way, nothing goes on.
+        _rpc9 = gs.connect_rpc(f"http://127.0.0.1:{_prx9}")
+        _rpc9.raw_request("transfer_split", {"destinations": []})
+    except BaseException:                                    # noqa: BLE001
+        pass
+    check("loopback: the wallet-rpc client follows no redirect -- the "
+          "transfer body never reaches the host a 307 names",
+          _HITS9["target"] >= 1 and _HITS9["redirected"] == 0
+          and _HITS9["proxy"] == 0)
+    _HITS9.update(target=0, redirected=0, proxy=0)
+    _gc9 = load("gs_console")
+    _pf9 = _sp9.run([sys.executable, "-c", _gc9.PREFLIGHT_WALLET,
+                     f"http://127.0.0.1:{_prx9}"], cwd=REPO,
+                    capture_output=True, text=True, timeout=60)
+    check("loopback: the console's wallet check follows no redirect either, "
+          "and says so", _HITS9["redirected"] == 0
+          and "redirect" in _pf9.stdout and _HITS9["proxy"] == 0)
+finally:
+    for _k, _v in _env9.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+    for _s9 in (_px9, _tg9, _rd9, _rx9):
+        _s9.shutdown()
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed, {len(UNPROVEN)} UNPROVEN")
 if UNPROVEN:
     print("UNPROVEN (these guarantees were NOT measured — do not read this "

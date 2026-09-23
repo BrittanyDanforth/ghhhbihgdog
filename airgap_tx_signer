@@ -29,7 +29,8 @@ Usage:
       --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
-import argparse, json, subprocess, hashlib, os, re, sys, time, shutil, tempfile
+import argparse, atexit, json, subprocess, hashlib, os, re, sys, time, shutil, tempfile
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from pathlib import Path
 from decimal import Decimal
 from typing import List
@@ -43,6 +44,9 @@ from gs_common import (
     secure_delete_or_warn,
     secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
     delay_is_sane, MAX_PLANNED_DELAY,
+    fee_scale_for_inputs, FEE_BASE_MULT, FEE_PER_INPUT_MULT,
+    MAX_PLANNED_INPUTS,
+    FEE_SAFETY_MARGIN as FEE_SAFETY_MARGIN_PLAN,
 )
 
 def _validate_plan(plan: List[dict], phase: str = "create") -> None:
@@ -193,6 +197,15 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
                 f"    this check, and build_entry_veils in GhostSpiral, for "
                 f"the four other reasons.")
 
+        # HOW MANY OUTPUTS A SWEEP WAS COUNTED SPENDING when it was planned
+        # (GhostSpiral, an entry veil on a dusted address): it scales the fee
+        # bound. A whole number of at least 2, or absent.
+        _nin = tx.get("inputs")
+        if _nin is not None and (isinstance(_nin, bool)
+                                 or not isinstance(_nin, int)
+                                 or not 2 <= _nin <= MAX_PLANNED_INPUTS):
+            sys.exit(f"[!] Schema error at TX {i}: 'inputs' must be a whole "
+                     f"number from 2 to {MAX_PLANNED_INPUTS}")
         # A SWEEP carries no amount by design: sweep_all sends the whole
         # subaddress balance minus the fee, which is exactly why it leaves no
         # change. Requiring 'amt' here would reject the one plan shape that
@@ -690,12 +703,26 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
         try:
             attempt = _build(forward)
         except Exception:                                    # noqa: BLE001
-            if result is not None:
+            # A BUILD IN HAND IS KEPT -- if the signer will take it. One whose
+            # change is over CONSUME_CHANGE_MAX is refused at the offline
+            # machine, so settling for it stops the chain there instead of
+            # here; the loop tries on while it has tries.
+            if result is not None and residue <= _CONSUME_DUST_PICO:
                 integrity_log("signer", "exact_consume_retry_failed")
                 break
             if _try + 1 < _EXACT_CONSUME_TRIES:
-                fee = fee + max(fee // 50, 1)
+                # A LITTLE HIGHER, AND NEVER BY MORE THAN A QUARTER OF THE
+                # DUST THE SIGNER ACCEPTS. A build priced over its real fee
+                # leaves the difference as change, and two percent of a
+                # priority-4 fee (0.000176 XMR) is over CONSUME_CHANGE_MAX:
+                # driven, that build was returned and the signer refused it
+                # (half of 45-peel chains). A decoy draw moves the fee by
+                # about a thousand piconero; this is 25 million.
+                fee = fee + max(1, min(fee // 50, _CONSUME_DUST_PICO // 4))
                 continue
+            if result is not None:
+                integrity_log("signer", "exact_consume_retry_failed")
+                break
             raise
         got = int(attempt.get("fee") or 0)
         # PRICED AT `fee`, BUILT AT `got`. Equal means the two destinations and
@@ -1094,6 +1121,7 @@ def _cli_pico(amount: str) -> int:
 #: none; what a fee that moved between two builds leaves is about a million
 #: piconero (measured: 0.0000012 XMR). Anything near this is not drift.
 CONSUME_CHANGE_MAX = Decimal("0.0001")
+_CONSUME_DUST_PICO = int(CONSUME_CHANGE_MAX * 10 ** 12)
 
 #: The most fee one transaction may burn when the plan names no estimate.
 #: Mainnet's priority-4 fee on a many-output fan-out is a few hundredths of
@@ -1143,8 +1171,22 @@ def _plan_expectations(plan: List[dict], idx: int) -> dict:
     return out
 
 
+def _max_fee_arg(text):
+    """--max-fee-xmr: a positive amount in XMR, at most ten times
+    FEE_CAP_PER_TX -- a number someone looked at, not a way to switch the
+    bound off."""
+    try:
+        v = Decimal(str(text).strip())
+    except (ArithmeticError, ValueError):
+        raise argparse.ArgumentTypeError("not an amount of XMR")
+    if not v.is_finite() or v <= 0 or v > FEE_CAP_PER_TX * 10:
+        raise argparse.ArgumentTypeError(
+            f"must be more than 0 and at most {FEE_CAP_PER_TX * 10} XMR")
+    return v
+
+
 def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int,
-                             fee_per_round=None) -> None:
+                             fee_per_round=None, max_fee=None) -> None:
     """Refuse if wallet-cli says it is paying anything the PLAN does not.
 
     THE ONE THING THAT CAN DECODE THE BLOB IS WALLET-CLI ITSELF.
@@ -1177,9 +1219,15 @@ def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int,
     AND THE FEE IS BOUNDED. Exact destinations and amounts leave the free
     parts -- a sweep's amount, a fan-out's change, a peel's forward -- free to
     be moved into the FEE, which burns them: nothing above looked at "fee F".
-    It may be at most ten times the plan's own per-transaction estimate
-    (`fee_per_round` in the plan's meta), or FEE_CAP_PER_TX per transaction
-    when the plan names none. A bound, public like everything else: what it
+    It may be at most ten times the plan's own estimate (`fee_per_round` in
+    the plan's meta, or FEE_CAP_PER_TX when the plan names none) for the
+    ENTRY -- scaled by the inputs the plan counted it spending (`inputs`,
+    gs_common.fee_scale_for_inputs), never by the transaction count the set
+    itself reports, which is the thing being checked. A dusted entry veil
+    pays a fee per output, and the memo publishes the address to dust. A
+    refusal for the fee says so, and `max_fee` (--max-fee-xmr, typed by the
+    operator at the offline machine) replaces the bound for a run whose fee
+    they have looked at. A bound, public like everything else: what it
     limits is how much a swapped blob can destroy, not who can swap one.
 
     An output naming full addresses that this cannot read as that list is
@@ -1248,16 +1296,44 @@ def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int,
                 "would burn cannot be checked.")
     _ntx, _fee = int(_loaded.group(1)), _xmr(_cli_pico(_loaded.group(3)))
     try:
-        _per = (Decimal(str(fee_per_round)) * 10
-                if fee_per_round not in (None, "") else FEE_CAP_PER_TX)
-        if not _per.is_finite() or _per <= 0:
-            _per = FEE_CAP_PER_TX
+        _est = (Decimal(str(fee_per_round))
+                if fee_per_round not in (None, "") else None)
+        if _est is not None and (not _est.is_finite() or _est <= 0):
+            _est = None
     except (ArithmeticError, ValueError, TypeError):
-        _per = FEE_CAP_PER_TX
-    if _fee > _per * max(1, _ntx):
-        _refuse("fee", f"It pays {_fee} XMR in fees for {_ntx} "
-                f"transaction(s); the most this plan allows is "
-                f"{_per * max(1, _ntx)}.")
+        _est = None
+    _per = _est * 10 if _est is not None else FEE_CAP_PER_TX
+    _tx = plan[idx] if isinstance(plan[idx], dict) else {}
+    _cap = _per * fee_scale_for_inputs(_tx.get("inputs"))
+    if max_fee is not None:
+        _cap = Decimal(max_fee)
+    if _fee > _cap:
+        integrity_log("signer", "wallet_cli_fee_over_bound")
+        # NOT THE TAMPER MESSAGE. The destinations and amounts all matched;
+        # what is over is the fee, and the ordinary cause is a sweep of more
+        # outputs than the plan counted -- dust on an address the swap memo
+        # made public. Said, with what a fee this size pays for and the one
+        # way past it, so a dusted swap is not stranded by a bound.
+        _implied = ""
+        if _est is not None:
+            _one = _est / FEE_SAFETY_MARGIN_PLAN
+            _k = ((_fee / _one) - FEE_BASE_MULT) / FEE_PER_INPUT_MULT
+            if _k.is_finite() and _k > 1:
+                _implied = (f" A fee that size pays for a transaction of "
+                            f"about {int(_k)} inputs at this plan's rate; "
+                            f"the plan counted "
+                            f"{_tx.get('inputs') or 1}.")
+        sys.exit(
+            f"[!] TX {idx}: monero-wallet-cli decoded this unsigned "
+            f"transaction and it pays exactly the plan's destinations, but "
+            f"{_fee} XMR in fees ({_ntx} transaction(s)) -- over the {_cap} "
+            f"XMR this plan allows for it.{_implied}\n"
+            f"    If the address it spends was sent dust after the plan was "
+            f"made (an entry address is public in the swap memo), check that "
+            f"figure against what you expect and re-run --phase sign with "
+            f"--max-fee-xmr {_fee}.\n"
+            f"    If not, something altered the transaction: REFUSING TO SIGN. "
+            f"Re-run --phase create from the plan.")
     if changes and exp["kind"] == "sweep":
         _refuse("change", "A sweep makes no change, and this sends "
                 f"{change_total} XMR as change to "
@@ -1453,10 +1529,40 @@ def _pw_scratch_dir(fallback: str = None) -> str:
     This is a PREFERENCE, not a guarantee -- on a host with no usable /dev/shm
     it still falls back to disk, which is what the callers already did. The
     file is 0600 from creation and securely deleted in a finally regardless.
+
+    A PRIVATE 0700 DIRECTORY INSIDE IT, never /dev/shm itself. /dev/shm is
+    1777 and listable by every account, and stat() needs no read permission
+    on a file: the password file's SIZE was its exact length, and the names
+    beside it (.gs_pw_*, gs_sign_*, .gs_ringdb_*) named this toolchain and
+    dated each signature -- to any local user (the host-privacy review,
+    driven). Inside a 0700 directory nothing can be stat'ed by anyone else,
+    and the directory's own name is Python's ordinary "tmp..." -- one temp
+    directory among any Python program's. One per process, removed at exit;
+    paranoia_mode finds a killed run's by what is inside it.
     """
-    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
-        return "/dev/shm"
-    return fallback or tempfile.gettempdir()
+    if _PRIVATE_SCRATCH and os.path.isdir(_PRIVATE_SCRATCH[0]):
+        return _PRIVATE_SCRATCH[0]
+    base = ("/dev/shm" if os.path.isdir("/dev/shm")
+            and os.access("/dev/shm", os.W_OK)
+            else (fallback or tempfile.gettempdir()))
+    d = tempfile.mkdtemp(dir=base)
+    _PRIVATE_SCRATCH[:] = [d]
+    atexit.register(_drop_private_scratch, d)
+    return d
+
+
+#: This process's private scratch directory (_pw_scratch_dir), once made.
+_PRIVATE_SCRATCH = []
+
+
+def _drop_private_scratch(d: str) -> None:
+    """At exit: whatever a caller's finally did not remove, securely, and
+    the directory with it."""
+    try:
+        if os.path.isdir(d) and not os.path.islink(d):
+            secure_delete_tree(Path(d))
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 #: The scratch directory monero-wallet-cli's ring database goes to, made once
@@ -1641,8 +1747,12 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
         # signing loop's /dev/shm handling; the previous version put both in
         # /tmp, and wrote the holdings blob with umask perms (0644) rather than
         # 0600.
-        _shm = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
-        _iw = tempfile.mkdtemp(prefix="gs_impout_", dir=_shm)
+        # INSIDE THE PRIVATE SCRATCH DIRECTORY, like the password file and
+        # the signing work (self-doubt over the host-privacy fix, which
+        # moved those two and left this one): a gs_impout_* directory in
+        # /dev/shm itself is listable by every account, and its name and
+        # time said this toolchain imported a holdings picture, when.
+        _iw = tempfile.mkdtemp(prefix="gs_impout_", dir=_pw_scratch_dir())
         _ipw = None
         try:
             _blob_path = Path(_iw) / "outputs_blob"
@@ -1908,7 +2018,8 @@ def phase_sign(args, plan: List[dict], meta: dict = None):
             # blob swap, and this is the only decoder available offline.
             _check_wallet_cli_agrees(
                 (result.stdout or "") + (result.stderr or ""), plan, idx,
-                fee_per_round=(meta or {}).get("fee_per_round"))
+                fee_per_round=(meta or {}).get("fee_per_round"),
+                max_fee=getattr(args, "max_fee_xmr", None))
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"
@@ -2066,7 +2177,20 @@ def main():
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--max-fee-xmr", type=_max_fee_arg, default=None,
+                     help="phase=sign only: the most any one plan entry may "
+                          "pay in fees, replacing the plan's own bound. For a "
+                          "run a refusal said was over it -- a sweep of an "
+                          "address sent dust after planning -- once you have "
+                          "looked at the fee it named.")
     args = cli.parse_args()
+    if args.max_fee_xmr is not None and args.phase != "sign":
+        sys.exit("[!] --max-fee-xmr bounds what --phase sign signs; it means "
+                 "nothing to --phase create.")
+    if args.max_fee_xmr is not None:
+        integrity_log("signer", "fee_bound_overridden")
+        print(f"  [!] --max-fee-xmr {args.max_fee_xmr}: every plan entry may "
+              f"pay up to that in fees, in place of the plan's own bound.")
 
     # Prefer the environment over argv for the wallet password. /proc/<pid>/
     # cmdline is mode 444 -- any local user can read an argv password with

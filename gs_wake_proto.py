@@ -510,6 +510,12 @@ class WakeError(Exception):
     echo attacker-supplied bytes back into a log or a terminal."""
 
 
+class PairTampered(WakeError):
+    """The peer revealed a key it had not committed to. Not a stray: the one
+    failure that means someone tried to choose the comparison code, so the
+    ceremony ends rather than listening on for another try."""
+
+
 class PairAborted(WakeError):
     """A HUMAN decided not to pair. Distinct from every other pairing failure.
 
@@ -2326,7 +2332,7 @@ def pair_responder(sock, my_sk, my_pub: bytes, my_info: dict, ask,
     # strings while an attacker sat between them.
     if not hmac.compare_digest(pair_commitment(peer_pub), commitment):
         _pair_abort(sock, "commitment")
-        raise WakeError(
+        raise PairTampered(
             "the other box revealed a key that does not match what it "
             "committed to. That is what an attempt to fix the comparison code "
             "looks like. Refusing, and nothing was written.")

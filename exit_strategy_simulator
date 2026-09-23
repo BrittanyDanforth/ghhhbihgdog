@@ -64,6 +64,7 @@ screen while the full plan still goes to the 0600 JSON file.
 """
 from __future__ import annotations
 import argparse, os, sys, time
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Dict

@@ -582,6 +582,136 @@ finally:
     except OSError:
         pass
 
+# ---------------------------------------------------------------------------
+# A KILLED SIGNER'S PRIVATE SCRATCH. The signer stages the password and its
+# work inside a 0700 directory of its own, named like any Python temp
+# directory ("tmp..."), so no other account can stat the password file's
+# size (its exact length) or see names that date each signature. The wipe
+# finds one by what it holds: this uid's, and nothing in it but our scratch.
+# ---------------------------------------------------------------------------
+para.tempfile.gettempdir = real_gettempdir     # an earlier block patched it
+_ps = Path(tempfile.mkdtemp(prefix="gs_shmpriv_", dir=real_gettempdir()))
+(_ps / "tmpq1w2e3").mkdir()
+(_ps / "tmpq1w2e3" / ".gs_pw_x").write_text("correct horse")
+(_ps / "tmpq1w2e3" / "gs_sign_y").mkdir()
+(_ps / "tmpq1w2e3" / "gs_sign_y" / "signed_monero_tx").write_bytes(b"R" * 64)
+(_ps / "tmpother").mkdir()
+(_ps / "tmpother" / "data.bin").write_bytes(b"another program's")
+(_ps / "tmpmixed").mkdir()
+(_ps / "tmpmixed" / ".gs_pw_z").write_text("p")
+(_ps / "tmpmixed" / "theirs.txt").write_text("keep")
+(_ps / "tmpempty").mkdir()
+_saved_ps = (para.SHM_ROOT, para.tempfile.gettempdir)
+try:
+    para.SHM_ROOT = str(_ps)
+    para.tempfile.gettempdir = lambda: str(_ps)
+    _pc, _pf = para._wipe_targeted_temp_roots(dry=False, uid=os.getuid(),
+                                              already_done=[])
+finally:
+    para.SHM_ROOT, para.tempfile.gettempdir = _saved_ps
+check("private scratch: a killed signer's own 0700 directory is found by "
+      "what it holds and securely removed", not (_ps / "tmpq1w2e3").exists())
+check("private scratch: ...another program's temp directory, one holding "
+      "anything else, and an empty one all survive",
+      (_ps / "tmpother" / "data.bin").exists()
+      and (_ps / "tmpmixed" / "theirs.txt").exists()
+      and (_ps / "tmpempty").exists())
+check("private scratch: counted once, no failures", _pc == 1 and _pf == 0)
+_ats = load("airgap_tx_signer")
+_d1 = _ats._pw_scratch_dir()
+_d2 = _ats._pw_scratch_dir("/var/tmp")
+check("private scratch: the signer stages in ONE private 0700 directory of "
+      "its own, named like any temp directory, never in the shared root",
+      _d1 == _d2 and os.path.isdir(_d1)
+      and (os.stat(_d1).st_mode & 0o777) == 0o700
+      and os.path.basename(_d1).startswith("tmp")
+      and os.path.dirname(_d1) in ("/dev/shm", real_gettempdir()))
+if os.geteuid() == 0:
+    _fd9, _pw9 = tempfile.mkstemp(prefix=".gs_pw_", dir=_d1)
+    os.write(_fd9, b"fifteen-letters")
+    os.close(_fd9)
+    _pid9 = os.fork()
+    if _pid9 == 0:
+        try:
+            os.setgid(65534)
+            os.setuid(65534)
+            os.stat(_pw9)
+            os._exit(1)            # another account could stat it: its length
+        except PermissionError:
+            os._exit(0)
+        except BaseException:      # noqa: BLE001
+            os._exit(2)
+    _, _st9 = os.waitpid(_pid9, 0)
+    check("private scratch: another account cannot stat the password file "
+          "(its size was the password's length)",
+          os.WIFEXITED(_st9) and os.WEXITSTATUS(_st9) == 0)
+    os.unlink(_pw9)
+getattr(_ats, "_drop_private_scratch", lambda _d: None)(_d1)
+check("private scratch: removed at exit",
+      _d1 not in ("/dev/shm", real_gettempdir()) and not os.path.exists(_d1))
+# THE OUTPUT IMPORT TOO (self-doubt over that fix): the import helper made
+# its gs_impout_* directory in /dev/shm itself -- a name and a time, in a
+# root every account lists, saying this toolchain imported a holdings
+# picture. Driven with wallet-cli faked: where does its work directory sit?
+import types as _ty6
+_io6 = Path(tempfile.mkdtemp(prefix="gs_impout_case_", dir=real_gettempdir()))
+(_io6 / _ats.OUTPUTS_EXPORT_NAME).write_text("00ff00ff")
+_seen6 = []
+_real_sp6 = _ats.subprocess
+_real_eoa6 = _ats._ensure_offline_accounts
+
+
+def _fake_run6(argv, **kw):
+    _seen6.append(kw.get("cwd"))
+    return _ty6.SimpleNamespace(returncode=0, stdout="2 outputs imported",
+                                stderr="")
+
+
+try:
+    _ats.subprocess = _ty6.SimpleNamespace(
+        run=_fake_run6, TimeoutExpired=_real_sp6.TimeoutExpired,
+        CalledProcessError=_real_sp6.CalledProcessError)
+    _ats._ensure_offline_accounts = lambda *a, **k: None
+    import contextlib as _cl6, io as _sio6
+    with _cl6.redirect_stdout(_sio6.StringIO()):
+        _ats._import_view_outputs(_io6, "wallet_x", _ty6.SimpleNamespace(
+            wallet_cli="monero-wallet-cli", wallet_password="pw"))
+    _e6 = None
+except Exception as _e:                                      # noqa: BLE001
+    _e6 = _e
+finally:
+    _ats.subprocess = _real_sp6
+    _ats._ensure_offline_accounts = _real_eoa6
+check("private scratch: the output import works inside the signer's private "
+      "directory too, never as a gs_impout_* of the shared root "
+      f"({_e6!r}, {_seen6})",
+      _e6 is None and len(_seen6) == 1 and _seen6[0]
+      and os.path.basename(_seen6[0]).startswith("gs_impout_")
+      and os.path.dirname(_seen6[0]) == _ats._pw_scratch_dir()
+      and os.path.dirname(_seen6[0]) not in ("/dev/shm", real_gettempdir())
+      and not os.path.exists(_seen6[0]))
+getattr(_ats, "_drop_private_scratch", lambda _d: None)(_ats._pw_scratch_dir())
+# ...AND GONE WHEN THE PROCESS ENDS, by itself: a real interpreter makes
+# one, leaves it holding a file, and exits without calling anything.
+import subprocess as _sp7
+_code7 = (
+    "import importlib.machinery, importlib.util, os, sys\n"
+    f"sys.path.insert(0, {REPO!r})\n"
+    "_l = importlib.machinery.SourceFileLoader('ats', "
+    f"os.path.join({REPO!r}, 'airgap_tx_signer'))\n"
+    "_s = importlib.util.spec_from_loader('ats', _l)\n"
+    "_m = importlib.util.module_from_spec(_s); _l.exec_module(_m)\n"
+    "_d = _m._pw_scratch_dir()\n"
+    "open(os.path.join(_d, '.gs_pw_left'), 'w').write('pw')\n"
+    "print(_d)\n")
+_r7 = _sp7.run([sys.executable, "-c", _code7], capture_output=True,
+               text=True, timeout=120)
+_d7 = (_r7.stdout or "").strip().splitlines()[-1:] or [""]
+check("private scratch: a run that exits without cleaning up leaves no "
+      f"directory behind (rc={_r7.returncode}, {_d7[0]!r})",
+      _r7.returncode == 0 and _d7[0].startswith("/")
+      and not os.path.exists(_d7[0]))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAIL:
     print("FAILURES: " + ", ".join(FAILURES))

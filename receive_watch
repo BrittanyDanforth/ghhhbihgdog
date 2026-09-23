@@ -49,6 +49,7 @@ OPSEC hardening:
 """
 from __future__ import annotations
 import argparse, re, secrets, shlex, sys, time
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
@@ -1111,17 +1112,33 @@ def main():
     # the gate is keyed on does not cover every swap in the target, so the
     # "smallest chunk" it found is an inference and not a reading.
     _shape_partial = False
+    # A TYPED TOTAL STANDS WITHOUT THE FILE. --expect-xmr says what this
+    # address is to receive; a quote file that is missing, or holds only
+    # other addresses' swaps, cannot contradict that -- it is said, and the
+    # watch goes on, as the run does (gs_console: "a typed total overrides
+    # the file"). Without one, there is nothing else to wait for: refused.
+    _pairs_note = None
     if args.pairs:
         try:
             allp = load_pairs(args.pairs)
         except Exception as e:                               # noqa: BLE001
-            sys.exit(f"[!] {e}")
+            if args.expect_xmr is None:
+                sys.exit(f"[!] {e}")
+            allp, _pairs_note = [], f"{e}"
         matched = pairs_for_dest(allp, dest)
-        if not matched:
-            sys.exit(
-                f"[!] None of the {len(allp)} swap pair(s) in {args.pairs} are routed to\n"
-                f"    this receive address ({scrub_address(dest)}).\n"
-                f"    Watching it would wait for a payment that is going somewhere else.")
+        if not matched and _pairs_note is None:
+            _pairs_note = (f"none of the {len(allp)} swap pair(s) in "
+                           f"{args.pairs} are routed to this receive address "
+                           f"({scrub_address(dest)})")
+            if args.expect_xmr is None:
+                sys.exit(
+                    f"[!] None of the {len(allp)} swap pair(s) in {args.pairs} are routed to\n"
+                    f"    this receive address ({scrub_address(dest)}).\n"
+                    f"    Watching it would wait for a payment that is going somewhere else.")
+        if _pairs_note is not None:
+            integrity_log("recv", "pairs_unused_typed_total")
+            print(f"  [!] The quote file was not used ({_pairs_note}); "
+                  f"waiting for the total you typed instead.")
         target, _unreadable, _chunk_amounts = sum_quoted_xmr(matched)
         if _unreadable:
             # BOTH SENTENCES BELOW ARE ABOUT A TARGET --expect-xmr MAY BE ABOUT

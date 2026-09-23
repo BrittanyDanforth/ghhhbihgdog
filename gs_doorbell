@@ -65,6 +65,7 @@ import re
 import socket
 import stat
 import sys
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

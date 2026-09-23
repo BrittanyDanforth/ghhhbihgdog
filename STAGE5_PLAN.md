@@ -178,7 +178,7 @@ one of these, in this order, each a status word and an action:
 | not listed; inputs still unspent; no hex | `returned` | the outputs are money never sent: a FRESH forward of them (new quote, new signature, new plan; the old plan kept as `btc_forward_<handle>.<n>.json`); the ledger's `forward_inputs` grows |
 | not listed; inputs spent by a tx that is not ours | FAILED, no word; kind `forward_foreign_spend` | nothing is signed. Only a leaked key does this; the phone hears "failed", which is true of the machine, and the operator reads the kind at the vault |
 | new unspent outputs beyond the forwarded inputs (a refund, or a second payment) | `returned` | a fresh forward of the new outputs only, as above, once they settle to `min_conf` (a refund is a normal payment to the address) |
-| the outputs are gone, our txid is in the history, and there is no plan (case 1 of section 1) | `sent` | the history shows our spend; the ledger learns `forward_sent`, the plan is reconstructed from the history (txid, inputs) with `reconstructed: true` |
+| the outputs are gone, our txid is in the history, and there is no plan (case 1 of section 1) | `sent` | the history shows our spend; the ledger learns `forward_sent`, the plan is reconstructed from the history (txid, inputs) with `reconstructed: true`. "Our txid" is one in `btc_forward_<h>.signed.json`, written before the bytes were sent -- not a memo naming the destination, which every forward publishes and a seed thief can copy |
 
 The word `moved` is NOT reused: on the wire it means "paid out by a
 withdrawal", and a forward that went out is `sent`. `_phase_of` reads the

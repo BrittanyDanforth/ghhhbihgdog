@@ -34,6 +34,7 @@ failed and must be re-created and re-signed with a higher --fee-priority.
 """
 from __future__ import annotations
 import argparse, json, time, sys, os, hashlib
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
@@ -44,7 +45,7 @@ from gs_common import (
     integrity_log_once,
     MAX_PLANNED_DELAY, delay_is_sane,
     install_signal_handlers, shutdown_requested, redact_addresses,
-    _LOCALHOST_NAMES,
+    _LOCALHOST_NAMES, loopback_proxies,
 )
 # AFTER gs_common, deliberately. gs_common lowers RLIMIT_CORE at import so no
 # later import can dump a core holding key material, and this was the one tool
@@ -85,7 +86,9 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
     MoneroRPC does not.
     """
     if _is_localhost(url):
-        proxies = None  # never route loopback through Tor
+        # Never through Tor -- and never through a proxy the ENVIRONMENT
+        # names either: gs_common.loopback_proxies says why.
+        proxies = loopback_proxies(url)
     elif not proxies:
         # `not proxies`, NOT `is None`: requests treats proxies={} as no proxy
         # and connects DIRECTLY, so an empty dict used to pass this guard and
@@ -134,6 +137,30 @@ class TxItem:
     @property
     def key(self) -> str:
         return self.path.name
+
+
+#: The largest signed set this reads. A set holds one to a few transactions
+#: of a few kilobytes each; this bounds what a planted file can make it read.
+MAX_BLOB_BYTES = 16 * 1024 * 1024
+
+
+def _read_blob(path: Path) -> bytes:
+    """A blob's bytes, never through a symbolic link: the signer writes plain
+    files, and a link planted in the staging directory
+    (tx_0.signed -> ~/.ssh/id_ed25519) would have its target read and POSTed.
+    O_NOFOLLOW on the open itself, so a link swapped in after any check is
+    refused too. Raises OSError."""
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            data = f.read(MAX_BLOB_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > MAX_BLOB_BYTES:
+        raise OSError(f"{path.name} is larger than any signed set")
+    return data
 
 
 def _load_manifest(path: Path) -> list:
@@ -300,13 +327,21 @@ def _items_from_manifest(entries: list, mdir: Path) -> List[TxItem]:
             idx = _blob_sort_key(raw)
             sha, delay = None, 0
 
-        # Prefer the recorded path when it exists, else the same filename beside
-        # the manifest (the normal case when the staging dir was moved between
-        # the signing machine and this one). When neither exists yet, the
-        # manifest-local path is the EXPECTED location, so a blob that appears
-        # there later is found on resume.
-        local = mdir / raw.name
-        path = raw if raw.exists() else local
+        # THE MANIFEST'S OWN DIRECTORY, AND ONLY THE NAME FROM THE ENTRY. The
+        # signer writes every blob beside the manifest that lists it
+        # (signed/tx_N.signed), so the same name beside the manifest is the
+        # blob wherever the staging directory was carried -- and when it is
+        # not there yet it is the EXPECTED location, found on resume.
+        #
+        # The recorded path used to win when it existed, and the manifest
+        # crosses the air gap on removable media: whoever held the stick
+        # chose it. An absolute path to ~/.ssh/id_ed25519, or a relative one
+        # that happened to exist under this shell's cwd (another run's
+        # tx_staging/), was read and POSTed to the wallet-rpc as a signed
+        # set. A name that is not a plain file name is refused.
+        if raw.name in ("", ".", ".."):
+            sys.exit(f"[!] Manifest entry {pos}: 'file' names no blob.")
+        path = mdir / raw.name
 
         if path.name in seen:
             sys.exit(
@@ -778,7 +813,10 @@ def main():
             print("  [!] No signed_manifest_v1.json in that directory: blob hashes "
                   "CANNOT be verified and planned delays are unknown.")
     elif input_path.exists():
-        items = [TxItem(_blob_sort_key(input_path), input_path)]
+        # THE OPERATOR'S OWN ARGUMENT, so a link they typed is theirs to
+        # follow: resolved here, before _read_blob's no-link open. A link
+        # INSIDE a staging directory -- the carrier's -- is still refused.
+        items = [TxItem(_blob_sort_key(input_path), input_path.resolve())]
     else:
         sys.exit(f"[!] No such path: {input_path}")
 
@@ -925,8 +963,15 @@ def main():
     # submit, because this pass can be hours stale by the time a TX with a long
     # planned delay actually goes out.
     if manifest_hashes:
-        tampered = [i.key for i in items if i.sha and i.path.exists()
-                    and hashlib.sha256(i.path.read_bytes()).hexdigest() != i.sha]
+        def _mismatch(i):
+            try:
+                return hashlib.sha256(_read_blob(i.path)).hexdigest() != i.sha
+            except OSError:
+                # A LINK, or larger than any set: not one of the signer's.
+                return os.path.islink(i.path) or i.path.is_file()
+        tampered = [i.key for i in items if i.sha and (i.path.exists()
+                                                        or i.path.is_symlink())
+                    and _mismatch(i)]
         if tampered:
             integrity_log("broadcast", f"TAMPER_DETECTED:{len(tampered)}_blobs")
             for t in tampered:
@@ -1127,7 +1172,7 @@ def main():
         # planned delay, so it cannot vouch for the bytes about to be relayed;
         # a blob swapped during the wait would previously have been broadcast.
         try:
-            raw_data = blob.read_bytes()
+            raw_data = _read_blob(blob)
         except OSError as e:
             print(f"  [!] Unreadable at submit time: {item.key} ({e}) - will retry.")
             _transient("unreadable_at_submit")

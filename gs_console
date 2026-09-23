@@ -35,6 +35,7 @@ Stdlib only, so it runs on the air-gapped machine too.
 """
 from __future__ import annotations
 import argparse, atexit, hmac, json, os, re, secrets, shlex, shutil, signal, subprocess, sys, threading, time
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -338,6 +339,33 @@ MAX_EXIT_DESTS = 16
 DEFAULT_PAIRS_FILE = "thor_pairs.json"
 
 
+def pairs_file_for(p: dict) -> str:
+    """The quote file for THIS receive wallet: the one typed, or
+    thor_pairs_<wallet>.json beside it -- the default the quote, the watch
+    and the run all read (DEFAULT_PAIRS_FILE says why they must agree).
+
+    ONE PER RECEIVE ADDRESS. One receive address takes one swap
+    (quote_problems), so several swaps are several receive wallets, each run
+    on its own -- the advice the quote step gives. With one shared default
+    each quote replaced the last: the second wallet's run found its file
+    holding the other address's swap, said to set 'Number of swaps' to the
+    0 it held, and its watch refused ("none of the swap pairs are routed to
+    this receive address"). Still thor_pairs_*.json, so the wipe takes it.
+    Only thor_pairs.json when there is no wallet to name it after."""
+    if p.get("pairs_file"):
+        return p["pairs_file"]
+    raw = os.path.basename(str(p.get("receive_wallet") or ""))
+    if raw.endswith(".json"):
+        raw = raw[:-len(".json")]
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", raw).strip("._")
+    if stem and stem != raw:
+        # TWO NAMES THAT CLEAN TO ONE ("w a" and "w_a") would share a file,
+        # the collision this exists to end: the original rides along, hashed.
+        import hashlib as _hl
+        stem += "_" + _hl.sha256(raw.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"thor_pairs_{stem}.json" if stem else DEFAULT_PAIRS_FILE
+
+
 def clean(params: dict) -> dict:
     """Validate every parameter against SCHEMA. Unknown keys are dropped."""
     out, errs = {}, []
@@ -458,7 +486,7 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         # DEFAULTED, like the two actions above. See DEFAULT_PAIRS_FILE: this
         # was the one of the three that did not, which left the standard GUI
         # receive flow running with no arrival gate at all.
-        a += ["--swap-pairs", p.get("pairs_file") or DEFAULT_PAIRS_FILE]
+        a += ["--swap-pairs", pairs_file_for(p)]
         # AS MANY QUOTES AS SWAPS, or the run waits for the wrong total. A
         # quote file holding fewer swaps to this address than 'Number of
         # swaps' says is one that a later quote overwrote: the run would sum
@@ -468,8 +496,15 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         _np = _pairs_for_receive(p)
         _n = max(1, int(p.get("split") or 1))
         if _np is not None and _np != _n and not p.get("expect_total_xmr"):
+            # NONE AT ALL is a quote for ANOTHER address in this file, and
+            # "set 'Number of swaps' to 0" is advice nobody can follow.
             why.append(
-                f"{p.get('pairs_file') or DEFAULT_PAIRS_FILE} holds {_np} "
+                f"{pairs_file_for(p)} holds no swap paying this receive "
+                f"address: its quote is for another one. Get the deposit "
+                f"address for THIS receive wallet (step 2, which saves it to "
+                f"its own file), or type the total you are expecting in "
+                f"'Total XMR expected'." if _np == 0 else
+                f"{pairs_file_for(p)} holds {_np} "
                 f"swap(s) paying this receive address and 'Number of swaps' "
                 f"is {_n}. Set 'Number of swaps' to what was quoted, or type "
                 f"the total you are expecting in 'Total XMR expected'.")
@@ -652,7 +687,7 @@ ACTIONS = {
                         "build": lambda p: [PY, "thor_swap_preparer",
                                             "--dest-from-receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", ""),
-                                            "--outfile", p.get("pairs_file") or DEFAULT_PAIRS_FILE]
+                                            "--outfile", pairs_file_for(p)]
                                            + (["--min-out-xmr", str(quote_floor_xmr(p))]
                                               if quote_floor_xmr(p) else [])},
     # watches YOUR OWN wallet-rpc until the payment lands. Reads only — it
@@ -663,10 +698,11 @@ ACTIONS = {
                         "build": lambda p: [PY, "receive_watch",
                                             "--receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", "")]
-                                           + ["--pairs", p.get("pairs_file") or DEFAULT_PAIRS_FILE]},
+                                           + ["--pairs", pairs_file_for(p)]},
     # NOT "--any" when the field is blank. The swap_quote action two entries
-    # above defaults the SAME blank field to "thor_pairs.json" and writes the
-    # quote there -- so the GUI's default flow produced a quote file and then
+    # above defaults the SAME blank field (pairs_file_for: this wallet's own
+    # file) and writes the quote there -- so the GUI's default flow produced a
+    # quote file and then
     # watched with no target at all, discarding the expected amount, the
     # under-delivery check and the shortfall report, and firing on any dust
     # that reached the address. The two actions must agree on the default, and
@@ -787,10 +823,17 @@ else:
     print('[*] loopback wallet-rpc -> direct (Tor cannot route to loopback)')
 
 u=url+'/json_rpc'
+# NO REDIRECT, NO PROXY FROM THE ENVIRONMENT: a 307 from whatever holds the
+# port sent these calls on to a host of its choosing, outside Tor, from this
+# machine's own address (gs_common.MoneroRPC says the same of the pipeline).
+_s=requests.Session(); _s.trust_env=False
 def rpc(m,p=None):
     b={'jsonrpc':'2.0','id':'0','method':m}
     if p: b['params']=p
-    r=requests.post(u,json=b,timeout=25,proxies=proxies)
+    r=_s.post(u,json=b,timeout=25,proxies=proxies,allow_redirects=False)
+    if r.is_redirect or 300<=r.status_code<400:
+        print('[!] the wallet-rpc answered with a redirect, which is not followed.')
+        raise SystemExit(1)
     r.raise_for_status(); return r.json()
 print('[*] contacting wallet-rpc at', u)
 try:
@@ -1413,7 +1456,7 @@ def run_notes(p: dict) -> list:
     notes = []
     if p.get("mode") == "receive":
         if not p.get("expect_total_xmr"):
-            _pf = p.get("pairs_file") or DEFAULT_PAIRS_FILE
+            _pf = pairs_file_for(p)
             _have = False
             try:
                 _have = os.path.isfile(os.path.join(REPO, _pf))
@@ -1631,7 +1674,7 @@ def _pairs_for_receive(p: dict):
         with open(os.path.join(REPO, p.get("receive_wallet") or ""),
                   encoding="utf-8") as f:
             addr = str((json.load(f) or {}).get("address") or "")
-        with open(os.path.join(REPO, p.get("pairs_file") or DEFAULT_PAIRS_FILE),
+        with open(os.path.join(REPO, pairs_file_for(p)),
                   encoding="utf-8") as f:
             pairs = json.load(f)
     except (OSError, ValueError, AttributeError, TypeError):
@@ -2663,7 +2706,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
           <input id="swap_btc" autocomplete="off" spellcheck="false" placeholder="0.05">
           <span class="d limits"></span></div>
         <div class="f"><label for="pairs_file">Save quote to</label>
-          <input id="pairs_file" autocomplete="off" spellcheck="false" placeholder="thor_pairs.json"></div>
+          <input id="pairs_file" autocomplete="off" spellcheck="false" placeholder="thor_pairs_&lt;receive wallet&gt;.json"></div>
         <div class="stepacts" data-acts="swap_quote"></div>
         <p class="lead" style="margin-top:8px">The swap provider necessarily learns
         "this BTC deposit → this XMR address". Tor hides who asked, not the link itself —
@@ -2677,17 +2720,17 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         With a quote file it waits for the quoted amount, otherwise for any balance at all.
         <div class="stepacts" data-acts="watch_receive"></div>
         <div class="f" style="margin-top:10px"><label for="expect_total_xmr">Total XMR expected
-          <span class="d">all swaps to this address</span></label>
+          <span class="d">at this receive address</span></label>
           <input id="expect_total_xmr" autocomplete="off" spellcheck="false" placeholder="4.0">
         <span class="d limits"></span></div>
         <div class="f"><label for="split_recv">Number of swaps
-          <span class="d">paying that total</span></label>
+          <span class="d">paying that total — one per receive address</span></label>
           <input id="split_recv" type="number" min="1" max="8" value="1"></div>
         <p class="lead" style="margin-top:6px"><b>Fill these in.</b> Without a total the mix does
-        <i>not</i> wait: it plans against whatever has landed the moment it starts. If the
-        sender pays in several swaps, the ones that arrive later are never mixed — they sit on
-        the receive address, which the swap memo names in public. The count tightens the gate
-        so one missing swap cannot hide inside the tolerance.</p>
+        <i>not</i> wait: it plans against whatever has landed the moment it starts, and a
+        payment that arrives later is never mixed — it sits on the receive address, which the
+        swap memo names in public. One receive address takes one swap: for several, make a
+        receive wallet for each (step 1) and run each on its own; each gets its own quote file.</p>
       </div></div>
     </div>
     <div class="stepnav"><button class="bk" data-go="1">← Back</button><button class="nx" data-go="3">Next →</button></div>

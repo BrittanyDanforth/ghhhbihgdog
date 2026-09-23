@@ -524,7 +524,9 @@ def test_the_quote_step_gates_and_keeps_every_swap():
         c.REPO = d
         with open(os.path.join(d, "w.json"), "w") as f:
             json.dump({"schema": "gs_receive_wallet_v1", "address": "8ADDR"}, f)
-        with open(os.path.join(d, "thor_pairs.json"), "w") as f:
+        # THIS wallet's own default quote file (pairs_file_for).
+        _qf = os.path.join(d, c.pairs_file_for(c.clean(base)["params"]))
+        with open(_qf, "w") as f:
             json.dump([{"dest_xmr": "8ADDR", "expected_xmr": "1.0"},
                        {"dest_xmr": "8OTHER", "expected_xmr": "1.0"}], f)
         _, why2 = c.pipeline_argv(c.clean(dict(base, split=2))["params"])
@@ -539,6 +541,16 @@ def test_the_quote_step_gates_and_keeps_every_swap():
         _, why1 = c.pipeline_argv(c.clean(dict(base, split=1))["params"])
         check("NON-VACUITY: 1 swap quoted, 1 expected, no refusal",
               not any("swap(s) paying" in w for w in why1))
+        # A FILE HOLDING ONLY ANOTHER ADDRESS'S QUOTE: "set 'Number of
+        # swaps' to 0" was the advice, and the box's minimum is 1.
+        with open(_qf, "w") as f:
+            json.dump([{"dest_xmr": "8OTHER", "expected_xmr": "1.0"}], f)
+        _, why0 = c.pipeline_argv(c.clean(dict(base, split=1))["params"])
+        check("a quote file with no swap for this address says to quote THIS "
+              "wallet, not to set 'Number of swaps' to 0",
+              any("holds no swap paying this receive address" in w
+                  for w in why0)
+              and not any("holds 0 swap" in w for w in why0))
     finally:
         c.REPO = real_repo
         __import__("shutil").rmtree(d, ignore_errors=True)
@@ -1779,16 +1791,39 @@ def test_the_receive_flow_arms_its_own_arrival_gate():
     base = {"mode": "receive", "receive_wallet": "w.json",
             "tor_proxy": "socks5h://127.0.0.1:9050", "wallets": 10, "deep": 2}
     a, why = c.pipeline_argv(c.clean(base)["params"])
+    _dpf = c.pairs_file_for(c.clean(base)["params"])
     check("receive: the blank bundle field still reaches the run",
-          "--swap-pairs" in a
-          and a[a.index("--swap-pairs") + 1] == c.DEFAULT_PAIRS_FILE)
+          "--swap-pairs" in a and a[a.index("--swap-pairs") + 1] == _dpf)
     check("receive: ...and it is the SAME default the quote and watch steps "
           "use",
           (lambda _q: _q[_q.index("--outfile") + 1])(
               c.ACTIONS["swap_quote"]["build"](c.clean(base)["params"]))
-          == c.DEFAULT_PAIRS_FILE
-          and c.DEFAULT_PAIRS_FILE
-          in c.ACTIONS["watch_receive"]["build"](c.clean(base)["params"]))
+          == _dpf
+          and _dpf in c.ACTIONS["watch_receive"]["build"](
+              c.clean(base)["params"]))
+    # ONE QUOTE FILE PER RECEIVE WALLET. One address takes one swap, so the
+    # quote step's own advice is a receive wallet per swap -- and with one
+    # shared default each quote replaced the last: the other wallet's run
+    # was told to set 'Number of swaps' to the 0 its file held, and its
+    # watch refused ("none of the swap pairs are routed to this address").
+    _w2 = dict(base, receive_wallet="wallet_b2.json")
+    import fnmatch as _fn7
+    check("receive: two receive wallets default to two quote files, each "
+          "still one the wipe takes",
+          _dpf == "thor_pairs_w.json"
+          and c.pairs_file_for(c.clean(_w2)["params"])
+          == "thor_pairs_wallet_b2.json"
+          and all(_fn7.fnmatch(_f, "thor_pairs_*.json")
+                  for _f in (_dpf, "thor_pairs_wallet_b2.json"))
+          and c.pairs_file_for({}) == c.DEFAULT_PAIRS_FILE
+          and c.pairs_file_for({"receive_wallet": "../x/../w a.json"})
+          .startswith("thor_pairs_w_a_")
+          and "/" not in c.pairs_file_for({"receive_wallet": "../x/../w a.json"}))
+    check("receive: two wallet names that clean to one name still get two "
+          "files", c.pairs_file_for({"receive_wallet": "w a.json"})
+          != c.pairs_file_for({"receive_wallet": "w_a.json"})
+          and c.pairs_file_for({"receive_wallet": "w_a.json"})
+          == "thor_pairs_w_a.json")
     check("receive: an explicit bundle still wins over the default",
           c.pipeline_argv(c.clean(dict(base, pairs_file="other.json"))
                           ["params"])[0][
@@ -1812,7 +1847,7 @@ def test_the_receive_flow_arms_its_own_arrival_gate():
     # `problem` (those stop the spend) -- but an empty problem list reads as
     # "everything is set", which is how this stayed invisible.
     import os as _os
-    _pf = _os.path.join(REPO, c.DEFAULT_PAIRS_FILE)
+    _pf = _os.path.join(REPO, c.pairs_file_for(c.clean(base)["params"]))
     _had = _os.path.exists(_pf)
     if not _had:
         _notes = c.run_notes(c.clean(base)["params"])
@@ -2098,9 +2133,9 @@ def test_console_can_express_the_expected_total():
     # with no arrival gate. See test_the_receive_flow_arms_its_own_arrival_gate.
     a, _ = argv_for()
     check("expected total: a blank bundle field falls back to the SAME file "
-          "the quote and watch steps use",
+          "the quote and watch steps use -- this receive wallet's own",
           "--swap-pairs" in a
-          and a[a.index("--swap-pairs") + 1] == c.DEFAULT_PAIRS_FILE)
+          and a[a.index("--swap-pairs") + 1] == "thor_pairs_w.json")
     check("expected total: ...and send mode still gets no bundle",
           "--swap-pairs" not in argv_for(mode="send")[0])
 

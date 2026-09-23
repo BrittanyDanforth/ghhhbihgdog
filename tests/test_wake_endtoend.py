@@ -664,11 +664,31 @@ try:
             time.sleep(0.05)
     else:
         _junk = None
+    _reveals = []
     if _junk is not None:
         _junk.close()                       # connect and vanish: a port scan
         _junk2 = socket.create_connection(("127.0.0.1", _sp), timeout=2)
         _junk2.sendall(b"GET / HTTP/1.0\r\n\r\n")   # and now noise
         _junk2.close()
+        # TWO PROBES THAT COMMIT, READ THE REVEAL AND HANG UP. The vault kept
+        # one keypair for the whole ceremony, so each learned the key the
+        # real Pi would be compared against before committing to its own.
+        for _ in range(2):
+            _pr = socket.create_connection(("127.0.0.1", _sp), timeout=5)
+            _pr.sendall(json.dumps({"t": "commit", "v": P.PAIR_PROTO,
+                                    "c": os.urandom(32).hex()}).encode()
+                        + b"\n")
+            _b = b""
+            while not _b.endswith(b"\n"):
+                _c = _pr.recv(1)
+                if not _c:
+                    break
+                _b += _c
+            _pr.close()
+            try:
+                _reveals.append(json.loads(_b)["pub"])
+            except (ValueError, KeyError):
+                _reveals.append(None)
     _sargs = types.SimpleNamespace(vault="127.0.0.1", pair_port=_sp,
                                    key=os.path.join(_sd, "gs_wake_pi.key"),
                                    port=0, kdf="interactive")
@@ -697,6 +717,53 @@ try:
     check("...and the operator is TOLD each one happened, rather than just "
           "seeing a slow pairing",
           _svout.count("That was not the Pi") >= 2)
+    check("each connection is revealed a DIFFERENT vault key, so no probe "
+          "learns the key the real Pi's code is computed from",
+          len(_reveals) == 2 and None not in _reveals
+          and _reveals[0] != _reveals[1])
+
+    # A KEY THAT DOES NOT MATCH ITS COMMITMENT ENDS THE CEREMONY. It was
+    # counted as a stray and the vault listened on for another try.
+    _td = tempfile.mkdtemp(prefix="wake_tamper_")
+    _tp = free_port()
+    _tv = subprocess.Popen(
+        [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+         "--out", _td, "--bind", "127.0.0.1", "--pair-port", str(_tp),
+         "--mac", "aa:bb:cc:dd:ee:ff", "--broadcast", "255.255.255.255"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, cwd=_td)
+    _tc = None
+    for _ in range(400):
+        try:
+            _tc = socket.create_connection(("127.0.0.1", _tp), timeout=5)
+            break
+        except OSError:
+            time.sleep(0.05)
+    if _tc is not None:
+        _tc.sendall(json.dumps({"t": "commit", "v": P.PAIR_PROTO,
+                                "c": os.urandom(32).hex()}).encode() + b"\n")
+        _b = b""
+        while not _b.endswith(b"\n"):
+            _c = _tc.recv(1)
+            if not _c:
+                break
+            _b += _c
+        _tc.sendall(json.dumps({"t": "reveal", "v": P.PAIR_PROTO,
+                                "pub": os.urandom(32).hex()}).encode() + b"\n")
+        try:
+            _tc.recv(4096)
+        except OSError:
+            pass
+        _tc.close()
+    try:
+        _tvout, _ = _tv.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        _tv.kill()
+        _tvout, _ = _tv.communicate()
+    check("a revealed key that does not match its commitment ends the "
+          "ceremony (it was counted as a stray)",
+          _tv.returncode not in (0, None) and "ceremony is over" in _tvout
+          and not os.path.exists(os.path.join(_td, "gs_wake_thinkpad.key")))
 
 
     print("\n== the doorbell's queue depth is one, over the wire ==")

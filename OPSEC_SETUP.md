@@ -319,9 +319,11 @@ Four things to know:
 **Still in the clear after all of this:** the Monero wallet file, which is the
 whole mix graph — encrypted under a password that is now sealed, which is
 better than it was and not the same as solved. And the issued-index marks,
-outside every seal on purpose (§4's wipe note says why): they name no address
-and no client, only that an intake ran here and how many addresses it handed
-out.
+outside every seal on purpose (§4's wipe note says why): named by an id keyed
+with the account's chain code, so to anyone without the xpub they name no
+address and no client, only that an intake ran here, how many addresses it
+handed out, and -- by the file's ctime, which no unprivileged call can move --
+when the last one was.
 
 Telegram never gets: wallet path, RPC URL, view key, spend key, seed — and by
 default nothing else either, only which job finished and a 4-hex handle.
@@ -503,7 +505,8 @@ WOL is a magic packet on the LAN. Anyone on the switch can send one.
 
 ### What the Pi must never hold
 
-Spend key, view key, `wallet_*.json`, `thor_pairs.json`, memo, seed.
+Spend key, view key, `wallet_*.json`, `thor_pairs*.json` (the console saves
+each receive wallet's quote as `thor_pairs_<wallet>.json`), memo, seed.
 If you find any of those on the SD, the split is already broken.
 
 `gs_doorbell` imports nothing but the standard library and PyNaCl, and
@@ -705,7 +708,14 @@ missing, none extra — at the plan's amounts, with change only where the plan
 allows it: none on a sweep, dust at most on a peel, and on a fan-out the
 spending account's own subaddress 0, which the plan names — and a fee of at
 most ten times the plan's own estimate, so the free parts (a sweep's amount,
-a fan-out's change) cannot be burned instead. Amounts are read in whatever
+a fan-out's change) cannot be burned instead. The bound is per plan entry and
+scales with the inputs the plan counted it spending, never with the
+transaction count the set reports about itself: an entry veil or an exit
+sweeps every output on an address the swap memo made public, dust included,
+and pays a fee per output. Dust sent after planning can still put a veil over
+its bound; the refusal then says so — the fee, about how many inputs it pays
+for, and that `--phase sign --max-fee-xmr <that fee>` signs it once you have
+looked — rather than calling it a tampered blob. Amounts are read in whatever
 unit the offline wallet displays (`set unit`). The manifest's
 hash cannot do this: it sits beside the blob it covers. The check rests on the
 plan being the one you made — whoever can rewrite the plan and its
@@ -800,7 +810,11 @@ remove the aggregator from the path), and
 was: `exit_strategy_simulator` reads it when you run that tool by hand, but the
 console has never set it. A list of protections is worth nothing if entries can
 sit on it unearned, which is the same defect as the sentence below once was.) The command preview the page shows you is
-the real argv, which is why no secret appears in it.
+the real argv, which is why no secret appears in it. Run by hand,
+`thor_swap_preparer` takes its GPG recipient — your email or key id — from
+`GS_GPG_RECIPIENT` the same way, and encrypts with `--throw-keyids` so the
+`.gpg` bundle does not say whose key opens it; gpg's own command line still
+carries the recipient for the moment gpg runs (python-gnupg builds it).
 
 `GS_USAGE_FEE_PCT` is on that list for a reason that is easy to talk yourself
 out of. The console used to compose `--usage-fee-pct 0.011` onto argv under a
@@ -2845,7 +2859,12 @@ would not pay for today is `delayed` like a
 first forward, and the original stands. A spend of the address that is not
 the vault's own fails the run with `foreign_spend` on the chain: only a
 leaked seed does that, and the job log at the machine names the
-transaction. One signature per output while a spend of it may be in the
+transaction. "The vault's own" is a txid, never a memo: every forward puts
+the deposit's memo on the chain, so a seed thief can attach it to a theft,
+and a memo that sufficed turned the alarm into "forward found on chain".
+Each forward's txid is written to `btc_forward_<handle>.signed.json`, and
+synced, before any byte of it is sent; a spend that no plan and no record
+names is foreign whatever memo it carries. One signature per output while a spend of it may be in the
 network — a replacement is the one exception, and it is built to beat every
 earlier one, so whichever the network mines swaps once — is the rule the
 reconciliation keeps; the plan chain beside the ledger
@@ -2870,10 +2889,15 @@ file per intake chain, `issued_<chain id>.json` under the pairing's
 `--mark-dir` (`/var/lib/ghostspiral-marks`, the agent unit's
 `StateDirectory=`, which systemd creates at every start and which sits
 outside every wipe root and outside the artifact dir), holding a chain id
-(a digest of the chain's first address, so an xpub and a zpub of one
-account are one chain), the account number and a count; no address and
-no amount — that paranoia_mode leaves in place on purpose: an empty
-ledger the mark contradicts is refused as wiped even when address 0 is
+(an HMAC of the account key under its chain code, so an xpub and a zpub of
+one account are one chain, and nobody without the xpub can tell which
+chain: a plain digest of the first address, as it was, is one hash away
+from an address the chain publishes once it is paid), the account number
+and a count; no address and no amount; its mtime and its directory's set
+back to a ten-minute bucket, and read without moving its atime (a mark an earlier build wrote under the
+unkeyed id is still read, and rewritten under the keyed one the first time
+the vault reads it) — that paranoia_mode leaves in place on purpose: an
+empty ledger the mark contradicts is refused as wiped even when address 0 is
 still unpaid, and a ledger that lost only its newest records is stepped
 past the mark. A deposit is refused rather than issued if that mark
 cannot be written; `gs_wake_agent --dry-run` tries the write and says

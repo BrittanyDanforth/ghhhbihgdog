@@ -30,6 +30,7 @@ scrubbed form is what goes into the persistent integrity log.
 """
 from __future__ import annotations
 import argparse, stat, sys, time
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from pathlib import Path
 
 from gs_common import (

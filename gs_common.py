@@ -997,6 +997,24 @@ def decimal_arg(text: str) -> Decimal:
     return v
 
 
+#: The largest power of ten, either way, a number from outside may carry.
+#: Every amount here -- satoshi, piconero, a price, a fee rate -- sits
+#: between 1e-15 and 1e20. Decimal takes "1e2000000" at once and then turns
+#: int() of it, or a fixed-point format of it, into minutes of arithmetic:
+#: 56 s driven for one THORNode dust_threshold, the forward's whole budget,
+#: and the node's to choose. Refused at the parse, so no reader has to
+#: remember a bound of its own. EXTERNAL numbers only: argv and the
+#: environment are the operator's, parsed by decimal_arg / decimal_env and
+#: bounded where they are used (max_value), with a sentence that says so.
+EXTERNAL_DECIMAL_MAX_EXP = 30
+
+
+def decimal_in_range(v) -> bool:
+    """A finite Decimal whose magnitude is within 10**+-30 (or zero)."""
+    return v == 0 or (-EXTERNAL_DECIMAL_MAX_EXP <= v.adjusted()
+                      <= EXTERNAL_DECIMAL_MAX_EXP)
+
+
 def finite_decimal(value, default=None):
     """Parse an EXTERNAL number, or return `default`. Never raises.
 
@@ -1027,7 +1045,10 @@ def finite_decimal(value, default=None):
         v = Decimal(str(value))
     except Exception:                                        # noqa: BLE001
         return default
-    return v if v.is_finite() else default
+    if not v.is_finite() or not decimal_in_range(v):
+        return default
+    # A zero keeps no exponent: "0E+2000000" formats to two million digits.
+    return Decimal(0) if v == 0 else v
 
 
 def decimal_env(label: str, text, positive: bool = False,
@@ -1163,12 +1184,41 @@ def paranoia_search_roots(resolve: bool = True, cwd: bool = True) -> list:
     its own cwd is only a root if the operator starts paranoia_mode from that
     same directory, which wipe_cwd_only lets it say.
     """
-    roots = ([Path(".")] if cwd else []) + [
-        Path.home(), Path.home() / "ghostspiral", Path.home() / "GhostSpiral",
-        TOOLCHAIN_DIR]
+    homes = [Path.home()]
+    # UNDER SUDO, THE OPERATOR'S HOME TOO. sudo's default env_reset sets
+    # HOME to root's, so `sudo paranoia_mode` -- the remedy sweep_refusal
+    # names for a root-owned artifact -- searched /root, found nothing, and
+    # reported success with the file still in the operator's tree. The home
+    # is read from the password database for the uid sudo itself set, never
+    # from the environment's HOME; ownership (sweep_refusal) still gates
+    # every match.
+    _su = sudo_home()
+    if _su is not None and _su not in homes:
+        homes.append(_su)
+    roots = ([Path(".")] if cwd else [])
+    for _h in homes:
+        roots += [_h, _h / "ghostspiral", _h / "GhostSpiral"]
+    roots.append(TOOLCHAIN_DIR)
     if not resolve:
         return roots
     return [r.resolve() for r in roots]
+
+
+def sudo_home() -> Optional[Path]:
+    """The home of the account that ran sudo, when this process is root
+    under sudo; None otherwise. From the password database by SUDO_UID
+    (which sudo sets, overriding any the caller passed), never from HOME."""
+    try:
+        if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
+            return None
+        _uid = int(os.environ["SUDO_UID"])
+        if _uid == 0:
+            return None
+        import pwd
+        _d = pwd.getpwuid(_uid).pw_dir
+    except (KeyError, TypeError, ValueError, OSError, ImportError):
+        return None
+    return Path(_d) if _d and os.path.isabs(_d) else None
 
 
 GS_ARTIFACT_FILE_PATTERNS = [
@@ -1602,11 +1652,16 @@ def sweep_refusal(root: Path, match: Path, owners) -> Optional[tuple]:
             return ("belongs to root (left by a run under sudo?) -- run the "
                     "wipe with sudo to remove it", True, "owner")
         return ("belongs to another account", False, "owner")
+    why = _not_ours_reason(match, st)
+    if why:
+        return (why, False, "content")
+    # LAST, so "hard_link" means every other check passed: the one refusal
+    # a caller may lift (paranoia_mode, when every name the file has is one
+    # this sweep takes on its own), and lifting it must not skip the rest.
     if stat_module.S_ISREG(st.st_mode) and st.st_nlink > 1:
         return (f"has {st.st_nlink} names (hard links); overwriting it would "
                 f"destroy the content under the others too", True, "hard_link")
-    why = _not_ours_reason(match, st)
-    return (why, False, "content") if why else None
+    return None
 
 
 def wipe_covers(target) -> bool:
@@ -2323,7 +2378,7 @@ def check_daemon_relay_egress(daemon_url: str,
            "detail": "", "nettype": "unknown", "height": 0}
     parsed = urlparse(daemon_url)
     host = (parsed.hostname or "127.0.0.1").lower()
-    use_proxies = None
+    use_proxies = loopback_proxies(daemon_url)
     if host not in _LOCALHOST_NAMES:
         if not proxies:
             out["detail"] = "remote daemon and no proxy available to query it"
@@ -2871,6 +2926,26 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False,
 #  Retry-wrapped HTTP
 # ---------------------------------------------------------------------------
 
+def loopback_proxies(url: str) -> dict:
+    """WHAT A LOOPBACK CALL PASSES AS ITS PROXIES: every key requests looks
+    a proxy up under for this URL (utils.select_proxy: scheme://host,
+    scheme, all://host, all), each named as none. `proxies=None` let
+    requests fill the map from the environment -- HTTP_PROXY / ALL_PROXY,
+    which the children inherit -- and a loopback submit_transfer,
+    get_fee_estimate or get_info went to whatever proxy that named, in the
+    clear, with this machine's address (driven by the host-privacy review).
+    requests only fills a key the map does not already have, even as None.
+    ALL OF THEM, not the two schemes (self-doubt over that fix, driven):
+    {"http": None, "https": None} left "all" open, and ALL_PROXY alone
+    still took every loopback call to its proxy; an environment variable
+    named for the host ("http://127.0.0.1_proxy") is a key of its own."""
+    host = urlparse(str(url)).hostname or ""
+    keys = ["http", "https", "all"]
+    if host:
+        keys += [f"http://{host}", f"https://{host}", f"all://{host}"]
+    return {k: None for k in keys}
+
+
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
 def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     # `not proxies`, NOT `is None`. requests treats proxies={} exactly like no
@@ -3182,6 +3257,25 @@ class MoneroRPC:
                     f"    (socat/ssh) and point at 127.0.0.1 instead."
                 )
             integrity_log("rpc", "non_local_rpc:proxy_applied")
+
+        # NO REDIRECT IS FOLLOWED AND NO PROXY IS TAKEN FROM THE ENVIRONMENT.
+        # monero-python posts through a requests Session with both on: a 307
+        # from whatever answered on the port -- a local user holding it, or
+        # the far end of the socat/ssh tunnel the refusal above recommends --
+        # sent the SAME JSON-RPC body (transfer_split's destinations and
+        # amounts) to a host of its choosing, looked up by the system
+        # resolver and connected to from this machine's own address, the Tor
+        # proxy never consulted. Driven by the host-privacy review. And
+        # HTTP_PROXY / ALL_PROXY in the environment reached every loopback
+        # call. Refused if the attribute is not where 1.1.1 keeps it: an
+        # assumption about a library is not a bound.
+        _sess = getattr(self._backend, "session", None)
+        if _sess is None or not hasattr(_sess, "max_redirects"):
+            sys.exit("[!] This monero-python keeps no requests Session where "
+                     "it is expected, so redirects cannot be refused. "
+                     "Refusing to talk to the wallet-rpc through it.")
+        _sess.max_redirects = 0
+        _sess.trust_env = False
 
         self._wallet = XMRWallet(self._backend)
 
@@ -3690,6 +3784,53 @@ def per_tx_fee_xmr(per_byte_piconero) -> Decimal:
     return Decimal(int(per_byte_piconero) * TX_BYTES_ESTIMATE) / Decimal(10 ** 12)
 
 
+#: What a two-output transaction costs, as a multiple of the daemon's
+#: per-transaction estimate, by its INPUT count: 0.765 + 0.335 per input.
+#: Fitted to the measurements above GhostSpiral's PEEL_CARRIER_RESERVE_MULT
+#: (monerod 0.18.3.1, current consensus): 1.10 / 1.44 / 2.11 / 3.45 / 6.13 at
+#: 1 / 2 / 4 / 8 / 16 inputs against 1.10 / 1.43 / 2.09 / 3.42 / 6.14 measured.
+#: ONE COPY, for the two readers that must agree: the planner's reserve for a
+#: veil that sweeps a dusted entry address, and the signer's fee bound for it.
+FEE_BASE_MULT = Decimal("0.765")
+FEE_PER_INPUT_MULT = Decimal("0.335")
+#: The margin every planned fee carries over the daemon's estimate:
+#: GhostSpiral's hop reserve (`fee_per_round` in a plan's meta is the
+#: estimate times this) and the signer, which divides it back out to say
+#: what a fee it refuses would pay for. One definition for both.
+FEE_SAFETY_MARGIN = Decimal("1.5")
+#: The most outputs a plan may say one entry spends (its 'inputs'). Far past
+#: what one transaction holds; it bounds a number, not a wallet.
+MAX_PLANNED_INPUTS = 5000
+
+
+def planned_inputs(n) -> Optional[int]:
+    """The 'inputs' a plan entry carries for a sweep of `n` outputs: None
+    for one (or an unknown count) -- the shape every entry is planned as --
+    and at most MAX_PLANNED_INPUTS."""
+    if isinstance(n, bool) or not isinstance(n, int) or n <= 1:
+        return None
+    return min(n, MAX_PLANNED_INPUTS)
+
+
+def fee_mult_for_inputs(n_inputs) -> Decimal:
+    """The expected fee of a two-output transaction spending `n_inputs`,
+    as a multiple of the per-transaction estimate. An unknown or
+    non-positive count is one input: the shape every hop is planned as."""
+    try:
+        n = int(n_inputs)
+    except (TypeError, ValueError):
+        n = 1
+    if isinstance(n_inputs, bool) or n < 1:
+        n = 1
+    return FEE_BASE_MULT + FEE_PER_INPUT_MULT * Decimal(n)
+
+
+def fee_scale_for_inputs(n_inputs) -> Decimal:
+    """How many times a one-input transaction's fee a spend of `n_inputs`
+    costs: 1 for one input (or an unknown count), 5.57 for sixteen."""
+    return fee_mult_for_inputs(n_inputs) / fee_mult_for_inputs(1)
+
+
 def fee_estimate_per_tx(est: dict, fee_priority: int) -> tuple:
     """(fee_xmr, source) from a get_fee_estimate result; (None, "") if unusable.
 
@@ -3730,7 +3871,7 @@ def daemon_fee_estimate(daemon_url: str, proxies: Optional[Dict[str, str]] = Non
     """
     parsed = urlparse(daemon_url)
     host = (parsed.hostname or "127.0.0.1").lower()
-    use_proxies = None
+    use_proxies = loopback_proxies(daemon_url)
     if host not in _LOCALHOST_NAMES:
         if not proxies:
             return {}

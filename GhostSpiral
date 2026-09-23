@@ -34,12 +34,15 @@ OPSEC hardening (v10.5):
 """
 from __future__ import annotations
 import argparse, atexit, json, os, re, sys, time, subprocess, secrets
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import List, Optional
 
 from gs_common import (
     SWAPKIT_API, parse_swap_route, memo_size_note, fee_estimate_per_tx,
+    fee_mult_for_inputs, fee_scale_for_inputs, planned_inputs,
+    FEE_SAFETY_MARGIN as _GS_FEE_SAFETY_MARGIN,
     PRIORITY_FEE_MULTIPLIER,
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
     safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
@@ -130,8 +133,9 @@ PEEL_CARRIER_RESERVE_MULT = Decimal("1")
 # Single source of truth for the fee safety margin. It was written inline as
 # Decimal("1.5") in the stage-4 fee budget, in compute_hop_amount, and in the
 # operator-facing message that reports the reserve -- three copies that could
-# drift, so a changed margin would have made the printed number a lie.
-FEE_SAFETY_MARGIN = Decimal("1.5")
+# drift, so a changed margin would have made the printed number a lie. It is
+# gs_common's now: the signer reads the same figure back out of a plan.
+FEE_SAFETY_MARGIN = _GS_FEE_SAFETY_MARGIN
 
 
 # Default per-TX broadcast delay, in seconds: 3 to 12 minutes. Written inline
@@ -692,6 +696,35 @@ def hop_fee_reserve(fee_xmr: Decimal) -> Decimal:
     site where it could drift out of sync.
     """
     return fee_xmr * FEE_SAFETY_MARGIN
+
+
+def veil_fee_reserve(fee_xmr: Decimal, n_inputs=None) -> Decimal:
+    """What one entry veil holds back for its fee: hop_fee_reserve for the
+    one-input sweep it is meant to be, and that same margin over the
+    measured fee of a sweep of `n_inputs` when the entry address holds more
+    (dust, which the swap memo invites). ONE CHUNK'S VEIL, ONE FEE -- but
+    the fee of the transaction it will actually be."""
+    return hop_fee_reserve(fee_xmr) * fee_scale_for_inputs(n_inputs)
+
+
+def measure_veil_inputs(rpc, args, entries: list) -> dict:
+    """{entry: outputs on its address} for every entry a veil will sweep,
+    measured ONCE: the chunk sizing, the veil's reserve and the plan's
+    'inputs' all read these. {} with the veil off."""
+    if not getattr(args, "entry_veil", True):
+        return {}
+    return {_e: entry_output_count(rpc, _e[1], _e[2]) for _e in entries}
+
+
+def veil_expected_surplus(veil_plan: list, fee_xmr: Decimal) -> Decimal:
+    """What the first chunk's veil is expected to leave unspent of its
+    reserve (veil_fee_reserve less the measured fee of its sweep), which
+    rides into that chunk's distribution. 0 with no veil."""
+    if not veil_plan or not isinstance(veil_plan[0], dict):
+        return Decimal(0)
+    _n = veil_plan[0].get("inputs")
+    return max(Decimal(0), veil_fee_reserve(fee_xmr, _n)
+               - fee_xmr * fee_mult_for_inputs(_n))
 
 
 def hop_is_fundable(fanout_amt: Decimal, fee_xmr: Decimal) -> bool:
@@ -1799,9 +1832,59 @@ class PeelBudgetError(Exception):
                          f"{hop_headroom * hops} XMR of headroom")
 
 
+def peel_last_extra(amounts: list, bal: Decimal, fee_xmr: Decimal,
+                    surplus_extra: Decimal = Decimal(0)) -> Decimal:
+    """What the LAST peel's destination is expected to receive on top of
+    its planned amount. PURE.
+
+    Every hop holds back its headroom (1.5x the estimate) and spends its
+    real fee (1.10x, one input and two outputs -- measured, see
+    PEEL_CARRIER_RESERVE_MULT), and the last peel is a sweep: whatever the
+    chain did not spend is its. `surplus_extra` is the same difference on
+    the veil in front of the chain."""
+    n = len(amounts)
+    if n == 0:
+        return Decimal(0)
+    spent = fee_xmr * fee_mult_for_inputs(1) * Decimal(n)
+    return max(Decimal(0), bal + surplus_extra
+               - sum(amounts, Decimal(0)) - spent)
+
+
+def level_peel_last(amounts: list, extra: Decimal, floor: Decimal) -> list:
+    """The distribution with the expected surplus taken OFF the last
+    planned share and spread over the others, in proportion. PURE.
+
+    The chain's headroom surplus lands on the last destination by
+    construction (peel_last_extra): driven, +0.17 XMR on a planned 0.019 --
+    5x the mean -- at priority 4 with forty wallets. The planned total is
+    unchanged, so every carrier holds what the reserves require; what moves
+    is which share the surplus lands on. The last share keeps at least
+    `floor`, the least any output may carry, and stays where the draw put
+    it: moving the largest share last gave it room, and made the last
+    output the largest of every chain -- a regularity of its own. What the
+    room cannot take stays on the last, and the caller says so."""
+    out = list(amounts)
+    n = len(out)
+    if n < 2 or extra <= 0:
+        return out
+    move = min(extra, max(Decimal(0), out[-1] - floor)).quantize(
+        DUST_XMR, rounding=ROUND_DOWN)
+    others = sum(out[:-1], Decimal(0))
+    if move <= 0 or others <= 0:
+        return out
+    given = Decimal(0)
+    for i in range(n - 1):
+        share = (move * out[i] / others).quantize(DUST_XMR, rounding=ROUND_DOWN)
+        out[i] += share
+        given += share
+    out[-1] -= given
+    return out
+
+
 def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
                           fanout_count: int, fee_xmr: Decimal,
-                          dag_enabled: bool, rng, hop_headroom: Decimal):
+                          dag_enabled: bool, rng, hop_headroom: Decimal,
+                          surplus_extra: Decimal = Decimal(0)):
     """Shrink the distribution until peel 0 is affordable. Returns (amounts, frac).
 
     A PEEL CHAIN CANNOT DISTRIBUTE AS MUCH AS A FAN-OUT, and the planner has to
@@ -1847,7 +1930,11 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
             continue
         reserves = peel_carrier_reserves(trial, hop_headroom)
         if peel_entry_requirement(trial, reserves) <= cap:
-            return trial, frac
+            # ...AND THE SURPLUS OFF THE LAST SHARE (level_peel_last). The
+            # total does not move, so the requirement just met still holds.
+            return level_peel_last(
+                trial, peel_last_extra(trial, bal, fee_xmr, surplus_extra),
+                min_exit_fundable(fee_xmr, dag_enabled)), frac
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
@@ -1880,7 +1967,8 @@ def entry_output_count(rpc, account: int, index: int):
                and int(t.get("amount", 0) or 0) > 0)
 
 
-def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
+def build_entry_veils(rpc, entries: list, delay_window=None,
+                      counts=None) -> tuple:
     """The first spend out of each entry output, shaped like ordinary traffic.
 
     `entries` is [(addr, account, index)] from create_entry_set -- one per swap
@@ -2041,7 +2129,11 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
     plan = []
     carriers = []
     for _pos, (addr_in, acct_in, idx_in) in enumerate(entries):
-        _n_inputs = entry_output_count(rpc, acct_in, idx_in)
+        # THE COUNT THE DISTRIBUTION WAS SIZED WITH, when the caller has one
+        # (measure_veil_inputs): measured twice, the sizing and the reserve
+        # could disagree about the same veil.
+        _n_inputs = (counts[_pos] if counts is not None
+                     else entry_output_count(rpc, acct_in, idx_in))
         _label = (f"entry {_pos + 1}/{len(entries)}" if len(entries) > 1
                   else "ENTRY")
         if _n_inputs is None:
@@ -2079,7 +2171,7 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
 
         acct = create_fresh_account(rpc, label="")
         addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
-        plan.append({
+        _veil = {
             "src": addr_in,
             "src_index": idx_in,
             "account_index": acct_in,
@@ -2104,7 +2196,17 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
             # as N-squared. Measured against the shipped constants, N=8 went
             # from 1.0h to 6.6h for no property that was not already held.
             "delay": hop_delay(delay_window),
-        })
+        }
+        # HOW MANY OUTPUTS THIS SWEEP SPENDS, when it is more than one: the
+        # fee grows with every input (gs_common.fee_mult_for_inputs), and
+        # the entry address is public in the swap memo, so dust on it is
+        # anyone's to send. The reserve for this veil (resolve_entry_veils)
+        # and the signer's fee bound for it both read this; each assumed one
+        # input, and a dusted veil then ate the chain's slack or was refused
+        # by the signer as a burned fee, stranding the swap on the address.
+        if planned_inputs(_n_inputs) is not None:
+            _veil["inputs"] = planned_inputs(_n_inputs)
+        plan.append(_veil)
         carriers.append((acct, idx, addr))
     # THE CARRIERS MUST BE DISTINCT, and this is the invariant's last gap.
     #
@@ -7263,7 +7365,7 @@ def report_completion(rpc, incomplete, accounts, spent_plans=(),
 
 def resolve_entry_veils(rpc, args, addr_index: dict, entries: list,
                         bal: Decimal, fee_xmr: Decimal,
-                        delay_window=None) -> tuple:
+                        delay_window=None, veil_inputs=None) -> tuple:
     """Decide what the distribution actually spends. Returns
     (veil_plan, sources, balance), where `sources` is [(addr, account, index)]
     -- one distribution source per swap chunk.
@@ -7287,7 +7389,8 @@ def resolve_entry_veils(rpc, args, addr_index: dict, entries: list,
               "candidate transactions down to it by output count alone.")
         return [], list(entries), bal
 
-    veil_plan, carriers = build_entry_veils(rpc, entries, delay_window)
+    veil_plan, carriers = build_entry_veils(rpc, entries, delay_window,
+                                            counts=veil_inputs)
     sources = []
     for acct, idx, addr in carriers:
         addr_index[addr] = (acct, idx)
@@ -7304,7 +7407,9 @@ def resolve_entry_veils(rpc, args, addr_index: dict, entries: list,
               f"distributions: no transaction in this run will ever spend "
               f"value from two different swap chunks, which is what stops an "
               f"analyst intersecting their rings.")
-    return veil_plan, sources, bal - hop_fee_reserve(fee_xmr) * _n
+    return (veil_plan, sources,
+            bal - sum((veil_fee_reserve(fee_xmr, _v.get("inputs"))
+                       for _v in veil_plan), Decimal(0)))
 
 
 def limits_report(args) -> dict:
@@ -7782,7 +7887,8 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                             fee_xmr, bal_account, fanout_count,
                             _delay_window, _secrets, bal,
                             usable, fee_addr=None,
-                            fee_amt=Decimal(0)) -> tuple:
+                            fee_amt=Decimal(0),
+                            veil_surplus=Decimal(0)) -> tuple:
     """Build the plan that spends the carriers. Returns
     (fanout_plan, change_accounts, distribution_mode, fanout_by_addr).
 
@@ -7900,7 +8006,8 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         try:
             _fitted, _frac = fit_peel_distribution(
                 _peel_amounts, bal, usable, fanout_count, fee_xmr,
-                bool(getattr(args, "dag_mixing", False)), _peel_rng, _hop_fee)
+                bool(getattr(args, "dag_mixing", False)), _peel_rng, _hop_fee,
+                surplus_extra=veil_surplus)
         except PeelBudgetError as _pbe:
             integrity_log("stage4", "peel_refused:unaffordable")
             sys.exit(
@@ -7943,6 +8050,21 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                   f"will receive that much more than its share -- one output "
                   f"visibly larger than the rest. Fewer --wallets, or the "
                   f"fan-out distribution, avoids it.")
+        # WHAT THE LEVELLING COULD NOT MOVE, SAID. When the chain's fees are
+        # a large part of the balance (many wallets, a high priority), the
+        # surplus is more than the last share has room to give, and the
+        # last destination still stands out.
+        _lx = peel_last_extra(_fitted, bal, fee_xmr, veil_surplus)
+        if len(_fitted) > 1 and (_fitted[-1] + _lx
+                                 > max(_fitted[:-1]) * Decimal("1.5")):
+            integrity_log("stage4", "peel_last_outlier")
+            print(f"  [!] The last peel's destination is expected to receive "
+                  f"about {(_fitted[-1] + _lx).quantize(DUST_XMR)} XMR, "
+                  f"against at most {max(_fitted[:-1]).quantize(DUST_XMR)} "
+                  f"for every other: each of the {len(_fitted)} hops holds "
+                  f"back a fee margin it does not spend, and the last peel "
+                  f"sweeps what is left. Fewer --wallets or a lower "
+                  f"--fee-priority shrinks it.")
         _peel_amounts = _fitted
         # ONE SOURCE OF TRUTH for the amounts from here down. fanout_by_addr is
         # what build_peel_stage_plan reads, so a shrunk plan that did not
@@ -8322,7 +8444,7 @@ def select_funded_entries(entry_set: list, entry_unlocked: list) -> tuple:
 
 def size_and_prune_chunks(args, entries: list, unlocked: list,
                           fanout_dests: list, bal_before_veils: Decimal,
-                          fee_xmr: Decimal, rng) -> tuple:
+                          fee_xmr: Decimal, rng, veil_inputs=None) -> tuple:
     """Fit the distribution to the chunks that arrived. Returns
     (entries, unlocked, bal, usable, dest_slices, slice_usable, amounts).
 
@@ -8359,6 +8481,13 @@ def size_and_prune_chunks(args, entries: list, unlocked: list,
     # changes `usable`, so the whole budget is recomputed each round rather
     # than patched. Bounded by the chunk count; dropping one gives the rest
     # a larger share, so it converges.
+    # EACH CHUNK'S OWN VEIL (veil_fee_reserve over the inputs counted on its
+    # entry address, parallel to `entries`), and each chunk sized by what its
+    # carrier will hold after it. A dusted entry's veil costs a fee per
+    # output; charged as one one-input fee, spread over every chunk, the
+    # dusted chunk's fan-out asked its carrier for more than it held.
+    _vin = (list(veil_inputs) if veil_inputs is not None
+            else [None] * len(entries))
     for _attempt in range(max(1, len(entries))):
         # `bal` here is the balance AFTER the veils will have paid their fees,
         # which is what the distribution can actually spend. It is local: the
@@ -8368,8 +8497,10 @@ def size_and_prune_chunks(args, entries: list, unlocked: list,
         # merely conservative -- and left `bal` meaning something different
         # either side of the veil call. Caught by re-reading the diff, not by a
         # test: nothing fails, the peel fit just quietly tightens.
-        _veil_cost = (hop_fee_reserve(fee_xmr) * len(entries)
-                      if getattr(args, "entry_veil", True) else Decimal(0))
+        _veil_each = ([veil_fee_reserve(fee_xmr, _n) for _n in _vin]
+                      if getattr(args, "entry_veil", True)
+                      else [Decimal(0)] * len(entries))
+        _veil_cost = sum(_veil_each, Decimal(0))
         bal = bal_before_veils - _veil_cost
         if bal <= DUST_XMR:
             sys.exit(f"[!] Balance {bal} XMR left after the entry "
@@ -8384,8 +8515,9 @@ def size_and_prune_chunks(args, entries: list, unlocked: list,
             sys.exit(fee_budget_shortfall(bal, total_fees, rounds, usable,
                                           getattr(args, "peel", False)))
         _sl, _su, _amts, _bad = size_distribution(
-            fanout_dests, unlocked, usable, fee_xmr,
-            args.dag_mixing, rng)
+            fanout_dests,
+            [max(DUST_XMR, _u - _v) for _u, _v in zip(unlocked, _veil_each)],
+            usable, fee_xmr, args.dag_mixing, rng)
         if _bad is None or len(entries) <= 1:
             break
         _dropped = entries[_bad]
@@ -8401,6 +8533,7 @@ def size_and_prune_chunks(args, entries: list, unlocked: list,
                             if i != _bad]
         unlocked = [u for i, u in enumerate(unlocked)
                            if i != _bad]
+        _vin = [n for i, n in enumerate(_vin) if i != _bad]
     # bal_before_veils, NOT the netted `bal` -- see the note in the loop.
     return (entries, unlocked, bal_before_veils, usable, _sl, _su, _amts)
 
@@ -8969,14 +9102,16 @@ def main():
             bal = bal - _fee_amt
         # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
         # give a chain analyst one value and one shape to cluster and follow.
+        _vin = measure_veil_inputs(rpc_primary, args, ENTRY_SET_FUNDED)
         (ENTRY_SET_FUNDED, _entry_unlocked, bal, usable,
          _dest_slices, _slice_usable, fanout_amounts) = size_and_prune_chunks(
             args, ENTRY_SET_FUNDED, _entry_unlocked, fanout_dests, bal,
-            fee_xmr, _secrets.SystemRandom())
+            fee_xmr, _secrets.SystemRandom(),
+            veil_inputs=[_vin.get(_e) for _e in ENTRY_SET_FUNDED])
 
         veil_plan, SPEND_SOURCES, bal = resolve_entry_veils(
             rpc_primary, args, addr_index, ENTRY_SET_FUNDED, bal, fee_xmr,
-            _delay_window)
+            _delay_window, [_vin.get(_e) for _e in ENTRY_SET_FUNDED])
         # The first source is the run's "home" for the one or two things that
         # genuinely have exactly one (the peel planner's change fallback).
         SPEND_ADDR, bal_account, entry_index = SPEND_SOURCES[0]
@@ -9036,7 +9171,8 @@ def main():
             args, rpc_primary, addr_index, SPEND_SOURCES, fanout_dests,
             fanout_by_addr, _dest_slices, fee_xmr, bal_account,
             fanout_count, _delay_window, _secrets, bal, usable,
-            fee_addr=_fee_addr, fee_amt=_fee_amt)
+            fee_addr=_fee_addr, fee_amt=_fee_amt,
+            veil_surplus=veil_expected_surplus(veil_plan, fee_xmr))
 
         # Subaddresses that will receive a fan-out output, with the (account, index)
         # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
@@ -11005,6 +11141,14 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             "sweep": True,
             "delay": hop_delay(delay_window),
         }
+        # COUNTED, like an entry veil: a receive subaddress is in its swap's
+        # public memo, and every output on it -- dust included -- is an input
+        # of this sweep and a fee the signer's bound has to allow for.
+        _nin = planned_inputs(entry_output_count(
+            connect_rpc(args.rpc_primary,
+                        proxy_url=getattr(args, "tor_proxy", "")), acct, sub))
+        if _nin is not None:
+            tx["inputs"] = _nin
         # See _run_change_sweep for why this is args.output and not
         # Path(staging_dir).parent, which resolved to the shell's cwd.
         _outdir = Path(args.output)

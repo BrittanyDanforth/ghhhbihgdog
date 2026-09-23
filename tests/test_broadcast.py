@@ -852,6 +852,48 @@ def test_a_real_resume_still_resumes():
           code3 != 0 and h3.posts == [] and "DIFFERENT set of blobs" in msg3)
 
 
+def test_a_manifest_path_outside_its_directory_is_never_read():
+    # THE MANIFEST CROSSES THE AIR GAP ON REMOVABLE MEDIA, and its 'file'
+    # field is the carrier's to write. The recorded path won whenever it
+    # existed: an absolute path to a secret was read and POSTed to the
+    # wallet-rpc as a signed set. Only the NAME is taken from the entry.
+    h = Harness(n=1)
+    secret = os.path.join(h.work, "id_ed25519")
+    with open(secret, "wb") as f:
+        f.write(b"PRIVATE KEY MATERIAL")
+    os.unlink(h.blob(0))
+    ents = [dict(h.entries[0], file=secret,
+                 hash=hashlib.sha256(b"PRIVATE KEY MATERIAL").hexdigest())]
+    _rewrite(h, ents)
+    code, msg = h.run()
+    sent = [bytes.fromhex(p["params"]["tx_data_hex"]) for p in h.posts]
+    check("path: a manifest entry naming a file OUTSIDE its own directory "
+          "is never read or sent (only the name beside the manifest is)",
+          b"PRIVATE KEY MATERIAL" not in sent and code != 70)
+
+
+def test_a_symlinked_blob_is_never_followed():
+    # ...and a blob that is a LINK is not followed: the carrier could plant
+    # tx_0.signed -> ~/.ssh/id_ed25519 beside the manifest.
+    h = Harness(n=1)
+    secret = os.path.join(h.work, "id_ed25519")
+    with open(secret, "wb") as f:
+        f.write(b"PRIVATE KEY MATERIAL")
+    os.unlink(h.blob(0))
+    os.symlink(secret, h.blob(0))
+    _rewrite(h, [dict(h.entries[0], hash=hashlib.sha256(
+        b"PRIVATE KEY MATERIAL").hexdigest())])
+    code, msg = h.run()
+    sent = [bytes.fromhex(p["params"]["tx_data_hex"]) for p in h.posts]
+    check("path: a symlinked blob is refused, its target never sent",
+          b"PRIVATE KEY MATERIAL" not in sent and code not in (0, 70))
+    # NON-VACUITY: the same run with a plain blob relays.
+    h2 = Harness(n=1)
+    code2, _ = h2.run()
+    check("path: NON-VACUITY -- a plain blob beside its manifest relays",
+          code2 == 0 and len(h2.posts) == 1)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

@@ -19,6 +19,7 @@ OPSEC hardening:
 """
 from __future__ import annotations
 import argparse, fcntl, glob, os, random, re, shutil, socket, subprocess, sys, tempfile, time
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from pathlib import Path
 
 from gs_common import (
@@ -121,6 +122,17 @@ PYCACHE_GLOBS = [
     str(Path.home() / "**/__pycache__"),
     "/tmp/**/__pycache__",
 ]
+
+
+def _pycache_globs() -> list:
+    """PYCACHE_GLOBS, and the toolchain's own directory: the tools write no
+    bytecode now (sys.dont_write_bytecode in every entry point), but a
+    __pycache__ an older run -- or a hand `python3 -c 'import gs_common'` --
+    left beside them in /opt/ghostspiral, outside $HOME and /tmp, dated the
+    first run as root and was never reached (the host-privacy review)."""
+    import gs_common as _gsm        # read live: a test may point it elsewhere
+    return list(PYCACHE_GLOBS) + [str(Path(_gsm.TOOLCHAIN_DIR)
+                                      / "**/__pycache__")]
 
 
 def link_check(iface: str) -> int:
@@ -298,7 +310,7 @@ def _warn_history_will_be_rewritten(dry: bool) -> None:
 def wipe_pycache(dry: bool):
     count = 0
     failed = 0
-    for pattern in PYCACHE_GLOBS:
+    for pattern in _pycache_globs():
         for d in glob.glob(pattern, recursive=True):
             if dry:
                 print(f"  [dry] would remove {d}")
@@ -777,7 +789,16 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
     # The Pi's chain retirement hard-links integrity_chain.log to .retired
     # for an instant, and a kill in that instant leaves both names; the
     # hard-link rule then left both, as failures. When every name the inode
-    # has is a match here, all of them are ours and it goes.
+    # has is one this sweep would take ON ITS OWN, all of them are ours and
+    # it goes.
+    #
+    # ON ITS OWN: ours by name, owned, its content ours, and reached with no
+    # link on the way (sweep_refusal passes, or refuses for the hard link
+    # alone -- its last check). Counted by the directory that holds it and
+    # the name, not by the path text: a name found again through a linked
+    # directory, or a bind mount of one, is the same name, and counting it
+    # twice let a file with ONE name here and one in ~/private pass as
+    # "every name here" -- and be overwritten, the private copy with it.
     _names = {}
     for _r in search_roots:
         if not _r.is_dir():
@@ -788,11 +809,18 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
             except OSError:
                 continue
             for _m in _ms:
+                if not artifact_name_is_ours(_m.name):
+                    continue
+                _w = sweep_refusal(_r, _m, owners)
+                if _w is not None and _w[2] != "hard_link":
+                    continue
                 try:
                     _st = os.lstat(_m)
+                    _pst = os.stat(_m.parent)
                 except OSError:
                     continue
-                _names.setdefault((_st.st_dev, _st.st_ino), set()).add(_m)
+                _names.setdefault((_st.st_dev, _st.st_ino), set()).add(
+                    (_pst.st_dev, _pst.st_ino, _m.name))
 
     def _all_names_here(p: Path) -> bool:
         try:
@@ -931,6 +959,24 @@ GS_TEMP_PREFIXES = ("gs_sign_", "gs_impout_", ".gs_pw_", ".gs_ringdb_")
 SHM_ROOT = "/dev/shm"
 
 
+def _is_private_scratch(entry, uid: int) -> bool:
+    """A killed signer's PRIVATE scratch directory (airgap_tx_signer
+    _pw_scratch_dir): named like any Python temp directory ("tmp..."), so
+    recognised by what it holds -- a real directory of this uid whose every
+    entry is one of GS_TEMP_PREFIXES, and at least one. Anything else in
+    it, or nothing, and it is some other program's."""
+    try:
+        if not entry.name.startswith("tmp") or not entry.is_dir(
+                follow_symlinks=False):
+            return False
+        if os.lstat(entry.path).st_uid != uid:
+            return False
+        names = [e.name for e in os.scandir(entry.path)]
+    except OSError:
+        return False
+    return bool(names) and all(n.startswith(GS_TEMP_PREFIXES) for n in names)
+
+
 def _wipe_targeted_temp_roots(dry: bool, uid: int, already_done: list):
     """Securely delete OUR scratch from temp roots we must not wipe wholesale.
 
@@ -979,7 +1025,8 @@ def _wipe_targeted_temp_roots(dry: bool, uid: int, already_done: list):
             failed += 1
             continue
         for entry in entries:
-            if not entry.name.startswith(GS_TEMP_PREFIXES):
+            if not (entry.name.startswith(GS_TEMP_PREFIXES)
+                    or _is_private_scratch(entry, uid)):
                 continue
             try:
                 # lstat, so a symlink is judged by its OWN ownership rather

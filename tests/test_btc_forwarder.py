@@ -22,6 +22,7 @@ is checked against the file it writes and the transaction inside it:
     appears in neither the plan file nor the output;
   * what the hash chain gets is kinds without a digit in them.
 """
+import fnmatch
 import importlib.machinery
 import importlib.util
 import io
@@ -783,6 +784,54 @@ check("the floor is int(expected * 1e8 * (1 - margin)) -- the margin pinned "
       "to 10% -- and 0 is raised to exactly it",
       _direct(F.enforce_memo_terms, "=:XMR.XMR:x:0/1/0", _E, _W, 0)
       == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True)))
+# A LIMIT WITH A HUGE EXPONENT IS REFUSED AT ONCE. int(Decimal("1e2000000"))
+# is quadratic in the exponent -- 56 s, driven -- and the aggregator (or
+# whoever answers as it) chooses the memo; 119 bytes held the forward until
+# the job's budget ran out, and the operator got a timeout for a refusal.
+import time as _t_lim                                          # noqa: E402
+_t0_lim = _t_lim.monotonic()
+_big_lim = _direct(F.enforce_memo_terms, "=:XMR.XMR:x:1e2000000/1/0", _E, _W, 0)
+check("a limit of 1e2000000 is refused as memo_bad_limit, at once",
+      _big_lim == ("refused", "memo_bad_limit")
+      and _t_lim.monotonic() - _t0_lim < 2)
+check("...and so is twenty-one digits: no limit in 1e8 base units needs them",
+      _direct(F.enforce_memo_terms, "=:XMR.XMR:x:" + "1" * 21 + "/1/0",
+              _E, _W, 0) == ("refused", "memo_bad_limit"))
+check("the limit pattern itself is bounded: 20 digits, a 2-digit exponent",
+      F._LIMIT_RE.match("1" * 20) and F._LIMIT_RE.match("1e99")
+      and not F._LIMIT_RE.match("1" * 21) and not F._LIMIT_RE.match("1e100"))
+# ...AND EVERY OTHER NUMBER FROM OUTSIDE. The limit was bounded and THORNode's
+# dust_threshold and outbound_fee went on to int(Decimal(...)) unbounded --
+# 56 s for 1e2000000, driven by the review of the fix, and a traceback out
+# of main past that. The bound is at the one parse every external number
+# takes (gs_common.finite_decimal), so it cannot be half-applied again.
+_t0_in = _t_lim.monotonic()
+_n_in = Net(thornode=[{"chain": "BTC", "address": _INBOUND, "halted": False,
+                       "dust_threshold": "1e2000000",
+                       "outbound_fee": "1e2000000"}]).install()
+try:
+    _r_in = ("ok", F.cross_check_inbound(_INBOUND, "https://tn.example",
+                                         _PROXY))
+except SystemExit:
+    _r_in = ("refused", None)
+except Exception as _e_in:                                   # noqa: BLE001
+    _r_in = ("crash", f"{type(_e_in).__name__}")
+check("THORNode figures of 1e2000000 are no figures: read as absent, at once, "
+      "never a crash", _r_in == ("ok", (None, None))
+      and _t_lim.monotonic() - _t0_in < 2)
+_t0_ef = _t_lim.monotonic()
+check("...and an Electrum fee estimate of 1e999990 is no estimate, at once",
+      C.electrum_fee_to_sat_vb("1e999990") is None
+      and C.electrum_fee_to_sat_vb("0.00012") == 12
+      and _t_lim.monotonic() - _t0_ef < 2)
+check("the parse every external number takes is bounded both ways, and a "
+      "zero keeps no exponent",
+      C.finite_decimal("1e30") == Decimal("1e30")
+      and C.finite_decimal("1e31") is None
+      and C.finite_decimal("1e-31") is None
+      and C.finite_decimal("1e-30") == Decimal("1e-30")
+      and str(C.finite_decimal("0E+2000000")) == "0")
+
 check("one base unit under the floor is raised; the floor itself is kept",
       _direct(F.enforce_memo_terms, "=:XMR.XMR:x:134999999/1/0", _E, _W, 0)
       == ("ok", ("=:XMR.XMR:x:135000000/1/0", 135000000, 0, True))
@@ -1029,11 +1078,38 @@ def _spend_tx(memo_text=None, send=190000):
 
 
 _OURS = _spend_tx("=:XMR.XMR:" + _DEST + ":123456/1/0")
+
+
+def _new_of():
+    return os.path.join(_scratch, f"plan_{os.urandom(4).hex()}.json")
+
+
+def _ours_of(txid):
+    """A plan path whose record says this tool sent `txid`: what a send
+    that died before its plan leaves behind."""
+    _p = _new_of()
+    F.record_signed(_p, txid)
+    return _p
+
+
+# OUR MEMO ALONE IS NOT OURS. Every forward puts it on the chain, so a
+# seed thief who read this code attached it to a theft: the alarm became
+# "forward found on chain", a reconstructed plan the agent read as sent.
+_nk = Net(utxos=[], spends=[_OURS])
+_c, _o, _p, _of = run(_nk)
+check("EMPTIED BY A SPEND CARRYING OUR OWN MEMO THAT THIS BOX NEVER RECORDED "
+      "SENDING (a seed thief who copied the memo): FAILED, foreign_spend, no "
+      "plan -- and the log says the memo is copyable",
+      _c == F.EXIT_FAILED and _p is None
+      and ("forward", "foreign_spend") in _nk.kinds
+      and ("forward", "reconstructed") not in _nk.kinds
+      and "never recorded sending it" in _o and _nk.submits == [])
 _nr = Net(utxos=[], spends=[_OURS])
-_c, _o, _p, _of = run(_nr)
-check("EMPTIED BY OUR OWN FORWARD (the memo names this deposit's "
-      "destination): the run reports done, no quote is asked, nothing is "
-      "signed or sent, and the plan is RECONSTRUCTED from the chain",
+_c, _o, _p, _of = run(_nr, outfile=_ours_of(_OURS["txid"]))
+check("EMPTIED BY OUR OWN FORWARD (its txid recorded before it was sent, "
+      "its memo naming this deposit's destination): the run reports done, "
+      "no quote is asked, nothing is signed or sent, and the plan is "
+      "RECONSTRUCTED from the chain",
       _c == F.EXIT_OK and _p is not None and _p.get("reconstructed") is True
       and _nr.posts == [] and _nr.submits == [] and _nr.seens == []
       and ("forward", "reconstructed") in _nr.kinds
@@ -1095,7 +1171,7 @@ check("money on the address (unconfirmed): the history is NOT read -- that "
       and _ns.spend_calls == [])
 _two = Net(utxos=[], spends=[_spend_tx("=:XMR.XMR:" + _OTHER + ":0/1/0"),
                              _OURS])
-_c, _o, _p, _of = run(_two)
+_c, _o, _p, _of = run(_two, outfile=_ours_of(_OURS["txid"]))
 check("with several spends the LAST one decides (the newest state of the "
       "address)", _c == F.EXIT_OK and _p is not None
       and _p["txid"] == _OURS["txid"])
@@ -1107,6 +1183,98 @@ check("an OP_RETURN is read exactly as this tool lays one out -- one push, "
       and F._op_return_data(bytes([0x6a, 0x4c, 3]) + b"abcd") is None
       and F._op_return_data(_IN_SPK.data) is None
       and F._op_return_data(b"") is None and F._op_return_data(None) is None)
+
+
+# SENT, THEN KILLED BEFORE THE PLAN -- the case the reconstruction exists
+# for, driven end to end: the seen-wait runs for minutes over Tor, and the
+# box dies in it. The record must already hold the txid when the first
+# byte goes to a server.
+class _Died(BaseException):
+    pass
+
+
+class _DyingNet(Net):
+    def _submit(self, raw_hex, expected_txid, *a, **kw):
+        self.rec_at_submit = set(F.signed_txids(self.of))
+        return super()._submit(raw_hex, expected_txid, *a, **kw)
+
+    def _seen(self, *a, **kw):
+        raise _Died()
+
+
+_nd = _DyingNet(submit=_ACCEPTED)
+_nd.of = _new_of()
+try:
+    run(_nd, broadcast=True, outfile=_nd.of)
+    _died = False
+except _Died:
+    _died = True
+_dtx = (_nd.submits[0]["txid"] if _nd.submits else None)
+check("a forward's txid is RECORDED, and on disk, before its bytes reach "
+      "any server",
+      _died and _dtx is not None and _nd.rec_at_submit == {_dtx}
+      and not os.path.exists(_nd.of))
+_nd2 = Net(utxos=[], spends=[{"txid": _dtx, "height": 850001,
+                              "hex": _nd.submits[0]["raw_hex"],
+                              "inputs": [{"tx_hash": _H1, "vout": 0,
+                                          "value": 200000}],
+                              "server": "s.onion"}])
+_c, _o, _p, _ = run(_nd2, outfile=_nd.of)
+check("...and the next run finds that very forward on the emptied address "
+      "and reconstructs its plan: sent, not a leaked seed",
+      _c == F.EXIT_OK and _p is not None and _p.get("reconstructed") is True
+      and _p["txid"] == _dtx and ("forward", "foreign_spend") not in _nd2.kinds)
+# A RECORD THAT CANNOT BE WRITTEN SENDS NOTHING.
+_real_awj = F.atomic_write_json
+
+
+def _no_record(obj, path, *a, **k):
+    if str(path).endswith(".signed.json"):
+        raise OSError(28, "No space left on device")
+    return _real_awj(obj, path, *a, **k)
+
+
+F.atomic_write_json = _no_record
+try:
+    _nx = Net(submit=_ACCEPTED, seen=_SEEN0)
+    _c, _o, _p, _ = run(_nx, broadcast=True)
+finally:
+    F.atomic_write_json = _real_awj
+check("a record that cannot be written is a refusal: nothing is sent",
+      _c == F.EXIT_REFUSED and _nx.submits == []
+      and ("forward", "refused:signed_record_failed") in _nx.kinds)
+# The record yields txids and nothing else, keeps the newest SIGNED_KEEP,
+# and an unreadable one reads as empty -- the side that raises the alarm.
+_ofk = _new_of()
+_ids = [f"{i:064x}" for i in range(F.SIGNED_KEEP + 6)]
+for _t in _ids:
+    F.record_signed(_ofk, _t)
+F.record_signed(_ofk, _ids[-3].upper())
+_kept = F._read_signed(_ofk)
+check("the record keeps the newest SIGNED_KEEP txids, once each, the "
+      "re-recorded one moved to the end",
+      len(_kept) == F.SIGNED_KEEP and _kept[-1] == _ids[-3]
+      and _kept.count(_ids[-3]) == 1 and _ids[0] not in _kept
+      and _kept[0] == _ids[len(_ids) - F.SIGNED_KEEP])
+with open(F.signed_path(_ofk), "w") as _fh:
+    json.dump({"schema": F.SIGNED_SCHEMA,
+               "txids": [_nd.submits[0]["raw_hex"], "zz" * 32, 7, _dtx]}, _fh)
+check("...a record yields only 64-hex txids: a transaction or junk in it "
+      "is never read as one", F._read_signed(_ofk) == [_dtx])
+with open(F.signed_path(_ofk), "w") as _fh:
+    _fh.write("{not json")
+_nb = Net().install()
+check("...and an unreadable record reads as EMPTY, with a kind on the "
+      "chain: a spend it named is foreign, never a theft passed as ours",
+      F.signed_txids(_ofk) == set()
+      and ("forward", "signed_record_unreadable") in _nb.kinds)
+check("the record is wiped and sealed with the plans (btc_forward_*.json) "
+      "and is never read as a rotated plan",
+      any(fnmatch.fnmatch(F.signed_path("/a/btc_forward_h.json").name, _pt)
+          for _pt in C.GS_ARTIFACT_FILE_PATTERNS)
+      and F.signed_path("/a/btc_forward_h.json").name
+      == "btc_forward_h.signed.json"
+      and F._plan_chain(_ofk) == [])
 
 print("\n== STAGE 5: --reconcile, what became of a forward that went out ==")
 _TN = ("--thornode", "https://tn.example")
@@ -1245,15 +1413,29 @@ check("a spend this tool did not sign among the address's spends: FAILED, "
       _c == F.EXIT_FAILED and _n8.submits == [] and _n8.posts == []
       and ("forward", "foreign_spend") in _n8.kinds)
 # (h) our plan's txid is not listed, but a listed spend with OUR memo
-# consumed its inputs (an earlier reconciliation re-signed; this plan is
-# the older one): adopted, recorded as superseded, done.
+# consumed its inputs (an earlier reconciliation re-signed and died before
+# its plan; this plan is the older one): adopted -- ONLY because its txid
+# was recorded before it was sent -- recorded as superseded, done.
 _p9, _of9, _hx9 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
 _adopt = {**_spend_tx("=:XMR.XMR:" + _DEST + ":99/1/0"), "height": 850003}
+_n9k = Net(utxos=[], spends=[_adopt])
+_c, _o, _p, _ = _reconcile(_n9k, _of9)
+check("a listed spend with OUR memo that this box never recorded sending "
+      "(a seed thief who copied the memo from our first forward): FAILED, "
+      "foreign_spend -- it was adopted as ours and this plan marked "
+      "superseded by the theft, `forwarded` once it mined",
+      _c == F.EXIT_FAILED and ("forward", "foreign_spend") in _n9k.kinds
+      and ("forward", "adopted_spend") not in _n9k.kinds
+      and "never recorded sending it" in _o
+      and json.load(open(_of9)).get("superseded_by") is None
+      and _n9k.submits == [])
+F.record_signed(_of9, _adopt["txid"])
 _n9 = Net(utxos=[], spends=[_adopt])
 _c, _o, _p, _ = _reconcile(_n9, _of9)
-check("a listed spend with OUR memo that the plan chain did not know: "
-      "adopted as ours; this plan's inputs were consumed by it, so it is "
-      "recorded as superseded and the run is done -- nothing re-sent",
+check("a listed spend whose txid this box recorded before sending, that the "
+      "plan chain did not know: adopted as ours; this plan's inputs were "
+      "consumed by it, so it is recorded as superseded and the run is done "
+      "-- nothing re-sent",
       _c == F.EXIT_OK and _p["superseded_by"] == _adopt["txid"]
       and _n9.submits == [] and _n9.posts == []
       and ("forward", "adopted_spend") in _n9.kinds
@@ -2255,10 +2437,24 @@ check("the forwarder names no Electrum method that spends: the broadcast is "
 # wrote (STAGE5_PLAN.md 3.1): only under --reconcile, only after the
 # schema is checked, and only the bytes kept because the network had not
 # shown them. No --rebroadcast flag, no other read.
+# TWO FILES ARE READ, AND ONE OF THEM CAN HOLD A TRANSACTION: the plan.
+# The other is the record of sent txids, and it yields 64-hex strings and
+# nothing else (driven above, "a record yields only 64-hex txids").
+_jl = [_m.start() for _m in re.finditer(r"json\.load\(", _src)]
+
+
+def _inside(fn):
+    _a = _src.index(f"def {fn}(")
+    _b = _src.index("\ndef ", _a + 1)
+    return sum(1 for _j in _jl if _a < _j < _b)
+
+
 check("the forwarder reads a transaction from a file to send it ONLY in "
-      "--reconcile, from its own plan (schema checked), the kept bytes",
-      "--rebroadcast" not in _src and _src.count("json.load(") == 1
-      and _src.index("json.load(") > _src.index("def _read_plan(")
+      "--reconcile, from its own plan (schema checked), the kept bytes; the "
+      "one other file it parses is the txid record, inside _read_signed",
+      "--rebroadcast" not in _src and len(_jl) == 2
+      and _inside("_plan_file") == 1 and _inside("_read_signed") == 1
+      and "json.loads(" not in _src
       and 'plan.get("schema") != PLAN_SCHEMA' in _src
       and 'if plan.get("tx_hex"):' in _src
       and _src.index("_read_plan(args.outfile)")

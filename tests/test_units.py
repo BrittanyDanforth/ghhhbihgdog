@@ -3063,6 +3063,49 @@ check("fit_peel_distribution: ...and the result really is affordable",
       ghost.peel_entry_requirement(_fit, ghost.peel_carrier_reserves(_fit, _HR))
       <= Decimal("10") - _HR)
 
+# THE SURPLUS OFF THE LAST SHARE. Every hop holds back 1.5x the estimate and
+# spends ~1.1x; the last peel sweeps the difference to its destination
+# (driven: +0.17 XMR on a planned 0.019, 5x the mean, at priority 4). The
+# levelled plan moves what the last share has room for onto the others,
+# keeping the total -- so the requirement above still holds.
+_pre = list(ghost.compute_fanout_amounts(_usable, 6, Decimal("0.0024"),
+                                         False, _R()))
+_floor = ghost.min_exit_fundable(Decimal("0.0024"), False)
+_lv = ghost.level_peel_last(_pre, Decimal("0.05"), _floor)
+check("level_peel_last: the total is unchanged, the last share carries the "
+      "expected surplus less, and every other share is larger",
+      sum(_lv, Decimal(0)) == sum(_pre, Decimal(0))
+      and _pre[-1] - _lv[-1] <= Decimal("0.05")
+      and _pre[-1] - _lv[-1] > Decimal("0.049")
+      and all(_lv[i] >= _pre[i] for i in range(len(_pre) - 1))
+      and [i for i in range(len(_pre) - 1) if _lv[i] > _pre[i]])
+_lv2 = ghost.level_peel_last(_pre, Decimal("1000"), _floor)
+check("level_peel_last: ...never below the least any output may carry, and "
+      "an extra it cannot take stays where it was",
+      _lv2[-1] >= _floor and _lv2[-1] - _floor < Decimal("0.0001") * 6
+      and ghost.level_peel_last(_pre, Decimal(0), _floor) == _pre
+      and ghost.level_peel_last(_pre[:1], Decimal("1"), _floor) == _pre[:1])
+check("peel_last_extra: the balance, less the plan, less n measured fees "
+      "(1.10x the estimate each), plus the veil's leftover",
+      ghost.peel_last_extra([Decimal("1"), Decimal("2")], Decimal("3.1"),
+                            Decimal("0.01")) == Decimal("0.078")
+      and ghost.peel_last_extra([Decimal("1"), Decimal("2")], Decimal("3.1"),
+                                Decimal("0.01"), Decimal("0.002"))
+      == Decimal("0.080")
+      and ghost.peel_last_extra([Decimal("3")], Decimal("3"),
+                                Decimal("0.01")) == 0)
+_trial = ghost.compute_fanout_amounts(
+    max(_usable, Decimal("10") - _HR * 6), 6, Decimal("0.0024"), False, _R(),
+    spend_fraction=Decimal("1"))
+_want = min(ghost.peel_last_extra(_trial, Decimal("10"), Decimal("0.0024")),
+            _trial[-1] - _floor)
+check("fit_peel_distribution: the plan it returns is levelled -- the same "
+      "total, the last share lighter by the expected extra (to the dust "
+      "each other share rounds away)",
+      sum(_fit, Decimal(0)) == sum(_trial, Decimal(0))
+      and Decimal(0) <= _want - (_trial[-1] - _fit[-1]) < ghost.DUST_XMR * 6
+      and _want > ghost.DUST_XMR * 6)
+
 # A headroom large enough to make the default distribution unaffordable must
 # shrink it rather than hand back a plan that strands funds.
 _big = Decimal("0.4")

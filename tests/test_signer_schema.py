@@ -17,6 +17,7 @@ through, and the only one where the value becomes a transaction.
 These are pure-function checks: no daemon, no wallet, no binaries.
 """
 import importlib.machinery, importlib.util, io, os, sys, contextlib
+from decimal import Decimal
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 ld=importlib.machinery.SourceFileLoader("airgap_tx_signer", os.path.join(REPO,"airgap_tx_signer"))
@@ -320,6 +321,46 @@ _dr3 = _DriftRPC(5_000_000_000_000,
                  [2_635_200_000, 2_700_000_000, 2_650_000_000])
 ck("a first exact build that fails is re-priced and retried, not fatal",
    _raises(_dr3) == "")
+# AT PRIORITY 4 THE RE-PRICE WAS OVER THE DUST THE SIGNER TAKES. Two percent
+# of a 0.0088 XMR fee is 0.000176, over CONSUME_CHANGE_MAX; a build priced
+# that much over its real fee kept the difference as change, a retry that
+# then drew high returned it, and the signer refused the peel (the review of
+# the last change: half of 45-peel chains). Probe LOW, then HIGH, LOW, HIGH.
+class _P4(_DriftRPC):
+    def raw_request(self, method, params=None):
+        r = super().raw_request(method, params)
+        if method == "transfer":
+            r["_change"] = (self.unlocked - sum(
+                int(d["amount"]) for d in params["destinations"]) - r["fee"])
+        return r
+
+
+_LO4, _HI4 = 8_800_000_000, 8_804_000_000
+_p4 = _P4(5_000_000_000_000, [_LO4, _HI4, _LO4, _HI4, _HI4, _HI4])
+with _cl5.redirect_stdout(_io5.StringIO()):
+    try:
+        _r4 = a._build_exact_consume(_p4, CONSUME, _dests, 5, 1, 4)
+    except Exception:                                        # noqa: BLE001
+        _r4 = None
+ck("at priority 4 the retry never returns a build whose change the signer "
+   "refuses (re-priced by at most a quarter of CONSUME_CHANGE_MAX)",
+   _r4 is not None and 0 <= _r4["_change"]
+   <= int(a.CONSUME_CHANGE_MAX * 10 ** 12) // 4)
+# ...AND A BUILD IN HAND IS SETTLED FOR ONLY IF THE SIGNER WILL TAKE IT. A
+# probe that drew far over the real fee (the estimate moved between them)
+# priced the first exact build 0.0002 XMR high -- change over the limit --
+# and the next draw failing used to return that one.
+_p4b = _P4(5_000_000_000_000,
+           [9_000_000_000, _LO4, _HI4, _LO4, _HI4, _HI4, _HI4])
+with _cl5.redirect_stdout(_io5.StringIO()):
+    try:
+        _r4b = a._build_exact_consume(_p4b, CONSUME, _dests, 5, 1, 4)
+    except Exception:                                        # noqa: BLE001
+        _r4b = None
+ck("a usable build whose change the signer would refuse is not settled for "
+   "while a retry can do better",
+   _r4b is not None and 0 <= _r4b["_change"]
+   <= int(a.CONSUME_CHANGE_MAX * 10 ** 12))
 ck("NON-VACUITY: a carrier that can never be built still fails closed",
    "not enough money" in _raises(_DriftRPC(
        5_000_000_000_000, [2_635_200_000] + [9_000_000_000_000] * 9)))
@@ -551,6 +592,14 @@ def _with_fee(fee, body):
     return body.replace("fee 0.000030000000", f"fee {fee}")
 
 
+def _bad_fee(v):
+    try:
+        a._max_fee_arg(v)
+    except Exception:                                       # noqa: BLE001
+        return True
+    return False
+
+
 _sw = [{"src_index": 2, "dst": _HON, "sweep": True}]
 ck("a sweep that burns 9.9 XMR as fee is refused",
    _agrees(_with_fee("9.900000000000",
@@ -583,7 +632,58 @@ ck("the cross-check is actually wired into the signing loop, with the PLAN",
    "_check_wallet_cli_agrees(" in _sg
    and _sg.count("_check_wallet_cli_agrees(") >= 2
    and '(result.stdout or "") + (result.stderr or ""), plan, idx,' in _sg
-   and 'fee_per_round=(meta or {}).get("fee_per_round"))' in _sg)
+   and 'fee_per_round=(meta or {}).get("fee_per_round"),' in _sg
+   and 'max_fee=getattr(args, "max_fee_xmr", None))' in _sg)
+
+
+# A DUSTED VEIL. The entry address is public in the swap memo, and every
+# output on it is an input of the veil's sweep_all: 43 inputs pay 0.000601
+# XMR at a plan whose estimate is 0.00004 (fee_per_round 0.00006), over ten
+# times the estimate -- and the bound refused it as a burned fee, for good,
+# stranding the swap on the public address (the review of the last change,
+# driven with monero's own weight formula).
+def _chk(body, plan, **kw):
+    try:
+        with _cl6.redirect_stdout(_io6.StringIO()):
+            a._check_wallet_cli_agrees(body, plan, 0, **kw)
+        return "ALLOWED", ""
+    except SystemExit as e:
+        return "REFUSED", str(e)
+    except Exception as e:                                   # noqa: BLE001
+        return "CRASHED", f"{type(e).__name__}: {e}"
+
+
+_dust = _with_fee("0.000601020000", _loaded([("2.999398980000", _HON)]))
+_veil43 = [{"src_index": 2, "dst": _HON, "sweep": True, "inputs": 43}]
+ck("a veil the plan COUNTED 43 inputs for signs at the 43-input fee",
+   _chk(_dust, _veil43, fee_per_round="0.00006")[0] == "ALLOWED")
+_st, _msg = _chk(_dust, _sw, fee_per_round="0.00006")
+ck("...uncounted, it is refused -- but as a FEE over a bound, not as a "
+   "tampered blob: what it pays for, and the way past it",
+   _st == "REFUSED" and "pays exactly the plan's destinations" in _msg
+   and "does NOT" not in _msg and "about 42 inputs" in _msg
+   and "--max-fee-xmr 0.00060102" in _msg)
+ck("...and --max-fee-xmr at that figure signs it, one under refuses",
+   _chk(_dust, _sw, fee_per_round="0.00006",
+        max_fee=Decimal("0.00060102"))[0] == "ALLOWED"
+   and _chk(_dust, _sw, fee_per_round="0.00006",
+            max_fee=Decimal("0.00060101"))[0] == "REFUSED")
+# THE COUNT THE SET REPORTS IS WHAT IS BEING CHECKED: it multiplied the
+# bound, so a set of 40 transactions could burn 40 times as much.
+_forty = _with_fee("0.020000000000", _loaded([("2.979970000000", _HON)])
+                   ).replace("Loaded 1 transactions", "Loaded 40 transactions")
+ck("a set reporting 40 transactions earns no 40x bound",
+   _chk(_forty, _sw, fee_per_round="0.00006")[0] == "REFUSED")
+_vv = {**_veil43[0], "src": "entry"}
+ck("'inputs' is a whole number from 2, and nothing else",
+   "'inputs'" in rejects([{**_vv, "inputs": 1}])[1]
+   and "'inputs'" in rejects([{**_vv, "inputs": True}])[1]
+   and "'inputs'" in rejects([{**_vv, "inputs": "43"}])[1]
+   and "'inputs'" in rejects([{**_vv, "inputs": a.MAX_PLANNED_INPUTS + 1}])[1]
+   and rejects([_vv]) == (False, "ACCEPTED"))
+ck("--max-fee-xmr takes a positive amount up to 1 XMR, and nothing else",
+   getattr(a, "_max_fee_arg", lambda v: None)("0.0006") == Decimal("0.0006")
+   and all(_bad_fee(v) for v in ("0", "-1", "1.1", "nan", "inf", "x")))
 ck("...and it reads BOTH streams, since wallet-cli's prompt may be on either",
    "(result.stdout or \"\") + (result.stderr or \"\")" in _sg)
 

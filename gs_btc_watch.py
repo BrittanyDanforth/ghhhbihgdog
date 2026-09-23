@@ -314,13 +314,33 @@ def summarize(utxos, tip, min_conf):
 
 
 def chain_id(xpub, network="main"):
-    """A short, public-safe name for the CHAIN an account xpub derives: a
-    digest of its FIRST receiving address, never of the xpub's text. An
-    xpub and a zpub of one account derive the same addresses and are one
-    chain; keyed on the text, the vault's issued-index mark read a re-pair
-    that pasted the other encoding as a fresh chain and handed address 0
-    out again. Sixteen hex characters: names no address, no amount, no
-    client. Raises BtcWatchError for an xpub that derives nothing."""
+    """A short name for the CHAIN an account xpub derives, safe to leave on
+    a disk that is taken: an HMAC of the account's public key under its
+    CHAIN CODE, never the xpub's text. An xpub and a zpub of one account
+    carry the same key and chain code and are one chain; keyed on the text,
+    the vault's issued-index mark read a re-pair that pasted the other
+    encoding as a fresh chain and handed address 0 out again.
+    KEYED, NOT A PLAIN DIGEST (the host-privacy pass): this was
+    sha256("addr0:" + first address), and the first address is public the
+    moment a client pays it -- THORChain shows every BTC sender, and an
+    address list is a hash away from the file name the wipe leaves on
+    purpose. Whoever took the vault could hash candidate addresses until
+    one named the mark, and so tie this box to deposit 0 and to how many
+    followed it. The chain code is in the xpub and in no address, so the
+    name says nothing to anyone who cannot already derive every deposit
+    address. Sixteen hex characters. Raises BtcWatchError for an xpub that
+    derives nothing."""
+    derive_receive_address(xpub, 0, network)        # every refusal, one place
+    hd = bip32.HDKey.from_base58(str(xpub))
+    return hmac.new(hd.chain_code, b"gs-issued-mark-v2:" + hd.key.sec(),
+                    hashlib.sha256).hexdigest()[:16]
+
+
+def legacy_chain_id(xpub, network="main"):
+    """The name chain_id gave before it was keyed: a digest of the chain's
+    first address. Read ONLY to find a mark written under it -- a vault
+    updated in place must still see how many addresses it handed out, or
+    its wiped ledger would hand address 0 out again -- and never written."""
     a0 = derive_receive_address(xpub, 0, network)
     return hashlib.sha256(("addr0:" + str(a0)).encode()).hexdigest()[:16]
 

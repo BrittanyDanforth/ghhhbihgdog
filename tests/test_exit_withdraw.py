@@ -282,6 +282,55 @@ check("exit: every destination is one the operator supplied",
       all(t["dst"] in (A1, A2) for t in _txs))
 check("exit: the withdrawal is SPREAD across both destinations",
       len({t["dst"] for t in _txs}) == 2)
+check("exit: an output-count the wallet did not report is no 'inputs' "
+      "(one input, the planned shape)",
+      all("inputs" not in t for t in _txs))
+
+
+# A RECEIVE SUBADDRESS IS PUBLIC IN ITS SWAP'S MEMO, and every output on it --
+# dust anyone can send -- is an input of its exit sweep. Counted into the
+# plan like an entry veil's, so the signer's fee bound allows for them.
+class _DustRPC(_BalRPC):
+    def raw_request(self, method, params=None):
+        if method == "incoming_transfers":
+            _a = (params or {}).get("account_index")
+            _s = ((params or {}).get("subaddr_indices") or [None])[0]
+            _n = 17 if (_a, _s) == (7, 1) else 1
+            return {"transfers": [{"amount": 5, "spent": False}] * _n}
+        return super().raw_request(method, params)
+
+
+_saved = (ghost._run_round, ghost._wait_for_change_settled,
+          ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+          ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+rec2 = _Recorder()
+try:
+    ghost._run_round = rec2
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.connect_rpc = lambda *a, **k: _DustRPC(
+        {7: {1: 3_000_000_000_000}, 8: {1: 2_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _outdir2 = _tf.mkdtemp(prefix="exitwd2_")
+    _stg2 = os.path.join(_outdir2, "tx_staging")
+    os.makedirs(_stg2, exist_ok=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost._run_exit_withdrawals(
+            types.SimpleNamespace(**dict(vars(_args), output=_outdir2)),
+            [7, 8], [A1, A2], _stg2, None, {}, (0, 0))
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay) = _saved
+_t2 = {(t["account_index"], t["src_index"]): t
+       for r in rec2.rounds for t in r}
+check("exit: a dusted subaddress's sweep carries its input count (17); a "
+      "one-output one carries none",
+      _t2.get((7, 1), {}).get("inputs") == 17
+      and "inputs" not in _t2.get((8, 1), {"inputs": 0}))
 # THIS CHECK USED TO READ:
 #
 #   check("exit: each carries its own random extra (no shared fingerprint)",

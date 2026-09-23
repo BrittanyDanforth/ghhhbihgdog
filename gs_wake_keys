@@ -85,6 +85,7 @@ import re
 import socket
 import struct
 import sys
+sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -749,15 +750,22 @@ def mark_note_lines(args) -> list:
     if not xpub:
         return []
     import gs_btc_watch as _w
-    try:
-        cid = _w.chain_id(xpub, str(getattr(args, "btc_network", "main")
-                                    or "main"))
-        p = Path(str(args.mark_dir)) / f"issued_{cid}.json"
-        d = json.loads(p.read_text())
-        n = d.get("issued") if isinstance(d, dict) else None
-    except Exception:                                        # noqa: BLE001
-        return []
-    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+    _net = str(getattr(args, "btc_network", "main") or "main")
+    # UNDER EITHER ID: the keyed one, and the address digest a mark carried
+    # before the host-privacy pass (the agent reads both, and renames the
+    # old one at its next deposit).
+    n, p = None, None
+    for _id in (_w.chain_id, _w.legacy_chain_id):
+        try:
+            _p = Path(str(args.mark_dir)) / f"issued_{_id(xpub, _net)}.json"
+            d = json.loads(_p.read_text())
+            _n = d.get("issued") if isinstance(d, dict) else None
+        except Exception:                                    # noqa: BLE001
+            continue
+        if isinstance(_n, int) and not isinstance(_n, bool) \
+                and (n is None or _n > n):
+            n, p = _n, _p
+    if not isinstance(n, int) or n <= 0:
         return []
     return [
         f"[*] This chain has handed out {n} deposit address(es) before "
@@ -1265,8 +1273,14 @@ def do_pair(args) -> int:
     tp_path = outdir / THINKPAD_FILE
     _refuse_existing(tp_path)
 
-    sk = nacl.public.PrivateKey.generate()
-    my_pub = sk.public_key.encode()
+    # A FRESH KEYPAIR FOR EVERY CONNECTION, minted inside the loop below. It
+    # was minted once, here, and every connection that failed after the
+    # reveal -- a hang-up, a key that did not match its commitment -- left the
+    # vault listening WITH THE SAME KEY. pair_sas's 40 bits rest on neither
+    # side choosing its key while knowing the other's; across connections
+    # anyone who could reach the port learned the vault's key first and then
+    # committed to theirs. Driven: two connections, one revealed key.
+    sk = my_pub = None
 
     # THE FEE ADDRESS IS MINTED BEFORE THE PI IS INVOLVED, so a fee wallet-rpc
     # that is down, or that is really the mixing wallet, aborts here with
@@ -1292,8 +1306,17 @@ def do_pair(args) -> int:
                 sys.exit("[!] the Pi never connected. Nothing was written. "
                          "Check the cable, the address, and that both boxes "
                          "are on the same switch.")
+            sk = nacl.public.PrivateKey.generate()
+            my_pub = sk.public_key.encode()
             try:
                 agreed = _one_attempt(conn, peer, sk, my_pub, args)
+            except proto.PairTampered as e:
+                # NOT A STRAY. A revealed key that does not match its
+                # commitment is someone trying to choose the code; listening
+                # on would hand them another try.
+                sys.exit(f"[!] {e}\n    The ceremony is over. Take "
+                         f"everything you do not own off the switch and pair "
+                         f"again.")
             except proto.PairAborted as e:
                 # A PERSON decided. Not a fault, and not something to sit
                 # through: retrying would ask them again until they got it

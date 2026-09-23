@@ -318,6 +318,47 @@ check("G5: with FOUR it says the veil will be a 4-INPUT transaction",
 check("G5: ...and that the rings can be intersected to find the carrier",
       "intersect" in _m and "carrier" in _m)
 
+# A DUSTED VEIL IS SIZED AND BOUNDED AS WHAT IT IS. Every output on the
+# entry address -- dust anyone can send to the address the memo publishes --
+# is an input of the veil, and its fee grows with each. The veil reserved
+# one one-input fee, the chain's slack paid the rest and peels stopped
+# part-way (driven by the review of the last change: 16-59 chains of ~1100
+# at 20-40 dust outputs); the signer's fee bound refused it as a burned fee.
+def _veil_plan(transfers):
+    _saved = ghost.create_fresh_account
+    try:
+        ghost.create_fresh_account = lambda rpc, label="": 41
+        with contextlib.redirect_stdout(io.StringIO()):
+            return ghost.build_entry_veils(_XferRPC(transfers),
+                                           [("ENTRY0", 3, 1)])[0]
+    finally:
+        ghost.create_fresh_account = _saved
+
+
+_d43 = [{"amount": 1000, "spent": False} for _ in range(43)]
+check("G5: a dusted entry's veil carries its input count; a clean one does "
+      "not", _veil_plan(_d43)[0].get("inputs") == 43
+      and "inputs" not in _veil_plan(_one)[0])
+_fx = Decimal("0.00004")
+_sv = ghost.create_fresh_account
+ghost.create_fresh_account = lambda rpc, label="": 41
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _vp43, _vs43, _vb43 = ghost.resolve_entry_veils(
+            _XferRPC(_d43), types.SimpleNamespace(entry_veil=True), {},
+            [("ENTRY0", 3, 1)], Decimal("1"), _fx, None)
+finally:
+    ghost.create_fresh_account = _sv
+check("G5: ...and the distribution is sized after THAT veil's fee (43 inputs "
+      "cost ~13.8x one), not one input's",
+      _vb43 == Decimal("1") - ghost.veil_fee_reserve(_fx, 43)
+      and ghost.veil_fee_reserve(_fx, 43) > 13 * ghost.hop_fee_reserve(_fx)
+      and ghost.veil_fee_reserve(_fx, None) == ghost.hop_fee_reserve(_fx)
+      and ghost.veil_fee_reserve(_fx, 1) == ghost.hop_fee_reserve(_fx))
+check("G5: ...and the reserve covers the measured fee of that sweep with the "
+      "usual margin", ghost.veil_fee_reserve(_fx, 43)
+      >= _fx * ghost.fee_mult_for_inputs(43) * Decimal("1.3"))
+
 # THE TWO CASES ARE NOT THE SAME, and the message has to say which is which.
 # Two publicly-known swap outputs give an analyst two candidate sets to
 # intersect; one swap output plus a stranger's dust gives him nothing to
@@ -3251,6 +3292,41 @@ for _w in (3, 10, 20, 60):
           f"is worth more than the fee to spend it",
           (_b * _MM_CUT).quantize(ghost.DUST_XMR)
           > ghost.hop_fee_reserve(_MFU_FEE))
+
+# EACH CHUNK PAYS ITS OWN VEIL. A dusted entry address's veil costs a fee per
+# output; sized as one one-input fee spread over every chunk, the dusted
+# chunk's fan-out asked its carrier for more than its veil had left it --
+# "not enough money" AFTER the veils had relayed. Each chunk is sized by
+# what its own carrier will hold.
+import random as _rnd_cv                                          # noqa: E402
+_cv_fee = _MFU_FEE_HI
+_cv_unl = [Decimal("0.3"), Decimal("3.0")]
+_cv_entries = [("a0", 0, 1), ("a1", 1, 1)]
+_cv_dests = ["d%d" % i for i in range(12)]
+_cv_over = []
+with contextlib.redirect_stdout(io.StringIO()):
+    for _seed in range(20):
+        try:
+            _cv = ghost.size_and_prune_chunks(
+                _MMArgs(10), list(_cv_entries), list(_cv_unl), _cv_dests,
+                sum(_cv_unl, Decimal(0)), _cv_fee, _rnd_cv.Random(_seed),
+                veil_inputs=[43, None])
+        except SystemExit:
+            continue
+        except TypeError as _te:
+            _cv_over.append(("no per-chunk veil sizing", str(_te)[:60]))
+            break
+        _cv_by = dict(zip(_cv_dests, _cv[6]))
+        for _i, (_e, _sl) in enumerate(zip(_cv[0], _cv[4])):
+            _hold = (_cv[1][_i] - ghost.veil_fee_reserve(
+                _cv_fee, 43 if _e == _cv_entries[0] else None))
+            if sum((_cv_by[_d] for _d in _sl), Decimal(0)) > _hold:
+                _cv_over.append((_seed, _e, _hold))
+check("fan-out: no chunk's slice asks for more than its OWN carrier holds "
+      "after its own (dusted, 43-input) veil", _cv_over == [])
+check("fan-out: ...and the reserve for all of them is each veil's own",
+      ghost.veil_fee_reserve(_cv_fee, 43) + ghost.veil_fee_reserve(_cv_fee)
+      > 2 * ghost.hop_fee_reserve(_cv_fee) * 5)
 
 # THE ENTRY VEIL'S FEE, WHICH THE PUBLISHED MINIMUM USED TO OMIT.
 #
