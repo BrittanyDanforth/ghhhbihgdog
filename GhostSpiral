@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse, atexit, json, os, re, sys, time, subprocess, secrets
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from gs_common import (
     SWAPKIT_API, parse_swap_route, memo_size_note, fee_estimate_per_tx,
@@ -51,6 +51,7 @@ from gs_common import (
     integrity_log_once,
     secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
+    RECEIVE_SCHEMA,
     finite_decimal,
     decimal_env, XMR_ABSURD_TOTAL, BTC_ABSURD_TOTAL,
     delay_is_sane,
@@ -1769,11 +1770,23 @@ def peel_entry_requirement(amounts: list, reserves: list) -> Decimal:
 
 
 
-#: Fractions of `usable` the peel planner will try, in order, when the default
-#: distribution does not leave every hop its headroom. None means "whatever
-#: compute_fanout_amounts already produced".
-PEEL_BUDGET_FRACTIONS = (None, Decimal("0.80"), Decimal("0.70"),
-                         Decimal("0.60"), Decimal("0.50"), Decimal("0.40"))
+#: Fractions of `usable` the peel planner will try, in order, until every hop
+#: has its headroom.
+#:
+#: ALL OF IT FIRST. This began at None -- "whatever compute_fanout_amounts
+#: produced", i.e. FANOUT_SPEND_FRACTION, 0.9 -- and a peel chain has no change
+#: to leave the other tenth on: each peel forwards everything it does not pay
+#: to the next carrier and the last one sweeps, so the undistributed 10% rode
+#: the chain to the LAST destination. Driven with the shipped planner: at 10
+#: XMR the last output was 1.92 against a mean of 0.58 (3.3x), at 50 XMR 6.20
+#: against 1.75 -- one conspicuous output, exactly what the note above
+#: PEEL_CARRIER_RESERVE_MULT says the chain must not produce, and then sent to
+#: --exit-to. The 0.9 exists for a MANY-output fan-out that could not be
+#: constructed near 100% on a test chain; a peel transaction is 1-in/2-out
+#: with its second output "the rest", so spending all of it is its shape.
+PEEL_BUDGET_FRACTIONS = (Decimal("1"), Decimal("0.90"), Decimal("0.80"),
+                         Decimal("0.70"), Decimal("0.60"), Decimal("0.50"),
+                         Decimal("0.40"))
 
 
 class PeelBudgetError(Exception):
@@ -1804,10 +1817,13 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     the entire remaining balance on a carrier subaddress, which this pipeline
     has no auto-resume for. Reproduced end to end before this existed.
 
-    `frac` is None when the default distribution already fit, otherwise the
-    fraction that did -- the caller reports it rather than this deciding how to
-    talk to the operator. Raises PeelBudgetError when nothing fits, so the
-    caller fails BEFORE any money moves.
+    `frac` is None when the WHOLE of `usable` fit, otherwise the fraction that
+    did -- the caller reports it, and where the rest goes, rather than this
+    deciding how to talk to the operator. Raises PeelBudgetError when nothing
+    fits, so the caller fails BEFORE any money moves.
+
+    `amounts` (the fan-out's own distribution) is no longer the first trial:
+    see PEEL_BUDGET_FRACTIONS for why a peel chain starts from all of usable.
 
     Returns (amounts, frac).
     """
@@ -1815,9 +1831,10 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     # later hop, so it comes off the balance before anything is distributed.
     cap = bal - hop_headroom
     for frac in PEEL_BUDGET_FRACTIONS:
-        trial = (amounts if frac is None else compute_fanout_amounts(
+        trial = compute_fanout_amounts(
             usable, fanout_count, fee_xmr, dag_enabled, rng,
-            spend_fraction=frac))
+            spend_fraction=frac)
+        frac = None if frac == Decimal("1") else frac
         if not trial:
             continue
         reserves = peel_carrier_reserves(trial, hop_headroom)
@@ -3445,7 +3462,8 @@ def entry_balance_reader(rpc_primary, pairs: list, echo=print, clock=None):
 
 
 def read_entry_balances_strict(rpc_primary, pairs: list, what: str,
-                               attempts: int = 3, sleep_fn=None) -> list:
+                               attempts: int = 8, sleep_fn=None,
+                               recovery=None) -> list:
     """entry_set_balances for a DECISION, not for a poll. Fails closed.
 
     The poll loop can afford to under-report: it just polls again. The read
@@ -3468,6 +3486,17 @@ def read_entry_balances_strict(rpc_primary, pairs: list, what: str,
     spent at this point in the run -- this read happens before the veil -- so
     aborting costs the operator a re-run and keeps every chunk recoverable,
     which is strictly better than silently mixing three quarters of it.
+
+    BUT THE SWAP HAS LANDED, which is what makes an abort here expensive, and
+    two things follow. PATIENTLY: eight reads over about three minutes rather
+    than three over six seconds, because a wallet-rpc busy refreshing is the
+    likely cause and waiting it out costs nothing. And "RUN AGAIN" IS WRONG IN
+    SEND MODE: a send run mints a fresh ENTRY every time, so the re-run this
+    told the operator to make would leave this chunk stranded on an address
+    its swap memo names in public -- the veil-timeout message in this file
+    says exactly that. `recovery` = (wallet-rpc URL, [(addr, account,
+    index)]) in send mode: a receive bundle is written for each entry, and
+    the message says to mix each from where it sits.
     """
     sleep_fn = sleep_fn or time.sleep
     last = []
@@ -3483,9 +3512,9 @@ def read_entry_balances_strict(rpc_primary, pairs: list, what: str,
             print(f"  [!] {len(bad)} of {len(pairs)} entry address(es) could "
                   f"not be read ({what}); retrying "
                   f"({attempt}/{attempts - 1}).")
-            sleep_fn(min(10, 2 ** attempt))
+            sleep_fn(min(60, 2 ** attempt))
     integrity_log("stage4", "entry_balance_unreadable_abort")
-    sys.exit(
+    _head = (
         f"[!] {len(last)} of {len(pairs)} entry address(es) could not be read "
         f"from wallet-rpc ({str(last[0][2])[:80]}).\n"
         f"    NOTHING HAS BEEN SPENT. This read decides which swap chunks the "
@@ -3494,9 +3523,34 @@ def read_entry_balances_strict(rpc_primary, pairs: list, what: str,
         f"one: continuing would\n"
         f"    drop a chunk that is fully funded, leave its money on ENTRY "
         f"unmixed, and tell you\n"
-        f"    it never arrived. Fix the wallet-rpc connection and run again — "
-        f"every chunk is\n"
-        f"    still where the swap put it.")
+        f"    it never arrived.")
+    if not recovery:
+        sys.exit(_head + " Fix the wallet-rpc connection and run again — "
+                 "every chunk is\n    still where the swap put it.")
+    _rpc_url, _entries = recovery
+    _made = []
+    for _addr, _acct, _idx in _entries:
+        _b = Path(f"wallet_recover_{secure_hex(4)}.json")
+        try:
+            atomic_write_json({"schema": RECEIVE_SCHEMA,
+                               "address": _addr, "account_index": int(_acct),
+                               "subaddress_index": int(_idx),
+                               "rpc_endpoint": _rpc_url}, _b, perms=0o600)
+            _made.append(str(_b))
+        except Exception:                                    # noqa: BLE001
+            _made.append(f"(could not write; account {_acct}, subaddress "
+                         f"{_idx})")
+    sys.exit(
+        _head + "\n"
+        "    DO NOT simply run this again: a send run mints a NEW entry "
+        "address, and the\n"
+        "    swap you already paid would stay on this one, named by its "
+        "memo, unmixed.\n"
+        "    Once wallet-rpc answers, mix each chunk from where it sits -- "
+        "one run per bundle:\n"
+        + "".join(f"        GhostSpiral --receive-wallet {m} ...\n"
+                  for m in _made)
+        + "    (the same settings as this run, without --btc-entry).")
 
 
 def swap_expected_total(deposits: list) -> tuple:
@@ -4670,6 +4724,45 @@ def wallet_sync_reasons(h1: int, tip: int, h2=None, alt_err: str = "") -> list:
     return why
 
 
+def resolve_wallet_file(args) -> None:
+    """Make --wallet-file absolute, and refuse now if there is nothing to sign
+    with -- BEFORE a quote, a swap or a mint.
+
+    The default was the relative "offline.wallet", passed as-is to the signer,
+    which checked it from ITS cwd and then ran monero-wallet-cli from a scratch
+    directory in /dev/shm, where no relative path exists. Nothing looked at the
+    wallet before the swap, so the first thing to fail was Round 0 -- "Only 0/1
+    TXs signed" -- with the XMR already on ENTRY; and a send-mode re-run mints
+    a new ENTRY, which strands the first. Resolved against the directory the
+    operator ran this from, which is what they meant.
+
+    The .keys file is the one wallet-cli cannot sign without (the spend key
+    lives there); the cache beside it is rebuilt if absent.
+    """
+    wf = str(getattr(args, "wallet_file", "") or "").strip()
+    if not wf:
+        sys.exit("[!] --wallet-file is empty. It names the full wallet the "
+                 "rounds are signed with.")
+    p = Path(wf).expanduser()
+    if p.name.endswith(".keys"):
+        p = p.with_name(p.name[:-len(".keys")])
+    try:
+        p = p.resolve()
+    except OSError:
+        p = Path(os.path.abspath(str(p)))
+    if not Path(str(p) + ".keys").is_file():
+        integrity_log("stage0", "REFUSED:no_wallet_keys")
+        sys.exit(
+            f"[!] No wallet to sign with: {p}.keys does not exist.\n"
+            f"    Every round is signed by the full wallet named by "
+            f"--wallet-file (default\n"
+            f"    'offline.wallet', read from the directory you run this in). "
+            f"Nothing has been\n"
+            f"    spent or quoted. Pass --wallet-file /full/path/to/wallet "
+            f"(without .keys).")
+    args.wallet_file = str(p)
+
+
 def stage0_preflight(args, proxy) -> tuple:
     """Every gate that must hold BEFORE this run is allowed to touch money.
 
@@ -4698,6 +4791,7 @@ def stage0_preflight(args, proxy) -> tuple:
     """
     # ---- Stage 0: Environment checks ----
     require_resources(min_disk_gb=2.0)
+    resolve_wallet_file(args)
     verify_tor(proxy)
     integrity_log("stage0", "tor_ok")
 
@@ -7661,6 +7755,20 @@ def plan_usage_fee(rpc, args, bal: Decimal, fee_xmr: Decimal) -> tuple:
     return None, Decimal(0), None
 
 
+def _account_change_address(rpc_primary, account) -> Optional[str]:
+    """The address of `account`'s subaddress 0 -- where monerod returns a
+    transfer's change -- or None if the wallet will not say."""
+    try:
+        res = rpc_primary.raw_request("get_address", {
+            "account_index": int(account), "address_index": [0]})
+        for e in (res or {}).get("addresses") or []:
+            if e.get("address_index") == 0 and isinstance(e.get("address"), str):
+                return e["address"]
+    except Exception:                                        # noqa: BLE001
+        pass
+    return None
+
+
 def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                             fanout_dests, fanout_by_addr, _dest_slices,
                             fee_xmr, bal_account, fanout_count,
@@ -7809,17 +7917,23 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                 f"distribution, or fund\n"
                 f"    the wallet more.")
         if _frac is not None:
-            # SHRUNK, and said so. The operator asked to distribute a certain
-            # amount and is getting less; the remainder stays on ENTRY rather
-            # than being silently absorbed.
+            # SHRUNK, and said so -- and said TRUTHFULLY. This told the
+            # operator "the rest stays on ENTRY", which nothing in a peel
+            # chain does: peel 0 spends ENTRY whole, every peel forwards what
+            # it does not pay, and the last one sweeps. The rest arrives on
+            # the LAST destination, on top of its own share.
             integrity_log("stage4", f"peel_distribution_shrunk:{_frac}")
+            _rest = usable - sum(_fitted, Decimal(0))
             print(f"  [!] The peel chain could not carry the full "
                   f"distribution: {fanout_count} hops need "
                   f"{_hop_fee * (fanout_count - 1)} XMR of headroom on top of "
                   f"it, which this balance does not leave.")
             print(f"      Distributing {_frac * 100:.0f}% of the usable "
-                  f"balance instead. The rest stays on ENTRY — it is not "
-                  f"lost, and it is not mixed either.")
+                  f"balance instead. The other ~{_rest.quantize(DUST_XMR)} "
+                  f"XMR rides the chain to the LAST peel's destination, which "
+                  f"will receive that much more than its share -- one output "
+                  f"visibly larger than the rest. Fewer --wallets, or the "
+                  f"fan-out distribution, avoids it.")
         _peel_amounts = _fitted
         # ONE SOURCE OF TRUTH for the amounts from here down. fanout_by_addr is
         # what build_peel_stage_plan reads, so a shrunk plan that did not
@@ -7960,13 +8074,24 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
             if _fee_by_chunk and _fee_by_chunk[_si] > 0:
                 _dests.append({"address": fee_addr,
                                "amount": str(_fee_by_chunk[_si])})
-            fanout_plan.append({
+            _entry = {
                 "src": _src_addr,
                 "src_index": _src_idx,
                 "account_index": _src_acct,
                 "destinations": _dests,
                 "delay": hop_delay(_delay_window),
-            })
+            }
+            # WHERE THIS TRANSFER'S CHANGE MAY GO, in the plan the signer
+            # checks the blob against: monerod returns it to the spending
+            # account's subaddress 0, and a blob rewritten to send the change
+            # elsewhere prints "<amount> change to <someone else>" in
+            # wallet-cli's own decode -- which the signer can only refuse if
+            # the plan says what the address should be. Left out, rather than
+            # guessed, when the wallet will not say.
+            _chg = _account_change_address(rpc_primary, _src_acct)
+            if _chg:
+                _entry["change_to"] = _chg
+            fanout_plan.append(_entry)
         if fee_addr:
             # STRUCTURE, NOT THE AMOUNT. The cut is a fixed fraction of the
             # deposit, so logging it would put the deposit on a chain that
@@ -8739,32 +8864,9 @@ def main():
         # Stage 4 - Balance, amounts, plan
         ###########################################################################
 
-        # THE SPEND ACCOUNT IS THE MIX ACCOUNT. Not "0 unless receiving".
-        #
-        # This line used to read `receive_account_index if receive_mode else 0`,
-        # written before the mix account was rotated and never revisited when it
-        # was. resolve_mix_account creates a fresh account and create_subs puts
-        # ENTRY and every mix subaddress in it -- and then send mode came back
-        # here and hard-coded 0, which is used for:
-        #   * the balance poll (xmr_balance),
-        #   * the peel carriers,
-        #   * the PLAN's account_index, i.e. which account every spend comes from,
-        #   * the change-sweep destination, and
-        #   * change_target -- so change went to account 0 / subaddress 0.
-        #
-        # Two failures, and the second is the one that matters.
-        #
-        # FUNCTIONAL: the balance was polled from account 0 at ENTRY's index. That
-        # is a DIFFERENT subaddress -- account 0's subaddress at that number -- so
-        # send mode sized its plan from an unrelated balance, or from nothing.
-        #
-        # OPSEC: every spend named account 0, so the run's change came to rest on
-        # account 0 / subaddress 0 -- the wallet PRIMARY -- and the change sweep
-        # then SPENT it. The account rotation was theatre in send mode: the fresh
-        # account held the subaddresses while the wallet's identity address did all
-        # the work. An analyst labelling that address recovers it from every send
-        # graph, which is exactly what rotation was added to prevent.
-        #
+        # THE SPEND ACCOUNT IS THE MIX ACCOUNT, read back from the wallet --
+        # not "0 unless receiving", which put every send run's spends and its
+        # change on the wallet PRIMARY address. resolve_entry_accounts says how.
         ENTRY_PAIRS = resolve_entry_accounts(
             rpc_primary, addr_index, ENTRY_ADDRS, sub_account)
         # The first entry's account is still the run's "home" account for the
@@ -8801,7 +8903,8 @@ def main():
         # STRICT, not best-effort: select_funded_entries cannot tell a zero
         # that means "never arrived" from a dropped socket. See the helper.
         _entry_unlocked = [u for _t, u in read_entry_balances_strict(
-            rpc_primary, ENTRY_PAIRS, "sizing the distribution")]
+            rpc_primary, ENTRY_PAIRS, "sizing the distribution",
+            recovery=None if receive_mode else (args.rpc_primary, ENTRY_SET))]
 
         ENTRY_SET_FUNDED, _entry_unlocked = select_funded_entries(
             ENTRY_SET, _entry_unlocked)
@@ -9019,6 +9122,9 @@ def main():
                                      addr_index, change_accounts, bal_account),
                                  exit_hold=_exit_hold_list(args, addr_index,
                                                            ENTRY_ADDRS),
+                                 exit_scope=_exit_scope(addr_index, (
+                                     receive_account_index if receive_mode
+                                     else None)),
                                  # Defence in depth on an isolation that is
                                  # otherwise only an omission -- see the note
                                  # in _stage5_run where this joins _hold.
@@ -9229,6 +9335,17 @@ def _wipe_spent_plans(*plan_files):
     if _cm and Path(_cm).exists():
         secure_delete_or_warn(Path(_cm), "this run's chain marker")
     _CHAIN_ONCE_FILE[0] = ""
+    # AND THE EMPTY DIRECTORY THEY SAT IN, for the same reason: an empty
+    # ./unsigned/ is a directory whose mtime is the second the last plan left
+    # it -- the end of the run, beside a chain that rounds to ten minutes.
+    # Only the default name, and only if empty: an --output the operator
+    # chose is theirs to keep, and rmdir refuses anything with a file in it.
+    for _d in {Path(pf).parent for pf in plan_files if pf}:
+        if _d.name == "unsigned":
+            try:
+                _d.rmdir()
+            except OSError:
+                pass
 
 
 #: Env var carrying the wallet spend-key password to the SIGN child only.
@@ -10265,6 +10382,35 @@ def _exit_account_list(addr_index, change_accounts, bal_account) -> list:
             + [bal_account])
 
 
+def _exit_scope(addr_index, receive_account) -> dict:
+    """{account: the subaddresses the exit may look at} for accounts this run
+    did NOT make. Every other account is the run's own and is read whole.
+
+    RECEIVE MODE'S ACCOUNT IS NOT THE RUN'S. create_subs gives every mix
+    subaddress, carrier and change sweep a fresh account, and the exit reads
+    each of those whole -- right, since nothing else lives there. But the
+    bundle's account is put into addr_index too, and it is whatever account
+    create_receive_wallet was pointed at: `--account 5` twice (two swaps in
+    flight to one account), `--account 0`, or the wake agent's withdrawal of
+    an output on an account holding others. _funded_subaddresses read every
+    subaddress of it, the hold list protected only ENTRY, and a second
+    bundle's swap -- named by its own public memo -- went to --exit-to in one
+    hop, the outcome this file calls the worst it has, before "EXIT
+    COMPLETE". Driven: exit accounts [5, 9, 12, 13], hold [(5, 1), ...],
+    and "account 5 / subaddress 2 emptied".
+
+    So on that account the exit sees only what this run put there: the
+    subaddresses addr_index names in it (ENTRY, held) and subaddress 0, where
+    the distribution's change comes to rest under --no-entry-veil (held as
+    change). Anything else there is named and left, not withdrawn.
+    """
+    if receive_account is None:
+        return {}
+    recv = int(receive_account)
+    return {recv: {int(s) for a, s in addr_index.values()
+                   if int(a) == recv} | {0}}
+
+
 def _exit_hold_list(args, addr_index, entry_addr) -> list:
     """The outputs the exit must refuse to withdraw: ENTRY, and only ENTRY.
 
@@ -10342,8 +10488,12 @@ def _landing_targets(addr_index, dag_plan, change_sweep_jobs) -> tuple:
     return _dag, _sweep
 
 
-def _funded_subaddresses(rpc, accounts) -> tuple:
+def _funded_subaddresses(rpc, accounts, scope=None, foreign=None) -> tuple:
     """Every (account, subaddress, atomic_balance) in `accounts` holding money.
+
+    `scope` ({account: allowed subaddresses}, see _exit_scope) narrows the
+    accounts this run did not make to what it put there; a funded
+    subaddress outside it is appended to `foreign`, never returned.
 
     The exit spends per SUBADDRESS, not per account, because that is the unit a
     Monero sweep takes and because it keeps the guarantee the whole run is
@@ -10423,16 +10573,23 @@ def _funded_subaddresses(rpc, accounts) -> tuple:
         if bal is None:
             unreadable.append(acct)
             continue
+        _allowed = (scope or {}).get(acct)
         for sub in bal.get("per_subaddress", []) or []:
             amt = int(sub.get("balance", 0) or 0)
             if amt > 0:
-                found.append((acct, int(sub.get("address_index", 0)), amt))
+                _si = int(sub.get("address_index", 0))
+                if _allowed is not None and _si not in _allowed:
+                    if foreign is not None:
+                        foreign.append((acct, _si, amt))
+                    continue
+                found.append((acct, _si, amt))
     return found, unreadable
 
 
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                           delay_window=None, hold=(), entry_pairs=(),
-                          remainder_pairs=(), fee_pairs=()) -> tuple:
+                          remainder_pairs=(), fee_pairs=(),
+                          scope=None) -> tuple:
     """ACTUALLY SPEND THE MIXED FUNDS OUT.
     Returns (relayed, failed, skipped, held, unclean), where `held` is a
     {"entry": n, "change": n, "remainder": n, "usagefee": n} breakdown -- NOT a
@@ -10490,10 +10647,13 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     address" is a problem the operator can fix with another run and "your
     destination is now publicly tied to your swap" is not fixable at all.
     """
+    # NOT THIS RUN'S, and so never withdrawn: see _exit_scope. Collected by
+    # every read below and named once at the end.
+    _foreign = []
     targets, _unreadable = _funded_subaddresses(
         connect_rpc(args.rpc_primary,
                     proxy_url=getattr(args, "tor_proxy", "")),
-        accounts)
+        accounts, scope=scope, foreign=_foreign)
     # ZERO FUNDED OUTPUTS, ACROSS EVERY ACCOUNT OF THE RUN, IS ANOMALOUS.
     #
     # This function is only reached because --exit-to was given and a
@@ -10524,7 +10684,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         targets, _unreadable = _funded_subaddresses(
             connect_rpc(args.rpc_primary,
                         proxy_url=getattr(args, "tor_proxy", "")),
-            accounts)
+            accounts, scope=scope, foreign=_foreign)
     # AN OUTPUT SMALLER THAN ITS OWN SWEEP FEE CANNOT BE WITHDRAWN AT ALL, and
     # trying is not a failure to report as one.
     #
@@ -10952,7 +11112,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         _late, _late_unreadable = _funded_subaddresses(
             connect_rpc(args.rpc_primary,
                         proxy_url=getattr(args, "tor_proxy", "")),
-            accounts)
+            accounts, scope=scope, foreign=_foreign)
         # AN ACCOUNT THIS PASS COULD NOT READ IS NOT A CLEAN EXIT EITHER, and
         # the same rule the initial enumeration follows applies here: it may
         # hold anything. Only accounts the FIRST read could see are counted --
@@ -11027,6 +11187,19 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             _withdraw_one(acct, sub, f"exit {_done}/{total}",
                           dest_pool[(_done - 1) % len(dest_pool)])
 
+    _fx = {}
+    for _a, _s, _amt in _foreign:
+        _fx[(_a, _s)] = max(_amt, _fx.get((_a, _s), 0))
+    if _fx:
+        integrity_log("exit", f"left_not_this_runs:{len(_fx)}")
+        print(f"  [!] EXIT: {len(_fx)} funded output(s) on the receive account "
+              f"were NOT put there by this run, and were left where they are:")
+        for (_a, _s), _amt in sorted(_fx.items()):
+            print(f"        account {_a} / subaddress {_s}: "
+                  f"{Decimal(_amt) / Decimal(10 ** 12)} XMR")
+        print(f"      Withdrawing them would send an unmixed deposit -- named by "
+              f"its own swap memo -- straight to your destination. Mix each "
+              f"with its own run (its own receive bundle).")
     integrity_log("exit", "withdraw_done:" +
                   (",".join(sorted(_outcomes)) or "nothing_attempted"))
     return (relayed, failed, skipped, dict(_held_kinds), unclean)
@@ -11038,7 +11211,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 change_accounts=None,
                 delay_window=None, veil_file=None, veil_target=None,
                 veil_need=None, exit_accounts=None, exit_hold=None,
-                exit_fee_hold=None,
+                exit_fee_hold=None, exit_scope=None,
                 dag_dst_index=None, sweep_targets=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
@@ -11496,7 +11669,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             _exit_meta, delay_window, hold=_hold,
             entry_pairs=list(exit_hold or ()),
             remainder_pairs=([_stuck_carrier] if _stuck_carrier else []),
-            fee_pairs=list(exit_fee_hold or ()))
+            fee_pairs=list(exit_fee_hold or ()), scope=exit_scope)
         _held_entry = (_held or {}).get("entry", 0)
         _held_change = (_held or {}).get("change", 0)
         _held_remainder = (_held or {}).get("remainder", 0)

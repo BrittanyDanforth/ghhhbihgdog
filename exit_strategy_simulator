@@ -69,8 +69,8 @@ from pathlib import Path
 from typing import Dict
 
 from gs_common import (
-    wipe_will_erase, wipe_miss_reason,
-    integrity_log, verify_tor, validate_proxy, safe_get,
+    wipe_will_erase, wipe_cwd_note, wipe_miss_reason,
+    integrity_log, verify_tor, validate_proxy, safe_get, _own_stream,
     atomic_write_json, install_signal_handlers, shutdown_requested,
     env_or_argv, decimal_arg, decimal_env, XMR_ABSURD_TOTAL,
 )
@@ -174,7 +174,17 @@ def coarsen_rate(v: Decimal) -> Decimal:
 
 
 def fetch_prices(proxy):
-    """Fetch XMR and BTC prices. Falls back to Bisq price oracle if CoinGecko fails."""
+    """Fetch XMR and BTC prices. Falls back to Bisq price oracle if CoinGecko fails.
+
+    ON A STREAM OF ITS OWN (gs_common._own_stream), not the bare proxy: the
+    Tor check just before this is isolated, so these two fetches were the
+    only requests this tool made on the default circuit -- beside whatever
+    else the operator's Tor was carrying -- against the rule _own_stream
+    states, that it is decided in one place so no caller can forget it.
+    Both oracles share the one stream: the fallback is a retry of the same
+    question.
+    """
+    proxy = _own_stream(proxy, "exit_prices")
     try:
         j = safe_get(CG_URL, proxy)
         out = {
@@ -698,6 +708,11 @@ def main():
     # tools disagreed about the same question and a wrong answer is silent.
     # wipe_will_erase: --outfile is free-form and the sweep matches the NAME
     # too, so a covered directory is only half the answer.
+    # SWEPT FROM HERE ONLY: the cwd is a root of the wipe started in it, not
+    # of the one the operator starts from $HOME (gs_common.wipe_cwd_only).
+    _cwd_note = wipe_cwd_note(_out)
+    if _cwd_note:
+        print(_cwd_note)
     if not wipe_will_erase(_out):
         # _dir is computed HERE. Replacing the old inline coverage test with
         # wipe_covers deleted the local this message interpolated, so the

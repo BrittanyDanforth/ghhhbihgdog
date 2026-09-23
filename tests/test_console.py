@@ -144,9 +144,10 @@ def test_secrets_are_scoped_to_the_actions_that_need_them():
     se = c.secret_env({"btc_entry": "bc1x", "btc_amount": "0.4",
                        "swap_btc": "0.4", "expect_total_xmr": "1.25",
                        "exit_to": ["EXIT_A", "EXIT_B"]})
-    check("secret_env still produces the four values",
+    check("secret_env still produces the four values (and the arrival target "
+          "under the watch's name too)",
           set(se) == {"GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_SWAP_AMOUNTS",
-                      "GS_EXIT_TO", "GS_EXPECT_TOTAL_XMR"})
+                      "GS_EXIT_TO", "GS_EXPECT_TOTAL_XMR", "GS_EXPECT_XMR"})
 
     def child_env(aid):
         env = c._child_env(aid)
@@ -156,9 +157,12 @@ def test_secrets_are_scoped_to_the_actions_that_need_them():
         return {k: v for k, v in env.items() if k.startswith("GS_")}
 
     for aid in ("units", "integration", "ipleak", "compile", "paranoia_dry",
-                "leakaudit", "make_receive", "watch_receive",
+                "leakaudit", "make_receive",
                 "preflight_tor", "preflight_egress", "preflight_wallet"):
         check(f"'{aid}' gets NO secret at all", child_env(aid) == {})
+    # The watch gets the one value its own field on the page is for.
+    check("'watch_receive' gets the expected total and nothing else",
+          child_env("watch_receive") == {"GS_EXPECT_XMR": "1.25"})
     _rp = child_env("run_pipeline")
     check("the pipeline gets the entry, the amount, the total and the exit",
           _rp.get("GS_EXIT_TO") == "EXIT_A EXIT_B"
@@ -363,6 +367,168 @@ def test_tor_port_autodetect():
     check("the page has a Detect Tor button", 'id="pfdetect"' in src)
     check("the page auto-detects Tor on load", "detectTor(true)" in src)
     check("there is a /api/detect-tor endpoint", '"/api/detect-tor"' in src)
+
+
+def test_started_tor_gets_no_secrets_and_does_not_outlive_the_console():
+    """Start Tor handed tor the console's whole environment -- the wallet
+    spend password and the exit address among it -- and tor, which takes
+    SIGHUP as a reload, outlived the console holding them. Driven with a
+    stand-in tor that records its own environ and then waits."""
+    import tempfile as _tf, stat as _st
+    c = load_console()
+    d = _tf.mkdtemp(prefix="faketor_")
+    fake = os.path.join(d, "tor")
+    with open(fake, "w") as f:
+        f.write("#!/bin/sh\n"
+                "tr '\\0' '\\n' < /proc/$$/environ > \"$(dirname \"$0\")/env.txt\"\n"
+                "ps -o sid= -p $$ > \"$(dirname \"$0\")/sid.txt\"\n"
+                "trap '' HUP\n"
+                "exec sleep 300\n")
+    os.chmod(fake, 0o755)
+    saved = {k: os.environ.get(k) for k in ("GS_WALLET_PASSWORD", "GS_EXIT_TO",
+                                             "SOME_OTHER_TOKEN")}
+    os.environ["GS_WALLET_PASSWORD"] = "s3cret-spend-pw"
+    os.environ["GS_EXIT_TO"] = "4ExitAddressOfTheOperator"
+    os.environ["SOME_OTHER_TOKEN"] = "not-for-tor"
+    real_sleep = c.time.sleep
+    try:
+        c.detect_tor_proxy = lambda pref="": {"ok": False, "proxy": None}
+        c._find_tor_binary = lambda: fake
+        c.time.sleep = lambda s: None          # 60 polls, no waiting
+        c.start_tor()
+        p = c._TOR_PROC
+        for _ in range(100):
+            if os.path.exists(os.path.join(d, "sid.txt")):
+                break
+            real_sleep(0.05)
+        env = open(os.path.join(d, "env.txt")).read()
+        check("tor gets no GS_ variable -- not the spend password, not the "
+              "exit address", "GS_" not in env and "s3cret" not in env)
+        check("tor gets nothing off the allow-list either",
+              "SOME_OTHER_TOKEN" not in env)
+        check("NON-VACUITY: tor did get what it needs (PATH)", "PATH=" in env)
+        sid = open(os.path.join(d, "sid.txt")).read().strip()
+        check("tor runs in its own session, not the terminal's",
+              sid == str(p.pid))
+        check("stop_started_tor ends the tor this console launched",
+              c.stop_started_tor() is True and p.poll() is not None)
+        check("...and a second call is a no-op (nothing of ours is running)",
+              c.stop_started_tor() is False)
+    finally:
+        c.time.sleep = real_sleep
+        try:
+            c.stop_started_tor()
+        except Exception:
+            pass
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        __import__("shutil").rmtree(d, ignore_errors=True)
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("the console stops its tor on every way out of main()",
+          "finally:\n        if stop_started_tor():" in src
+          and "atexit.register(stop_started_tor)" in src)
+
+
+def test_the_quote_step_gates_and_keeps_every_swap():
+    """The quote step passed no --min-out-xmr, so a deposit too small to mix
+    was quoted and paid; and each click wrote the whole quote file, so
+    quoting the swaps of an N-swap receive one at a time left the watch and
+    the run waiting for the last swap only. Also: the aggregator key and the
+    watch's expected total never reached the children that read them, and a
+    send run's Bitcoin address reached receive runs."""
+    import tempfile as _tf
+    from decimal import Decimal as _D
+    c = load_console()
+    g = c._ghost()
+    base = {"mode": "receive", "receive_wallet": "w.json", "wallets": 10,
+            "tor_proxy": "socks5h://127.0.0.1:9050", "fee_priority": 1}
+    p1 = c.clean(dict(base, swap_btc="0.05", split=1))["params"]
+    argv = c.ACTIONS["swap_quote"]["build"](p1)
+    want1 = g.mix_minimum_xmr(g.FALLBACK_FEE_BY_PRIORITY[1], 10,
+                              dag_mixing=False, exit_set=False, chunks=1)
+    check("the quote carries --min-out-xmr", "--min-out-xmr" in argv)
+    check("...at the figure the panel shows (the shipped mix_minimum_xmr)",
+          _D(argv[argv.index("--min-out-xmr") + 1]) == want1)
+    p3 = c.clean(dict(base, swap_btc="0.05 0.03, 0.04", split=3))["params"]
+    check("several amounts are one quote: normalised, never de-duplicated",
+          p3.get("swap_btc") == "0.05 0.03 0.04"
+          and c.clean(dict(base, swap_btc="0.05 0.05"))["params"]
+          .get("swap_btc") == "0.05 0.05")
+    check("...and they reach thor as its amounts",
+          c.secret_env(p3).get("GS_SWAP_AMOUNTS") == "0.05 0.03 0.04")
+    a3 = c.ACTIONS["swap_quote"]["build"](p3)
+    want3 = g.mix_minimum_xmr(g.FALLBACK_FEE_BY_PRIORITY[1], 10,
+                              dag_mixing=False, exit_set=False, chunks=3)
+    check("with N swaps each one is gated at its share of the N-swap minimum",
+          _D(a3[a3.index("--min-out-xmr") + 1]) * 3 >= want3
+          and _D(a3[a3.index("--min-out-xmr") + 1]) * 3 - want3 < _D("0.001"))
+    check("the quote step runs when the amounts match the swaps",
+          c.quote_problems(p3) == [])
+    pbad = c.clean(dict(base, swap_btc="0.05", split=3))["params"]
+    check("one amount for three swaps is refused, and says why",
+          any("one at a time" in w for w in c.quote_problems(pbad)))
+    check("nine amounts is refused by the schema",
+          c.clean({"swap_btc": " ".join(["0.01"] * 9)})["params"]
+          .get("swap_btc") is None)
+    _real_ghost = c._ghost
+    try:
+        c._ghost = lambda: (_ for _ in ()).throw(ImportError("no GhostSpiral"))
+        check("no computable floor: the quote is refused, not run ungated",
+              c.quote_floor_xmr(p1) is None
+              and any("no floor" in w for w in c.quote_problems(p1)))
+    finally:
+        c._ghost = _real_ghost
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("the /run/ handler honours an action's check before building it",
+          'why = act.get("check", lambda _p: [])(c["params"])' in src)
+    # The run refuses a quote file that holds fewer swaps than it expects.
+    d = _tf.mkdtemp(prefix="qfile_")
+    real_repo = c.REPO
+    try:
+        c.REPO = d
+        with open(os.path.join(d, "w.json"), "w") as f:
+            json.dump({"schema": "gs_receive_wallet_v1", "address": "8ADDR"}, f)
+        with open(os.path.join(d, "thor_pairs.json"), "w") as f:
+            json.dump([{"dest_xmr": "8ADDR", "expected_xmr": "1.0"},
+                       {"dest_xmr": "8OTHER", "expected_xmr": "1.0"}], f)
+        _, why2 = c.pipeline_argv(c.clean(dict(base, split=2))["params"])
+        check("a quote file with 1 swap for this address, 2 expected: the run "
+              "is refused before it spends",
+              any("holds 1 swap" in w for w in why2))
+        _, why2t = c.pipeline_argv(c.clean(dict(base, split=2,
+                                                expect_total_xmr="2.0"))
+                                   ["params"])
+        check("...a typed total is the way past it",
+              not any("holds 1 swap" in w for w in why2t))
+        _, why1 = c.pipeline_argv(c.clean(dict(base, split=1))["params"])
+        check("NON-VACUITY: 1 swap quoted, 1 expected, no refusal",
+              not any("swap(s) paying" in w for w in why1))
+    finally:
+        c.REPO = real_repo
+        __import__("shutil").rmtree(d, ignore_errors=True)
+    # Send mode's own values stay out of a receive run.
+    se_r = c.secret_env({"mode": "receive", "btc_entry": "bc1qsend",
+                         "btc_amount": "0.4"})
+    check("a receive run gets no GS_BTC_ENTRY / GS_BTC_AMOUNT left on the "
+          "hidden send fields", "GS_BTC_ENTRY" not in se_r
+          and "GS_BTC_AMOUNT" not in se_r)
+    check("NON-VACUITY: a send run still gets them",
+          c.secret_env({"mode": "send", "btc_entry": "bc1qsend",
+                        "btc_amount": "0.4"}).get("GS_BTC_ENTRY") == "bc1qsend")
+    # The aggregator key reaches the two children that quote, and no other.
+    os.environ["GS_SWAPKIT_API_KEY"] = "k-123"
+    try:
+        check("GS_SWAPKIT_API_KEY reaches the quote step and the pipeline",
+              c._child_env("swap_quote").get("GS_SWAPKIT_API_KEY") == "k-123"
+              and c._child_env("run_pipeline").get("GS_SWAPKIT_API_KEY")
+              == "k-123")
+        check("...and not the unit suite",
+              "GS_SWAPKIT_API_KEY" not in c._child_env("units"))
+    finally:
+        os.environ.pop("GS_SWAPKIT_API_KEY", None)
 
 
 def test_start_tor_launches_only_installed_binary():
@@ -832,9 +998,10 @@ def test_receive_is_btc_to_monero():
           argv[argv.index("--outfile") + 1] == "thor_pairs.json")
     check("the swap quote is forced through Tor",
           argv[argv.index("--tor-proxy") + 1].startswith("socks5h://"))
+    _nd = a["build"]({"swap_btc": "0.05", "receive_wallet": "w.json",
+                      "tor_proxy": "socks5h://127.0.0.1:9050"})
     check("with no filename given the quote still has a default destination",
-          a["build"]({"swap_btc": "0.05", "receive_wallet": "w.json",
-                      "tor_proxy": "socks5h://127.0.0.1:9050"})[-1].endswith(".json"))
+          _nd[_nd.index("--outfile") + 1].endswith(".json"))
     check("swap_btc is in the parameter schema (unlisted keys are dropped)",
           "swap_btc" in c.SCHEMA and c.clean({"swap_btc": "0.05"})["params"]
           .get("swap_btc") == "0.05")
@@ -1584,7 +1751,8 @@ def test_the_receive_flow_arms_its_own_arrival_gate():
           and a[a.index("--swap-pairs") + 1] == c.DEFAULT_PAIRS_FILE)
     check("receive: ...and it is the SAME default the quote and watch steps "
           "use",
-          c.ACTIONS["swap_quote"]["build"](c.clean(base)["params"])[-1]
+          (lambda _q: _q[_q.index("--outfile") + 1])(
+              c.ACTIONS["swap_quote"]["build"](c.clean(base)["params"]))
           == c.DEFAULT_PAIRS_FILE
           and c.DEFAULT_PAIRS_FILE
           in c.ACTIONS["watch_receive"]["build"](c.clean(base)["params"]))

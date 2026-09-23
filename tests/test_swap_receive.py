@@ -598,6 +598,44 @@ def test_count_mints_independent_receives():
     got = thor.resolve_destinations([D("1"), D("2"), D("3")], [],
                                     [str(f) for f in files])
     check("thor accepts the three bundles --count wrote", got == addrs)
+    # ...and SAYS it could not check them against the exit when GS_EXIT_TO is
+    # unset. It printed nothing, which reads as a check that passed; in the
+    # console flow the exit is typed a step AFTER the quote, so unset is the
+    # ordinary case, and OPSEC_SETUP promised it "says so".
+    _prev_exit = os.environ.pop("GS_EXIT_TO", None)
+    real, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        thor.resolve_destinations([D("1")], [], [str(files[0])])
+        _said = sys.stdout.getvalue()
+    finally:
+        sys.stdout = real
+        if _prev_exit is not None:
+            os.environ["GS_EXIT_TO"] = _prev_exit
+    check("thor says it could NOT check the destination against an unset "
+          "GS_EXIT_TO", "could NOT check" in _said)
+
+    # THE ROTATION AFTER THE MINT IS BEST-EFFORT. With required=True a failed
+    # NEWNYM exited 1 with the account, subaddress and bundle already made,
+    # and the obvious response -- run it again -- minted a second address.
+    _asked = []
+
+    def _rot(required=False, **k):
+        _asked.append(required)
+        if required:
+            sys.exit("[!] Tor circuit rotation FAILED")
+        return False
+    crw.newnym = _rot
+    real, sys.stdout = sys.stdout, io.StringIO()
+    _exited = False
+    try:
+        crw.mint_one_receive(rpc, args)
+    except SystemExit:
+        _exited = True
+    finally:
+        sys.stdout = real
+        crw.newnym = lambda *a, **k: None
+    check("a failed rotation after the mint does not exit after minting",
+          not _exited and _asked == [False])
 
 
 def test_count_refuses_a_repeating_wallet():

@@ -18,13 +18,14 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, os, random, re, shutil, socket, subprocess, sys, tempfile, time
+import argparse, fcntl, glob, os, random, re, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
     shutdown_requested, secure_hex, secure_delete_file, secure_write_bytes,
-    verify_integrity_chain, paranoia_search_roots,
+    verify_integrity_chain, paranoia_search_roots, secure_delete_tree,
+    sweep_refusal, artifact_name_is_ours, scope_lock_taken, rpc_lock_scope,
 )
 
 # Paths to wipe
@@ -122,39 +123,34 @@ PYCACHE_GLOBS = [
 ]
 
 
-def dns_check() -> int:
-    """Verify basic network connectivity after MAC spoof.
+def link_check(iface: str) -> int:
+    """Say whether the MAC spoof left the link up. SENDS NOTHING.
 
-    OPSEC: We must NOT resolve Tor-related domains (check.torproject.org)
-    over clearnet DNS — that links the new MAC address to Tor usage in
-    ISP DNS logs. Instead, resolve a benign, high-traffic domain that
-    reveals nothing about the operator's intent.
-
-    It used to sys.exit(1) on failure, which ABANDONED THE ENTIRE WIPE: a MAC
-    spoof that dropped the link (the common failure) would make this check fail
-    and kill the process before shell histories, temp files, swap and the
-    GhostSpiral artifacts were ever touched -- leaving exactly the material
-    this tool exists to destroy. None of the wipe phases need the network, so
-    a failed connectivity probe is now a reported warning, not a hard stop.
+    This was dns_check: a lookup of www.google.com through the system
+    resolver, straight after the MAC change, on every real run. That is a
+    clearnet DNS query from the freshly spoofed address -- the first thing it
+    ever does is the same query every run, a signature of this tool, timed to
+    the second the new MAC appeared -- and on a host that is correctly
+    Tor-only it always failed, so a correct setup was reported as a failed
+    wipe phase. What the phase was FOR (dns_check's own docstring: "a MAC
+    spoof that dropped the link") is a local fact the kernel already knows:
+    /sys/class/net/<iface>/operstate. Informational: none of the wipe needs
+    the network, so a link that is down is said and is not a failure.
     """
     try:
-        res = socket.getaddrinfo("www.google.com", 443)
-        if not res:
-            raise RuntimeError("DNS returned empty")
-        integrity_log("paranoia", "dns_check_ok")
-        print("  [+] Network reachable post-spoof")
+        state = Path(f"/sys/class/net/{iface}/operstate").read_text().strip()
+    except OSError:
+        print(f"  [*] {iface}: no link state to read (no such interface?). "
+              f"The wipe needs no network.")
         return 0
-    except (socket.gaierror, OSError, RuntimeError) as e:
-        # Type, not text -- and unlike the other two sites this one was not
-        # even truncated, so an arbitrarily long OSError string went verbatim
-        # into a persistent, append-only hash chain. See newnym() in gs_common
-        # for the class: the chain must not carry text this toolchain did not
-        # author. The message still reaches the terminal on the next line.
-        integrity_log("paranoia", f"dns_fail:{type(e).__name__}")
-        print(f"  [!] DNS/connectivity failed post-spoof: {str(e)[:80]}")
-        print("  [!] The MAC spoof may have dropped the link — the WIPE CONTINUES "
-              "regardless (it needs no network).")
-        return 1
+    if state == "up":
+        print(f"  [+] {iface} is up after the spoof (read locally; no packet "
+              f"was sent).")
+    else:
+        print(f"  [!] {iface} is {state!r} after the spoof -- the MAC change "
+              f"may have dropped the link. The WIPE CONTINUES regardless (it "
+              f"needs no network).")
+    return 0
 
 
 def rand_mac() -> str:
@@ -555,19 +551,28 @@ def _secure_delete_file(path: Path) -> bool:
 
 
 def _secure_delete_dir(path: Path) -> bool:
-    """Overwrite every file in a tree, then remove it. Returns True on success."""
-    if not path.is_dir():
-        return False
-    ok = True
-    for f in path.rglob("*"):
-        if f.is_file():
-            ok = _secure_delete_file(f) and ok
+    """Overwrite every file in a tree, then remove it. Returns True on success.
+
+    gs_common.secure_delete_tree, not a second copy: this one tested
+    path.is_dir() and walked path.rglob("*"), both of which follow a symlink
+    at `path`, so a directory-pattern match that was a link to $HOME had
+    every file under $HOME overwritten -- the wallet and its .keys among
+    them. The shared primitive refuses a link and walks by descriptor.
+    """
+    return secure_delete_tree(path)
+
+
+def _operator_uids() -> set:
+    """Whose files the artifact sweep may take: the operator's, and under
+    sudo root's as well (a unit run as root writes the vault's artifacts).
+    Never another account's -- see gs_common.sweep_refusal."""
+    uids = {os.getuid(), os.geteuid()}
     try:
-        shutil.rmtree(path)
-        return ok
-    except OSError:
-        shutil.rmtree(path, ignore_errors=True)
-        return False
+        if os.environ.get("SUDO_UID"):
+            uids.add(int(os.environ["SUDO_UID"]))
+    except (TypeError, ValueError):
+        pass
+    return uids
 
 
 # Module-level so they are a single introspectable source of truth: the
@@ -624,6 +629,71 @@ from gs_common import (                                      # noqa: E402
 )
 
 
+def _search_roots(extra_dirs: list = None) -> list:
+    """The artifact sweep's roots, resolved and de-duplicated.
+
+    ONE LIST, gs_common's. This kept a private copy of the four roots while
+    the comment on paranoia_search_roots said three places must agree about
+    them -- and the wipe itself was the one not reading it. Resolved BEFORE
+    de-duplicating: see _wipe_gs_artifacts_inner for the double count that
+    comparing Paths by text produced.
+    """
+    _roots = list(paranoia_search_roots(resolve=False))
+    _roots += [Path(d) for d in (extra_dirs or [])]
+    _seen, out = set(), []
+    for _r in _roots:
+        try:
+            _r = _r.resolve()
+        except OSError:
+            # A cwd that has been deleted, or an unresolvable --search-dir.
+            # Keep it as given rather than dropping it: the sweep's own
+            # is_dir() check is what decides whether it is usable.
+            pass
+        if _r in _seen:
+            continue
+        _seen.add(_r)
+        out.append(_r)
+    return out
+
+
+def running_pipelines(extra_dirs: list = None,
+                      rpcs=("http://127.0.0.1:18083",)) -> list:
+    """Where a GhostSpiral run is live NOW, or [].
+
+    The wipe listed a running pipeline's unsigned_*.json, its exitplan_v1.json
+    and its own .ghostspiral.lock for deletion without a word, although the run
+    holds that lock and scope_lock_taken said so. Erasing a live run's plans
+    and staged transactions mid-mix strands the money wherever the run had got
+    to, with nothing left saying where. Asked two ways, both kernel-held: the
+    flock on any .ghostspiral.lock the sweep would reach, and the wallet-rpc
+    scope lock (rpc_lock_scope) for the default endpoint, which a run started
+    anywhere holds.
+    """
+    live = []
+    for root in _search_roots(extra_dirs):
+        try:
+            locks = list(root.glob(".ghostspiral.lock")) + list(
+                root.glob("*/.ghostspiral.lock"))
+        except OSError:
+            continue
+        for lk in locks:
+            try:
+                fd = os.open(lk, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                live.append(str(lk))
+            finally:
+                os.close(fd)
+    for r in rpcs:
+        if scope_lock_taken(rpc_lock_scope(r)):
+            live.append(f"the wallet-rpc at {r}")
+    return live
+
+
 def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
     common subdirectories, and any --search-dir paths provided.
@@ -665,29 +735,44 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
     # Resolving also folds an --search-dir that names a root by another
     # spelling (a symlink, a trailing "/.", a relative path) onto the same
     # entry, and makes the dry-run listing print absolute paths.
-    # ONE LIST, gs_common's. This kept a private copy of the four roots while
-    # the comment on paranoia_search_roots said three places must agree about
-    # them -- and this, the wipe itself, was the one not reading it.
-    _roots = list(paranoia_search_roots(resolve=False))
-    _roots += [Path(d) for d in (extra_dirs or [])]
-    _seen, search_roots = set(), []
-    for _r in _roots:
-        try:
-            _r = _r.resolve()
-        except OSError:
-            # A cwd that has been deleted, or an unresolvable --search-dir.
-            # Keep it as given rather than dropping it: the sweep's own
-            # is_dir() check below is what decides whether it is usable.
-            pass
-        if _r in _seen:
-            continue
-        _seen.add(_r)
-        search_roots.append(_r)
+    search_roots = _search_roots(extra_dirs)
 
     # count = files ACTUALLY deleted; failed (e.g. permission-denied) deletes
     # are NOT counted, so the reported number never overstates what happened.
     count = 0
     failed = 0
+    #: Matches the sweep left alone, and why (gs_common.sweep_refusal). Said
+    #: in the dry run as well: the preview is what the operator reads before
+    #: the irreversible run, and it listed a planted link as one ordinary line.
+    left = 0
+    owners = _operator_uids()
+
+    def _reached_directly(p: Path) -> bool:
+        # A match found THROUGH a link whose real file the sweep also reaches
+        # under its own name, from a root, without a link: that pass takes
+        # it, so this one is neither a refusal nor a failure to report.
+        try:
+            real = p.resolve()
+        except OSError:
+            return False
+        return any(real.parent == r or real.parent.parent == r
+                   for r in search_roots)
+
+    def _leave(item, refusal) -> bool:
+        nonlocal left, failed
+        why, stays, kind = refusal
+        if kind == "via_link" and _reached_directly(item):
+            return True
+        print(f"  [!] {'Would leave' if dry else 'Left'} {item} alone: it {why}.")
+        # One of ours still on disk is a failed wipe; a link, another
+        # account's file or a user's own file was never ours to wipe.
+        if stays:
+            failed += 1
+        else:
+            left += 1
+        return True
+
+    _done = set()
     #: Set when the wake pairing is among the casualties. NAMED IN THE SUMMARY,
     #: because losing it is the one wipe result that presents as a hardware
     #: fault: the next magic packet produces a correct fail-closed refusal that
@@ -700,6 +785,19 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
 
         for pattern in file_patterns:
             for f in list(root.glob(pattern)) + list(root.glob(f"*/{pattern}")):
+                # One verdict per file: a name several patterns match
+                # (thor_pairs.json.tmp is "*.json.tmp" and "*.tmp"), or one
+                # two roots reach ($HOME/*/x and $HOME/ghostspiral/x), was
+                # listed and counted once per pattern in the dry run.
+                if f in _done:
+                    continue
+                _done.add(f)
+                if not artifact_name_is_ours(f.name):
+                    continue
+                why = sweep_refusal(root, f, owners)
+                if why:
+                    _leave(f, why)
+                    continue
                 if dry:
                     print(f"  [dry] would securely delete {f}"); count += 1
                     if f.name.startswith("gs_wake_") and f.suffix == ".key":
@@ -713,7 +811,14 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
 
         for dirname in dir_patterns:
             for d in list(root.glob(dirname)) + list(root.glob(f"*/{dirname}")):
-                if not d.is_dir():
+                # is_symlink first: is_dir() follows a link, and a link to a
+                # directory is exactly the match that must not be walked.
+                if not (d.is_symlink() or d.is_dir()) or d in _done:
+                    continue
+                _done.add(d)
+                why = sweep_refusal(root, d, owners)
+                if why:
+                    _leave(d, why)
                     continue
                 if dry:
                     print(f"  [dry] would securely delete dir {d}"); count += 1
@@ -722,7 +827,32 @@ def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
                 else:
                     failed += 1
 
+    # LEFT ON PURPOSE, AND SAID. Two things this toolchain causes survive
+    # every wipe by design, and survived it in silence -- so an operator
+    # reading "Deleted N artifact(s)" had no way to know they were there.
+    #   * gs_delivery.key: the operator's only delivery key. Sealed with a
+    #     passphrase, and wiping it would end every future slip, so it stays
+    #     (.gitignore's note); `gs_delivery_key shred` is how it goes.
+    #   * tor's DataDirectory (~/.tor), when gs_console's Start Tor launched
+    #     tor: its guard state and the time tor last ran. Deleting it makes
+    #     the next start choose new entry guards, which is its own exposure.
+    for root in search_roots:
+        for dk in list(root.glob("gs_delivery.key")) + list(
+                root.glob("*/gs_delivery.key")):
+            if dk in _done:
+                continue
+            _done.add(dk)
+            print(f"  [*] Left on purpose: {dk} (your delivery key, "
+                  f"passphrase-sealed). Remove it with: "
+                  f"gs_delivery_key shred --key {dk}")
+    _tor_dd = Path.home() / ".tor"
+    if _tor_dd.is_dir() and not _tor_dd.is_symlink():
+        print(f"  [*] Left on purpose: {_tor_dd} (tor's state: its entry "
+              f"guards and when it last ran). Removing it makes tor pick new "
+              f"guards next time.")
     tail = f" ({failed} could not be deleted)" if failed else ""
+    if left:
+        tail += f" ({left} left alone, named above)"
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s){tail}")
     if wake_pairing_gone:
         print(f"  [!] {'Would destroy' if dry else 'DESTROYED'} the WAKE "
@@ -1024,6 +1154,13 @@ def wipe_xdg_traces(dry: bool):
         else:
             failed += 1
     for d in dir_targets:
+        if d.is_symlink():
+            # Never walked (secure_delete_tree refuses a link): what it points
+            # at may be anything, and is not this phase's to decide.
+            print(f"  [!] {d} is a symlink; it is not followed, so what it "
+                  f"points at is not wiped.")
+            failed += 1
+            continue
         if not d.is_dir():
             continue
         if dry:
@@ -1116,6 +1253,11 @@ def main():
     ap.add_argument("--search-dir", action="append", default=[],
                     help="additional directories to search for GhostSpiral artifacts "
                          "(can be specified multiple times)")
+    ap.add_argument("--even-if-running", action="store_true",
+                    help="wipe although a GhostSpiral run is in progress. It "
+                         "erases that run's plans and staged transactions "
+                         "mid-mix, which strands its money wherever the run "
+                         "had got to. Only for when that is the lesser harm.")
     # This tool DESTROYS integrity_chain.log, so it is the operator's last
     # chance to check it. Nothing in this toolchain verified the chain at all
     # before now -- every header advertised "integrity hash-chain logging" and
@@ -1155,6 +1297,19 @@ def main():
         sys.exit(1)
 
     require_resources(min_disk_gb=1.0)
+    _live = running_pipelines(args.search_dir)
+    if _live:
+        print("  [!] A GhostSpiral run is IN PROGRESS (holding "
+              + "; ".join(_live) + ").")
+        print("      Its plans, staged transactions and lock are among what "
+              "this would erase, and")
+        print("      erasing them mid-mix strands its money wherever the run "
+              "had got to.")
+        if not args.dry_run and not args.even_if_running:
+            print("      Stop the run first (or let it finish), then wipe. If "
+                  "wiping now is the lesser")
+            print("      harm, pass --even-if-running.")
+            sys.exit(1)
     integrity_log("paranoia", f"start:dry={args.dry_run}")
 
     # Each phase returns its FAILURE COUNT (0 = clean). They are collected so
@@ -1183,12 +1338,7 @@ def main():
 
     run_phase(1, "MAC spoof", spoof_mac, args.iface, args.dry_run)
 
-    print("  [*] Phase 2: DNS check")
-    if args.dry_run:
-        print("  [dry] would check DNS connectivity (skipped to avoid DNS leak)")
-        failures["DNS check"] = 0
-    else:
-        failures["DNS check"] = dns_check()
+    run_phase(2, "Link check (local, no traffic)", link_check, args.iface)
 
     run_phase(3, "DNS cache flush", flush_dns_cache, args.dry_run)
     run_phase(4, "Shell histories", wipe_shell_histories, args.dry_run)

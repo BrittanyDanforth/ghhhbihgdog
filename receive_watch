@@ -67,7 +67,7 @@ from gs_common import (
     bech32_checksum_ok,
     instruction_field_safe,
     atomic_write_json,
-    wipe_will_erase, wipe_miss_reason,
+    wipe_will_erase, wipe_cwd_note, wipe_miss_reason, quote_age, QUOTE_STALE_S,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -508,6 +508,11 @@ def _write_result_json(args, r: dict) -> None:
     # So the danger was already understood; only the hand-run path was missed,
     # because under the agent the name happens to match.
     _p = Path(path)
+    # SWEPT FROM HERE ONLY: the cwd is a root of the wipe started in it, not
+    # of the one the operator starts from $HOME (gs_common.wipe_cwd_only).
+    _cwd_note = wipe_cwd_note(_p)
+    if _cwd_note:
+        print(_cwd_note)
     if not wipe_will_erase(_p):
         try:
             _dir = _p.resolve().parent
@@ -839,7 +844,8 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
         sleep_fn(poll_seconds(rng))
 
 
-def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> None:
+def _print_sender_instructions(matched: list, dest: str = "", echo=print,
+                               now=None) -> bool:
     """Re-print the BTC side: this is the 'receive address' the sender pays.
 
     The memo binding is CHECKED AGAIN here, not trusted because
@@ -860,7 +866,7 @@ def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> Non
     elsewhere.
     """
     if not matched:
-        return
+        return False
     # THE ADDRESS THE BITCOIN ACTUALLY GOES TO, checked for the same reason and
     # by the same argument the docstring above makes about the memo -- which it
     # then applied to the memo only.
@@ -923,10 +929,41 @@ def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> Non
                 f"    vouch for. Re-run thor_swap_preparer without that flag rather "
                 f"than trusting\n"
                 f"    this file, or watch without a bundle by passing --expect-xmr.")
+    # HOW OLD, BEFORE "SEND EXACTLY". This is the copy the operator messages
+    # to the sender hours later, and every re-run after a timeout printed it
+    # again -- from a file of any age: thor_swap_preparer stamps each pair's
+    # `ts` and nothing here read it. ThorChain's quotes expire in minutes and
+    # its inbound vault addresses rotate, so a stale block is an instruction
+    # to pay an address that may no longer route the swap. gs_unseal already
+    # refuses to call a slip past QUOTE_STALE_S fresh; this is the same rule
+    # for the same block. WITHHELD, not refused: the watch is still what
+    # notices a payment the sender already made against it.
+    _ages = [quote_age(p.get("ts"), now) for p in matched]
+    _worst = max((a for a, _w in _ages if a is not None), default=None)
+    _unknown = [w for a, w in _ages if a is None]
+    if _unknown or (_worst is not None and _worst > QUOTE_STALE_S):
+        integrity_log("recv", "quote_stale_withheld")
+        echo("")
+        echo("  [!] NOT REPRINTING THE DEPOSIT INSTRUCTIONS.")
+        if _unknown:
+            echo(f"      How old this quote is cannot be told: its timestamp is "
+                 f"{_unknown[0]}.")
+        else:
+            echo(f"      This quote is ~{_worst // 60} minutes old. Quotes "
+                 f"expire and the deposit address rotates;")
+        echo("      paying against it can be refunded minus fees, filled at a "
+             "rate you did not")
+        echo("      agree to, or sent where the swap is no longer routed. Quote "
+             "again and give")
+        echo("      the sender the new block. If they ALREADY paid against "
+             "this one, this watch")
+        echo("      is still waiting for that payment.")
+        return True
     echo("")
     echo("  ============================================================")
     echo("  GIVE THIS TO THE BTC SENDER (this is the receive address):")
     echo("  ============================================================")
+    echo(f"  Quoted ~{_worst // 60} min ago; quotes expire within minutes.")
     for i, p in enumerate(matched):
         echo(f"\n  --- Payment {i + 1} of {len(matched)} ---")
         echo(f"  Send exactly: {p.get('btc_in')} BTC")
@@ -954,6 +991,7 @@ def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> Non
     echo("  retract that link, so treat this receive address as burned: this one")
     echo("  swap, then let the mix move the funds off it.")
     echo("  ============================================================")
+    return False
 
 
 def main():

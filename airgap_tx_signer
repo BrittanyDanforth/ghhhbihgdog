@@ -227,6 +227,17 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         # destination, and refused alongside 'sweep' (a sweep has nothing left
         # over to forward) and alongside a multi-destination entry (the fixed
         # part must be exactly one output, or "the rest" is ambiguous).
+        # WHERE A TRANSFER'S CHANGE MAY GO (see _check_wallet_cli_agrees).
+        # An address or absent; a sweep and an exact-consume peel make none.
+        _chg = tx.get("change_to")
+        if _chg is not None:
+            if not isinstance(_chg, str) or not _XMR_ADDR_IN_TEXT.fullmatch(_chg):
+                sys.exit(f"[!] Schema error at TX {i}: 'change_to' must be a "
+                         f"Monero address")
+            if tx.get("sweep") or tx.get("consume_to"):
+                sys.exit(f"[!] Schema error at TX {i}: 'change_to' on a "
+                         f"{'sweep' if tx.get('sweep') else 'consume_to'} "
+                         f"entry, which makes no change.")
         _consume = tx.get("consume_to")
         if _consume is not None:
             if not isinstance(_consume, str) or not _consume:
@@ -642,15 +653,39 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
             "the fee probe returned no fee, so the exact amount cannot be "
             "computed; refusing to build a transaction that would leave "
             "change and a third output.")
+    # A USABLE BUILD IS NEVER THROWN AWAY FOR A RETRY. The retries used to be
+    # priced at the fee the last build came back with -- LOWER, since a build
+    # that succeeds without matching is one whose real fee came in under its
+    # price -- and the next draw of decoys can cost more than that, which
+    # wallet2 answers "not enough money". That exception escaped the loop,
+    # phase_create exited, and the peel chain stopped part-way with its
+    # remainder on a carrier -- discarding a build that was fine but for
+    # 1200 piconero of dust, the case this loop exists to make rarer. Driven:
+    # probe, a usable build 1200 under, a retry that costs more -> RAISED.
+    #
+    # So: retries are priced at the HIGHER of the two fees (a redraw that
+    # costs what the probe cost -- six of seven, measured -- is then exact),
+    # and a retry that fails leaves the best build already in hand. Only a
+    # FIRST exact build that fails, with nothing in hand, is priced a little
+    # higher and tried again, and after that it fails closed as before.
     result, residue = None, None
-    for _ in range(_EXACT_CONSUME_TRIES):
+    for _try in range(_EXACT_CONSUME_TRIES):
         forward = unlocked - fixed - fee
         if forward <= 0:
             raise RuntimeError(
                 f"after the {fee}-unit fee there is nothing left to forward "
                 f"from {tx_acct}/{src_index}: the carrier holds {unlocked} and "
                 f"this peel pays {fixed}.")
-        attempt = _build(forward)
+        try:
+            attempt = _build(forward)
+        except Exception:                                    # noqa: BLE001
+            if result is not None:
+                integrity_log("signer", "exact_consume_retry_failed")
+                break
+            if _try + 1 < _EXACT_CONSUME_TRIES:
+                fee = fee + max(fee // 50, 1)
+                continue
+            raise
         got = int(attempt.get("fee") or 0)
         # PRICED AT `fee`, BUILT AT `got`. Equal means the two destinations and
         # the fee account for the input exactly and there is no third output.
@@ -659,7 +694,7 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
             break
         if result is None or abs(fee - got) < residue:
             result, residue = attempt, abs(fee - got)
-        fee = got
+        fee = max(fee, got)
     if result is None:                                       # unreachable
         raise RuntimeError("no build was produced for the exact-consume peel")
     if residue:
@@ -1017,9 +1052,66 @@ def _plan_destinations(plan: List[dict], idx: int) -> list:
 #: subaddress, 106 integrated.
 _XMR_ADDR_IN_TEXT = re.compile(r"[1-9A-HJ-NP-Za-km-z]{95,106}")
 
+#: monero-wallet-cli's own decode of a loaded set (simplewallet.cpp,
+#: accept_loaded_tx): "Loaded N transactions, for T, fee F, sending A1 to X1,
+#: sending A2 to X2, C change to Y, with min ring size R, ... Is this okay?"
+#: -- or "no change". Amounts are print_money: twelve decimals. The change
+#: amount is taken off its destination before the "sending" list is printed.
+_CLI_SEND = re.compile(r"sending (\d+\.\d{12}) to ([1-9A-HJ-NP-Za-km-z]{95,106})",
+                       re.I)
+_CLI_CHANGE = re.compile(
+    r"(\d+\.\d{12}) change to ([1-9A-HJ-NP-Za-km-z]{95,106})", re.I)
 
-def _check_wallet_cli_agrees(out_text: str, expected: list, idx: int) -> None:
-    """Refuse if wallet-cli says it is paying somewhere the PLAN does not.
+#: The most change an exact-consume peel may carry. It is built to leave
+#: none; what a fee that moved between two builds leaves is a few hundred
+#: piconero (measured: 0.0000012). Anything near this is not drift.
+CONSUME_CHANGE_MAX = Decimal("0.0001")
+
+
+def _plan_expectations(plan: List[dict], idx: int) -> dict:
+    """What the PLAN says entry `idx` pays: every destination, the fixed
+    amount of each one that has one, and what change it may make.
+
+    {"fixed": {addr: Decimal}, "free": {addr}, "kind": "sweep" | "consume"
+    | "transfer", "change_to": addr or None}
+    """
+    out = {"fixed": {}, "free": set(), "kind": "transfer", "change_to": None}
+    if not isinstance(plan, list) or idx < 0 or idx >= len(plan):
+        return out
+    tx = plan[idx] if isinstance(plan[idx], dict) else {}
+    if tx.get("sweep"):
+        out["kind"] = "sweep"
+        if isinstance(tx.get("dst"), str) and tx.get("dst"):
+            out["free"].add(tx["dst"])
+        return out
+    dests = tx.get("destinations")
+    if isinstance(dests, list):
+        for d in dests:
+            if not isinstance(d, dict) or not isinstance(d.get("address"), str):
+                continue
+            try:
+                amt = Decimal(str(d.get("amount")))
+            except Exception:                                # noqa: BLE001
+                out["free"].add(d["address"])
+                continue
+            out["fixed"][d["address"]] = (out["fixed"].get(d["address"],
+                                                           Decimal(0)) + amt)
+    elif isinstance(tx.get("dst"), str) and tx.get("dst"):
+        try:
+            out["fixed"][tx["dst"]] = Decimal(str(tx.get("amt")))
+        except Exception:                                    # noqa: BLE001
+            out["free"].add(tx["dst"])
+    ct = tx.get("consume_to")
+    if isinstance(ct, str) and ct:
+        out["kind"] = "consume"
+        out["free"].add(ct)
+    if isinstance(tx.get("change_to"), str) and tx.get("change_to"):
+        out["change_to"] = tx["change_to"]
+    return out
+
+
+def _check_wallet_cli_agrees(out_text: str, plan: List[dict], idx: int) -> None:
+    """Refuse if wallet-cli says it is paying anything the PLAN does not.
 
     THE ONE THING THAT CAN DECODE THE BLOB IS WALLET-CLI ITSELF.
 
@@ -1033,21 +1125,32 @@ def _check_wallet_cli_agrees(out_text: str, expected: list, idx: int) -> None:
 
     wallet-cli decodes the set and prints the destinations before it asks "Is
     this okay?", a prompt this tool auto-answers "y". So its output is a
-    decoder we already have: whatever the blob really pays, wallet-cli names
-    it. Cross-checking that against the fingerprint-covered plan closes the
-    loop the hash cannot.
+    decoder we already have, and it is checked against the plan EXACTLY.
 
-    Fail-closed only on a POSITIVE disagreement -- addresses were found and
-    ours is not among them. If no full address appears at all (a wallet-cli
-    build that abbreviates, or a format this does not recognise) that is not
-    evidence of tampering, so it warns and records instead of refusing: a
-    check that bricks legitimate signing on a formatting change would be
-    removed by the next operator who hits it, and then nothing would be left.
+    IT USED TO CHECK ONLY THAT THE PLAN'S ADDRESSES APPEARED SOMEWHERE in that
+    output, never the amounts and never an extra destination -- so a blob
+    paying one piconero to the plan's address and everything else to another
+    SIGNED, as did one paying 0.1 of a planned 1.5 and 1.4 elsewhere. Only a
+    blob that dropped the plan's address altogether was refused. Now:
+
+      * the "sending A to X" destinations are the plan's, no more, no fewer;
+      * each fixed amount in the plan is the amount wallet-cli prints;
+      * change: none on a sweep (sweep_all makes none), dust at most on an
+        exact-consume peel, and on a transfer whose plan names `change_to`,
+        that address -- otherwise a transfer's change is said to be
+        unverified, because nothing offline can say which address is ours.
+
+    An output naming full addresses that this cannot read as that list is
+    REFUSED: a format this does not understand cannot be vouched for. One
+    naming no address at all -- wallet-cli failed before its prompt -- signed
+    nothing to check, and says so.
     """
+    exp = _plan_expectations(plan, idx)
+    expected = set(exp["fixed"]) | exp["free"]
     if not expected:
         return
-    seen = set(_XMR_ADDR_IN_TEXT.findall(out_text or ""))
-    if not seen:
+    text = out_text or ""
+    if not _XMR_ADDR_IN_TEXT.search(text):
         integrity_log_once("signer", "wallet_cli_dest_unparsed")
         print(f"  [!] TX {idx}: could not read a destination out of "
               f"monero-wallet-cli's output, so what it signed was NOT "
@@ -1056,20 +1159,63 @@ def _check_wallet_cli_agrees(out_text: str, expected: list, idx: int) -> None:
               f"it sits next to the file it covers. Treat the staging "
               f"directory as trusted media.")
         return
-    missing = [a for a in expected if a not in seen]
-    if missing:
-        integrity_log("signer", "wallet_cli_dest_mismatch")
+
+    def _refuse(why: str, detail: str) -> None:
+        integrity_log("signer", f"wallet_cli_dest_mismatch:{why}")
         sys.exit(
             f"[!] TX {idx}: monero-wallet-cli decoded this unsigned transaction "
-            f"and did NOT\n"
-            f"    name the destination the plan says it pays.\n"
-            f"    plan expects : {', '.join(scrub_address(a) for a in missing)}\n"
-            f"    wallet-cli saw: "
-            f"{', '.join(scrub_address(a) for a in sorted(seen))}\n"
+            f"and it does NOT\n"
+            f"    pay what the plan says. {detail}\n"
             f"    The unsigned blob does not match the plan it was created from.\n"
             f"    Its manifest hash cannot catch this -- the hash is stored beside\n"
             f"    the blob, so anything that rewrote one rewrote the other.\n"
             f"    REFUSING TO SIGN. Re-run --phase create from the plan.")
+
+    sends = {}
+    for amt, addr in _CLI_SEND.findall(text):
+        sends[addr] = sends.get(addr, Decimal(0)) + Decimal(amt)
+    if not sends:
+        _refuse("unparsed", "Its output names addresses, but not as the "
+                "'sending <amount> to <address>' list this checks, so what "
+                "it would sign cannot be vouched for.")
+    extra = sorted(set(sends) - expected)
+    missing = sorted(expected - set(sends))
+    if extra:
+        _refuse("extra", f"It also pays "
+                f"{', '.join(scrub_address(a) for a in extra)}, which the plan "
+                f"does not name.")
+    if missing:
+        _refuse("missing", f"The plan pays "
+                f"{', '.join(scrub_address(a) for a in missing)}, which it "
+                f"does not.")
+    # In PICONERO, truncated the way phase_create truncated when it built the
+    # request: a plan amount with more than twelve decimals was sent as
+    # int(amount * 10**12), and that integer is what wallet-cli prints.
+    _atomic = lambda d: int(d * Decimal(10 ** 12))           # noqa: E731
+    for addr, want in exp["fixed"].items():
+        if _atomic(sends.get(addr, Decimal(-1))) != _atomic(want):
+            _refuse("amount", f"It sends {sends.get(addr)} XMR to "
+                    f"{scrub_address(addr)}; the plan says {want}.")
+    changes = [(Decimal(a), x) for a, x in _CLI_CHANGE.findall(text)]
+    change_total = sum((a for a, _x in changes), Decimal(0))
+    if changes and exp["kind"] == "sweep":
+        _refuse("change", "A sweep makes no change, and this sends "
+                f"{change_total} XMR as change to "
+                f"{scrub_address(changes[0][1])}.")
+    if exp["kind"] == "consume" and change_total > CONSUME_CHANGE_MAX:
+        _refuse("change", f"An exact-consume peel leaves at most dust as "
+                f"change, and this sends {change_total} XMR to "
+                f"{scrub_address(changes[0][1])}.")
+    if changes and exp["change_to"] and any(x != exp["change_to"]
+                                            for _a, x in changes):
+        _refuse("change", f"Its change goes to "
+                f"{scrub_address(changes[0][1])}; the plan says "
+                f"{scrub_address(exp['change_to'])}.")
+    if changes and exp["kind"] == "transfer" and not exp["change_to"]:
+        integrity_log_once("signer", "wallet_cli_change_unverified")
+        print(f"  [!] TX {idx}: its change ({change_total} XMR) goes to "
+              f"{scrub_address(changes[0][1])}, and this plan does not name "
+              f"a change address to check that against.")
 
 
 def _load_signing_manifest(outdir, plan: list) -> list:
@@ -1286,6 +1432,16 @@ def _cli_state_args() -> list:
             "--shared-ringdb-dir", _RINGDB_DIR[0]]
 
 
+def _cli_env() -> dict:
+    """monero-wallet-cli's environment: this process's, less every GS_
+    variable. It is given the password by file and on stdin, and inherited
+    GS_WALLET_PASSWORD besides -- driven with a stand-in wallet-cli that dumped
+    its environ -- for as long as it ran, in /proc/<pid>/environ, beside the
+    exit address and whatever else the caller exported. Nothing it runs reads
+    a GS_ variable."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GS_")}
+
+
 def _offline_account_count(wallet_file: str, args) -> int:
     """How many accounts the OFFLINE wallet has, via wallet-cli's `account`.
 
@@ -1302,7 +1458,7 @@ def _offline_account_count(wallet_file: str, args) -> int:
         r = subprocess.run(
             [args.wallet_cli, *_cli_state_args(), "--wallet-file", wallet_file,
              "--password-file", pw_path, "--command", "account"],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=300, env=_cli_env(),
             input=f"{args.wallet_password or ''}\n" + "y\n" * 3)
         txt = (r.stdout or "") + (r.stderr or "")
         # "        1 8Bmvo7        0.000000000000 ..." -- index then a
@@ -1369,7 +1525,7 @@ def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
         subprocess.run(
             [args.wallet_cli, *_cli_state_args(), "--wallet-file", wallet_file,
              "--password-file", pw_path],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=_cli_env(),
             timeout=max(600, missing * 5),
             input=f"{args.wallet_password or ''}\n"
                   + "account new\n" * missing + "exit\n")
@@ -1450,6 +1606,7 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
                      "--password-file", _ipw,
                      "--command", "import_outputs", str(_blob_path)],
                     capture_output=True, text=True, timeout=300, cwd=_iw,
+                    env=_cli_env(),
                     input=f"{args.wallet_password or ''}\n" + "y\n" * 3,
                 )
                 _txt = (_r.stdout or "") + (_r.stderr or "")
@@ -1534,9 +1691,20 @@ def phase_sign(args, plan: List[dict]):
     # Load unsigned manifest
     entries = _load_signing_manifest(outdir, plan)
 
+    # ABSOLUTE, because monero-wallet-cli runs in a scratch directory (cwd=
+    # work_dir below, and _iw for the output import): a relative path that
+    # exists HERE names nothing THERE, so every TX failed with "file not
+    # found" after this check had passed. And the .keys file is the one that
+    # signs; the cache beside it is optional.
     wallet_file = args.wallet_file
-    if not wallet_file or not Path(wallet_file).exists():
-        sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
+    if wallet_file:
+        _wp = Path(wallet_file).expanduser()
+        if _wp.name.endswith(".keys"):
+            _wp = _wp.with_name(_wp.name[:-len(".keys")])
+        wallet_file = str(_wp.resolve())
+    if not wallet_file or not Path(wallet_file + ".keys").is_file():
+        sys.exit(f"[!] Wallet file required for signing: {wallet_file} "
+                 f"(its .keys file is not there)")
 
     # Create signed output directory
     signed_dir = outdir / "signed"
@@ -1671,7 +1839,7 @@ def phase_sign(args, plan: List[dict]):
             # wallet-cli ignores remaining stdin.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=120, cwd=work_dir,
+                timeout=120, cwd=work_dir, env=_cli_env(),
                 input=f"{args.wallet_password or ''}\n" + "y\n" * 3,
             )
 
@@ -1679,8 +1847,7 @@ def phase_sign(args, plan: List[dict]):
             # See _check_wallet_cli_agrees: the manifest hash cannot catch a
             # blob swap, and this is the only decoder available offline.
             _check_wallet_cli_agrees(
-                (result.stdout or "") + (result.stderr or ""),
-                _plan_destinations(plan, idx), idx)
+                (result.stdout or "") + (result.stderr or ""), plan, idx)
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"

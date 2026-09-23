@@ -218,6 +218,10 @@ _plan_C = [{"src": "A", "dst": "B", "amt": "0.1", "delay": 0}]
 }))
 _fake_wallet = Path(os.getcwd()) / "walletC.bin"
 _fake_wallet.write_bytes(b"wallet")
+# ...and its .keys, which is the file that signs and the one phase_sign now
+# requires (a relative or cache-only path used to pass its check and then
+# fail inside wallet-cli's scratch directory).
+Path(str(_fake_wallet) + ".keys").write_bytes(b"keys")
 
 captured = {}
 _real_run = airgap.subprocess.run
@@ -352,9 +356,14 @@ try:
     ghost.check_daemon_relay_egress = lambda *a, **k: {
         "verdict": "clearnet", "onion": 0, "clear": 4, "detail": "4 clearnet peer(s)"}
     _argv = sys.argv[:]
+    # A wallet to sign with, so stage 0's first refusal (no .keys file) is
+    # not the one this reaches.
+    _d1w = Path(os.getcwd()) / "walletD1"
+    Path(str(_d1w) + ".keys").write_bytes(b"k")
     sys.argv = ["GhostSpiral", "--btc-entry",
                 "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-                "--tor-proxy", "socks5h://127.0.0.1:9050"]
+                "--tor-proxy", "socks5h://127.0.0.1:9050",
+                "--wallet-file", str(_d1w)]
     _msg = ""
     try:
         ghost.main()
@@ -364,6 +373,21 @@ try:
         sys.argv = _argv
     check("D1: GhostSpiral aborts on clearnet relay egress",
           "Aborting BEFORE any work" in _msg)
+    # ...and with NO wallet it refuses before that, and before any RPC:
+    # a missing wallet used to surface only at Round 0, after the swap.
+    sys.argv = ["GhostSpiral", "--btc-entry",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                "--tor-proxy", "socks5h://127.0.0.1:9050",
+                "--wallet-file", str(_d1w) + "_absent"]
+    _msg0 = ""
+    try:
+        ghost.main()
+    except SystemExit as e:
+        _msg0 = str(e)
+    finally:
+        sys.argv = _argv
+    check("D1b: no wallet .keys -> refused at stage 0, nothing spent or quoted",
+          "No wallet to sign with" in _msg0 and _reached["rpc"] is False)
     check("D1: abort happens BEFORE any RPC work is done", _reached["rpc"] is False)
 finally:
     (ghost.verify_tor, ghost.require_resources,
@@ -519,6 +543,7 @@ _E_dir = Path(os.getcwd()) / "stageE"
 _E_unsigned = _E_dir / "tx_0.unsigned"
 _E_unsigned.write_text("00")
 _E_wallet = Path(os.getcwd()) / "walletE.bin"; _E_wallet.write_bytes(b"w")
+Path(str(_E_wallet) + ".keys").write_bytes(b"k")
 _E_PLAN = [{"src": "A", "src_index": 0, "dst": "B", "amt": "0.1", "delay": 0}]
 _E_OTHER = [{"src": "A", "src_index": 9, "dst": "ATTACKER", "amt": "99"}]
 _E_HASH = hashlib.sha256(b"00").hexdigest()
@@ -553,6 +578,44 @@ def _run_sign(manifest, plan=None):
 
 check("E: a valid manifest still signs normally",
       _run_sign({"plan_fingerprint": _E_FP, "entries": [_entry()]}) == "SIGNED")
+
+# A RELATIVE --wallet-file (GhostSpiral's default is "offline.wallet") must
+# reach wallet-cli ABSOLUTE: wallet-cli runs in a scratch dir, where the
+# relative name was "file not found" for every TX after the existence check
+# here had passed.
+_E_cmds = []
+_real_run_e = airgap.subprocess.run
+_cwd_e = os.getcwd()
+try:
+    airgap.subprocess.run = lambda cmd, **kw: (
+        _E_cmds.append((list(cmd), kw)),
+        Path(kw["cwd"], "signed_monero_tx").write_bytes(b"sig"),
+        types.SimpleNamespace(returncode=0, stdout="", stderr=""))[2]
+    os.environ["GS_WALLET_PASSWORD"] = "spend-pw-in-env"
+    (_E_dir / "unsigned_manifest.json").write_text(json.dumps(
+        {"plan_fingerprint": _E_FP, "entries": [_entry()]}))
+    os.chdir(os.path.dirname(str(_E_wallet)))
+    airgap.phase_sign(types.SimpleNamespace(
+        outdir=str(_E_dir), wallet_cli="x",
+        wallet_file=os.path.basename(str(_E_wallet)), wallet_password=""),
+        _E_PLAN)
+finally:
+    os.chdir(_cwd_e)
+    airgap.subprocess.run = _real_run_e
+    os.environ.pop("GS_WALLET_PASSWORD", None)
+_E_wf = [c[c.index("--wallet-file") + 1] for c, _k in _E_cmds
+         if "--wallet-file" in c]
+check("E: a relative --wallet-file reaches wallet-cli as an absolute path",
+      _E_wf and all(os.path.isabs(w) and w == str(_E_wallet) for w in _E_wf))
+# wallet-cli is given the password by file and stdin; it inherited it from
+# the environment as well, for as long as it ran.
+check("E: monero-wallet-cli gets an environment with no GS_ variable in it",
+      _E_cmds and all(_k.get("env") is not None
+                      and not any(v.startswith("GS_") for v in _k["env"])
+                      for _c, _k in _E_cmds))
+_air_src = open(os.path.join(REPO, "airgap_tx_signer")).read()
+check("E: every wallet-cli call in the signer passes that environment",
+      _air_src.count("subprocess.run(") == _air_src.count("env=_cli_env()"))
 
 # The fingerprint must be MANDATORY. The old guard was `if saved_fp and ...`,
 # so deleting one JSON field disabled the only thing tying the manifest to the

@@ -46,6 +46,16 @@ check("exit-sim: xmr_eur = 275.00 (not inverted)", prices["xmr_eur"] == Decimal(
 check("exit-sim: btc_usd = 60000 (not inverted)", prices["btc_usd"] == Decimal("60000.00"))
 # sanity: the OLD inverted math would have produced ~8.3e-8, quantized to 0.00
 check("exit-sim: not the old ~0 bug", prices["xmr_usd"] > Decimal("1"))
+# ...and on a stream of its own: both oracle fetches used the BARE proxy, the
+# default circuit, while the Tor check beside them was isolated.
+_seen_proxies = []
+esim.safe_get = lambda url, proxy: (_seen_proxies.append(proxy), fake_get(url, proxy))[1]
+esim.fetch_prices({"http": "socks5h://127.0.0.1:9050",
+                   "https": "socks5h://127.0.0.1:9050"})
+check("exit-sim: the price fetches carry their own SOCKS credential "
+      "(an isolated stream), never the bare proxy",
+      _seen_proxies and all("@" in (p.get("https") or "") for p in _seen_proxies))
+esim.safe_get = fake_get
 
 # ---------------------------------------------------------------------------
 # paranoia_mode BUG 4 — a REAL (non-dry) wipe must NOT recreate integrity log,

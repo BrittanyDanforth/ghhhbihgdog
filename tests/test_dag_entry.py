@@ -766,6 +766,32 @@ check("split: ...naming that carrier's own account, not a shared one",
 check("split: each fan-out pays only ITS slice of the mix targets",
       [[d["address"] for d in t["destinations"]] for t in _plan] == _SLICES)
 
+
+# WHERE EACH FAN-OUT'S CHANGE MAY GO, named in the plan the signer checks the
+# blob against (airgap_tx_signer._check_wallet_cli_agrees): the spending
+# account's subaddress 0, read from the wallet -- and left out, not guessed,
+# when the wallet will not say.
+class _AddrRpc:
+    def raw_request(self, method, params=None):
+        if method == "get_address":
+            a = params["account_index"]
+            return {"addresses": [{"address_index": 0,
+                                   "address": f"8CHANGE{a}" + "x" * 87}]}
+        raise AssertionError(method)
+
+
+with contextlib.redirect_stdout(io.StringIO()):
+    _cplan = ghost.build_distribution_plan(
+        _VA2(peel=False, dag_mixing=False), _AddrRpc(),
+        {a: (c, i) for a, c, i in _SRC}, _SRC,
+        [d for sl in _SLICES for d in sl], _BY, _SLICES, Decimal("0.0024"),
+        20, 6, (0, 0), _secretsmod, Decimal("310"), Decimal("279"))[0]
+check("split: each fan-out names its own account's subaddress 0 as change_to",
+      [t.get("change_to") for t in _cplan]
+      == [f"8CHANGE{a}" + "x" * 87 for a in (20, 21, 22)])
+check("split: ...and with no wallet to ask, change_to is left out, not guessed",
+      all("change_to" not in t for t in _plan))
+
 # THE INVARIANT, checked on the plan as a whole rather than tx by tx: trace
 # every destination back to the chunk that funded it and confirm no two chunks
 # ever meet in one transaction.
@@ -1439,9 +1465,11 @@ check("peel planner: the returned amounts are the ones the plan pays",
 # that merely refuses, or merely fits, leaves this unexercised -- which is how
 # the stale dict survived in the first place.
 _shrunk_plan = _shrunk_amts = None
-# Six 1 XMR destinations need 6.018 with the headroom, so anything at or
-# below 6.00 forces the 0.80 fraction. Walked rather than pinned to one
-# number, because the reserve constants are the kind that get retuned.
+# The planner now starts from ALL of `usable` (PEEL_BUDGET_FRACTIONS), not
+# the amounts handed in, so the shrink is forced by leaving the chain no
+# headroom: usable EQUAL to the balance cannot also pay the hops' reserves.
+# Walked rather than pinned to one number, because the reserve constants are
+# the kind that get retuned.
 for _bal_try in ("6.00", "5.75", "5.50", "5.00", "4.50", "4.00", "3.00"):
     _buf_sh = io.StringIO()
     try:
@@ -1450,11 +1478,12 @@ for _bal_try in ("6.00", "5.75", "5.50", "5.00", "4.50", "4.00", "3.00"):
                 _pl_args, _PeelRpc(), {"PC0": (20, 1)}, [("PC0", 20, 1)],
                 _pl_dests, dict(_pl_by), [_pl_dests], Decimal("0.0024"), 20,
                 len(_pl_dests), (0, 0), _peel_secmod,
-                Decimal(_bal_try), Decimal(_bal_try) * Decimal("0.98"))
+                Decimal(_bal_try), Decimal(_bal_try))
     except SystemExit:
         continue
     if "could not carry the full distribution" in _buf_sh.getvalue():
         _shrunk_plan, _shrunk_amts = _sp, _sa
+        _shrunk_msg = _buf_sh.getvalue()
         break
 check("peel planner: a shrinking balance was found, so the path below ran",
       _shrunk_plan is not None)
@@ -1463,6 +1492,12 @@ check("peel planner: a SHRUNK distribution returns the shrunk amounts",
       and any(Decimal(str(_shrunk_amts[_d])) != _pl_by[_d] for _d in _pl_dests))
 check("peel planner: ...and they still match what the plan pays",
       _shrunk_plan is not None and _amounts_agree(_shrunk_plan, _shrunk_amts))
+# The shrink message said "The rest stays on ENTRY" -- false in a peel chain,
+# where peel 0 spends ENTRY whole and the last peel sweeps what is left.
+check("peel planner: a shrink says the rest goes to the LAST destination, "
+      "not that it stays on ENTRY",
+      _shrunk_plan is not None and "LAST peel's destination" in _shrunk_msg
+      and "stays on ENTRY" not in _shrunk_msg)
 
 # The call site has to USE the fourth value. A caller that unpacks three and
 # keeps its own dict is the defect back, with the function fixed.

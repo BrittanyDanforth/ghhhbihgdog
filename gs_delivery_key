@@ -680,7 +680,9 @@ def build_cli() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    install_signal_handlers()
+    # interactive: it waits on a person, and Ctrl-C at that prompt must stop
+    # it (gs_common.install_signal_handlers).
+    install_signal_handlers(interactive=True)
     # ARGS FIRST, NACL SECOND -- see gs_unseal's main() for why: --help must
     # work on a box that has not installed anything yet.
     args = build_cli().parse_args(argv)
@@ -694,4 +696,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n  [!] Stopped.", file=sys.stderr)
+        sys.exit(130)

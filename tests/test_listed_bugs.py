@@ -1159,7 +1159,7 @@ _MISSING = [t for t in
              "broadcast_signed_xmr", "thor_swap_preparer", "create_receive_wallet",
              "exit_strategy_simulator", "gs_delivery_key", "gs_unseal",
              "gs_wake_agent", "gs_wake_keys", "gs_telegram_pager")
-            if not _re5.search(r"^[ \t]*install_signal_handlers\(\)",
+            if not _re5.search(r"^[ \t]*install_signal_handlers\((interactive=True)?\)",
                                Path(os.path.join(REPO, t)).read_text(), _re5.M)]
 check(f"core dumps: NON-VACUITY -- every other tool still takes the shared "
       f"hook, so the local copies stay two named exceptions ({_MISSING or 'none missing'})",

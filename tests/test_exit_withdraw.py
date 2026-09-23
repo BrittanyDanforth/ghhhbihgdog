@@ -1607,7 +1607,8 @@ try:
     ghost._run_round = lambda *a, **k: 1
 
     def _cap_exit(a, accounts, dests, stg, proxy, meta, dw=None, hold=(),
-                  entry_pairs=(), remainder_pairs=(), fee_pairs=()):
+                  entry_pairs=(), remainder_pairs=(), fee_pairs=(),
+                  scope=None):
         _s5_seen["hold"] = list(hold)
         _s5_seen["remainder"] = list(remainder_pairs)
         return (1, 0, 0, {"entry": 0, "change": 0, "remainder": 1,
@@ -1912,6 +1913,94 @@ check("...and nothing was written into the working directory",
       not [f for f in os.listdir(_scratch9) if f.startswith("unsigned_")])
 check("...and the directory it landed in is owner-only",
       oct(os.stat(_od9).st_mode)[-3:] == "700")
+
+
+# ===========================================================================
+# THE EXIT EMPTIED EVERY FUNDED SUBADDRESS OF THE RECEIVE ACCOUNT.
+#
+# create_subs gives each output of the run its own fresh account, so reading
+# those whole is right. The receive bundle's account is not the run's: it is
+# whatever create_receive_wallet --account named, and a SECOND bundle in it
+# (two swaps in flight to one account) held another swap's XMR -- which went
+# to --exit-to in one hop, named by its own public memo, before "EXIT
+# COMPLETE". Driven with the real _exit_account_list, _exit_hold_list,
+# _exit_scope and _run_exit_withdrawals; RPC and rounds stubbed.
+# ===========================================================================
+print("\n=== the exit takes only what this run put on the receive account ===")
+_BAL10 = {(5, 2): 3_000_000_000_000, (12, 1): 1_000_000_000_000,
+          (13, 1): 900_000_000_000}
+
+
+class _RPC10:
+    def raw_request(self, m, p):
+        if m == "refresh":
+            return {}
+        if m == "get_balance":
+            a = p["account_index"]
+            return {"per_subaddress": [{"address_index": s, "balance": v}
+                                       for (aa, s), v in _BAL10.items()
+                                       if aa == a]}
+        raise AssertionError(m)
+
+
+_sv10 = {k: getattr(ghost, k) for k in ("connect_rpc", "_wait_for_change_settled",
+                                     "relay_gates", "_change_residue",
+                                     "hop_delay", "_run_round", "integrity_log")}
+_sent10 = []
+try:
+    ghost.connect_rpc = lambda *a, **k: _RPC10()
+    ghost._wait_for_change_settled = lambda args, a, s, proxy, label: (
+        True, _BAL10[(a, s)])
+    ghost.relay_gates = lambda *a, **k: None
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.hop_delay = lambda w=None: 0
+    ghost.integrity_log = lambda *a, **k: None
+
+    def _round10(args, plan_file, stage, label, wipe=True):
+        tx = json.loads(Path(plan_file).read_text())["txs"][0]
+        _sent10.append((tx["account_index"], tx["src_index"]))
+    ghost._run_round = _round10
+    _d10 = tempfile.mkdtemp(prefix="exitscope_")
+    _a10 = types.SimpleNamespace(rpc_primary="http://127.0.0.1:18083",
+                                 tor_proxy="", output=_d10)
+    _DEST10 = ("44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7Sq"
+               "SsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A")
+    _ix10 = {"ENTRY": (5, 1), "CARRIER": (9, 1), "M1": (12, 1), "M2": (13, 1)}
+    _acc10 = ghost._exit_account_list(_ix10, [9], 9)
+    _hold10 = ghost._exit_hold_list(types.SimpleNamespace(), _ix10, ["ENTRY"]) \
+        + [(9, 0), (9, 1)]
+    _scope10 = ghost._exit_scope(_ix10, 5)
+    with contextlib.redirect_stdout(io.StringIO()) as _o10:
+        ghost._run_exit_withdrawals(_a10, _acc10, [_DEST10], _d10, None,
+                                {"fee_per_round": "0.00006"}, hold=_hold10,
+                                entry_pairs=[(5, 1)], scope=_scope10)
+    check("the receive account is read only where this run put money: "
+          "(5, 2), another bundle's swap, is NOT withdrawn",
+          (5, 2) not in _sent10)
+    check("...it is named and left, with its amount",
+          "account 5 / subaddress 2" in _o10.getvalue()
+          and "NOT put there by this run" in _o10.getvalue())
+    check("NON-VACUITY: the run's own mix outputs are still withdrawn",
+          sorted(_sent10) == [(12, 1), (13, 1)])
+    check("the scope names only the receive account; send mode has none",
+          set(_scope10) == {5} and _scope10[5] == {0, 1}
+          and ghost._exit_scope(_ix10, None) == {})
+    # Without a scope (the old call), the same wallet sends (5, 2) out -- the
+    # defect, reproduced, so the checks above are about the change.
+    _sent10.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost._run_exit_withdrawals(_a10, _acc10, [_DEST10], _d10, None,
+                                {"fee_per_round": "0.00006"}, hold=_hold10,
+                                entry_pairs=[(5, 1)])
+    check("CONTROL: unscoped, the other bundle's swap is swept out",
+          (5, 2) in _sent10)
+    _gsrc10 = open(os.path.join(REPO, "GhostSpiral")).read()
+    check("main() passes the scope to the exit",
+          "exit_scope=_exit_scope(" in _gsrc10
+          and "scope=exit_scope)" in _gsrc10)
+finally:
+    for _k, _v in _sv10.items():
+        setattr(ghost, _k, _v)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

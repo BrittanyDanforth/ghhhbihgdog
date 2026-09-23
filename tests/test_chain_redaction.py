@@ -775,19 +775,11 @@ def _capture_par(fn, *a, **k):
     return lines, buf.getvalue()
 
 
-_saved_gai = _par.socket.getaddrinfo
-try:
-    def _boom(*a, **k):
-        raise OSError(101, "Network is unreachable", MARKER)
-    _par.socket.getaddrinfo = _boom
-    _chain, _term = _capture_par(_par.dns_check)
-    check("dns_check: the resolver's error text does NOT reach the chain",
-          MARKER not in " ".join(_chain))
-    check("dns_check: ...the type does", "OSError" in " ".join(_chain))
-    check("dns_check: ...and the operator still sees the message",
-          MARKER in _term)
-finally:
-    _par.socket.getaddrinfo = _saved_gai
+# dns_check is gone (it was a clearnet lookup after the MAC change); its
+# replacement reads the link state locally and writes nothing to the chain.
+_chain, _term = _capture_par(_par.link_check, "nonexistent-iface-zzz")
+check("link_check: writes nothing to the chain", _chain == [])
+check("link_check: ...and the operator still sees the state", _term.strip())
 
 _saved_run = _par.subprocess.run
 try:

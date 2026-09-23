@@ -1160,10 +1160,8 @@ MUTATIONS = [
  # decoder available offline, and its confirmation is auto-answered "y".
  ("the signer stops cross-checking what wallet-cli says it signed",
   "airgap_tx_signer",
-  "            _check_wallet_cli_agrees(\n"
-  '                (result.stdout or "") + (result.stderr or ""),\n'
-  "                _plan_destinations(plan, idx), idx)",
-  "            pass",
+  '            _check_wallet_cli_agrees(\n                (result.stdout or "") + (result.stderr or ""), plan, idx)',
+  '            pass',
   ["test_signer_schema"]),
 
  # ---- the Telegram pager: it may TRIGGER, it may never CARRY ------------
@@ -2005,11 +2003,8 @@ MUTATIONS = [
  # "both" -- "no name like yours is ever swept", the opposite of the truth.
  ("wipe_miss_reason goes back to judging a directory by the file patterns",
   "gs_common.py",
-  "    pats = (GS_ARTIFACT_DIR_PATTERNS if res.is_dir()\n"
-  "            else GS_ARTIFACT_FILE_PATTERNS)\n"
-  "    return any(fnmatch.fnmatch(res.name, pat) for pat in pats)",
-  "    return any(fnmatch.fnmatch(res.name, pat)\n"
-  "               for pat in GS_ARTIFACT_FILE_PATTERNS)",
+  '    if res.is_dir():\n        return any(fnmatch.fnmatch(res.name, pat)\n                   for pat in GS_ARTIFACT_DIR_PATTERNS)\n    return artifact_name_is_ours(res.name)',
+  '    return artifact_name_is_ours(res.name)',
   ["test_opsec_guarantees", "test_gitignore"]),
 
  # --result-json is free-form like the two --outfiles that DO warn, and it
@@ -2017,8 +2012,8 @@ MUTATIONS = [
  # by hand that the sweep would walk past it.
  ("receive_watch stops warning that its result file survives the wipe",
   "receive_watch",
-  "    _p = Path(path)\n    if not wipe_will_erase(_p):",
-  "    _p = Path(path)\n    if False:",
+  '        print(_cwd_note)\n    if not wipe_will_erase(_p):',
+  '        print(_cwd_note)\n    if False:',
   ["test_receive_watch", "test_listed_bugs"]),
 
  # A bare mkdir is 0777 & ~umask -- measured 0755, and a real uid-65534 child
@@ -2837,8 +2832,8 @@ MUTATIONS = [
  # reported safe from the wipe while paranoia_mode really deletes it.
  ("wipe_will_erase goes back to answering the write-here question",
   "gs_common.py",
-  "    if not _wipe_sweep_reaches_item(res):\n",
-  "    if not wipe_covers(res):\n",
+  '    if not _wipe_sweep_reaches_item(res, cwd=cwd):\n',
+  '    if not wipe_covers(res):\n',
   ["test_units"]),
 
  # stem was listed as a SOFT dependency ("guarded or unused on the wake path")
@@ -7536,6 +7531,249 @@ MUTATIONS = [
   '        _prev_int = signal.signal(signal.SIGINT, signal.default_int_handler)\n',
   '        _prev_int = None\n',
   ['test_wake_agent']),
+ # ---- wt17: the desk tools and the wipe --------------------------------
+ ('the artifact sweep deletes a planted symlink as the directory it names',
+  'gs_common.py',
+  '    if stat_module.S_ISLNK(st.st_mode):\n'
+  '        return ("is a symlink; neither the link nor what it points at is "',
+  '    if False:\n'
+  '        return ("is a symlink; neither the link nor what it points at is "',
+  ['test_opsec_guarantees']),
+ ('the sweep walks through a linked directory to a match',
+  'gs_common.py',
+  '            if stat_module.S_ISLNK(os.lstat(cur).st_mode):\n'
+  '                return (f"is reached through the symlink {cur}, which is not "',
+  '            if False:\n'
+  '                return (f"is reached through the symlink {cur}, which is not "',
+  ['test_opsec_guarantees']),
+ ('the sweep takes another account\'s file', 'gs_common.py',
+  '    if st.st_uid not in owners:\n',
+  '    if False:\n',
+  ['test_opsec_guarantees']),
+ ('the sweep overwrites a file with a second name in place', 'gs_common.py',
+  '    if stat_module.S_ISREG(st.st_mode) and st.st_nlink > 1:\n',
+  '    if False:\n',
+  ['test_opsec_guarantees']),
+ ('a user\'s wallet_*.json is taken by its name alone', 'gs_common.py',
+  '        if not (isinstance(doc, dict)\n'
+  '                and doc.get("schema") == RECEIVE_SCHEMA):\n',
+  '        if False:\n',
+  ['test_opsec_guarantees']),
+ ('a user\'s unsigned/ directory is taken by its name alone', 'gs_common.py',
+  '                    if not (e.is_file(follow_symlinks=False)\n'
+  '                            and artifact_name_is_ours(e.name)):\n',
+  '                    if False:\n',
+  ['test_opsec_guarantees']),
+ ('any *.tmp in $HOME is swept', 'gs_common.py',
+  '    if any(p not in _SUFFIX_ONLY_PATTERNS for p in hits):\n'
+  '        return True\n',
+  '    if True:\n'
+  '        return True\n',
+  ['test_opsec_guarantees']),
+ ('secure_delete_tree follows a link inside the tree', 'gs_common.py',
+  '                path, topdown=False, onerror=_walk_error,\n'
+  '                follow_symlinks=False):\n',
+  '                path, topdown=False, onerror=_walk_error,\n'
+  '                follow_symlinks=True):\n',
+  ['test_opsec_guarantees']),
+ ('secure_delete_tree takes a tree someone else owns', 'gs_common.py',
+  '    if owner_uid is not None and st.st_uid != owner_uid:\n'
+  '        return False\n',
+  '    if False:\n'
+  '        return False\n',
+  ['test_opsec_guarantees']),
+ ('the console\'s checkout is not a wipe root', 'gs_common.py',
+  '        Path.home(), Path.home() / "ghostspiral", Path.home() / "GhostSpiral",\n'
+  '        TOOLCHAIN_DIR]\n',
+  '        Path.home(), Path.home() / "ghostspiral", Path.home() / "GhostSpiral"]\n',
+  ['test_opsec_guarantees']),
+ ('a writer in a bare cwd is told nothing about where to start the wipe',
+  'gs_common.py',
+  '    return bool(wipe_will_erase(target)\n'
+  '                and not wipe_will_erase(target, cwd=False))\n',
+  '    return False\n',
+  ['test_opsec_guarantees']),
+ ('the wipe keeps the delivery key in silence', 'paranoia_mode',
+  '            print(f"  [*] Left on purpose: {dk} (your delivery key, "\n',
+  '            print(f"  [*] {dk} (your delivery key, "\n',
+  ['test_opsec_guarantees']),
+ ('a running pipeline\'s lock is not seen', 'paranoia_mode',
+  '            except OSError:\n'
+  '                live.append(str(lk))\n',
+  '            except OSError:\n'
+  '                pass\n',
+  ['test_gapfixes']),
+ ('the real wipe runs over a live pipeline', 'paranoia_mode',
+  '        if not args.dry_run and not args.even_if_running:\n',
+  '        if False:\n',
+  ['test_gapfixes']),
+ ('phase 2 asks a name server again', 'paranoia_mode',
+  '    try:\n'
+  '        state = Path(f"/sys/class/net/{iface}/operstate").read_text().strip()\n',
+  '    try:\n'
+  '        socket.getaddrinfo("localhost", 443)\n'
+  '        state = Path(f"/sys/class/net/{iface}/operstate").read_text().strip()\n',
+  ['test_gapfixes']),
+ ('Start Tor hands tor the spend password', 'gs_console',
+  '                env=_tor_env(), start_new_session=True)',
+  '                start_new_session=True)',
+  ['test_console']),
+ ('the tor Start Tor launched is never stopped', 'gs_console',
+  '        if p is None or p.poll() is not None:\n'
+  '            return False\n'
+  '        p.terminate()\n',
+  '        return False\n'
+  '        p.terminate()\n',
+  ['test_console']),
+ ('the quote step passes no mixing floor', 'gs_console',
+  '                                           + (["--min-out-xmr", str(quote_floor_xmr(p))]\n'
+  '                                              if quote_floor_xmr(p) else [])},',
+  '                                           + []},',
+  ['test_console']),
+ ('one amount is quoted for several swaps', 'gs_console',
+  '    elif len(amounts) != n:\n',
+  '    elif False:\n',
+  ['test_console']),
+ ('a quote file short of swaps is run anyway', 'gs_console',
+  '        if _np is not None and _np != _n and not p.get("expect_total_xmr"):\n',
+  '        if False:\n',
+  ['test_console']),
+ ('a receive run gets the hidden send fields', 'gs_console',
+  '    if params.get("mode") != "receive":\n'
+  '        if params.get("btc_entry"):\n',
+  '    if True:\n'
+  '        if params.get("btc_entry"):\n',
+  ['test_console']),
+ ('the watch never gets the expected total', 'gs_console',
+  '        env["GS_EXPECT_XMR"] = str(params["expect_total_xmr"])\n',
+  '        pass\n',
+  ['test_console']),
+ ('the aggregator key is stripped from the quote step', 'gs_console',
+  '    "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO", "GS_SWAPKIT_API_KEY"},',
+  '    "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO"},',
+  ['test_console']),
+ ('a quote of any age is reprinted as payable', 'receive_watch',
+  '    if _unknown or (_worst is not None and _worst > QUOTE_STALE_S):\n',
+  '    if _unknown:\n',
+  ['test_receive_watch']),
+ ('thor is silent when it cannot check against the exit',
+  'thor_swap_preparer',
+  '    if not _exit_set:\n'
+  '        print("  [*] GS_EXIT_TO is not set, so this could NOT check that the "\n',
+  '    if False:\n'
+  '        print("  [*] GS_EXIT_TO is not set, so this could NOT check that the "\n',
+  ['test_swap_receive']),
+ ('the exit simulator prices on the default circuit',
+  'exit_strategy_simulator',
+  '    proxy = _own_stream(proxy, "exit_prices")\n',
+  '\n',
+  ['test_realfns']),
+ ('Ctrl-C at the unseal prompt is swallowed', 'gs_unseal',
+  '    install_signal_handlers(interactive=True)\n',
+  '    install_signal_handlers()\n',
+  ['test_sealed_slip']),
+ ('the interactive hook installs the flag-setter anyway', 'gs_common.py',
+  '    if interactive:\n'
+  '        signal.signal(signal.SIGINT, _interrupt)\n',
+  '    if False:\n'
+  '        signal.signal(signal.SIGINT, _interrupt)\n',
+  ['test_sealed_slip']),
+ ('a failed rotation after the mint exits after minting',
+  'create_receive_wallet',
+  '    newnym(required=False, proxy_url=getattr(args, "tor_proxy", ""))\n',
+  '    newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))\n',
+  ['test_swap_receive']),
+ # ---- wt17: the mixer pipeline -------------------------------------------
+ ('the exit sweeps the receive account\'s other bundles', 'GhostSpiral',
+  '                if _allowed is not None and _si not in _allowed:\n',
+  '                if False:\n',
+  ['test_exit_withdraw']),
+ ('main does not hand the exit its scope', 'GhostSpiral',
+  '            fee_pairs=list(exit_fee_hold or ()), scope=exit_scope)',
+  '            fee_pairs=list(exit_fee_hold or ()))',
+  ['test_exit_withdraw']),
+ ('the signer signs a blob with an extra destination', 'airgap_tx_signer',
+  '    if extra:\n'
+  '        _refuse("extra"',
+  '    if False:\n'
+  '        _refuse("extra"',
+  ['test_signer_schema']),
+ ('the signer signs a blob paying the wrong amount', 'airgap_tx_signer',
+  '        if _atomic(sends.get(addr, Decimal(-1))) != _atomic(want):\n',
+  '        if False:\n',
+  ['test_signer_schema']),
+ ('the signer signs a sweep that makes change', 'airgap_tx_signer',
+  '    if changes and exp["kind"] == "sweep":\n',
+  '    if False:\n',
+  ['test_signer_schema']),
+ ('the signer signs a consume peel with real change', 'airgap_tx_signer',
+  '    if exp["kind"] == "consume" and change_total > CONSUME_CHANGE_MAX:\n',
+  '    if False:\n',
+  ['test_signer_schema']),
+ ('the signer signs change sent away from change_to', 'airgap_tx_signer',
+  '    if changes and exp["change_to"] and any(x != exp["change_to"]\n',
+  '    if False and any(x != exp["change_to"]\n',
+  ['test_signer_schema']),
+ ('the fan-out plan names no change address', 'GhostSpiral',
+  '            if _chg:\n'
+  '                _entry["change_to"] = _chg\n',
+  '            if False:\n'
+  '                _entry["change_to"] = _chg\n',
+  ['test_dag_entry']),
+ ('a run with no wallet .keys goes on to the swap', 'GhostSpiral',
+  '    if not Path(str(p) + ".keys").is_file():\n',
+  '    if False:\n',
+  ['test_integration']),
+ ('the signer hands wallet-cli a relative wallet path', 'airgap_tx_signer',
+  '        wallet_file = str(_wp.resolve())\n',
+  '        wallet_file = str(_wp)\n',
+  ['test_integration']),
+ ('the peel chain distributes 90% and the last hop takes the rest',
+  'GhostSpiral',
+  'PEEL_BUDGET_FRACTIONS = (Decimal("1"), Decimal("0.90"), Decimal("0.80"),\n',
+  'PEEL_BUDGET_FRACTIONS = (Decimal("0.90"), Decimal("0.90"), Decimal("0.80"),\n',
+  ['test_units']),
+ ('a shrunk peel chain says the rest stays on ENTRY', 'GhostSpiral',
+  '                  f"XMR rides the chain to the LAST peel\'s destination, which "\n',
+  '                  f"XMR stays on ENTRY, which "\n',
+  ['test_dag_entry']),
+ ('the exact-consume retry is priced at the lower fee', 'airgap_tx_signer',
+  '        fee = max(fee, got)',
+  '        fee = got',
+  ['test_signer_schema']),
+ ('a failed consume retry throws away the usable build', 'airgap_tx_signer',
+  '            if result is not None:\n'
+  '                integrity_log("signer", "exact_consume_retry_failed")\n'
+  '                break\n',
+  '            if result is not None:\n'
+  '                raise\n',
+  ['test_signer_schema']),
+ ('wallet-cli inherits the GS_ environment', 'airgap_tx_signer',
+  '    return {k: v for k, v in os.environ.items() if not k.startswith("GS_")}\n',
+  '    return dict(os.environ)\n',
+  ['test_integration']),
+ ('the chain\'s mtime says the second', 'gs_common.py',
+  '                os.utime(_p, (ts, ts), follow_symlinks=False)\n',
+  '                pass\n',
+  ['test_units']),
+ ('a complete run leaves an empty ./unsigned/', 'GhostSpiral',
+  '                _d.rmdir()\n',
+  '                pass\n',
+  ['test_units']),
+ ('an unreadable entry gives up in seconds', 'GhostSpiral',
+  '                               attempts: int = 8, sleep_fn=None,\n',
+  '                               attempts: int = 3, sleep_fn=None,\n',
+  ['test_swap_arrival']),
+ ('a send run is told to run again, stranding its entry', 'GhostSpiral',
+  '            recovery=None if receive_mode else (args.rpc_primary, ENTRY_SET))]',
+  '            recovery=None)]',
+  ['test_swap_arrival']),
+ ('the send-mode abort writes no recovery bundle', 'GhostSpiral',
+  '    if not recovery:\n'
+  '        sys.exit(_head + " Fix the wallet-rpc connection and run again — "',
+  '    if True:\n'
+  '        sys.exit(_head + " Fix the wallet-rpc connection and run again — "',
+  ['test_swap_arrival']),
 ]
 
 

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from gs_common import (
-    wipe_will_erase, wipe_miss_reason, instruction_field_safe,
+    wipe_will_erase, wipe_cwd_note, wipe_miss_reason, instruction_field_safe,
     integrity_log, verify_tor, validate_proxy, newnym, isolated_proxy,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
@@ -228,6 +228,16 @@ def resolve_destinations(amounts: List[Decimal], dests, bundles) -> List[str]:
     # for reading the flag.
     _exit_env = os.environ.get("GS_EXIT_TO") or ""
     _exit_set = {x for x in re.split(r"[\s,]+", _exit_env) if x}
+    # "SAYS SO", which OPSEC_SETUP promised and this did not: with the
+    # variable unset the loop below compared against nothing and printed
+    # nothing, which reads exactly like a check that passed. In the console
+    # flow that is the ordinary case -- the exit is typed in step 3, after the
+    # quote in step 2 -- so name it rather than imply it.
+    if not _exit_set:
+        print("  [*] GS_EXIT_TO is not set, so this could NOT check that the "
+              "swap destination is")
+        print("      not your final exit address. It must not be: the swap "
+              "memo names it in public.")
     for i, d in enumerate(out):
         if d in _exit_set:
             integrity_log("thor", "SWAP_DEST_IS_EXIT_DEST")
@@ -730,6 +740,11 @@ def main():
     #   ~/gs/my_notes.json     covers=True  NO match      -> NEVER erased
     # so the second one printed no warning at all, for the file this comment
     # calls the single artifact tying the BTC side to the XMR side.
+    # SWEPT FROM HERE ONLY: the cwd is a root of the wipe started in it, not
+    # of the one the operator starts from $HOME (gs_common.wipe_cwd_only).
+    _cwd_note = wipe_cwd_note(_out)
+    if _cwd_note:
+        print(_cwd_note)
     if not wipe_will_erase(_out):
         try:
             _wdir = _out.resolve().parent

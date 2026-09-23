@@ -809,6 +809,31 @@ check("...and creates NO file in the directory it ran from -- no integrity "
 check("...and the source names no integrity_log call at all",
       "integrity_log(" not in _us_src)
 
+# Ctrl-C AT THE PROMPT STOPS IT. It installed the flag-only handler and never
+# looked at the flag, so SIGINT at the passphrase prompt was swallowed -- the
+# read resumed and the process sat there through two of them. Driven with a
+# real process blocked on its prompt: its own session, so getpass has no
+# /dev/tty and reads the (open, silent) pipe.
+import signal as _sig                                        # noqa: E402
+import time as _t                                            # noqa: E402
+for _signame in ("SIGINT", "SIGTERM"):
+    _pp = subprocess.Popen(
+        [sys.executable, os.path.join(REPO, "gs_unseal"), "--key", _dkey],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=_clean, start_new_session=True)
+    _t.sleep(3)
+    _pp.send_signal(getattr(_sig, _signame))
+    try:
+        _rc = _pp.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        _pp.kill()
+        _rc = "still running"
+    _pp.stdin.close(); _pp.stdout.close(); _pp.stderr.close()
+    check(f"gs_unseal: {_signame} at the passphrase prompt stops it "
+          f"(rc {_rc})", _rc == 130)
+check("gs_delivery_key takes the interactive hook too",
+      "install_signal_handlers(interactive=True)" in _dk_src)
+
 _us_flags, _dk_flags = _flags(_us_src), _flags(_dk_src)
 check("_flags actually finds the flags these tools do define, so the "
       "assertions below are not vacuous",

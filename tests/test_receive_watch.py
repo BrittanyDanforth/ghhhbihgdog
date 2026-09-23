@@ -1179,6 +1179,42 @@ check("liveness: the floor is LIVENESS_MIN_S, thirty minutes, above the "
       "doubt threshold the stalled verdict uses",
       rw.LIVENESS_MIN_S == 1800 and rw.LIVENESS_MIN_S > rw.LIVENESS_DOUBT_S)
 
+# ---------------------------------------------------------------------------
+# A QUOTE OF ANY AGE WAS REPRINTED AS PAYABLE. thor_swap_preparer stamps each
+# pair's `ts` and nothing here read it, so every re-run of the watch -- hours
+# or days later, after a timeout -- printed "Send exactly X BTC to Y" from a
+# quote ThorChain had long expired, at a deposit address that rotates.
+# ---------------------------------------------------------------------------
+print("\n== a stale quote is not reprinted as payable ==")
+_NOW = 1_800_000_000
+def _block(ts):
+    out = []
+    p = dict(_good[0])
+    if ts is not None:
+        p["ts"] = ts
+    withheld = rw._print_sender_instructions(
+        [p], _DEST, echo=lambda *a, **k: out.append(" ".join(map(str, a))),
+        now=_NOW)
+    return withheld, "\n".join(out)
+_w, _o = _block(_NOW - 5 * 60)
+check("a fresh quote is printed, with its age", _w is False
+      and "Send exactly" in _o and "Quoted ~5 min ago" in _o)
+_w, _o = _block(_NOW - 3 * 86400)
+check("a three-day-old quote is withheld: no 'Send exactly', no address",
+      _w is True and "Send exactly" not in _o and _REAL_DEP not in _o
+      and "4320 minutes old" in _o)
+check("...and the operator is told the watch still waits for a payment "
+      "already made", "still waiting" in _o)
+_w, _o = _block(None)
+check("a quote with no timestamp is withheld, and says the age is unknown",
+      _w is True and "cannot be told" in _o and "Send exactly" not in _o)
+_w, _o = _block(_NOW + 3600)
+check("a quote stamped in the future is withheld too",
+      _w is True and "FUTURE" in _o)
+_w, _o = _block(_NOW - rw.QUOTE_STALE_S)
+check("the boundary is QUOTE_STALE_S, shared with gs_unseal",
+      _w is False and rw.QUOTE_STALE_S == 20 * 60)
+
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     for f in FAILURES:

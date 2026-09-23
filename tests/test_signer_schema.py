@@ -261,6 +261,58 @@ ck("a carrier with too little to probe with is refused",
    "probe" in _raises(_RPC(1_500_000_000_001)))
 ck("a probe that reports no fee is refused rather than guessed",
    "no fee" in _raises(_RPC(5_000_000_000_000, fee=0)))
+
+
+# A USABLE BUILD IS NOT THROWN AWAY FOR A RETRY. The wallet model here is
+# wallet2's: a build whose destinations plus its REAL fee exceed the input
+# fails "not enough money". Fees drift by decoy draw (measured +/-1200 pico).
+class _DriftRPC:
+    def __init__(self, unlocked, fees):
+        self.unlocked, self.fees, self.builds = unlocked, list(fees), []
+
+    def raw_request(self, method, params=None):
+        if method == "get_balance":
+            return {"per_subaddress": [
+                {"address_index": params["address_indices"][0],
+                 "unlocked_balance": self.unlocked}]}
+        real = self.fees.pop(0) if self.fees else 2_635_200_000
+        need = sum(int(d["amount"]) for d in params["destinations"]) + real
+        self.builds.append((params, real))
+        if need > self.unlocked:
+            raise RuntimeError("RPC Error of code -37, message: not enough money")
+        return {"fee": real, "amount": 1, "tx_hash": "ab" * 32,
+                "unsigned_txset": "00"}
+
+
+# probe; a build 1200 under its price (usable, dust); a redraw that costs more
+# than that lower figure. Retried at the lower fee this RAISED and the peel
+# chain stopped; retried at the higher one it is exact.
+_dr = _DriftRPC(5_000_000_000_000,
+                [2_635_200_000, 2_634_000_000, 2_635_200_000])
+_dres = _raises(_dr)
+ck("a retry priced at the HIGHER fee comes back exact instead of raising",
+   _dres == "" and _dr.builds[-1][1] == 2_635_200_000
+   and sum(int(d["amount"]) for d in _dr.builds[-1][0]["destinations"])
+   + _dr.builds[-1][1] == 5_000_000_000_000)
+# ...and a retry that fails anyway leaves the build already in hand.
+_dr2 = _DriftRPC(5_000_000_000_000,
+                 [2_635_200_000, 2_634_000_000, 2_636_400_000, 2_636_400_000,
+                  2_636_400_000])
+import io as _io5, contextlib as _cl5                          # noqa: E402
+with _cl5.redirect_stdout(_io5.StringIO()) as _o5:
+    _res2 = a._build_exact_consume(_dr2, CONSUME, _dests, 5, 1, 1)
+ck("a failed retry returns the best usable build rather than raising",
+   _res2 is not None and _res2.get("fee") == 2_634_000_000)
+ck("...and says it leaves dust", "dust" in _o5.getvalue())
+# A first exact build that fails with nothing in hand is priced a little
+# higher once, rather than stopping the chain.
+_dr3 = _DriftRPC(5_000_000_000_000,
+                 [2_635_200_000, 2_700_000_000, 2_650_000_000])
+ck("a first exact build that fails is re-priced and retried, not fatal",
+   _raises(_dr3) == "")
+ck("NON-VACUITY: a carrier that can never be built still fails closed",
+   "not enough money" in _raises(_DriftRPC(
+       5_000_000_000_000, [2_635_200_000] + [9_000_000_000_000] * 9)))
 ck("more than one fixed destination is refused here too",
    "exactly one" in _raises(_RPC(5_000_000_000_000),
                             dests=[dict(_dests[0]), dict(_dests[0])]))
@@ -384,23 +436,74 @@ def _agrees(out_text, plan=_plan1, idx=0):
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            a._check_wallet_cli_agrees(out_text, a._plan_destinations(plan, idx), idx)
+            a._check_wallet_cli_agrees(out_text, plan, idx)
         return "ALLOWED", buf.getvalue()
     except SystemExit as e:
         return "REFUSED", str(e)
 
 
-ck("wallet-cli naming the plan's own destination signs",
-   _agrees(f"Sending 1.500000000000 XMR to {_HON}\nIs this okay?  (Y/Yes/N/No): ")[0]
-   == "ALLOWED")
+# wallet-cli's REAL decode line (simplewallet accept_loaded_tx): amounts are
+# print_money, twelve decimals, and change is its own clause.
+def _loaded(sends, change=None):
+    parts = [f"sending {amt} to {addr}" for amt, addr in sends]
+    ch = (f"{change[0]} change to {change[1]}" if change else "no change")
+    return (f"Loaded 1 transactions, for 3.000000000000, fee 0.000030000000, "
+            f"{', '.join(parts)}, {ch}, with min ring size 16, no payment ID. "
+            f"Is this okay?  (Y/Yes/N/No): ")
+
+
+ck("wallet-cli naming the plan's own destination and amount signs",
+   _agrees(_loaded([("1.500000000000", _HON)]))[0] == "ALLOWED")
 ck("wallet-cli naming SOMEONE ELSE -- the tampered blob -- is REFUSED",
-   _agrees(f"Sending 1.500000000000 XMR to {_EVIL}\nIs this okay?")[0] == "REFUSED")
+   _agrees(_loaded([("1.500000000000", _EVIL)]))[0] == "REFUSED")
 ck("...and the refusal says the manifest hash cannot catch it",
-   "stored beside" in _agrees(f"Sending to {_EVIL}")[1])
-# A change address alongside ours must not be mistaken for a mismatch.
-ck("ours plus a change address still signs",
-   _agrees(f"Sending to {_HON}, change to {_EVIL}")[0] == "ALLOWED")
-# FAIL-OPEN ONLY WHERE IT MUST: an unrecognised format is not evidence.
+   "stored beside" in _agrees(_loaded([("1.500000000000", _EVIL)]))[1])
+# THE TWO BLOBS THE OLD CHECK SIGNED: ours still named, but paid a token and
+# the rest sent elsewhere. Presence was all it asked about.
+ck("one piconero to the plan's address and the rest elsewhere is REFUSED",
+   _agrees(_loaded([("0.000000000001", _HON),
+                    ("2.999969999999", _EVIL)]))[0] == "REFUSED")
+ck("0.1 of a planned 1.5, and 1.4 elsewhere, is REFUSED",
+   _agrees(_loaded([("0.100000000000", _HON),
+                    ("1.400000000000", _EVIL)]))[0] == "REFUSED")
+ck("the right destination at the WRONG AMOUNT alone is refused too",
+   _agrees(_loaded([("1.400000000000", _HON)]))[0] == "REFUSED")
+_sweep = [{"src_index": 2, "dst": _HON, "sweep": True}]
+ck("a sweep to the planned address signs, whatever amount it moves",
+   _agrees(_loaded([("2.999970000000", _HON)]), plan=_sweep)[0] == "ALLOWED")
+ck("a SWEEP carrying change is refused (sweep_all makes none)",
+   _agrees(_loaded([("2.000000000000", _HON)],
+                   change=("0.999970000000", _EVIL)), plan=_sweep)[0]
+   == "REFUSED")
+_cons = [{"src_index": 2, "destinations": [{"address": _HON, "amount": "0.3"}],
+          "consume_to": _EVIL}]
+ck("an exact-consume peel: fixed part exact, the rest free, dust change ok",
+   _agrees(_loaded([("0.300000000000", _HON), ("1.699968800000", _EVIL)],
+                   change=("0.000001200000", _EVIL)), plan=_cons)[0]
+   == "ALLOWED")
+ck("...but real change on a consume entry is refused",
+   _agrees(_loaded([("0.300000000000", _HON), ("0.699970000000", _EVIL)],
+                   change=("1.000000000000", _EVIL)), plan=_cons)[0]
+   == "REFUSED")
+_OUR_CHG = "8" + "B" * 94
+_fan = [{"src_index": 1, "destinations": [{"address": _HON, "amount": "1.5"}],
+         "change_to": _OUR_CHG}]
+ck("a transfer whose change goes where the plan says signs",
+   _agrees(_loaded([("1.500000000000", _HON)],
+                   change=("1.499970000000", _OUR_CHG)), plan=_fan)[0]
+   == "ALLOWED")
+ck("...and change sent anywhere else is refused",
+   _agrees(_loaded([("1.500000000000", _HON)],
+                   change=("1.499970000000", _EVIL)), plan=_fan)[0]
+   == "REFUSED")
+_st, _msg = _agrees(_loaded([("1.500000000000", _HON)],
+                            change=("1.499970000000", _EVIL)))
+ck("a transfer with no change_to in its plan signs, and SAYS the change "
+   "address was not verified", _st == "ALLOWED" and "change" in _msg
+   and "does not name" in _msg)
+ck("an output naming addresses in a shape this cannot read is REFUSED, not "
+   "waved through", _agrees(f"Pay {_HON} please")[0] == "REFUSED")
+# FAIL-OPEN ONLY WHERE NOTHING WAS SIGNED TO CHECK: no address at all.
 _st, _msg = _agrees("Transaction successfully signed to file signed_monero_tx")
 ck("an output with no full address does NOT refuse, because a formatting "
    "change must not brick signing", _st == "ALLOWED")
@@ -408,11 +511,12 @@ ck("...but it says the signature was not cross-checked", "NOT" in _msg)
 ck("...and it tells the operator the hash detects corruption, not tampering",
    "corruption, not tampering" in _msg)
 ck("an entry the plan has no destinations for is not second-guessed",
-   _agrees(f"Sending to {_EVIL}", plan=[{}], idx=0)[0] == "ALLOWED")
+   _agrees(_loaded([("1.0", _EVIL)]), plan=[{}], idx=0)[0] == "ALLOWED")
 _sg = open(os.path.join(REPO, "airgap_tx_signer")).read()
-ck("the cross-check is actually wired into the signing loop",
+ck("the cross-check is actually wired into the signing loop, with the PLAN",
    "_check_wallet_cli_agrees(" in _sg
-   and _sg.count("_check_wallet_cli_agrees(") >= 2)
+   and _sg.count("_check_wallet_cli_agrees(") >= 2
+   and '(result.stdout or "") + (result.stderr or ""), plan, idx)' in _sg)
 ck("...and it reads BOTH streams, since wallet-cli's prompt may be on either",
    "(result.stdout or \"\") + (result.stderr or \"\")" in _sg)
 

@@ -75,7 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
     install_signal_handlers, instruction_field_safe,
-    memo_binds_destination, terminal_safe,
+    memo_binds_destination, terminal_safe, QUOTE_STALE_S,
 )
 import gs_wake_proto as proto                                # noqa: E402
 
@@ -85,7 +85,7 @@ ROLE = "delivery"
 #: are good for a matter of minutes; the slip's timestamp is coarsened to a
 #: 10-minute bucket, so anything under one bucket is indistinguishable from
 #: fresh and the first honest threshold is the next one up.
-STALE_WARN_S = 20 * 60
+STALE_WARN_S = QUOTE_STALE_S          # gs_common: one rule for slip and pairs file
 
 
 def read_passphrase(prompt: str, getter=None) -> bytes:
@@ -321,7 +321,9 @@ def build_cli() -> argparse.ArgumentParser:
 
 
 def main(argv=None, getter=None, reader=None) -> int:
-    install_signal_handlers()
+    # interactive: it waits on a person, and Ctrl-C at that prompt must stop
+    # it (gs_common.install_signal_handlers).
+    install_signal_handlers(interactive=True)
     # ARGS FIRST, NACL SECOND. --help exits inside parse_args, and --help is
     # how an operator finds out what a program wants BEFORE they have
     # installed anything. tests/test_cli_flags.py holds every tool here to
@@ -347,4 +349,8 @@ def main(argv=None, getter=None, reader=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n  [!] Stopped.", file=sys.stderr)
+        sys.exit(130)

@@ -31,7 +31,7 @@ AttributeError on import -- red, but a demonstration of nothing. The OLD GATE
 section reproduces the old loop condition verbatim and drives it down the same
 timeline the fix is tested on, so the defect is shown rather than asserted.
 """
-import importlib.machinery, importlib.util, io, itertools, os, sys, contextlib, types
+import importlib.machinery, importlib.util, io, itertools, json, os, shutil, sys, contextlib, tempfile, types
 from decimal import Decimal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1380,6 +1380,38 @@ try:
     # The whole point: it must NOT quietly become a 'chunk never arrived'.
     check("blind: ...and never claims the chunk did not arrive",
           "have NOT arrived" not in (_sx or ""))
+    # PATIENTLY, AND WITHOUT "RUN AGAIN" IN SEND MODE. The swap has landed by
+    # now; three reads over six seconds gave up on a wallet-rpc busy for ten,
+    # and a send-mode re-run mints a new ENTRY, stranding this one.
+    _sleeps, _rcwd = [], os.getcwd()
+    _rdir = tempfile.mkdtemp(prefix="recover_")
+    _sx2 = None
+    try:
+        os.chdir(_rdir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.read_entry_balances_strict(
+                _BlindRPC(_BFULL, dead=[(11, 1)]), _BP, "sizing",
+                sleep_fn=_sleeps.append,
+                recovery=("http://127.0.0.1:18083",
+                          [("8" + "C" * 94, 11, 1)]))
+    except SystemExit as _e:
+        _sx2 = str(_e)
+    finally:
+        os.chdir(_rcwd)
+    _rb = [f for f in os.listdir(_rdir) if f.startswith("wallet_recover_")]
+    check("blind: it waits minutes, not seconds, before giving up",
+          len(_sleeps) == 7 and sum(_sleeps) >= 150)
+    check("blind: in send mode it does NOT say 'run again' -- that mints a "
+          "new entry", _sx2 is not None
+          and "DO NOT simply run this again" in _sx2
+          and "and run again" not in _sx2)
+    _rbd = (json.load(open(os.path.join(_rdir, _rb[0]))) if _rb else {})
+    check("blind: ...and writes a receive bundle for the entry, named in "
+          "the message", len(_rb) == 1 and _rb[0] in (_sx2 or "")
+          and _rbd.get("schema") == "gs_receive_wallet_v1"
+          and (_rbd.get("account_index"), _rbd.get("subaddress_index"))
+          == (11, 1))
+    shutil.rmtree(_rdir, ignore_errors=True)
 
     # Non-vacuity for the abort: a chunk that is GENUINELY empty is still
     # allowed through, because that is a real swap shortfall and
@@ -1425,6 +1457,10 @@ check("blind: ...and the distribution's sizing read is the STRICT one",
       "read_entry_balances_strict( rpc_primary, ENTRY_PAIRS" in _norm_gs)
 check("blind: ...with the best-effort read gone from that decision",
       "entry_set_balances( rpc_primary, ENTRY_PAIRS)" not in _norm_gs)
+check("blind: ...and a SEND run hands it the entries to write recovery "
+      "bundles for, so its abort never says 'run again'",
+      "recovery=None if receive_mode else (args.rpc_primary, ENTRY_SET)"
+      in _norm_gs)
 
 
 # ==========================================================================

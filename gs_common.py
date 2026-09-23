@@ -753,6 +753,16 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     correlation window between the log and blockchain/network timestamps.
     An attacker with the log can only narrow the operation to a 10-min window
     instead of the exact second.
+
+    THE FILE'S OWN TIMES SAID THE SECOND. Every line carried the bucket while
+    the file's mtime, read by `stat`, carried the exact second of the last
+    append -- `exit|withdraw_done` and `main|pipeline_complete` land seconds
+    after the final relay, so the chain dated the run's end to the second
+    beside lines that claimed ten minutes. The mtime (and atime) of the chain
+    and its lock are set back to the bucket after each append. The CTIME
+    cannot be: the kernel sets it on every change, utime included, and no
+    unprivileged call moves it. So the inode still says when the last line
+    was written, to the second -- said here rather than claimed away.
     """
     # LOCKED read-modify-write. This read the whole file, took the last line's
     # hash as `prev`, and appended -- with nothing serialising the three steps.
@@ -832,6 +842,12 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
             if _written < len(pending):
                 _PENDING_CHAIN[:0] = pending[_written:]
             raise
+        # The bucket, not the second (see the docstring; ctime is beyond it).
+        for _p in (log_path, lock_path):
+            try:
+                os.utime(_p, (ts, ts), follow_symlinks=False)
+            except (OSError, NotImplementedError):
+                pass
     finally:
         if lock_fd is not None:
             try:
@@ -1093,20 +1109,63 @@ def fmt_btc(x: Decimal) -> str:
 MAX_SPLIT = 8
 
 
+#: How old a swap quote may be before a tool that shows it to the operator
+#: stops presenting it as payable. ThorChain's quotes are good for minutes and
+#: its inbound vault addresses rotate; a quote's own timestamp is coarsened to
+#: a 10-minute bucket, so under one bucket is indistinguishable from fresh and
+#: the first honest threshold is the next one up. gs_unseal (the slip) and
+#: receive_watch (the pairs file) both judge by this one number.
+QUOTE_STALE_S = 20 * 60
+
+
+def quote_age(ts, now=None):
+    """(age_seconds, why_unknown): the age of a quote stamped `ts`, or None
+    and the reason it cannot be told -- absent, not a whole number, or in the
+    future (a clock that disagrees makes every age fiction)."""
+    if isinstance(ts, bool) or not isinstance(ts, int):
+        return None, ("absent" if ts is None
+                      else f"not a whole number of seconds ({type(ts).__name__})")
+    age = int((now if now is not None else time.time()) - ts)
+    if age < 0:
+        return None, (f"stamped {abs(age) // 60} min in the FUTURE -- this "
+                      f"machine's clock and the quoting one's disagree")
+    return age, ""
+
+
+#: THE TOOLCHAIN'S OWN DIRECTORY, a root wherever the wipe is started from.
+#:
+#: gs_console runs every child with cwd set to this directory, so the pairs
+#: file, the receive bundles and the chain its buttons produce land here. The
+#: roots below were cwd and $HOME, so an operator whose checkout sat at
+#: $HOME/src/ghostspiral (two levels down) or /opt/ghostspiral ran
+#: paranoia_mode from their shell and the sweep never saw any of it -- while
+#: each child, whose cwd WAS this directory, had asked wipe_will_erase and
+#: been told yes, and the console's own "Wipe preview" (run from here too)
+#: listed the files as covered. A module-level name so a test can point it at
+#: a scratch tree instead of the checkout it runs from.
+TOOLCHAIN_DIR = Path(__file__).resolve().parent
+
+
 #: The roots paranoia_mode globs when it hunts artifacts, at depth 0 and 1.
 #: Named ONCE, here, because three places now need to agree about them: the
 #: wipe itself, and the two tools that write operator-chosen paths which the
 #: wipe may therefore never reach.
-def paranoia_search_roots(resolve: bool = True) -> list:
+def paranoia_search_roots(resolve: bool = True, cwd: bool = True) -> list:
     """The directories paranoia_mode searches for artifacts.
 
     resolve=False hands back the raw paths, for paranoia_mode itself, which
     resolves each one under its own OSError handling (a deleted cwd, an
     unreadable home) rather than letting one bad root abort the wipe. It used
     to keep a private copy of this list instead, so "named ONCE" was not true.
+
+    cwd=False leaves out the one root that depends on where the WIPE is
+    started, for a writer asking whether a later wipe will reach its file:
+    its own cwd is only a root if the operator starts paranoia_mode from that
+    same directory, which wipe_cwd_only lets it say.
     """
-    roots = [Path("."), Path.home(),
-             Path.home() / "ghostspiral", Path.home() / "GhostSpiral"]
+    roots = ([Path(".")] if cwd else []) + [
+        Path.home(), Path.home() / "ghostspiral", Path.home() / "GhostSpiral",
+        TOOLCHAIN_DIR]
     if not resolve:
         return roots
     return [r.resolve() for r in roots]
@@ -1276,7 +1335,7 @@ GS_ARTIFACT_DIR_PATTERNS = [
 ]
 
 
-def _wipe_sweep_reaches_item(res: Path) -> bool:
+def _wipe_sweep_reaches_item(res: Path, cwd: bool = True) -> bool:
     """Would the sweep MATCH `res` ITSELF by name -- file or directory?
 
     NOT the same question as wipe_covers, and conflating the two is a real
@@ -1309,10 +1368,10 @@ def _wipe_sweep_reaches_item(res: Path) -> bool:
     parent is a root or its grandparent is.
     """
     return any(res.parent == r or res.parent.parent == r
-               for r in paranoia_search_roots())
+               for r in paranoia_search_roots(cwd=cwd))
 
 
-def wipe_will_erase(target) -> bool:
+def wipe_will_erase(target, cwd: bool = True) -> bool:
     """True if paranoia_mode's artifact sweep would actually DELETE `target`.
 
     wipe_covers answers only half the question. The sweep matches on TWO
@@ -1341,9 +1400,37 @@ def wipe_will_erase(target) -> bool:
     # answer different questions, and for a DIRECTORY target wipe_covers is
     # off by one level -- it says a matching directory one level down will not
     # be erased when the sweep really does erase it.
-    if not _wipe_sweep_reaches_item(res):
+    if not _wipe_sweep_reaches_item(res, cwd=cwd):
         return False
     return _wipe_name_matches(res)
+
+
+def wipe_cwd_only(target) -> bool:
+    """True if `target` is erased ONLY by a paranoia_mode started from this
+    process's cwd.
+
+    wipe_will_erase counts the writer's cwd as a root, and it is one -- of the
+    wipe that is started there. A tool run from /media/usb/work writes its
+    pairs file there and hears "will be erased"; the operator later runs
+    paranoia_mode from $HOME and the file stays. The writer cannot know where
+    the wipe will be started, so it says which directory it depends on.
+    """
+    return bool(wipe_will_erase(target)
+                and not wipe_will_erase(target, cwd=False))
+
+
+def wipe_cwd_note(target) -> Optional[str]:
+    """The line a writer prints when wipe_cwd_only(target): one wording for
+    every tool, naming the directory the wipe must be started from."""
+    if not wipe_cwd_only(target):
+        return None
+    try:
+        here = Path.cwd()
+    except OSError:
+        return None
+    return (f"  [*] {Path(target).name} is erased only by a paranoia_mode "
+            f"started from {here}: run the wipe from there, or pass "
+            f"--search-dir {here}.")
 
 
 def _wipe_name_matches(res: Path) -> bool:
@@ -1370,9 +1457,131 @@ def _wipe_name_matches(res: Path) -> bool:
     need: --outfile is checked before the file is written. Both callers now
     inherit that from here rather than each deciding.
     """
-    pats = (GS_ARTIFACT_DIR_PATTERNS if res.is_dir()
-            else GS_ARTIFACT_FILE_PATTERNS)
-    return any(fnmatch.fnmatch(res.name, pat) for pat in pats)
+    if res.is_dir():
+        return any(fnmatch.fnmatch(res.name, pat)
+                   for pat in GS_ARTIFACT_DIR_PATTERNS)
+    return artifact_name_is_ours(res.name)
+
+
+#: Patterns that name nothing but an ENDING: atomic_write's "<name>.tmp" and
+#: "<name>.<random>.tmp", integrity_log's "<name>.lock".
+_SUFFIX_ONLY_PATTERNS = ("*.json.tmp", "*.tmp", "*.log.lock")
+
+
+def artifact_name_is_ours(name: str) -> bool:
+    """Does the sweep take a FILE called `name`?
+
+    "*.tmp" and "*.log.lock" matched every file with those endings at depth 0
+    and 1 of every root -- $HOME/Downloads/installer.tmp and another
+    program's app.log.lock were on the list, and the sweep overwrites what it
+    lists. This toolchain only ever puts those endings on the name of one of
+    its own artifacts, so a name that ONLY they match is taken when what it
+    ends on is itself on the list: thor_pairs.json.tmp and
+    integrity_chain.log.lock, not installer.tmp. A name another pattern
+    matches (.ghostspiral.lock) is decided by that one.
+    """
+    hits = [p for p in GS_ARTIFACT_FILE_PATTERNS if fnmatch.fnmatch(name, p)]
+    if not hits:
+        return False
+    if any(p not in _SUFFIX_ONLY_PATTERNS for p in hits):
+        return True
+    base = name.rsplit(".", 1)[0]
+    # mkstemp's "<name>.<random>.tmp" as well as "<name>.tmp".
+    bases = [base] + ([base.rsplit(".", 1)[0]]
+                      if name.endswith(".tmp") and "." in base else [])
+    return any(b and b != name and artifact_name_is_ours(b) for b in bases)
+
+
+def _not_ours_reason(path: Path, st) -> Optional[str]:
+    """The CONTENT half of "is this ours", for names too ordinary to decide.
+
+    RECEIVE_SCHEMA is what every wallet_*.json this toolchain writes carries
+    -- create_receive_wallet's bundles and gs_wake_agent's fee-sweep and
+    withdrawal bundles alike.
+
+    wallet_*.json is what every bundle here is called and what a user's
+    wallet_eth_backup.json in $HOME/Documents is called too; unsigned/ is
+    where GhostSpiral puts its plans and where an Android build puts its
+    APKs. The name is ours to choose and theirs to collide with, so for those
+    two the sweep looks inside before it overwrites.
+    """
+    name = path.name
+    if stat_module.S_ISREG(st.st_mode) and fnmatch.fnmatch(name, "wallet_*.json"):
+        try:
+            if st.st_size > (1 << 16):
+                return "is too large to be one of this toolchain's bundles"
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as f:
+                doc = json.loads(f.read(1 << 16) or b"null")
+        except (OSError, ValueError):
+            return "is not a bundle this toolchain wrote (does not parse)"
+        if not (isinstance(doc, dict)
+                and doc.get("schema") == RECEIVE_SCHEMA):
+            return "is not a bundle this toolchain wrote (no bundle schema)"
+        return None
+    if stat_module.S_ISDIR(st.st_mode) and name == "unsigned":
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    if not (e.is_file(follow_symlinks=False)
+                            and artifact_name_is_ours(e.name)):
+                        return (f"holds {e.name!r}, which this toolchain does "
+                                f"not write there")
+        except OSError:
+            return "could not be listed"
+    return None
+
+
+def sweep_refusal(root: Path, match: Path, owners) -> Optional[tuple]:
+    """Why paranoia_mode's artifact sweep must leave `match` alone, or None.
+
+    `match` was found by globbing `root`, and a glob follows links: at
+    `*/pattern` it walks through a linked directory, and a matched name that
+    is a link to a directory was then shredded as the directory it named.
+    Another local account needed one symlink in /tmp -- which receive_watch
+    tells the operator to pass as --search-dir -- to have the sweep overwrite
+    everything in $HOME, the wallet included. Kerckhoffs: none of this rests
+    on the pattern list being secret; it rests on the kernel's ownership, so
+    the gate is ownership and the absence of links, both read by lstat.
+
+    `owners` is the set of uids whose files are this operator's (their own
+    and, under sudo, root). A regular file with more than one name is left
+    too: overwriting it in place destroys the content under its other name,
+    which a hard link in a shared directory could make any file of theirs.
+
+    Returns (why, stays, kind): `stays` is True when what is left is
+    plausibly one of this toolchain's own artifacts and so is still on disk --
+    a failed wipe, not a declined one; `kind` is "via_link", "link", "owner",
+    "hard_link", "content" or "gone".
+    """
+    try:
+        rel = match.relative_to(root)
+    except ValueError:
+        return ("is not under the directory searched", False, "gone")
+    cur = root
+    for part in rel.parts[:-1]:
+        cur = cur / part
+        try:
+            if stat_module.S_ISLNK(os.lstat(cur).st_mode):
+                return (f"is reached through the symlink {cur}, which is not "
+                        f"followed; if that directory is yours, pass its real "
+                        f"path with --search-dir", True, "via_link")
+        except OSError:
+            return ("went away while it was being checked", False, "gone")
+    try:
+        st = os.lstat(match)
+    except OSError:
+        return ("went away while it was being checked", False, "gone")
+    if stat_module.S_ISLNK(st.st_mode):
+        return ("is a symlink; neither the link nor what it points at is "
+                "touched", False, "link")
+    if st.st_uid not in owners:
+        return ("belongs to another account", False, "owner")
+    if stat_module.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        return (f"has {st.st_nlink} names (hard links); overwriting it would "
+                f"destroy the content under the others too", True, "hard_link")
+    why = _not_ours_reason(match, st)
+    return (why, False, "content") if why else None
 
 
 def wipe_covers(target) -> bool:
@@ -1986,7 +2195,7 @@ def secure_delete_or_warn(path, what: str) -> bool:
     return False
 
 
-def secure_delete_tree(path: Path) -> bool:
+def secure_delete_tree(path: Path, owner_uid: Optional[int] = None) -> bool:
     """Overwrite every file in a directory tree, then remove the tree.
 
     The canonical "securely delete a directory" primitive. Cleanup code across
@@ -2000,18 +2209,59 @@ def secure_delete_tree(path: Path) -> bool:
     enforces that), so a symlink planted in a staging dir cannot redirect the
     overwrite onto an unrelated file.
 
+    NOR IS THE TREE ITSELF FOLLOWED. This began `if not path.is_dir()` and
+    walked `path.rglob("*")`, and both follow a symlink at `path`: a
+    `tx_staging` that is a link to $HOME had every regular file under $HOME
+    overwritten -- the offline wallet and its .keys file included -- by the
+    tool whose promise is that it never touches the wallet. paranoia_mode's
+    artifact sweep reached this through a link another local account planted
+    in /tmp, one line of dry-run output that read like any other. So `path`
+    must be a real directory by lstat, and the walk is os.fwalk by
+    descriptor: every directory it enters is opened and compared with what
+    was checked, so a directory renamed to a link mid-walk is skipped rather
+    than followed. owner_uid, when given, must own the tree's root.
+
     Returns True only if every file was securely erased AND the tree was
-    removed, so callers can report honestly instead of assuming success.
+    removed, so callers can report honestly instead of assuming success. A
+    link, a non-directory or someone else's directory is False and untouched.
     """
     path = Path(path)
-    if not path.is_dir():
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat_module.S_ISDIR(st.st_mode):
+        return False
+    if owner_uid is not None and st.st_uid != owner_uid:
         return False
     ok = True
-    # Deepest-first so directories are empty by the time we unlink them.
-    for entry in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-        if entry.is_symlink() or entry.is_file():
-            ok = secure_delete_file(entry) and ok
+
+    def _walk_error(_e):
+        nonlocal ok
+        ok = False
+
     try:
+        # Deepest-first, so each directory is empty by the time its parent
+        # removes it; fwalk lists a link to a directory among the dirnames
+        # and never descends it.
+        for _dp, dirnames, filenames, dfd in os.fwalk(
+                path, topdown=False, onerror=_walk_error,
+                follow_symlinks=False):
+            for name in filenames:
+                ok = secure_delete_file(name, dir_fd=dfd) and ok
+            for name in dirnames:
+                try:
+                    if stat_module.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
+                        os.unlink(name, dir_fd=dfd)
+                    else:
+                        os.rmdir(name, dir_fd=dfd)
+                except OSError:
+                    ok = False
+    except OSError:
+        ok = False
+    try:
+        # rmtree refuses a symlink at the top and walks by descriptor, so
+        # what is left (a fifo the overwrite declined) goes without a follow.
         shutil.rmtree(path)
         return ok
     except OSError:
@@ -3564,8 +3814,20 @@ def _shutdown_handler(signum, frame):
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
 
-def install_signal_handlers():
+def _interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers(interactive: bool = False):
     """Install handlers for SIGINT and SIGTERM, and forbid core dumps.
+
+    interactive=True is for a tool that WAITS ON A PERSON -- a passphrase, a
+    pasted slip -- and has no loop to check a flag in. The flag-setter below
+    swallows Ctrl-C there: the handler runs, the read resumes, and gs_unseal
+    and gs_delivery_key sat at their prompts through two SIGINTs (driven).
+    So those raise KeyboardInterrupt on both signals instead, which unwinds
+    through every finally (atomic_write_json erases its partial on
+    BaseException), and still get the core-dump suppression below.
 
     Core-dump suppression rides along here because every script that WANTS THE
     HANDLERS calls this at startup.
@@ -3594,8 +3856,12 @@ def install_signal_handlers():
     above is now the true one: this hook covers the scripts that take the
     handlers, and the other two are named rather than assumed.
     """
-    signal.signal(signal.SIGINT, _shutdown_handler)
-    signal.signal(signal.SIGTERM, _shutdown_handler)
+    if interactive:
+        signal.signal(signal.SIGINT, _interrupt)
+        signal.signal(signal.SIGTERM, _interrupt)
+    else:
+        signal.signal(signal.SIGINT, _shutdown_handler)
+        signal.signal(signal.SIGTERM, _shutdown_handler)
     disable_core_dumps()
 
 
@@ -4454,7 +4720,7 @@ def bech32_checksum_ok(addr: str) -> bool:
     return True
 
 
-def secure_delete_file(path: Path) -> bool:
+def secure_delete_file(path: Path, dir_fd: Optional[int] = None) -> bool:
     """Overwrite a regular file's full extent in place (random then zeros), then
     unlink. Returns True on success. The single real wipe primitive -- callers
     that must not leave plaintext (a GPG bundle's source, paranoia_mode's
@@ -4468,16 +4734,21 @@ def secure_delete_file(path: Path) -> bool:
     symlink (no TOCTOU gap), and we unlink the link itself instead: removing a
     symlink discloses nothing, as the link holds no file content.
     Non-regular files (fifo, device, socket) are likewise never overwritten.
+
+    dir_fd makes `path` a NAME inside that open directory, for
+    secure_delete_tree: a tree walked by descriptor cannot be redirected by
+    renaming one of its directories to a symlink between the check and the
+    overwrite, which a walk by path name can.
     """
     path = Path(path)
     try:
-        st = os.lstat(path)
+        st = os.lstat(path, dir_fd=dir_fd)
     except OSError:
         return False
 
     if stat_module.S_ISLNK(st.st_mode):
         try:
-            path.unlink()          # drop the link only; target untouched
+            os.unlink(path, dir_fd=dir_fd)   # the link only; target untouched
             return True
         except OSError:
             return False
@@ -4485,7 +4756,7 @@ def secure_delete_file(path: Path) -> bool:
         return False               # refuse fifo/device/socket/dir
 
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
     except PermissionError:
         # A 0400 FILE THIS TOOLCHAIN WROTE ITSELF, and it could not erase one.
         #
@@ -4517,7 +4788,7 @@ def secure_delete_file(path: Path) -> bool:
         # own, and the file is destroyed microseconds later.
         fd = -1
         try:
-            rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
         except OSError:
             return False
         try:
@@ -4531,7 +4802,7 @@ def secure_delete_file(path: Path) -> bool:
         finally:
             os.close(rfd)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
         except OSError:
             return False
     except OSError:
@@ -4555,7 +4826,7 @@ def secure_delete_file(path: Path) -> bool:
                     f.flush(); os.fsync(f.fileno())
         elif fd >= 0:
             os.close(fd); fd = -1
-        path.unlink()
+        os.unlink(path, dir_fd=dir_fd)
         return True
     except (PermissionError, OSError):
         return False

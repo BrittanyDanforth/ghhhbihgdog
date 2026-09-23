@@ -377,7 +377,8 @@ def _run_paranoia_main(phase_returns, dry=False):
     p.install_signal_handlers = lambda: None
     stubs = {
         "spoof_mac": lambda iface, d: phase_returns.get("MAC spoof", 0),
-        "dns_check": lambda: phase_returns.get("DNS check", 0),
+        "link_check": lambda iface: phase_returns.get("Link check", 0),
+        "running_pipelines": lambda *a, **k: phase_returns.get("_live", []),
         "flush_dns_cache": lambda d: phase_returns.get("DNS cache flush", 0),
         "wipe_shell_histories": lambda d: phase_returns.get("Shell histories", 0),
         "wipe_pycache": lambda d: phase_returns.get("Python cache", 0),
@@ -392,7 +393,8 @@ def _run_paranoia_main(phase_returns, dry=False):
     }
     for name, fn in stubs.items():
         setattr(p, name, fn)
-    argv = ["paranoia_mode"] + (["--dry-run"] if dry else [])
+    argv = (["paranoia_mode"] + (["--dry-run"] if dry else [])
+            + list(phase_returns.get("_argv", [])))
     old_argv = sys.argv
     sys.argv = argv
     buf = io.StringIO(); real = sys.stdout; sys.stdout = buf
@@ -448,7 +450,7 @@ def test_every_phase_returns_a_failure_count():
     try:
         results = {
             "spoof_mac": p.spoof_mac("nonexistent-iface-zzz", True),
-            "dns_check_dry": 0,  # dns_check has no dry path; skipped in main on dry
+            "link_check": p.link_check("nonexistent-iface-zzz"),
             "flush_dns_cache": p.flush_dns_cache(True),
             "wipe_shell_histories": p.wipe_shell_histories(True),
             "wipe_pycache": p.wipe_pycache(True),
@@ -464,25 +466,75 @@ def test_every_phase_returns_a_failure_count():
         check(f"{name} returns an int failure count (dry)", isinstance(r, int))
 
 
-def test_dns_check_failure_does_not_abort_the_wipe():
-    """dns_check used to sys.exit(1), abandoning every wipe phase after it.
-    The real function must now RETURN a status, not exit."""
+def test_link_check_sends_nothing_and_never_aborts_the_wipe():
+    """Phase 2 was dns_check: a clearnet lookup of www.google.com straight
+    after the MAC change -- the new address's first query, the same every
+    run, and on a Tor-only host a guaranteed "failure". It used to sys.exit
+    too. The replacement reads the link state locally: no socket may be
+    opened, and a down link is said but is not a failed phase."""
     p = load("paranoia_mode")
     p.integrity_log = lambda *a, **k: None
     import io, socket
-    orig = socket.getaddrinfo
-    socket.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(socket.gaierror("no dns"))
+    opened = []
+    orig_sock, orig_gai = socket.socket, socket.getaddrinfo
+    socket.socket = lambda *a, **k: (opened.append(a), (_ for _ in ()).throw(
+        AssertionError("link_check opened a socket")))[1]
+    socket.getaddrinfo = lambda *a, **k: (opened.append(a), (_ for _ in ()).throw(
+        AssertionError("link_check resolved a name")))[1]
     real = sys.stdout; sys.stdout = io.StringIO()
     exited = False
     try:
-        rc = p.dns_check()
+        rc_lo = p.link_check("lo")
+        rc_none = p.link_check("nonexistent-iface-zzz")
+        out = sys.stdout.getvalue()
     except SystemExit:
-        exited = True; rc = None
+        exited = True; rc_lo = rc_none = None; out = ""
     finally:
         sys.stdout = real
-        socket.getaddrinfo = orig
-    check("dns_check does NOT sys.exit on failure", not exited)
-    check("dns_check reports failure as a return code", rc == 1)
+        socket.socket, socket.getaddrinfo = orig_sock, orig_gai
+    check("link_check sends nothing: no socket, no name lookup", opened == [])
+    check("link_check does NOT sys.exit", not exited)
+    check("link_check is informational: 0 for any link state", rc_lo == 0
+          and rc_none == 0)
+    check("NON-VACUITY: it did report something", "lo" in out)
+    src = open(os.path.join(REPO, "paranoia_mode")).read()
+    check("paranoia_mode resolves no name anywhere",
+          "getaddrinfo(" not in src and "gethostbyname(" not in src)
+
+
+def test_a_running_pipeline_stops_the_real_wipe():
+    """The wipe listed a live run's plans, staged transactions and its own
+    lock for deletion without a word. Erased mid-mix, the run's money is
+    stranded wherever it had got to."""
+    code, out = _run_paranoia_main({"_live": ["/x/.ghostspiral.lock"],
+                                    "Artifacts": 0})
+    check("a real wipe refuses while a run holds its lock", code == 1
+          and "IN PROGRESS" in out and "Phase 13" not in out)
+    code, out = _run_paranoia_main({"_live": ["/x/.ghostspiral.lock"]},
+                                   dry=True)
+    check("...a dry run says so and still previews", code == 0
+          and "IN PROGRESS" in out and "Phase 13" in out)
+    code, out = _run_paranoia_main({"_live": ["/x/.ghostspiral.lock"],
+                                    "_argv": ["--even-if-running"]})
+    check("...and --even-if-running is the way past it", code == 0
+          and "Phase 13" in out)
+    # The probe itself, against a real flock.
+    import tempfile, fcntl
+    p = load("paranoia_mode")
+    d = tempfile.mkdtemp(prefix="livelock_")
+    lk = os.path.join(d, ".ghostspiral.lock")
+    fd = os.open(lk, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held = p.running_pipelines([d], rpcs=())
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    free = p.running_pipelines([d], rpcs=())
+    check("running_pipelines sees a held .ghostspiral.lock", held
+          and held[0].endswith(".ghostspiral.lock"))
+    check("NON-VACUITY: and not a released one", free == [])
+    __import__("shutil").rmtree(d, ignore_errors=True)
 
 
 def test_shell_history_coverage():

@@ -563,6 +563,14 @@ participant in the pipeline. Verified on-chain by
 Do not point the pipeline at account 0 with `--account 0` unless you have a
 reason; it warns, and the warning is the whole story above.
 
+**The exit takes only what the run put there.** Every account a run creates
+is read whole at the exit; the receive bundle's account is not the run's, so
+on it the exit looks only at the subaddresses the run itself used. Money
+sitting elsewhere in that account — a second bundle in the same `--account`,
+the wallet's own funds under `--account 0` — is named at the end and left
+where it is. It used to be swept to `--exit-to` in one hop, named by its own
+swap memo. Mix each bundle with its own run.
+
 **Nothing is left parked.** A distribution cannot allocate its input exactly
 — the fee is not known when the amounts are chosen — so a remainder always
 comes back as change. Rotating the account moved that off your primary
@@ -690,6 +698,19 @@ If your offline wallet already exists, you do **not** have to recreate it:
 makes that unnecessary. `tests/real_cold_lookahead_testnet.py` pins both
 halves, including a negative control that fails without the fix.
 
+**What the signer checks before it signs.** `monero-wallet-cli` decodes each
+unsigned set and prints what it pays before it asks "Is this okay?". The
+signer refuses unless that list is the plan's destinations exactly — none
+missing, none extra — at the plan's amounts, with change only where the plan
+allows it: none on a sweep, dust at most on a peel, and on a fan-out the
+spending account's own subaddress 0, which the plan names. The manifest's
+hash cannot do this: it sits beside the blob it covers. The check rests on the
+plan being the one you made — whoever can rewrite the plan and its
+fingerprint rewrites what it is compared against — so the staging media is
+still trusted media. `--wallet-file` is resolved to an absolute path and its
+`.keys` file checked before anything is quoted; it used to fail only at Round 0,
+with the swap already paid.
+
 **How far apart the hops land is yours to choose, and the default is not the
 strong setting.** A peel hop cannot be built until the previous hop's output
 has confirmed and unlocked — about 10 blocks — and `--hop-delay` is added on
@@ -758,7 +779,8 @@ running process's arguments — while `/proc/<pid>/environ` is **0400**. So the
 console hands its children the sensitive values through the environment, not
 argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
 `GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination),
-`GS_EXPECT_TOTAL_XMR` (how much XMR this run is waiting for),
+`GS_EXPECT_TOTAL_XMR` (how much XMR this run is waiting for; the watch step
+gets the same figure as `GS_EXPECT_XMR`),
 `GS_USAGE_FEE_ADDRESS` and `GS_USAGE_FEE_PCT` (see below),
 `GS_SWAPKIT_API_KEY` (the quote aggregator's key, if your account needs one;
 it is sent only to that host and never appears on argv — **and it is an
@@ -799,6 +821,30 @@ for the several hours a run takes. Running GhostSpiral by hand, `--exit-to`
 still works and warns.
 
 Running a tool by hand still accepts the flags — it warns and logs when you do.
+
+**What the wipe will and will not touch**
+
+`paranoia_mode` takes only what this toolchain wrote. A match that is a
+symlink, is reached through one, belongs to another account, has a second
+name (a hard link), or is one of the ordinary names (`wallet_*.json`,
+`*.tmp`, `unsigned/`) without this toolchain's content is **left, and
+named** — the dry run lists it, so read the dry run. A planted
+`/tmp/tx_staging -> $HOME` used to have the sweep overwrite everything in
+`$HOME`, the wallet included. A match reached through a link to a directory
+of yours counts as not wiped: pass its real path with `--search-dir`.
+
+It refuses to run while a GhostSpiral run holds its lock (erasing a live
+run's plans strands its money mid-mix); `--even-if-running` is there for
+when that is the lesser harm. Phase 2 reads the interface's link state
+locally and sends nothing — it used to resolve a public name over clearnet
+DNS straight after the MAC change.
+
+Left on purpose, and said at the end of the sweep: your `gs_delivery.key`
+(`gs_delivery_key shred` removes it), and `~/.tor` if the console's Start
+Tor launched tor (its entry guards; deleting it makes tor choose new ones).
+The console launches that tor with none of its own environment — not the
+wallet password, not the exit — in its own session, and stops it when the
+console exits.
 
 **What the wallet file gives away**
 
@@ -2067,8 +2113,9 @@ python3 gs_wake_agent --key /etc/gs_wake_thinkpad.key
 
 Install the units from `systemd/` **as shipped**, and leave
 `WorkingDirectory=` and `Environment=HOME=` alone. `paranoia_mode`
-sweeps four fixed roots — cwd, `$HOME`, `$HOME/ghostspiral`,
-`$HOME/GhostSpiral` — and systemd starts a unit with cwd `/` and
+sweeps five roots — cwd, `$HOME`, `$HOME/ghostspiral`,
+`$HOME/GhostSpiral`, and the directory the toolchain itself sits in
+(where `gs_console` runs every child) — and systemd starts a unit with cwd `/` and
 `HOME=/root`, so without those two lines the woken job's bundles and
 slips sit somewhere the wipe never looks. The agent checks this itself
 and refuses the boot (`outside_wipe_roots`) rather than writing them
@@ -2084,7 +2131,7 @@ A `paranoia_mode` run started from your home directory will not see
 them.
 
 It will **not** touch `/etc/gs_wake_thinkpad.key`, because `/etc` is not
-one of the four roots — measured, not assumed. That is the right answer
+one of the roots — measured, not assumed. That is the right answer
 for a routine wipe: the vault stays pairable and the doorbell keeps
 working. It is the wrong answer if you are wiping because you expect the
 door to come in, and `paranoia_mode` cannot tell those two apart. In

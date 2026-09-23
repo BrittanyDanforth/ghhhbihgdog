@@ -33,7 +33,7 @@ import argparse, stat, sys, time
 from pathlib import Path
 
 from gs_common import (
-    wipe_will_erase,
+    wipe_will_erase, wipe_cwd_note,
     integrity_log, integrity_log_once, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json,
     install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
@@ -313,6 +313,11 @@ def mint_one_receive(wallet_rpc, args, seen_addrs=None, seen_accts=None,
     # wipe_will_erase: this tool picks the name (wallet_*.json, which the
     # sweep matches), so only the directory varies -- but asking the question
     # that is actually being answered keeps it right if either side changes.
+    # SWEPT FROM HERE ONLY: the cwd is a root of the wipe started in it, not
+    # of the one the operator starts from $HOME (gs_common.wipe_cwd_only).
+    _cwd_note = wipe_cwd_note(fname)
+    if _cwd_note:
+        print(_cwd_note)
     if not wipe_will_erase(fname):
         integrity_log_once("wallet", "bundle_outside_wipe_roots")
         print(f"  [!] {outdir} is OUTSIDE the directories paranoia_mode "
@@ -327,10 +332,17 @@ def mint_one_receive(wallet_rpc, args, seen_addrs=None, seen_accts=None,
 
     integrity_log_once("wallet", "saved")
 
-    # required=True: the header claims this rotation happens, and a silent
-    # failure leaves the subaddress creation on the same circuit as whatever
-    # follows it -- which is the correlation the rotation exists to break.
-    newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
+    # THE ROTATION the header claims, so what follows this mint is not on the
+    # circuit that came before it. BEST-EFFORT NOW, because it runs AFTER the
+    # mint. With required=True a
+    # failed rotation exited 1 with the account, the subaddress and the bundle
+    # already made: the console showed the step as failed, and the ordinary
+    # response -- run it again -- minted a second receive address and left the
+    # first bundle naming one nobody would use. And the rotation guards little
+    # here: the wallet-rpc is loopback, and the one Tor request this tool
+    # makes (the check before it) is on its own isolated stream. It still
+    # rotates, and says so loudly when it cannot (newnym's own warning).
+    newnym(required=False, proxy_url=getattr(args, "tor_proxy", ""))
     # (account, subaddress) alongside the address, so main() can compare
     # SUCCESSIVE mints -- see refuse_duplicate_receive.
     #

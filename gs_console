@@ -34,7 +34,7 @@ SAFETY MODEL, because this can spend money:
 Stdlib only, so it runs on the air-gapped machine too.
 """
 from __future__ import annotations
-import argparse, hmac, json, os, re, secrets, shlex, shutil, signal, subprocess, sys, threading, time
+import argparse, atexit, hmac, json, os, re, secrets, shlex, shutil, signal, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,12 @@ SCHEMA = {
     "btc_entry":    ("addr_re", BTC_RE),
     "receive_wallet": ("re", PATH_RE),
     "pairs_file":   ("re", PATH_RE),
-    "swap_btc":     ("re", DEC_RE),
+    #: ONE AMOUNT PER SWAP, space- or comma-separated, quoted in one click.
+    #: It was a single amount, and the page's "Number of swaps" asks for up to
+    #: eight: each click wrote the whole pairs file afresh, so the second
+    #: quote replaced the first and the watch and the run then waited for the
+    #: last swap alone -- the others landing unmixed on the entry address.
+    "swap_btc":     ("dec_list", (DEC_RE, 8)),
     "btc_amount":   ("re", DEC_RE),
     #: HOW MUCH XMR THIS RUN IS WAITING FOR, and the console could not say it.
     #:
@@ -397,6 +402,20 @@ def clean(params: dict) -> dict:
                                 f"{s[:16]}…")
                 elif s:
                     out[k] = s
+            elif kind == "dec_list":
+                # Amounts, so NOT de-duplicated: two swaps of 0.05 are two
+                # swaps. Normalised to one space-separated string, which is
+                # the shape GS_SWAP_AMOUNTS takes.
+                _rx, _cap = spec
+                raw = v if isinstance(v, list) else re.split(r"[\s,]+", str(v))
+                items = [str(t).strip() for t in raw if str(t).strip()]
+                bad = [t for t in items if not _rx.match(t)]
+                if bad:
+                    errs.append(f"{k} is not a valid amount: {bad[0][:24]}")
+                elif len(items) > _cap:
+                    errs.append(f"{k}: at most {_cap} amounts, one per swap")
+                elif items:
+                    out[k] = " ".join(items)
             elif kind == "list_re":
                 # Accept a JSON array or a newline/comma separated string, so
                 # the field works whether the page sends a list or raw text.
@@ -458,6 +477,20 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         # was the one of the three that did not, which left the standard GUI
         # receive flow running with no arrival gate at all.
         a += ["--swap-pairs", p.get("pairs_file") or DEFAULT_PAIRS_FILE]
+        # AS MANY QUOTES AS SWAPS, or the run waits for the wrong total. A
+        # quote file holding fewer swaps to this address than 'Number of
+        # swaps' says is one that a later quote overwrote: the run would sum
+        # what is left, open its gate on that, and the rest would land after
+        # it had finished. A typed total overrides the file, so it is the way
+        # past this for someone who knows what they are expecting.
+        _np = _pairs_for_receive(p)
+        _n = max(1, int(p.get("split") or 1))
+        if _np is not None and _np != _n and not p.get("expect_total_xmr"):
+            why.append(
+                f"{p.get('pairs_file') or DEFAULT_PAIRS_FILE} holds {_np} "
+                f"swap(s) paying this receive address and 'Number of swaps' "
+                f"is {_n}. Quote all {_n} together in step 2, or type the "
+                f"total you are expecting in 'Total XMR expected'.")
     else:
         if not p.get("btc_entry"):
             why.append("Send mode needs a BTC entry address (bech32).")
@@ -624,12 +657,22 @@ ACTIONS = {
     # handed to the sender is a Monero one, so the sender must already hold XMR
     # and the swap that the whole receive flow exists for never happens.
     # Destination comes from the receive bundle, never a retyped address.
+    #
+    # --min-out-xmr, WHICH thor_swap_preparer'S OWN COMMENT SAID THIS PASSED.
+    # It did not, and an absent flag is no gate: a deposit too small to mix
+    # was quoted, the sender paid it, and the mix refused it at stage 0 with
+    # the XMR already on the entry address the swap memo names in public.
+    # quote_problems refuses the click when the floor cannot be computed or
+    # the amounts do not match the number of swaps.
     "swap_quote":      {"group": "Receive", "label": "Get the BTC deposit address", "risk": "safe",
                         "desc": "BTC→XMR quote: the address + memo you give the sender",
+                        "check": lambda p: quote_problems(p),
                         "build": lambda p: [PY, "thor_swap_preparer",
                                             "--dest-from-receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", ""),
-                                            "--outfile", p.get("pairs_file") or DEFAULT_PAIRS_FILE]},
+                                            "--outfile", p.get("pairs_file") or DEFAULT_PAIRS_FILE]
+                                           + (["--min-out-xmr", str(quote_floor_xmr(p))]
+                                              if quote_floor_xmr(p) else [])},
     # watches YOUR OWN wallet-rpc until the payment lands. Reads only — it
     # never spends, so it stays a `safe` action even though it is the step
     # that decides a mix is about to happen.
@@ -811,11 +854,21 @@ PASSWORD_ACTIONS = {"run_pipeline"}
 #: reads it to refuse a swap whose destination is also the exit destination --
 #: which would publish the final address in a Bitcoin OP_RETURN. That check is
 #: the reason the variable reaches that child at all.
+#:
+#: GS_SWAPKIT_API_KEY for the two actions that ask the aggregator for a quote
+#: (swap_quote, and run_pipeline in send mode). It is the operator's own and
+#: comes from the shell, never the page -- and _child_env stripped it with the
+#: rest, so a keyed SwapKit account was told "put it in GS_SWAPKIT_API_KEY"
+#: while it was set, and OPSEC_SETUP says the console forwards it.
+#:
+#: GS_EXPECT_XMR for watch_receive: the page's "Total XMR expected" box is the
+#: watch step's own field, and the value never reached the watch.
 ACTION_SECRETS = {
     "run_pipeline": {"GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_EXIT_TO",
                      "GS_EXPECT_TOTAL_XMR", "GS_USAGE_FEE_ADDRESS",
-                     "GS_USAGE_FEE_PCT"},
-    "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO"},
+                     "GS_USAGE_FEE_PCT", "GS_SWAPKIT_API_KEY"},
+    "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO", "GS_SWAPKIT_API_KEY"},
+    "watch_receive": {"GS_EXPECT_XMR"},
 }
 _JOB_SEQ = [0]
 
@@ -850,10 +903,16 @@ def secret_env(params: dict) -> dict:
     whitespace or commas.
     """
     env = {}
-    if params.get("btc_entry"):
-        env["GS_BTC_ENTRY"] = params["btc_entry"]
-    if params.get("btc_amount"):
-        env["GS_BTC_AMOUNT"] = str(params["btc_amount"])
+    # SEND MODE'S OWN, and only there. The page hides these two boxes in
+    # receive mode but collect() still sends them, so a value left from an
+    # earlier send run reached a receive run's environment -- the operator's
+    # Bitcoin address, handed to a run that does not use it, which GhostSpiral
+    # then refuses outright while the page showed no problem at all.
+    if params.get("mode") != "receive":
+        if params.get("btc_entry"):
+            env["GS_BTC_ENTRY"] = params["btc_entry"]
+        if params.get("btc_amount"):
+            env["GS_BTC_AMOUNT"] = str(params["btc_amount"])
     if params.get("swap_btc"):
         env["GS_SWAP_AMOUNTS"] = str(params["swap_btc"])
     # HOW MUCH XMR THIS RUN IS WAITING FOR. Same class as GS_BTC_AMOUNT above,
@@ -861,6 +920,8 @@ def secret_env(params: dict) -> dict:
     # because the argv form is world-readable for the life of the run.
     if params.get("expect_total_xmr"):
         env["GS_EXPECT_TOTAL_XMR"] = str(params["expect_total_xmr"])
+        # The same box, under the name receive_watch reads (--expect-xmr).
+        env["GS_EXPECT_XMR"] = str(params["expect_total_xmr"])
     if params.get("exit_to"):
         env["GS_EXIT_TO"] = " ".join(params["exit_to"])
     # THE CUT DESTINATION, same class as the exit destination and for a
@@ -1362,11 +1423,18 @@ def run_notes(p: dict) -> list:
                 _have = os.path.isfile(os.path.join(REPO, _pf))
             except Exception:                                # noqa: BLE001
                 _have = False
-            if _have:
+            _np = _pairs_for_receive(p)
+            if _have and _np:
                 notes.append(
-                    f"The arrival target comes from {_pf}: the run sums the "
-                    f"swaps routed to this receive address and waits for all "
-                    f"of them. Set 'Expected total XMR' only to override that.")
+                    f"The arrival target comes from {_pf}: {_np} swap(s) "
+                    f"routed to this receive address, and the run waits for "
+                    f"all of them. Set 'Expected total XMR' only to override "
+                    f"that.")
+            elif _have:
+                notes.append(
+                    f"{_pf} names no swap paying this receive address, so the "
+                    f"run has no arrival target from it. Quote the swaps in "
+                    f"step 2, or type the total you are expecting.")
             else:
                 notes.append(
                     f"NO ARRIVAL TARGET. {_pf} is not in the repo directory "
@@ -1499,6 +1567,80 @@ def limits_badge(p: dict) -> str:
                 f"Min {low} XMR · Max your balance · Usage fee off")
     except Exception:                                        # noqa: BLE001
         return ""
+
+
+def quote_floor_xmr(p: dict):
+    """The least XMR ONE swap of this quote may deliver, or None if unknown.
+
+    The run's minimum is limits_badge's figure -- the shipped mix_minimum_xmr
+    at these settings and this many swaps -- and each swap is one chunk of it,
+    so a swap below its equal share is refused before the sender is told to
+    pay. thor_swap_preparer gates the worst arrival it will accept (after
+    slippage) against this, per swap, and the run re-checks the real total at
+    stage 0. At the fallback fee, like the panel: an understatement at
+    priorities above 1, so a floor and never a promise.
+    """
+    try:
+        g = _ghost()
+        from decimal import Decimal as _D, ROUND_UP as _UP
+        w = max(1, int(p.get("wallets") or 10))
+        prio = int(p.get("fee_priority") or 1)
+        fee = g.FALLBACK_FEE_BY_PRIORITY.get(prio, g.FALLBACK_FEE_XMR)
+        n = max(1, int(p.get("split") or 1))
+        pct = None
+        if p.get("usage_fee"):
+            _p = p.get("usage_fee_pct")
+            pct = _D(str(_p)) if _p else g.USAGE_FEE_PCT
+        total = g.mix_minimum_xmr(fee, w, dag_mixing=bool(p.get("dag_mixing")),
+                                  exit_set=bool(p.get("exit_to")), chunks=n,
+                                  usage_pct=pct)
+        return (total / n).quantize(g.DUST_XMR, rounding=_UP)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def quote_problems(p: dict) -> list:
+    """Why the quote step must not run with these settings; [] if it may."""
+    why = []
+    amounts = str(p.get("swap_btc") or "").split()
+    n = max(1, int(p.get("split") or 1))
+    if not amounts:
+        why.append("Enter the BTC amount the sender will pay.")
+    elif len(amounts) != n:
+        why.append(
+            f"'Number of swaps' is {n} and {len(amounts)} amount(s) were "
+            f"entered. Put one amount per swap in the amount box, all of them "
+            f"(e.g. '0.05 0.03'): each quote writes the whole quote file, so "
+            f"swaps quoted one at a time replace each other and the watch and "
+            f"the run wait for the last one only.")
+    if quote_floor_xmr(p) is None:
+        why.append(
+            "The mixing minimum could not be computed here (GhostSpiral did "
+            "not load), so this quote would have no floor: a deposit too small "
+            "to mix would be quoted and paid, and then stuck on the entry "
+            "address. Refusing.")
+    return why
+
+
+def _pairs_for_receive(p: dict):
+    """How many swaps in the quote file pay THIS receive address, or None.
+
+    Children run with cwd=REPO, so that is where both files are read from.
+    None when either is missing or unreadable: nothing to compare.
+    """
+    try:
+        with open(os.path.join(REPO, p.get("receive_wallet") or ""),
+                  encoding="utf-8") as f:
+            addr = str((json.load(f) or {}).get("address") or "")
+        with open(os.path.join(REPO, p.get("pairs_file") or DEFAULT_PAIRS_FILE),
+                  encoding="utf-8") as f:
+            pairs = json.load(f)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if not addr or not isinstance(pairs, list):
+        return None
+    return sum(1 for q in pairs
+               if isinstance(q, dict) and q.get("dest_xmr") == addr)
 
 
 def limits_note(p: dict) -> str:
@@ -1811,6 +1953,55 @@ def detect_tor_proxy(preferred: str = "") -> dict:
 _TOR_PROC = None
 _TOR_LOCK = threading.Lock()
 
+#: ALL tor is handed from this console's environment: what a daemon needs to
+#: find its binary's libraries, its default DataDirectory and its locale.
+#:
+#: Start Tor ran Popen([tor_bin]) with no env=, so tor inherited the console's
+#: whole environment -- GS_WALLET_PASSWORD and GS_EXIT_TO, which OPSEC_SETUP
+#: has the operator export before starting the console, and which _child_env
+#: exists to keep from every child that is not the pipeline. Driven with a
+#: stand-in tor that printed its environ: both were there. Tor is also the one
+#: child that outlives a click -- real tor takes SIGHUP as "reload", so closing
+#: the terminal left it running with the spend password in /proc/<pid>/environ
+#: for as long as the machine stayed up. An allow-list, not a deny-list, for
+#: the reason _child_env gives: the next secret will not be spelt GS_.
+_TOR_ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+                 "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE",
+                 "APPDATA", "LOCALAPPDATA")
+
+
+def _tor_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k in _TOR_ENV_KEEP}
+
+
+def stop_started_tor() -> bool:
+    """Stop the tor THIS console launched, if it is still running.
+
+    Only ours: a Tor that was already up when Start Tor was clicked (Tor
+    Browser, a system tor) was reused, never launched, and is not touched.
+    Called on every way out of main() and from atexit. Returns True if one
+    was stopped.
+    """
+    global _TOR_PROC
+    with _TOR_LOCK:
+        p, _TOR_PROC = _TOR_PROC, None
+    try:
+        if p is None or p.poll() is not None:
+            return False
+        p.terminate()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(timeout=5)
+    except Exception:                                # noqa: BLE001
+        # On the way out, from atexit: say nothing rather than raise.
+        return False
+    return True
+
+
+atexit.register(stop_started_tor)
+
 
 def _find_tor_binary():
     """Locate an ALREADY-INSTALLED tor daemon. Never downloads anything —
@@ -1870,9 +2061,13 @@ def start_tor():
             return {"ok": False, "proxy": None, "started": False,
                     "detail": "No installed 'tor' binary found. " + hint}
         try:
+            # env: _TOR_ENV_KEEP. start_new_session: the terminal's SIGHUP
+            # and Ctrl-C are the console's to act on; stop_started_tor ends
+            # this one on the way out.
             _TOR_PROC = subprocess.Popen(
                 [tor_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, cwd=os.path.dirname(tor_bin) or None)
+                stdin=subprocess.DEVNULL, cwd=os.path.dirname(tor_bin) or None,
+                env=_tor_env(), start_new_session=True)
         except Exception as e:                        # noqa: BLE001
             return {"ok": False, "proxy": None, "started": False,
                     "detail": f"found tor at {tor_bin} but could not launch it: {str(e)[:100]}"}
@@ -2196,6 +2391,9 @@ class H(BaseHTTPRequestHandler):
                 # Refuse instead, and say which field is wrong.
                 if c["errors"]:
                     return self._send(400, json.dumps({"error": "; ".join(c["errors"])}))
+                why = act.get("check", lambda _p: [])(c["params"])
+                if why:
+                    return self._send(400, json.dumps({"error": "; ".join(why)}))
                 argv = act["build"](c["params"])
             return self._send(200, json.dumps(
                 {"jid": start(argv, act["label"], action_id=aid,
@@ -2461,7 +2659,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         above, so the 95-character Monero address is never retyped — the one field where a typo
         is irreversible. The memo is checked to actually name your address before any
         instructions are printed.
-        <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay</label>
+        <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay
+          <span class="d">one per swap, all together: 0.05 0.03 — as many as 'Number of swaps' in step 3</span></label>
           <input id="swap_btc" autocomplete="off" spellcheck="false" placeholder="0.05">
           <span class="d limits"></span></div>
         <div class="f"><label for="pairs_file">Save quote to</label>
@@ -3200,10 +3399,21 @@ def main():
     print( "  Use a private window, or clear the entry yourself.")
     print(f"  {len(ACTIONS)} actions · funds require the arm phrase '{ARM_PHRASE}'")
     print(f"  wallet password: {'from GS_WALLET_PASSWORD' if os.environ.get('GS_WALLET_PASSWORD') else 'not set'}")
+    # A CLOSED TERMINAL OR A kill IS A WAY OUT TOO. Both ended the process
+    # without unwinding, so nothing ran after them -- the tor Start Tor
+    # launched among it. SystemExit unwinds serve_forever like Ctrl-C does.
+    def _leave(signum, _frame):
+        raise SystemExit(128 + signum)
+    for _sig in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, _sig):
+            signal.signal(getattr(signal, _sig), _leave)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n  stopped")
+    finally:
+        if stop_started_tor():
+            print("  stopped the tor this console started")
 
 
 if __name__ == "__main__":

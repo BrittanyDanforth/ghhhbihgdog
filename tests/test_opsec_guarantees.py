@@ -139,6 +139,10 @@ finally:
 pm = _load("paranoia_mode")
 _cwd = os.getcwd()
 _d = tempfile.mkdtemp(prefix="wipechain_")
+# The toolchain's directory is a sweep root wherever the wipe starts; a REAL
+# wipe here must not reach into the checkout the other suites are running in.
+_tc2 = gs.TOOLCHAIN_DIR
+gs.TOOLCHAIN_DIR = Path(tempfile.mkdtemp(prefix="wipechain_tc_"))
 try:
     os.chdir(_d)
     Path("integrity_chain.log").write_text("h | an earlier run\n")
@@ -173,6 +177,8 @@ try:
 finally:
     os.chdir(_cwd)
     __import__("shutil").rmtree(_d, ignore_errors=True)
+    __import__("shutil").rmtree(gs.TOOLCHAIN_DIR, ignore_errors=True)
+    gs.TOOLCHAIN_DIR = _tc2
 
 # ---------------------------------------------------------------------------
 # 3. Relay egress must be re-checked before EVERY submit, not on a timer.
@@ -732,13 +738,170 @@ try:
     _gcs = Path(os.path.join(REPO, "gs_common.py")).read_text()
     check("wipe/reason: ONE name rule -- wipe_miss_reason no longer carries a "
           "second copy that hard-codes the FILE patterns",
-          _gcs.count("GS_ARTIFACT_DIR_PATTERNS if res.is_dir()") == 1
+          _gcs.count("for pat in GS_ARTIFACT_DIR_PATTERNS)") == 1
+          and _gcs.count("return artifact_name_is_ours(res.name)") == 1
           and "named = _wipe_name_matches(res)" in _gcs)
 finally:
     if _prev_home is None:
         os.environ.pop("HOME", None)
     else:
         os.environ["HOME"] = _prev_home
+
+
+# ---------------------------------------------------------------------------
+# 5. The artifact sweep must not follow a link, or take what is not ours.
+#
+# It tested d.is_dir() and walked d.rglob("*"), both of which follow a
+# symlink, so one link another local account planted in a shared directory
+# -- /tmp/tx_staging -> the operator's $HOME -- had the sweep overwrite every
+# file in $HOME, the offline wallet and its .keys included. receive_watch
+# tells the operator to pass exactly such a directory as --search-dir. And
+# its ordinary patterns ("*.tmp", "wallet_*.json", "unsigned/") took a
+# user's own files at depth 1 of $HOME. Driven with the real sweep, for
+# real, in a sandboxed HOME, with the toolchain root pointed at scratch.
+# ---------------------------------------------------------------------------
+_pm5 = _load("paranoia_mode")
+_pm5.integrity_log = lambda *a, **k: None
+_box5 = Path(tempfile.mkdtemp(prefix="wipelink_"))
+_saved5 = (os.environ.get("HOME"), os.getcwd(), gs.TOOLCHAIN_DIR)
+try:
+    _H5 = _box5 / "home"
+    (_H5 / "Monero").mkdir(parents=True)
+    _keep5 = {
+        "Monero/offline.wallet": b"WALLET-CACHE",
+        "Monero/offline.wallet.keys": b"SPEND-KEYS",
+        "notes.txt": b"my notes",
+        # A user's own files the ordinary patterns matched by name alone.
+        "Documents/wallet_eth_backup.json": b'{"crypto": {"cipher": "x"}}',
+        "Downloads/installer.tmp": b"an installer",
+        "android/unsigned/app-release.apk": b"PK..",
+    }
+    for _n, _b in _keep5.items():
+        (_H5 / _n).parent.mkdir(parents=True, exist_ok=True)
+        (_H5 / _n).write_bytes(_b)
+    # Ours, which must still go.
+    _ours5 = {
+        "gs/wallet_ab12cd34.json":
+            b'{"schema": "gs_receive_wallet_v1", "address": "8x"}',
+        "gs/thor_pairs.json.tmp": b"[]",
+        "thor_pairs.json": b"[]",
+        "unsigned/unsigned_1000.json": b"{}",
+    }
+    for _n, _b in _ours5.items():
+        (_H5 / _n).parent.mkdir(parents=True, exist_ok=True)
+        (_H5 / _n).write_bytes(_b)
+    (_H5 / "gs" / "gs_delivery.key").write_bytes(b'{"sealed": 1}')
+    _S5 = _box5 / "shared_tmp"
+    _S5.mkdir()
+    os.chmod(_S5, 0o1777)
+    # (a) a link NAMED like a directory pattern, to $HOME
+    os.symlink(_H5, _S5 / "tx_staging")
+    # (b) a link to a directory, for `*/pattern` to walk through
+    (_box5 / "elsewhere").mkdir()
+    (_box5 / "elsewhere" / "wallet_ffff0000.json").write_bytes(
+        b'{"schema": "gs_receive_wallet_v1"}')
+    os.symlink(_box5 / "elsewhere", _S5 / "through")
+    # (c) a second NAME for the user's notes, called like an artifact
+    os.link(_H5 / "notes.txt", _S5 / "thor_pairs_x.json")
+    os.environ["HOME"] = str(_H5)
+    _tc5 = _box5 / "toolchain"
+    _tc5.mkdir()
+    gs.TOOLCHAIN_DIR = _tc5
+    (_box5 / "cwd").mkdir()
+    os.chdir(_box5 / "cwd")
+    with contextlib.redirect_stdout(io.StringIO()) as _dry5:
+        _pm5.wipe_gs_artifacts(dry=True, extra_dirs=[str(_S5)])
+    _d5 = _dry5.getvalue()
+    check("sweep/said: the delivery key it keeps on purpose is named, not "
+          "passed over in silence",
+          f"Left on purpose: {_H5 / 'gs' / 'gs_delivery.key'}" in _d5)
+    check("sweep/link: the dry run SAYS it leaves the planted link alone",
+          f"Would leave {_S5 / 'tx_staging'} alone" in _d5
+          and "would securely delete dir " + str(_S5 / "tx_staging") not in _d5)
+    # $HOME/thor_pairs.json is reached twice: from $HOME, and through the
+    # link. The second is not a refusal to report -- the first pass takes it.
+    check("sweep/link: a file reached through a link AND under its own root "
+          "is listed once, as deleted, not also as a failure",
+          f"would securely delete {_H5 / 'thor_pairs.json'}" in _d5
+          and "tx_staging/thor_pairs.json alone" not in _d5)
+    with contextlib.redirect_stdout(io.StringIO()) as _real5:
+        _f5 = _pm5.wipe_gs_artifacts(dry=False, extra_dirs=[str(_S5)])
+    _r5 = _real5.getvalue()
+    _lost5 = [n for n, b in _keep5.items()
+              if not (_H5 / n).exists() or (_H5 / n).read_bytes() != b]
+    check(f"sweep/link: nothing of the user's is touched -- wallet, keys, "
+          f"notes, their own look-alike files (lost: {_lost5})", _lost5 == [])
+    check("sweep/link: the planted link is left as it was",
+          os.path.islink(_S5 / "tx_staging"))
+    check("sweep/link: a match reached THROUGH a linked directory is left, "
+          "and said", (_box5 / "elsewhere" / "wallet_ffff0000.json").exists()
+          and "through the symlink" in _r5)
+    check("sweep/link: a second name (hard link) of a user's file is left "
+          "rather than overwritten in place",
+          (_H5 / "notes.txt").read_bytes() == b"my notes"
+          and "hard links" in _r5)
+    check("sweep/link: ...and both of those count as NOT wiped (they may be "
+          "ours and they are still on disk)", _f5 == 2)
+    check("sweep/said: ...and it is still there after the real wipe",
+          (_H5 / "gs" / "gs_delivery.key").exists())
+    _gone5 = [n for n in _ours5 if (_H5 / n).exists()]
+    check(f"sweep/link: NON-VACUITY -- this toolchain's own files still go "
+          f"(left: {_gone5})", _gone5 == [])
+    # The ownership half, which a single-uid sandbox cannot plant for real:
+    # asked directly, with owners that do not include the file's.
+    _o5 = _box5 / "thor_pairs.json"
+    _o5.write_bytes(b"[]")
+    _rf5 = gs.sweep_refusal(_box5, _o5, {os.geteuid() + 4242})
+    check("sweep/owner: another account's file is refused",
+          _rf5 is not None and "another account" in _rf5[0])
+    check("sweep/owner: NON-VACUITY -- the operator's own is taken",
+          gs.sweep_refusal(_box5, _o5, {os.geteuid()}) is None)
+    # secure_delete_tree itself, the primitive GhostSpiral and the agent use.
+    _v5 = _box5 / "victim"
+    _v5.mkdir()
+    (_v5 / "keep").write_bytes(b"k")
+    os.symlink(_v5, _box5 / "tree_link")
+    check("tree: a link to a directory is refused, and its target kept",
+          gs.secure_delete_tree(_box5 / "tree_link") is False
+          and (_v5 / "keep").read_bytes() == b"k")
+    _t5 = _box5 / "tree"
+    (_t5 / "sub").mkdir(parents=True)
+    (_t5 / "sub" / "a").write_bytes(b"a")
+    os.symlink(_v5, _t5 / "sub" / "inner_link")
+    os.symlink(_v5 / "keep", _t5 / "file_link")
+    check("tree: a real tree goes, links inside it unlinked, never followed",
+          gs.secure_delete_tree(_t5) is True and not _t5.exists()
+          and (_v5 / "keep").read_bytes() == b"k")
+    _t6 = _box5 / "tree6"
+    _t6.mkdir()
+    check("tree: owner_uid that does not own the root is refused",
+          gs.secure_delete_tree(_t6, owner_uid=os.geteuid() + 4242) is False
+          and _t6.exists())
+    # M4: the checkout the console runs its children in is a root however
+    # the wipe is started, and a writer's bare cwd is said to be one only
+    # for a wipe started there.
+    (_tc5 / "thor_pairs.json").write_bytes(b"[]")
+    os.chdir(_box5)
+    check("roots: a pairs file in the toolchain's directory is erased by a "
+          "wipe started anywhere",
+          gs.wipe_will_erase(_tc5 / "thor_pairs.json", cwd=False))
+    _w5 = _box5 / "usbwork"
+    _w5.mkdir()
+    os.chdir(_w5)
+    check("roots: a file in a bare cwd is erased only by a wipe started "
+          "there, and the writer says which directory",
+          gs.wipe_cwd_only(_w5 / "thor_pairs.json")
+          and str(_w5) in (gs.wipe_cwd_note(_w5 / "thor_pairs.json") or ""))
+    check("roots: NON-VACUITY -- no such note under $HOME",
+          gs.wipe_cwd_note(_H5 / "thor_pairs.json") is None)
+finally:
+    os.chdir(_saved5[1])
+    gs.TOOLCHAIN_DIR = _saved5[2]
+    if _saved5[0] is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _saved5[0]
+    __import__("shutil").rmtree(_box5, ignore_errors=True)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

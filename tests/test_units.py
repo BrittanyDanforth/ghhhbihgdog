@@ -3048,10 +3048,18 @@ class _R:
 
 _usable = Decimal("9.5")
 _base = ghost.compute_fanout_amounts(_usable, 6, Decimal("0.0024"), False, _R())
+
+
+def usable_minus(amts):
+    """What a peel plan leaves undistributed -- and so hands the last hop."""
+    return _usable - sum(amts, Decimal(0))
 _fit, _frac = ghost.fit_peel_distribution(
     _base, Decimal("10"), _usable, 6, Decimal("0.0024"), False, _R(), _HR)
-check("fit_peel_distribution: a fundable chain is left at the default fraction",
-      _frac is None and _fit == _base)
+check("fit_peel_distribution: a fundable chain distributes ALL of usable "
+      "(frac None), not the fan-out's 0.9 -- the rest would ride the chain "
+      "to the last destination",
+      _frac is None and sum(_fit, Decimal(0)) > sum(_base, Decimal(0))
+      and usable_minus(_fit) < Decimal("0.001"))
 check("fit_peel_distribution: ...and the result really is affordable",
       ghost.peel_entry_requirement(_fit, ghost.peel_carrier_reserves(_fit, _HR))
       <= Decimal("10") - _HR)
@@ -3984,6 +3992,10 @@ check("wipe_covers: a DIRECTORY two levels down is NOT covered either "
 # and compares what it names against what wipe_will_erase predicts.
 _wd_root = Path(tempfile.mkdtemp(prefix="wipe_agree_"))
 _wd_saved_home, _wd_saved_cwd = os.environ.get("HOME"), os.getcwd()
+# The toolchain's own directory is a sweep root too; point it at empty scratch
+# so what this checkout's other suites left in it is not counted here.
+_wd_saved_tc = _gsc.TOOLCHAIN_DIR
+_gsc.TOOLCHAIN_DIR = Path(tempfile.mkdtemp(prefix="wipe_tc_"))
 try:
     os.environ["HOME"] = str(_wd_root)
     os.chdir(_wd_root)
@@ -4033,6 +4045,8 @@ finally:
     if _wd_saved_home is not None:
         os.environ["HOME"] = _wd_saved_home
     shutil.rmtree(_wd_root, ignore_errors=True)
+    shutil.rmtree(_gsc.TOOLCHAIN_DIR, ignore_errors=True)
+    _gsc.TOOLCHAIN_DIR = _wd_saved_tc
 # ...and the boundary still holds from the other side, so this is not simply
 # "refuse everything".
 check("control: a directory ONE level down is still covered (--output plans)",
@@ -4049,6 +4063,8 @@ shutil.rmtree(_cov_dir, ignore_errors=True)
 # The preview is what an operator reads before the irreversible run.
 _dr_root = Path(tempfile.mkdtemp(prefix="dryroot_"))
 _dr_home, _dr_cwd = os.environ.get("HOME"), os.getcwd()
+_dr_tc = _gsc.TOOLCHAIN_DIR
+_gsc.TOOLCHAIN_DIR = Path(tempfile.mkdtemp(prefix="dry_tc_"))
 try:
     os.environ["HOME"] = str(_dr_root)
     (_dr_root / "thor_pairs.json").write_text("{}")
@@ -4090,6 +4106,8 @@ finally:
     if _dr_home is not None:
         os.environ["HOME"] = _dr_home
     shutil.rmtree(_dr_root, ignore_errors=True)
+    shutil.rmtree(_gsc.TOOLCHAIN_DIR, ignore_errors=True)
+    _gsc.TOOLCHAIN_DIR = _dr_tc
 
 # GhostSpiral must actually WARN, not merely be able to. An incomplete run
 # keeps its plans on purpose, so an --output the wipe cannot reach is exactly
@@ -5284,6 +5302,39 @@ check("an unsigned plan's meta carries no toolchain version",
       '"schema": "unsigned_v1",' in _pm_src
       and '"version": VERSION' not in _pm_src)
 
+
+# THE CHAIN'S OWN MTIME DATED THE RUN TO THE SECOND while every line in it
+# carried a ten-minute bucket: the last append (withdraw_done,
+# pipeline_complete) lands seconds after the final relay. Set back to the
+# bucket after each append; ctime cannot be, and the docstring says so.
+_mt_d = Path(tempfile.mkdtemp(prefix="chain_mtime_"))
+_mt_p = _mt_d / "integrity_chain.log"
+_gsc.integrity_log("t", "one", _mt_p)
+check("chain mtime: the file's mtime is the line's bucket, not the second",
+      os.stat(_mt_p).st_mtime % 600 == 0
+      and int(os.stat(_mt_p).st_mtime)
+      == int(open(_mt_p).read().split(" | ")[1].split("|")[0]))
+check("chain mtime: ...and its lock file's too",
+      os.stat(str(_mt_p) + ".lock").st_mtime % 600 == 0)
+check("chain mtime: the docstring does not claim ctime away",
+      "CTIME" in (_gsc.integrity_log.__doc__ or ""))
+shutil.rmtree(_mt_d, ignore_errors=True)
+
+# AND THE EMPTY ./unsigned/ A COMPLETE RUN LEFT, whose mtime was the second
+# its last plan was erased. Only the default name, and only when empty.
+_up_d = Path(tempfile.mkdtemp(prefix="spent_plans_"))
+(_up_d / "unsigned").mkdir()
+(_up_d / "mine").mkdir()
+_up_a = _up_d / "unsigned" / "unsigned_fanout_x.json"
+_up_b = _up_d / "mine" / "unsigned_dag_x.json"
+_up_a.write_text("{}")
+_up_b.write_text("{}")
+ghost._wipe_spent_plans(str(_up_a), str(_up_b))
+check("spent plans: the emptied default ./unsigned/ goes with them",
+      not (_up_d / "unsigned").exists())
+check("spent plans: an --output directory the operator named is kept",
+      (_up_d / "mine").is_dir() and not _up_b.exists())
+shutil.rmtree(_up_d, ignore_errors=True)
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
