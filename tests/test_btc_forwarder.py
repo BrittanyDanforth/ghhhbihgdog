@@ -1604,6 +1604,16 @@ check("bump_due compares today's estimate with what the forward REALLY pays "
       and F.bump_due(_paid_real, 12, 7200, now=9000) is True
       and F.bump_due(dict(_paid_real, fee_sat=None), 11, 7200,
                      now=9000) is True)
+# A PLAN RECONSTRUCTED FROM THE CHAIN KNOWS ITS RATE: the fee and vsize off
+# the transaction itself. It was never bumped for want of a target, so a
+# first forward whose sending run died sat at its rate however far fees rose.
+check("bump_due takes a RECONSTRUCTED plan (no target, the fee and vsize "
+      "off the chain) by the rate it really pays",
+      F.bump_due({"feerate_target_sat_vb": None, "fee_sat": 2850,
+                  "vsize": 240, "ts": 1000}, 12, 7200, now=9000) is True
+      and F.bump_due({"feerate_target_sat_vb": None, "fee_sat": 2850,
+                      "vsize": 240, "ts": 1000}, 11, 7200,
+                     now=9000) is False)
 _bnd1 = F.btx.vsize_upper_bound(1, [F.INBOUND_SPK_MAX,
                                      F.btx.op_return_script_len(120)])
 check("bump_floor never goes under the paid rate plus one, the operator's "
@@ -1838,6 +1848,19 @@ _r("inbound_unverified", Net(thornode=OSError("down")), "--thornode",
    "https://t")
 _r("inbound_unverified", Net(thornode={"not": "a list"}), "--thornode",
    "https://t")
+# THE SERVERS A SENDING FORWARD LISTENS TO ARE WHO THEY SAY (the review of
+# stages 2-6): an unpinned clearnet Electrum server is whatever the Tor
+# exit says, and the forward took its fee estimate and its word on "seen".
+_cl = run(Net(), "--electrum", "electrum.example.com:50002",
+          broadcast=True)
+check("a SENDING forward refuses an unpinned clearnet --electrum server "
+      "before any look, and a pinned one or an onion is taken",
+      _cl[0] == F.EXIT_REFUSED and "bad_args" in _cl[1]
+      and F.watch.server_authenticated(("x.onion", 50002, None))
+      and F.watch.server_authenticated(("electrum.example.com", 50002,
+                                        "ab" * 32))
+      and not F.watch.server_authenticated(("electrum.example.com", 50002,
+                                            None)))
 # THE CROSS-CHECK RESTS ON TLS OR ON AN ONION KEY (the review of stages
 # 2-6): a plaintext http:// THORNode was accepted, and then any Tor exit
 # could answer for it -- echo the aggregator's own address, mark BTC halted.
@@ -3230,10 +3253,13 @@ _cD, _oD, _pD, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
                            thornode=_dustN), "--thornode", "https://t")
 F.FEE_JITTER = lambda bound: 0
 check("a send of 11,260 sat that a draw of 200 took under a live dust "
-      "threshold of 11,200 is signed AT the threshold: the jitter gives "
-      "back the 140 it needs, never a refusal by chance",
-      _cD == 0 and _pD["send_sat"] == 11200
-      and _pD["fee_sat"] == _fee0J + 60)
+      "threshold of 11,200 is signed AT OR ABOVE the threshold: the jitter "
+      "gives back what it needs, never a refusal by chance -- and what it "
+      "has left over is drawn, so the send does not land exactly on "
+      "THORNode's published figure (pinned here to the top of that draw)",
+      _cD == 0 and 11200 <= _pD["send_sat"] <= 11260
+      and _pD["send_sat"] + _pD["fee_sat"] == 11260 + _fee0J
+      and _pD["fee_sat"] >= _fee0J and _pD["send_sat"] == 11260)
 _cD2, _oD2, _pD2, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
                                       "value": 11160 + _fee0J,
                                       "confirmations": 5}],
@@ -3266,6 +3292,31 @@ _cG, _oG, _pG, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
 check("...and the jitter never takes the fee past the fee fraction: at "
       "200,000 sat a huge draw stops at exactly 20%",
       _cG == 0 and _pG["fee_sat"] == 40000 and _pG["send_sat"] == 160000)
+# DRAWN OVER THE ROOM THERE IS (the review of stages 2-6): with less room
+# than a bound, a draw over the bound clamped to the room put most of its
+# weight ON the cap -- the fee exactly bound x rate plus the room, or the
+# send exactly the minimum. The jitter is asked for the room it has.
+_widths = []
+F.FEE_JITTER = lambda bound: (_widths.append(bound), bound - 1)[1]
+_cW, _oW, _pW, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                   "value": 20030 + _fee0,
+                                   "confirmations": 5}]),
+                       "--min-send-sat", "20000")
+check("with 30 sat of room under a bound of hundreds, the jitter is asked "
+      "for a width of 31 -- uniform over what is allowed -- not the bound "
+      "then clamped",
+      _cW == 0 and _widths and _widths[0] == 31
+      and _pW["fee_sat"] == _fee0 + 30 and _pW["send_sat"] == 20000)
+F.FEE_JITTER = F._fee_jitter
+_caps = 0
+for _ in range(40):
+    _cX, _oX, _pX, _ = run(Net(utxos=[{"tx_hash": _H1, "vout": 0,
+                                       "value": 20030 + _fee0,
+                                       "confirmations": 5}]),
+                           "--min-send-sat", "20000")
+    _caps += int(_cX == 0 and _pX["send_sat"] == 20000)
+check("...so with the real draw the send lands on the minimum about one "
+      "time in 31, not on most runs", _caps <= 8)
 F.FEE_JITTER = lambda bound: 0
 F.LIMIT_JITTER = lambda cap: 1
 _code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")

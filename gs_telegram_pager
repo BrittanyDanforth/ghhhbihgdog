@@ -1816,6 +1816,11 @@ class Pager:
         self.convos = {}
         self.clock = time.monotonic
         self.rng = random.SystemRandom()
+        #: Each address on its own drawn schedule (btc_tick): the real
+        #: watcher's way. A fixture-built Pager (no __init__) keeps the
+        #: class default -- every open address each tick -- so a check can
+        #: drive one transition per call.
+        self.btc_spread_looks = True
         #: (chat_id, message_id, wall_clock_sent) for every message this
         #: process has put in a chat -- ITS OWN REPLIES AND THE OPERATOR'S
         #: COMMANDS -- that it may still be able to delete.
@@ -5273,7 +5278,15 @@ class Pager:
         with lock:
             opened[h] = {"addr": str(addr), "chat": int(chat_id),
                          "state": "not_seen", "conf": 0, "unconf": 0,
-                         "said": set(), "since": time.time()}
+                         "said": set(), "since": time.time(),
+                         # ...and NOT looked at the moment it is issued:
+                         # the vault asked a server about this address
+                         # seconds ago (unused()), and a look straight
+                         # after it is the pair of the two.
+                         "next_look": time.time()
+                         + (getattr(self, "rng", None)
+                            or random.SystemRandom()).uniform(
+                                0, float(self.btc_poll_s))}
 
     def _btc_watched(self, h: str) -> bool:
         lock, opened = self._btc()
@@ -5638,6 +5651,9 @@ class Pager:
 
     #: Ticks in a row whose every look failed before the watcher says so.
     LOOK_FAIL_WARN_TICKS = 6
+    #: Every open address each tick (a fixture), or one due address on its
+    #: own schedule (the real watcher; __init__ turns it on).
+    btc_spread_looks = False
 
     #: How many times a fee retry's wait doubles before it stops growing:
     #: one, two, four, then eight times --btc-fee-retry (eight hours on the
@@ -5749,6 +5765,26 @@ class Pager:
                         or (e["state"] == "forwarded" and e.get("addr")
                             and _now - float(e.get("looked_at") or 0.0)
                             >= float(self.btc_recheck_s))]
+            # EACH ADDRESS ON ITS OWN SCHEDULE (the review of stages 2-6).
+            # Every open address was looked at back to back, in the same
+            # order, every --btc-poll: one server saw a fresh circuit per
+            # address arriving seconds apart on a fixed period, and could
+            # put every client's deposit in one watcher's set by timing
+            # alone -- which a circuit per address does nothing about. Now
+            # each address has its own next look, drawn from the CSPRNG
+            # (exponential, mean --btc-poll), and a tick looks at ONE that
+            # is due: never two in a burst, never on a shared clock.
+            if getattr(self, "btc_spread_looks", False) and snapshot:
+                _ready = [(float(opened[_h].get("next_look") or 0.0), _h, _e)
+                          for _h, _e in snapshot if _h in opened
+                          and float(opened[_h].get("next_look") or 0.0)
+                          <= _now]
+                snapshot = []
+                if _ready:
+                    _ready.sort(key=lambda x: x[0])
+                    _t, _h1, _e1 = _ready[0]
+                    snapshot = [(_h1, _e1)]
+                    opened[_h1]["next_look"] = _now + self._btc_look_draw()
             # ...ONCE PER --btc-recheck WINDOW for the forwarded ones: a
             # look is a fresh circuit announcing a spent address to a
             # server, and every ten minutes for two days was two hundred
@@ -6131,9 +6167,26 @@ class Pager:
                 # the next window tries again.
                 e["state"] = "forwarded" if _from_forwarded else "seen"
 
+    #: The watcher's wake, when each address keeps its own schedule: a
+    #: tick looks at one due address at most, so it wakes often and at
+    #: drawn intervals rather than once per --btc-poll on the dot.
+    LOOK_WAKE_S = (20, 60)
+
+    def _btc_look_draw(self) -> float:
+        """Seconds to an address's next look: exponential with mean
+        --btc-poll, from the CSPRNG, held between a quarter and three
+        times it -- a period nobody can lay a grid over, bounded both
+        ways."""
+        import math
+        _p = float(self.btc_poll_s)
+        _d = -math.log(1.0 - self.rng.random()) * _p
+        return min(max(_d, _p / 4.0), 3.0 * _p)
+
     def btc_watch_loop(self) -> None:
-        """The watcher thread: a tick, then a sleep of --btc-poll, until
-        shutdown. Sleeps in short steps so a stop is prompt."""
+        """The watcher thread: a tick, then a drawn sleep, until shutdown.
+        Sleeps in short steps so a stop is prompt. The sleep is --btc-poll
+        only for a Pager that looks at every address each tick; the real
+        one keeps a schedule per address and wakes at LOOK_WAKE_S."""
         while True:
             if shutdown_requested():
                 return
@@ -6141,7 +6194,10 @@ class Pager:
                 self.btc_tick()
             except BaseException as ex:                      # noqa: BLE001
                 print(f"  [!] watch tick failed: {_redact(ex)[:120]}")
-            for _ in range(max(1, int(self.btc_poll_s))):
+            _nap = (self.rng.randint(*self.LOOK_WAKE_S)
+                    if getattr(self, "btc_spread_looks", False)
+                    else int(self.btc_poll_s))
+            for _ in range(max(1, int(_nap))):
                 if shutdown_requested():
                     return
                 time.sleep(1)

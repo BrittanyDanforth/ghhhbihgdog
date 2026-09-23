@@ -691,7 +691,15 @@ argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
 `GS_EXPECT_TOTAL_XMR` (how much XMR this run is waiting for),
 `GS_USAGE_FEE_ADDRESS` and `GS_USAGE_FEE_PCT` (see below),
 `GS_SWAPKIT_API_KEY` (the quote aggregator's key, if your account needs one;
-it is sent only to that host and never appears on argv), and
+it is sent only to that host and never appears on argv — **and it is an
+account name on every quote**: each BTC forward's quote carries the exact
+amount that appears on-chain seconds later and the client's XMR
+destination, so under a key the aggregator, or whoever obtains its logs,
+holds every forward this host made, every deposit address and every
+destination as one list. A per-quote circuit hides the IP, not the key.
+Leave it unset if your aggregator allows; the quote itself still names
+amount and destination, and only quoting from your own THORNode would
+remove the aggregator from the path), and
 `GS_WALLET_PASSWORD` as before. (`GS_EXIT_AMOUNT` was listed here too and never
 was: `exit_strategy_simulator` reads it when you run that tool by hand, but the
 console has never set it. A list of protections is worth nothing if entries can
@@ -2508,6 +2516,15 @@ its own circuit. A third-party Electrum server can correlate the two; your
 own electrs over an onion cannot, which is one more reason the `--btc-electrum`
 list should be yours.
 
+**A pair that broadcasts listens only to servers that are who they say.**
+With `--allow-btc-broadcast`, every `--btc-electrum` must be a `.onion` or
+carry a certificate pin (`host:port,<sha256>`); the pairing refuses an
+unpinned clearnet one, and so does the forwarder when it sends. Such a
+server is reached with TLS unverified, as every Electrum client's is, so any
+Tor exit can answer for it: a fee estimate at the ceiling burns up to a
+fifth of a deposit to miners, and a forged history makes a broadcast look
+seen, so the signed bytes are dropped.
+
 **The xpub does not go on the Pi.** `BTC_INTAKE_DESIGN.md` first put it
 there; an xpub is the generator of every address the host has ever minted
 and ever will, so a seized card would yield the whole intake history, past
@@ -2531,7 +2548,9 @@ python3 gs_telegram_pager ... \
                            # vault finds early is tried again after twenty
                            # minutes, doubling -- not every tick)
     --btc-network main     # main, testnet, signet or regtest
-    --btc-poll 600         # seconds between looks; under 60 is refused
+    --btc-poll 600         # the MEAN seconds between looks at one address:
+                           # each address has its own schedule, drawn, and
+                           # never two looks in a burst; under 60 is refused
     --btc-fee-retry 3600   # how long after the vault would not pay today's
                            # fee for a forward this end tries again, by
                            # itself (floor 600)

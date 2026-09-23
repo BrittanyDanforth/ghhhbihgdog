@@ -701,9 +701,21 @@ def _validate_btc(args) -> None:
                  "exit could answer for THORNode.")
     for _s in (args.btc_electrum or []):
         try:
-            _w.parse_server(_s)
+            _srv = _w.parse_server(_s)
         except _w.BtcWatchError as e:
             sys.exit(f"[!] --btc-electrum: {e}")
+        # A PAIR THAT MOVES MONEY LOOKS ONLY AT SERVERS THAT ARE WHO THEY
+        # SAY (the review of stages 2-6): an unpinned clearnet server is
+        # whatever the Tor exit says it is, and the forward takes its fee
+        # estimate (up to the ceiling) and its word that a broadcast was
+        # seen (the signed bytes dropped).
+        if getattr(args, "allow_btc_broadcast", False) \
+                and not _w.server_authenticated(_srv):
+            sys.exit(f"[!] --btc-electrum {_s!r}: a pair that broadcasts "
+                     f"needs each server to be a .onion or pinned "
+                     f"(host:port,<sha256 of its certificate>) -- over an "
+                     f"unpinned clearnet server any Tor exit can forge the "
+                     f"fee estimate or the history.")
     if args.btc_xpub:
         try:
             _w.derive_receive_address(args.btc_xpub, 0, args.btc_network)

@@ -5358,6 +5358,46 @@ check("after the forward reported SENT, /check on that deposit asks the XMR "
       "is kept as sent", _sj3 == [(111, "swap_status", {"handle": "B4A1"})]
       and (_sp3.btc_open.get("B4A1") or {}).get("state") == "sent")
 
+print("\n-- each address on its own schedule (the review of stages 2-6) --")
+# Every open address was looked at back to back, in one order, every
+# --btc-poll: a server saw one fresh circuit per client's address arriving
+# seconds apart on a fixed period, and could link them by timing alone.
+_sl, _sls, _slj = _watch_pager(h="C001")
+_sl.btc_servers = [("s.onion", 50002, None)]
+_sl.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_sl.btc_spread_looks = True
+for _hh in ("C002", "C003", "C004"):
+    _sl._btc_register(_hh, _BTC_ADDR, 111)
+_slc = []
+for _k in range(4):
+    _sl.btc_tick(look=_look_returning("not_seen", calls=_slc))
+check("a newly issued address is NOT looked at straight away (the vault "
+      "asked a server about it seconds ago): its first look is drawn",
+      _slc == []
+      and all(0 < _sl.btc_open[_hh]["next_look"] - time.time()
+              <= _sl.btc_poll_s + 5
+              for _hh in ("C001", "C002", "C003", "C004")))
+for _hh in ("C001", "C002", "C003", "C004"):
+    _sl.btc_open[_hh]["next_look"] = time.time() - 1
+_slc2 = []
+_sl.btc_tick(look=_look_returning("not_seen", calls=_slc2))
+check("with four addresses due, a tick looks at ONE -- never a burst of a "
+      "circuit per address seconds apart",
+      len(_slc2) == 1)
+_nexts = [_sl.btc_open[_hh]["next_look"] - time.time()
+          for _hh in ("C001", "C002", "C003", "C004")]
+check("...and the one looked at gets its OWN next look, drawn: the others "
+      "stay due for the ticks after it",
+      sum(1 for _n in _nexts if _n > 0) == 1)
+_draws = [pg.Pager._btc_look_draw(_sl) for _ in range(400)]
+check("the per-address interval is drawn from the CSPRNG around --btc-poll "
+      "and bounded both ways, not the fixed period a server could lay a "
+      "grid over",
+      min(_draws) >= _sl.btc_poll_s / 4 and max(_draws) <= 3 * _sl.btc_poll_s
+      and len({round(_d) for _d in _draws}) > 200
+      and 0.6 * _sl.btc_poll_s < sum(_draws) / len(_draws)
+      < 1.2 * _sl.btc_poll_s)
+
 print("\n-- a stranger's dust on an open deposit (the review of stages 2-6) --")
 # Anyone who knows an open deposit's address -- the server the vault asked
 # before issuing it, the servers this end polls, a reader of the chat --
@@ -6092,8 +6132,8 @@ _q9_n = len(_qj9)
 _q9.btc_tick(look=_look_returning("not_seen"))
 check("(setup) an unsure forward learned after a restart is rechecked on the "
       "tick, for its own chat",
-      _qj9[-1] == (111, "forward_to_swap", {"handle": "B4A1"})
-      and len(_qj9) == _q9_n + 1)
+      len(_qj9) == _q9_n + 1
+      and _qj9[-1] == (111, "forward_to_swap", {"handle": "B4A1"}))
 _q9b, _qs9b, _qt9b, _qj9b = _tapper()
 _q9b._btc_forward_result("B4A1", "done", "unsure", 111)
 _q9b._btc_register("B4A2", _BTC_ADDR, 111)

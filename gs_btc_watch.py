@@ -39,7 +39,11 @@ source"):
     hold" -- is the fingerprint, not the source IP; Tor hides who, not what.
     Each address is looked at on its own Tor circuit, keyed by the address
     through gs_common.isolated_proxy (IsolateSOCKSAuth), so a server logging
-    its queries cannot cluster this operator's addresses by circuit. A retry
+    its queries cannot cluster this operator's addresses by circuit -- BY
+    CIRCUIT. It still can by TIME: the Pi looked at every open address
+    back to back on a fixed period, and a circuit apiece did nothing about
+    a burst of them seconds apart every ten minutes. So the caller keeps a
+    schedule per address, drawn (gs_telegram_pager btc_tick). A retry
     of one address reuses that address's circuit -- a retry is not a new fact
     to leak. A proxy URL that already carries a credential is REFUSED rather
     than used as-is: it would put every address on one circuit, silently.
@@ -377,6 +381,17 @@ def _check_pin(pin):
         raise BtcWatchError("a certificate pin must be 64 hex characters "
                             "(the SHA-256 of the server's certificate)")
     return p
+
+
+def server_authenticated(server) -> bool:
+    """Whether a parsed (host, port, pin) server is one whose answers rest
+    on a key rather than on the Tor exit that carries them: a .onion (the
+    address names the service's key) or a pinned certificate. An unpinned
+    clearnet server is reached with TLS unverified -- as every Electrum
+    client's is -- so any exit can answer for it: forge the fee estimate
+    up to the ceiling, or a history that makes a broadcast look seen."""
+    host, _port, pin = server
+    return str(host).lower().endswith(".onion") or bool(pin)
 
 
 def thornode_url_ok(url) -> bool:

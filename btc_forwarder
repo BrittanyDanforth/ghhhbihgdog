@@ -1166,9 +1166,17 @@ def bump_due(plan, fee_sat_vb, bump_after_s, now=None):
     """Is a forward LISTED IN THE MEMPOOL worth replacing at today's rate
     (stage 6, STAGE6_PLAN.md 3.1)? Yes when it has sat there at least
     `bump_after_s` seconds (from the plan's own send stamp) AND the
-    estimate is above the rate it pays. A plan that does not know its rate
-    (one reconstructed from the chain) is never bumped: nothing here would
+    estimate is above the rate it pays. A plan that knows neither the rate
+    it pays nor the rate it aimed at is never bumped: nothing here would
     know what to pay more than. Pure; the clock may be injected.
+
+    A PLAN RECONSTRUCTED FROM THE CHAIN KNOWS ITS RATE (the review of
+    stages 2-6): it records the fee and the vsize off the transaction
+    itself, and has no target only because no run aimed it. It was never
+    bumped for want of the target -- a first forward the sending run did
+    not live to record then sat at its rate however far fees rose. Its
+    stamp is the reconstruction's, later than the send, so the wait is
+    only ever longer than asked.
 
     "THE RATE IT PAYS" IS fee_sat / vsize, when the plan records both, and
     not the rate it was aimed at. The target sits below the real rate every
@@ -1182,7 +1190,12 @@ def bump_due(plan, fee_sat_vb, bump_after_s, now=None):
     plan from before the real rate was recorded."""
     paid = plan.get("feerate_target_sat_vb")
     ts = plan.get("ts")
-    if isinstance(paid, bool) or not isinstance(paid, int) or paid < 1:
+    fee, vs = plan.get("fee_sat"), plan.get("vsize")
+    _real = all(isinstance(x, int) and not isinstance(x, bool) and x >= 1
+                for x in (fee, vs))
+    _aimed = isinstance(paid, int) and not isinstance(paid, bool) \
+        and paid >= 1
+    if not (_real or _aimed):
         return False
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return False
@@ -1197,12 +1210,7 @@ def bump_due(plan, fee_sat_vb, bump_after_s, now=None):
     age = (now if now is not None else time.time()) - float(ts)
     if float(bump_after_s) > 0:
         age -= STAMP_BUCKET_S - 1
-    fee, vs = plan.get("fee_sat"), plan.get("vsize")
-    if all(isinstance(x, int) and not isinstance(x, bool) and x >= 1
-           for x in (fee, vs)):
-        above = fee_sat_vb * vs > fee
-    else:
-        above = fee_sat_vb > paid
+    above = (fee_sat_vb * vs > fee) if _real else (fee_sat_vb > paid)
     return age >= float(bump_after_s) and above
 
 
@@ -2202,6 +2210,19 @@ def main(argv=None):
         address = derive_receive_address(xpub, index, args.network)
     except watch.BtcWatchError as e:
         raise Refused("bad_args", str(e))
+    # MONEY MOVES ONLY ON A SERVER THAT IS WHO IT SAYS (the review of
+    # stages 2-6): a .onion or a pinned certificate. Over an unpinned
+    # clearnet server any Tor exit can answer the fee estimate (up to the
+    # ceiling, burned to miners) or forge the history that proves a
+    # broadcast seen. A rehearsal may still look where it likes.
+    if (args.broadcast or args.reconcile) and not all(
+            watch.server_authenticated(s) for s in servers):
+        raise Refused("bad_args", "a forward that sends needs every "
+                      "--electrum server to be a .onion or pinned "
+                      "(host:port,<sha256 of its certificate>): over an "
+                      "unpinned clearnet server any Tor exit can forge the "
+                      "fee estimate or the history. Re-pair (gs_wake_keys "
+                      "--btc-electrum) with an onion or a pin.")
     try:
         dest_xmr = load_receive_bundle(args.dest_from_receive_wallet)["address"]
     except (ValueError, OSError) as e:
@@ -2353,7 +2374,15 @@ def main(argv=None):
         # than a refusal the floor said could not happen.
         _room = min(settled_sat - fee_sat - int(args.min_send_sat),
                     int(settled_sat * MAX_FEE_FRACTION) - fee_sat)
-        _jit = max(0, min(int(FEE_JITTER(vsize_bound)), _room))
+        # DRAWN OVER THE ROOM THERE IS, not drawn over the bound and then
+        # clamped (the review of stages 2-6): with less room than a bound,
+        # every draw past it landed ON the cap -- the fee exactly
+        # bound x rate, or exactly a fifth of the inputs, or the send
+        # exactly the minimum, on most runs near the floor. Uniform over
+        # what is allowed, the cap is one value among the rest. The clamp
+        # stays for a jitter that ignores its argument.
+        _w = max(1, min(int(vsize_bound), int(_room) + 1))
+        _jit = max(0, min(int(FEE_JITTER(_w)), _room))
         fee_sat += _jit
         send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
     except Refused as e:
@@ -2401,8 +2430,15 @@ def main(argv=None):
                 # on some draws and refused on others. Deterministic now:
                 # the jitter gives back what the threshold needs. The
                 # quote stands (it was for a little less; more arrives).
-                fee_sat -= dust - send_sat
-                send_sat = dust
+                # ...AND NOT EXACTLY ON THE THRESHOLD: a send equal to
+                # THORNode's published dust figure is a value anyone can
+                # test for. What the jitter has left over it is drawn.
+                _give = dust - send_sat
+                _spare = _jit - _give
+                _more = (max(0, min(int(FEE_JITTER(_spare + 1)), _spare))
+                         if _spare > 0 else 0)
+                fee_sat -= _give + _more
+                send_sat += _give + _more
             else:
                 raise Refused("below_thor_dust",
                               "ThorChain's live dust threshold is above what "

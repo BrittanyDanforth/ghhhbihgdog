@@ -411,6 +411,16 @@ already forgets after two days.
   the same deposit over other outpoints waits for the next recheck.
 - THORChain's acceptance of the memo, and its treatment of a payment
   that confirms after its vault churned, are proven only on mainnet.
+- A REPLACEMENT WHOSE RUN DIED BEFORE ITS PLAN WAS WRITTEN (killed in the
+  seen wait, a power cut) is found by its memo and adopted as ours, and
+  the plan it replaced is marked superseded by it -- but it has no plan
+  of its own, so it is never a bump candidate: it sits at its rate until
+  it mines, or the mempool drops it and the reconciliation re-signs the
+  same money (the evicted branch). A first forward in the same position
+  IS reconstructed as a plan, and since the review of stages 2-6 is
+  bumped by the rate it really pays (bump_due). Writing an intent record
+  before the submit would close the rest; not done, because it changes
+  what "the current plan" means on every path of a money-moving tool.
 
 ---
 

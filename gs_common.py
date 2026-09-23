@@ -169,10 +169,18 @@ CHECK_TOR_URL = "https://check.torproject.org/api/ip"
 #: on this box, sent to Telegram, the quote host, the oracle and the Tor
 #: check alike -- so one third party could file all of this host's traffic
 #: under one client, and a reader of the public tree knew which string to
-#: match. The bare "Mozilla/5.0" is the most common thing a script sends
-#: and says nothing about the box. Never a real browser's full string: a
-#: fake browser on a JSON endpoint is its own tell, and one that would
-#: have to be kept current.
+#: match. The bare "Mozilla/5.0" is a common thing for a script to send.
+#: Never a real browser's full string: a fake browser on a JSON endpoint is
+#: its own tell, and one that would have to be kept current.
+#:
+#: WHAT IT DOES NOT DO (the review of stages 2-6), said plainly because
+#: this file is public: ANY fixed string, beside requests' Accept "*/*" and
+#: urllib3's TLS handshake, is a badge of this toolchain to someone who has
+#: read it -- this one only joins a larger crowd of scripts than the
+#: library default did. Nor is it on every request: a Monero wallet-rpc or
+#: daemon reached through monero-python, and the daemon checks here that
+#: call requests directly, still send the library default. The choice is
+#: which crowd, not whether there is one.
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 INTEGRITY_LOG = Path("integrity_chain.log")
 #: Chain entries a signal handler wanted to write. See _shutdown_handler for
@@ -248,6 +256,28 @@ def isolated_proxy(proxy_url: str, tag: str) -> Dict[str, str]:
     scheme, _, rest = proxy_url.partition("://")
     built = f"{scheme}://{user}:x@{rest}"
     return {"http": built, "https": built}
+def _own_stream(proxy, tag: str):
+    """`proxy` on a stream of its own, keyed by `tag` -- the isolation a
+    caller handing over the BARE proxy dict did not ask for.
+
+    THE TOR CHECK AND THE PRICE ORACLE SHARED THE DEFAULT CIRCUIT with
+    whatever else the bare proxy carried (the review of stages 2-6): the
+    vault's own agent and forwarder isolate theirs, and the children they
+    start -- thor_swap_preparer, create_receive_wallet, receive_watch,
+    GhostSpiral, the signers -- passed the bare dict, so check.torproject.org
+    and CoinGecko saw one exit seconds apart on every quote. Decided here,
+    once, so no caller can forget it. A proxy that already carries a
+    credential is the caller's own isolation, or the operator's, and is
+    left exactly as it is; an empty one stays empty, so every `not proxy`
+    guard below still fails closed."""
+    if not isinstance(proxy, dict) or not proxy:
+        return proxy
+    url = proxy.get("https") or proxy.get("http") or ""
+    if not url or "@" in url:
+        return proxy
+    return isolated_proxy(url, tag)
+
+
 # CRITICAL: only socks5h:// is accepted. Plain socks5:// leaks DNS locally
 # because the requests library resolves hostnames BEFORE sending through
 # the SOCKS proxy. With socks5h://, DNS resolution happens at the proxy.
@@ -2105,7 +2135,7 @@ def verify_tor(proxy: Dict[str, str]) -> None:
     gets the same clear abort message as every other Tor-failure path.
     """
     try:
-        data = _verify_tor_once(proxy)
+        data = _verify_tor_once(_own_stream(proxy, "tor:check"))
     except requests.exceptions.InvalidSchema as e:
         # Not a network problem: requests cannot speak SOCKS without PySocks,
         # so EVERY socks5h:// request dies here. Reporting that as a "network
@@ -2138,6 +2168,7 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
     if not proxy:
         sys.exit("[!] Tor recheck called without proxies — that request would go "
                  "clearnet. Aborting.")
+    proxy = _own_stream(proxy, "tor:check")
     try:
         r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy,
                          allow_redirects=False, headers=HTTP_HEADERS)
@@ -3512,7 +3543,7 @@ def btc_per_xmr_oracle(proxies: Optional[Dict[str, str]] = None, getter=None):
     """
     fetch = getter or safe_get
     try:
-        p = fetch(CG_PRICE_URL, proxies)
+        p = fetch(CG_PRICE_URL, _own_stream(proxies, "oracle"))
         # finite_decimal: a NaN rate made `rate <= 0` RAISE (caught below, so
         # it degraded to None by accident rather than by design), and an
         # Infinity rate sailed past `<= 0` and was RETURNED as a usable price.

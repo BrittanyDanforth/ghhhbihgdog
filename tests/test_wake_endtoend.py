@@ -834,7 +834,15 @@ try:
             # any Tor exit could answer for THORNode.
             (("--thornode", "http://thornode.example"),
              "a plaintext http:// THORNode that is not an onion",
-             "https://")):
+             "https://"),
+            # ...AND THE ELECTRUM SERVERS A BROADCASTING PAIR LISTENS TO: an
+            # unpinned clearnet one is whatever the Tor exit says it is.
+            (("--allow-btc-forward", "--allow-btc-broadcast", "--thornode",
+              "https://t.example", "--btc-xpub", "zpubFAKE",
+              "--deposit-in-chat", "--op-return-max-bytes", "140",
+              "--btc-electrum", "electrum.example.com:50002"),
+             "an unpinned clearnet Electrum server on a pair that broadcasts",
+             "a .onion or pinned")):
         _r = _keys_cli(*_extra)
         check(f"refuses {_why}",
               _r.returncode != 0 and _needle in (_r.stdout + _r.stderr))

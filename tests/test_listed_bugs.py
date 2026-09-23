@@ -2488,6 +2488,61 @@ check("chain/count: memo_dest_mismatch is logged before the abort check, "
       in Path(os.path.join(REPO, "thor_swap_preparer")).read_text())
 
 
+# ===========================================================================
+print("\n-- the Tor check and the price oracle on streams of their own --")
+# The vault's agent and forwarder isolated theirs; the children they start
+# passed the BARE proxy dict, so check.torproject.org and CoinGecko saw one
+# exit seconds apart on every quote (the review of stages 2-6). Decided in
+# gs_common now, so no caller can leave it out.
+_bare = GSC.validate_proxy("socks5h://127.0.0.1:9050")
+_seen_px = []
+
+
+class _TorResp:
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"IsTor": True}
+
+
+_o_get = GSC.requests.get
+GSC.requests.get = lambda url, **kw: (_seen_px.append(dict(kw.get("proxies")
+                                                           or {})),
+                                      _TorResp())[1]
+_o_il1 = GSC.integrity_log_once
+GSC.integrity_log_once = lambda *a, **k: ""
+try:
+    GSC.verify_tor(_bare)
+    GSC.tor_recheck(_bare, "t")
+    _cred = GSC.isolated_proxy("socks5h://127.0.0.1:9050", "caller-own")
+    GSC.verify_tor(_cred)
+finally:
+    GSC.requests.get = _o_get
+    GSC.integrity_log_once = _o_il1
+check("verify_tor and tor_recheck handed the BARE proxy go out on a stream "
+      "of their own (a SOCKS credential), not the default circuit",
+      len(_seen_px) == 3
+      and all("@" in _p.get("https", "") for _p in _seen_px[:2])
+      and _seen_px[0] == _seen_px[1])
+check("...while a proxy that already carries the caller's own isolation is "
+      "used exactly as given", _seen_px[2] == _cred)
+_orc_px = []
+GSC.btc_per_xmr_oracle(_bare, getter=lambda url, px: (
+    _orc_px.append(dict(px or {})), {"monero": {"btc": "0.003"}})[1])
+check("the price oracle handed the bare proxy asks on ANOTHER stream than "
+      "the Tor check -- the two no longer share an exit",
+      len(_orc_px) == 1 and "@" in _orc_px[0].get("https", "")
+      and _orc_px[0] != _seen_px[0])
+_gone = None
+try:
+    GSC.verify_tor({})
+except SystemExit as e:
+    _gone = str(e)
+check("...and an EMPTY proxy still fails closed before anything is sent",
+      _gone and "clearnet" in _gone)
+
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
