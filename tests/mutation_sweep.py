@@ -4962,7 +4962,7 @@ MUTATIONS = [
   ['test_telegram_pager']),
  ('dust on a forwarded address starts a forward (a wake for a stranger\'s sat)',
   'gs_telegram_pager',
-  '                        or conf < int(self.deposit_min_sat or 0)):',
+  '                        or settled < int(self.deposit_min_sat or 0)):',
   '                        or False):',
   ['test_telegram_pager']),
  ('money back on a forwarded address is a foreground start (the reserve ignored)',
@@ -7494,7 +7494,7 @@ MUTATIONS = [
   '        return float(_b)',
   ['test_telegram_pager']),
  ('settled dust under the floor starts a first forward', 'gs_telegram_pager',
-  '                if state == "confirmed" and conf < _fl:\n',
+  '                if state == "confirmed" and settled < _fl:\n',
   '                if False:\n',
   ['test_telegram_pager']),
  ("dust in the mempool under the floor is 'received' and ends the pay message's hold", 'gs_telegram_pager',
@@ -8689,6 +8689,75 @@ MUTATIONS = [
   '                    except KeyError:\n'
   '                        integrity_log("forward", "leftover_unrecorded")\n',
   ['test_btc_forwarder']),
+
+ # ---- the stage 4 read: ghost records, the chain id, the Pi's intake ----
+ ("a deposit whose slip was never written holds a place", 'gs_wake_agent',
+  '        if not Path(str(rec["slip"])).is_file():\n'
+  '            return False\n',
+  '        if False:\n'
+  '            return False\n',
+  ['test_wake_agent', 'test_multi_client']),
+ ("a slip that cannot be asked about gives its place up", 'gs_wake_agent',
+  '        # Could not tell: the place is kept, as for a wallet that cannot\n'
+  '        # be asked.\n'
+  '        return True\n',
+  '        return False\n',
+  ['test_multi_client']),
+ ("a paid intake deposit whose forward ran is read as a ghost", 'gs_wake_agent',
+  '    if rec.get("btc_index") is not None and (rec.get("forward_sent")\n'
+  '                                             or rec.get("forwarded")):\n'
+  '        return True\n',
+  '',
+  ['test_multi_client']),
+ ("every intake record is this chain's, whatever it says", 'gs_wake_agent',
+  '    return _c is None or _c == _xpub_id(key)\n',
+  '    return True\n',
+  ['test_wake_agent']),
+ ("a record from before the chain id is another chain's", 'gs_wake_agent',
+  '    return _c is None or _c == _xpub_id(key)\n',
+  '    return _c == _xpub_id(key)\n',
+  ['test_wake_agent']),
+ ("the allocator counts another account's indices", 'gs_wake_agent',
+  '            and not isinstance(r.get("btc_index"), bool)\n'
+  '            and _on_this_chain(r, key)]\n',
+  '            and not isinstance(r.get("btc_index"), bool)]\n',
+  ['test_wake_agent']),
+ ("an intake record does not say which chain issued it", 'gs_wake_agent',
+  '                    handles[handle]["btc_chain"] = _xpub_id(key)\n',
+  '                    pass\n',
+  ['test_wake_agent']),
+ ("a reused record hands its index to another chain", 'gs_wake_agent',
+  '                        or not _on_this_chain(_old_rec, key):\n',
+  '                        or False:\n',
+  ['test_wake_agent']),
+ ("a forward runs on another chain's record", 'gs_wake_agent',
+  '        if not _on_this_chain(rec, key):\n'
+  '            integrity_log("wake", "btc_chain_changed")\n',
+  '        if False:\n'
+  '            integrity_log("wake", "btc_chain_changed")\n',
+  ['test_wake_agent']),
+ ("the Pi weighs the floor against one-block money (a first payment)", 'gs_telegram_pager',
+  '                if state == "confirmed" and settled < _fl:\n',
+  '                if state == "confirmed" and conf < _fl:\n',
+  ['test_telegram_pager']),
+ ("the Pi weighs the floor against one-block money (money back)", 'gs_telegram_pager',
+  '                        or settled < int(self.deposit_min_sat or 0)):\n',
+  '                        or conf < int(self.deposit_min_sat or 0)):\n',
+  ['test_telegram_pager']),
+ ("the Pi looks through an unpinned clearnet server", 'gs_telegram_pager',
+  '        if not all(_w.server_authenticated(s) for s in args.btc_servers):\n',
+  '        if False:\n',
+  ['test_telegram_pager']),
+ ("an intake card starts a pager that cannot watch", 'gs_telegram_pager',
+  '    if isinstance(key, dict) and key.get("deposit_min_sat") is not None \\\n',
+  '    if False and key.get("deposit_min_sat") is not None \\\n',
+  ['test_telegram_pager']),
+ ("an intake deposit is shown by an end that cannot watch it", 'gs_telegram_pager',
+  '                if not self.btc_servers:\n'
+  '                    print("  [!] the vault issued a BTC deposit address of its "\n',
+  '                if False:\n'
+  '                    print("  [!] the vault issued a BTC deposit address of its "\n',
+  ['test_telegram_pager']),
 
 ]
 

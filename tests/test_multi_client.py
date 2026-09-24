@@ -527,6 +527,25 @@ check("paid out, or never quoted, was never pending",
       A._deposit_pending({**_ghost, "spent": True}, {}, _now, ask=_some) is False
       and A._deposit_pending({**_ghost, "slip": ""}, {}, _now, ask=_some)
       is False)
+# A PAID INTAKE DEPOSIT IS NOT A GHOST (the stage 4 read): its client paid
+# the host's BTC address, and the XMR subaddress this asks about stays
+# empty until the forward's swap lands. Past the TTL it gave its place away
+# while its mix was still to come.
+check("an INTAKE deposit whose forward ran keeps its place past the TTL, "
+      "its XMR address still empty (the swap has not landed)",
+      A._deposit_pending({**_ghost, "btc_index": 3, "forward_sent": True},
+                         {}, _now, ask=_zero) is True
+      and A._deposit_pending({**_ghost, "btc_index": 3,
+                              "forwarded": 1700000000},
+                             {}, _now, ask=_zero) is True)
+check("NON-VACUITY: an intake deposit whose forward never ran is asked "
+      "about as before -- nothing on it, past the TTL: no place",
+      A._deposit_pending({**_ghost, "btc_index": 3}, {}, _now, ask=_zero)
+      is False)
+check("...and a slip whose existence cannot be asked (a path the system "
+      "refuses to look up) keeps its place: could not tell is not absent",
+      A._deposit_pending({**_ghost, "slip": "/" + "a" * 5000}, {}, _now,
+                         ask=_zero) is True)
 _bad = dict(_ghost, bundle=str(_d1 / "no_such_bundle.json"))
 _bad.pop("pair", None)
 check("...and one whose pair cannot be named keeps its place",
@@ -547,6 +566,29 @@ check("...and that refusal is the one that carries a word: 'full', so the "
       "phone hears the same sentence the Pi says from memory",
       _b6.result is not None and _b6.result.get("status") == "refused"
       and _b6.result.get("phase") == "full")
+# A DEPOSIT WHOSE QUOTE NEVER WROTE ITS SLIP HOLDS NO PLACE (the stage 4
+# read): the intake saves the record naming its slip's path before the
+# quote runs, and a machine killed while it ran left that record on the
+# disk. It held a whole reserve for two days about an address nobody was
+# shown. Young, and with the wallet saying its address holds something,
+# so neither the age nor the balance is what lets it go.
+_d8, _kf8, _b8 = _env(45, 1)
+_l8 = A._load_ledger(_d8)
+_l8["handles"]["E000"]["admitted"] = int(time.time()) // 600 * 600
+A._save_handles(_d8, _l8["handles"], _l8["owners"])
+Path(_l8["handles"]["E000"]["slip"]).unlink()
+_o8, _e8 = _run(_kf8, _b8, _d8, 4, subaddress_total=_some)
+check("a record whose slip was never written (a quote killed mid-run) "
+      "holds no place: the next deposit is admitted",
+      _o8 is not None and _o8[1] == "done")
+_d9, _kf9, _b9 = _env(45, 1)
+_l9 = A._load_ledger(_d9)
+_l9["handles"]["E000"]["admitted"] = int(time.time()) // 600 * 600
+A._save_handles(_d9, _l9["handles"], _l9["owners"])
+_o9, _e9 = _run(_kf9, _b9, _d9, 4, subaddress_total=_some)
+check("NON-VACUITY: the same young record WITH its slip still refuses the "
+      "next deposit at_capacity",
+      _o9 is None and _e9 is not None and _e9.code == "at_capacity")
 _d7, _kf7, _b7 = _env(45, 0)
 _o7, _e7 = _run(_kf7, _b7, _d7, None)
 check("...a refusal for any other reason carries none",

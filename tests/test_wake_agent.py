@@ -6279,6 +6279,19 @@ _o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
 check("a handle naming no single bundle has no destination: "
       "handle_not_forwardable", _o is None
       and getattr(_e, "code", None) == "handle_not_forwardable")
+# A DEPOSIT ISSUED ON ANOTHER ACCOUNT OF THE SEED (the stage 4 read): after
+# a re-pair to another --btc-account this pair derives a different address
+# for the record's index, and the forward looked there -- "not yet" for
+# ever while the client's money sat where they paid it.
+_o, _e, _ran = _fwd_run({**_FWD_REC, "btc_chain": "0f" * 8}, _FWD_KEY)
+check("a record issued on another account's chain is refused "
+      "btc_chain_changed, before any child runs",
+      _o is None and getattr(_e, "code", None) == "btc_chain_changed"
+      and _ran == [])
+_o, _e, _ran = _fwd_run({**_FWD_REC, "btc_chain": A._xpub_id(_FWD_KEY)},
+                        _FWD_KEY)
+check("NON-VACUITY: a record issued on THIS pair's chain runs its forward",
+      _e is None and _o is not None and len(_ran) == 1)
 _o, _e, _ran = _fwd_run(None, _FWD_KEY, ledger=False)
 check("an unknown handle is refused unknown_handle",
       _o is None and getattr(_e, "code", None) == "unknown_handle" and _ran == [])
@@ -7005,6 +7018,96 @@ check("a ledger that knows index 0, with index 1 USED on the network (a "
       "asked about 1 and 2 in order", _c is None
       and _rec4(_d5b, "B5B1")["btc_index"] == 2
       and _asked == [_ADDR[1], _ADDR[2]])
+check("...and the new record says which account's index it is: the chain "
+      "id of the pair that issued it",
+      _rec4(_d5b, "B5B1").get("btc_chain") == A._xpub_id(_BK)
+      and _rec4(_d5b, "B5B1")["btc_chain"] != A._xpub_id(
+          {**_BK, "btc_account_xpub": _zpub1}))
+# ANOTHER ACCOUNT'S INDICES ARE NOT THIS ONE'S (the stage 4 read). A
+# re-pair to --btc-account one higher -- the way out of ledger_wiped --
+# left the old account's records in the ledger, and the next deposit on
+# the new chain was numbered one past the OLD chain's highest: index 8 of
+# a chain whose 0..7 nobody was ever handed, a hole toward the recovery gap.
+_d5c, _runs5c, _run5c = _btc_env("btc5c_", handles={
+    "A0A0": {"bundle": "/x/w.json", "minted": 1, "btc_index": 7,
+             "btc_chain": "0f" * 8, "slip": "/x/thor_pairs_A0A0.json"}})
+_o, _c, _asked, _ = _btc_dispatch(_d5c, _run5c, "B5C1", True)
+check("a ledger holding only ANOTHER account's index 7: this chain's first "
+      "deposit is index 0, not 8",
+      _c is None and _rec4(_d5c, "B5C1").get("btc_index") == 0
+      and _asked == [_ADDR[0]])
+# ...AND A FAILED DEPOSIT'S INDEX IS HANDED BACK ONLY TO ITS OWN CHAIN: a
+# record minted on the old account, never quoted, reused after the re-pair
+# carried its index 5 into the new chain -- issued there as the first
+# address, five past a fresh chain's start.
+_d5e = Path(tempfile.mkdtemp(prefix="btc5e_"))
+_b5e = _d5e / "wallet_old.json"
+_b5e.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
+                            "address": _XMR_SAMPLE, "account_index": 8,
+                            "subaddress_index": 1,
+                            "rpc_endpoint": "http://127.0.0.1:18083"}))
+_, _runs5e, _run5e = _btc_env("btc5e_unused_")
+(_d5e / A.HANDLES_FILE).write_text(json.dumps({"handles": {
+    "A0A0": {"bundle": str(_b5e), "minted": 1, "btc_index": 5,
+             "btc_chain": "0f" * 8, "slip": None, "owner": OWNER}},
+    "owners": {}}))
+_o, _c, _asked, _ = _btc_dispatch(_d5e, _run5e, "B5E1", True, reuse=0)
+check("a never-quoted record of ANOTHER account, reused after a re-pair: "
+      "its bundle is taken, its index is not -- this chain's first is 0",
+      _c is None and _rec4(_d5e, "B5E1").get("btc_index") == 0
+      and _rec4(_d5e, "B5E1").get("bundle") == str(_b5e))
+_d5d, _runs5d, _run5d = _btc_env("btc5d_", handles={
+    "A0A0": {"bundle": "/x/w.json", "minted": 1, "btc_index": 7,
+             "slip": "/x/thor_pairs_A0A0.json"}})
+_o, _c, _asked, _ = _btc_dispatch(_d5d, _run5d, "B5D1", True)
+check("NON-VACUITY: a record from before the field is taken to be this "
+      "chain's, as it always was -- index 8",
+      _c is None and _rec4(_d5d, "B5D1").get("btc_index") == 8)
+# ...AND A MACHINE KILLED WHILE THE QUOTE RUNS (the stage 4 read): the
+# intake saves the record, naming its slip's path, before the quote child
+# starts, and state_open keeps what a dead run left on the disk. The record
+# named a slip that was never written, and _deposit_pending read the field:
+# a whole account reserve held for two days, and the intake closed to the
+# next client, about an address nobody was ever shown.
+class _KilledMidQuote(BaseException):
+    pass
+
+
+_dK, _runsK, _runK = _btc_env("btckill_")
+
+
+def _runK_dies(argv, env_extra, budget_s):
+    if "thor_swap_preparer" in " ".join(argv):
+        raise _KilledMidQuote()
+    return _runK(argv, env_extra, budget_s)
+
+
+try:
+    _btc_dispatch(_dK, _runK_dies, "BK11", True)
+    _kK = "no kill"
+except _KilledMidQuote:
+    _kK = "killed"
+finally:
+    A.integrity_log = _saved_il_ld
+_recK = _rec4(_dK, "BK11")
+check("(setup) killed while the quote ran: the record on the disk names a "
+      "slip that was never written",
+      _kK == "killed" and _recK.get("slip")
+      and not Path(str(_recK["slip"])).exists())
+check("...and it holds NO place in the account reserve -- young, and "
+      "whatever the wallet would say of its address",
+      A._deposit_pending(_recK, _BK, int(time.time()),
+                         ask=lambda k, a, s: 5) is False)
+check("...and its bundle is the next deposit's, as a refused quote's is",
+      A._reusable_receive(_BK, json.loads(
+          (_dK / A.HANDLES_FILE).read_text())["handles"],
+          balance=lambda k, a, s: 0, owner=OWNER) is not None)
+_sK = Path(str(_recK.get("slip") or (_dK / "thor_pairs_BK11.json")))
+_sK.write_text("{}")
+check("NON-VACUITY: the same record once its slip exists holds its place",
+      A._deposit_pending(_recK, _BK, int(time.time()),
+                         ask=lambda k, a, s: 5) is True)
+_sK.unlink(missing_ok=True)
 _d6, _runs6, _run6 = _btc_env("btc6_")
 _o, _c, _asked, _kinds = _btc_dispatch(
     _d6, _run6, "B6A1", W_ERR := __import__("gs_btc_watch").BtcWatchError("x"))

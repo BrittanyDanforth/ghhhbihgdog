@@ -2593,6 +2593,24 @@ def _legacy_xpub_id(key: dict) -> str:
         return hashlib.sha256(("xpub:" + xpub).encode()).hexdigest()[:16]
 
 
+def _on_this_chain(rec: dict, key: dict) -> bool:
+    """Whether an intake record's btc_index is an index of THIS pair's
+    account chain. The record says which chain it was issued on
+    (`btc_chain`, _xpub_id at the allocation); one from before the field
+    is taken to be this chain's, which is all an older build knew.
+
+    BOOKKEEPING, NOT A DEFENCE: the id tells two accounts of one seed
+    apart for the operator's own ledger, and rests on nothing secret. A
+    re-pair to another account (--btc-account one higher: the way out of
+    ledger_wiped) made every record from the old account name an index of
+    the NEW one. Its forward looked at an address nobody paid and said
+    "not yet" for ever while the client's money sat on the old one, and
+    the next deposit was numbered one past the old account's highest -- a
+    hole at the start of the new chain, toward the recovery gap."""
+    _c = rec.get("btc_chain") if isinstance(rec, dict) else None
+    return _c is None or _c == _xpub_id(key)
+
+
 #: The mark's times, and its directory's, are set back to this bucket after
 #: each write -- the integrity chain's ten minutes (gs_common.integrity_log).
 #: The exact second of the last write is the second a client was handed an
@@ -2787,9 +2805,12 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None,
     empty ledger it contradicts is refused as wiped, a short one is
     stepped past it."""
     from gs_common import integrity_log_once as _once
+    # THIS CHAIN'S INDICES ONLY (_on_this_chain): another account's say
+    # nothing about which of this one's addresses were handed out.
     used = [r.get("btc_index") for r in handles.values()
             if isinstance(r, dict) and isinstance(r.get("btc_index"), int)
-            and not isinstance(r.get("btc_index"), bool)]
+            and not isinstance(r.get("btc_index"), bool)
+            and _on_this_chain(r, key)]
     # A NEVER-PUBLISHED INDEX HANDED BACK (`prefer`: a reused record's, see
     # _dispatch) is one the ledger knew: it counts as known here, so the
     # deposit after a failed one is not refused as a wiped ledger, and it
@@ -5563,13 +5584,45 @@ def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
     let go too; but a pair the record cannot name, or a wallet that cannot
     be asked (`None` from _subaddress_total), keeps the place. Age alone
     never frees anything: only the address saying it holds nothing does.
+
+    QUOTED MEANS THE SLIP FILE IS THERE, not that the record names one (the
+    stage 4 read). The record is saved naming its slip's path before the
+    quote runs (the intake saves it early, so the ledger follows the
+    issued-index mark), and a machine that dies while the quote runs -- the
+    deadman, the job budget, a power cut -- leaves that record on the disk:
+    state_open keeps a member a dead run left, as newer than the seal. It
+    named a slip that was never written, held a whole account reserve for
+    two days, and closed the intake to the next client (at_capacity) about
+    a deposit nobody was ever shown. The refused allocation and a person
+    sitting down already clear the path; a kill cannot. The same test
+    _reusable_receive makes: no slip file, nothing was published, and its
+    bundle is the next deposit's.
     """
     if not (rec.get("bundle") and rec.get("slip")) or rec.get("spent") is True:
         return False
+    try:
+        if not Path(str(rec["slip"])).is_file():
+            return False
+    except Exception:                                        # noqa: BLE001
+        # Could not tell: the place is kept, as for a wallet that cannot
+        # be asked.
+        return True
     _adm = rec.get("admitted")
     if not isinstance(_adm, int) or isinstance(_adm, bool):
         _adm = 0
     if int(now) - _adm < proto.DEPOSIT_PLACE_TTL_S:
+        return True
+    # AN INTAKE DEPOSIT WHOSE FORWARD RAN WAS PAID (the stage 4 read). Its
+    # client paid the host's BTC address, not the XMR subaddress, and that
+    # stays empty until the forward's swap lands -- hours after the forward,
+    # or days while a fee spike holds it `delayed`. Asked about it alone,
+    # a paid deposit read as a ghost after DEPOSIT_PLACE_TTL_S and gave its
+    # place to the next client: two mixes to come against a reserve for
+    # one. A forward that ran (a rehearsal's `forwarded`, a send's
+    # `forward_sent`) found settled money there. One that has not run yet
+    # is asked about as before.
+    if rec.get("btc_index") is not None and (rec.get("forward_sent")
+                                             or rec.get("forwarded")):
         return True
     _pair = _bundle_pair(rec)
     if _pair is None:
@@ -5943,6 +5996,21 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                           "address recorded (it was quoted for the client to "
                           "pay ThorChain directly), so there is nothing on "
                           "this machine's key to forward.")
+        # ISSUED ON ANOTHER ACCOUNT OF THE SEED (see _on_this_chain): this
+        # pair derives a different address for that index, and a forward
+        # run on it looks at an address nobody paid -- "not yet" for ever,
+        # while the client's money sits where they paid it. Refused before
+        # anything runs, with the way out.
+        if not _on_this_chain(rec, key):
+            integrity_log("wake", "btc_chain_changed")
+            raise Refused("btc_chain_changed",
+                          f"handle {params['handle']}'s deposit address was "
+                          "issued on another account of the seed than the one "
+                          "this pair names (a re-pair with a different "
+                          "--btc-account or xpub since). The money on it is "
+                          "the seed's still; this pair cannot find it. Nothing "
+                          "was run. Re-pair with the account it was issued "
+                          "on to forward it, or move it by hand.")
         # THE DEPOSIT'S OWN LABEL, not the fresh one drawn above: the plan
         # file is named for the deposit it forwards, and the reply names the
         # handle the operator asked about (as the watching jobs do).
@@ -6116,7 +6184,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 _old_rec = handles.pop(_old_h, None) or {}
                 _reuse_idx = _old_rec.get("btc_index")
                 if isinstance(_reuse_idx, bool) \
-                        or not isinstance(_reuse_idx, int):
+                        or not isinstance(_reuse_idx, int) \
+                        or not _on_this_chain(_old_rec, key):
                     _reuse_idx = None
                 integrity_log("wake", "receive_bundle_reused")
             else:
@@ -6203,6 +6272,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 try:
                     handles[handle]["btc_index"] = _allocate_btc_index(
                         key, handles, unused=btc_unused, prefer=_reuse_idx)
+                    # ...AND WHICH ACCOUNT'S INDEX IT IS (_on_this_chain).
+                    handles[handle]["btc_chain"] = _xpub_id(key)
                     # THE LEDGER FOLLOWS THE MARK AT ONCE (self-doubt over
                     # the fix pass): the record used to be saved only
                     # after the quote child ran, so a machine that died

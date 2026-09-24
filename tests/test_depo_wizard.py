@@ -1527,10 +1527,13 @@ check("/fee's claim holds: the agent spawns the mix only for the spending job "
       and _agent.index('def build_fee_sweep_argv')
       < _agent.index('[sys.executable, _tool("GhostSpiral")')
       < _agent.index('def run_fee_sweep('))
+# Each switch is read through _key_switch since 3f9b060: a boolean or a
+# refusal, never a coerced "1" or "no". This check still spelled the old
+# `key.get(...)` read, and went red with that commit.
 check("...and that job is refused unless this machine's own keyfile allows it "
       "(and the BTC forward reads its OWN switch, not this one)",
-      '_allowed = key.get("allow_withdraw")' in _agent
-      and '_allowed = key.get("allow_btc_forward")' in _agent
+      '_allowed = _key_switch(key, "allow_withdraw",' in _agent
+      and '_allowed = _key_switch(key, "allow_btc_forward",' in _agent
       and "if not _allowed:" in _agent)
 # AND THE OLD CHECK HERE IS GONE, DELIBERATELY. It asserted the fee RATE never
 # reached the chat, on the reasoning that the rate divides an observed cash-out

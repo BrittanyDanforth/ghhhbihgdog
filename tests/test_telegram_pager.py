@@ -4426,6 +4426,33 @@ try:
 finally:
     (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy, pg.load_token,
      pg.doorbell, pg.integrity_log, pg.Pager.run) = _mh_saved
+# AN INTAKE PAIR'S CARD WITHOUT --btc-electrum IS REFUSED AT START (the
+# stage 4 read): the card carries deposit_min_sat only from a pair with the
+# intake, and OPSEC_SETUP says the flag is not optional on one.
+_ik_saved = (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy,
+             pg.load_token, pg.doorbell, pg.integrity_log, pg.Pager.run)
+pg.validate_proxy = lambda u: "socks5h://x"
+pg.verify_tor = lambda p: None
+pg.isolated_proxy = lambda u, tag: {"https": "socks5h://x"}
+pg.load_token = lambda f: "123456:TOKEN"
+pg.doorbell = lambda: types.SimpleNamespace(
+    load_key=lambda p: {"secret": "11" * 32, "role": "pi",
+                        "deposit_min_sat": 150000},
+    FETCH_WINDOW_S=600, PRE_WOL_MAX_S=900)
+pg.integrity_log = lambda *a, **k: None
+pg.Pager.run = lambda self: 0
+try:
+    _ik_hf = ["--hold-file", os.path.join(_mh_d, "wakes.held")]
+    _ik_no = _mh_boot(_ik_hf)
+    _ik_yes = _mh_boot(_ik_hf + ["--btc-electrum", "s.onion"])
+finally:
+    (pg.validate_proxy, pg.verify_tor, pg.isolated_proxy, pg.load_token,
+     pg.doorbell, pg.integrity_log, pg.Pager.run) = _ik_saved
+check("main: an INTAKE pair's card with no --btc-electrum refuses to start, "
+      "and says which flag",
+      _ik_no.startswith("EXIT") and "--btc-electrum" in _ik_no)
+check("NON-VACUITY: the same card WITH --btc-electrum starts",
+      not _ik_yes.startswith("EXIT"))
 check("main: a --hold-file whose directory is missing refuses to start, "
       "saying no hold could then be placed",
       _mh_bad.startswith("EXIT") and "--hold-file" in _mh_bad
@@ -4861,10 +4888,13 @@ _PLAIN_SHARED = {**_PLAIN_BTC, "h": "C7D2",
                  "m": "=:XMR.XMR:" + "8" + "d" * 94 + ":0/1/0"}
 
 
-def _depo_done(plain, chat=111):
+def _depo_done(plain, chat=111, servers=True):
     """A deposit reported done with `plain`, through the REAL start_job and
     poke with the doorbell stubbed. Returns (pager, [(text, buttons)])."""
     _fp, _fs, _, _ = _tapper((chat,))
+    # AN INTAKE CARD IS TAKEN ONLY BY AN END THAT WATCHES (the stage 4
+    # read): a server of its own, as --btc-electrum gives it.
+    _fp.btc_servers = [("s.onion", 50002, None)] if servers else []
     _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
 
     class _Done:
@@ -4892,6 +4922,31 @@ def _depo_done(plain, chat=111):
     return _fp, _fs
 
 
+# AN INTAKE CARD ON AN END THAT DOES NOT WATCH (the stage 4 read): a card
+# from before the pairing carried the floor starts without --btc-electrum,
+# and it told the client "I will say here when it arrives" -- an end that
+# never looks -- whose button, after a restart, asked the swap side "nothing
+# yet" for ever about money on the host's own address. Refused before the
+# address is shown.
+_ilog = []
+_ilsaved = pg.integrity_log
+pg.integrity_log = lambda st, kind, *a, **k: _ilog.append(kind)
+try:
+    with contextlib.redirect_stdout(io.StringIO()) as _iout:
+        _np_, _ns_ = _depo_done(_PLAIN_BTC, servers=False)
+finally:
+    pg.integrity_log = _ilsaved
+_nt_ = [t for t, _b in _ns_]
+check("an intake card on an end with no --btc-electrum: the address is NOT "
+      "shown, nothing is watched, the chat hears there is nothing to pay, "
+      "and the operator is told the flag at the terminal and the kind on "
+      "the chain",
+      not any(_BTC_ADDR in t for t in _nt_)
+      and not any("I will say here" in t for t in _nt_)
+      and any("nothing to pay" in t for t in _nt_)
+      and "B4A1" not in _np_._btc()[1]
+      and "intake_unwatched" in _ilog
+      and "--btc-electrum" in _iout.getvalue())
 _bp, _bs = _depo_done(_PLAIN_BTC)
 _bt = [t for t, _b in _bs]
 _pay = [t for t in _bt if "here is how to pay" in t]
@@ -4926,6 +4981,9 @@ check("...and the address is now on this end's watch list for that chat, "
 def _depo_pay_fails(n, chat=111):
     """_depo_done with the pay message's send failing `n` times."""
     _fp, _fs, _, _ = _tapper((chat,))
+    # AN INTAKE CARD IS TAKEN ONLY BY AN END THAT WATCHES (the stage 4
+    # read): a server of its own, as --btc-electrum gives it.
+    _fp.btc_servers = [("s.onion", 50002, None)]
     _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
     _fails = [n]
 
@@ -5003,6 +5061,9 @@ def _depo_done_with_mid(plain, mid=4321, chat=111, burn_after=900):
     recorded on the watch list -- on an install that burns (the default
     fifteen minutes), since the sentence about staying is only said then."""
     _fp, _fs, _, _ = _tapper((chat,))
+    # AN INTAKE CARD IS TAKEN ONLY BY AN END THAT WATCHES (the stage 4
+    # read): a server of its own, as --btc-electrum gives it.
+    _fp.btc_servers = [("s.onion", 50002, None)]
     _fp.burn_after = burn_after
     _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
 
@@ -6297,6 +6358,29 @@ except SystemExit as _e:
 check("a --tor-proxy the intake's look would refuse (a credential in it) is "
       "refused at START, where the operator is standing",
       _pxr and "--tor-proxy" in _pxr and "credential" in _pxr)
+# AN UNPINNED CLEARNET SERVER IS WHATEVER THE TOR EXIT SAYS IT IS (the
+# stage 4 read): this end's looks decide what the client is told and when
+# a forward starts. Refused at start, as the vault's sending pairs refuse it.
+_upr = None
+try:
+    pg.main(["--chat-id", "1", "--btc-electrum", "s.onion",
+             "--btc-electrum", "electrum.example.com:50002"])
+except SystemExit as _e:
+    _upr = str(_e)
+check("an unpinned clearnet --btc-electrum is refused at START, and the "
+      "refusal names no server",
+      _upr and "a .onion or pinned" in _upr
+      and "electrum.example.com" not in _upr)
+_ppr = None
+try:
+    pg.main(["--chat-id", "1", "--btc-electrum",
+             "electrum.example.com:50002," + "ab" * 32,
+             "--tor-proxy", "socks5h://user:pass@127.0.0.1:9050"])
+except SystemExit as _e:
+    _ppr = str(_e)
+check("NON-VACUITY: the same server PINNED passes that gate (and meets the "
+      "next one, the proxy's)",
+      _ppr and "a .onion or pinned" not in _ppr and "--tor-proxy" in _ppr)
 _nw, _nws, _nwj = _watch_pager(addr="tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
                                h="B4A2")
 _nw.btc_servers = [("s.onion", 50002, None)]
@@ -7630,6 +7714,29 @@ check("a PROBE answered with a word this end lacks gets the one sentence: "
 # the entry landed on `seen`: looked at every tick instead of once a
 # window, the reserve and floor gates of the forwarded branch left behind
 # -- 144 circuits a day for a spent address.
+# THE FLOOR IS WEIGHED AGAINST SETTLED MONEY (the stage 4 read). `confirmed`
+# means SOME output reached the depth, and confirmed_sat counts every mined
+# output: a stranger's settled dust beside the client's payment one block
+# deep started the forward a block early -- a wake spent to hear "still
+# confirming". Anyone who knows the address can pay the dust.
+for _fb_from in ("not_seen", "forwarded"):
+    _fbp, _fbs, _fbj = _watch_pager()
+    _fbl = int(_fbp.deposit_min_sat)
+    _fbp.btc_open["B4A1"]["state"] = _fb_from
+    _fbp._btc_apply("B4A1", {"state": "confirmed",
+                             "confirmed_sat": _fbl + 600,
+                             "unconfirmed_sat": 0, "settled_sat": 600})
+    check(f"settled dust beside a payment one block deep ({_fb_from}): the "
+          f"floor is not met by what a forward can spend, and nothing starts",
+          _fbj == [] and _fbp.btc_open["B4A1"]["state"] != "forwarding")
+    _fbp2, _fbs2, _fbj2 = _watch_pager()
+    _fbp2.btc_open["B4A1"]["state"] = _fb_from
+    _fbp2._btc_apply("B4A1", {"state": "confirmed",
+                              "confirmed_sat": _fbl + 600,
+                              "unconfirmed_sat": 0,
+                              "settled_sat": _fbl + 600})
+    check(f"NON-VACUITY ({_fb_from}): the same money SETTLED starts the "
+          f"forward", len(_fbj2) == 1)
 print("\n== THE HOST-PRIVACY PASS: a settled deposit is held a drawn while "
       "before its first forward ==")
 # Both the payment confirming and the sweep that follows it are public, and
@@ -7639,7 +7746,7 @@ print("\n== THE HOST-PRIVACY PASS: a settled deposit is held a drawn while "
 _hd, _hds, _hdj = _watch_pager(hold=1800)
 _hd.rng = types.SimpleNamespace(randint=lambda a, b: 900)
 _hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
-                        "unconfirmed_sat": 0})
+                        "unconfirmed_sat": 0, "settled_sat": 5000000})
 check("the tick that first sees a deposit SETTLE does not start the "
       "forward: it draws a hold, leaves the entry on seen and spends no "
       "wake",
@@ -7657,7 +7764,7 @@ check("...and, the chat having heard nothing yet (the payment was mined "
       and not any(c.isdigit() for c in _hds[0][0].split(":", 1)[1]))
 _hd_first = _hd.btc_open["B4A1"]["forward_hold"]
 _hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
-                        "unconfirmed_sat": 0})
+                        "unconfirmed_sat": 0, "settled_sat": 5000000})
 check("...a later tick inside the hold does not redraw it and still starts "
       "nothing, and says nothing more: the wait is the deposit's, not the "
       "tick's",
@@ -7677,7 +7784,7 @@ check("a /check inside the hold starts NOTHING and says it goes by itself, "
       and not any(c.isdigit() for c in _hds[-1][0].split(":", 1)[1]))
 _hd.btc_open["B4A1"]["forward_hold"] = time.time() - 1
 _hd._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
-                        "unconfirmed_sat": 0})
+                        "unconfirmed_sat": 0, "settled_sat": 5000000})
 check("...and the first tick after it runs out starts the forward and says "
       "'Sending it on now' -- so the sentence lands with the wake, not "
       "with the confirmation it used to announce",
@@ -7689,7 +7796,7 @@ check("...and the first tick after it runs out starts the forward and says "
 # is not there any more, and a payment that lands again is a fresh deposit.
 _hg, _hgs, _hgj = _watch_pager(hold=1800)
 _hg._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
-                        "unconfirmed_sat": 0})
+                        "unconfirmed_sat": 0, "settled_sat": 5000000})
 _hg.btc_open["B4A1"]["state"] = "seen"
 _hg._btc_apply("B4A1", {"state": "not_seen", "confirmed_sat": 0,
                         "unconfirmed_sat": 0})
@@ -7726,14 +7833,14 @@ _fr.btc_open["B4A1"]["state"] = "forwarded"
 _fr.btc_open["B4A1"]["looked_at"] = time.time()
 _fr.start_job = lambda cid, job, params: False
 _fr._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
-                        "unconfirmed_sat": 0})
+                        "unconfirmed_sat": 0, "settled_sat": 5000000})
 check("returned money on a FORWARDED deposit whose start is refused: the "
       "entry stays forwarded (its look stamp kept), not demoted to seen",
       _fr.btc_open["B4A1"]["state"] == "forwarded"
       and _fr.btc_open["B4A1"].get("looked_at"))
 _fr.btc_open["B4A1"]["state"] = "seen"
 _fr._btc_apply("B4A1", {"state": "confirmed", "confirmed_sat": 5000000,
-                        "unconfirmed_sat": 0})
+                        "unconfirmed_sat": 0, "settled_sat": 5000000})
 check("...while a first payment's refused start still goes back to seen, "
       "for the next tick",
       _fr.btc_open["B4A1"]["state"] == "seen")

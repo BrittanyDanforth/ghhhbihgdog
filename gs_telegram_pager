@@ -3859,6 +3859,24 @@ class Pager:
                 # and "confirmed" here, and the confirmation sends it on by
                 # itself. Registered BEFORE the reply goes out, so a tap on
                 # the button a moment later already finds it.
+                # ...BY AN END THAT CAN WATCH IT (the stage 4 read). A card
+                # from before the pairing carried the intake floor cannot be
+                # refused at start (main), so it is refused here, BEFORE the
+                # address is shown: nothing is paid to an address this end
+                # would promise to watch and never look at, and whose button
+                # after a restart asks the swap side "nothing yet" for ever.
+                if not self.btc_servers:
+                    print("  [!] the vault issued a BTC deposit address of its "
+                          "own and this pager has no --btc-electrum, so it "
+                          "was NOT shown: restart with --btc-electrum "
+                          "(OPSEC_SETUP.md).")
+                    integrity_log("pager", "intake_unwatched")
+                    self.send(chat_id,
+                              f"{chat_name(job)}: this deposit could not be "
+                              f"set up here, so there is nothing to pay. "
+                              f"Nothing was spent. Try again later.",
+                              buttons=MENU_BUTTONS)
+                    return
                 self._btc_register(h, plain.get("d", ""), chat_id)
                 # THIS MESSAGE OUTLIVES THE TIMED BURN, until the payment
                 # is seen (burn_expired, _btc_held_messages). --burn-after
@@ -6464,6 +6482,14 @@ class Pager:
         state = str(r.get("state") or "")
         conf = int(r.get("confirmed_sat") or 0)
         unconf = int(r.get("unconfirmed_sat") or 0)
+        # WHAT A FORWARD CAN SPEND, for the floor (the stage 4 read):
+        # `confirmed` means SOME output reached --btc-min-conf, and
+        # confirmed_sat counts every mined output, one block deep or more.
+        # Weighed against the floor, a settled dust output beside a payment
+        # one block deep started the forward a block early -- a wake spent
+        # to hear "still confirming" -- and anyone who knows the address can
+        # pay the dust. A picture that does not say is nothing settled.
+        settled = int(r.get("settled_sat") or 0)
         say, start = None, False
         _from_forwarded = False
         lock, opened = self._btc()
@@ -6523,8 +6549,8 @@ class Pager:
                         return
                     if conf != _held:
                         self._btc_unhold(e)
-                if (state != "confirmed" or conf <= 0
-                        or conf < int(self.deposit_min_sat or 0)):
+                if (state != "confirmed" or settled <= 0
+                        or settled < int(self.deposit_min_sat or 0)):
                     return
                 # ...AND NOT WHILE A `delayed` WAIT RUNS: the vault would not
                 # pay today's fee for what came back, and the forward branch
@@ -6584,7 +6610,7 @@ class Pager:
                 # payment was never sent on by itself. Under the pairing's
                 # floor, seen or settled, the address reads as unpaid.
                 _fl = int(self.deposit_min_sat or 0)
-                if state == "confirmed" and conf < _fl:
+                if state == "confirmed" and settled < _fl:
                     state = "seen" if conf + unconf >= _fl else "not_seen"
                 elif state == "seen" and conf + unconf < _fl:
                     state = "not_seen"
@@ -7511,14 +7537,16 @@ def build_cli():
     ap.add_argument("--no-jitter", action="store_true",
                     help="passed through to the wake: skip the pre-WOL delay")
     # THE INTAKE'S WATCH, configured HERE like the Tor proxy and never on the
-    # card (STAGE4_PLAN.md 3.3). Without --btc-electrum nothing is watched
-    # and an intake deposit behaves as any other: the button wakes the vault.
+    # card (STAGE4_PLAN.md 3.3). Not optional on an intake pair: main refuses
+    # to start on a card that carries the intake floor without it, and an
+    # older card's intake deposit is refused before its address is shown.
     ap.add_argument("--btc-electrum", action="append", default=[],
                     metavar="HOST[:PORT][,PIN]",
                     help="Electrum server this Pi looks at the intake's "
                          "deposit addresses through, over Tor on one circuit "
-                         "per address; repeatable. Prefer an .onion, or pin a "
-                         "clearnet server's certificate.")
+                         "per address; repeatable. An .onion, or a clearnet "
+                         "server with its certificate pinned: an unpinned one "
+                         "is refused at start.")
     ap.add_argument("--btc-min-conf", type=int, default=2,
                     help="depth at which this Pi calls a deposit confirmed "
                          "and sends it on (default 2; match the vault's)")
@@ -7645,6 +7673,21 @@ def main(argv=None) -> int:
             _w._network(args.btc_network)
         except _w.BtcWatchError as e:
             sys.exit(f"[!] --btc-electrum / --btc-network: {e}")
+        # ...AND EVERY ONE OF THEM ANSWERS ON A KEY (the stage 4 read): a
+        # .onion, or a pinned certificate -- the rule the vault's sending
+        # pairs already keep (gs_btc_watch.server_authenticated). Over an
+        # unpinned clearnet server any Tor exit answers for it, and what it
+        # answers is what this end says and does: "confirmed" to a client
+        # about money that is not there, a forward started on nothing -- a
+        # wake spent each time -- or a real payment never seen. That rested
+        # on no exit trying. No server is named here: a spec names a machine.
+        if not all(_w.server_authenticated(s) for s in args.btc_servers):
+            sys.exit("[!] --btc-electrum: every server this end looks "
+                     "through must be a .onion or pinned "
+                     "(host:port,<sha256 of its certificate>). Over an "
+                     "unpinned clearnet server any Tor exit can answer for "
+                     "it: tell a client their payment confirmed when "
+                     "nothing is there, or hide one that is.")
         # ...AND THE PROXY, AS THE LOOK WILL READ IT (the review of stages
         # 2-6). validate_proxy takes a socks5h://user:pass@ URL; the look
         # refuses one (the credential is its own, per circuit), so every
@@ -7859,6 +7902,20 @@ def main(argv=None) -> int:
                  f"({type(e).__name__}), so this cannot issue a confirmation "
                  f"number that belongs to one chat. Re-pair with "
                  f"gs_wake_keys.")
+    # AN INTAKE PAIR IS WATCHED FROM HERE, OR ITS DEPOSITS ARE NOT TAKEN
+    # (the stage 4 read). The card carries deposit_min_sat only from a pair
+    # with the intake (gs_wake_keys). Started without --btc-electrum, every
+    # deposit was told "I will say here when it arrives" by an end that
+    # never looks -- and after a restart the button asked the swap side,
+    # which answers "nothing yet" for ever about money on the host's own
+    # address. OPSEC_SETUP says the flag is not optional; now it is not.
+    if isinstance(key, dict) and key.get("deposit_min_sat") is not None \
+            and not getattr(args, "btc_servers", None):
+        sys.exit("[!] this card is an intake pair's (the vault takes BTC on "
+                 "addresses of its own), and --btc-electrum is not optional "
+                 "on one: without it this end cannot see a payment arrive, "
+                 "and after a restart it cannot find the deposits it was "
+                 "given. Start it with --btc-electrum (OPSEC_SETUP.md).")
     # THE WIZARD'S FLOOR, settled here where the operator can read the
     # refusal: a --deposit-min-sat UNDER the floor the pairing carried would
     # take a deposit the vault refuses and spend a wake finding out.

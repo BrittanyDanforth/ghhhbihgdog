@@ -313,6 +313,19 @@ does a client's money sit with nobody able to move it?":
   `/check` on a forgotten handle ask the forward, which sends a settled one
   on and otherwise answers `not_yet`/`arriving`. `--btc-electrum` is no
   longer optional on an intake pair and OPSEC_SETUP says so.
+  ...AND, READ AGAIN IN THE STAGE 4 REVIEW, NOTHING ENFORCED IT: a pager
+  started without the flag took the intake's cards, promised "I will say
+  here when it arrives" from an end that never looked, and after a restart
+  asked the swap side as before. Now a card that carries the pairing's
+  intake floor (only an intake pair sends one) refuses to start without
+  `--btc-electrum`, and an older card's first intake deposit is refused
+  before its address is shown (`intake_unwatched` on the chain, the flag
+  named at the terminal). Every server must also be a `.onion` or pinned,
+  as on the vault's sending pairs: this end's looks decide what the client
+  is told and when a forward starts, and over an unpinned clearnet server
+  any Tor exit answers for them. And the floor is weighed against SETTLED
+  money: a settled dust output beside a payment one block deep started the
+  forward a block early.
 - **The automatic path died silently whenever the box was busy.** The
   watcher's `start_job` for a confirmed deposit went through the one wake
   path, which is right — and that path answers "no: busy" into the chat and
