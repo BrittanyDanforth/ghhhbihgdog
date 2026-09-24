@@ -565,6 +565,27 @@ check("...an output is dust when it is worth no more than twice its own "
 check("an address holding only dust is refused nothing_economic, nothing "
       "signed", _refusal(Net(utxos=_storm))[3] == "nothing_economic"
       and _refusal(Net(utxos=_storm))[2] is None)
+# A FLOOD JUST OVER THE DUST LINE: 1,600 outputs of 300 sat (above the
+# 294 sat relay dust limit, above this rate's dust line) beside a real
+# 400,000 sat deposit. Every one was spent, and the transaction -- signed,
+# "passing" as a dry run -- weighed over the 400,000 WU every relaying node
+# refuses; every retry built it again, so the deposit could never move.
+_flood = ([{"tx_hash": _H1, "vout": 0, "value": 400000, "confirmations": 9}]
+          + [{"tx_hash": "%064x" % (i + 1000), "vout": 0, "value": 300,
+              "confirmations": 9} for i in range(1600)])
+_code, _out, _plan, _ = run(Net(utxos=_flood, fee=1))
+_tx = _signed_tx(_out)
+check("a dust flood beside a deposit: the forward stays standard (weight "
+      "within 400,000), spends the deposit, and the plan counts what was "
+      "left over for a standard size",
+      _code == 0 and _tx is not None
+      and T.measure(_tx)[1] <= F.STANDARD_TX_WEIGHT
+      and any(i.txid.hex() == _H1 for i in _tx.vin)
+      and _plan["left_over"] == 1601 - len(_tx.vin) > 0
+      and f"{_plan['left_over']} left for a standard size" in _out)
+check("...the cap is the vsize bound's: one input more would not be standard",
+      F.standard_fits(len(_tx.vin), 120)
+      and not F.standard_fits(len(_tx.vin) + 1, 120))
 _code, _out, _plan, _ = run(Net(), "--plan-only", seed=None)
 check("--plan-only needs no seed, writes an UNSIGNED transaction, signed "
       "false, and still no broadcast",
@@ -1476,6 +1497,54 @@ check("a rejected re-send: a FRESH forward is quoted, signed and sent; the "
       and json.load(open(_chain4[1]))["resends"] == 1
       and ("forward", "resend_rejected") in _n4.kinds
       and ("forward", "reconcile_rejected") in _n4.kinds)
+# A STOP ASKED AFTER THE LOOK STOPS THE SEND. The handler only sets a flag
+# and main() read it once, right after the look: a SIGTERM during the
+# quote (or the reconciliation's history read) went on to sign and SEND,
+# and the agent SIGKILLed the child in the seen wait with no plan written.
+class _StopNet(Net):
+    """A Net whose stop flag rises during the quote (`at`="quote") or the
+    history read (`at`="history")."""
+
+    def __init__(self, at, **kw):
+        super().__init__(**kw)
+        self.at, self.stop = at, False
+
+    def install(self):
+        super().install()
+        F.shutdown_requested = lambda: self.stop
+        return self
+
+    def safe_post(self, url, payload, proxies=None):
+        if self.at == "quote":
+            self.stop = True
+        return super().safe_post(url, payload, proxies)
+
+    def _spends(self, *a, **kw):
+        if self.at == "history":
+            self.stop = True
+        return super()._spends(*a, **kw)
+
+
+_nSt = _StopNet("quote", submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ofSt = run(_nSt, broadcast=True)
+check("a stop that lands during the quote: nothing recorded as signed, "
+      "nothing handed to any server, exit failed, the kind on the chain",
+      _c == F.EXIT_FAILED and _nSt.submits == []
+      and not os.path.exists(F.signed_path(_ofSt))
+      and ("forward", "stopped_before_send") in _nSt.kinds)
+_nSn = Net(submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nSn, broadcast=True)
+check("NON-VACUITY: without the stop the same forward is sent, and its seen "
+      "wait is handed the live stop flag to end on",
+      _c == F.EXIT_OK and len(_nSn.submits) == 1
+      and _nSn.seens[0].get("stop") is F.shutdown_requested)
+_p3s, _of3s, _hx3s = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_nSr = _StopNet("history", utxos=_UNSPENT0, spends=[], submit=_ACCEPTED,
+                seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nSr, _of3s)
+check("a stop during the reconciliation's history read: the kept bytes are "
+      "NOT re-sent, exit failed", _c == F.EXIT_FAILED and _nSr.submits == []
+      and ("forward", "stopped_before_send") in _nSr.kinds)
 # (c'') the re-send reaches NO server: nothing was sent this time, and the
 # earlier send's outcome stands. It was overwritten with `unreachable`,
 # and the plan then read as a forward that never went out -- to the agent
@@ -1623,6 +1692,46 @@ check("a listed spend whose txid this box recorded before sending, that the "
       and _n9.submits == [] and _n9.posts == []
       and ("forward", "adopted_spend") in _n9.kinds
       and ("forward", "reconciled_superseded") in _n9.kinds)
+# (h2) SUPERSEDED, AND MONEY CAME BACK NOT YET SETTLED: the same state the
+# listed branch answers `returned` (or keeps, at the bound). The superseded
+# branch had no such tail -- done, the phone hearing `forwarded`, and a
+# kept mark dropped -- two answers to one state, decided twice.
+for _rmax, _want in (((), "returned"), (("--returns-max", "0"), "kept")):
+    _pS9, _ofS9, _hxS9 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+    _adS = {**_spend_tx("=:XMR.XMR:" + _DEST + ":99/1/0"), "height": 850003}
+    F.record_signed(_ofS9, _adS["txid"])
+    _nS9 = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 150000,
+                       "confirmations": 0}], spends=[_adS])
+    _c, _o, _p, _ = _reconcile(_nS9, _ofS9, *_rmax)
+    _pS9now = json.load(open(_ofS9))
+    if _want == "returned":
+        _ok = (_c == F.EXIT_REFUSED and _status_of(_ofS9) == "returned"
+               and ("forward", "refused:returned_unsettled") in _nS9.kinds)
+    else:
+        _ok = (_c == F.EXIT_OK and isinstance(_pS9now.get("returned_kept"),
+                                              dict))
+    check(f"superseded, with unsettled money back ({_rmax or 'the default'}"
+          f" bound): '{_want}', as the listed branch says",
+          _ok and ("forward", "reconciled_superseded") in _nS9.kinds
+          and _pS9now.get("superseded_by") == _adS["txid"]
+          and _nS9.submits == [])
+# (h3) THE SUPERSEDER IS THE FORWARD OVER THIS PLAN'S INPUTS, not the newest
+# of all ours: a newer forward of ours in the mempool over OTHER outpoints
+# (returned money) was named, its height 0, and `forwarded` for this plan
+# waited on an unrelated transaction.
+_pS10, _ofS10, _hxS10 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_adA = {**_spend_tx("=:XMR.XMR:" + _DEST + ":99/1/0"), "height": 850003}
+_adB = {**_spend_tx("=:XMR.XMR:" + _DEST + ":98/1/0", send=140000),
+        "height": 0, "inputs": [{"tx_hash": _H2, "vout": 0,
+                                 "value": 150000}]}
+F.record_signed(_ofS10, _adA["txid"])
+F.record_signed(_ofS10, _adB["txid"])
+_nS10 = Net(utxos=[], spends=[_adA, _adB])
+_c, _o, _p, _ = _reconcile(_nS10, _ofS10)
+check("superseded: superseded_by names our forward over THIS plan's inputs "
+      "(mined at 850003), not a newer one of ours over other outpoints",
+      _c == F.EXIT_OK and _p["superseded_by"] == _adA["txid"]
+      and _p["superseded_height"] == 850003)
 # (i) the history could not be read: a reconciliation cannot decide.
 _p10, _of10, _hx10 = _first_send()
 _n10 = Net(utxos=_UNSPENT0, spends=F.watch.BtcWatchError("nobody answered"),
@@ -3344,6 +3453,40 @@ check("...and the one after that (the record is not rewritten when it "
       "already names the spend)",
       _c == F.EXIT_OK and ("forward", "kept_moved") in _nM2c.kinds
       and ("forward", "foreign_spend") not in _nM2c.kinds)
+# A LOOK THAT HAS NOT SEEN THE HAND MOVE: the history lists it (the
+# operator's K, in a mempool) while the look -- another server, or taken a
+# moment before K -- still lists the kept output unspent. The run said
+# kept_moved and then, under a raised bound, SIGNED A FORWARD OVER K's
+# INPUT in the same breath: a second signature over an outpoint a listed
+# transaction spends -- the kept money into the swap if ours wins, and if
+# K wins, our own forward's input read as foreign on every later run.
+for _rmax in ((), ("--returns-max", "5")):
+    _ofS, _lS, _pS3, _hxS3 = _two_returns()
+    _lS3 = _listed(_pS3, _hxS3, inputs=[{"tx_hash": _H2, "vout": 1,
+                                         "value": 140000}])
+    _c, _o, _p, _ = _reconcile(Net(utxos=_RET3, spends=_lS + [_lS3],
+                                   fee=10, submit=_ACCEPTED, seen=_SEEN0),
+                               _ofS)
+    assert (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]]
+    _K = {**_moved, "height": 0}
+    _nS = Net(utxos=_RET3, spends=_lS + [_lS3, _K], fee=10,
+              submit=_ACCEPTED, seen=_SEEN0)
+    _c, _o, _p, _ = _reconcile(_nS, _ofS, *_rmax)
+    _bound = "a raised bound" if _rmax else "the bound"
+    check(f"a hand move the look has not seen yet ({_bound}): kept_moved, "
+          "and NOTHING signed over the moved output -- no submit, no "
+          "returned forward, and no kept mark naming money already moved",
+          _c == F.EXIT_OK and ("forward", "kept_moved") in _nS.kinds
+          and _nS.submits == [] and _nS.posts == []
+          and ("forward", "returned_settled") not in _nS.kinds
+          and [_HK3, 0] not in ((_p.get("returned_kept") or {})
+                                .get("outpoints") or []))
+    _nS2 = Net(utxos=[], spends=_lS + [_lS3, {**_K, "height": 850040}],
+               fee=10)
+    _c, _o, _p, _ = _reconcile(_nS2, _ofS, *_rmax)
+    check(f"...and the run after ({_bound}), K mined and the look caught "
+          "up: the operator's hand still, no seed-leak alarm",
+          _c == F.EXIT_OK and ("forward", "foreign_spend") not in _nS2.kinds)
 _moved2 = {**_spend_tx(None, send=120000),
            "inputs": [{"tx_hash": _HK3, "vout": 0, "value": 130000},
                       {"tx_hash": _H2, "vout": 1, "value": 140000}]}

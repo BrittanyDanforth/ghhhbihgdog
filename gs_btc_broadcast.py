@@ -549,7 +549,7 @@ def _history_once(txid, scripthash, order, make):
 def seen(txid, address, servers, proxy_url, *, network="main",
          timeout=DEFAULT_TIMEOUT, wait_s=DEFAULT_SEEN_WAIT_S,
          interval_s=DEFAULT_SEEN_INTERVAL_S, sleeper=None, clock=None,
-         transport_factory=None, avoid=None):
+         transport_factory=None, avoid=None, stop=None):
     """Is `txid` in the deposit address's history yet? Polls until it is
     or `wait_s` has passed (at least once; wait_s 0 is one look). Returns
         {seen, height, server, cert_sha256, polls, asked}
@@ -567,7 +567,12 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     poll fails over within itself -- so with the other server down the
     accepting one was asked after all, listed its own claimed txid, and
     the forward dropped the signed bytes as proven. Now nobody else
-    answering is "nobody could be asked", and the bytes are kept."""
+    answering is "nobody could be asked", and the bytes are kept.
+
+    `stop`, when given, is asked between polls and during the sleep (in
+    slices of at most a second): once it says True the wait ends with what
+    the polls have learned, so a caller being stopped can still write down
+    what it sent. A poll already in flight is not cut short."""
     want = _check_txid(txid)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
@@ -596,6 +601,15 @@ def seen(txid, address, servers, proxy_url, *, network="main",
                     "cert_sha256": cert, "polls": polls, "asked": True}
         if clock() + float(interval_s) > deadline:
             break
-        sleeper(float(interval_s))
+        if stop is None:
+            sleeper(float(interval_s))
+            continue
+        _left = float(interval_s)
+        while _left > 0 and not stop():
+            _s = min(1.0, _left)
+            sleeper(_s)
+            _left -= _s
+        if stop():
+            break
     return {"seen": False, "height": None, "server": host,
             "cert_sha256": cert, "polls": polls, "asked": asked}

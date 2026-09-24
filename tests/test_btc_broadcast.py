@@ -446,6 +446,25 @@ _r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=30, interval_s=15,
 check("never found, wait 30 at 15: polls at 0, 15 and 30, then stops -- "
       "never past the budget", _r["seen"] is False and _r["polls"] == 3
       and _slept == [15.0, 15.0] and _r["asked"] is True)
+# A STOP ENDS THE WAIT (the caller's SIGTERM): asked during the sleep in
+# slices of at most a second, so the caller can still write down what it
+# sent inside the agent's ten-second grace instead of being killed with
+# nothing on disk.
+_slept, _t = [], [0.0]
+_r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=90, interval_s=15,
+              sleeper=lambda s: (_slept.append(s), _t.__setitem__(
+                  0, _t[0] + s)), clock=lambda: _t[0],
+              stop=lambda: _t[0] >= 3)
+check("a stop three seconds into the first sleep ends the wait there: one "
+      "poll, three one-second slices, not seen but asked",
+      _r["seen"] is False and _r["polls"] == 1 and _r["asked"] is True
+      and _slept == [1.0, 1.0, 1.0])
+_slept, _t = [], [0.0]
+_r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=30, interval_s=15,
+              sleeper=lambda s: (_slept.append(s), _t.__setitem__(
+                  0, _t[0] + s)), clock=lambda: _t[0], stop=lambda: False)
+check("NON-VACUITY: a stop that never comes changes nothing but the slicing: "
+      "polls at 0, 15 and 30", _r["polls"] == 3 and sum(_slept) == 30.0)
 check("a wait under 0 or an interval of 0 is refused",
       _refused(B.seen, _TXID, _A0, _SERVERS, _PROXY, wait_s=-1,
                transport_factory=_never)

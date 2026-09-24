@@ -298,6 +298,22 @@ class Refused(SystemExit):
 
 # --- the pieces, each a function so tests can drive them alone --------------
 
+def stop_before_send(what):
+    """Refuse to start a send once a stop has been asked (SIGTERM from the
+    agent's deadline, the deadman, systemctl stop). The handler only sets
+    a flag, and main() read it once, right after the look: a stop that
+    landed during the quote, the oracle, THORNode or the reconciliation's
+    history read went on to sign and SEND, and the agent SIGKILLed the
+    child ten seconds later in the seen wait -- no plan written, the kept
+    bytes lost, a forward whose money was accepted reported as a machine
+    that failed. Asked immediately before the bytes are recorded and
+    handed over, where refusing still costs nothing."""
+    if shutdown_requested():
+        integrity_log("forward", "stopped_before_send")
+        print(f"[!] a stop was asked before {what}; nothing was sent")
+        raise SystemExit(EXIT_FAILED)
+
+
 def sat_to_btc_text(sat):
     """Satoshis -> the BTC text SwapKit is sent, fixed notation (fmt_btc:
     str(Decimal) would emit 3E-8 for a small amount)."""
@@ -408,6 +424,51 @@ def size_the_fee(n_inputs, op_return_limit, rate):
     return bound, btx.fee_for(bound, rate)
 
 
+#: Bitcoin Core's MAX_STANDARD_TX_WEIGHT: a heavier transaction is refused
+#: by every relaying node ("tx-size") whatever it pays or carries. A public
+#: relay constant, not a defence -- it only keeps the forward relayable.
+STANDARD_TX_WEIGHT = 400_000
+
+
+def standard_fits(n_inputs, op_return_limit):
+    """Whether a forward of `n_inputs` P2WPKH inputs stays standard at its
+    worst case (vsize_upper_bound, the bound the fee is sized on)."""
+    return btx.vsize_upper_bound(
+        n_inputs, [INBOUND_SPK_MAX, btx.op_return_script_len(op_return_limit)]
+    ) * 4 <= STANDARD_TX_WEIGHT
+
+
+def spendable(utxos, min_conf, rate, exclude, op_return_limit):
+    """What a forward at `rate` spends: select_inputs' choice, CAPPED to what
+    one standard transaction can carry -- every `must` input (a
+    replacement's committed outpoints), then the largest others while the
+    worst case stays within STANDARD_TX_WEIGHT -- in the order given.
+    Returns (chosen, skipped_dust, unsettled, left_over).
+
+    A dust flood a little over twice each output's input cost (294 sat
+    relays; about 1,450 of them) made a forward no node would relay: the
+    dry run passed, the broadcast was rejected everywhere, every retry
+    built the same transaction, and the deposit beside the flood could
+    never be sent by this tool. What is left over stays on the address,
+    like dust. The one selection main() and forwards_at both use, so the
+    word a refusal leaves is decided on what a forward would really
+    spend. When the `must` inputs alone are over the cap, all of them are
+    kept and the caller refuses (standard_fits)."""
+    chosen, dust, unsettled = select_inputs(utxos, min_conf, rate,
+                                            exclude=exclude)
+    if not chosen or standard_fits(len(chosen), op_return_limit):
+        return chosen, dust, unsettled, 0
+    must = [u for u in chosen if u.get("must")]
+    keep = {id(u) for u in must}
+    for u in sorted((u for u in chosen if not u.get("must")),
+                    key=lambda u: -int(u["value"])):
+        if not standard_fits(len(keep) + 1, op_return_limit):
+            break
+        keep.add(id(u))
+    kept = [u for u in chosen if id(u) in keep]
+    return kept, dust, unsettled, len(chosen) - len(kept)
+
+
 def send_refusal(settled_sat, fee_sat, min_send_sat):
     """None when a forward of `settled_sat` paying `fee_sat` passes both
     fee guards, else the (kind, message) amount_to_send refuses it with.
@@ -444,8 +505,9 @@ def forwards_at(utxos, min_conf, rate, exclude, op_return_limit,
     puts on it passes send_refusal. The fee's jitter is left out: main()
     draws it inside the room those two guards leave, so it never turns a
     pass into a refusal."""
-    chosen, _, _ = select_inputs(utxos, min_conf, rate, exclude=exclude)
-    if not chosen:
+    chosen, _, _, _ = spendable(utxos, min_conf, rate, exclude,
+                                op_return_limit)
+    if not chosen or not standard_fits(len(chosen), op_return_limit):
         return False
     _, fee = size_the_fee(len(chosen), op_return_limit, rate)
     return send_refusal(sum(u["value"] for u in chosen), fee,
@@ -476,7 +538,8 @@ def forwards_in_band(utxos, min_conf, floor, ceiling, exclude,
         if forwards_at(utxos, min_conf, r, exclude, op_return_limit,
                        min_send_sat):
             return True
-        chosen, _, _ = select_inputs(utxos, min_conf, r, exclude=exclude)
+        chosen, _, _, _ = spendable(utxos, min_conf, r, exclude,
+                                    op_return_limit)
         if sum(u["value"] for u in chosen) < btx.forward_floor_sat(
                 op_return_limit, r, min_send_sat):
             return False
@@ -1242,6 +1305,7 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
                     "value": i["value"], "confirmations": None}
                    for i in last["inputs"]],
         "skipped_dust": 0,
+        "left_over": 0,
         "unsettled_outputs": 0,
         "tip": tip,
         "inbound": inbound,
@@ -1837,6 +1901,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     _kept_ops -= _signed_ops
     _sent_here = signed_txids(args.outfile)
     listed = {s["txid"]: s for s in spends}
+    # WHAT A LISTED HAND MOVE SPENDS is gone, whatever the look says: the
+    # look is another session, perhaps another server, and one that has
+    # not seen the move still lists the kept outputs unspent. Counted as
+    # consumed below with our own forwards' inputs.
+    _moved_ins = set()
     for s in spends:
         if s["txid"] in ours:
             continue
@@ -1886,6 +1955,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                 _dirty = True
             if _dirty:
                 write_plan(args.outfile, plan)
+            _moved_ins |= _ins
             integrity_log("forward", "kept_moved")
             print(f"  reconcile: the kept outputs were moved by a spend "
                   f"this tool did not sign (txid {s['txid']}): the "
@@ -1902,8 +1972,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
               "signed. If no operator moved it by hand, the seed has "
               "leaked.")
         raise SystemExit(EXIT_FAILED)
-    consumed = {(i["tx_hash"], int(i["vout"]))
-                for s in spends if s["txid"] in ours for i in s["inputs"]}
+    # ...AND WHAT A HAND MOVE OF THE KEPT OUTPUTS SPENDS: a run that said
+    # kept_moved then signed a forward over the moved output whenever the
+    # look still listed it -- a second signature over an outpoint a listed
+    # transaction spends: the kept money into the swap if ours won, and
+    # if the operator's won, our own forward's input read as foreign ("the
+    # seed has leaked") on every run after.
+    consumed = {(str(i["tx_hash"]).lower(), int(i["vout"]))
+                for s in spends if s["txid"] in ours
+                for i in s["inputs"]} | _moved_ins
     unspent = {(str(u["tx_hash"]).lower(), int(u["vout"])): u
                for u in picture["utxos"]}
     fresh = {k: u for k, u in unspent.items() if k not in consumed}
@@ -2016,6 +2093,43 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             _ex |= _outpoints(settled_new)
         return "forward", sorted(_ex), "bumped", stuck, conflicts
 
+    def _after_record(stuck):
+        """WHAT FOLLOWS ONCE THE RECORD IS FOUND -- our transaction listed,
+        or this plan superseded by a forward of ours that is -- decided
+        once for both: a stuck forward is replaced; new settled money is
+        forwarded (or kept, at the bound); new money not yet settled is
+        the word `returned` and a refusal (or kept, at the bound); None
+        when there is nothing to do. The superseded branch once had only
+        the first two: unsettled money back beside a superseded plan was
+        `done` -- the phone hearing `forwarded` where the listed branch
+        said `returned`, and a kept mark dropped at the bound."""
+        if stuck is not None:
+            return _bump(stuck)
+        if settled_new:
+            _k = _kept(settled_new, True)
+            if _k is not None:
+                return _k
+            integrity_log("forward", "returned_settled")
+            _nr = sum(1 for u in settled_new
+                      if (str(u.get("tx_hash") or "").lower(),
+                          int(u.get("vout") or 0)) in _refund_ops)
+            print(f"  reconcile: {len(settled_new)} new settled output(s) on "
+                  f"the address that no forward of ours consumed ({_nr} "
+                  f"verified ThorChain refund(s), {len(settled_new) - _nr} "
+                  "payment(s) or unverified): forwarding them.")
+            return "forward", sorted(consumed), "returned"
+        if unsettled_new:
+            _k = _kept(unsettled_new, False)
+            if _k is not None:
+                return _k
+            integrity_log("forward", "returned_unsettled")
+            write_status(args.outfile, STATUS_RETURNED)
+            raise Refused("returned_unsettled",
+                          f"{len(unsettled_new)} new output(s) came back to "
+                          "the address and are not settled yet; they are "
+                          "sent on once they are")
+        return None
+
     if txid in listed:
         hit = listed[txid]
         plan["seen"] = True
@@ -2053,31 +2167,9 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                  else f"in a block at height {hit['height']}")
         print(f"  reconcile: our transaction is listed {where}. Nothing to "
               "send.")
-        if stuck is not None:
-            return _bump(stuck)
-        if settled_new:
-            _k = _kept(settled_new, True)
-            if _k is not None:
-                return _k
-            integrity_log("forward", "returned_settled")
-            _nr = sum(1 for u in settled_new
-                      if (str(u.get("tx_hash") or "").lower(),
-                          int(u.get("vout") or 0)) in _refund_ops)
-            print(f"  reconcile: {len(settled_new)} new settled output(s) on "
-                  f"the address that no forward of ours consumed ({_nr} "
-                  f"verified ThorChain refund(s), {len(settled_new) - _nr} "
-                  "payment(s) or unverified): forwarding them.")
-            return "forward", sorted(consumed), "returned"
-        if unsettled_new:
-            _k = _kept(unsettled_new, False)
-            if _k is not None:
-                return _k
-            integrity_log("forward", "returned_unsettled")
-            write_status(args.outfile, STATUS_RETURNED)
-            raise Refused("returned_unsettled",
-                          f"{len(unsettled_new)} new output(s) came back to "
-                          "the address and are not settled yet; they are "
-                          "sent on once they are")
+        _then = _after_record(stuck)
+        if _then is not None:
+            return _then
         print(f"  plan updated: {args.outfile}")
         return "done", EXIT_OK
     # NOT LISTED. Where are the inputs it spent?
@@ -2105,12 +2197,18 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
               + (", leaving out what came back past the bound" if _kept_ex
                  else "") + ".")
         return "forward", sorted(consumed | set(_kept_ex)), "evicted"
-    if plan_inputs and plan_inputs & consumed:
+    # THE FORWARDS OF OURS OVER THIS PLAN'S INPUTS: the superseder is one
+    # of them, never simply the newest of ours -- a newer forward of
+    # returned money over other outpoints, in the mempool, was named, and
+    # `forwarded` for this plan waited on an unrelated transaction.
+    _over = [s for s in spends if s["txid"] in ours
+             and plan_inputs & {(str(i["tx_hash"]).lower(), int(i["vout"]))
+                                for i in s["inputs"]}]
+    if plan_inputs and _over:
         # Its inputs were consumed by a listed forward of ours under
         # another txid (an earlier reconciliation re-signed). That one is
         # the record; this plan is superseded by it.
-        newest = max((s for s in spends if s["txid"] in ours),
-                     key=lambda s: (s["height"] <= 0, s["height"]))
+        newest = max(_over, key=lambda s: (s["height"] <= 0, s["height"]))
         plan["superseded_by"] = newest["txid"]
         # ...AND WHERE THAT ONE IS (stage 6): its height, so the agent can
         # say `forwarded` once the forward that IS the record is in a
@@ -2124,13 +2222,9 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         integrity_log("forward", "reconciled_superseded")
         print(f"  reconcile: this plan's inputs were spent by our listed "
               f"transaction {newest['txid']}; recorded.")
-        if stuck is not None:
-            return _bump(stuck)
-        if settled_new:
-            _k = _kept(settled_new, True)
-            if _k is not None:
-                return _k
-            return "forward", sorted(consumed), "returned"
+        _then = _after_record(stuck)
+        if _then is not None:
+            return _then
         return "done", EXIT_OK
     integrity_log("forward", "history_inconsistent")
     print("[!] reconcile: the plan's inputs are neither unspent nor consumed "
@@ -2150,6 +2244,7 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     stale (a policy or a fee the network no longer takes) and its inputs
     are still ours, so a fresh forward at today's fee follows."""
     txid = str(plan.get("txid") or "").lower()
+    stop_before_send("re-sending")
     record_signed(args.outfile, txid)
     integrity_log("forward", "resending")
     try:
@@ -2203,7 +2298,7 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
                             network=args.network, timeout=args.timeout,
                             wait_s=args.seen_wait,
                             interval_s=args.seen_interval,
-                            avoid=sub["server"])
+                            avoid=sub["server"], stop=shutdown_requested)
     except watch.PinMismatch:
         seen_r = {"seen": False, "height": None, "server": None,
                   "cert_sha256": None, "polls": 0, "asked": False,
@@ -2587,9 +2682,14 @@ def main(argv=None):
     try:
         rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
                         args.feerate_floor, args.feerate_ceiling)
-        chosen, skipped_dust, unsettled = select_inputs(picture["utxos"],
-                                                        args.min_conf, rate,
-                                                        exclude=exclude)
+        chosen, skipped_dust, unsettled, left_over = spendable(
+            picture["utxos"], args.min_conf, rate, exclude,
+            args.op_return_max_bytes)
+        if chosen and not standard_fits(len(chosen),
+                                        args.op_return_max_bytes):
+            raise Refused("forward_too_large",
+                          "the forward being replaced spends more outputs "
+                          "than one standard transaction can carry")
         if not chosen:
             raise Refused("nothing_economic",
                           "what is settled here is all dust at this fee "
@@ -2719,6 +2819,7 @@ def main(argv=None):
                           f"{int(age)} s passed since the quote, over the "
                           f"{args.quote_max_age} s this box allows between "
                           "quoting and sending; nothing was sent")
+        stop_before_send("sending")
         # ON DISK BEFORE THE BYTES LEAVE: the one mark that tells this
         # forward, found on the chain with no plan, from a copy of its memo
         # (SIGNED_SCHEMA says why).
@@ -2745,20 +2846,25 @@ def main(argv=None):
                           f"every Electrum server that answered "
                           f"({len(sub['codes'])} of {sub['attempts']}) "
                           f"rejected the transaction (codes {sub['codes']}); "
-                          "nothing moved. A node with the standard OP_RETURN "
-                          "relay policy refuses a swap memo: the server list "
-                          "needs one that relays it (STAGE3_PLAN.md 3.3)")
+                          "nothing moved. The common cause: a node with the "
+                          "standard OP_RETURN relay policy refuses a swap "
+                          "memo, and the server list needs one that relays "
+                          "it (STAGE3_PLAN.md 3.3); the codes say which")
         if outcome == bcast.OUTCOME_UNREACHABLE:
             print(f"[!] no Electrum server could be reached to send "
                   f"({sub['attempts']} tried); nothing moved")
             raise SystemExit(EXIT_FAILED)
         # ACCEPTED OR AMBIGUOUS: the money may have moved. Look for it.
         try:
+            # A STOP ENDS THE WAIT, not the run: what the polls learned so
+            # far is kept, and the plan below -- with the bytes kept as
+            # unseen -- is written inside the agent's grace instead of the
+            # child being killed mid-wait with nothing on disk.
             seen_r = bcast_seen(txid, address, servers, args.tor_proxy,
                                 network=args.network, timeout=args.timeout,
                                 wait_s=args.seen_wait,
                                 interval_s=args.seen_interval,
-                                avoid=sub["server"])
+                                avoid=sub["server"], stop=shutdown_requested)
         except watch.PinMismatch:
             seen_r = {"seen": False, "height": None, "server": None,
                       "cert_sha256": None, "polls": 0, "asked": False,
@@ -2805,6 +2911,7 @@ def main(argv=None):
                     "value": u["value"], "confirmations": u["confirmations"]}
                    for u in chosen],
         "skipped_dust": skipped_dust,
+        "left_over": left_over,
         "unsettled_outputs": unsettled,
         "tip": picture["tip"],
         "inbound": inbound,
@@ -2928,6 +3035,7 @@ def main(argv=None):
     print(f"  from {scrub_address(address)} index {index}: "
           f"{settled_sat} sat in {n_inputs} spendable output(s)"
           f"{f', {skipped_dust} dust left' if skipped_dust else ''}"
+          f"{f', {left_over} left for a standard size' if left_over else ''}"
           f"{f', {unsettled} not yet settled' if unsettled else ''}")
     print(f"  to   {scrub_address(inbound)}"
           f"{' (THORNode-verified)' if cross_checked else ''}: "
