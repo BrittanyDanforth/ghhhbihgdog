@@ -2911,7 +2911,7 @@ def _allocate_btc_index(key: dict, handles: dict, unused=None,
 #: (under what was quoted) -- stage 5.
 _FORWARD_STATUS_PHASE = {"not_seen": "not_yet", "seen": "arriving",
                          "delayed": "delayed", "short": "short",
-                         "returned": "returned"}
+                         "returned": "returned", "leftover": "leftover"}
 
 
 def _forward_status_path(artifact_dir, handle: str) -> Path:
@@ -5019,6 +5019,17 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             _word = _forward_status_word(artifact_dir, handle, reader)
             if _word in ("returned", "delayed"):
                 return _word
+            # MONEY BACK THAT NO RATE CAN CARRY, once the forward on record
+            # is in a block (wire 11): `leftover`, where the plan alone said
+            # `forwarded` and the Pi started the same refused forward every
+            # recheck window. While the record is still in the mempool the
+            # plan's `sent` stands -- the Pi's recheck of it must go on
+            # until it mines, and the next one answers this word.
+            if _word == "leftover" and _forward_mined(
+                    artifact_dir, handle, reader) and (
+                    outcome == "accepted"
+                    or _forward_superseded(artifact_dir, handle, reader)):
+                return "leftover"
             # (KEPT, above, comes before `forwarded` too: or the Pi would end
             # its rechecks on a deposit whose money is sitting here, and the
             # chat would hear "confirmed" about it -- third self-doubt pass.)
@@ -5038,7 +5049,10 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
         # a forward that found nothing settled and said what it saw
         # (not_yet / arriving) -- the answer a tap on "Has it arrived?"
         # gets on a deposit the Pi is not watching (STAGE4_PLAN.md 3.6).
-        return _forward_status_word(artifact_dir, handle, reader)
+        # Never `leftover` here: it says the forward confirmed, and with no
+        # plan that moved nothing did.
+        _word = _forward_status_word(artifact_dir, handle, reader)
+        return "" if _word == "leftover" else _word
     # A FINISHED WITHDRAWAL ANSWERS A DIFFERENT QUESTION: is there another
     # arrival still sitting here?
     #

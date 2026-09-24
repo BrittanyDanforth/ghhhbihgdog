@@ -1115,8 +1115,14 @@ STATUS_SHORT = "short"
 #: Money came BACK to the address after the forward (a refund, a second
 #: payment) and is not yet settled; it is sent on when it is (--reconcile).
 STATUS_RETURNED = "returned"
+#: Money came back after the forward and NO rate this pair allows can carry
+#: it on, settled or not (--reconcile's `short`). Its own word, because the
+#: agent answers a moved plan from the plan and dropped `short` there -- a
+#: sentence about a deposit that has not gone -- so the Pi heard
+#: `forwarded` and started the same refused forward every recheck window.
+STATUS_LEFTOVER = "leftover"
 STATUS_WORDS = (watch.STATE_NOT_SEEN, watch.STATE_SEEN, STATUS_DELAYED,
-                STATUS_SHORT, STATUS_RETURNED)
+                STATUS_SHORT, STATUS_RETURNED, STATUS_LEFTOVER)
 #: The refusals that are about TODAY'S FEE, not about the deposit. Each
 #: becomes a word (fee_word: `delayed`, `seen` while money is still
 #: confirming, or `short` when no rate this pair allows could ever carry
@@ -2836,6 +2842,11 @@ def main(argv=None):
             # that and `returned`.
             if _word == watch.STATE_SEEN and why == "returned":
                 _word = STATUS_RETURNED
+            # ...AND RETURNED MONEY NO RATE CAN CARRY is `leftover`, not the
+            # fresh deposit's `short`: the forward went out, and what came
+            # back since is what stays.
+            elif _word == STATUS_SHORT and why == "returned":
+                _word = STATUS_LEFTOVER
             write_status(args.outfile, _word)
         raise
 

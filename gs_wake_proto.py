@@ -216,7 +216,18 @@ import time
 #: alternative is running with an empty ledger and re-issuing somebody's
 #: address -- so a half-upgraded pair must fail at the version check and not
 #: at the ledger. Update both boxes together.
-WIRE_VERSION = 10
+#:
+#: 11: one phase word, `leftover` (money came back to the deposit address
+#: after the forward MINED, and no fee rate the pair allows can carry it on
+#: -- the vault's `short` about returned money). Before it, that answer was
+#: dropped for the moved plan's `forwarded`, and the Pi started the same
+#: refused forward once per recheck window for as long as the money sat
+#: there, each answer extending the entry's life -- a wake a window, for
+#: good, and "nothing more to check" said about money that was not sent
+#: on. As with 5, 7, 8 and 9: no record changes shape, the closed
+#: vocabulary grows, an old Pi reads the word as unknown and says UPDATE
+#: BOTH BOXES. Update both boxes together.
+WIRE_VERSION = 11
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -462,7 +473,7 @@ BTC_INDEX_GAP = 20
 #:              operator. Says nothing about how much, or why it came back.
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
           "more_locked", "moved", "partial", "full", "sent", "unsure",
-          "delayed", "returned", "forwarded", "kept")
+          "delayed", "returned", "forwarded", "kept", "leftover")
 
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
@@ -977,6 +988,13 @@ PHASE_LINES = {
     # no coin, no reason; "check" is the whole of what to do.
     "kept": "some of it came back to where it was paid, again, and is kept "
             "there — not sent on again by itself. Check.",
+    # MONEY CAME BACK AFTER THE FORWARD MINED AND CANNOT BE SENT ON (wire
+    # 11): no fee rate the pair allows carries it. The forward itself is
+    # done; what came back stays where it was paid until someone acts. No
+    # amount, no count, no coin, no reason; "check" is what to do.
+    "leftover": "the forward has confirmed. Some came back to where it was "
+                "paid since and cannot be sent on by itself — it stays "
+                "there. Check.",
     # NOT RENDERED ON ITS OWN. The pager acts on this one -- it starts the
     # next leg -- and says so in its own words, because "more left" is not
     # something the operator has to do anything about. The sentence is here

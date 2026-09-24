@@ -1286,9 +1286,9 @@ _c, _o, _p, _of = run(_nm)
 check("a refusal that is not about the fee (memo_unbound) writes NO status "
       "word: it is a refusal, and the phone hears that",
       _c == F.EXIT_REFUSED and _status_of(_of) is None)
-check("the five words the status file may carry, and the six fee kinds that "
+check("the six words the status file may carry, and the six fee kinds that "
       "earn one", set(F.STATUS_WORDS) == {"not_seen", "seen", "delayed",
-                                          "short", "returned"}
+                                          "short", "returned", "leftover"}
       and set(F.DELAY_KINDS) == {"no_fee_estimate", "bad_fee_estimate",
                                  "fee_out_of_band", "fee_eats_deposit",
                                  "nothing_economic", "below_minimum"})
@@ -1763,10 +1763,11 @@ _n7b = Net(utxos=[_IN_STILL, {"tx_hash": _H2, "vout": 0, "value": 5000,
 _c, _o, _p, _ = _reconcile(_n7b, _of7b)
 check("RETURNED, too small to send on, beside the listed forward's own input "
       "still shown unspent: refused, nothing sent, and the status word is "
-      "'short' -- the excluded input is not money this forward carries",
+      "'leftover' (returned money no rate carries; a fresh deposit's is "
+      "'short') -- the excluded input is not money this forward carries",
       _c == F.EXIT_REFUSED and ("forward", "reconcile_returned") in _n7b.kinds
       and ("forward", "refused:fee_eats_deposit") in _n7b.kinds
-      and _n7b.submits == [] and _status_of(_of7b) == "short")
+      and _n7b.submits == [] and _status_of(_of7b) == "leftover")
 _p7c, _of7c, _hx7c = _first_send()
 _n7c = Net(utxos=[_IN_STILL, {"tx_hash": _H2, "vout": 0, "value": 150000,
                               "confirmations": 5}],
@@ -1777,6 +1778,35 @@ check("NON-VACUITY: 150,000 sat back beside the same input, on a day the "
       "cheaper blocks", _c == F.EXIT_REFUSED
       and ("forward", "refused:fee_out_of_band") in _n7c.kinds
       and _n7c.submits == [] and _status_of(_of7c) == "delayed")
+# (f4) RETURNED MONEY NO RATE CAN CARRY, AFTER THE FORWARD MINED (wire 11).
+# A hundred 200 sat outputs came back and settled: over the Pi's floor, and
+# no rate in the band forwards them. The forwarder said `short`, the agent
+# answered the moved plan's `forwarded` over it, and the Pi started the
+# same refused forward every recheck window. Now the forwarder names the
+# state -- `leftover` -- and the REAL agent, reading what this run wrote,
+# answers it once the forward on record is in a block.
+_AG = load("gs_wake_agent")
+_left = [{"tx_hash": "%064x" % (i + 900), "vout": 0, "value": 200,
+          "confirmations": 9} for i in range(100)]
+for _h, _want in ((850002, "leftover"), (0, "sent")):
+    _pL4, _ofL4, _hxL4 = _first_send()
+    _nL4 = Net(utxos=_left, spends=[_listed(_pL4, _hxL4, height=_h)], fee=1,
+               submit=_ACCEPTED, seen=_SEEN0)
+    _c, _o, _p, _ = _reconcile(_nL4, _ofL4)
+    _agd = tempfile.mkdtemp(prefix="agent_view_")
+    with open(os.path.join(_agd, "btc_forward_B4A1.json"), "w") as _fh:
+        _fh.write(open(_ofL4).read())
+    with open(os.path.join(_agd, "btc_forward_B4A1.status.json"), "w") as _fh:
+        _fh.write(open(F.status_path(_ofL4)).read())
+    _phL4 = _AG._phase_of("forward_to_swap", _agd, status="done",
+                          handle="B4A1")
+    check(f"returned money no rate carries, the forward on record "
+          f"{'mined' if _h else 'in the mempool'}: refused, nothing sent, the "
+          f"word 'leftover', and the real agent answers {_want!r}",
+          _c == F.EXIT_REFUSED and _nL4.submits == [] and _nL4.posts == []
+          and _status_of(_ofL4) == "leftover" and _phL4 == _want)
+check("NON-VACUITY: the same money on a FRESH deposit is still 'short'",
+      _status_of(run(Net(utxos=_left, fee=1))[3]) == "short")
 # (f3) A REPLACEMENT TODAY'S FEE WILL NOT CARRY IS `delayed`, never
 # `short`: the forward it would replace stands in the mempool. 15,000 sat
 # went out at 11 sat/vB and sat four hours; at an estimate of 30 the

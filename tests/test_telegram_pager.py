@@ -6645,6 +6645,132 @@ check("a `delayed` on a kept entry: still kept, and the next tap asks the XMR "
       "side for a window, not the forward",
       _rk.btc_open["B4A1"]["state"] == "kept"
       and not _rk._btc_kept_due("B4A1"))
+
+
+# MONEY BACK THAT NO RATE CAN CARRY, AFTER THE FORWARD MINED (wire 11). The
+# vault's reconciliation refused it `short`; the agent answered the moved
+# plan's `forwarded`; this end reset the entry's clock and, next window,
+# started the same refused forward again -- a wake a window, for good, the
+# entry never expiring, and "nothing more to check" said each time about
+# money that was not sent on.
+def _open_window(p):
+    p.btc_open["B4A1"]["looked_at"] = time.time() - p.btc_recheck_s - 1
+
+
+_lo, _loj = _fwd_look_started()            # the look saw 100,000 confirmed
+_loe = _lo.btc_open["B4A1"]
+_lo_sent_at = _loe.get("sent_at")
+_lo._btc_forward_result("B4A1", "done", "leftover", 111)
+check("a `leftover` answer to this end's own start: forwarded, HOLDING the "
+      "total that start was made for, its clock not reset, the XMR side the "
+      "next ask", _loe["state"] == "forwarded"
+      and _loe.get("held_conf") == 100000 and _loe.get("held_until") is None
+      and _lo_sent_at and _loe.get("sent_at") == _lo_sent_at
+      and "B4A1" in _lo._btc_sent_set())
+_lo_n = len(_loj)
+for _ in range(6):
+    _open_window(_lo)
+    _lo.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...six recheck windows later, the same money still there: NOT ONE "
+      "more start", len(_loj) == _lo_n and _loe["state"] == "forwarded")
+_open_window(_lo)
+_lo.btc_tick(look=_look_returning("confirmed", conf=150000))
+check("...and a top-up is news: more confirmed than the hold starts the "
+      "forward again", len(_loj) == _lo_n + 1 and "held_conf" not in _loe)
+_lm, _lmj = _fwd_look_started()
+_lm._btc_forward_result("B4A1", "done", "leftover", 111)
+_lm_held = _lm.btc_open["B4A1"].get("held_conf") == 100000
+_open_window(_lm)
+_lm.btc_tick(look=_look_returning("not_seen"))
+check("money LEAVING the address releases the hold it had (nothing there to "
+      "start on)", _lm_held and "held_conf" not in _lm.btc_open["B4A1"]
+      and len(_lmj) == 1)
+_open_window(_lm)
+_lm.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...and money that comes back after that is news again: started",
+      len(_lmj) == 2)
+_lx, _lxj = _fwd_look_started()
+_lx._btc_forward_result("B4A1", "done", "leftover", 111)
+_lx.btc_open["B4A1"]["sent_at"] = (time.time()
+                                   - pg.proto.DEPOSIT_PLACE_TTL_S - 1)
+_lx.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...and a held entry EXPIRES on the forward's own clock (every answer "
+      "used to reset it, so it never did)", "B4A1" not in _lx.btc_open
+      and len(_lxj) == 1)
+# A BARE `forwarded` TO THIS END'S OWN START: an old vault's word for it, or
+# a vault whose server has not seen the money this end's has. Held for a
+# doubling while, not for good -- a lagging server catches up, and a hold
+# without end would strand money it had not seen yet.
+_lb, _lbj = _fwd_look_started()
+_lbe = _lb.btc_open["B4A1"]
+_lb_sent_at = _lbe.get("sent_at")
+_lb._btc_forward_result("B4A1", "done", "forwarded", 111)
+check("a bare `forwarded` answer to this end's own start: held on that total "
+      "for two recheck windows, the clock not reset",
+      _lbe["state"] == "forwarded" and _lbe.get("held_conf") == 100000
+      and abs(float(_lbe.get("held_until") or 0)
+              - (time.time() + 2 * _lb.btc_recheck_s)) < 60
+      and _lbe.get("sent_at") == _lb_sent_at)
+_open_window(_lb)
+_lb.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...inside that while the same money starts nothing", len(_lbj) == 1)
+_lbe["held_until"] = time.time() - 1
+_open_window(_lb)
+_lb.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("NON-VACUITY: ...once it has passed, the same money is asked about "
+      "again -- a server that lagged is not a strand", len(_lbj) == 2)
+_lb._btc_forward_result("B4A1", "done", "forwarded", 111)
+check("...a second bare answer doubles the while (four windows)",
+      _lbe.get("held_tries") == 2
+      and abs(float(_lbe.get("held_until") or 0)
+              - (time.time() + 4 * _lb.btc_recheck_s)) < 60)
+_lbe["held_until"] = time.time() - 1
+_open_window(_lb)
+_lb.btc_tick(look=_look_returning("confirmed", conf=100000))
+_lb._btc_forward_result("B4A1", "done", "sent", 111)
+check("...and a forward that went out clears every hold",
+      len(_lbj) == 3 and _lbe["state"] == "sent"
+      and not any(k in _lbe for k in ("held_conf", "held_until",
+                                      "held_tries")))
+# `leftover` ANSWERING A START THIS END DID NOT MAKE (the recheck of a
+# forward that mined meanwhile): no total to hold yet, so the next look's.
+_lr, _lrs, _lrj = _watch_pager()
+_lr.btc_servers = [("s.onion", 50002, None)]
+_lr.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_lr.limits.headroom = lambda: 9
+_lr._btc_forward_result("B4A1", "done", "sent", 111)
+_lr._btc_forward_result("B4A1", "done", "leftover", 111)
+_lre = _lr.btc_open["B4A1"]
+check("a `leftover` answer to a recheck: forwarded, the hold to be taken at "
+      "the next look", _lre["state"] == "forwarded"
+      and _lre.get("held_conf") == -1)
+for _ in range(3):
+    _open_window(_lr)
+    _lr.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...the next look takes the hold on what it sees and starts nothing, "
+      "nor do the ones after", _lre.get("held_conf") == 100000
+      and _lrj == [])
+check("/balance names a forwarded deposit whose returned money stays there",
+      "some came back and stays there" in _lr._btc_balance_text(111))
+_ln, _lns, _lnj = _watch_pager()
+_ln.btc_open.pop("B4A1", None)
+_ln._btc_forward_result("B4A1", "done", "leftover", 111)
+check("a `leftover` about a deposit this end forgot (a restart) is learned "
+      "back as forwarded, and the next ask is the XMR side's",
+      (_ln.btc_open.get("B4A1") or {}).get("state") == "forwarded"
+      and "B4A1" in _ln._btc_sent_set())
+_lfp, _lfs = _forward_outcome_pager("done", alert_chat=222,
+                                    phase="leftover")
+_lline = pg.proto.PHASE_LINES.get("leftover", "")
+check("a leftover forward: the chat hears the protocol's sentence -- no "
+      "digit, none of the banned words -- and the operator's chat hears once "
+      "that a forward was stopped for another chat",
+      _lline and any(c == 111 and _lline in t for c, t in _lfs)
+      and any(c == 222 and "stopped for a deposit in another chat" in t
+              for c, t in _lfs)
+      and not any(ch.isdigit() for ch in _lline)
+      and not any(w in _lline.lower().replace(".", " ").replace(",", " ")
+                  .replace("—", " ").split() for w in _BANNED_HERE))
 _rg, _rgs, _rgj = _watch_pager()
 _rg.btc_servers = [("s.onion", 50002, None)]
 _rg.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")

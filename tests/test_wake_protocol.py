@@ -1233,6 +1233,20 @@ check("`state_half` is RESERVED in an M2, so no job schema can use the "
 check("WIRE_VERSION was bumped for it: M2 changed SHAPE, so a "
       "half-upgraded pair must fail at the version and not at the ledger",
       P.WIRE_VERSION >= 10)
+# WIRE 11: `leftover` -- money came back after the forward MINED and no fee
+# rate the pair allows carries it on. A word of its own (the Pi holds that
+# money instead of starting the same refused forward every window), in the
+# closed vocabulary the doorbell checks, with one sentence of its own.
+check("`leftover` is a phase word the doorbell knows, with its own sentence: "
+      "no digit, and it says the forward confirmed and the rest stays",
+      P.phase_is_known("leftover") and "leftover" in P.PHASES
+      and "confirmed" in P.PHASE_LINES["leftover"]
+      and "stays there" in P.PHASE_LINES["leftover"]
+      and not any(ch.isdigit() for ch in P.PHASE_LINES["leftover"])
+      and P.PHASE_LINES["leftover"] != P.PHASE_LINES["short"]
+      and P.PHASE_LINES["leftover"] != P.PHASE_LINES["forwarded"])
+check("...and WIRE_VERSION was bumped for it: an old Pi reads the word as "
+      "unknown and says UPDATE BOTH BOXES", P.WIRE_VERSION >= 11)
 
 # LAST LINE BEFORE THE RESULT. fail_loudly_on_crash disarms itself when this
 # is called, so a check BELOW it that DIES prints no RESULT line -- which the

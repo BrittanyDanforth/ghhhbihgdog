@@ -5919,6 +5919,22 @@ for _st in ("delayed", "returned"):
     check(f"a kept plan and this run's '{_st}': 'kept' -- the money sits here "
           "for the operator's hand", _e is None
           and (_bb.result or {}).get("phase") == "kept")
+# MONEY BACK THAT NO RATE CAN CARRY (wire 11): `leftover` once the forward
+# on record is in a block -- where the plan alone said `forwarded` and the
+# Pi started the same refused forward every recheck window. While the
+# record is still in the mempool the plan's `sent` stands (the Pi's recheck
+# must go on until it mines); a kept mark still comes first; and with no
+# plan that moved, it is never said (it says the forward confirmed).
+for _plan_l, _want, _why in (
+        ({**_ACC, "seen_height": 850002}, "leftover", "a mined forward"),
+        ({**_ACC, "seen_height": 0}, "sent", "a forward in the mempool"),
+        ({**_kpl, "seen_height": 850002}, "kept", "a mined forward, kept"),
+        ({"broadcast": False, "broadcast_outcome": None, "seen": False},
+         "", "a rehearsal plan")):
+    _o, _e, _ran, _dd, _bb = _fwd_run_both(_SENT_REC, _SEND_KEY, 2, _plan_l,
+                                           "leftover")
+    check(f"this run's 'leftover' over {_why}: {_want!r}", _e is None
+          and (_bb.result or {}).get("phase") == _want)
 # ONCE SENT, ALWAYS RECONCILED. A kept re-send that every server rejected
 # writes broadcast False on the plan (the pairs rewrite must not count it);
 # when the fresh forward of the same money is then refused on today's fee,
@@ -5943,11 +5959,12 @@ check("a superseded plan whose superseder mined is 'forwarded' and the "
       "record stays sent, whatever the plan's own outcome says",
       _e is None and (_bb.result or {}).get("phase") == "forwarded"
       and _rec_of(_dd).get("forward_sent") is True)
-check("the status-word table maps exactly the five words the forwarder "
+check("the status-word table maps exactly the six words the forwarder "
       "writes, to words the wire knows",
       A._FORWARD_STATUS_PHASE == {"not_seen": "not_yet", "seen": "arriving",
                                   "delayed": "delayed", "short": "short",
-                                  "returned": "returned"}
+                                  "returned": "returned",
+                                  "leftover": "leftover"}
       and all(v in P.PHASES for v in A._FORWARD_STATUS_PHASE.values()))
 # STAGE 6: IN A BLOCK IS ITS OWN WORD. A forward whose plan says the network
 # kept it (seen at a height above 0 -- a reconciliation brings the plan up

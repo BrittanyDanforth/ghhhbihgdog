@@ -3496,7 +3496,7 @@ class Pager:
         # a sent one closes the entry, a "not yet" reopens it, a refusal or
         # a failure stops the automatic path and says so once.
         if job == "forward_to_swap":
-            if out == "failed" or _early == "kept":
+            if out == "failed" or _early in ("kept", "leftover"):
                 # THE RUN DIED -- or the vault KEEPS money that came back
                 # again, which needs a hand at the machine -- and on a bot
                 # serving several people the deposit's own chat is not the
@@ -5378,6 +5378,7 @@ class Pager:
         "sent": "sent on",
         "forwarded": "sent on, confirmed",
         "kept": "came back again, kept there",
+        "leftover": "sent on, confirmed; some came back and stays there",
     }
     #: How long after a forward the vault would not pay for at today's fee
     #: (`delayed`) the watcher tries again, in seconds: --btc-fee-retry.
@@ -5490,7 +5491,7 @@ class Pager:
         """A forward reported for a deposit on the watch list."""
         lock, opened = self._btc()
         with lock:
-            if out == "done" and phase in ("sent", "forwarded"):
+            if out == "done" and phase in ("sent", "forwarded", "leftover"):
                 # LEARNED FROM THE ANSWER, watched or not: the next ask
                 # about this deposit is for the XMR side -- until the
                 # recheck is due (stage 6, _btc_recheck_due).
@@ -5519,7 +5520,8 @@ class Pager:
                 self._btc_sent_set().discard(h)
             e = opened.get(h)
             if (not e and out == "done"
-                    and phase in ("sent", "unsure", "forwarded", "kept")
+                    and phase in ("sent", "unsure", "forwarded", "kept",
+                                  "leftover")
                     and isinstance(h, str) and proto.HANDLE_RE.match(h)
                     and isinstance(chat_id, int)
                     and not isinstance(chat_id, bool)):
@@ -5541,6 +5543,11 @@ class Pager:
                 return
             _was_forwarding = e.get("state") == "forwarding"
             _from_fwd = bool(e.pop("from_forwarded", False))
+            _start_conf = e.pop("start_conf", None)
+            # THIS END'S OWN START OF A FORWARD OF MONEY BACK, answered: the
+            # vault ran over the confirmed total this end saw.
+            _own = _was_forwarding and _from_fwd and isinstance(
+                _start_conf, int) and not isinstance(_start_conf, bool)
             if out == "done":
                 # THE RUN FINISHED: whatever it said, the automatic retries
                 # of a refused or failed forward start over from here.
@@ -5585,6 +5592,56 @@ class Pager:
                 e["recheck_after"] = self._btc_recheck_draw()
                 e.pop("retry_after", None)
                 e.pop("fee_tries", None)
+                self._btc_unhold(e)
+                return
+            if out == "done" and phase == "leftover":
+                # THE FORWARD MINED, AND WHAT CAME BACK SINCE CANNOT BE SENT
+                # ON (wire 11): no fee rate the pair allows carries it. The
+                # vault said `forwarded` for this before -- the plan's word,
+                # the reconciliation's own `short` dropped -- and the next
+                # window's look started the same refused forward again, each
+                # answer resetting the entry's clock: a wake a window, for
+                # good. Now the entry is `forwarded` and HOLDS the confirmed
+                # total this end's start saw: no start again until it
+                # changes (a top-up is news; so is money leaving). An answer
+                # to a start this end did not make (a recheck of a forward
+                # that mined meanwhile, a tap) holds whatever the next look
+                # sees. Its clock is the forward's: already forwarded, it
+                # keeps the one it had, so the entry expires on schedule.
+                if not (_was_forwarding and _from_fwd
+                        and e.get("sent_at")):
+                    e["sent_at"] = time.time()
+                e["state"] = "forwarded"
+                e["word"] = "forwarded"
+                self._btc_unhold(e)
+                e["held_conf"] = _start_conf if _own else -1
+                e.pop("retry_after", None)
+                e.pop("rechecked_at", None)
+                e.pop("fee_tries", None)
+                e.pop("early_tries", None)
+                return
+            if out == "done" and phase == "forwarded" and _own:
+                # THE VAULT RAN OVER MONEY THIS END SAW AND SENT NOTHING, and
+                # said only that the forward on record is in a block: an old
+                # vault's word for `leftover`, or a vault whose server has not
+                # seen the money this end's has. Held on the same total, but
+                # for a doubling while (two recheck windows, then four, eight,
+                # sixteen), not for good -- a lagging server catches up, and
+                # a hold without end would strand money it had not seen yet.
+                # The clock is not reset: the forward that mined is the same.
+                try:
+                    _n = max(0, int(e.get("held_tries") or 0)) + 1
+                except (TypeError, ValueError):
+                    _n = 1
+                e["state"] = "forwarded"
+                e["word"] = phase
+                e["held_conf"] = _start_conf
+                e["held_tries"] = _n
+                e["held_until"] = time.time() + float(
+                    self.btc_recheck_s) * float(2 ** min(_n, 4))
+                e.pop("retry_after", None)
+                e.pop("rechecked_at", None)
+                e.pop("fee_tries", None)
                 return
             if out == "done" and phase == "forwarded":
                 # IN A BLOCK (stage 6): the rechecks end here. Kept on the
@@ -5612,6 +5669,7 @@ class Pager:
                 e["rechecked_at"] = time.time()
                 e.pop("retry_after", None)
                 e.pop("fee_tries", None)
+                self._btc_unhold(e)
                 return
             if out == "done" and phase == "returned":
                 if not e.get("addr"):
@@ -5629,6 +5687,7 @@ class Pager:
                 e.pop("retry_after", None)
                 e.pop("rechecked_at", None)
                 e.pop("fee_tries", None)
+                self._btc_unhold(e)
                 if _was_forwarding:
                     # ...AND IF THIS END STARTED IT, THE EARLY WAIT: the
                     # vault found the money unsettled where this end saw
@@ -5848,6 +5907,13 @@ class Pager:
         e["fee_tries"] = tries
         return float(self.btc_fee_retry_s) * float(
             2 ** min(tries - 1, int(self.FEE_RETRY_DOUBLINGS)))
+
+    @staticmethod
+    def _btc_unhold(e) -> None:
+        """Forget a hold on money the vault already answered for (the
+        forwarded look's `held_conf`, wire 11)."""
+        for _k in ("held_conf", "held_until", "held_tries"):
+            e.pop(_k, None)
 
     def _btc_early_wait(self, e) -> None:
         """The wait after a forward this end started that the vault found
@@ -6201,6 +6267,24 @@ class Pager:
                 # its figures are the deposit's, not what came back.
                 # What starts is said as a first payment is; the vault's
                 # answer (sent, kept, ...) takes it from there.
+                # ...NOT AGAIN FOR THE SAME MONEY (wire 11). The vault
+                # answered this confirmed total already: `leftover` (no rate
+                # carries it) holds it until it changes; a bare `forwarded`
+                # to this end's own start holds it for a doubling while. A
+                # hold set by an answer this end did not start is taken on
+                # what this look sees. Any change -- a top-up, money leaving
+                # -- is news, and releases it.
+                _held = e.get("held_conf")
+                if isinstance(_held, int) and not isinstance(_held, bool):
+                    if _held < 0:
+                        e["held_conf"] = conf
+                        return
+                    if conf == _held and (
+                            e.get("held_until") is None
+                            or time.time() < float(e["held_until"])):
+                        return
+                    if conf != _held:
+                        self._btc_unhold(e)
                 if (state != "confirmed" or conf <= 0
                         or conf < int(self.deposit_min_sat or 0)):
                     return
@@ -6216,8 +6300,10 @@ class Pager:
                 e["state"] = "forwarding"
                 # ...REMEMBERED ON THE ENTRY, for the answer: a `delayed`
                 # puts it back to `forwarded` (looked at once a window),
-                # not `seen` (looked at every tick).
+                # not `seen` (looked at every tick); a `leftover` or a bare
+                # `forwarded` holds the total this start was made for.
                 e["from_forwarded"] = True
+                e["start_conf"] = conf
                 e["said"].discard("confirmed")
                 self._btc_sent_set().discard(h)
                 # (No "btc_returned_seen" on the chain: the poke that
@@ -6394,6 +6480,7 @@ class Pager:
                 # the next window tries again.
                 e["state"] = "forwarded" if _from_forwarded else "seen"
                 e.pop("from_forwarded", None)
+                e.pop("start_conf", None)
 
     #: The watcher's wake, when each address keeps its own schedule: a
     #: tick looks at one due address at most, so it wakes often and at
@@ -6491,7 +6578,12 @@ class Pager:
                 _cn = self._label(cid, h)
             except BaseException:                            # noqa: BLE001
                 _cn = "?"                        # never the bare handle
-            lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(e['state'], e['state'])}")
+            # A FORWARDED DEPOSIT HOLDING MONEY THAT STAYS (a `leftover`
+            # hold: no end to it) says so, not "sent on, confirmed" alone.
+            _st = ("leftover" if e["state"] == "forwarded"
+                   and e.get("held_conf") is not None
+                   and e.get("held_until") is None else e["state"])
+            lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(_st, _st)}")
         return "\n".join(lines)
 
     def _working_line(self, job: str, params: dict, how: str) -> str:
