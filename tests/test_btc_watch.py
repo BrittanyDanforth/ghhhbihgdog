@@ -300,6 +300,7 @@ for _label, _bad in [
         ("tx_hash that is not 64 hex chars", [_u(1, 5, "zz" * 32)]),
         ("tx_hash too short", [_u(1, 5, "ab" * 31)]),
         ("tx_pos negative", [_u(1, 5, _H, -1)]),
+        ("tx_pos wider than the wire's four bytes", [_u(1, 5, _H, 2 ** 32)]),
         ("a missing field", [{"tx_hash": _H, "height": 1, "value": 5}]),
         ("an entry that is not an object", [7]),
         ("a reply that is not a list", {"tx_hash": _H}),
@@ -1270,11 +1271,15 @@ check("a four-element server spec is refused",
 for _mc in (0, -1, True, "1", 1.0):
     check(f"min_conf={_mc!r} is refused: an unconfirmed deposit is never "
           f"settled money", _refused(_look, _FakeTransport(), min_conf=_mc))
-for _to in (float("inf"), float("nan"), "abc", None, 0, -1, True):
+for _to in (float("inf"), float("nan"), "abc", None, 0, -1, True, 1e10,
+            W.MAX_TIMEOUT + 1):
     check(f"timeout={_to!r} is refused up front through the module's error "
-          f"(inf/nan used to escape from the socket layer)",
-          _refused(W.look, _A0, _SERVERS, _PROXY, timeout=_to,
-                   transport_factory=_counting))
+          f"(inf/nan, and a finite 1e10, used to escape from the socket "
+          f"layer)", _refused(W.look, _A0, _SERVERS, _PROXY, timeout=_to,
+                              transport_factory=_counting))
+check("timeout at the ceiling is fine",
+      W.look(_A0, _SERVERS, _PROXY, timeout=W.MAX_TIMEOUT,
+             transport_factory=_one(_FakeTransport()))["state"] == "not_seen")
 check("timeout=1 (an int) is fine",
       W.look(_A0, _SERVERS, _PROXY, timeout=1,
              transport_factory=_one(_FakeTransport()))["state"] == "not_seen")
@@ -1422,9 +1427,53 @@ check("...and the result key is absent when no fee was asked for",
 check("Electrum's -1 ('no estimate') is None, never 0 and never a refusal "
       "of the look itself: the caller decides",
       _look(_FakeTransport(fee_reply=-1), fee_blocks=3)["fee_sat_vb"] is None)
-check("a junk fee reply (string, dict, bool) is None too",
+check("...and so is any number at or under 0: no estimate, not a free one",
       all(_look(_FakeTransport(fee_reply=v), fee_blocks=3)["fee_sat_vb"]
-          is None for v in ("abc", {"x": 1}, True)))
+          is None for v in (0, -2, -1.0)))
+# A JUNK FEE REPLY IS A MALFORMED REPLY, not "no estimate". Read as None,
+# it ended the look successfully on the leading server -- which leads every
+# retry of that address -- and the forward was `delayed` for as long as
+# that server answered junk. (This check used to pin the junk as None.)
+check("a junk fee reply (string, dict, bool, null, list, NaN) is refused "
+      "like any malformed reply: with no other server, the look refuses",
+      all(_refused(_look, _FakeTransport(fee_reply=v), fee_blocks=3)
+          for v in ("abc", {"x": 1}, True, None, [0.0001], float("nan"))))
+# TWO SERVERS: the leader answers the look but has no estimate (its node
+# has none), the other has one.
+_S2 = [("s1.onion", 50002), ("s2.onion", 50002)]
+_lead = W.server_order(_S2, W.address_to_scripthash(_A0))[0][0]
+_other = [h for h, _p in _S2 if h != _lead][0]
+
+
+def _two(lead_fee, other_fee, other_utxos=()):
+    fts = {_lead: _FakeTransport(utxos=[_u(_TIP, 7000)], fee_reply=lead_fee),
+           _other: _FakeTransport(utxos=list(other_utxos),
+                                  fee_reply=other_fee)}
+    r = W.look(_A0, _S2, _PROXY, fee_blocks=3,
+               transport_factory=lambda host, port, tag: fts[host])
+    return r, fts
+
+
+_r, _fts = _two(-1, 0.00002)
+check("the leader has no estimate: its picture is kept and the OTHER server's "
+      "estimate is used", _r["server"] == _lead and _r["fee_sat_vb"] == 2
+      and _r["settled_sat"] == 7000)
+check("...and the other server is asked for the estimate ONLY -- never "
+      "listunspent, never the scripthash",
+      _fts[_other].methods == ["server.version", "blockchain.estimatefee"]
+      and all(_SCRIPTHASH not in json.dumps(q)
+              for q in _fts[_other].requests))
+_r, _fts = _two("junk", 0.00003)
+check("a leader answering junk is failed over like any malformed reply: the "
+      "look is the other server's, with its estimate",
+      _r["server"] == _other and _r["fee_sat_vb"] == 3)
+_r, _fts = _two(-1, -1)
+check("nobody configured has an estimate: the leader's picture, fee None",
+      _r["server"] == _lead and _r["fee_sat_vb"] is None)
+_r, _fts = _two(0.00002, 0.00009)
+check("NON-VACUITY: a leader WITH an estimate is the whole answer; the other "
+      "server is never contacted", _r["fee_sat_vb"] == 2
+      and _fts[_other].methods == [])
 check("fee_blocks out of range is refused up front",
       all(_refused(_look, _FakeTransport(), fee_blocks=v)
           for v in (0, 1009, True, "3", 1.0)))

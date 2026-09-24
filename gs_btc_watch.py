@@ -47,10 +47,14 @@ source"):
     of one address reuses that address's circuit -- a retry is not a new fact
     to leak. A proxy URL that already carries a credential is REFUSED rather
     than used as-is: it would put every address on one circuit, silently.
-  * NO SINGLE SERVER SEES EVERY ADDRESS. With several servers configured,
-    each address starts at a server chosen by its own scripthash and fails
-    over from there, so one third party collects a share of the set, never
-    all of it.
+  * NO SINGLE SERVER SEES EVERY ADDRESS -- WHILE THEY ALL ANSWER. With
+    several servers configured, each address starts at a server chosen by
+    its own scripthash and fails over from there, so one third party
+    collects a share of the set. A server that is down hands its share to
+    the next one for as long as it is down: with one of two servers dead,
+    the other is asked about every address. Rests on no secret -- the
+    rotation is public and computable -- it only spreads the set while the
+    servers are up.
   * What isolation CANNOT hide: behaviour. Every connection speaks the same
     three read-only calls and hangs up, and announces a stock wallet's
     version string; a server that fingerprints by behaviour can still
@@ -113,6 +117,10 @@ DEFAULT_ELECTRUM_PORT = 50002
 #: TLS, every request and reply. A deadline, not a per-read timeout, so a
 #: server that drips one byte at a time cannot hold the watcher for ever.
 DEFAULT_TIMEOUT = 30.0
+#: The longest one server's exchange may be given. A finite but huge value
+#: passed the check above it and escaped the socket layer as an
+#: OverflowError traceback -- neither a refusal nor a failover.
+MAX_TIMEOUT = 3600.0
 #: server.version identity: the string a stock Electrum wallet of a widely
 #: deployed release announces, so this badge is one shared with a crowd. A
 #: bare or invented name would be a fingerprint that survives every circuit.
@@ -289,6 +297,11 @@ def summarize(utxos, tip, min_conf):
         # the same output and counts once.
         if value > 21_000_000 * 100_000_000:
             raise BtcWatchError("electrum: bad listunspent entry (value)")
+        # ...NOR AN OUTPUT INDEX WIDER THAN THE WIRE'S FOUR BYTES: taken
+        # here, the builder refused it at signing on every retry, behind
+        # the same leading server; refused here, the look fails over.
+        if vout > 0xFFFFFFFF:
+            raise BtcWatchError("electrum: bad listunspent entry (fields)")
         _op = (txid.lower(), vout)
         if _op in seen:
             continue
@@ -789,8 +802,11 @@ class Electrum:
         return self._await(self._send(method, params))
 
     def handshake(self):
-        # Best effort: some servers require server.version first, some ignore
-        # it. Its failure is not our failure -- the next call decides that.
+        # Best effort: some servers require server.version first, some
+        # answer it with an error. An ERROR is tolerated -- the next call
+        # decides. A server that never answers it at all is not: the wait
+        # for the reply uses up the session's one deadline, the next call
+        # finds none left, and the look fails over to the next server.
         try:
             self._rpc("server.version", [CLIENT_NAME, PROTOCOL_VERSION])
         except BtcWatchError:
@@ -828,7 +844,20 @@ class Electrum:
                 or not 1 <= blocks <= 1008:
             raise BtcWatchError("fee target must be 1..1008 blocks")
         r = self._rpc("blockchain.estimatefee", [blocks])
-        return electrum_fee_to_sat_vb(r)
+        # NO ESTIMATE is a number at or under 0 (Electrum answers -1 while
+        # its node has none). ANYTHING ELSE that is not a positive number
+        # -- a string, null, a list, a bool, NaN -- is a MALFORMED reply,
+        # refused like any other, so look() fails over: read as "no
+        # estimate", it ended the look successfully on the leading server,
+        # whose rotation leads every retry, and the forward was `delayed`
+        # for as long as that server answered junk.
+        if isinstance(r, (int, float)) and not isinstance(r, bool) \
+                and math.isfinite(r) and r <= 0:
+            return None
+        sat = electrum_fee_to_sat_vb(r)
+        if sat is None:
+            raise BtcWatchError("electrum: bad fee estimate")
+        return sat
 
 
 # --- the answer the caller wants --------------------------------------------
@@ -868,7 +897,9 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
     With `fee_blocks` set, the same session also asks the server's fee
     estimate for that confirmation target (the forwarder needs both the
     outputs and a rate, and one circuit is one fact fewer to leak); the
-    result then carries `fee_sat_vb`, None when the server has no estimate.
+    result then carries `fee_sat_vb`. When the server that answered the
+    look has no estimate, the others are asked for one (estimatefee only,
+    never the scripthash); None only when no configured server has one.
     Returns
         {state, confirmed_sat, unconfirmed_sat, settled_sat, confirmations,
          utxos, tip, server, cert_sha256[, fee_sat_vb]}
@@ -888,9 +919,9 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
                                    or not 1 <= fee_blocks <= 1008):
         raise BtcWatchError("fee_blocks must be None or an int in 1..1008")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
-            or not math.isfinite(timeout) or timeout <= 0:
-        raise BtcWatchError("timeout must be a finite, positive number of "
-                            "seconds")
+            or not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT:
+        raise BtcWatchError(f"timeout must be a positive number of seconds, "
+                            f"at most {MAX_TIMEOUT}")
     order = server_order(servers, scripthash)
     tag = "btcwatch:" + address       # one circuit per address; see the header
     if transport_factory is None:
@@ -898,6 +929,15 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
         # not a failover per configured server.
         _socks_parts(proxy_url, tag)
     last = None
+    # THE PICTURE, KEPT WHILE THE REST ARE ASKED FOR AN ESTIMATE ONLY: a
+    # leading server with no fee estimate (its node has none -- after a
+    # restart, on a quiet chain) ended the look, and the forward was
+    # `delayed` for as long as it lacked one, every retry led by the same
+    # server while a second configured server that had one was never
+    # asked. The others are asked server.version and estimatefee and
+    # nothing else -- never the scripthash -- so the rotation still hands
+    # no server more of the address set than its share.
+    kept = None
     for host, port, pin in order:
         if transport_factory is not None:
             transport = transport_factory(host, port, tag)
@@ -907,6 +947,12 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
         try:
             with Electrum(transport) as e:
                 e.handshake()
+                if kept is not None:
+                    fee = e.estimate_fee(fee_blocks)
+                    if fee is not None:
+                        kept["fee_sat_vb"] = fee
+                        return kept
+                    continue
                 tip = e.tip_height()
                 picture = summarize(e.listunspent(scripthash), tip, min_conf)
                 if fee_blocks is not None:
@@ -923,7 +969,12 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
         picture["tip"] = tip
         picture["server"] = host
         picture["cert_sha256"] = getattr(transport, "cert_sha256", None)
+        if fee_blocks is not None and picture["fee_sat_vb"] is None:
+            kept = picture
+            continue
         return picture
+    if kept is not None:
+        return kept           # nobody configured has an estimate: None
     # Our own reasons are safe to repeat; anything else is named by class
     # only, so no socket or TLS text about a peer travels with the error.
     why = str(last) if isinstance(last, BtcWatchError) \

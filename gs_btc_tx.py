@@ -40,6 +40,7 @@ and the rules that keep money from going wrong are stated where they bite:
 Nothing here logs, prints, or touches the hash chain.
 """
 import sys
+import unicodedata
 from decimal import Decimal
 from pathlib import Path
 
@@ -417,10 +418,18 @@ def account_from_mnemonic(mnemonic, network="main", passphrase="",
             or not 0 <= account <= MAX_ACCOUNT:
         raise BtcTxError(f"account must be an int in 0..{MAX_ACCOUNT}")
     net = network_of(network)
-    words = " ".join(str(mnemonic).split())
+    # NFKD, AS BIP39 DEFINES THE SALT: "mnemonic" + NFKD(passphrase), and
+    # the words the same. embit encodes what it is given as it is, and a
+    # passphrase typed on a keyboard is NFC -- "über", "café" -- so a seed
+    # and passphrase exactly as the wallet that exported the xpub has
+    # them derived another account: every deposit refused with "another
+    # passphrase" as the reason. NFKD is idempotent: a passphrase already
+    # entered decomposed derives what it always did.
+    words = " ".join(unicodedata.normalize("NFKD", str(mnemonic)).split())
     if not bip39.mnemonic_is_valid(words):
         raise BtcTxError("the seed is not a valid BIP39 mnemonic")
-    seed = bip39.mnemonic_to_seed(words, str(passphrase or ""))
+    seed = bip39.mnemonic_to_seed(
+        words, unicodedata.normalize("NFKD", str(passphrase or "")))
     root = bip32.HDKey.from_seed(seed, version=net["xprv"])
     return root.derive([BIP84_PURPOSE + _HARDENED,
                         int(net["bip32"]) + _HARDENED,

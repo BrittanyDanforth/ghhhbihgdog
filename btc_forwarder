@@ -102,13 +102,14 @@ seed.
 """
 import argparse
 import json
+import math
 import os
 import re
 import secrets
 import sys
 sys.dont_write_bytecode = True   # no __pycache__: its mtimes date the first run
 import time
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal, localcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -243,6 +244,9 @@ BUMP_WINDOW = _bump_window
 #: The slippage the arrival watcher accepts, mirrored from
 #: thor_swap_preparer.ARRIVAL_TOLERANCE so the two gates cannot drift.
 ARRIVAL_TOLERANCE = Decimal("0.10")
+#: More Monero than will ever exist (~18.4 million, plus 0.6 a block): a
+#: quote above it is not a price (validate_expected).
+XMR_QUOTE_MAX = Decimal(10 ** 9)
 #: The most bytes a scriptPubKey ThorChain could give us has (P2WSH or
 #: P2TR); declared in gs_btc_tx so the vault's deposit floor and this
 #: tool's fee bound are built from one figure.
@@ -614,7 +618,11 @@ def fetch_quote(send_sat, dest_xmr, proxy_url):
         raise Refused("quote_failed",
                       f"the quote could not be fetched ({type(e).__name__})")
     routes = resp.get("routes", []) if isinstance(resp, dict) else []
-    if not routes or not isinstance(routes[0], dict):
+    # A LIST, BEFORE IT IS INDEXED: `routes` is whatever JSON the host that
+    # answered chose, and 5, true or {"x": 1} raised TypeError / KeyError
+    # here -- a traceback and a bare exit 1 with no kind on the chain.
+    if not isinstance(routes, list) or not routes \
+            or not isinstance(routes[0], dict):
         raise Refused("no_route", "the aggregator returned no swap route")
     inbound, memo, expected = parse_swap_route(routes[0])
     return inbound, memo, expected
@@ -740,9 +748,21 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
                       "units; no floor can be written")
     # ...LESS A LITTLE (LIMIT_JITTER), so the limit written is not the
     # margin times anything either: at most LIMIT_JITTER_MAX base units
-    # and 1% of the floor, never below 1.
-    floor = max(1, floor - int(LIMIT_JITTER(min(LIMIT_JITTER_MAX,
-                                                floor // 100))))
+    # and 1% of the floor -- AND NEVER UNDER THE WORST ARRIVAL. With the
+    # margin drawn at the tolerance the floor already sits at the worst
+    # arrival, and the jitter took it up to 5,000 units below: a swap
+    # executed in that band, and the watcher read it as `short` by the
+    # memo's own doing, which the margin's ceiling was there to prevent.
+    # The line is the watcher's own -- expected * (1 - tolerance), exact
+    # (receive_watch calls a payment complete once the arrival clears it)
+    # -- not the quantized worst, which can round under it; and the draw
+    # is clamped to its cap, for a jitter that ignores its argument.
+    worst_units = int((max(worst_xmr, expected_xmr * (1 - ARRIVAL_TOLERANCE))
+                       * Decimal(10 ** 8)).to_integral_value(
+                           rounding=ROUND_CEILING))
+    floor = max(floor, worst_units)
+    _jcap = max(0, min(LIMIT_JITTER_MAX, floor // 100, floor - worst_units))
+    floor = max(1, floor - min(max(0, int(LIMIT_JITTER(_jcap))), _jcap))
     ceiling = int(expected_xmr * Decimal(10 ** 8))
     if quoted > ceiling:
         raise Refused("memo_bad_limit",
@@ -799,10 +819,23 @@ def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
         raise Refused("expected_unreadable",
                       "the quote's expected Monero is missing or not a "
                       "positive number (a route field name may have changed)")
-    worst = (exp * (1 - ARRIVAL_TOLERANCE)).quantize(Decimal("0.000001"))
+    # MORE MONERO THAN EXISTS IS NOT A PRICE. Rests on no secret: it stops
+    # an aggregator's absurd figure before the arithmetic below -- 1e23
+    # overflowed the 28-digit quantize into an uncaught InvalidOperation,
+    # a traceback with no kind on the chain -- and before a limit is
+    # written from it that no swap could meet (a certain refund).
+    if exp > XMR_QUOTE_MAX:
+        raise Refused("expected_unreadable",
+                      "the quote's expected Monero is more than exists; no "
+                      "real route answers that")
+    with localcontext() as _ctx:
+        _ctx.prec = 80            # finite_decimal bounds the exponent to 30
+        worst = (exp * (1 - ARRIVAL_TOLERANCE)).quantize(Decimal("0.000001"))
+        needed = None
+        if min_out_xmr is not None:
+            needed = (min_out_xmr / (1 - ARRIVAL_TOLERANCE)).quantize(
+                Decimal("0.000001"))
     if min_out_xmr is not None and worst < min_out_xmr:
-        needed = (min_out_xmr / (1 - ARRIVAL_TOLERANCE)).quantize(
-            Decimal("0.000001"))
         raise Refused("below_mix_minimum",
                       f"this swap would deliver about {exp} XMR and after "
                       f"the {int(ARRIVAL_TOLERANCE * 100)}% slippage the "
@@ -1804,6 +1837,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         for _i0 in (_p0.get("inputs") or []):
             if isinstance(_i0, dict) and _i0.get("tx_hash"):
                 _keep.add(str(_i0["tx_hash"]).lower())
+        # ...AND WHAT FUNDED THE KEPT AND THE HAND-MOVED OUTPUTS: pushed off
+        # the window by a flood, a hand move of them was listed with no
+        # inputs, matched no kept outpoint, and read as a foreign spend --
+        # "the seed has leaked" -- on every run until it left the window.
+        _rk0 = _p0.get("returned_kept")
+        for _t0, _v0 in (_pairs((_rk0 or {}).get("outpoints")
+                                if isinstance(_rk0, dict) else None)
+                         | _pairs(_p0.get("returned_moved"))):
+            _keep.add(str(_t0).lower())
     try:
         _res = bcast_spends(address, servers, args.tor_proxy,
                             network=args.network, timeout=args.timeout,
@@ -2465,6 +2507,34 @@ def main(argv=None):
                            or args.seen_interval <= 0):
         raise Refused("bad_args", "--quote-max-age must be >= 1, "
                       "--seen-wait >= 0, --seen-interval > 0")
+    # FINITE, AND IN RANGE, BEFORE ANYTHING RUNS: NaN passed every `< 0`
+    # and `<= 0` above -- --seen-interval nan reached time.sleep AFTER the
+    # transaction was sent (a traceback, no plan written, the bytes lost),
+    # --seen-wait inf polled for ever after the send -- and a timeout of
+    # 1e10 escaped the socket layer as an OverflowError.
+    if not (math.isfinite(args.seen_wait) and 0 <= args.seen_wait <= 3600
+            and math.isfinite(args.seen_interval)
+            and 0 < args.seen_interval <= 3600):
+        raise Refused("bad_args", "--seen-wait must be 0..3600 and "
+                      "--seen-interval above 0, at most 3600, both finite")
+    if not (math.isfinite(args.timeout)
+            and 0 < args.timeout <= watch.MAX_TIMEOUT):
+        raise Refused("bad_args", f"--timeout must be above 0 and at most "
+                      f"{watch.MAX_TIMEOUT:g} seconds")
+    # AN EXPLICIT RATE IS A RATE: 0 was read as "none given" and the
+    # server's estimate paid without a word; a negative one was refused as
+    # a bad ESTIMATE, blamed on the server, and written `delayed`.
+    if args.feerate_sat_vb is not None and args.feerate_sat_vb < 1:
+        raise Refused("bad_args", "--feerate-sat-vb must be at least 1")
+    # A PLAN NAMED <stem>.json: the rotation, the chain, the status word and
+    # the signed record are all named from that stem, and a name without
+    # it rotated plans out of the chain -- our own forward then read as a
+    # stranger's spend.
+    if not str(args.outfile).endswith(".json") \
+            or str(args.outfile).endswith(("/.json", ".status.json",
+                                           ".signed.json")) \
+            or str(args.outfile) == ".json":
+        raise Refused("bad_args", "--outfile must be a <name>.json file")
     if args.bump_after < 0:
         raise Refused("bad_args", "--bump-after cannot be negative")
     if args.returns_max < 0:
@@ -2559,6 +2629,15 @@ def main(argv=None):
     # host-privacy pass): the Tor check is the first request of every
     # forward, and it shared Tor's default circuit with any other
     # uncredentialed stream on the box.
+    # THE CONSTANT-TIME BACKEND, BEFORE ANYTHING: a run that will sign
+    # asks first, not in build_and_sign after the look, the quote and a
+    # derivation from the seed on the variable-time curve -- the timing
+    # channel the refusal exists to avoid, taken on the way to it.
+    if not args.plan_only:
+        try:
+            btx.require_native()
+        except btx.BtcTxError as e:
+            raise Refused("backend_refused", str(e))
     verify_tor(isolated_proxy(args.tor_proxy, "forward:verify"))
     integrity_log("forward", "start")
 

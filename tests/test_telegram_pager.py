@@ -6316,6 +6316,41 @@ check("...and a watcher whose every look fails for LOOK_FAIL_WARN_TICKS "
       and "no circuit" not in _lf_out.getvalue())
 _lf.btc_tick(look=_look_returning("not_seen"))
 check("...and one answer resets the count", _lf._look_fail_ticks == 0)
+# A PINNED SERVER'S MISMATCH, WHILE OTHER LOOKS ANSWER: counted as one more
+# failure, it was never said -- the line above needs EVERY look to fail --
+# and the addresses that start at that server went unwatched in silence.
+_pm, _pms, _pmj = _watch_pager()
+_pm.btc_servers = [("a.example", 50002, "ab" * 32),
+                   ("b.example", 50002, "cd" * 32)]
+_pm.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_ADDR_OK = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+_pm._btc_register("B4A5", _ADDR_OK, 111)
+_W = __import__("gs_btc_watch")
+
+
+def _pin_look(addr, servers, proxy, **kw):
+    if addr == _BTC_ADDR:
+        raise _W.PinMismatch("certificate mismatch")
+    return _look_returning("not_seen")(addr, servers, proxy, **kw)
+
+
+_pm_kinds, _saved_pm_il = [], pg.integrity_log
+pg.integrity_log = lambda stage, kind, *a, **k: _pm_kinds.append(kind)
+_pm_out = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_pm_out):
+        for _ in range(_pm.LOOK_FAIL_WARN_TICKS + 3):
+            for _e in _pm.btc_open.values():
+                _e.pop("look_after", None)
+            _pm.btc_tick(look=_pin_look)
+finally:
+    pg.integrity_log = _saved_pm_il
+check("a pinned server's certificate mismatch while another address answers "
+      "is said ONCE at the terminal and once on the chain, the class only",
+      _pm_out.getvalue().count("does not match its pin") == 1
+      and _pm_kinds.count("pin_mismatch") == 1
+      and "a.example" not in _pm_out.getvalue()
+      and "certificate mismatch" not in _pm_out.getvalue())
 
 print("\n-- the floor the pairing carried (the MED pass) --")
 # The wizard took any deposit down to the wire's floor unless the operator

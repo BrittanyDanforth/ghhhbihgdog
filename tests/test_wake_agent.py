@@ -6346,6 +6346,25 @@ check("a BTC-intake deposit with NO seed in the environment: refused "
       _c == "btc_seed_unset" and _runs4s == [] and _asked == []
       and "btc_seed_unset" in _kinds
       and not (_d4s / A.HANDLES_FILE).exists())
+# ...AND THE CONSTANT-TIME BACKEND IS THERE: the forward refuses to sign
+# without it, so an address issued on a machine without it holds the
+# client's money until someone installs the package.
+_curve_ag = __import__("embit.util.secp256k1", fromlist=["NATIVE"])
+_saved_ag = (_curve_ag.NATIVE, _curve_ag.BACKEND)
+_curve_ag.NATIVE, _curve_ag.BACKEND = False, "python"
+# (its own ledger and runner: were it to issue the address, the checks
+# after it must not inherit a child run and a recorded deposit)
+_d4n, _runs4n, _run4n = _btc_env("btc4n_")
+try:
+    _o, _c, _asked, _kinds = _btc_dispatch(_d4n, _run4n, "B4SN", True)
+finally:
+    _curve_ag.NATIVE, _curve_ag.BACKEND = _saved_ag
+check("a BTC-intake deposit on a machine WITHOUT the constant-time "
+      "libsecp256k1: refused btc_backend_missing before any child runs -- no "
+      "address asked about, nothing recorded, kind on the chain",
+      _c == "btc_backend_missing" and _runs4n == [] and _asked == []
+      and "btc_backend_missing" in _kinds
+      and not (_d4n / A.HANDLES_FILE).exists())
 _o, _c, _asked, _kinds = _btc_dispatch(
     _d4s, _run4s, "B4S2", True,
     seed="zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong")

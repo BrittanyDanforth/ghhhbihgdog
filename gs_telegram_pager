@@ -5961,6 +5961,7 @@ class Pager:
                     >= self._btc_recheck_after(e)]
         _failed = _answered = 0
         _why = ""
+        _pin = False
         for h, e in snapshot:
             try:
                 if look is None:
@@ -5972,9 +5973,30 @@ class Pager:
             except Exception as ex:                          # noqa: BLE001
                 _failed += 1
                 _why = type(ex).__name__
+                import gs_btc_watch as _wm
+                if isinstance(ex, _wm.PinMismatch):
+                    _pin = True
                 continue
             _answered += 1
             self._btc_apply(h, r)
+        # A PINNED SERVER THAT PRESENTED ANOTHER CERTIFICATE (an
+        # interception, or a certificate renewed and not repinned) is not
+        # a bad circuit: look() will not route around it, by design, so
+        # every address whose rotation starts there goes unwatched until
+        # it is repinned or removed. It was counted as one more failure,
+        # and the only line below needs EVERY look to fail -- so while any
+        # other address answered, a share of the open deposits was never
+        # looked at and nobody was told a mismatch had been seen. Said
+        # once per process, whatever the other looks did; the class only,
+        # no host.
+        if _pin and not getattr(self, "_pin_warned", False):
+            self._pin_warned = True
+            print("  [!] a pinned --btc-electrum server presented a "
+                  "certificate that does not match its pin (an "
+                  "interception, or a renewed certificate): the addresses "
+                  "that start at it are NOT being watched until it is "
+                  "repinned or removed.")
+            integrity_log("pager", "pin_mismatch")
         # A WATCHER WHOSE EVERY LOOK FAILS SAYS SO, ONCE (the review of
         # stages 2-6): each failure was swallowed, which is right for one
         # bad circuit and wrong for a watcher that can never look -- a

@@ -2484,6 +2484,21 @@ def _prove_btc_seed(key: dict) -> None:
             "was issued: the forward could never sign for it. Nothing was "
             f"published. Set GS_BTC_SEED{_set_in()}, at the machine."
             + _reseal_hint("GS_BTC_SEED"))
+    # THE CONSTANT-TIME BACKEND, BEFORE ANY ADDRESS: the forward refuses
+    # to sign without the system libsecp256k1, so an address issued on a
+    # machine without it holds the client's money until someone installs
+    # the package -- and the proof below would derive from the seed on the
+    # variable-time curve. Asked before the seed is touched.
+    try:
+        _btx.require_native()
+    except _btx.BtcTxError:
+        integrity_log("wake", "btc_backend_missing")
+        raise Refused(
+            "btc_backend_missing",
+            "this machine has no constant-time libsecp256k1 (the "
+            "libsecp256k1-1 package), so no deposit address was issued: the "
+            "forward refuses to sign without it and could never send what "
+            "landed there. Nothing was published. Install it at the machine.")
     account_no = _btc_setting(key, "btc_account", 0, 0, 2 ** 31 - 1)
     account = None
     try:

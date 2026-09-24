@@ -950,6 +950,56 @@ _r("inbound_wrong_network", Net(inbound="1BitcoinEaterAddressDontSendf59kuE"))
 _r("bad_inbound", Net(inbound=_INBOUND[:-1] + "x"))
 _r("bad_inbound", Net(inbound=""))
 _r("no_route", Net(routes=[]))
+# `routes` IS WHATEVER JSON THE HOST CHOSE: 5, true, an object or a float
+# were indexed before their type was looked at -- a TypeError/KeyError
+# traceback and a bare exit 1, with no kind on the chain.
+# (A traceback here is the defect itself; caught, so it fails THIS check
+# instead of ending the suite before every check after it.)
+
+
+def _r_nocrash(name, net, *extra, **kw):
+    try:
+        return _r(name, net, *extra, **kw)
+    except Exception as _ex:                                  # noqa: BLE001
+        check(f"{name}: refused by kind, not a traceback "
+              f"({type(_ex).__name__})", False)
+
+
+for _bad in (5, True, {"x": 1}, 3.5):
+    _r_nocrash("no_route", Net(routes=_bad))
+# MORE MONERO THAN EXISTS IS NOT A PRICE: 1e23 overflowed the 28-digit
+# quantize into an uncaught InvalidOperation, with or without an oracle.
+for _big in ("1e23", "99999999999999999999999.5", "1e30", "2e9"):
+    _r_nocrash("expected_unreadable",
+               Net(expected=_big, memo="=:XMR.XMR:" + _DEST + ":0/1/0"))
+    _r_nocrash("expected_unreadable",
+               Net(expected=_big, oracle=None,
+                   memo="=:XMR.XMR:" + _DEST + ":0/1/0"))
+try:
+    _mo_kind = _refusal(Net(), "--min-out-xmr", "1e25")[3]
+except Exception as _ex:                                      # noqa: BLE001
+    _mo_kind = type(_ex).__name__
+check("...and an operator --min-out-xmr far past the supply refuses by kind, "
+      "not a traceback", _mo_kind == "below_mix_minimum")
+# ARGUMENTS ARE REFUSED BEFORE ANYTHING RUNS. NaN passed every `< 0` and
+# `<= 0`: --seen-interval nan reached time.sleep AFTER the send, a finite
+# 1e10 timeout escaped the socket layer, --feerate-sat-vb 0 was read as
+# "none given", and a negative one was blamed on the server as `delayed`.
+for _flags in (("--seen-interval", "nan"), ("--seen-wait", "inf"),
+               ("--seen-wait", "nan"), ("--seen-wait", "3601"),
+               ("--timeout", "1e10"), ("--timeout", "nan"),
+               ("--feerate-sat-vb", "0"), ("--feerate-sat-vb", "-5")):
+    _nA = Net()
+    _cA, _oA, _pA, _kA = _refusal(_nA, *_flags)
+    check(f"{' '.join(_flags)}: refused bad_args before the look",
+          _cA == 2 and _kA == "bad_args" and _nA.look_calls == [])
+for _of_bad in ("fwd.plan", "fwd", "x.status.json", "x.signed.json"):
+    _nO = Net()
+    _cO, _oO, _pO, _kO = _refusal(
+        _nO, outfile=os.path.join(_scratch, _of_bad))
+    check(f"--outfile {_of_bad}: refused bad_args (the chain, the status word "
+          "and the signed record are named from a <name>.json stem)",
+          _cO == 2 and _kO == "bad_args" and _nO.look_calls == [])
 _r("quote_failed", Net(post_error=OSError("down")))
 _r("nothing_settled", Net(utxos=[]))
 _r("nothing_settled", Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 5,
@@ -2366,6 +2416,16 @@ check("...a passphrase is honoured and removed from the environment too",
 _saved = (_curve.NATIVE, _curve.BACKEND)
 _curve.NATIVE, _curve.BACKEND = False, "python"
 _r("backend_refused", Net())
+# ...BEFORE ANYTHING: not in build_and_sign after the look, the quote and a
+# derivation from the seed on the variable-time curve.
+_nNB = Net()
+_c, _o, _p, _ = run(_nNB)
+check("without the constant-time backend: refused backend_refused before the "
+      "look and the quote -- no address looked at, nothing quoted",
+      _c == F.EXIT_REFUSED and ("forward", "refused:backend_refused")
+      in _nNB.kinds and _nNB.look_calls == [] and _nNB.posts == [])
+check("...while --plan-only (it signs nothing) still runs without it",
+      run(Net(), "--plan-only", seed=None)[0] == 0)
 _curve.NATIVE, _curve.BACKEND = _saved
 check("...and with the native library back it signs again",
       run(Net())[0] == 0)
@@ -3453,6 +3513,14 @@ check("...and the one after that (the record is not rewritten when it "
       "already names the spend)",
       _c == F.EXIT_OK and ("forward", "kept_moved") in _nM2c.kinds
       and ("forward", "foreign_spend") not in _nM2c.kinds)
+# WHAT FUNDED THE KEPT OUTPUT IS ALWAYS READ. The history keeps only the
+# txids it is handed from beyond its newest-MAX_HISTORY window; a flood
+# that pushed the kept output's funding off it left the operator's hand
+# move listed with no inputs -- a foreign spend, "the seed has leaked".
+check("the history is asked to keep the kept output's funding transaction "
+      "(kept mark in place) and the moved one's (after the move)",
+      _HK3.lower() in (_nM2.spend_calls[0].get("keep_txids") or [])
+      and _HK3.lower() in (_nM2c.spend_calls[0].get("keep_txids") or []))
 # A LOOK THAT HAS NOT SEEN THE HAND MOVE: the history lists it (the
 # operator's K, in a mempool) while the look -- another server, or taken a
 # moment before K -- still lists the kept output unspent. The run said
@@ -3840,22 +3908,41 @@ for _ in range(40):
 check("...so with the real draw the send lands on the minimum about one "
       "time in 31, not on most runs", _caps <= 8)
 F.FEE_JITTER = lambda bound: 0
+# THE JITTER'S SHAPE, at a margin that leaves it room above the worst
+# arrival (3%). These two checks used to run at the suite's margin -- the
+# tolerance itself, where the floor IS the worst arrival -- and so pinned
+# a limit written up to 5,000 units UNDER it: a swap executed there was
+# `short` to the watcher by the memo's own doing.
+F.LIMIT_MARGIN_BPS = lambda: 300
 F.LIMIT_JITTER = lambda cap: 1
 _code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
 check("a limit jitter of 1 writes the floor LESS ONE into the memo: not the "
       "margin times anything",
       _code == 0 and _plan["memo_limit_set"] is True
-      and _plan["memo_limit_base_units"] == _floor_of(_plan) - 1
-      and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan) - 1}/1/0"
-      and _floor_of(_plan) % 9 == 0
-      and (_floor_of(_plan) - 1) % 9 != 0)
+      and _plan["memo_limit_base_units"] == _floor_of(_plan, 300) - 1
+      and _plan["memo"] == f"=:XMR.XMR:{_DEST}:{_floor_of(_plan, 300) - 1}/1/0")
 F.LIMIT_JITTER = lambda cap: cap
 _code, _out, _plan, _net, _tx = _limit_case("=:XMR.XMR:" + _DEST + ":0/1/0")
 check("the largest draw takes at most LIMIT_JITTER_MAX base units and 1% "
       "of the floor",
       _code == 0 and _plan["memo_limit_base_units"]
-      == _floor_of(_plan) - min(F.LIMIT_JITTER_MAX, _floor_of(_plan) // 100)
+      == _floor_of(_plan, 300) - min(F.LIMIT_JITTER_MAX,
+                                     _floor_of(_plan, 300) // 100)
       and _plan["memo_limit_base_units"] > 0)
+# AT THE TOLERANCE no draw -- the largest, or one that ignores its cap --
+# takes the limit under the watcher's own line, expected * (1 - tolerance).
+F.LIMIT_MARGIN_BPS = lambda: 1000
+for _jit, _why in ((lambda cap: cap, "the largest draw"),
+                   (lambda cap: 10 ** 9, "a draw that ignores its cap")):
+    F.LIMIT_JITTER = _jit
+    _code, _out, _plan, _net, _tx = _limit_case(
+        "=:XMR.XMR:" + _DEST + ":0/1/0")
+    _line = Decimal(_plan["expected_xmr"]) * (1 - F.ARRIVAL_TOLERANCE) \
+        * 10 ** 8
+    check(f"margin at the tolerance, {_why}: the limit is never under the "
+          "watcher's line (a swap that executes is never short by the "
+          "memo's own doing)", _code == 0
+          and Decimal(_plan["memo_limit_base_units"]) >= _line)
 F.LIMIT_JITTER = lambda cap: 0
 
 # A TRANSACTION THE SIGNER WILL NOT BUILD IS A REFUSAL, NOT A TRACEBACK

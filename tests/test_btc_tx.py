@@ -295,6 +295,35 @@ check("the account key from the mnemonic matches the account xpub the Pi "
       "would hold, in xpub AND zpub encoding (compared on key + chain code)",
       T.account_matches_xpub(_acct, _XPUB)
       and T.account_matches_xpub(_acct, _ZPUB))
+# THE PASSPHRASE IS NFKD-NORMALISED, as BIP39 defines the salt. The
+# expected account is computed INDEPENDENTLY of the code under test: PBKDF2
+# over "mnemonic" + NFKD(passphrase), exactly as the BIP states it, then
+# m/84'/0'/0'. A typed passphrase is NFC; without the normalisation the
+# right seed and the right passphrase derived another account.
+import hashlib as _hl                                         # noqa: E402
+import unicodedata as _ud                                     # noqa: E402
+
+
+def _spec_account_xpub(words, pp):
+    seed = _hl.pbkdf2_hmac("sha512", _ud.normalize("NFKD", words).encode(),
+                           ("mnemonic" + _ud.normalize("NFKD", pp)).encode(),
+                           2048, 64)
+    return (bip32.HDKey.from_seed(seed).derive("m/84h/0h/0h").to_public()
+            .to_base58())
+
+
+check("(the independent derivation reproduces the BIP39 vector: 'TREZOR' "
+      "over abandon x11 about)",
+      _hl.pbkdf2_hmac("sha512", _MNEMONIC.encode(), b"mnemonicTREZOR",
+                      2048, 64).hex().startswith("c55257c360c07c72"))
+for _pp in ("\u00fcber", "caf\u00e9", "\uff41bc", "Stra\u00dfe"):
+    check(f"a passphrase typed as NFC ({_pp!r}) derives the account the BIP "
+          "defines, and its decomposed form the same one",
+          T.account_matches_xpub(T.account_from_mnemonic(
+              _MNEMONIC, passphrase=_pp), _spec_account_xpub(_MNEMONIC, _pp))
+          and T.account_matches_xpub(T.account_from_mnemonic(
+              _MNEMONIC, passphrase=_ud.normalize("NFKD", _pp)),
+              _spec_account_xpub(_MNEMONIC, _pp)))
 check("...and does NOT match the root xpub, a child, another seed's account, "
       "an xprv, or junk",
       not T.account_matches_xpub(
