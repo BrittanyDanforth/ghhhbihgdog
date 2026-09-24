@@ -2374,18 +2374,33 @@ def _idle_boot_sweep(key: dict, artifact_dir: Path, d: dict,
     return True
 
 
+def _key_switch(key: dict, name: str, code: str) -> bool:
+    """A keyfile switch, as a boolean: ABSENT is off (every keyfile from
+    before the switch existed), True is on, and a value present and not a
+    boolean is REFUSED `code`, never coerced. The spending gate read
+    `if not key.get(...)`, so the string "false" -- what an operator
+    hand-editing the keyfile to turn a switch OFF would write -- was a
+    non-empty string, truthy, and turned it ON; 0 and "" read as off by the
+    same accident. A switch that moves money is not a value to guess at.
+    Rests on nothing secret: it only refuses to misread the file."""
+    v = key.get(name, False)
+    if not isinstance(v, bool):
+        raise Refused(code, f"this machine's keyfile carries an {name} that "
+                            f"is not a boolean; re-pair.")
+    return v
+
+
 def _btc_broadcast_on(key: dict) -> bool:
     """Does this keyfile let a forward SEND? Both switches, as booleans:
     `allow_btc_forward` (the forward may sign) and `allow_btc_broadcast`
     (it may hand the result to the network). Absent means no -- every
     keyfile from before the field existed is a rehearsal-only keyfile --
-    and a value present and not a boolean is refused, never coerced."""
-    v = key.get("allow_btc_broadcast", False)
-    if not isinstance(v, bool):
-        raise Refused("btc_config_malformed",
-                      "this machine's keyfile carries an allow_btc_broadcast "
-                      "that is not a boolean; re-pair.")
-    return bool(key.get("allow_btc_forward")) and v
+    and a value present and not a boolean is refused, never coerced
+    (_key_switch: the forward's switch was coerced, the docstring said
+    both were not)."""
+    _bc = _key_switch(key, "allow_btc_broadcast", "btc_config_malformed")
+    return _key_switch(key, "allow_btc_forward",
+                       "btc_config_malformed") and _bc
 
 
 def btc_mode(key: dict) -> bool:
@@ -4853,11 +4868,15 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         # must not silently enable spending clients' Bitcoin, or the reverse:
         # `allow_withdraw` gates the mix, `allow_btc_forward` gates the
         # forward, and both are absent from every keyfile that predates them.
+        # AS BOOLEANS, NEVER COERCED (_key_switch): "false" in a hand-edited
+        # keyfile was truthy here and let the job spend.
         if job == "forward_to_swap":
-            _allowed = key.get("allow_btc_forward")
+            _allowed = _key_switch(key, "allow_btc_forward",
+                                   "btc_config_malformed")
             _switch, _code = "--allow-btc-forward", "forward_not_allowed"
         else:
-            _allowed = key.get("allow_withdraw")
+            _allowed = _key_switch(key, "allow_withdraw",
+                                   "withdraw_config_malformed")
             _switch, _code = "--allow-withdraw", "withdraw_not_allowed"
         if not _allowed:
             raise Refused(

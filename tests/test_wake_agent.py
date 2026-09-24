@@ -2894,6 +2894,10 @@ check("plain_slip: ...and does it BEFORE it mints anything, so a refusal "
 _KEY_READS = set(re.findall(r'key\.get\(\s*"([a-z_]+)"', _ag_src))
 _KEY_READS |= set(re.findall(r'key\[\s*"([a-z_]+)"\s*\]', _ag_src))
 _KEY_READS |= set(re.findall(r'\bk\.get\(\s*"([a-z_]+)"', _ag_src))
+# ...AND THE SWITCHES READ THROUGH _key_switch (strict booleans): a read
+# this scan could not see would be a field with no writer it never checks.
+_KEY_READS |= set(re.findall(r'_key_switch\(\s*key,\s*"([a-z_]+)"',
+                             _ag_src))
 _WRITERS = _kp_src + open(os.path.join(REPO, "gs_delivery_key"),
                           encoding="utf-8").read()
 # ...OR THE LOADER ITSELF, for the one field that is a fact about WHERE the
@@ -2912,7 +2916,8 @@ check(f"keyfile: every field the vault reads has a tool that writes it "
 # not an empty scan.
 check(f"keyfile: NON-VACUITY -- the scan found the real ones ({len(_KEY_READS)})",
       {"deposit_in_chat", "delivery_public", "allow_withdraw", "wallet_file",
-       "usage_fee_address"} <= _KEY_READS)
+       "usage_fee_address", "allow_btc_forward", "allow_btc_broadcast"}
+      <= _KEY_READS)
 # proto.xmr_address, NOT the withdraw schema's exit_to field. This used to
 # borrow that one, which was fine only while the two happened to be the same
 # check -- exit_to takes a LIST of destinations now, so the borrowed gate would
@@ -3641,11 +3646,13 @@ check("...and the only tools it can spawn are the four in JOBS, with the mix "
 # written before this job existed -- means no. EACH spending job reads its
 # OWN switch: enabling Monero withdrawals never enables the BTC forward.
 check("...and a spending job is refused unless the KEYFILE allows it",
-      '_allowed = key.get("allow_withdraw")' in _A_SRC
-      and '_allowed = key.get("allow_btc_forward")' in _A_SRC
+      '_allowed = _key_switch(key, "allow_withdraw",' in _A_SRC
+      and '_allowed = _key_switch(key, "allow_btc_forward",' in _A_SRC
       and "if not _allowed:" in _A_SRC)
+_ks = getattr(A, "_key_switch", lambda k, n, c: None)
 check("...which an upgraded pair does not gain silently: absent means no",
-      ".get(\"allow_withdraw\")" in _A_SRC
+      _ks({}, "allow_withdraw", "x") is False
+      and _ks({}, "allow_btc_forward", "x") is False
       and "allow_withdraw\"]" not in _A_SRC
       and "allow_btc_forward\"]" not in _A_SRC)
 
@@ -5180,6 +5187,38 @@ for _badb in ("yes", 1, "true"):
           "refused btc_config_malformed, never coerced, no child",
           _o is None and getattr(_e, "code", None) == "btc_config_malformed"
           and _ran == [])
+# THE FORWARD'S OWN SWITCH, NEVER COERCED EITHER: "false" -- what a hand
+# edit to turn it OFF writes -- was a non-empty string, truthy, and the
+# forward signed and sent.
+for _badf in ("false", "no", "0", 0, 1, "true", None):
+    _o, _e, _ran = _fwd_run(_FWD_REC, {**_SEND_KEY, "allow_btc_forward": _badf})
+    check(f"allow_btc_forward present and not a boolean ({_badf!r}) is "
+          "refused btc_config_malformed, never coerced, no child",
+          _o is None and getattr(_e, "code", None) == "btc_config_malformed"
+          and _ran == [])
+# ...AND THE WITHDRAWAL'S: "false" passed the gate and the job went on to
+# look for money to mix (nothing_to_withdraw here only because the scratch
+# wallet is empty).
+for _badw in ("false", "no", 1):
+    _dW, _kW, _keyW, _bW = new_env(job="withdraw",
+                                   params={"exit_to": ["4" + "1" * 94],
+                                           "depth": 2})
+    _keyW.update({"allow_withdraw": _badw,
+                  "wallet_file": "/var/lib/gs/x.wallet",
+                  "usage_fee_addresses": ["4" + "7" * 94]})
+    os.chmod(_kW, 0o600)
+    _kW.write_text(json.dumps(P.lock_keyfile(_keyW, b"", role="thinkpad")))
+    os.chmod(_kW, 0o400)
+    _dpW = deps_for(_dW, _bW, extend_deadman=lambda s: True)
+    try:
+        _oW, _eW, _ = run(_kW, _dpW)
+    except Exception as _xW:                                 # noqa: BLE001
+        _oW, _eW = None, _xW
+    check(f"allow_withdraw present and not a boolean ({_badw!r}) is refused "
+          "withdraw_config_malformed at the gate, never coerced, no child",
+          _oW is None
+          and getattr(_eW, "code", None) == "withdraw_config_malformed"
+          and _dpW["_ran"] == [])
 _o, _e, _ran = _fwd_run(_FWD_REC, {**{k: v for k, v in _FWD_KEY.items()
                                       if k != "allow_btc_forward"},
                                    "allow_btc_broadcast": True,
