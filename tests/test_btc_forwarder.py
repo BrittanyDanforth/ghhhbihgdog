@@ -606,7 +606,8 @@ check("a dust flood beside a deposit: the forward stays standard (weight "
       and T.measure(_tx)[1] <= 400_000
       and any(i.txid.hex() == _H1 for i in _tx.vin)
       and _plan["left_over"] == 1601 - len(_tx.vin) > 0
-      and f"{_plan['left_over']} left for a standard size" in _out)
+      and f"{_plan['left_over']} left on the address (past a standard "
+          f"size" in _out)
 check("...the cap is the vsize bound's: one input more would not be standard",
       _tx is not None and F.standard_fits(len(_tx.vin), 120)
       and not F.standard_fits(len(_tx.vin) + 1, 120))
@@ -616,7 +617,8 @@ _mustv = [{"tx_hash": "%064x" % (i + 5000), "vout": 0, "value": 300,
            "confirmations": 9, "must": True} for i in range(10)]
 _bigv = [{"tx_hash": "%064x" % (i + 7000), "vout": 0, "value": 5000,
           "confirmations": 9} for i in range(1600)]
-_chosen_c, _, _, _left_c = F.spendable(_bigv + _mustv, 2, 1, (), 120)
+_chosen_c, _, _, _left_c = F.spendable(_bigv + _mustv, 2, 1, (), 120,
+                                       F.FORWARD_MIN_SAT)
 check("capping a selection with a replacement's `must` inputs among 1,600 "
       "larger ones: every `must` input is kept, the rest capped",
       all(u in _chosen_c for u in _mustv) and _left_c > 0
@@ -1215,30 +1217,124 @@ for _vals, _est, _kind, _fl in (([200] * 100, 1, "fee_eats_deposit", "1"),
           "forwards them", _c == F.EXIT_REFUSED
           and ("forward", f"refused:{_kind}") in _nX.kinds
           and _p is None and _status_of(_of) == "short")
-# ...AND THE CHEAPEST RATE IS NOT ALWAYS THE ONE THAT FORWARDS. 20,000 sat
-# beside a hundred of 140 fails at 1 sat/vB (a 101-input fee over a fifth)
-# and forwards at 2, where the 140s are dust: `delayed`, not `short` --
-# the naive fix (the whole selection's fee at the floor rate) says short.
+def _spendable6(u, mc, r, ex, op, ms):
+    """spendable with the minimum after the fee (the cut); on a build
+    without that parameter, its uncut choice -- a check that fails, never a
+    suite that crashes."""
+    try:
+        return F.spendable(u, mc, r, ex, op, ms)
+    except TypeError:
+        return F.spendable(u, mc, r, ex, op)
+
+
+# OUTPUTS BETWEEN THE DUST LINE AND WHAT THE FEE'S FIFTH NEEDS (the review
+# of the marginal inputs). select_inputs keeps an output worth more than
+# twice its input cost; the fifth needs about five times. 20,000 sat beside
+# a hundred of 140 was refused at 1 sat/vB -- the 101-input fee over a
+# fifth -- and `delayed`: the forward waited for fees to RISE to 2, where
+# the 140s are dust, though the 20,000 went alone at 1. Anyone who knows
+# the address could buy that wait with a hundred tiny payments. The forward
+# now spends the longest largest-first run the guards allow.
 _mix = _outs([20000] + [140] * 100)
 _nY = Net(utxos=_mix, fee=1)
 _c, _o, _p, _of = run(_nY)
-check("fails at the floor rate, forwards at a higher one: 'delayed'",
-      _c == F.EXIT_REFUSED
-      and ("forward", "refused:fee_eats_deposit") in _nY.kinds
-      and _status_of(_of) == "delayed")
-check("NON-VACUITY: ...and at an estimate of 2 the same address signs",
-      run(Net(utxos=_mix, fee=2))[0] == 0)
-# ...UP TO AND INCLUDING THE CEILING: 30,000 beside a hundred of 1,243 fails
-# at 9 sat/vB and forwards only at 10, the ceiling itself, where the 1,243s
-# are dust. A band that stopped one short of the ceiling said `short`.
+_ytx = _signed_tx(_o)
+check("20,000 beside a hundred of 140 at 1 sat/vB: SIGNED -- the 20,000 and "
+      "as many 140s as the fee's fifth carries, the rest left on the address "
+      "and counted, no refusal and no status word",
+      _c == 0 and _ytx is not None and _p is not None
+      and any(i.txid.hex() == "%064x" % 1 for i in _ytx.vin)
+      and 1 < len(_ytx.vin) < 101
+      and _p["left_over"] == 101 - len(_ytx.vin)
+      and f"{_p['left_over']} left on the address" in _o
+      and _p["fee_sat"] <= _p["settled_sat"] * F.MAX_FEE_FRACTION
+      and _p["send_sat"] > 20000
+      and not any(k.startswith("refused") for _s, k in _nY.kinds)
+      and _status_of(_of) is None)
+check("NON-VACUITY: ...and at an estimate of 2 the same address signs, the "
+      "140s dust there", run(Net(utxos=_mix, fee=2))[0] == 0)
+# ...THE LONGEST RUN THE GUARDS ALLOW, asked of the guards themselves: what
+# spendable spends passes send_refusal at its own fee, and one more of what
+# it left (the next largest) would not. With a replacement's `must` inputs
+# -- marginal at this rate too -- every one of them is kept.
+for _cn, _cu, _cr in (
+        ("the reported address, 1 sat/vB", _mix, 1),
+        ("a deposit and five hundred of 200, 1 sat/vB",
+         _outs([60000] + [200] * 500), 1),
+        ("three sizes of marginal output, 3 sat/vB",
+         _outs([90000] + [900] * 40 + [700] * 40 + [500] * 200), 3),
+        ("ten marginal `must` inputs, a deposit, a hundred of 140",
+         [dict(u, must=True) for u in _outs([300] * 10)]
+         + [dict(u, tx_hash="%064x" % (int(u["tx_hash"], 16) + 900))
+            for u in _outs([20000] + [140] * 100)], 1)):
+    _ch, _, _, _lo = _spendable6(_cu, 2, _cr, (), 120, F.FORWARD_MIN_SAT)
+    _left = sorted((u for u in F.select_inputs(_cu, 2, _cr)[0]
+                    if all(u is not c for c in _ch)),
+                   key=lambda u: -u["value"])
+    _fee_n = F.size_the_fee(len(_ch), 120, _cr)[1]
+    _ok = F.send_refusal(sum(u["value"] for u in _ch), _fee_n,
+                         F.FORWARD_MIN_SAT) is None
+    _more = (_left and F.send_refusal(
+        sum(u["value"] for u in _ch) + _left[0]["value"],
+        F.size_the_fee(len(_ch) + 1, 120, _cr)[1], F.FORWARD_MIN_SAT)
+        is not None)
+    check(f"the cut ({_cn}): what is spent passes the fee's fifth, one more "
+          f"of what is left would not, every `must` input is kept, and the "
+          f"largest others go first",
+          _ok and _more and _lo == len(_left) > 0
+          and all(any(u is c for c in _ch) for u in _cu if u.get("must"))
+          and min(u["value"] for u in _ch if not u.get("must"))
+          >= _left[0]["value"])
+_whole = _outs([20000] + [400] * 10)
+check("NO CUT when everything chosen passes: all of it is spent",
+      _spendable6(_whole, 2, 1, (), 120, F.FORWARD_MIN_SAT)[0] == _whole)
+_none = _outs([200] * 100)
+check("...and when NO run passes, what was chosen is returned as it was -- "
+      "the caller refuses on it, same kind as before",
+      _spendable6(_none, 2, 1, (), 120, F.FORWARD_MIN_SAT)[:4:3]
+      == (_none, 0))
+# THE FLOOR DECIDES THE BAND NOW -- the proof in forwards_in_band, asked
+# of the code rather than restated: over these addresses and every rate
+# from 1 to 40, whenever a rate forwards, the floor does. Without the cut
+# the reported address failed at 1 and forwarded at 2.
+_props = [_mix, _outs([30000] + [1243] * 100), _outs([200] * 100),
+          _outs([520] * 20), _outs([1000] * 200),
+          _outs([60000] + [200] * 500),
+          _outs([90000] + [900] * 40 + [700] * 40 + [500] * 200),
+          _outs([5000] * 7 + [600] * 60),
+          [dict(u, must=True) for u in _outs([300] * 10)]
+          + [dict(u, tx_hash="%064x" % (int(u["tx_hash"], 16) + 900))
+             for u in _outs([20000] + [140] * 100)]]
+_bad = [(i, r) for i, _pu in enumerate(_props) for r in range(2, 41)
+        if F.forwards_at(_pu, 2, r, (), 120, F.FORWARD_MIN_SAT)
+        and not F.forwards_at(_pu, 2, 1, (), 120, F.FORWARD_MIN_SAT)]
+check("no rate above the floor forwards where the floor does not (nine "
+      "addresses, rates 1..40)", _bad == [])
+check("NON-VACUITY: ...the property has cases on both sides: some address "
+      "forwards at the floor, some at no rate",
+      any(F.forwards_at(_pu, 2, 1, (), 120, F.FORWARD_MIN_SAT)
+          for _pu in _props)
+      and any(not any(F.forwards_at(_pu, 2, r, (), 120, F.FORWARD_MIN_SAT)
+                      for r in range(1, 41)) for _pu in _props))
+check("a band with no rates in it (floor over ceiling) carries nothing, "
+      "whatever the outputs", not F.forwards_in_band(
+          _outs([500000]), 2, 5, 4, (), 120, F.FORWARD_MIN_SAT)
+      and F.forwards_in_band(_outs([500000]), 2, 4, 4, (), 120,
+                             F.FORWARD_MIN_SAT))
+# THE WORD WHEN TODAY'S RATE IS REFUSED: over the ceiling, the address that
+# forwards at the floor (cut) is `delayed` -- it waited for fees to FALL,
+# not rise -- and one no rate carries is `short`.
 _edge = _outs([30000] + [1243] * 100)
-_c, _o, _p, _of = run(Net(utxos=_edge, fee=9), "--feerate-floor", "9",
+_c, _o, _p, _of = run(Net(utxos=_edge, fee=11), "--feerate-floor", "9",
                       "--feerate-ceiling", "10")
-check("forwardable only AT the ceiling rate: 'delayed', not 'short'",
+check("30,000 beside a hundred of 1,243, today's estimate over the ceiling: "
+      "refused, and 'delayed' -- the floor carries it, cut",
       _c == F.EXIT_REFUSED and _status_of(_of) == "delayed")
-check("NON-VACUITY: ...and at an estimate of 10 it signs",
-      run(Net(utxos=_edge, fee=10), "--feerate-floor", "9",
-          "--feerate-ceiling", "10")[0] == 0)
+check("NON-VACUITY: ...and at an estimate of 9, the floor, it signs: the "
+      "1,243s past the fee's fifth left behind",
+      (lambda r: r[0] == 0 and r[2]["left_over"] > 0)(
+          run(Net(utxos=_edge, fee=9), "--feerate-floor", "9",
+              "--feerate-ceiling", "10")))
 check("dust_from is the rate from which select_inputs leaves an output of "
       "that value behind, and not one below it",
       all(F.select_inputs(_outs([_v]), 1, F.dust_from(_v))[0] == []

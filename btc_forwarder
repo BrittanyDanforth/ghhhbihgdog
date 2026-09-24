@@ -442,33 +442,74 @@ def standard_fits(n_inputs, op_return_limit):
     ) * 4 <= STANDARD_TX_WEIGHT
 
 
-def spendable(utxos, min_conf, rate, exclude, op_return_limit):
+def spendable(utxos, min_conf, rate, exclude, op_return_limit,
+              min_send_sat):
     """What a forward at `rate` spends: select_inputs' choice, CAPPED to what
-    one standard transaction can carry -- every `must` input (a
-    replacement's committed outpoints), then the largest others while the
-    worst case stays within STANDARD_TX_WEIGHT -- in the order given.
-    Returns (chosen, skipped_dust, unsettled, left_over).
+    one standard transaction can carry, and CUT to what the fee guards let
+    it carry. `min_send_sat` is required, not defaulted: a caller that left
+    it out would get the uncut choice without a word, and a status word
+    decided on it would disagree with what main() spends (None asks for
+    the uncut choice on purpose). Every `must` input (a
+    replacement's committed outpoints) is kept whatever happens; of the
+    others, the LARGEST first, in the order given.
+    Returns (chosen, skipped_dust, unsettled, left_over): left_over counts
+    the outputs worth spending that stay on the address, for either cut.
 
-    A dust flood a little over twice each output's input cost (294 sat
-    relays; about 1,450 of them) made a forward no node would relay: the
-    dry run passed, the broadcast was rejected everywhere, every retry
+    THE CAP: a dust flood a little over twice each output's input cost (294
+    sat relays; about 1,450 of them) made a forward no node would relay:
+    the dry run passed, the broadcast was rejected everywhere, every retry
     built the same transaction, and the deposit beside the flood could
-    never be sent by this tool. What is left over stays on the address,
-    like dust. The one selection main() and forwards_at both use, so the
-    word a refusal leaves is decided on what a forward would really
-    spend. When the `must` inputs alone are over the cap, all of them are
-    kept and the caller refuses (standard_fits)."""
+    never be sent by this tool. When the `must` inputs alone are over the
+    cap, all of them are kept and the caller refuses (standard_fits).
+
+    THE CUT (the fee's share): select_inputs keeps an output worth more
+    than TWICE its input cost, and send_refusal lets the fee be at most a
+    FIFTH of what is spent -- an input pays its way there only above FIVE
+    times its cost. Outputs between the two lines each raised the fee's
+    share, and enough of them refused a forward the deposit beside them
+    carried alone: `fee_eats_deposit` at today's rate, `delayed`, and the
+    forward waited for fees to RISE until the outputs turned to dust --
+    a wait anyone who knows the address could buy with a hundred tiny
+    payments. So when the capped choice fails send_refusal, the longest
+    largest-first prefix that passes is spent instead, and the rest stay
+    on the address like dust.
+    WHY A PREFIX, AND THE LONGEST: the fee depends only on how many inputs
+    there are, so of any n the n largest carry the most; the fifth's slack
+    moves by (a fifth of the value) less (the input's cost) per input, a
+    step that only shrinks down a largest-first order, so the counts it
+    allows are one run; and every input kept is over twice its cost, so
+    what is sent only grows with n and the minimum allows every n from
+    some count up. The longest prefix that passes is therefore the one
+    that sends the most, and scanning down from the capped count finds it.
+    When none passes, the capped choice is returned as it was, and the
+    caller refuses on it as before -- same kind, and fee_word decides the
+    word over every rate.
+
+    The ONE selection main() and forwards_at both use, so the word a
+    refusal leaves is decided on what a forward would really spend."""
     chosen, dust, unsettled = select_inputs(utxos, min_conf, rate,
                                             exclude=exclude)
-    if not chosen or standard_fits(len(chosen), op_return_limit):
+    if not chosen:
         return chosen, dust, unsettled, 0
     must = [u for u in chosen if u.get("must")]
-    keep = {id(u) for u in must}
-    for u in sorted((u for u in chosen if not u.get("must")),
-                    key=lambda u: -int(u["value"])):
-        if not standard_fits(len(keep) + 1, op_return_limit):
-            break
-        keep.add(id(u))
+    others = sorted((u for u in chosen if not u.get("must")),
+                    key=lambda u: -int(u["value"]))
+    k = len(others)
+    while k > 0 and not standard_fits(len(must) + k, op_return_limit):
+        k -= 1
+    if min_send_sat is not None and (must or k):
+        _base = sum(int(u["value"]) for u in must)
+        _sums = [0]
+        for u in others[:k]:
+            _sums.append(_sums[-1] + int(u["value"]))
+        for j in range(k, -1, -1):
+            if not must and j == 0:
+                break
+            _, _fee = size_the_fee(len(must) + j, op_return_limit, rate)
+            if send_refusal(_base + _sums[j], _fee, min_send_sat) is None:
+                k = j
+                break
+    keep = {id(u) for u in must} | {id(u) for u in others[:k]}
     kept = [u for u in chosen if id(u) in keep]
     return kept, dust, unsettled, len(chosen) - len(kept)
 
@@ -505,12 +546,13 @@ def amount_to_send(settled_sat, fee_sat, min_send_sat):
 def forwards_at(utxos, min_conf, rate, exclude, op_return_limit,
                 min_send_sat):
     """Whether a forward at `rate` passes every fee-shaped guard main()
-    applies: select_inputs chooses something, and the fee size_the_fee
-    puts on it passes send_refusal. The fee's jitter is left out: main()
+    applies: spendable chooses something (cut, as main() cuts it, to what
+    the fee guards let it carry), and the fee size_the_fee puts on it
+    passes send_refusal. The fee's jitter is left out: main()
     draws it inside the room those two guards leave, so it never turns a
     pass into a refusal."""
     chosen, _, _, _ = spendable(utxos, min_conf, rate, exclude,
-                                op_return_limit)
+                                op_return_limit, min_send_sat)
     if not chosen or not standard_fits(len(chosen), op_return_limit):
         return False
     _, fee = size_the_fee(len(chosen), op_return_limit, rate)
@@ -521,33 +563,40 @@ def forwards_at(utxos, min_conf, rate, exclude, op_return_limit,
 def forwards_in_band(utxos, min_conf, floor, ceiling, exclude,
                      op_return_limit, min_send_sat):
     """Whether ANY whole rate in [floor, ceiling] carries a forward of
-    these outputs (forwards_at).
+    these outputs (forwards_at). THE FLOOR DECIDES IT, and why is the
+    whole of this function.
 
-    NOT ONLY THE FLOOR: a higher rate can pass where the floor fails. At
-    the floor, outputs worth more than twice their input cost are spent,
-    and a hundred of them can take more than a fifth in fee; a rate or two
-    higher they are dust, left behind, and the real payment beside them
-    forwards alone. EXACT AND CHEAP: what select_inputs chooses changes
-    only at the rates an output turns to dust (dust_from), and between two
-    such rates the fee only grows -- so the lowest rate of each stretch is
-    the one to ask: the floor, and each output's dust_from inside the
-    band. And once what a rate chooses is under the one-input floor at
-    that rate, no higher rate can pass (it chooses no more; its floor is
-    no lower), which bounds the asks by the money, not by how many
-    outputs someone parked on the address."""
-    rates = {floor} | {r for r in (dust_from(u["value"]) for u in utxos
-                                   if not u.get("must"))
-                       if floor < r <= ceiling}
-    for r in sorted(rates):
-        if forwards_at(utxos, min_conf, r, exclude, op_return_limit,
-                       min_send_sat):
-            return True
-        chosen, _, _, _ = spendable(utxos, min_conf, r, exclude,
-                                    op_return_limit)
-        if sum(u["value"] for u in chosen) < btx.forward_floor_sat(
-                op_return_limit, r, min_send_sat):
-            return False
-    return False
+    It used to ask the floor and then every output's dust_from inside the
+    band: a higher rate could pass where the floor failed, because at the
+    floor a hundred outputs worth a little over twice their input cost
+    were all spent and their fee took more than a fifth, while a rate or
+    two higher they were dust, left behind, and the payment beside them
+    forwarded alone. The same set was refused at the floor itself, and
+    the forward waited for fees to rise (`delayed`). spendable now CUTS
+    such outputs at any rate, and with the cut no rate above the floor can
+    pass where the floor does not:
+
+      - what select_inputs keeps at a higher rate is what it keeps at the
+        floor less the SMALLEST non-`must` outputs (an output is dust from
+        dust_from(value) up, and dust_from only grows with value), and the
+        `must` inputs are kept at every rate -- so any largest-first
+        prefix spendable could spend there is one it can spend at the
+        floor, the standard cap (a count, not a rate) the same;
+      - on the same inputs the floor's fee is no higher, so every guard
+        that prefix passes there it passes at the floor: the fifth, the
+        minimum after the fee, the standard weight;
+      - and spendable at the floor finds a passing prefix whenever one
+        exists (the longest; see there).
+
+    So forwards_at(floor) is exact for the band, one ask, bounded by the
+    outputs on the address and not by how many distinct values someone
+    parked there (each was a rate to ask). A band with no rates in it
+    (floor over ceiling -- main() refuses that before anything runs) carries
+    nothing."""
+    if floor > ceiling:
+        return False
+    return forwards_at(utxos, min_conf, floor, exclude, op_return_limit,
+                       min_send_sat)
 
 
 def fee_word(utxos, min_conf, floor, ceiling, exclude, op_return_limit,
@@ -2886,7 +2935,7 @@ def main(argv=None):
                         args.feerate_floor, args.feerate_ceiling)
         chosen, skipped_dust, unsettled, left_over = spendable(
             picture["utxos"], args.min_conf, rate, exclude,
-            args.op_return_max_bytes)
+            args.op_return_max_bytes, args.min_send_sat)
         if chosen and not standard_fits(len(chosen),
                                         args.op_return_max_bytes):
             raise Refused("forward_too_large",
@@ -3251,10 +3300,12 @@ def main(argv=None):
                   f"({hex_reason}): the network has not shown it yet, and "
                   "losing it would lose the forward. It is a bearer "
                   "instrument until it confirms.")
+    _left = (f", {left_over} left on the address (past a standard size, "
+             f"or not worth the fee's share)" if left_over else "")
     print(f"  from {scrub_address(address)} index {index}: "
           f"{settled_sat} sat in {n_inputs} spendable output(s)"
           f"{f', {skipped_dust} dust left' if skipped_dust else ''}"
-          f"{f', {left_over} left for a standard size' if left_over else ''}"
+          f"{_left}"
           f"{f', {unsettled} not yet settled' if unsettled else ''}")
     print(f"  to   {scrub_address(inbound)}"
           f"{' (THORNode-verified)' if cross_checked else ''}: "
