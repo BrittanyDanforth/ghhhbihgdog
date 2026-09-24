@@ -3943,7 +3943,16 @@ for _jit, _why in ((lambda cap: cap, "the largest draw"),
           "watcher's line (a swap that executes is never short by the "
           "memo's own doing)", _code == 0
           and Decimal(_plan["memo_limit_base_units"]) >= _line)
+# ...AND WHEN THE LINE IS NOT A WHOLE NUMBER OF BASE UNITS: 0.12345679 XMR
+# expected puts it at 11,111,111.1; the margin's floor truncates to
+# 11,111,111 -- under it -- with no jitter at all.
 F.LIMIT_JITTER = lambda cap: 0
+_nL = Net(expected="0.12345679", oracle=None,
+          memo="=:XMR.XMR:" + _DEST + ":0/1/0")
+_cL, _oL, _pL, _ = run(_nL)
+check("a line that is not a whole number of units: the limit is rounded UP "
+      "to it, never truncated under it", _cL == 0
+      and _pL["memo_limit_base_units"] == 11111112)
 
 # A TRANSACTION THE SIGNER WILL NOT BUILD IS A REFUSAL, NOT A TRACEBACK
 # (the MED pass after the deep read). A server that repeated an outpoint
