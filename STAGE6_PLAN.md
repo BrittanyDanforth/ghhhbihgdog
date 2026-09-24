@@ -413,14 +413,23 @@ already forgets after two days.
   that confirms after its vault churned, are proven only on mainnet.
 - A REPLACEMENT WHOSE RUN DIED BEFORE ITS PLAN WAS WRITTEN (killed in the
   seen wait, a power cut) is found by its memo and adopted as ours, and
-  the plan it replaced is marked superseded by it -- but it has no plan
-  of its own, so it is never a bump candidate: it sits at its rate until
-  it mines, or the mempool drops it and the reconciliation re-signs the
-  same money (the evicted branch). A first forward in the same position
-  IS reconstructed as a plan, and since the review of stages 2-6 is
-  bumped by the rate it really pays (bump_due). Writing an intent record
-  before the submit would close the rest; not done, because it changes
-  what "the current plan" means on every path of a money-moving tool.
+  the plan it replaced is marked superseded by it. This used to be the
+  residual: with no plan of its own it was never a bump candidate, and a
+  reconciliation's fresh forward of returned money in the same position
+  was never counted toward --returns-max either. The intent record this
+  bullet once said was missing exists now -- `record_signed`, written
+  before the bytes leave -- and closes it: `reconcile()` rebuilds a plan
+  for every adopted spend from the transaction itself (as
+  `reconcile_emptied` does for a first forward: `reconstructed`, fee and
+  vsize off the chain, no quote) and files it as a ROTATED predecessor.
+  The current plan stays the one it was, so what "the current plan"
+  means on every path is unchanged; the bump (`stuck_forward`), the bound
+  (`carried_refunds`, from `round_outpoints` over the inputs no other plan
+  of ours spends) and `classify_returns` all read the chain and now see
+  it. What stays: the rebuilt plan carries no quote, so the vault's pairs
+  rewrite counts it for nothing, as it counts any reconstructed plan; and
+  a refund of it is classified from the run AFTER the one that rebuilds
+  it (the refunds are read before the adoption, and recomputed every run).
 
 ---
 

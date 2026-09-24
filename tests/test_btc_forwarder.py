@@ -4110,6 +4110,287 @@ check("the look handing the forwarder one outpoint twice: refused build_failed "
       _cX == F.EXIT_REFUSED and "build_failed" in _oX and _pX is None
       and "Traceback" not in _oX)
 
+# A FORWARD OF OURS WHOSE RUN DIED BEFORE ITS PLAN (a power cut, the agent's
+# deadman or job budget, a kill in the seen wait), found later on the chain
+# and ADOPTED -- its txid was recorded before the send. Adopted, and written
+# nowhere: never a bump candidate, never counted toward --returns-max, and a
+# refund of it matched no plan. Driven through main() end to end: a
+# reconciliation's fresh forward of returned money is SENT, and the run is
+# killed while it waits to see it listed.
+print("\n== an adopted forward of ours is recorded as a plan ==")
+
+
+class _DieInSeen(Net):
+    """Sends, then the run dies in the seen wait: nothing after the send."""
+    def _seen(self, *a, **kw):
+        raise _Died()
+
+
+_HA2 = "a2" * 32
+_RA1 = [{"tx_hash": _HA2, "vout": 0, "value": 150000, "confirmations": 5}]
+_RA2 = [{"tx_hash": "a3" * 32, "vout": 0, "value": 130000,
+         "confirmations": 5}]
+
+
+def _killed_return(fee=10, utxos=None, *extra):
+    """A first forward (listed, mined), then a reconciliation whose fresh
+    forward of returned money is sent and killed before its plan. Returns
+    (first plan, outfile, first hex, the killed forward's submit record)."""
+    p1, of, hx1 = _first_send()
+    n = _DieInSeen(utxos=utxos or _RA1, spends=[_listed(p1, hx1)], fee=fee,
+                   submit=_ACCEPTED, seen=_SEEN0)
+    try:
+        _reconcile(n, of, *extra)
+    except _Died:
+        pass
+    assert n.submits, "the killed run sent nothing"
+    return p1, of, hx1, n.submits[0]
+
+
+def _listing(sub, inputs, height=850004):
+    return {"txid": sub["txid"], "height": height, "hex": sub["raw_hex"],
+            "inputs": inputs, "server": "s.onion"}
+
+
+_IN_A1 = [{"tx_hash": _HA2, "vout": 0, "value": 150000}]
+
+
+def _chain_files(of):
+    return [json.load(open(f)) for f in F._plan_chain(of)]
+
+
+_pA1, _ofA, _hxA1, _wA = _killed_return()
+check("(setup) the killed run SENT a forward of returned money, recorded "
+      "before the send, and wrote no plan: the first forward is still the "
+      "only plan", _wA["txid"] in F.signed_txids(_ofA)
+      and len(F._plan_chain(_ofA)) == 1
+      and json.load(open(_ofA))["txid"] == _pA1["txid"])
+_nA = Net(utxos=_RA2, spends=[_listed(_pA1, _hxA1), _listing(_wA, _IN_A1)],
+          fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nA, _ofA, "--returns-max", "1")
+_chA = _chain_files(_ofA)
+_wtx = Transaction.parse(bytes.fromhex(_wA["raw_hex"]))
+_wfee = 150000 - sum(int(o.value) for o in _wtx.vout)
+check("the next run ADOPTS it and records it as a plan -- rebuilt from the "
+      "transaction (its txid, its input, the fee it really pays, no quote), "
+      "filed as a ROTATED predecessor, the current plan unchanged",
+      _c == F.EXIT_OK and ("forward", "adopted_spend") in _nA.kinds
+      and ("forward", "adopted_planned") in _nA.kinds
+      and len(_chA) == 2 and _chA[0]["txid"] == _pA1["txid"]
+      and _chA[1]["txid"] == _wA["txid"]
+      and _chA[1].get("reconstructed") is True
+      and _chA[1].get("adopted") is True
+      and [(i["tx_hash"], i["vout"]) for i in _chA[1]["inputs"]]
+      == [(_HA2, 0)]
+      and _chA[1]["fee_sat"] == _wfee and _wfee > 0
+      and _chA[1]["expected_xmr"] is None
+      and not _chA[1].get("replaces"))
+check("...and it COUNTS toward --returns-max: the round it carried is one "
+      "(a refund-sized return), so with --returns-max 1 the SECOND return "
+      "is KEPT -- as the same sequence without the kill keeps it -- not "
+      "quoted and sent on",
+      _chA[1].get("carried_refunds") == 1
+      and _nA.posts == [] and _nA.submits == []
+      and (_chA[0].get("returned_kept") or {}).get("forwards_of_returned")
+      == 1)
+_pC1, _ofC, _hxC1 = _first_send()
+_nC2 = Net(utxos=_RA1, spends=[_listed(_pC1, _hxC1)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c2, _, _pC2, _ = _reconcile(_nC2, _ofC)
+_nC3 = Net(utxos=_RA2, spends=[_listed(_pC1, _hxC1),
+                               _listing(_nC2.submits[0], _IN_A1)],
+           fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c3, _, _pC3, _ = _reconcile(_nC3, _ofC, "--returns-max", "1")
+check("NON-VACUITY: the same sequence where the run LIVED: kept at "
+      "--returns-max 1 (what the killed one must match)",
+      _c2 == F.EXIT_OK and _c3 == F.EXIT_OK and _nC3.submits == []
+      and isinstance(_pC3.get("returned_kept"), dict))
+_pA1b, _ofAb, _hxA1b, _wAb = _killed_return()
+_nAb = Net(utxos=_RA2, spends=[_listed(_pA1b, _hxA1b),
+                               _listing(_wAb, _IN_A1)],
+           fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nAb, _ofAb, "--returns-max", "2")
+check("NON-VACUITY: ...and under a bound it does not reach (2), the second "
+      "return is forwarded -- what keeps it is the count, nothing else",
+      _c == F.EXIT_OK and len(_nAb.submits) == 1
+      and _p["reconcile_reason"] == "returned")
+_nA2 = Net(utxos=_RA2, spends=[_listed(_pA1, _hxA1), _listing(_wA, _IN_A1)],
+           fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nA2, _ofA, "--returns-max", "1")
+check("...and it is recorded ONCE: the next run finds it in the chain -- "
+      "ours, not adopted again, no second rotated file",
+      _c == F.EXIT_OK and ("forward", "adopted_spend") not in _nA2.kinds
+      and ("forward", "adopted_planned") not in _nA2.kinds
+      and len(F._plan_chain(_ofA)) == 2 and _nA2.submits == [])
+# ...A REFUND OF IT MATCHES A PLAN NOW: classify_returns finds a forward by
+# its txid and verifies a refund by the vault that forward paid. With no
+# plan, a refund of the adopted forward was nobody's.
+_HRA = "a4" * 32
+_nA3 = Net(utxos=[{"tx_hash": _HRA, "vout": 0, "value": 140000,
+                   "confirmations": 5}],
+           spends=[_listed(_pA1, _hxA1), _listing(_wA, _IN_A1)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0,
+           funding=[_paid(_HRA, 140000, "REFUND:" + _wA["txid"].upper(),
+                          _INBOUND)])
+_c, _o, _p, _ = _reconcile(_nA3, _ofA, "--returns-max", "1")
+_rfA = [r for r in (json.load(open(_ofA)).get("refunds") or [])
+        if r.get("txid") == _HRA]
+check("...and a refund of it is a VERIFIED refund of that forward (the vault "
+      "it paid), recorded on the plan -- it matched no forward before",
+      _c == F.EXIT_OK and len(_rfA) == 1
+      and _rfA[0].get("of") == _wA["txid"].lower()
+      and _rfA[0].get("verified") is True)
+# THE BUMP: an adopted forward in the mempool at a rate the market left
+# behind is REPLACED like any forward of ours. With no plan it sat there.
+_pB1, _ofB, _hxB1, _wB = _killed_return(2, None, "--feerate-floor", "1")
+_nB = Net(utxos=[], spends=[_listed(_pB1, _hxB1),
+                            _listing(_wB, _IN_A1, height=0)],
+          fee=40, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nB, _ofB, "--bump-after", "0")
+check("an adopted forward at ~2 sat/vB in the mempool, today's estimate 40, "
+      "the window passed: REPLACED -- a bump over its own input, naming it",
+      _c == F.EXIT_OK and len(_nB.submits) == 1
+      and _p["reconcile_reason"] == "bumped"
+      and _p.get("replaces") == _wB["txid"]
+      and (_HA2, 0) in [(i["tx_hash"], i["vout"]) for i in _p["inputs"]])
+# A REPLACEMENT WHOSE RUN DIED (STAGE6_PLAN.md's residual): a bump of the
+# returned forward, sent and killed. Adopted, the plan it replaced marked
+# superseded by it -- and now a plan of its own, a bump candidate in turn.
+# Its input is the one the plan it replaced spent: NOT a round of its own,
+# so the bound counts that swap once.
+_pR1, _ofRr, _hxR1 = _first_send()
+_nR2 = Net(utxos=_RA1, spends=[_listed(_pR1, _hxR1)], fee=2,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pR2, _ = _reconcile(_nR2, _ofRr, "--feerate-floor", "1")
+_hxR2 = _nR2.submits[0]["raw_hex"]
+_nR3 = _DieInSeen(utxos=[], spends=[_listed(_pR1, _hxR1),
+                                    _listed(_pR2, _hxR2, height=0,
+                                            inputs=_IN_A1)],
+                  fee=40, submit=_ACCEPTED, seen=_SEEN0)
+try:
+    _reconcile(_nR3, _ofRr, "--bump-after", "0")
+except _Died:
+    pass
+_wR = _nR3.submits[0] if _nR3.submits else {"txid": "", "raw_hex": ""}
+_nR4 = Net(utxos=[], spends=[_listed(_pR1, _hxR1),
+                             _listing(_wR, _IN_A1, height=0)],
+           fee=2, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nR4, _ofRr)
+_chR = _chain_files(_ofRr)
+_wRp = [q for q in _chR if q.get("txid") == _wR["txid"]]
+check("a bump whose run died: adopted, the plan it replaced superseded by "
+      "it, a plan rebuilt for it that carries NO round (its input is the "
+      "replaced plan's) -- the bound counts that swap once",
+      _c == F.EXIT_OK and _p.get("superseded_by") == _wR["txid"]
+      and len(_wRp) == 1 and _wRp[0].get("carried_refunds") == 0
+      and _wRp[0].get("carried_returned") == 0
+      and F.returned_forwards(_chR) == 1)
+_nR5 = Net(utxos=[], spends=[_listed(_pR1, _hxR1),
+                             _listing(_wR, _IN_A1, height=0)],
+           fee=60, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nR5, _ofRr, "--bump-after", "0")
+check("...and it is a bump candidate in turn: the estimate (60) past the "
+      "rate it pays (~42), it is replaced",
+      _c == F.EXIT_OK and len(_nR5.submits) == 1
+      and _p.get("replaces") == _wR["txid"]
+      and ("forward", "stuck_predecessor") in _nR5.kinds)
+# THE FEE ONLY WHEN EVERY INPUT IS NAMED. The history lists the inputs whose
+# funding is in its window; a flood that pushed one off left the sum short.
+# A missing input bigger than the fee made the fee negative; one smaller
+# than the fee made it too SMALL -- the rate read low, and the forward was
+# bumped when it already paid the market. (2,000 sat: over the dust line at
+# 10 sat/vB, so the killed forward spends both.)
+_RSm = [{"tx_hash": _HA2, "vout": 0, "value": 150000, "confirmations": 5},
+        {"tx_hash": "a5" * 32, "vout": 0, "value": 2000, "confirmations": 5}]
+for _named, _why in (([{"tx_hash": _HA2, "vout": 0, "value": 150000}],
+                      "the small input unnamed (the fee would read small)"),
+                     ([{"tx_hash": "a5" * 32, "vout": 0, "value": 2000}],
+                      "the large input unnamed (the fee would read "
+                      "negative)")):
+    _pP1, _ofP, _hxP1, _wP = _killed_return(10, _RSm)
+    _nP = Net(utxos=[], spends=[_listed(_pP1, _hxP1),
+                                _listing(_wP, _named, height=0)],
+              fee=40, submit=_ACCEPTED, seen=_SEEN0)
+    _c, _o, _p, _ = _reconcile(_nP, _ofP, "--bump-after", "0")
+    _wPp = [q for q in _chain_files(_ofP) if q.get("txid") == _wP["txid"]]
+    check(f"an adopted forward with {_why}: its plan records NO fee, and "
+          f"it is never bumped on a rate it does not know",
+          _c == F.EXIT_OK and len(_wPp) == 1
+          and _wPp[0].get("fee_sat") is None
+          and len(Transaction.parse(bytes.fromhex(_wP["raw_hex"])).vin) == 2
+          and _nP.submits == [])
+# ...AND EVERY INPUT NAMED, ONE OF THEM UNDERSTATED: the values are read off
+# the funding transactions the server hands over, and a server that lies
+# about one makes the sum short of what went out. A fee below zero is no
+# rate at all -- recorded as unknown, never as a number.
+_pQ1, _ofQ, _hxQ1, _wQ = _killed_return(10, _RSm)
+_nQ = Net(utxos=[], spends=[_listed(_pQ1, _hxQ1),
+                            _listing(_wQ, [{"tx_hash": _HA2, "vout": 0,
+                                            "value": 1000},
+                                           {"tx_hash": "a5" * 32, "vout": 0,
+                                            "value": 2000}], height=0)],
+          fee=40, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nQ, _ofQ, "--bump-after", "0")
+_wQp = [q for q in _chain_files(_ofQ) if q.get("txid") == _wQ["txid"]]
+check("an adopted forward whose inputs are all named, one understated by "
+      "the server (the sum short of what went out): its plan records NO "
+      "fee, not a negative one", _c == F.EXIT_OK and len(_wQp) == 1
+      and _wQp[0].get("fee_sat") is None
+      and _wQp[0].get("feerate_real_sat_vb") is None)
+# ...THE SAME RULE ON AN EMPTIED ADDRESS (reconcile_emptied, the one other
+# rebuild): the sum of the named inputs was the fee's whole basis.
+_ofE2 = _new_of()
+F.record_signed(_ofE2, _wP["txid"])
+_nE2 = Net(utxos=[], spends=[_listing(_wP, [{"tx_hash": "a5" * 32,
+                                             "vout": 0, "value": 2000}])])
+_c, _o, _p, _ = run(_nE2, outfile=_ofE2)
+check("an emptied address whose last spend names only one of its two "
+      "inputs: reconstructed, the fee unknown (it read negative), and said "
+      "so", _c == F.EXIT_OK and _p is not None
+      and _p.get("reconstructed") is True and _p.get("fee_sat") is None
+      and _p.get("feerate_real_sat_vb") is None and "fee unknown" in _o)
+# NEVER OVER A PLAN THAT EXISTS. The rebuilt plan takes the next free number
+# in the chain; a gap (a rotated file removed by hand) puts the count's
+# number on a file that is still there, and the rebuild must not land on it.
+_pG1, _ofG, _hxG1, _wG = _killed_return()
+_stemG = os.path.basename(_ofG)[:-len(".json")]
+_twoG = os.path.join(os.path.dirname(_ofG), f"{_stemG}.2.json")
+with open(_twoG, "w") as _fh:
+    json.dump({**_pG1, "txid": "ee" * 32, "inputs": [], "ts": 0}, _fh)
+_nG = Net(utxos=[], spends=[_listed(_pG1, _hxG1), _listing(_wG, _IN_A1)],
+          fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nG, _ofG)
+_threeG = os.path.join(os.path.dirname(_ofG), f"{_stemG}.3.json")
+check("a chain with a gap (only .2 on disk): the rebuilt plan goes to .3 and "
+      "the plan at .2 is still there",
+      _c == F.EXIT_OK and json.load(open(_twoG))["txid"] == "ee" * 32
+      and os.path.exists(_threeG)
+      and json.load(open(_threeG))["txid"] == _wG["txid"])
+# A PLAN THAT CANNOT BE WRITTEN IS STILL COUNTED FOR THE RUN: the bound and
+# the bump read the chain in memory; the next run adopts it again.
+_pW1, _ofW, _hxW1, _wW = _killed_return()
+
+
+def _no_rotated(obj, path, *a, **k):
+    if re.search(r"\.\d+\.json$", str(path)):
+        raise OSError(28, "No space left on device")
+    return _real_awj(obj, path, *a, **k)
+
+
+F.atomic_write_json = _no_rotated
+try:
+    _nW = Net(utxos=_RA2, spends=[_listed(_pW1, _hxW1),
+                                  _listing(_wW, _IN_A1)],
+              fee=10, submit=_ACCEPTED, seen=_SEEN0)
+    _c, _o, _p, _ = _reconcile(_nW, _ofW, "--returns-max", "1")
+finally:
+    F.atomic_write_json = _real_awj
+check("a rebuilt plan the disk will not take: said on the chain, and the "
+      "forward COUNTED for this run all the same -- the second return kept",
+      _c == F.EXIT_OK and ("forward", "adopted_plan_unwritten") in _nW.kinds
+      and len(F._plan_chain(_ofW)) == 1 and _nW.submits == []
+      and isinstance((_p or {}).get("returned_kept"), dict))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

@@ -1243,6 +1243,97 @@ def record_signed(outfile, txid):
 _op_return_data = btx.op_return_data
 
 
+def _plan_of_spend(spend, tx, memo, network, index, address, dest_xmr,
+                   tip):
+    """A plan REBUILT FROM A FORWARD OF OURS FOUND ON THE CHAIN whose sending
+    run did not live to write one (a power cut, the agent's deadman or job
+    budget, a kill in the seen wait): txid, inputs and their values, what
+    reached the inbound, the fee and the vsize off the transaction itself,
+    the memo. Marked `reconstructed`; no quote survives a crash, so it
+    carries none (and the vault's pairs rewrite counts it for nothing).
+
+    `spend` is a listing from bcast_spends ({txid, height, hex, inputs,
+    server}), `tx` its parsed transaction. THE FEE ONLY WHEN EVERY INPUT IS
+    NAMED: the history reader lists the inputs whose funding is in its
+    window, so a flood that pushed one off left the sum short -- a fee too
+    small, or below zero -- and a forward bumped on that rate paid more out
+    of the client's deposit than the market asked. With an input unnamed
+    the fee is None, and bump_due never bumps a plan that knows no rate.
+    Pure."""
+    net = btx.network_of(network)
+    paid = [o for o in tx.vout if _op_return_data(o.script_pubkey.data)
+            is None]
+    send_sat = int(paid[0].value) if paid else 0
+    try:
+        inbound = paid[0].script_pubkey.address(net) if paid else None
+    except Exception:                                        # noqa: BLE001
+        inbound = None
+    ins = [i for i in (spend.get("inputs") or []) if isinstance(i, dict)]
+    in_sat = sum(int(i["value"]) for i in ins)
+    _named = {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in ins}
+    _all = {(v.txid.hex(), int(v.vout)) for v in tx.vin}
+    fee_sat = (in_sat - sum(int(o.value) for o in tx.vout)
+               if _all and _named == _all else None)
+    if fee_sat is not None and fee_sat < 0:
+        fee_sat = None
+    vsize = btx.measure(tx)[0]
+    return {
+        "schema": PLAN_SCHEMA,
+        "network": network,
+        "dry_run": False,
+        "broadcast": True,                       # the network shows it
+        "broadcast_outcome": bcast.OUTCOME_ACCEPTED,
+        "broadcast_server": None,
+        "broadcast_codes": [],
+        "broadcast_attempts": 0,
+        "broadcast_mismatched": 0,
+        "seen": True,
+        "seen_height": spend["height"],
+        "seen_server": spend["server"],
+        "seen_asked": True,
+        "seen_polls": 0,
+        "signed": True,
+        "reconstructed": True,                   # from the chain, not a run
+        "index": index,
+        "address": address,
+        "inputs": [{"tx_hash": i["tx_hash"], "vout": i["vout"],
+                    "value": i["value"], "confirmations": None}
+                   for i in ins],
+        "skipped_dust": 0,
+        "left_over": 0,
+        "unsettled_outputs": 0,
+        "tip": tip,
+        "inbound": inbound,
+        "inbound_cross_checked": False,
+        "outbound_fee_sat": None,
+        "memo": memo,
+        "memo_quoted": None,
+        "memo_limit_set": None,
+        "memo_bytes": len(memo.encode("utf-8")),
+        "op_return_max_bytes": None,
+        "settled_sat": in_sat,
+        "send_sat": send_sat,
+        "fee_sat": fee_sat,
+        "feerate_target_sat_vb": None,
+        "vsize_bound": None,
+        "vsize": vsize,
+        "feerate_real_sat_vb": (fee_sat // vsize if vsize
+                                and fee_sat is not None else None),
+        "expected_xmr": None,                    # no quote survives a crash
+        "worst_case_xmr": None,
+        "memo_limit_base_units": None,
+        "affiliate_bps": None,
+        "dest_xmr": dest_xmr,
+        "txid": spend["txid"],
+        "tx_hex": None,
+        "tx_hex_reason": None,
+        "signed_hex_written": False,
+        "server": spend["server"],
+        "cert_sha256": None,
+        "ts": int(time.time()) // 600 * 600,
+    }
+
+
 def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
                       dest_xmr, outfile, tip):
     """The address holds nothing unspent. Was it ever paid, and where did
@@ -1313,71 +1404,11 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
               "signed. If no operator moved it by hand, the seed has "
               "leaked.")
         raise SystemExit(EXIT_FAILED)
-    net = btx.network_of(network)
-    paid = [o for o in tx.vout if _op_return_data(o.script_pubkey.data)
-            is None]
-    send_sat = int(paid[0].value) if paid else 0
-    try:
-        inbound = paid[0].script_pubkey.address(net) if paid else None
-    except Exception:                                        # noqa: BLE001
-        inbound = None
-    in_sat = sum(int(i["value"]) for i in last["inputs"])
-    fee_sat = in_sat - sum(int(o.value) for o in tx.vout)
-    vsize = btx.measure(tx)[0]
-    plan = {
-        "schema": PLAN_SCHEMA,
-        "network": network,
-        "dry_run": False,
-        "broadcast": True,                       # the network shows it
-        "broadcast_outcome": bcast.OUTCOME_ACCEPTED,
-        "broadcast_server": None,
-        "broadcast_codes": [],
-        "broadcast_attempts": 0,
-        "broadcast_mismatched": 0,
-        "seen": True,
-        "seen_height": last["height"],
-        "seen_server": last["server"],
-        "seen_asked": True,
-        "seen_polls": 0,
-        "signed": True,
-        "reconstructed": True,                   # from the chain, not a run
-        "index": index,
-        "address": address,
-        "inputs": [{"tx_hash": i["tx_hash"], "vout": i["vout"],
-                    "value": i["value"], "confirmations": None}
-                   for i in last["inputs"]],
-        "skipped_dust": 0,
-        "left_over": 0,
-        "unsettled_outputs": 0,
-        "tip": tip,
-        "inbound": inbound,
-        "inbound_cross_checked": False,
-        "outbound_fee_sat": None,
-        "memo": memo,
-        "memo_quoted": None,
-        "memo_limit_set": None,
-        "memo_bytes": len(memo.encode("utf-8")),
-        "op_return_max_bytes": None,
-        "settled_sat": in_sat,
-        "send_sat": send_sat,
-        "fee_sat": fee_sat,
-        "feerate_target_sat_vb": None,
-        "vsize_bound": None,
-        "vsize": vsize,
-        "feerate_real_sat_vb": fee_sat // vsize if vsize else None,
-        "expected_xmr": None,                    # no quote survives a crash
-        "worst_case_xmr": None,
-        "memo_limit_base_units": None,
-        "affiliate_bps": None,
-        "dest_xmr": dest_xmr,
-        "txid": last["txid"],
-        "tx_hex": None,
-        "tx_hex_reason": None,
-        "signed_hex_written": False,
-        "server": last["server"],
-        "cert_sha256": None,
-        "ts": int(time.time()) // 600 * 600,
-    }
+    plan = _plan_of_spend(last, tx, memo, network, index, address,
+                          dest_xmr, tip)
+    inbound, send_sat = plan["inbound"], plan["send_sat"]
+    in_sat, fee_sat, vsize = (plan["settled_sat"], plan["fee_sat"],
+                              plan["vsize"])
     write_plan(outfile, plan)
     integrity_log("forward", "reconstructed")
     where = ("in the mempool" if last["height"] <= 0
@@ -1389,7 +1420,9 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
     print(f"  from {scrub_address(address)} index {index}: {in_sat} sat in "
           f"{len(last['inputs'])} output(s)")
     print(f"  to   {scrub_address(inbound or '?')}: {send_sat} sat, fee "
-          f"{fee_sat} sat, {vsize} vB")
+          + (f"{fee_sat} sat" if fee_sat is not None else
+             "unknown (an input's funding is past the history window)")
+          + f", {vsize} vB")
     print(f"  memo {len(memo.encode('utf-8'))} bytes")
     print(f"  txid {last['txid']}")
     print(f"  plan written: {outfile}")
@@ -1431,6 +1464,23 @@ def _rotate_plan(outfile):
         n += 1
         target = p.with_name(f"{stem}.{n}.json")
     os.replace(p, target)
+    return target
+
+
+def _file_rotated(outfile, plan):
+    """Write `plan` into the chain as a ROTATED predecessor
+    `<stem>.<n>.json`, the next free number, leaving the current plan
+    where it is: a forward of ours the chain lacked (reconcile's adopted
+    spend), recorded without changing which plan is current. Never over a
+    file that exists (as _rotate_plan). Returns the path."""
+    p = Path(outfile)
+    stem = p.name[:-len(".json")]
+    n = 1 + sum(1 for f in _plan_chain(outfile) if Path(f) != p)
+    target = p.with_name(f"{stem}.{n}.json")
+    while target.exists():
+        n += 1
+        target = p.with_name(f"{stem}.{n}.json")
+    write_plan(target, plan)
     return target
 
 
@@ -1828,7 +1878,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
 
     A spend of the address that is not in our plan chain is examined: an
     txid this tool recorded before sending it (record_signed) is a forward
-    of ours the chain forgot (adopted as ours); anything else FAILS the run
+    of ours the chain forgot (adopted as ours, and a plan rebuilt for it
+    from the chain, filed as a rotated predecessor); anything else FAILS the run
     with the kind on the chain -- nothing is signed. A memo naming this
     destination is not enough: every forward of ours put it on the chain
     for whoever holds the seed to copy (SIGNED_SCHEMA). Money come back but not yet settled is
@@ -1957,6 +2008,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # not seen the move still lists the kept outputs unspent. Counted as
     # consumed below with our own forwards' inputs.
     _moved_ins = set()
+    _adopted = []
     for s in spends:
         if s["txid"] in ours:
             continue
@@ -1964,9 +2016,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         if mine and str(s["txid"]).lower() in _sent_here:
             # A FORWARD OF OURS THE CHAIN FORGOT: a signature this tool
             # made and recorded before sending, whose plan was lost. It is
-            # ours; its inputs are gone.
+            # ours; its inputs are gone. A plan is rebuilt for it below,
+            # once no spend here is the alarm.
             integrity_log("forward", "adopted_spend")
             ours.add(s["txid"])
+            _adopted.append((s, _memo))
             continue
         _ins = {(str(i.get("tx_hash") or "").lower(), int(i.get("vout") or 0))
                 for i in (s.get("inputs") or []) if isinstance(i, dict)}
@@ -2023,6 +2077,56 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
               "signed. If no operator moved it by hand, the seed has "
               "leaked.")
         raise SystemExit(EXIT_FAILED)
+    # A PLAN FOR EVERY FORWARD OF OURS ADOPTED ABOVE. A reconciliation's
+    # fresh forward (a refund, a second payment, a re-sign, a bump) that
+    # was SENT and then killed before its plan -- a power cut, the agent's
+    # deadman or job budget, a kill in the seen wait -- was adopted on every
+    # later run and recorded nowhere: never a stuck_forward candidate, so a
+    # low rate sat in the mempool while ThorChain's vault churned under it;
+    # never counted toward --returns-max, so the round it carried did not
+    # count, and the next return was sent on where the same run without the
+    # kill kept it; and a refund of it matched no plan, so classify_returns
+    # could neither see it as one nor verify its source. The record the
+    # reconstruction needed before the send (STAGE6_PLAN.md's residual)
+    # exists: record_signed, written before the bytes leave. The plan is
+    # rebuilt from the transaction as reconcile_emptied rebuilds one, and
+    # filed as a ROTATED predecessor: the current plan stays the one it
+    # was -- the verdict below, and the agent's word, are still read off it.
+    # Its `carried_refunds` are the rounds among its inputs no plan of ours
+    # spends (round_outpoints over this run's refunds and the chain), as
+    # main() counts a fresh forward's. NOT `replaces`: a replacement found
+    # this way carries no quote, so the pairs rewrite counts it for nothing,
+    # and naming the plan it replaced would drop that one too -- a swap
+    # counted neither way. Written once: next run it is in the chain, so in
+    # `ours`, and not adopted again.
+    for s, _memo in _adopted:
+        from embit.transaction import Transaction as _Tx
+        _ap = _plan_of_spend(s, _Tx.parse(bytes.fromhex(s["hex"])), _memo,
+                             args.network, index, address, dest_xmr,
+                             picture.get("tip"))
+        _new = _outpoints(_ap["inputs"]) - _signed_ops
+        _rounds = round_outpoints(_ap["inputs"], plan.get("refunds"),
+                                  [plan] + chain)
+        _ap["adopted"] = True           # for the operator's reading only
+        _ap["reconcile_reason"] = None
+        _ap["carried_returned"] = len(_new)
+        _ap["carried_refunds"] = len(_new & _rounds)
+        chain.append(_ap)
+        try:
+            _where = _file_rotated(args.outfile, _ap)
+        except OSError as e:
+            # Counted for THIS run all the same (the chain in memory): the
+            # bound and the bump read it below. The next run adopts it
+            # again and tries again.
+            integrity_log("forward", "adopted_plan_unwritten")
+            print(f"  [!] reconcile: the plan rebuilt for our forward "
+                  f"{s['txid']} could not be written "
+                  f"({e.strerror or e}); counted for this run only")
+            continue
+        integrity_log("forward", "adopted_planned")
+        print(f"  reconcile: our forward {s['txid']} went out and its run "
+              f"did not live to write a plan; one is rebuilt from the chain "
+              f"({_where.name})")
     # ...AND WHAT A HAND MOVE OF THE KEPT OUTPUTS SPENDS: a run that said
     # kept_moved then signed a forward over the moved output whenever the
     # look still listed it -- a second signature over an outpoint a listed
