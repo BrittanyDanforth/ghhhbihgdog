@@ -755,11 +755,14 @@ def enforce_memo_terms(memo_text, expected_xmr, worst_xmr, max_affiliate_bps):
     # memo's own doing, which the margin's ceiling was there to prevent.
     # The line is the watcher's own -- expected * (1 - tolerance), exact
     # (receive_watch calls a payment complete once the arrival clears it)
-    # -- not the quantized worst, which can round under it; and the draw
-    # is clamped to its cap, for a jitter that ignores its argument.
-    worst_units = int((max(worst_xmr, expected_xmr * (1 - ARRIVAL_TOLERANCE))
-                       * Decimal(10 ** 8)).to_integral_value(
-                           rounding=ROUND_CEILING))
+    # -- not the quantized worst, which rounds to a millionth either way:
+    # under the line, and at a tiny quote OVER the expected output itself,
+    # a limit no swap can meet. Never above the expected output; and the
+    # draw is clamped to its cap, for a jitter that ignores its argument.
+    worst_units = min(
+        int((expected_xmr * (1 - ARRIVAL_TOLERANCE) * Decimal(10 ** 8))
+            .to_integral_value(rounding=ROUND_CEILING)),
+        int(expected_xmr * Decimal(10 ** 8)))
     floor = max(floor, worst_units)
     _jcap = max(0, min(LIMIT_JITTER_MAX, floor // 100, floor - worst_units))
     floor = max(1, floor - min(max(0, int(LIMIT_JITTER(_jcap))), _jcap))
@@ -2632,8 +2635,12 @@ def main(argv=None):
     # THE CONSTANT-TIME BACKEND, BEFORE ANYTHING: a run that will sign
     # asks first, not in build_and_sign after the look, the quote and a
     # derivation from the seed on the variable-time curve -- the timing
-    # channel the refusal exists to avoid, taken on the way to it.
-    if not args.plan_only:
+    # channel the refusal exists to avoid, taken on the way to it. NOT a
+    # reconciliation here: most end `done` (listed, superseded, the kept
+    # bytes re-sent) and touch no seed, and refusing them left a mined
+    # forward unrecorded -- the Pi asking again every window. One whose
+    # verdict signs asks below, before the quote and the seed.
+    if not args.plan_only and not args.reconcile:
         try:
             btx.require_native()
         except btx.BtcTxError as e:
@@ -2686,6 +2693,12 @@ def main(argv=None):
                                            else ()))
         if verdict[0] == "done":
             return verdict[1]
+        # THIS RECONCILIATION SIGNS: the backend now, before the quote and
+        # before the seed is taken (see the gate above).
+        try:
+            btx.require_native()
+        except btx.BtcTxError as e:
+            raise Refused("backend_refused", str(e))
         _, exclude, why = verdict[:3]
         exclude = [tuple(x) for x in exclude]
         integrity_log("forward", f"reconcile_{why}")
@@ -2810,10 +2823,20 @@ def main(argv=None):
         # the Pi never starts it again by itself -- about a whole payment
         # one confirmation short of min_conf.
         if e.kind in DELAY_KINDS:
-            write_status(args.outfile, fee_word(
+            _word = fee_word(
                 picture["utxos"], args.min_conf, args.feerate_floor,
                 args.feerate_ceiling, exclude, args.op_return_max_bytes,
-                args.min_send_sat, replacing=(why == "bumped")))
+                args.min_send_sat, replacing=(why == "bumped"))
+            # MONEY BACK AND STILL CONFIRMING, beside settled money too
+            # small to forward on its own: the state returned_unsettled
+            # names, so the same word. `seen` there was dropped by the
+            # agent over the moved plan, and the phone heard "the forward
+            # has confirmed. Nothing more to check" -- whether a stranger's
+            # dust had also settled on the spent address decided between
+            # that and `returned`.
+            if _word == watch.STATE_SEEN and why == "returned":
+                _word = STATUS_RETURNED
+            write_status(args.outfile, _word)
         raise
 
     # 3. the quote, for exactly that amount, to exactly this destination
@@ -2937,8 +2960,10 @@ def main(argv=None):
         try:
             # A STOP ENDS THE WAIT, not the run: what the polls learned so
             # far is kept, and the plan below -- with the bytes kept as
-            # unseen -- is written inside the agent's grace instead of the
-            # child being killed mid-wait with nothing on disk.
+            # unseen -- is written instead of the child being killed
+            # mid-wait with nothing on disk. Best effort, not a bound: a
+            # connection already in flight when the stop lands can take up
+            # to --timeout, longer than the agent's ten-second grace.
             seen_r = bcast_seen(txid, address, servers, args.tor_proxy,
                                 network=args.network, timeout=args.timeout,
                                 wait_s=args.seen_wait,

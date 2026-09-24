@@ -537,6 +537,27 @@ check("...and with --min-conf 1 the same output IS spent",
       len(_signed_tx(run(Net(utxos=_net.utxos), "--min-conf", "1")[1]).vin)
       == 2)
 
+
+class _DeepLook(Net):
+    """A look whose settled total counts every MINED output, whatever the
+    depth rule -- a server that disagrees on depth -- beside the per-output
+    list that says otherwise. The forward trusts the list, never the sum."""
+
+    def look(self, address, servers, proxy_url, **kw):
+        pic = super().look(address, servers, proxy_url, **kw)
+        pic["settled_sat"] = pic["confirmed_sat"]
+        return pic
+
+
+_ndl = _DeepLook(utxos=_net.utxos)
+_code, _out, _plan, _ = run(_ndl)
+_tx = _signed_tx(_out)
+check("...and when the look's settled TOTAL counts that shallow output, it is "
+      "still neither counted nor spent: the forward sums what it spends",
+      _code == 0 and _tx is not None and len(_tx.vin) == 1
+      and _plan["settled_sat"] == 200000
+      and 200000 - _tx.vout[0].value == _plan["fee_sat"])
+
 # DUST STORM. Two hundred 546-sat outputs parked on the address (anyone can
 # send them) would, swept, make the fee eat the deposit and strand the real
 # payment. Dust is left where it lies.
@@ -579,13 +600,27 @@ check("a dust flood beside a deposit: the forward stays standard (weight "
       "within 400,000), spends the deposit, and the plan counts what was "
       "left over for a standard size",
       _code == 0 and _tx is not None
-      and T.measure(_tx)[1] <= F.STANDARD_TX_WEIGHT
+      # Bitcoin Core's MAX_STANDARD_TX_WEIGHT, written down HERE -- not read
+      # from the code under test, which a wrong constant would satisfy.
+      and F.STANDARD_TX_WEIGHT == 400_000
+      and T.measure(_tx)[1] <= 400_000
       and any(i.txid.hex() == _H1 for i in _tx.vin)
       and _plan["left_over"] == 1601 - len(_tx.vin) > 0
       and f"{_plan['left_over']} left for a standard size" in _out)
 check("...the cap is the vsize bound's: one input more would not be standard",
-      F.standard_fits(len(_tx.vin), 120)
+      _tx is not None and F.standard_fits(len(_tx.vin), 120)
       and not F.standard_fits(len(_tx.vin) + 1, 120))
+# THE CAP KEEPS A REPLACEMENT'S COMMITTED INPUTS FIRST, dust or not: the
+# replacement must spend every outpoint the stuck forward spends.
+_mustv = [{"tx_hash": "%064x" % (i + 5000), "vout": 0, "value": 300,
+           "confirmations": 9, "must": True} for i in range(10)]
+_bigv = [{"tx_hash": "%064x" % (i + 7000), "vout": 0, "value": 5000,
+          "confirmations": 9} for i in range(1600)]
+_chosen_c, _, _, _left_c = F.spendable(_bigv + _mustv, 2, 1, (), 120)
+check("capping a selection with a replacement's `must` inputs among 1,600 "
+      "larger ones: every `must` input is kept, the rest capped",
+      all(u in _chosen_c for u in _mustv) and _left_c > 0
+      and F.standard_fits(len(_chosen_c), 120))
 _code, _out, _plan, _ = run(Net(), "--plan-only", seed=None)
 check("--plan-only needs no seed, writes an UNSIGNED transaction, signed "
       "false, and still no broadcast",
@@ -985,7 +1020,8 @@ check("...and an operator --min-out-xmr far past the supply refuses by kind, "
 # `<= 0`: --seen-interval nan reached time.sleep AFTER the send, a finite
 # 1e10 timeout escaped the socket layer, --feerate-sat-vb 0 was read as
 # "none given", and a negative one was blamed on the server as `delayed`.
-for _flags in (("--seen-interval", "nan"), ("--seen-wait", "inf"),
+for _flags in (("--seen-interval", "nan"), ("--seen-interval", "3601"),
+               ("--seen-wait", "inf"),
                ("--seen-wait", "nan"), ("--seen-wait", "3601"),
                ("--timeout", "1e10"), ("--timeout", "nan"),
                ("--feerate-sat-vb", "0"), ("--feerate-sat-vb", "-5")):
@@ -993,7 +1029,8 @@ for _flags in (("--seen-interval", "nan"), ("--seen-wait", "inf"),
     _cA, _oA, _pA, _kA = _refusal(_nA, *_flags)
     check(f"{' '.join(_flags)}: refused bad_args before the look",
           _cA == 2 and _kA == "bad_args" and _nA.look_calls == [])
-for _of_bad in ("fwd.plan", "fwd", "x.status.json", "x.signed.json"):
+for _of_bad in ("fwd.plan", "fwd", "x.status.json", "x.signed.json",
+                ".json"):
     _nO = Net()
     _cO, _oO, _pO, _kO = _refusal(
         _nO, outfile=os.path.join(_scratch, _of_bad))
@@ -1191,6 +1228,17 @@ check("fails at the floor rate, forwards at a higher one: 'delayed'",
       and _status_of(_of) == "delayed")
 check("NON-VACUITY: ...and at an estimate of 2 the same address signs",
       run(Net(utxos=_mix, fee=2))[0] == 0)
+# ...UP TO AND INCLUDING THE CEILING: 30,000 beside a hundred of 1,243 fails
+# at 9 sat/vB and forwards only at 10, the ceiling itself, where the 1,243s
+# are dust. A band that stopped one short of the ceiling said `short`.
+_edge = _outs([30000] + [1243] * 100)
+_c, _o, _p, _of = run(Net(utxos=_edge, fee=9), "--feerate-floor", "9",
+                      "--feerate-ceiling", "10")
+check("forwardable only AT the ceiling rate: 'delayed', not 'short'",
+      _c == F.EXIT_REFUSED and _status_of(_of) == "delayed")
+check("NON-VACUITY: ...and at an estimate of 10 it signs",
+      run(Net(utxos=_edge, fee=10), "--feerate-floor", "9",
+          "--feerate-ceiling", "10")[0] == 0)
 check("dust_from is the rate from which select_inputs leaves an output of "
       "that value behind, and not one below it",
       all(F.select_inputs(_outs([_v]), 1, F.dust_from(_v))[0] == []
@@ -1530,6 +1578,16 @@ check("not listed, inputs unspent, bytes kept: RE-SENT -- the identical "
       and _p["resends"] == 1 and _p["seen"] is True and _p["tx_hex"] is None
       and _p["txid"] == _p3["txid"] and len(F._plan_chain(_of3)) == 1
       and ("forward", "resend") in _n3.kinds)
+check("...its seen wait is handed the live stop flag too",
+      _n3.seens and _n3.seens[0].get("stop") is F.shutdown_requested)
+_p3t, _of3t, _hx3t = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_n3t = Net(utxos=_UNSPENT0, spends=[], seen=_SEEN0,
+           submit={**_ACCEPTED, "server": "t.onion", "attempts": 3})
+_c, _o, _p, _ = _reconcile(_n3t, _of3t)
+check("...and an accepted re-send records ITS server and attempts, not the "
+      "first send's", _c == F.EXIT_OK and _p["broadcast_server"] == "t.onion"
+      and _p["broadcast_attempts"] == 3
+      and _p["resend_outcome"] == "accepted")
 # (c') the re-send is REJECTED by every server: stale bytes, live money --
 # a fresh forward at today's fee follows, the old plan rotated aside.
 _p4, _of4, _hx4 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
@@ -1609,6 +1667,48 @@ check("an unreachable re-send: exit failed, the plan keeps broadcast True and "
       and _p["broadcast"] is True and _p["broadcast_outcome"] == "accepted"
       and _p["resend_outcome"] == "unreachable" and _p["resends"] == 1
       and _p["tx_hex"] == _hx4u)
+# A RECONCILIATION THAT SIGNS NOTHING NEEDS NO BACKEND. The early gate
+# refused every --reconcile without the constant-time library, so a mined
+# forward was never recorded and the Pi asked again every window. One
+# whose verdict signs (evicted: re-signed afresh) is still refused before
+# the quote and the seed.
+_pNB, _ofNB, _hxNB = _first_send()
+_saved_nb = (_curve.NATIVE, _curve.BACKEND)
+_curve.NATIVE, _curve.BACKEND = False, "python"
+try:
+    _nNB1 = Net(utxos=[], spends=[_listed(_pNB, _hxNB, height=850002)])
+    _cNB1, _oNB1, _pNB1, _ = _reconcile(_nNB1, _ofNB)
+finally:
+    _curve.NATIVE, _curve.BACKEND = _saved_nb
+check("without the backend, a reconciliation that finds our forward mined "
+      "records it: done, the height on the plan, nothing refused",
+      _cNB1 == F.EXIT_OK and _pNB1["seen_height"] == 850002
+      and ("forward", "refused:backend_refused") not in _nNB1.kinds)
+_pEv, _ofEv, _hxEv = _first_send()        # seen: its bytes were dropped
+_curve.NATIVE, _curve.BACKEND = False, "python"
+try:
+    _nEv = Net(utxos=_UNSPENT0, spends=[], submit=_ACCEPTED, seen=_SEEN0)
+    _cEv, _oEv, _pEvr, _ = _reconcile(_nEv, _ofEv)
+finally:
+    _curve.NATIVE, _curve.BACKEND = _saved_nb
+check("...while one whose verdict signs (evicted) is refused backend_refused "
+      "before any quote", _cEv == F.EXIT_REFUSED
+      and ("forward", "refused:backend_refused") in _nEv.kinds
+      and _nEv.posts == [] and _nEv.submits == [])
+# RETURNED MONEY STILL CONFIRMING beside a small settled return is the same
+# state returned_unsettled names: `returned`, not `seen` (which the agent
+# drops over a moved plan, and the phone heard "confirmed, nothing more").
+for _small in (5000, 600):
+    _pR4, _ofR4, _hxR4 = _first_send()
+    _nR4 = Net(utxos=[{"tx_hash": _H2, "vout": 0, "value": 300000,
+                       "confirmations": 0},
+                      {"tx_hash": "%064x" % 77, "vout": 0, "value": _small,
+                       "confirmations": 5}],
+               spends=[_listed(_pR4, _hxR4, height=850002)])
+    _c, _o, _p, _ = _reconcile(_nR4, _ofR4)
+    check(f"300,000 back and confirming beside {_small} settled: refused, "
+          "nothing sent, and the word is 'returned'", _c == F.EXIT_REFUSED
+          and _nR4.submits == [] and _status_of(_ofR4) == "returned")
 # (d) NOT listed, inputs unspent, no bytes (it was listed once): evicted --
 # re-signed afresh (every input opts into RBF), the old plan rotated.
 _p5, _of5, _hx5 = _first_send()
@@ -3943,6 +4043,16 @@ for _jit, _why in ((lambda cap: cap, "the largest draw"),
           "watcher's line (a swap that executes is never short by the "
           "memo's own doing)", _code == 0
           and Decimal(_plan["memo_limit_base_units"]) >= _line)
+# ...AND NEVER OVER THE QUOTE'S OWN EXPECTED OUTPUT: at 0.0000009 XMR the
+# worst figure rounds to a millionth UP -- 100 units over 90 expected -- and
+# a limit raised to it is a swap that can only refund.
+F.LIMIT_JITTER = lambda cap: 0
+_nT = Net(expected="0.0000009", oracle=None,
+          memo="=:XMR.XMR:" + _DEST + ":0/1/0")
+_cT, _oT, _pT, _ = run(_nT)
+check("a tiny quote: the limit written is never above the expected output",
+      _pT is not None and _pT["memo_limit_base_units"] <= 90
+      and _pT["memo_limit_base_units"] >= 81)
 # ...AND WHEN THE LINE IS NOT A WHOLE NUMBER OF BASE UNITS: 0.12345679 XMR
 # expected puts it at 11,111,111.1; the margin's floor truncates to
 # 11,111,111 -- under it -- with no jitter at all.

@@ -5905,6 +5905,20 @@ for _h, _plan_word in ((0, "sent"), (850002, "forwarded")):
         check(f"...'{_st}' over the same moved plan is still the plan's word "
               f"'{_plan_word}'", _e is None
               and (_bb.result or {}).get("phase") == _plan_word)
+# ...BUT MONEY KEPT PAST THE BOUND IS `kept` FIRST. The listed branch keeps
+# the kept mark through a bump at the bound so the answer stays `kept`; a
+# `delayed` from that bump (today's fee over the ceiling) used to win and
+# tell the phone "tried again later, by itself -- nothing to do" about
+# money nothing retries and the operator must move.
+_kpl = {**_ACC, "seen_height": 0,
+        "returned_kept": {"outputs": 1, "sat": 130000, "settled": True,
+                          "forwards_of_returned": 2, "refunds": 0,
+                          "outpoints": [["ab" * 32, 0]]}}
+for _st in ("delayed", "returned"):
+    _o, _e, _ran, _dd, _bb = _fwd_run_both(_SENT_REC, _SEND_KEY, 2, _kpl, _st)
+    check(f"a kept plan and this run's '{_st}': 'kept' -- the money sits here "
+          "for the operator's hand", _e is None
+          and (_bb.result or {}).get("phase") == "kept")
 # ONCE SENT, ALWAYS RECONCILED. A kept re-send that every server rejected
 # writes broadcast False on the plan (the pairs rewrite must not count it);
 # when the fresh forward of the same money is then refused on today's fee,
@@ -6365,6 +6379,21 @@ check("a BTC-intake deposit on a machine WITHOUT the constant-time "
       _c == "btc_backend_missing" and _runs4n == [] and _asked == []
       and "btc_backend_missing" in _kinds
       and not (_d4n / A.HANDLES_FILE).exists())
+# ...ASKED BEFORE THE SEED IS TOUCHED: the proof's derivation is the
+# variable-time scalar multiplication the gate exists to avoid.
+_btx_n = __import__("gs_btc_tx")
+_derived, _saved_afm = [], _btx_n.account_from_mnemonic
+_btx_n.account_from_mnemonic = lambda *a, **k: (_derived.append(1),
+                                                _saved_afm(*a, **k))[1]
+_curve_ag.NATIVE, _curve_ag.BACKEND = False, "python"
+_d4m, _runs4m, _run4m = _btc_env("btc4m_")
+try:
+    _o, _c, _asked, _kinds = _btc_dispatch(_d4m, _run4m, "B4SM", True)
+finally:
+    _curve_ag.NATIVE, _curve_ag.BACKEND = _saved_ag
+    _btx_n.account_from_mnemonic = _saved_afm
+check("...and nothing is derived from the seed on the way to that refusal",
+      _c == "btc_backend_missing" and _derived == [])
 _o, _c, _asked, _kinds = _btc_dispatch(
     _d4s, _run4s, "B4S2", True,
     seed="zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong")
@@ -8164,6 +8193,29 @@ check("stage9: --seal-secrets writes a container the agent's own reader "
       and A._SECRETS["GS_WALLET_PASSWORD"] == "pw1"
       and A._SECRETS["GS_FEE_WALLET_PASSWORD"] == ""
       and "SOMETHING_ELSE" not in A._SECRETS)
+A._SECRETS.clear()
+check("stage9: ...and the seed is PROVEN against the pair's xpub",
+      "proven: it derives this pair's account xpub" in _stxt)
+# ...BUT NOT ON THE VARIABLE-TIME CURVE: on a box without the constant-time
+# library nothing is derived, and it says why -- "proven" there read as
+# ready while every deposit is refused btc_backend_missing.
+_cv9 = __import__("embit.util.secp256k1", fromlist=["NATIVE"])
+_sv9 = (_cv9.NATIVE, _cv9.BACKEND)
+_cv9.NATIVE, _cv9.BACKEND = False, "python"
+_sbufn = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_sbufn):
+        _srcn = A.seal_secrets_cli(types.SimpleNamespace(
+            key=str(_kf9), seal_secrets=_S8_PI.hex(),
+            secrets_env=str(_env9),
+            secrets_file=str(Path(_d0) / "written_nb.sealed")))
+finally:
+    _cv9.NATIVE, _cv9.BACKEND = _sv9
+check("stage9: ...on a box WITHOUT the constant-time library the seed is NOT "
+      "proven, and the summary says why and what every deposit will do",
+      _srcn == "sealed"
+      and "no constant-time libsecp256k1" in _sbufn.getvalue()
+      and "proven: it derives" not in _sbufn.getvalue())
 A._SECRETS.clear()
 # THE CONTAINER ITSELF, read directly. The check above opens it through
 # open_secrets, which applies the allow-list on the way IN -- so it could

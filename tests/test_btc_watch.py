@@ -1430,14 +1430,26 @@ check("Electrum's -1 ('no estimate') is None, never 0 and never a refusal "
 check("...and so is any number at or under 0: no estimate, not a free one",
       all(_look(_FakeTransport(fee_reply=v), fee_blocks=3)["fee_sat_vb"]
           is None for v in (0, -2, -1.0)))
-# A JUNK FEE REPLY IS A MALFORMED REPLY, not "no estimate". Read as None,
-# it ended the look successfully on the leading server -- which leads every
-# retry of that address -- and the forward was `delayed` for as long as
-# that server answered junk. (This check used to pin the junk as None.)
-check("a junk fee reply (string, dict, bool, null, list, NaN) is refused "
-      "like any malformed reply: with no other server, the look refuses",
-      all(_refused(_look, _FakeTransport(fee_reply=v), fee_blocks=3)
+# A JUNK FEE REPLY IS A MALFORMED ESTIMATE, never read as one. The picture
+# that server already answered stands (the next server is not handed the
+# scripthash for it); with no other server there is no estimate: None.
+def _fee_of(ft):
+    """The look's fee, or the exception class a look raised instead (the
+    defect itself: caught so it fails THIS check, not the whole suite)."""
+    try:
+        return _look(ft, fee_blocks=3)["fee_sat_vb"]
+    except Exception as _ex:                                  # noqa: BLE001
+        return type(_ex).__name__
+
+
+check("a junk fee reply (string, dict, bool, null, list, NaN) is never an "
+      "estimate: alone, the look's picture stands with fee None",
+      all(_fee_of(_FakeTransport(fee_reply=v)) is None
           for v in ("abc", {"x": 1}, True, None, [0.0001], float("nan"))))
+check("...and neither is an integer too large for a float, either sign (it "
+      "raised OverflowError out of look())",
+      all(_fee_of(_FakeTransport(fee_reply=v)) is None
+          for v in (10 ** 400, -(10 ** 400))))
 # TWO SERVERS: the leader answers the look but has no estimate (its node
 # has none), the other has one.
 _S2 = [("s1.onion", 50002), ("s2.onion", 50002)]
@@ -1463,10 +1475,25 @@ check("...and the other server is asked for the estimate ONLY -- never "
       _fts[_other].methods == ["server.version", "blockchain.estimatefee"]
       and all(_SCRIPTHASH not in json.dumps(q)
               for q in _fts[_other].requests))
-_r, _fts = _two("junk", 0.00003)
-check("a leader answering junk is failed over like any malformed reply: the "
-      "look is the other server's, with its estimate",
-      _r["server"] == _other and _r["fee_sat_vb"] == 3)
+def _two_safe(lead_fee, other_fee):
+    try:
+        return _two(lead_fee, other_fee)
+    except Exception as _ex:                                  # noqa: BLE001
+        return {"server": None, "fee_sat_vb": type(_ex).__name__}, None
+
+
+for _junk in ("junk", None, 10 ** 400):
+    _r, _fts = _two_safe(_junk, 0.00003)
+    check(f"a leader answering a malformed estimate ({str(_junk)[:8]}): its "
+          "picture stands and the other server is asked for the fee ONLY -- "
+          "never the scripthash", _fts is not None and _r["server"] == _lead
+          and _r["fee_sat_vb"] == 3
+          and _fts[_other].methods == ["server.version",
+                                       "blockchain.estimatefee"])
+_r, _fts = _two_safe(-1, 10 ** 400)
+check("a malformed estimate in the fee-only fallback is not one: no "
+      "traceback, the leader's picture with fee None",
+      _fts is not None and _r["server"] == _lead and _r["fee_sat_vb"] is None)
 _r, _fts = _two(-1, -1)
 check("nobody configured has an estimate: the leader's picture, fee None",
       _r["server"] == _lead and _r["fee_sat_vb"] is None)

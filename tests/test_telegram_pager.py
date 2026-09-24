@@ -6592,6 +6592,59 @@ _rde["looked_at"] = time.time() - _rd.btc_recheck_s - 1
 _rd.btc_tick(look=_look_returning("confirmed", conf=100000))
 check("NON-VACUITY: ...once it has passed, the next window's look starts it",
       _rdj == [(111, "forward_to_swap", {"handle": "B4A1"})])
+
+
+def _fwd_look_started():
+    """A forwarded entry whose look sees returned money settle and STARTS
+    the forward -- the path a vault answer now arrives on."""
+    p, ps, pj = _watch_pager()
+    p.btc_servers = [("s.onion", 50002, None)]
+    p.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+    p.limits.headroom = lambda: 9
+    p._btc_forward_result("B4A1", "done", "forwarded", 111)
+    p.btc_open["B4A1"]["looked_at"] = time.time() - p.btc_recheck_s - 1
+    p.btc_tick(look=_look_returning("confirmed", conf=100000))
+    return p, pj
+
+
+# THE VAULT FOUND IT UNSETTLED (its depth rule, or its server a block
+# behind): `returned` now reaches this end over the moved plan, and its
+# branch had no early wait -- the next look started the same forward again,
+# a wake per look until the depths agreed.
+_rr, _rrj = _fwd_look_started()
+check("(setup) the forwarded look started the forward",
+      len(_rrj) == 1 and _rr.btc_open["B4A1"]["state"] == "forwarding")
+_rr._btc_forward_result("B4A1", "done", "returned", 111)
+_rre = _rr.btc_open["B4A1"]
+_rr.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("a `returned` answer to a forward this end started: watched again, "
+      "and the next look starts NOTHING while the early wait runs",
+      _rre["state"] == "seen" and len(_rrj) == 1
+      and int(_rre.get("early_tries") or 0) == 1
+      and float(_rre.get("retry_after") or 0) > time.time())
+# A `delayed` ON A FORWARD THE FORWARDED LOOK STARTED: back to `forwarded`
+# (a look once a window, the wait gating the next start), not `seen` (a
+# look every tick for a spent address).
+_rs, _rsj = _fwd_look_started()
+_rs._btc_forward_result("B4A1", "done", "delayed", 111)
+_rse = _rs.btc_open["B4A1"]
+check("a `delayed` answer to a forward the forwarded look started: the entry "
+      "is `forwarded` again, with the fee wait, not `seen`",
+      _rse["state"] == "forwarded"
+      and float(_rse.get("retry_after") or 0) > time.time()
+      and "from_forwarded" not in _rse)
+# A `delayed` ON A KEPT ENTRY renews its recheck stamp, as `kept` does: left
+# due, every tap went to the forward and cost a wake to hear `delayed`.
+_rk, _rks, _rkj = _watch_pager()
+_rk._btc_forward_result("B4A1", "done", "kept", 111)
+_rk.btc_open["B4A1"]["rechecked_at"] = time.time() - 4 * 3600
+check("(setup) a kept entry whose window has passed: the tap asks the forward",
+      _rk._btc_kept_due("B4A1"))
+_rk._btc_forward_result("B4A1", "done", "delayed", 111)
+check("a `delayed` on a kept entry: still kept, and the next tap asks the XMR "
+      "side for a window, not the forward",
+      _rk.btc_open["B4A1"]["state"] == "kept"
+      and not _rk._btc_kept_due("B4A1"))
 _rg, _rgs, _rgj = _watch_pager()
 _rg.btc_servers = [("s.onion", 50002, None)]
 _rg.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")

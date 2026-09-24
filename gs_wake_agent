@@ -2455,6 +2455,11 @@ def _check_btc_policy(key: dict) -> None:
             f"whose relay policy carries it.")
 
 
+class _NoNativeBackend(Exception):
+    """The constant-time libsecp256k1 is not the live backend (seal-time
+    proof: nothing is derived from the seed without it)."""
+
+
 def _prove_btc_seed(key: dict) -> None:
     """The seed in this machine's environment DERIVES the account xpub the
     Pi watches -- proven before a deposit address is issued, never after a
@@ -4990,7 +4995,15 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             return ""
         moved, outcome = _forward_outcome(artifact_dir, handle, reader)
         if moved:
-            # THIS RUN'S OWN WORD FIRST, for the two a reconciliation over
+            # MONEY KEPT PAST THE BOUND FIRST (the review of the fix): the
+            # listed branch keeps the kept mark through a bump at the bound
+            # precisely so this answers `kept`; letting a `delayed` from
+            # that bump win told the phone "tried again later, by itself --
+            # nothing to do" about money nothing retries and the operator
+            # must move, and every tap after it cost a wake.
+            if _forward_kept(artifact_dir, handle, reader):
+                return "kept"
+            # THIS RUN'S OWN WORD NEXT, for the two a reconciliation over
             # a moved plan leaves when it refuses: money came back and is
             # not settled (`returned`), or a replacement -- or a fresh
             # forward of returned money -- that today's fee will not carry
@@ -5006,12 +5019,9 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             _word = _forward_status_word(artifact_dir, handle, reader)
             if _word in ("returned", "delayed"):
                 return _word
-            # MONEY CAME BACK AGAIN AND IS KEPT (third self-doubt pass):
-            # this word BEFORE `forwarded`, or the Pi would end its
-            # rechecks on a deposit whose money is sitting here, and the
-            # chat would hear "confirmed" about it.
-            if _forward_kept(artifact_dir, handle, reader):
-                return "kept"
+            # (KEPT, above, comes before `forwarded` too: or the Pi would end
+            # its rechecks on a deposit whose money is sitting here, and the
+            # chat would hear "confirmed" about it -- third self-doubt pass.)
             # IN A BLOCK IS ITS OWN WORD (stage 6): the Pi's rechecks of
             # this forward end on it, and the arrival is the XMR side's
             # question. Only an ACCEPTED forward can be mined; an
@@ -7585,6 +7595,14 @@ def seal_secrets_cli(args) -> str:
         try:
             import gs_btc_tx as _btx
             try:
+                # NOT ON THE VARIABLE-TIME CURVE: with no constant-time
+                # library nothing is derived here, and the operator is told
+                # why -- "proven" on this box read as ready while every
+                # deposit is refused btc_backend_missing.
+                _btx.require_native()
+            except _btx.BtcTxError:
+                raise _NoNativeBackend()
+            try:
                 _acct = _btx.account_from_mnemonic(
                     merged["GS_BTC_SEED"],
                     str(key.get("btc_network") or "main"),
@@ -7595,6 +7613,12 @@ def seal_secrets_cli(args) -> str:
                     _acct, str(key["btc_account_xpub"]))
             except _btx.BtcTxError:
                 _ok = False
+        except _NoNativeBackend:
+            _ok = None
+            _seed = ("NOT checked: this machine has no constant-time "
+                     "libsecp256k1 (the libsecp256k1-1 package), so nothing "
+                     "is derived from the seed here -- and every deposit is "
+                     "refused until it is installed")
         except Exception as e:                               # noqa: BLE001
             _ok = None
             _seed = f"NOT checked ({type(e).__name__})"

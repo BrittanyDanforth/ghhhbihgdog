@@ -316,7 +316,7 @@ check("(the independent derivation reproduces the BIP39 vector: 'TREZOR' "
       "over abandon x11 about)",
       _hl.pbkdf2_hmac("sha512", _MNEMONIC.encode(), b"mnemonicTREZOR",
                       2048, 64).hex().startswith("c55257c360c07c72"))
-for _pp in ("\u00fcber", "caf\u00e9", "\uff41bc", "Stra\u00dfe"):
+for _pp in ("\u00fcber", "caf\u00e9", "\uff41bc"):
     check(f"a passphrase typed as NFC ({_pp!r}) derives the account the BIP "
           "defines, and its decomposed form the same one",
           T.account_matches_xpub(T.account_from_mnemonic(
@@ -324,6 +324,23 @@ for _pp in ("\u00fcber", "caf\u00e9", "\uff41bc", "Stra\u00dfe"):
           and T.account_matches_xpub(T.account_from_mnemonic(
               _MNEMONIC, passphrase=_ud.normalize("NFKD", _pp)),
               _spec_account_xpub(_MNEMONIC, _pp)))
+check("NON-VACUITY: a passphrase NFKD leaves as it is ('Stra\u00dfe': the "
+      "sharp s has no decomposition) derives the same account either way",
+      T.account_matches_xpub(T.account_from_mnemonic(
+          _MNEMONIC, passphrase="Stra\u00dfe"),
+          _spec_account_xpub(_MNEMONIC, "Stra\u00dfe")))
+# ...AND THE WORDS: NFKD of the mnemonic too, as the BIP defines it. A
+# mnemonic in FULLWIDTH letters (an East Asian input method) decomposes to
+# the English words; un-normalised it was "not a valid BIP39 mnemonic".
+_FW = "".join(chr(ord(c) + 0xFEE0) if "a" <= c <= "z" else c
+              for c in _MNEMONIC)
+try:
+    _fw_ok = T.account_matches_xpub(T.account_from_mnemonic(_FW),
+                                    _spec_account_xpub(_MNEMONIC, ""))
+except T.BtcTxError:
+    _fw_ok = False                  # refused as not a mnemonic: the defect
+check("a mnemonic typed in fullwidth letters derives the account of the same "
+      "words", _FW != _MNEMONIC and _fw_ok)
 check("...and does NOT match the root xpub, a child, another seed's account, "
       "an xprv, or junk",
       not T.account_matches_xpub(

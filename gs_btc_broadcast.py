@@ -523,12 +523,15 @@ def spends_of(address, servers, proxy_url, *, network="main",
     raise BtcWatchError(f"no Electrum server answered (last: {why})")
 
 
-def _history_once(txid, scripthash, order, make):
+def _history_once(txid, scripthash, order, make, stop=None):
     """One pass over the servers: the first that answers decides. Returns
     (entry_or_None, host, cert_sha256); raises BtcWatchError when no
-    server answered at all."""
+    server answered at all -- or when `stop` says so before the next
+    server is dialled."""
     last = None
     for host, port, pin in order:
+        if stop is not None and stop():
+            break
         transport = make(host, port, pin)
         try:
             with Broadcaster(transport) as b:
@@ -569,10 +572,14 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     the forward dropped the signed bytes as proven. Now nobody else
     answering is "nobody could be asked", and the bytes are kept.
 
-    `stop`, when given, is asked between polls and during the sleep (in
-    slices of at most a second): once it says True the wait ends with what
-    the polls have learned, so a caller being stopped can still write down
-    what it sent. A poll already in flight is not cut short."""
+    `stop`, when given, is asked before every poll, before each server a
+    poll fails over to, and during the sleep (in slices of at most a
+    second): once it says True the wait ends with what the polls have
+    learned, so a caller being stopped can still write down what it sent.
+    A stop already raised on entry -- one that landed during the submit --
+    polls nothing. A connection already in flight is NOT cut short: it can
+    take up to `timeout`, which may be longer than the grace a stopping
+    caller is given."""
     want = _check_txid(txid)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
@@ -588,9 +595,12 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     polls, asked = 0, False
     host = cert = None
     while True:
+        if stop is not None and stop():
+            break
         polls += 1
         try:
-            hit, host, cert = _history_once(want, scripthash, order, make)
+            hit, host, cert = _history_once(want, scripthash, order, make,
+                                            stop=stop)
             asked = True
         except PinMismatch:
             raise

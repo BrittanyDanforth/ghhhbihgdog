@@ -481,6 +481,37 @@ _r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=30, interval_s=15,
                   0, _t[0] + s)), clock=lambda: _t[0], stop=lambda: False)
 check("NON-VACUITY: a stop that never comes changes nothing but the slicing: "
       "polls at 0, 15 and 30", _r["polls"] == 3 and sum(_slept) == 30.0)
+# A STOP ALREADY RAISED ON ENTRY -- one that landed during the submit --
+# polls nothing: the first poll used to fail over through every server
+# (--timeout each, 30 s by default) before the stop was first asked, and
+# the agent's SIGKILL came first, with no plan written.
+_S3 = [("s1.onion", 50002), ("s2.onion", 50002), ("s3.onion", 50002)]
+_r, _s = _seen(_FT("down"), _FT("down"), _FT("down"), servers=_S3,
+               wait_s=600, interval_s=15, stop=lambda: True)
+check("a stop raised before the wait: no server dialled, not seen, not "
+      "asked -- the caller writes its plan with the bytes kept",
+      _s["hosts"] == [] and _r["seen"] is False and _r["asked"] is False
+      and _r["polls"] == 0)
+# ...AND ONE RAISED DURING A POLL'S FAILOVER stops it before the next server.
+_raised = [False]
+
+
+def _dial_then_stop(*fts):
+    f = _factory(*fts)
+
+    def make(host, port, tag):
+        _raised[0] = True
+        return f(host, port, tag)
+    make.seen = f.seen
+    return make
+
+
+_fs = _dial_then_stop(_FT("down"), _FT("down"), _FT("down"))
+_r = B.seen(_TXID, _A0, _S3, _PROXY, transport_factory=_fs, wait_s=600,
+            interval_s=15, sleeper=lambda s: None, stop=lambda: _raised[0])
+check("a stop raised while the first server is being dialled: the poll does "
+      "not fail over to the others", len(_fs.seen["hosts"]) == 1
+      and _r["seen"] is False)
 check("a wait under 0 or an interval of 0 is refused",
       _refused(B.seen, _TXID, _A0, _SERVERS, _PROXY, wait_s=-1,
                transport_factory=_never)

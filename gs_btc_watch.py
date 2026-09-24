@@ -55,10 +55,12 @@ source"):
     the other is asked about every address. Rests on no secret -- the
     rotation is public and computable -- it only spreads the set while the
     servers are up.
-  * What isolation CANNOT hide: behaviour. Every connection speaks the same
-    three read-only calls and hangs up, and announces a stock wallet's
-    version string; a server that fingerprints by behaviour can still
-    cluster them. That residual is only removed by the operator's OWN node
+  * What isolation CANNOT hide: behaviour. Every look speaks the same
+    three read-only calls (four when the forwarder asks the fee) and hangs
+    up, and announces a stock wallet's version string; a server that
+    fingerprints by behaviour can still cluster them -- and a fee-only
+    session (server.version, estimatefee: the fallback when the server
+    that answered the look had no estimate) is a shape of its own. That residual is only removed by the operator's OWN node
     (BTC_INTAKE_DESIGN.md recommends exactly that). The server list is
     reached the one way this module speaks -- over Tor, TLS on -- so an own
     node is pointed at by its onion service (electrs/Fulcrum expose one in a
@@ -851,8 +853,12 @@ class Electrum:
         # estimate", it ended the look successfully on the leading server,
         # whose rotation leads every retry, and the forward was `delayed`
         # for as long as that server answered junk.
-        if isinstance(r, (int, float)) and not isinstance(r, bool) \
-                and math.isfinite(r) and r <= 0:
+        # An int is compared as an int: math.isfinite() on a JSON integer
+        # of 310+ digits raised OverflowError -- neither a failover nor a
+        # refusal, a traceback out of look() and the forwarder alike.
+        if not isinstance(r, bool) and (
+                (isinstance(r, int) and r <= 0)
+                or (isinstance(r, float) and math.isfinite(r) and r <= 0)):
             return None
         sat = electrum_fee_to_sat_vb(r)
         if sat is None:
@@ -898,8 +904,9 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
     estimate for that confirmation target (the forwarder needs both the
     outputs and a rate, and one circuit is one fact fewer to leak); the
     result then carries `fee_sat_vb`. When the server that answered the
-    look has no estimate, the others are asked for one (estimatefee only,
-    never the scripthash); None only when no configured server has one.
+    look has no estimate -- or answers the estimate malformed -- the others
+    are asked for one (server.version and estimatefee only, never the
+    scripthash); None when none of them has one or none could be reached.
     Returns
         {state, confirmed_sat, unconfirmed_sat, settled_sat, confirmations,
          utxos, tip, server, cert_sha256[, fee_sat_vb]}
@@ -956,7 +963,16 @@ def look(address, servers, proxy_url, *, min_conf=1, network="main",
                 tip = e.tip_height()
                 picture = summarize(e.listunspent(scripthash), tip, min_conf)
                 if fee_blocks is not None:
-                    picture["fee_sat_vb"] = e.estimate_fee(fee_blocks)
+                    # THE PICTURE IS ANSWERED: a failed or malformed ESTIMATE
+                    # from this server is not a reason to hand the next one
+                    # the scripthash. Failed over in full, a server that
+                    # answered junk to estimatefee passed its whole share of
+                    # addresses to the next; now the others are asked for
+                    # the fee only, like a server with no estimate.
+                    try:
+                        picture["fee_sat_vb"] = e.estimate_fee(fee_blocks)
+                    except BtcWatchError:
+                        picture["fee_sat_vb"] = None
         except PinMismatch:
             # A detected interception is not a dead server to route around.
             raise

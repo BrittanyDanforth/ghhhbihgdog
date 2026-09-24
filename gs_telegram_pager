@@ -5540,11 +5540,13 @@ class Pager:
             if not e:
                 return
             _was_forwarding = e.get("state") == "forwarding"
+            _from_fwd = bool(e.pop("from_forwarded", False))
             if out == "done":
                 # THE RUN FINISHED: whatever it said, the automatic retries
                 # of a refused or failed forward start over from here.
                 e.pop("stall_tries", None)
-                if phase not in ("arriving", "not_yet"):
+                if phase not in ("arriving", "not_yet") and not (
+                        phase == "returned" and _was_forwarding):
                     # ...and so do the waits after a forward the vault found
                     # early: it got past the look.
                     e.pop("early_tries", None)
@@ -5627,6 +5629,16 @@ class Pager:
                 e.pop("retry_after", None)
                 e.pop("rechecked_at", None)
                 e.pop("fee_tries", None)
+                if _was_forwarding:
+                    # ...AND IF THIS END STARTED IT, THE EARLY WAIT: the
+                    # vault found the money unsettled where this end saw
+                    # it confirmed (its depth rule, or its server a block
+                    # behind), and without the wait the next look started
+                    # the same forward again -- a wake per look until the
+                    # depths agreed, the thing the arriving branch's wait
+                    # exists to stop. (Reachable since the agent answers a
+                    # reconciliation's `returned` over a moved plan.)
+                    self._btc_early_wait(e)
                 return
             if out == "done" and phase == "delayed":
                 # ...AND EACH `delayed` IN A ROW DOUBLES THE WAIT
@@ -5634,6 +5646,13 @@ class Pager:
                 # wake an hour per deposit, which with two deposits was the
                 # whole day's budget on retries alone.
                 _wait = self.fee_retry_wait(e)
+                if _was_forwarding and _from_fwd:
+                    # A FORWARD OF RETURNED MONEY THE FORWARDED LOOK STARTED,
+                    # refused on today's fee: back to `forwarded` -- looked
+                    # at once a window, its wait gating the next start --
+                    # not `seen`, looked at every tick (the circuits the
+                    # throttle exists to remove, for a spent address).
+                    e["state"] = "forwarded"
                 if e["state"] in ("sent", "forwarded", "kept"):
                     # A REPLACEMENT THE VAULT WOULD NOT PAY FOR TODAY
                     # (stage 6): the original stands, listed, and the
@@ -5641,6 +5660,11 @@ class Pager:
                     # passed. The entry stays as it was -- a kept one too:
                     # its money is not this end's to start on.
                     e["retry_after"] = time.time() + _wait
+                    if e["state"] == "kept":
+                        # ...and a kept one's tap goes back to the XMR
+                        # side for a window, as after `kept` itself: left
+                        # due, every tap cost a wake to hear `delayed`.
+                        e["rechecked_at"] = time.time()
                     return
                 # THE VAULT WOULD NOT PAY TODAY'S FEE. Fees fall in hours:
                 # the deposit stays on the list as money seen and the
@@ -5668,17 +5692,8 @@ class Pager:
                     # nothing enforces it), or its server is a block behind
                     # this end's. Without a wait the next tick sees the
                     # same confirmed money and starts the forward again --
-                    # a wake every ten minutes until the depths agree. The
-                    # wait doubles from twenty minutes (two blocks' worth),
-                    # and the start after it is a background one, so it
-                    # leaves the reserve for taps.
-                    try:
-                        _n = max(0, int(e.get("early_tries") or 0)) + 1
-                    except (TypeError, ValueError):
-                        _n = 1
-                    e["early_tries"] = _n
-                    e["retry_after"] = time.time() + float(
-                        self.EARLY_WAIT_S) * float(2 ** min(_n - 1, 3))
+                    # a wake every ten minutes until the depths agree.
+                    self._btc_early_wait(e)
                 return
             if e["state"] in ("sent", "forwarded", "kept"):
                 # A RECHECK THAT DID NOT FINISH (stage 6): the history could
@@ -5833,6 +5848,20 @@ class Pager:
         e["fee_tries"] = tries
         return float(self.btc_fee_retry_s) * float(
             2 ** min(tries - 1, int(self.FEE_RETRY_DOUBLINGS)))
+
+    def _btc_early_wait(self, e) -> None:
+        """The wait after a forward this end started that the vault found
+        early (`arriving`, or `returned`): it doubles from EARLY_WAIT_S --
+        twenty minutes, two blocks' worth -- and the start after it is a
+        background one (early_tries marks it a retry), so it leaves the
+        reserve for taps."""
+        try:
+            _n = max(0, int(e.get("early_tries") or 0)) + 1
+        except (TypeError, ValueError):
+            _n = 1
+        e["early_tries"] = _n
+        e["retry_after"] = time.time() + float(
+            self.EARLY_WAIT_S) * float(2 ** min(_n - 1, 3))
 
     def _recheck_due_entry(self, e, now) -> bool:
         """Whether a watch entry's forward is the forward's question again
@@ -6185,6 +6214,10 @@ class Pager:
                 if not self._btc_can_start(background=True):
                     return
                 e["state"] = "forwarding"
+                # ...REMEMBERED ON THE ENTRY, for the answer: a `delayed`
+                # puts it back to `forwarded` (looked at once a window),
+                # not `seen` (looked at every tick).
+                e["from_forwarded"] = True
                 e["said"].discard("confirmed")
                 self._btc_sent_set().discard(h)
                 # (No "btc_returned_seen" on the chain: the poke that
@@ -6360,6 +6393,7 @@ class Pager:
                 # remove. It stays forwarded, its look stamp kept, and
                 # the next window tries again.
                 e["state"] = "forwarded" if _from_forwarded else "seen"
+                e.pop("from_forwarded", None)
 
     #: The watcher's wake, when each address keeps its own schedule: a
     #: tick looks at one due address at most, so it wakes often and at
