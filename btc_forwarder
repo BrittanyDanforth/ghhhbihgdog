@@ -132,6 +132,16 @@ from gs_btc_watch import derive_receive_address, look, parse_server  # noqa
 # them. Nothing else in this file names a method that spends.
 import gs_btc_broadcast as bcast                             # noqa: E402
 bcast_submit = bcast.submit
+
+
+def _vouchers_not(sub):
+    """The servers `seen` must not take the word of, from a submit's
+    result: the one that accepted (it cannot vouch for itself) and every
+    one that answered a txid not ours (caught out once already). In
+    memory only -- a server's name is never written to the plan from
+    here."""
+    out = [sub.get("server")] + list(sub.get("mismatched_servers") or ())
+    return [h for h in out if isinstance(h, str) and h]
 bcast_seen = bcast.seen
 # READ-ONLY, in the same module: the address's spends, for a forward that
 # went out and whose plan was never written (stage 5).
@@ -2553,7 +2563,8 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     integrity_log("forward", "resending")
     try:
         sub = bcast_submit(tx_hex, txid, address, servers, args.tor_proxy,
-                           network=args.network, timeout=args.timeout)
+                           network=args.network, timeout=args.timeout,
+                           stop=shutdown_requested)
     except watch.PinMismatch:
         raise Refused("pin_mismatch",
                       "a pinned Electrum server presented another "
@@ -2602,7 +2613,7 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
                             network=args.network, timeout=args.timeout,
                             wait_s=args.seen_wait,
                             interval_s=args.seen_interval,
-                            avoid=sub["server"], stop=shutdown_requested)
+                            avoid=_vouchers_not(sub), stop=shutdown_requested)
     except watch.PinMismatch:
         seen_r = {"seen": False, "height": None, "server": None,
                   "cert_sha256": None, "polls": 0, "asked": False,
@@ -3220,7 +3231,7 @@ def main(argv=None):
         try:
             sub = bcast_submit(tx.serialize().hex(), txid, address, servers,
                                args.tor_proxy, network=args.network,
-                               timeout=args.timeout)
+                               timeout=args.timeout, stop=shutdown_requested)
         except watch.PinMismatch:
             raise Refused("pin_mismatch",
                           "a pinned Electrum server presented another "
@@ -3258,7 +3269,7 @@ def main(argv=None):
                                 network=args.network, timeout=args.timeout,
                                 wait_s=args.seen_wait,
                                 interval_s=args.seen_interval,
-                                avoid=sub["server"], stop=shutdown_requested)
+                                avoid=_vouchers_not(sub), stop=shutdown_requested)
         except watch.PinMismatch:
             seen_r = {"seen": False, "height": None, "server": None,
                       "cert_sha256": None, "polls": 0, "asked": False,

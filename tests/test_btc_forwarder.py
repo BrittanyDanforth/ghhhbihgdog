@@ -1568,6 +1568,17 @@ check("...and the rebuilt plan carries the killed run's own quote, so the "
       and Decimal(str(_p["expected_xmr"])) == Decimal(_ndq)
       and _p.get("worst_case_xmr") is not None
       and Decimal(str(_p["worst_case_xmr"])) <= Decimal(_ndq))
+# THE STOP REACHES THE SUBMIT, AND SEEN SKIPS EVERY SERVER THE SUBMIT
+# CAUGHT OUT (the stage 3 read): a server that answered a txid not ours was
+# asked to vouch for the propagation, and its word dropped the signed bytes.
+_nv = Net(submit=dict(_ACCEPTED, mismatched=1,
+                      mismatched_servers=["t.onion"]), seen=_SEEN0)
+_c, _o, _p, _ = run(_nv, broadcast=True)
+check("a sending run hands submit the shutdown flag, and seen the "
+      "accepting server AND the one that answered a foreign txid to avoid",
+      _nv.submits and _nv.submits[0].get("stop") is F.shutdown_requested
+      and _nv.seens and _nv.seens[0].get("avoid") == ["s.onion", "t.onion"]
+      and "t.onion" not in json.dumps(_p or {}))
 # A RECORD THAT CANNOT BE WRITTEN SENDS NOTHING.
 _real_awj = F.atomic_write_json
 
@@ -2788,7 +2799,8 @@ check("...submit was given THIS address, the configured servers, the proxy, "
       and _net.seens[0]["interval_s"] == 15.0)
 check("...and seen is told which server ACCEPTED, so its proof comes from "
       "another one where there is one",
-      _net.seens[0]["avoid"] == "s.onion" == _plan["broadcast_server"])
+      _net.seens[0]["avoid"] == ["s.onion"]
+      and _plan["broadcast_server"] == "s.onion")
 check("...THE HEX IS NOWHERE: not in the plan (the network has it), not on "
       "stdout", _plan["tx_hex"] is None and _plan["tx_hex_reason"] is None
       and _plan["signed_hex_written"] is False

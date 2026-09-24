@@ -4425,8 +4425,8 @@ MUTATIONS = [
   '                        or False)',
   ['test_wake_agent']),
  ('seen() asks the server that accepted the transaction for the proof', 'gs_btc_broadcast.py',
-  '    if avoid and len(order) > 1:\n        order = [o for o in order if o[0] != avoid] or order',
-  '    if False:\n        order = [o for o in order if o[0] != avoid] or order',
+  '    if _avoid and len(order) > 1:\n        order = [o for o in order if o[0] not in _avoid]',
+  '    if False:\n        order = [o for o in order if o[0] not in _avoid]',
   ['test_btc_broadcast']),
  ('a paired BTC setting present and wrong is coerced, not refused', 'gs_wake_agent',
   '    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:',
@@ -5449,12 +5449,12 @@ MUTATIONS = [
   '',
   ['test_btc_forwarder']),
  ('the seen wait is not told about a stop', 'btc_forwarder',
-  '                                avoid=sub["server"], stop=shutdown_requested)',
-  '                                avoid=sub["server"])',
+  '                                avoid=_vouchers_not(sub), stop=shutdown_requested)',
+  '                                avoid=_vouchers_not(sub))',
   ['test_btc_forwarder']),
- ('a stop does not end the seen wait', 'gs_btc_broadcast.py',
-  '        if stop():\n            break',
-  '        if False:\n            break',
+ ('a stop does not cut the seen sleep short', 'gs_btc_broadcast.py',
+  '        while _left > 0 and not stop():\n',
+  '        while _left > 0:\n',
   ['test_btc_broadcast']),
  ('a dust flood makes a forward no node relays', 'btc_forwarder',
   '    while k > 0 and not standard_fits(len(must) + k, op_return_limit):',
@@ -8759,6 +8759,58 @@ MUTATIONS = [
   '                    print("  [!] the vault issued a BTC deposit address of its "\n',
   ['test_telegram_pager']),
 
+ # ---- the stage 3 read: what a broadcast may take a server's word for ----
+ ("submit sends bytes that are not the txid's", 'gs_btc_broadcast.py',
+  '    if _got != want:\n'
+  '        raise BtcWatchError("broadcast: the bytes are not the transaction "\n',
+  '    if False:\n'
+  '        raise BtcWatchError("broadcast: the bytes are not the transaction "\n',
+  ['test_btc_broadcast']),
+ ("submit is deaf to a stop between servers", 'gs_btc_broadcast.py',
+  '        if stop is not None and stop():\n'
+  '            break\n'
+  '        attempts += 1\n',
+  '        attempts += 1\n',
+  ['test_btc_broadcast']),
+ ("submit does not name the servers that answered a foreign txid", 'gs_btc_broadcast.py',
+  '            liars.append(host)\n',
+  '',
+  ['test_btc_broadcast']),
+ ("seen leaves out only the first server it is told to avoid", 'gs_btc_broadcast.py',
+  '        order = [o for o in order if o[0] not in _avoid]\n',
+  '        order = [o for o in order if o[0] != (avoid if isinstance(avoid, str) else (list(avoid) or [None])[0])]\n',
+  ['test_btc_broadcast']),
+ ("seen with every server avoided asks them anyway", 'gs_btc_broadcast.py',
+  '        order = [o for o in order if o[0] not in _avoid]\n'
+  '        if not order:\n',
+  '        order = [o for o in order if o[0] not in _avoid] or order\n'
+  '        if not order:\n',
+  ['test_btc_broadcast']),
+ ("seen with every server avoided waits out the poll for nobody", 'gs_btc_broadcast.py',
+  '        if not order:\n'
+  '            return {"seen": False, "height": None, "server": None,\n',
+  '        if False:\n'
+  '            return {"seen": False, "height": None, "server": None,\n',
+  ['test_btc_broadcast']),
+ ("a history height no tip may have reads as mined", 'gs_btc_broadcast.py',
+  '                    or h >= watch.Electrum.MAX_TIP_HEIGHT \\\n',
+  '',
+  ['test_btc_broadcast']),
+ ("the forward lets a server caught out at the submit vouch for the send", 'btc_forwarder',
+  '    out = [sub.get("server")] + list(sub.get("mismatched_servers") or ())\n',
+  '    out = [sub.get("server")]\n',
+  ['test_btc_forwarder']),
+ ("the forward's submit is deaf to the shutdown flag", 'btc_forwarder',
+  '                               timeout=args.timeout, stop=shutdown_requested)\n',
+  '                               timeout=args.timeout)\n',
+  ['test_btc_forwarder']),
+
+ ("the hex reaches the server as the caller cased it", 'gs_btc_broadcast.py',
+  '                            "node relays")\n'
+  '    return h.lower()\n',
+  '                            "node relays")\n'
+  '    return h\n',
+  ['test_btc_broadcast']),
 ]
 
 

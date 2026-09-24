@@ -1,9 +1,11 @@
 # Stage 3: broadcast over Tor — the forward leaves the machine
 
-Status: **PLANNED** (this commit); the build follows in the commits after it,
-and the status block at the end is updated as each step lands. This file is
-the whole context for stage 3 of the BTC-intake rework (`BTC_INTAKE_DESIGN.md`;
-stage 2 is `STAGE2_PLAN.md`), written before the build and kept as its record.
+Status: **BUILT** -- planned first, then built step by step; the status
+block at the end is the tally. (This line said PLANNED for as long as the
+build was in the tree; the stage 3 read corrected it and section 3.1's
+import claim below.) This file is the whole context for stage 3 of the
+BTC-intake rework (`BTC_INTAKE_DESIGN.md`; stage 2 is `STAGE2_PLAN.md`),
+written before the build and kept as its record.
 
 Stage 3 turns the signed, never-broadcast forward of stage 2 into a forward
 that is handed to the Bitcoin network over Tor, verified as seen, recorded,
@@ -88,8 +90,12 @@ in a module the Pi never imports (a source-level test pins that
 the Pi's side names the second). The stage-1 guarantee — the watch client knows
 no such method — stays literally true and its three tripwire tests stay green
 unchanged: the string `transaction.broadcast` still does not appear in
-`gs_btc_watch.py`, and in `btc_forwarder` it appears only as an import of the
-function below, under the `--broadcast` branch.
+`gs_btc_watch.py`. (Planned here: "in `btc_forwarder` it appears only as an
+import of the function below, under the `--broadcast` branch". As built,
+`btc_forwarder` imports the module at the top, `bcast_submit = bcast.submit`,
+and CALLS it at two sites only: the send under `--broadcast` and the re-send
+of kept bytes under `--reconcile`. A source check in test_btc_forwarder pins
+the two call sites, not an import position.)
 
 `history` is read-only and could have gone in stage 1's client; it goes here
 because only the broadcast needs it (to see its own transaction) and because

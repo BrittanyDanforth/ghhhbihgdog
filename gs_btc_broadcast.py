@@ -6,8 +6,12 @@ Pi's module: it derives, it looks, and its client "knows no method that
 could move money" -- three tests read its source to keep that literally
 true. This module is the other half, and it lives in its own file so that
 sentence stays true: it subclasses the watch client, adds
-blockchain.transaction.broadcast (the spend) and blockchain.scripthash.get_history
-(read-only, to see the spend), and nothing on the Pi imports it.
+blockchain.transaction.broadcast (the spend) and two read-only calls --
+blockchain.scripthash.get_history (to see the spend) and, since stage 5,
+blockchain.transaction.get (each listed transaction, its txid recomputed
+here) -- and nothing on the Pi imports it. Beside submit and seen below,
+stage 5's reconciliation reads the address through history_of, unused and
+spends_of; none of them can move money.
 
 Two questions are answered here, and the answers are shaped by money:
 
@@ -158,7 +162,14 @@ class Broadcaster(watch.Electrum):
             if not isinstance(e, dict):
                 raise BtcWatchError("electrum: bad history entry")
             h, tx = e.get("height"), e.get("tx_hash")
+            # ...AND NO HEIGHT AT OR ABOVE THE ONE A TIP MAY HAVE (the
+            # stage 3 read; watch.Electrum.MAX_TIP_HEIGHT): 10**30 read as
+            # a block, so `seen_height` and `superseded_height` took it as
+            # mined. Hygiene, not a defence -- a server that lies can name
+            # a plausible height -- but an absurd one is a malformed answer
+            # like any other, and the read fails over.
             if isinstance(h, bool) or not isinstance(h, int) or h < -1 \
+                    or h >= watch.Electrum.MAX_TIP_HEIGHT \
                     or not isinstance(tx, str) or not _TXID_RE.match(tx.lower()):
                 raise BtcWatchError("electrum: bad history entry")
             out.append({"tx_hash": tx.lower(), "height": h})
@@ -211,26 +222,55 @@ def _prepare(address, network, servers, proxy_url, transport_factory,
 
 
 def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
-           network="main", timeout=DEFAULT_TIMEOUT, transport_factory=None):
+           network="main", timeout=DEFAULT_TIMEOUT, transport_factory=None,
+           stop=None):
     """Hand the signed transaction to the network. See the module header
     for the four outcomes. Returns
         {outcome, server, cert_sha256, codes, attempts, mismatched,
-         pin_mismatch}
+         mismatched_servers, pin_mismatch}
     where `codes` are the numeric codes of every rejection, `attempts` how
     many servers were tried and `mismatched` how many answered with a
-    txid that was not ours. `server` names the accepting server, else
-    None. Raises only for a configuration that could not be right, or a
-    PinMismatch before any bytes left; a PinMismatch AFTER they did is
-    reported in the result (`pin_mismatch`) under outcome ambiguous, so
-    the fact that money may have moved is never lost to the interception
-    signal."""
+    txid that was not ours -- `mismatched_servers` names them, for `seen`
+    to leave out (never written anywhere by this module). `server` names
+    the accepting server, else None. Raises only for a configuration that
+    could not be right, or a PinMismatch before any bytes left; a
+    PinMismatch AFTER they did is reported in the result (`pin_mismatch`)
+    under outcome ambiguous, so the fact that money may have moved is never
+    lost to the interception signal.
+
+    THE BYTES ARE THE TXID'S (the stage 3 read): `raw_hex` is parsed and
+    its txid recomputed before any connection, and a pair that disagree is
+    refused. The acceptance test below compares a server's answer with
+    `expected_txid`; handed another transaction's bytes by a caller's bug,
+    a server answering the real txid read as a lie (ambiguous) and one
+    answering the expected one -- lying -- as accepted, about bytes that
+    were never the plan's.
+
+    `stop`, when given, is asked before each server is dialled: once it
+    says True no further server is tried and the result is what the tries
+    so far make it (bytes that left are still `ambiguous`; none left is
+    `unreachable` or `rejected`, and the caller keeps the bytes for the
+    next run). The stage 3 read found the loop deaf to it: over Tor a
+    server can take the whole timeout, and systemd's SIGKILL comes twenty
+    seconds after its SIGTERM -- a kill mid-submit, with the plan that
+    records the bytes never written."""
     raw = _check_hex(raw_hex)
     want = _check_txid(expected_txid)
+    try:
+        _got = Transaction.parse(bytes.fromhex(raw)).txid().hex()
+    except Exception:                                        # noqa: BLE001
+        raise BtcWatchError("broadcast: the bytes are not a transaction")
+    if _got != want:
+        raise BtcWatchError("broadcast: the bytes are not the transaction "
+                            "the txid names")
     _scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                         transport_factory, timeout)
     codes, attempts, mismatched, ambiguous = [], 0, 0, False
+    liars = []
     pinned = False
     for host, port, pin in order:
+        if stop is not None and stop():
+            break
         attempts += 1
         transport = make(host, port, pin)
         b = Broadcaster(transport)
@@ -259,12 +299,14 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
             continue
         if got != want:
             mismatched += 1
+            liars.append(host)
             ambiguous = True
             continue
         return {"outcome": OUTCOME_ACCEPTED, "server": host,
                 "cert_sha256": getattr(transport, "cert_sha256", None),
                 "codes": codes, "attempts": attempts,
-                "mismatched": mismatched, "pin_mismatch": False}
+                "mismatched": mismatched, "mismatched_servers": liars,
+                "pin_mismatch": False}
     if ambiguous:
         outcome = OUTCOME_AMBIGUOUS
     elif codes:
@@ -273,7 +315,7 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
         outcome = OUTCOME_UNREACHABLE
     return {"outcome": outcome, "server": None, "cert_sha256": None,
             "codes": codes, "attempts": attempts, "mismatched": mismatched,
-            "pin_mismatch": pinned}
+            "mismatched_servers": liars, "pin_mismatch": pinned}
 
 
 def history_of(address, servers, proxy_url, *, network="main",
@@ -572,6 +614,15 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     the forward dropped the signed bytes as proven. Now nobody else
     answering is "nobody could be asked", and the bytes are kept.
 
+    ...AND SO IS EVERY SERVER THAT ANSWERED THE SUBMIT WITH A TXID NOT OURS
+    (the stage 3 read): `avoid` may name several (submit's
+    `mismatched_servers` beside its `server`). One of those was asked here
+    before: caught out once already, it vouched for the propagation and the
+    signed bytes were dropped. When every configured server is avoided
+    nobody is asked, at once -- "nobody could be asked", the bytes kept.
+    None of this rests on a secret: it rests on some OTHER server being
+    honest, which is all a second opinion is.
+
     `stop`, when given, is asked before every poll, before each server a
     poll fails over to, and during the sleep (in slices of at most a
     second): once it says True the wait ends with what the polls have
@@ -583,8 +634,13 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     want = _check_txid(txid)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
-    if avoid and len(order) > 1:
-        order = [o for o in order if o[0] != avoid] or order
+    _avoid = ({avoid} if isinstance(avoid, str)
+              else {a for a in (avoid or ()) if isinstance(a, str) and a})
+    if _avoid and len(order) > 1:
+        order = [o for o in order if o[0] not in _avoid]
+        if not order:
+            return {"seen": False, "height": None, "server": None,
+                    "cert_sha256": None, "polls": 0, "asked": False}
     if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)) \
             or wait_s < 0 or isinstance(interval_s, bool) \
             or not isinstance(interval_s, (int, float)) or interval_s <= 0:
@@ -619,7 +675,8 @@ def seen(txid, address, servers, proxy_url, *, network="main",
             _s = min(1.0, _left)
             sleeper(_s)
             _left -= _s
-        if stop():
-            break
+        # (No second `if stop(): break` here: the loop's first line asks
+        # it. The stage 3 read found one, and the sweep's mutant of it
+        # survived because it changed nothing.)
     return {"seen": False, "height": None, "server": host,
             "cert_sha256": cert, "polls": polls, "asked": asked}

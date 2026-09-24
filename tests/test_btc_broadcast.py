@@ -56,13 +56,20 @@ _finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS),
 
 import gs_btc_broadcast as B                                 # noqa: E402
 import gs_btc_watch as W                                     # noqa: E402
+import gs_btc_tx as T                                        # noqa: E402
 
 # --- fixtures ----------------------------------------------------------------
 _A0 = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"            # BIP84 index 0
 _SH = W.address_to_scripthash(_A0)
-_TXID = "ab" * 32
+# A REAL TRANSACTION, ITS HEX UPPER-CASED (the stage 3 read). The bytes
+# were "02000000000101" and filler, all digits and lower case: a check that
+# the hex reaches the server lower-cased compared a string with itself, and
+# nothing tied the bytes to _TXID -- which submit now checks, as it must.
+_TX0 = T.build_unsigned([{"tx_hash": "11" * 32, "vout": 0, "value": 50000}],
+                        [(40000, T.address_script(_A0, "main"))])
+_TXID = _TX0.txid().hex()
 _OTHER = "cd" * 32
-_HEX = "02000000000101" + "11" * 40 + "ffffffff" + "00" * 12
+_HEX = _TX0.serialize().hex().upper()
 _PROXY = "socks5h://127.0.0.1:9050"
 _SERVERS = [("s1.onion", 50002)]
 _TWO = [("s1.onion", 50002), ("s2.onion", 50002)]
@@ -74,6 +81,10 @@ def _refused(fn, *a, **k):
         return False
     except W.BtcWatchError:
         return True
+    except AssertionError:
+        # _never was reached: the call got past the refusals it should have
+        # met. A red check, not a dead suite.
+        return False
 
 
 # ===========================================================================
@@ -112,6 +123,30 @@ check("without a transport factory, a proxy URL that cannot isolate is ONE "
       _refused(B.submit, _HEX, _TXID, _A0, _SERVERS, "socks5://127.0.0.1:9050")
       and _refused(B.submit, _HEX, _TXID, _A0, _SERVERS,
                    "socks5h://u:p@127.0.0.1:9050"))
+# THE BYTES ARE THE TXID'S (the stage 3 read): submit compares a server's
+# answer with the txid it was handed, so bytes and txid that disagree made
+# a lying server "accepted" and an honest one a liar.
+check("bytes whose txid is not the expected one are refused before "
+      "connecting", _refused(B.submit, _HEX, _OTHER, _A0, _SERVERS, _PROXY,
+                             transport_factory=_never))
+check("...and hex that is not a transaction at all is refused too",
+      _refused(B.submit, "00" * 60, _TXID, _A0, _SERVERS, _PROXY,
+               transport_factory=_never))
+_reached = []
+
+
+def _reach(host, port, tag):
+    _reached.append(host)
+    raise KeyError("reached the transport")
+
+
+try:
+    B.submit(_HEX, _TXID, _A0, _SERVERS, _PROXY, transport_factory=_reach)
+except KeyError:
+    pass
+check("NON-VACUITY: the same bytes with their own txid get past every "
+      "check before connecting (a transport is asked for)",
+      _reached == ["s1.onion"])
 check("the outcome vocabulary is four words and MAYBE_MOVED is exactly the "
       "two after which money may have moved",
       B.OUTCOMES == ("accepted", "rejected", "ambiguous", "unreachable")
@@ -246,7 +281,7 @@ check("ACCEPTED: the server answered with our txid -- outcome accepted, the "
       "server named, one attempt, no codes, no mismatch",
       _r == {"outcome": "accepted", "server": "s1.onion", "cert_sha256": None,
              "codes": [], "attempts": 1, "mismatched": 0,
-             "pin_mismatch": False})
+             "mismatched_servers": [], "pin_mismatch": False})
 check("...the session spoke server.version then the broadcast and NOTHING "
       "else, with the hex lower-cased as the one parameter",
       _ft.methods == ["server.version", "blockchain.transaction.broadcast"]
@@ -312,6 +347,39 @@ check("down then down: UNREACHABLE, two attempts",
 _r, _s = _submit(_FT("foreign"), _FT("accept"), servers=_TWO)
 check("a foreign txid then our own: accepted on the second, mismatched 1",
       _r["outcome"] == "accepted" and _r["mismatched"] == 1)
+check("...and the server that answered the foreign txid is NAMED, for seen "
+      "to leave out (the stage 3 read)",
+      _r.get("mismatched_servers") == _s["hosts"][:1]
+      and _r["server"] == _s["hosts"][1])
+# A STOP IS HEARD BETWEEN SERVERS (the stage 3 read): over Tor a server can
+# take the whole timeout, and SIGKILL follows SIGTERM by twenty seconds.
+
+
+def _submit_stop(f, servers, stop):
+    """submit with `stop`; a submit that takes no stop is a red check."""
+    try:
+        return B.submit(_HEX, _TXID, _A0, servers, _PROXY,
+                        transport_factory=f, stop=stop)
+    except TypeError:
+        return {"outcome": "(no stop parameter)", "attempts": -1}
+
+
+_f = _factory(_FT("accept"))
+_r = _submit_stop(_f, _SERVERS, lambda: True)
+check("a stop already raised: no server is dialled, and the result is "
+      "unreachable -- nothing left, the caller keeps the bytes",
+      _f.seen["hosts"] == [] and _r["outcome"] == "unreachable"
+      and _r["attempts"] == 0)
+_f = _factory(_FT("hangup"), _FT("accept"))
+_r = _submit_stop(_f, _TWO, lambda: bool(_f.seen["hosts"]))
+check("a stop raised during the first server: the second is never dialled, "
+      "and bytes that left are still ambiguous",
+      len(_f.seen["hosts"]) == 1 and _r["outcome"] == "ambiguous")
+_f = _factory(_FT("hangup"), _FT("accept"))
+_r = _submit_stop(_f, _TWO, lambda: False)
+check("NON-VACUITY: a stop that is never raised changes nothing -- the "
+      "second server is dialled and accepts",
+      len(_f.seen["hosts"]) == 2 and _r["outcome"] == "accepted")
 _f = _factory(_FT("accept", pin_mismatch=True), _FT("accept"))
 try:
     B.submit(_HEX, _TXID, _A0, _TWO, _PROXY, transport_factory=_f)
@@ -564,6 +632,42 @@ _r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
                servers=_SERVERS, wait_s=0, avoid="s1.onion")
 check("...and with ONE server there is nobody else: it is asked anyway",
       _s["hosts"] == ["s1.onion"] and _r["seen"] is True)
+# ...AND EVERY SERVER THE SUBMIT CAUGHT OUT (the stage 3 read): one that
+# answered a txid not ours was asked here, and its word dropped the bytes.
+_S3x = _TWO + [("s3.onion", 50002)]
+_o3 = [h for h, _p, _pin in W.server_order(_S3x, _SH)]
+_r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_S3x, wait_s=0, avoid=[_o3[0], _o3[1]])
+check("avoid= naming the accepting server AND a server that answered a "
+      "foreign txid: only the third is asked",
+      _s["hosts"] == [_o3[2]] and _r["server"] == _o3[2])
+try:
+    _r, _s = _seen(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+                   _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+                   servers=_TWO, wait_s=600, avoid=[_first, _second],
+                   sleeper=lambda s: (_ for _ in ()).throw(AssertionError(
+                       "slept with nobody to ask")))
+except AssertionError:
+    # A red check, not a dead suite: it waited out the poll with nobody
+    # to ask.
+    _r, _s = {"seen": None}, {"hosts": ["(slept)"]}
+check("...and with every server avoided nobody is asked, at once: not "
+      "seen, not asked -- the caller keeps the bytes",
+      _s["hosts"] == [] and _r["seen"] is False and _r["asked"] is False
+      and _r["polls"] == 0)
+# A HEIGHT NO TIP MAY HAVE IS NOT A HEIGHT (the stage 3 read): 10**30 read
+# as mined.
+_r, _ = _seen(_FT(history=[{"tx_hash": _TXID,
+                            "height": W.Electrum.MAX_TIP_HEIGHT}]), wait_s=0)
+check("a history height at the locktime threshold is a malformed answer: "
+      "not seen, nobody answered", _r["seen"] is False
+      and _r["asked"] is False)
+_r, _ = _seen(_FT(history=[{"tx_hash": _TXID,
+                            "height": W.Electrum.MAX_TIP_HEIGHT - 1}]),
+              wait_s=0)
+check("NON-VACUITY: one under it is a height", _r["seen"] is True)
 
 # ===========================================================================
 print("\n== unused(): has this address ever been used? ==")
@@ -902,7 +1006,8 @@ check("a spend of ours OLDER than the window is read all the same when the "
                                  "value": 300000}]
       and _SPEND1_ID not in [x["txid"] for x in _rk0])
 
-_r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k), {})
+_r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k),
+                {"txid": "compute"})
 check("plaintext: the real SOCKS5 handshake, then the real subclass hands "
       "the hex to the server and gets our txid back -- accepted, the server "
       "named", _r["outcome"] == "accepted" and _r["server"] == "send.example.onion")
@@ -922,7 +1027,7 @@ _r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k),
                 {"reject": 1})
 check("a rejection whose message carries the transaction (as ElectrumX's "
       "does) comes back as the code alone", _r["outcome"] == "rejected"
-      and _r["codes"] == [1] and _HEX not in json.dumps(_r)
+      and _r["codes"] == [1] and _HEX.lower() not in json.dumps(_r)
       and _cap.get("hex") == _HEX.lower())
 _r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k),
                 {"hangup": True})
@@ -947,19 +1052,27 @@ check("spends_of() end to end: the history, then each transaction fetched "
 
 from btcmock import tls_server_context                       # noqa: E402
 _sctx, _CERT_SHA256 = tls_server_context()
-_r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k), {},
-                tls_ctx=_sctx, pin=_CERT_SHA256)
+_r, _cap = _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k),
+                {"txid": "compute"}, tls_ctx=_sctx, pin=_CERT_SHA256)
 check("TLS with the right pin: accepted, TLS 1.2+, the certificate reported",
       _r["outcome"] == "accepted" and _r["cert_sha256"] == _CERT_SHA256
       and _cap.get("tls_version") in ("TLSv1.2", "TLSv1.3"))
-try:
-    _e2e(lambda s, p, **k: B.submit(_HEX, _TXID, _A0, s, p, **k), {},
-         tls_ctx=_sctx, pin="00" * 32)
-    _pm = "returned"
-except W.PinMismatch:
-    _pm = "raised"
+def _pin_caught(s, p, **k):
+    try:
+        B.submit(_HEX, _TXID, _A0, s, p, **k)
+        return "returned"
+    except W.PinMismatch:
+        return "raised"
+
+
+# "...AND NEVER SENT" WAS NOT CHECKED (the stage 3 read): only the raise
+# was, so a submit that sent first and raised after would have passed.
+# What the server captured is asked now.
+_pm, _cap = _e2e(_pin_caught, {"txid": "compute"}, tls_ctx=_sctx,
+                 pin="00" * 32)
 check("TLS with the WRONG pin: PinMismatch raised through submit, and the "
-      "transaction was never sent", _pm == "raised")
+      "transaction was never sent -- the server received no hex",
+      _pm == "raised" and "hex" not in _cap)
 
 # ===========================================================================
 print("\n== what the source must and must not be ==")
