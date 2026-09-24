@@ -537,13 +537,17 @@ class _StoreRPC:
     address."""
 
     def __init__(self, ok=True):
+        # True: every store succeeds; False: none does; an int: that many
+        # succeed, then none (GhostSpiral asks before minting and again
+        # after, and store_wallet asks up to three times each).
         self.ok = ok
         self.stores = 0
 
     def raw_request(self, method, params=None):
         if method == "store":
             self.stores += 1
-            if not self.ok:
+            if self.ok is False or (not isinstance(self.ok, bool)
+                                    and self.stores > self.ok):
                 raise RuntimeError("Failed to save wallet")
             return {}
         raise RuntimeError(f"not modelled here: {method}")
@@ -772,6 +776,7 @@ def _drive_split(n_chunks, wallets=6, store_ok=True):
     posted = []
     _wallet = _StoreRPC(store_ok)
     _drive_split.stores_at_post = []
+    _drive_split.stores_at_mint = None
     subs_fixture = [_addr(2000 + i) for i in range(wallets + 4)]
     idx_fixture = {a: (30 + i, 1) for i, a in enumerate(subs_fixture)}
     entry_fixture = [(_addr(3000 + i), 60 + i, 1) for i in range(n_chunks)]
@@ -796,7 +801,12 @@ def _drive_split(n_chunks, wallets=6, store_ok=True):
         ghost.resolve_mix_account = lambda *a, **k: None
         ghost.create_subs = lambda *a, **k: (list(subs_fixture),
                                              dict(idx_fixture), set())
-        ghost.create_entry_set = lambda rpc, n: list(entry_fixture[:n])
+        def _entry_set(rpc, n):
+            # The LAST mint before the quote: a store counted by now is
+            # the one asked before anything was minted.
+            _drive_split.stores_at_mint = _wallet.stores
+            return list(entry_fixture[:n])
+        ghost.create_entry_set = _entry_set
         ghost.newnym = lambda *a, **k: None
         ghost.tor_recheck = lambda *a, **k: None
         ghost.validate_xmr_address = lambda *a, **k: None
@@ -875,16 +885,27 @@ check("e2e: ...while still summing to exactly what was asked for",
 # first time an entry address leaves this machine. A wallet that forgot the
 # entry after a power cut mints it again for the next run, and two swaps then
 # pay one address (see GhostSpiral.persist_minted).
+# A STORE AFTER THE ENTRY SET WAS MINTED, not merely a store: the one asked
+# before anything is minted counts too, and ">= 1" was satisfied by it alone.
 check("e2e: the wallet had STORED the entry set before the first quote went "
-      f"out ({_drive_split.stores_at_post[:1]})",
+      f"out (stores at the mint {_drive_split.stores_at_mint}, at the quote "
+      f"{_drive_split.stores_at_post[:1]})",
       bool(_drive_split.stores_at_post)
-      and _drive_split.stores_at_post[0] >= 1)
+      and isinstance(_drive_split.stores_at_mint, int)
+      and _drive_split.stores_at_post[0] > _drive_split.stores_at_mint)
 _posted_ns, _err_ns = _drive_split(3, store_ok=False)
 check("e2e: a wallet that will NOT store stops the run before any quote is "
       "posted", _posted_ns == [] and _err_ns is not None
       and "would not write" in _err_ns)
-check("e2e: ...saying nothing was published or spent",
-      _err_ns is not None and "Nothing has been published" in _err_ns)
+check("e2e: ...and before it has minted anything, saying so",
+      _err_ns is not None
+      and "Nothing has been minted, published or spent" in _err_ns)
+_posted_n1, _err_n1 = _drive_split(3, store_ok=1)
+check("e2e: a wallet that stores before the mint and not after it stops "
+      "before any quote is posted, saying what going on would cost",
+      _posted_n1 == [] and _err_n1 is not None
+      and "two swaps paying one address" in _err_n1
+      and "Nothing has been published and nothing spent" in _err_n1)
 
 # MANUAL MODE MUST LIST EVERY ENTRY ADDRESS. It prints a thor_swap_preparer
 # command for the operator to run by hand; printing only the first --dests

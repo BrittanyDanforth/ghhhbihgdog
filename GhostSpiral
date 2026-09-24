@@ -8814,45 +8814,134 @@ def resolve_swap_deposits(args, proxy, jm_utxos, receive_mode, entry_addr,
     return swap_deposits
 
 
-def persist_minted(rpc_primary, stage: str, nothing_yet: str) -> None:
-    """Write the accounts this run has minted to the wallet file, or stop.
+def persist_minted(rpc_primary, stage: str, refusal: str, *,
+                   waive: str = "",
+                   what: str = "the accounts this run created") -> bool:
+    """Write the accounts this run has minted to the wallet file. Returns
+    True once it has; on a wallet that will not, stops with `refusal` --
+    or, given `waive`, says that and returns False.
 
-    Called twice from main(). The first call comes after the mix accounts and
-    the entry are minted, before the swap's deposit instructions exist. The
-    second comes after the last mint (the change-sweep accounts), before
-    stage 5 relays anything. Nothing in a run used to ask the wallet to
-    store, and wallet-rpc does not store on its own (gs_common.store_wallet
-    says when it does). A power cut during the hours of relays left a
-    wallet file without the accounts the run had paid money into. That
-    wallet lists the accounts it had before, and hands the same indices out
-    to the next thing that mints. On the vault, the ledger then recorded
-    them as the NEXT owner's, with the first owner's money on them. The
-    agent's recovery (_recover_pending_mixes) could only wait for a refresh
-    to derive them again, and let go after three wakes.
+    Called three times from main(): before the first mint (does this wallet
+    store at all?), after the mix accounts and the entry are minted, before
+    the swap's deposit instructions exist, and after the last mint (the
+    change-sweep accounts), before stage 5 relays anything. Nothing in a run
+    used to ask the wallet to store, and wallet-rpc does not store on its
+    own (gs_common.store_wallet says when it does). A power cut during the
+    hours of relays left a wallet file without the accounts the run had
+    paid money into. That wallet lists the accounts it had before, and
+    hands the same indices out to the next thing that mints. On the vault,
+    the ledger then recorded them as the NEXT owner's, with the first
+    owner's money on them. The agent's recovery (_recover_pending_mixes)
+    could only wait for a refresh to derive them again, and let go after
+    three wakes.
 
-    IT STOPS RATHER THAN GOES ON. At the first call nothing has been
-    published, so stopping costs nothing. At the second the swap may have
-    settled: rule 7 of AGENTS.md is about exactly that moment, and the
-    usage fee waives there instead of stopping. This one cannot waive,
-    because what would be waived is the record of whose money is on which
-    account, for hours of relays. The first call has already shown this
-    wallet can store, so the second failing means the wallet lost its disk
-    during the run. Nothing is relayed. The money stays on the entry, which
-    the first call stored.
+    BEFORE THE FIRST MINT TOO (the review of this change): asked only after
+    it, a wallet that could not store left thirteen empty accounts behind
+    on every attempt -- and on the vault every account counts against the
+    ceiling, so each /withdraw retry took headroom from every client.
+
+    STOP BEFORE THE SWAP, WAIVE AFTER IT (AGENTS.md rule 7; the same
+    review). A send-mode run's last store comes after the swap has paid the
+    entry, and stopping there told the operator to "run again": a re-run
+    mints a NEW entry set and never looks at the old one, so the money sat
+    on an address the swap's public memo names, with nothing pointing at
+    it. So there `waive` is given and the run goes on, having said what is
+    at stake and asking again when it ends (_store_at_exit). The vault's
+    runs are receive mode: no swap comes first, the first relay is the
+    irreversible step, and the store before it refuses -- which is what
+    keeps one owner's money off the next owner's accounts (rule 8).
     """
     try:
         store_wallet(rpc_primary)
+        return True
     except Exception as e:                                   # noqa: BLE001
-        integrity_log(stage, "wallet_store_FAILED")
-        sys.exit(
-            f"[!] The wallet would not write the accounts this run created "
-            f"to its file ({str(e)[:60]}).\n"
-            f"    A power cut now would lose them, and the next run would "
-            f"create the same\n"
-            f"    accounts again while this run's money sat on them. "
-            f"{nothing_yet}\n"
-            f"    Check that the wallet file's disk is writable, then run "
-            f"again.")
+        _why = str(e)[:60]
+    if waive:
+        integrity_log(stage, "wallet_store_WAIVED")
+        print(f"  [!] The wallet would not write {what} to its file "
+              f"({_why}).\n      {waive}")
+        atexit.register(_store_at_exit, rpc_primary)
+        return False
+    integrity_log(stage, "wallet_store_FAILED")
+    sys.exit(f"[!] The wallet would not write {what} to its file "
+             f"({_why}).\n    {refusal}")
+
+
+def _store_at_exit(rpc_primary) -> None:
+    """atexit, after a waived store (persist_minted): ask once more, however
+    the run ended, and say which it was. Never raises."""
+    try:
+        store_wallet(rpc_primary)
+        _ok = True
+    except Exception:                                        # noqa: BLE001
+        _ok = False
+    # The operator's line first, each on its own: a chain that cannot be
+    # written must not swallow what the operator has to do next.
+    try:
+        print("  [+] The wallet has now written the accounts this run "
+              "created to its file." if _ok else
+              "  [!] The wallet STILL has not written the accounts this run "
+              "created to its file. Make its disk writable and stop the "
+              "wallet-rpc in an orderly way (it stores when it stops) "
+              "before this machine is powered off -- or a later run is "
+              "handed the same accounts, with this run's money on them.")
+    except Exception:                                        # noqa: BLE001
+        pass
+    try:
+        integrity_log("stage5", "wallet_stored_at_exit" if _ok
+                      else "wallet_store_FAILED_at_exit")
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def persist_before_mint(rpc_primary) -> None:
+    """persist_minted before create_subs: does this wallet store at all?"""
+    persist_minted(rpc_primary, "stage3",
+                   "Nothing has been minted, published or spent: every "
+                   "account this run creates has to be on disk before "
+                   "money is paid into it, and this wallet cannot put "
+                   "anything there. Check that the wallet file's disk "
+                   "is writable, then run again.",
+                   what="anything")
+
+
+def persist_entry_set(rpc_primary) -> None:
+    """persist_minted after the mix accounts and the entry set, before the
+    swap is quoted: nothing is published yet, so it refuses."""
+    persist_minted(rpc_primary, "stage3",
+                   "Going on, a power cut before it did would lose them "
+                   "-- the entry among them -- and a later run would "
+                   "create the same entry again: two swaps paying one "
+                   "address. Nothing has been published and nothing "
+                   "spent. Check that the wallet file's disk is "
+                   "writable, then run again.")
+
+
+def persist_before_relay(rpc_primary, receive_mode: bool) -> bool:
+    """persist_minted after the last mint, before the first relay: refuses
+    in receive mode (the vault's), where the first relay is the
+    irreversible step; WAIVES in send mode, where the swap has already paid
+    the entry (AGENTS.md rule 7). See persist_minted."""
+    return persist_minted(
+        rpc_primary, "stage5",
+        "Going on, a power cut during the relays would lose the "
+        "accounts the rounds pay into, and whatever mints next -- on "
+        "the vault, another client's deposit or mix -- would be handed "
+        "the same ones with this run's money on them. Nothing has been "
+        "relayed: the money is still on the receive wallet's address. "
+        "Check that the wallet file's disk is writable, then run again "
+        "with the same --receive-wallet.",
+        waive=("" if receive_mode else
+               "The swap has already paid the entry, and stopping here "
+               "would leave that money on an address the swap's memo "
+               "names, for no later run to find (AGENTS.md rule 7), so "
+               "the run goes on. Until the wallet-rpc stores -- it does "
+               "when asked, and when it is stopped in an orderly way -- "
+               "a power cut loses the accounts the rounds pay into, and "
+               "a later mint -- a run of yours, or on a wallet a vault "
+               "also serves, a client's deposit -- is handed the same "
+               "ones with this run's money on them. This run asks "
+               "again when it ends."))
 
 
 def main():
@@ -8989,6 +9078,8 @@ def main():
         # Random per-run extra-output count, so the total (wallets + this) is not a
         # deterministic fingerprint of the `wallets` setting under public code.
         _num_decoys = secrets.SystemRandom().randint(DECOY_MIN, DECOY_MAX)
+        # A WALLET THAT CANNOT STORE IS FOUND BEFORE IT MINTS ANYTHING.
+        persist_before_mint(rpc_primary)
         subs, addr_index, decoy_addrs = create_subs(
             rpc_primary, args.wallets, _num_decoys)
         if len(subs) < MIN_WALLETS:
@@ -9021,8 +9112,7 @@ def main():
         # THEM. See persist_minted: a wallet that forgot the entry after a
         # power cut would mint it again for the next run, and two swaps would
         # pay one address.
-        persist_minted(rpc_primary, "stage3",
-                       "Nothing has been published and nothing spent.")
+        persist_entry_set(rpc_primary)
 
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
@@ -9287,9 +9377,7 @@ def main():
         # RELAYS. build_change_sweep_jobs, just above, is the last mint of the
         # run, and _stage5_run's entry veil is its first relay. See
         # persist_minted.
-        persist_minted(rpc_primary, "stage5",
-                       "Nothing has been relayed: the money is still on "
-                       "the entry.")
+        persist_before_relay(rpc_primary, receive_mode)
 
         # HOW LONG THIS WILL TAKE, BEFORE IT STARTS. The delays are the
         # dominant cost and nothing said so -- see estimate_runtime. An

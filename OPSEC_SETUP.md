@@ -1517,29 +1517,43 @@ python3 gs_wake_keys pair \
 **view-only** copy (GhostSpiral refuses a hot wallet-rpc at stage 0, on the
 fee wallet as on the mixing one); `--fee-wallet-file` is the full fee wallet
 the sweep signs with, its password in `GS_FEE_WALLET_PASSWORD` in the same
-EnvironmentFile as the spend password. Pairing asks the fee wallet-rpc to
-mint **one** subaddress and writes it into the keyfile as the only fee
-destination, so every withdrawal's cut lands there. It also checks that
-address is *foreign* to the mixing wallet-rpc, because two wallet-rpcs
-serving the same wallet is the exact configuration this exists to prevent.
+EnvironmentFile as the spend password. Pairing first asks both wallet-rpcs
+for their primary address and refuses when they are the same (one wallet,
+however the files are named) or when either does not answer. Only then does
+it ask the fee wallet-rpc to mint **one** subaddress, and writes it into the
+keyfile as the only fee destination, so every withdrawal's cut lands there.
+The mixing wallet-rpc must then answer that the address is *foreign* to it
+(its error -2). Down, locked, no wallet open, or any other error is not an
+answer, and pairing refuses. Two wallet-rpcs serving the same wallet is the
+exact configuration this exists to prevent. `--fee-wallet-file` is compared
+with `--wallet-file` as the files that sign (`<name>.keys`, symlinks
+followed), and each must have its `.keys` file there.
 
-**And every sweep asks again, before it reads a balance.** What pairing
+**And every sweep leg asks again, before it reads a balance.** What pairing
 checked was true of whatever was listening on each port that day. A sweep
 takes the largest output on whatever wallet answers the fee port as yours.
 So if the fee wallet-rpc is later restarted on the mixing wallet, or on a
 copy of it, a sweep would mix a client's deposit to your cold addresses.
-Before each sweep the vault now asks four things:
+Before each leg the vault now asks:
 - is the fee endpoint the mixing one, counting every loopback name as the
-  same host?
-- is the fee wallet file the mixing one, following symlinks?
-- does the mixing wallet-rpc claim the fee address?
+  same host and a URL with no port as port 18083?
+- do the fee wallet file and the mixing one sign with the same keys file?
+- do the two wallet-rpcs name different primary addresses? (Asking whether
+  one answers for the other's subaddress is not enough: a wallet only knows
+  the subaddresses up to 200 past the deepest one it has handed out.)
+- does the mixing wallet-rpc say the fee address is foreign?
 - does the fee wallet-rpc answer for the fee address?
 
-Only a wallet holding the fee wallet's keys can answer for that address, so
-the last answer is the one that decides. It rests on those keys, not on a
-port or a path. Anything but the right answers and nothing is read or spent:
-`fee_sweep:wallet_is_mixing` or `fee_sweep:wallet_unverified` on the chain,
-and the terminal says to check which wallet each wallet-rpc has open.
+Every answer has to come back right. Otherwise the leg does not start and
+nothing more is read or spent (legs that already ran say so):
+`fee_sweep:wallet_is_mixing` or `fee_sweep:wallet_unverified` goes on the
+chain, and the terminal says to check which wallet each wallet-rpc has open.
+
+What this rests on is that the processes on those two loopback ports are
+honest wallet-rpcs. That is the same as this machine not being someone
+else's. A process that answers anything on loopback beats these checks, and
+the keys on this disk with them. The port and path comparisons catch plain
+mistakes. Nothing rests on a port or a path being unguessable.
 
 One address for every cut is deliberate: outputs to one Monero address are
 unlinkable on-chain, the address is never published (the swap memo publishes
@@ -1692,22 +1706,35 @@ records, and what the chat is told:
   orderly way. A mix mints its accounts and then relays for hours, and a
   power cut in between left a wallet that had forgotten accounts holding
   one client's money. It then handed those accounts to the next client's
-  mix. GhostSpiral now stores the wallet after its mix accounts are minted
-  (before the swap is quoted) and again after its last mint (before the
-  first relay). Each store is followed by a flush of this machine's disks,
-  because wallet-rpc does not fsync what it writes. If the wallet cannot
-  store, GhostSpiral stops with nothing relayed (`wallet_store_FAILED` on
-  the chain). A failed store at the receive-wallet step is logged
-  (`store_failed`) and the deposit goes on: nothing has been paid to that
-  address yet. If a later cut does lose the account, it is caught before
-  anything is published or spent. The next deposit handed the same account
-  is refused (`bundle_reused`), and so is every withdrawal while the
-  wallet lists fewer accounts than the ledger gave out
-  (`wallet_accounts_behind`).
+  mix. GhostSpiral now asks the wallet to store before it mints anything
+  (a wallet that cannot is refused with nothing minted), again after its
+  mix accounts are minted (before the swap is quoted), and again after its
+  last mint (before the first relay). Each store is followed by a flush of
+  this machine's disks, because wallet-rpc does not fsync what it writes;
+  that reaches the wallet file only if the wallet-rpc runs on this machine,
+  which the setup here arranges and pairing does not check. If the wallet
+  cannot store, GhostSpiral stops with nothing relayed
+  (`wallet_store_FAILED` on the chain) — except at the last store of a
+  run started at the desk, which comes after the swap has paid the entry:
+  stopping there would strand that money, so the run goes on, says so
+  (`wallet_store_WAIVED`), and asks the wallet to store again when it ends
+  (`wallet_stored_at_exit`, or `wallet_store_FAILED_at_exit` with the
+  instruction to stop the wallet-rpc in an orderly way before powering
+  off). The vault's runs have no swap in front of them and always stop.
+  A failed store at the receive-wallet step is logged (`store_failed`),
+  said on the terminal, and the deposit goes on: nothing has been paid to
+  that address yet. On the vault, if a later cut does lose the account, it
+  is caught before anything is published or spent. The next deposit handed
+  the same account is refused (`bundle_reused`), and so is every
+  withdrawal while the wallet lists fewer accounts than the ledger gave out
+  (`wallet_accounts_behind`). Run by hand, nothing catches it: the
+  terminal says to stop the wallet-rpc in an orderly way.
   The vault still keeps an unsettled mix's mark for three wakes when the
-  wallet shows nothing new (`owner_accounts_not_found`). After this change
-  that only happens with a wallet file other than the one the mix stored
-  to, such as an older copy.
+  wallet shows nothing new (`owner_accounts_not_found`). That happens with
+  a wallet file other than the one the mix stored to, such as an older
+  copy, and with a mix stopped between minting its accounts and storing
+  them whose wallet-rpc was then cut off rather than stopped in an orderly
+  way.
 - **The three-minute probe claims less.** It passed `--stall-min 3` and
   could report a fully-unlocked partial arrival as "stopped growing" after
   one look; it passes no stall window now and says "some of it is here and
@@ -1801,13 +1828,14 @@ first two on the vault where they cannot be talked around from a phone:
   it is released only if the network says the address was never used, and
   a used address, or no answer, keeps the place (`release_btc_unconfirmed`
   in the chain). That rests on the server's word: a lying one can admit
-  one deposit too many. The address is asked only when the new deposit
-  needs that place to be admitted. The lookup happens in the same wake
-  that then checks the new deposit's address, so a server that answers
-  both can guess they are one client's retry. With room to spare nothing
-  is asked, the old deposit keeps its place for the usual two days, and
-  the chain says `release_btc_not_needed`. A pager restart forgets the
-  handle, and the old two-day rule applies.
+  one deposit too many. The lookup happens in the same wake that then
+  checks the new deposit's address, so a server that answers both can
+  guess they are one client's retry; neither lookup names them. It is made
+  on every such deposit, whether or not the new one needed the place:
+  this is the only wake that carries the old handle, so a place not
+  released now is held for two days, and the next client's deposit is the
+  one refused "full" for it. A pager restart forgets the handle, and the
+  old two-day rule applies.
   An intake deposit paid on the BTC side holds its place for the same two
   days from the LATEST sign of that money, not from its admission: a
   forward that sent, one that found its forward still in flight or first
@@ -2918,10 +2946,17 @@ listed is tried LAST by every later submit of that forward, so one that
 says "accepted" and relays nothing cannot take every re-send; a listing
 by the acceptor alone that no other server confirms is acted on as
 listed but never taken as proof — the bytes stay kept and are pushed
-once more to the others, and the phone hears `sent`, not `forwarded`,
-even after it is mined, for as long as no other server answers. A
-server list whose other entries are dead leaves every forward there,
-with `listed_unconfirmed` on the chain each run: fix the list),
+once more to the others, and the phone hears `sent`, not `forwarded`.
+When the servers cannot settle a listing, the pair's THORNode is asked
+whether ThorChain has finalised our transaction as an inbound. That
+witness is not an Electrum server at all, and it rests on the THORNode
+being who it says, as the inbound cross-check does. If it has, the listing
+is taken, at ThorChain's height (`listed_thornode_witnessed`). A THORNode
+is asked about a txid only then, never about one a server vouches for.
+Without a THORNode, or before ThorChain has finalised it, a mined forward
+stays `sent` for as long as no other server answers. A server list whose
+other entries are dead leaves every such forward there, with
+`listed_unconfirmed` on the chain each run: fix the list),
 re-signs a fresh forward if the
 network dropped it, REPLACES a forward that has sat in the mempool past
 `--btc-bump-after` at a rate under today's estimate (the bump: the same
@@ -2961,17 +2996,26 @@ with them, said on the chain as `kept_moved_with_dust`. That is ONE
 allowance for the deposit, across every such move, recorded on the plan
 (`returned_dust`). It is public, so a leaked seed can take that much
 beyond the kept money without the alarm, as it can the kept money itself.
-The chain still says `kept_moved_with_dust`. An input the move's own bytes
-name that the history's window did not, because a flood of dust pushed its
-funding out of the window, is looked up by its funding transaction's txid.
-That transaction is fetched and checked against the txid, so a server can
-refuse to answer but cannot lie. Paying this address, the input counts
-against the same allowance. Paying another address (your wallet moving
-several at once), it is not this deposit's money and is recorded as such
-(`hand_inputs_elsewhere`). If no server answers, the move is undecided
-(`hand_move_undecided`): the run fails, nothing is signed, the next run
-asks again, and the seed-leak alarm is not raised. Moving the kept outputs
-in a transaction of their own avoids all of this), or re-pair with a
+The chain still says `kept_moved_with_dust`. The move's own bytes name
+every input, including ones the history's window did not, because a flood
+of dust pushed their funding out of the window. A kept output they name is
+kept money. Any other input is looked up. If its funding transaction is not
+in the address's history, it paid another address (your wallet moving
+several at once): not this deposit's money, recorded as such
+(`hand_inputs_elsewhere`), and it costs no lookup however many there are.
+If the funding transaction is in the history, it is fetched and checked
+against its txid. Paying this address, the input counts against the same
+allowance. At most 16 are fetched for one move, and one past that counts
+as over the allowance. An input a forward of the vault's signed for is
+over the allowance at once. What this rests on is the txid hash, and the
+history server's word that a transaction is not this address's. That is
+the trust the whole reconciliation already places in the history: a server
+that leaves a spend out hides it altogether. If no server completes the
+lookup, the move is undecided (`hand_move_undecided`): the other spends
+are still examined, so a foreign one among them is still the alarm, and
+then the run fails, nothing is signed, and the next run asks again.
+Moving the kept outputs in a transaction of their own avoids all of
+this), or re-pair with a
 higher bound and let the next window's tap send it on. The mark follows
 the current plan: a bump or a
 re-sign at the bound leaves the kept money out and carries the mark onto

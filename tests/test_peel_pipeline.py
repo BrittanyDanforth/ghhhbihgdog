@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 
 from decimal import Decimal as D
 
@@ -91,7 +92,8 @@ EXIT_ADDR = addr(9999)
 class Run:
     """One driven pipeline: its wallet, its rounds and what they moved."""
 
-    def __init__(self, stop_at_peel=None, peel=True, stores_ok=None):
+    def __init__(self, stop_at_peel=None, peel=True, stores_ok=None,
+                 receive=False):
         self.subs = [addr(2000 + i) for i in range(WALLETS + 4)]
         self.idx = {a: (30 + i, 1) for i, a in enumerate(self.subs)}
         self.bal = {}                    # (acct, sub) -> atomic
@@ -121,6 +123,13 @@ class Run:
         self.posts = 0
         self.ilog = []
         self.exit_text = ""
+        # RECEIVE MODE, the vault's: the entry is an existing funded account
+        # (a deposit's), no swap comes first, and create_subs is the REAL
+        # one, so every mix account is minted through the wallet above.
+        self.receive = receive
+        # What the run hands atexit (the waived store's second ask), kept
+        # here rather than registered on this test process.
+        self.at_exit = []
 
     # -- the wallet ------------------------------------------------------
     def pair_of(self, a):
@@ -301,6 +310,14 @@ class Run:
             wait_for_swap_arrival=lambda fn, floor_, n: dict(
                 zip(("state", "total", "unlocked"), ("funded",) + fn())),
         )
+        if self.receive:
+            _recv = addr(4242)
+            self.addr_of[_recv] = (150, 1)
+            self.bal[(150, 1)] = ENTRY_ATOMIC
+            stubs.pop("create_subs")
+            stubs["resolve_entry_mode"] = lambda args: (True, _recv, 150, 1)
+        stubs["atexit"] = types.SimpleNamespace(
+            register=lambda f, *a, **k: self.at_exit.append((f, a)))
         saved = {k: getattr(g, k) for k in stubs}
 
         @contextlib.contextmanager
@@ -429,29 +446,94 @@ check("no round relays while an account it can pay into is only in memory",
       bool(full.rounds) and all(not s for s in full.unstored_at_round))
 
 _s0 = Run(stores_ok=0).go()
-check("a wallet that will not store stops the run BEFORE the swap is quoted "
+check("a wallet that will not store stops the run BEFORE it mints anything "
       f"({_s0.outcome[:80]})",
       _s0.outcome.startswith("SystemExit") and _s0.posts == 0
-      and _s0.rounds == [])
-check("...saying so, and that nothing was published or spent",
-      "would not write" in _s0.exit_text
-      and "Nothing has been published and nothing spent" in _s0.exit_text)
+      and _s0.rounds == [] and _s0.minted == [])
+check("...saying so, and that nothing was minted, published or spent -- a "
+      "wallet asked only after minting left the accounts behind on every "
+      "attempt, each one against the vault's ceiling",
+      "would not write anything" in _s0.exit_text
+      and "Nothing has been minted, published or spent" in _s0.exit_text)
 check("...after asking three times, not once",
       _s0.store_calls == 3)
 check("...and the chain says which stage stopped",
       ("stage3", "wallet_store_FAILED") in _s0.ilog)
 
 _s1 = Run(stores_ok=1).go()
-check("a store that fails AFTER the swap (the last mint's) relays NOTHING "
-      f"({_s1.outcome[:80]})",
-      _s1.outcome.startswith("SystemExit") and _s1.posts >= 1
-      and _s1.rounds == [])
-check("...and says the money has not moved",
-      "would not write" in _s1.exit_text
-      and "Nothing has been relayed" in _s1.exit_text)
-check("...and the chain says it was stage 5's",
-      ("stage5", "wallet_store_FAILED") in _s1.ilog
-      and ("stage3", "wallet_store_FAILED") not in _s1.ilog)
+check("a wallet that stores before the mint and not after it stops BEFORE "
+      f"the swap is quoted ({_s1.outcome[:80]})",
+      _s1.outcome.startswith("SystemExit") and _s1.posts == 0
+      and _s1.rounds == [] and bool(_s1.minted))
+check("...saying what going on would cost -- the entry forgotten and minted "
+      "again, two swaps paying one address -- and that nothing moved",
+      "two swaps paying one address" in _s1.exit_text
+      and "Nothing has been published and nothing spent" in _s1.exit_text)
+
+# AFTER THE SWAP A SEND-MODE RUN WAIVES (AGENTS.md rule 7; the review of the
+# store). It stopped there and said "run again", and a re-run mints a NEW
+# entry set and never looks at the old one: the money sat on an address the
+# swap's memo names, with nothing pointing at it.
+_s2 = Run(stores_ok=2).go()
+check("a store that fails AFTER the swap (the last mint's) does NOT strand "
+      f"the swap's money: the run goes on and relays ({_s2.outcome[:60]})",
+      _s2.outcome == "returned" and _s2.posts >= 1 and bool(_s2.rounds)
+      and not [v for v in _s2.bal.values() if v > 0])
+check("...saying what is at stake and why it goes on, and the chain says it "
+      "was waived, not failed",
+      "would not write" in _s2.text and "rule 7" in _s2.text
+      and ("stage5", "wallet_store_WAIVED") in _s2.ilog
+      and ("stage5", "wallet_store_FAILED") not in _s2.ilog)
+check("...and it asks again when it ends: one hook handed to atexit",
+      len(_s2.at_exit) == 1)
+# The hook runs after main() has returned, as atexit runs it: with the
+# stubs gone. Only the chain is caught again, so nothing lands on the real
+# one.
+_il_saved = g.integrity_log
+g.integrity_log = lambda *a, **k: _s2.ilog.append(a)
+_s2_out = io.StringIO()
+with contextlib.redirect_stdout(_s2_out):
+    _s2.at_exit[0][0](*_s2.at_exit[0][1])
+check("...which, the wallet still refusing, says to stop the wallet-rpc in "
+      "an orderly way before powering off, and says so on the chain",
+      "STILL" in _s2_out.getvalue() and "orderly" in _s2_out.getvalue()
+      and ("stage5", "wallet_store_FAILED_at_exit") in _s2.ilog)
+_s2.stores_ok = None
+_s2_out = io.StringIO()
+with contextlib.redirect_stdout(_s2_out):
+    _s2.at_exit[0][0](*_s2.at_exit[0][1])
+g.integrity_log = _il_saved
+check("...and, the wallet storing now, says it has",
+      "has now written" in _s2_out.getvalue()
+      and ("stage5", "wallet_stored_at_exit") in _s2.ilog
+      and set(_s2.minted) <= _s2.stored)
+check("NON-VACUITY: a run whose stores all succeed hands atexit nothing",
+      full.at_exit == [])
+
+# RECEIVE MODE, THE VAULT'S (the review of the store: no suite drove it, and
+# the fakes above mint nothing in create_subs, so "the mix accounts are on
+# disk before a round pays them" -- what _recover_pending_mixes rests on --
+# was checked nowhere). The entry is the deposit's funded account, no swap
+# comes first, and create_subs is the real one.
+_rv = Run(peel=False, receive=True).go()
+check(f"a receive-mode run relays, with the mix accounts minted through the "
+      f"wallet ({_rv.outcome[:60]}; {len(_rv.minted)} minted)",
+      _rv.outcome == "returned" and bool(_rv.rounds) and _rv.posts == 0
+      and len(_rv.minted) >= WALLETS)
+check("...and no round relays while an account it can pay into is only in "
+      "memory",
+      all(not u for u in _rv.unstored_at_round))
+_rv2 = Run(peel=False, receive=True, stores_ok=2).go()
+check("a receive-mode run whose last store fails relays NOTHING -- no swap "
+      "came first, so the first relay is the irreversible step and the "
+      f"refusal comes before it ({_rv2.outcome[:60]})",
+      _rv2.outcome.startswith("SystemExit") and _rv2.rounds == []
+      and ("stage5", "wallet_store_FAILED") in _rv2.ilog
+      and _rv2.at_exit == [])
+check("...saying the money is still on the receive wallet's address and to "
+      "run again with the same one",
+      "Nothing has been relayed" in _rv2.exit_text
+      and "same --receive-wallet" in _rv2.exit_text)
 
 
 # ===========================================================================
@@ -485,8 +567,17 @@ _left = {k: v for k, v in part.bal.items() if v > 0}
 check(f"the undistributed balance is still on the wallet, on ONE carrier "
       f"({[f'{v/10**12:.2f} XMR' for v in _left.values()]})",
       len(_left) == 1)
-check("...and it is most of the run — this is not rounding dust",
-      sum(_left.values()) > ENTRY_ATOMIC // 2)
+# NOT A THRESHOLD ON A RANDOM DRAW: "most of the run" (over half the
+# entry) was false in 8 of 300 driven runs -- the peel amounts are drawn --
+# and a check that is a coin proves nothing. What holds on every draw:
+# nothing was created or lost (every atomic unit is on the wallet, gone to
+# the exit, or paid as a fee), and what the carrier holds funds the peel
+# that did not run, so it is more than that peel's fee.
+_ntx = sum(len(txs) for _l, txs in part.rounds)
+check("...and it is exactly what the rounds did not pay out -- nothing "
+      "created or lost -- and more than a fee, so not rounding dust",
+      sum(part.bal.values()) + part.left_wallet + FEE * _ntx == ENTRY_ATOMIC
+      and sum(_left.values()) > FEE)
 check("...the exit did NOT sweep it to --exit-to",
       all((t["account_index"], t["src_index"]) not in _left
           for t in part.exits))

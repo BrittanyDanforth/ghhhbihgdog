@@ -1098,6 +1098,64 @@ def thornode_btc_height(thornode_url, proxy_url):
     return h
 
 
+def thornode_inbound_height(thornode_url, proxy_url, txid, fallback=None):
+    """The BTC block height at which ThorChain observed our inbound `txid`
+    -- once THORChain has FINALISED it, its validators agreeing the
+    transaction exists -- asked on its own circuit of the THORNode the
+    operator named. None when it is not finalised, when the answer is about
+    another transaction, when it names no height (and `fallback`, the
+    height a server listed it at, is none either), or when nobody answered.
+
+    A WITNESS THAT IS NOT AN ELECTRUM SERVER (the residual of the stage 3
+    review, C4a): a forward listed only by the server that accepted it,
+    with every other server down, stayed `sent` even once mined -- the
+    acceptor's word is never proof, and there was nobody else to ask. The
+    THORNode is somebody else, and the party whose view is the one that
+    matters: ThorChain finalising our inbound is the swap under way. A txid
+    commits to every input and output (not to the witnesses, which segwit
+    keeps apart), so a finalised inbound under our txid IS our forward.
+
+    Rests on the THORNode being who it says (https or an .onion,
+    watch.thornode_url_ok) and on its answer being ThorChain's -- what the
+    inbound cross-check already rests on -- not on anything secret. A
+    THORNode that says "finalised" falsely costs what a lying witness costs
+    anywhere here: the kept bytes are dropped and `forwarded` is said early.
+    If the transaction then turns out never to have reached the network, a
+    later reconciliation finds it unlisted with its inputs unspent and
+    re-signs it. Asked only when the Electrum servers could not settle the
+    listing, so a forward the servers vouch for puts no txid to a THORNode.
+    A txid that is not 64 hex characters is not put into the URL at all."""
+    if not _TXID_RE.match(str(txid or "").lower()):
+        return None
+    proxies = isolated_proxy(proxy_url, "forward:txstatus")
+    try:
+        st = safe_get(f"{thornode_url.rstrip('/')}/thorchain/tx/status/"
+                      f"{str(txid).upper()}", proxies)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("forward", f"txstatus_fetch_fail:{type(e).__name__}")
+        return None
+    if not isinstance(st, dict):
+        return None
+    tx = st.get("tx")
+    if not isinstance(tx, dict) \
+            or str(tx.get("id") or "").lower() != str(txid).lower() \
+            or tx.get("chain") != _THOR_BTC_CHAIN:
+        return None
+    stages = st.get("stages")
+    if not isinstance(stages, dict):
+        return None
+    fin = stages.get("inbound_finalised")
+    if not (isinstance(fin, dict) and fin.get("completed") is True):
+        return None
+    cc = stages.get("inbound_confirmation_counted")
+    h = cc.get("external_observed_height") if isinstance(cc, dict) else None
+    if isinstance(h, bool) or not isinstance(h, int) or h <= 0:
+        h = fallback
+    if isinstance(h, bool) or not isinstance(h, int) or h <= 0:
+        return None
+    return h
+
+
 #: HOW FAR OVER THORCHAIN'S OWN BTC GAS RATE a server's fee estimate may
 #: go before it is taken as a lie and ThorChain's figure (times this) is paid
 #: instead. ThorChain's rate already runs above the network's (it pays its
@@ -2457,7 +2515,10 @@ def _witnessed(args, plan, spends, address, servers):
     another can be asked. Listed by one of those, the address is asked
     once more, of the others. Returns (spends, state):
 
-      ""            listed by a witness, or confirmed by one now.
+      ""            listed by a witness, or confirmed by one now -- another
+                    server, or, when no server can settle it, the THORNode
+                    (ThorChain has finalised our inbound; see
+                    thornode_inbound_height).
       "unconfirmed" listed only by a server that took the bytes and was
                     not seen to relay them. Acted on as listed --
                     the bump reads it -- and never taken as proof: the
@@ -2525,6 +2586,25 @@ def _witnessed(args, plan, spends, address, servers):
     if sr["seen"]:
         hit["server"], hit["height"] = sr["server"], sr["height"]
         return spends, ""
+    # ...AND WHAT THE SERVERS CANNOT SETTLE, THE THORNODE CAN (C4a, the
+    # residual of the stage 3 review): with every other server down, a
+    # forward listed by its acceptor alone stayed `sent` even once mined.
+    # ThorChain finalising our inbound is a witness that is not an Electrum
+    # server at all (thornode_inbound_height says what it rests on). Its
+    # height is the one recorded; the listing is taken as listed.
+    if args.thornode and not shutdown_requested():
+        _hh = hit.get("height")
+        _th = thornode_inbound_height(
+            args.thornode, args.tor_proxy, txid,
+            fallback=(_hh if isinstance(_hh, int)
+                      and not isinstance(_hh, bool) and _hh > 0 else None))
+        if _th is not None:
+            hit["server"], hit["height"] = "thornode", _th
+            integrity_log("forward", "listed_thornode_witnessed")
+            print("  reconcile: our transaction is listed only by a server "
+                  "that cannot vouch for it, and ThorChain has finalised it "
+                  f"as an inbound at height {_th}: taken as listed.")
+            return spends, ""
     if by not in distrust:
         integrity_log("forward", "listed_unconfirmed")
         print("  reconcile: our transaction is listed only by a server that "
@@ -2683,11 +2763,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # funding transaction -- put hundreds of txids on top of the window,
     # past what the read's budget allows: history_unavailable on every run
     # for good, the jam MAX_HISTORY's window exists to close. The cap is
-    # public and rests on nothing secret; it bounds the read. Past it, a
-    # hand move whose EVERY input was funded off the window reads as a
-    # foreign spend -- FAILED, nothing signed -- until that move leaves
-    # the window itself; one with any input funded inside it still reads
-    # as the operator's hand.
+    # public and rests on nothing secret; it bounds the read. Past it, the
+    # history names none of a hand move's inputs that were funded off the
+    # window, and the move's own bytes do (_spend_outpoints, in the loop
+    # below): a kept output they name is kept money. That read as a leaked
+    # seed -- FAILED, nothing signed -- until the move left the window.
     _extra, _seen_x = [], set(_keep)
     for _c0, t in _cands:
         if t not in _seen_x:
@@ -2819,6 +2899,9 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     _dust_used = sum(_vals.get(o, 0) for o in {
         o for _p0 in [plan] + chain for o in _pair_list(
             _p0.get("returned_dust") if isinstance(_p0, dict) else None)})
+    # Hand moves nobody could finish asking about (below): decided after
+    # every other spend has been examined.
+    _undecided = []
     for s in spends:
         if s["txid"] in ours:
             continue
@@ -2858,48 +2941,54 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # before the window -- a flood's doing -- was not in the spend at
         # all, and a move of kept money beside it read as the operator's
         # hand whatever it took. The spend's own bytes name every input
-        # (_spend_outpoints). One they name and the history does not is
-        # asked where it came from (bcast.input_sources: each funding
-        # transaction is checked to be its txid's). Paying this address, it
-        # is an extra like the others, worth what it pays. Paying another
-        # address, it is not this deposit's money -- the operator's wallet
-        # may move several addresses at once -- and it is recorded
-        # (`hand_inputs_elsewhere`) so no later run asks again. A kept,
-        # leftover or moved output of ours already, it is kept money and
-        # needs no asking. What cannot be answered -- no server, a refusal,
-        # more inputs than bcast.INPUT_SOURCE_MAX -- leaves the move
-        # UNDECIDED unless what is known already puts it over the line: the
-        # run fails, nothing is signed, and the next run asks again. That
-        # is not the seed-leak alarm, which is for a spend the evidence
-        # shows is not the operator's hand. Rests on the txid hash and the
-        # seed, not on a server's word: a server can refuse to answer, not
-        # make an input pay somewhere it does not.
-        _hand = bool(_kept_ops and _ins and _ins & _kept_ops)
+        # (_spend_outpoints), and a kept output they name is kept money
+        # even where the history names none of the spend's inputs (a move
+        # whose every input was funded off the window: it read as a leaked
+        # seed). Of the rest, one a plan of ours signed is this address's
+        # and conflicts with our signature -- over the line, never asked.
+        # Anything else is asked (bcast.input_sources: the address's own
+        # history says which could pay it, and each of those is fetched and
+        # checked to be its txid's). Paying this address, it is an extra
+        # like the others, worth what it pays. Paying another address, it is
+        # not this deposit's money -- the operator's wallet may move several
+        # addresses at once -- and it is recorded (`hand_inputs_elsewhere`)
+        # so no later run asks again. One of this address's transactions
+        # that was not read (past bcast.INPUT_SOURCE_MAX) counts as more.
+        # NO SERVER COMPLETING THE ASK LEAVES THE MOVE UNDECIDED unless what
+        # is known already puts it over the line: it is set aside and the
+        # rest of the spends are still examined -- a foreign spend among
+        # them is still the alarm (the review of the first version, which
+        # stopped at the first undecided move and never looked at the
+        # rest) -- and then the run fails with nothing signed, and the next
+        # run asks again. What it rests on: the seed, the txid hash, and
+        # the history servers' word that a transaction is NOT this
+        # address's (input_sources states it) -- the trust the whole
+        # reconciliation already places in their history.
+        _all = _spend_outpoints(s)
+        _hand = bool(_kept_ops and _all is not None and _all & _kept_ops)
         _off, _else_new, _unknown = {}, set(), set()
+        _signed_hit, _failed = set(), False
         if _hand:
-            _all = _spend_outpoints(s)
-            if _all is None:
-                # Bytes that do not parse, or are not the listed txid's,
-                # name nothing -- and a move nothing names is not shown to
-                # be the operator's.
-                _hand = False
-            else:
-                _unnamed = _all - _ins - _elsewhere
-                for _o in _unnamed & _kept_ops:
-                    _off[_o] = _vals.get(_o)
-                _ask = sorted(_unnamed - _kept_ops)
-                if _ask:
-                    try:
-                        _src = bcast_sources(
-                            s["hex"], address, servers, args.tor_proxy,
-                            network=args.network, timeout=args.timeout,
-                            skip=sorted(_all - set(_ask)))
-                    except watch.PinMismatch as e:
-                        raise Refused("pin_mismatch", str(e))
-                    except watch.BtcWatchError:
-                        _src = {}
+            _unnamed = _all - _ins - _elsewhere
+            for _o in _unnamed & _kept_ops:
+                _off[_o] = _vals.get(_o)
+            _signed_hit = (_all - _ins) & _signed_ops
+            _ask = sorted(_unnamed - _kept_ops - _signed_ops)
+            if _ask:
+                try:
+                    _src = bcast_sources(
+                        s["hex"], address, servers, args.tor_proxy,
+                        network=args.network, timeout=args.timeout,
+                        skip=sorted(_all - set(_ask)))
+                except watch.PinMismatch as e:
+                    raise Refused("pin_mismatch", str(e))
+                except watch.BtcWatchError:
+                    _src = None
+                if not isinstance(_src, dict):
+                    _failed = True
+                else:
                     for _o in _ask:
-                        _sv = (_src or {}).get(_o)
+                        _sv = _src.get(_o)
                         if _sv is False:
                             _else_new.add(_o)
                         elif isinstance(_sv, int) \
@@ -2911,7 +3000,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # named, and what the bytes named and the chain said pays it.
         _ins_all = _ins | set(_off)
         _extra_ins = _ins_all - _kept_ops
-        if _hand and (_extra_ins or _unknown):
+        if _hand and (_extra_ins or _unknown or _signed_hit or _failed):
             _xval = {}
             for i in (s.get("inputs") or []):
                 if not isinstance(i, dict):
@@ -2928,21 +3017,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                 _xval[_o] = (_v if isinstance(_v, int)
                              and not isinstance(_v, bool) and _v > 0
                              else None)
-            _over = bool(_extra_ins & _signed_ops
+            _over = bool(_extra_ins & _signed_ops or _signed_hit or _unknown
                          or None in _xval.values()
                          or _dust_used + sum(_xval.values())
                          > dust_line(int(args.feerate_ceiling)))
             if _over:
                 _hand = False
-            elif _unknown:
-                integrity_log("forward", "hand_move_undecided")
-                print(f"[!] the kept outputs were moved by a spend this tool "
-                      f"did not sign (txid {s['txid']}), beside "
-                      f"{len(_unknown)} input(s) whose source could not be "
-                      "read. Nothing is signed; the next reconciliation "
-                      "asks again. A move of the kept outputs in a "
-                      "transaction of its own is decided at once.")
-                raise SystemExit(EXIT_FAILED)
+            elif _failed:
+                _undecided.append(s["txid"])
+                continue
             elif _extra_ins:
                 integrity_log("forward", "kept_moved_with_dust")
         if _hand:
@@ -3026,6 +3109,18 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
               f"tool did not sign: {_why} (txid {s['txid']}). Nothing is "
               "signed. If no operator moved it by hand, the seed has "
               "leaked.")
+        raise SystemExit(EXIT_FAILED)
+    # ...AND ONLY NOW THE MOVES THAT COULD NOT BE DECIDED: no spend above was
+    # the alarm, so this is not one either -- nothing is signed, and the next
+    # run asks again.
+    if _undecided:
+        integrity_log("forward", "hand_move_undecided")
+        print(f"[!] the kept outputs were moved by {len(_undecided)} "
+              f"spend(s) this tool did not sign (txid {_undecided[0]}"
+              f"{', ...' if len(_undecided) > 1 else ''}), beside inputs "
+              "whose source no server could read. Nothing is signed; the "
+              "next reconciliation asks again. A move of the kept outputs "
+              "in a transaction of its own is decided at once.")
         raise SystemExit(EXIT_FAILED)
     # A PLAN FOR EVERY FORWARD OF OURS ADOPTED ABOVE. A reconciliation's
     # fresh forward (a refund, a second payment, a re-sign, a bump) that

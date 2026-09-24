@@ -1936,43 +1936,31 @@ def fee_wallet_entry(key: dict, cfg: dict, injected=None):
     return _funded_entry(key, injected=injected, rpc_url=cfg["rpc"])
 
 
-def _wallet_owns(key: dict, url, address: str, injected=None) -> bool:
-    """True only when the wallet-rpc at `url` answers get_address_index for
-    `address` with an index. monero-wallet-rpc answers a foreign address
-    with an error, and an error of any kind -- foreign, down, locked -- is
-    False here: this is asked where only a positive answer means anything.
-    SystemExit too: connect_rpc exits on a URL it will not speak to, and a
-    wallet this probe cannot reach has not answered."""
+def _wallet_owns(key: dict, url, address: str, connect=None):
+    """gs_common.wallet_rpc_owns -- True, False (foreign) or None (no
+    answer) -- over the keyfile's Tor proxy, with connect_rpc's exit on a
+    URL it will not speak to read as no answer: a question does not end
+    the agent."""
+    from gs_common import wallet_rpc_owns
     try:
-        if injected is not None:
-            ix = injected(str(url or ""), address)
-        else:
-            from gs_common import connect_rpc
-            rpc = connect_rpc(str(url or ""),
-                              proxy_url=key.get("tor_proxy", ""))
-            ix = (rpc.raw_request("get_address_index", {"address": address})
-                  or {}).get("index")
-    except (Exception, SystemExit):                          # noqa: BLE001
-        return False
-    return (isinstance(ix, dict) and isinstance(ix.get("major"), int)
-            and not isinstance(ix.get("major"), bool))
-
-
-def _rpc_endpoint(url):
-    """(host, port) of a wallet-rpc URL, every loopback spelling as one
-    host, or None when it does not parse."""
-    try:
-        from urllib.parse import urlparse
-        _p = urlparse(str(url or "").strip())
-        _h = (_p.hostname or "").lower()
-        if _h in ("localhost", "::1") or _h.startswith("127."):
-            _h = "loopback"
-        return (_h, _p.port) if _h else None
-    except ValueError:
+        return wallet_rpc_owns(url, address,
+                               proxy_url=key.get("tor_proxy", ""),
+                               connect=connect)
+    except SystemExit:
         return None
 
 
-def fee_wallet_mismatch(key: dict, cfg: dict, injected=None) -> str:
+def _wallet_primary(key: dict, url, connect=None):
+    """gs_common.wallet_rpc_primary, on the same terms as _wallet_owns."""
+    from gs_common import wallet_rpc_primary
+    try:
+        return wallet_rpc_primary(url, proxy_url=key.get("tor_proxy", ""),
+                                  connect=connect)
+    except SystemExit:
+        return None
+
+
+def fee_wallet_mismatch(key: dict, cfg: dict, connect=None) -> str:
     """"" when the fee wallet-rpc is serving the fee wallet and not the
     mixing wallet; otherwise the reason, as a fee_sweep code. Asked before a
     sweep reads a balance.
@@ -1988,28 +1976,59 @@ def fee_wallet_mismatch(key: dict, cfg: dict, injected=None) -> str:
     client's deposit to the operator's own addresses. It ran as an ordinary
     successful sweep, and nothing said anything.
 
-    RESTS ON THE FEE WALLET'S KEYS. A wallet can place the fee address in
-    its subaddress table only if it holds the fee wallet's view key and
-    public spend key, and pairing asked the mixing wallet and found that it
-    did not. So a wallet-rpc that answers an index for the fee address is
-    serving the fee wallet, and one that does not is not asked for money.
-    The endpoint and wallet-file comparisons in front of that are the cheap
-    half: they catch the plain mistakes without a wallet call, and nothing
-    rests on a port or a path being unguessable. The mixing wallet is asked
-    too, as pairing asks it: an index from it for the fee address means the
-    two are one wallet. An error from it is the answer expected for a
-    foreign address, so an error is not a refusal.
+    WHAT IT RESTS ON, stated. Two wallet-rpcs whose wallets have the same
+    primary address hold the same keys -- a primary address IS the public
+    spend and view keys -- so the fee wallet-rpc and the mixing wallet-rpc
+    must each name theirs, and the two must differ: that is the question
+    that tells a COPY of the mixing wallet from the fee wallet, however the
+    files are named and however deep either has minted. Then the fee
+    address: a wallet can place it in its subaddress table only if it holds
+    the fee wallet's view key and public spend key, so the fee wallet-rpc
+    must answer an index for it (it is serving the wallet the cuts land
+    on), and the mixing wallet-rpc must answer "foreign" (-2). A subaddress
+    answer alone was not enough: wallet2's table ends 200 past the deepest
+    subaddress handed out in an account, so a same-keys wallet answers
+    "foreign" for one minted deeper than that. EVERY answer is required:
+    a wallet-rpc down, locked or with no wallet open has said nothing, and
+    the sweep waits (the review of this check: read as "foreign", the one
+    case the check exists for went through).
+
+    All of it rests on the processes on those two loopback ports being
+    honest wallet-rpcs, which is to say on this machine not being someone
+    else's: a process that answers anything on loopback beats every check
+    here, and the keys on this disk with it. The endpoint and signing-file
+    comparisons in front are the cheap half: they catch the plain mistakes
+    without a wallet call, and nothing rests on a port or a path being
+    unguessable. The files compared are the ones GhostSpiral SIGNS with
+    (gs_common.signing_files: `<base>.keys`, symlinks followed), not the
+    paths as typed -- `mix.keys`, or `fee.keys` linked to `mix.keys`, is the
+    mixing wallet's spend key whatever the string says.
+
+    run_fee_sweep asks it before every leg, so a wallet-rpc restarted on
+    another wallet in the hours a leg runs stops the next one. What a
+    running leg does is GhostSpiral's, against the wallet-rpc it was given.
+    `connect` stands in for connect_rpc in the suites.
     """
-    if _rpc_endpoint(cfg["rpc"]) is not None \
-            and _rpc_endpoint(cfg["rpc"]) == _rpc_endpoint(
-                key.get("rpc_primary")):
+    from gs_common import rpc_endpoint as _endpoint, \
+        signing_files as _signing_files
+    if _endpoint(cfg["rpc"]) is not None \
+            and _endpoint(cfg["rpc"]) == _endpoint(key.get("rpc_primary")):
         return "wallet_is_mixing"
-    _wf = str(key.get("wallet_file") or "").strip()
-    if _wf and os.path.realpath(_wf) == os.path.realpath(cfg["wallet_file"]):
+    if _signing_files(key.get("wallet_file")) \
+            & _signing_files(cfg["wallet_file"]):
         return "wallet_is_mixing"
-    if _wallet_owns(key, key.get("rpc_primary"), cfg["address"], injected):
+    _p_mix = _wallet_primary(key, key.get("rpc_primary"), connect)
+    _p_fee = _wallet_primary(key, cfg["rpc"], connect)
+    if _p_mix is None or _p_fee is None:
+        return "wallet_unverified"
+    if _p_mix == _p_fee:
         return "wallet_is_mixing"
-    if not _wallet_owns(key, cfg["rpc"], cfg["address"], injected):
+    _mix = _wallet_owns(key, key.get("rpc_primary"), cfg["address"], connect)
+    if _mix is True:
+        return "wallet_is_mixing"
+    if _mix is None:
+        return "wallet_unverified"
+    if _wallet_owns(key, cfg["rpc"], cfg["address"], connect) is not True:
         return "wallet_unverified"
     return ""
 
@@ -2080,21 +2099,6 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
     cfg = fee_sweep_config(key)
     if cfg is None:
         return "not_configured"
-    # THE FEE WALLET HAS TO BE THE FEE WALLET, asked of the wallets
-    # themselves before a balance is read (fee_wallet_mismatch).
-    _mis = fee_wallet_mismatch(key, cfg, injected=d.get("address_index"))
-    if _mis:
-        integrity_log("wake", f"fee_sweep:{_mis}")
-        agent_say("  [!] Fee sweep: "
-                  + ("the wallet-rpc named as the fee wallet is serving the "
-                     "MIXING wallet, whose money is the clients'. "
-                     if _mis == "wallet_is_mixing" else
-                     "the wallet-rpc named as the fee wallet did not answer "
-                     "for the fee address, so it cannot be shown to be the "
-                     "fee wallet. ")
-                  + "Nothing was read or spent. Check which wallet each "
-                    "wallet-rpc on this machine has open.")
-        return _mis
     wallets = withdraw_wallets(cfg["depth"])
     floor = Decimal(d.get("live_floor", live_floor_xmr)(key, wallets))
     # THE SAME MARGIN A WITHDRAWAL GETS (see proto.WITHDRAW_BUDGET_MARGIN):
@@ -2111,6 +2115,31 @@ def run_fee_sweep(key: dict, artifact_dir: Path, deps: dict = None,
     legs = 0
     _armed = False
     while True:
+        # THE FEE WALLET HAS TO BE THE FEE WALLET, asked of the wallets
+        # themselves before every balance is read (fee_wallet_mismatch) --
+        # before EVERY leg, not once: a leg is hours, and what answers on
+        # the fee port after one is whatever was started there since.
+        _mis = fee_wallet_mismatch(key, cfg, connect=d.get("wallet_rpc"))
+        if _mis:
+            integrity_log("wake", f"fee_sweep:{_mis}")
+            agent_say("  [!] Fee sweep: "
+                      + ("the wallet-rpc named as the fee wallet is serving "
+                         "the MIXING wallet, whose money is the clients'. "
+                         if _mis == "wallet_is_mixing" else
+                         "it cannot be shown that the fee wallet is not the "
+                         "mixing wallet: each wallet-rpc has to name its own "
+                         "wallet, the two have to differ, the fee wallet-rpc "
+                         "has to own the fee address and the mixing one has "
+                         "to say it does not -- and one of those answers "
+                         "did not come. ")
+                      + ("Nothing was read or spent. " if legs == 0 else
+                         f"{legs} leg(s) ran before this and moved what "
+                         f"they moved; no further leg was started. ")
+                      + "Check which wallet each wallet-rpc on this machine "
+                        "has open.")
+            if legs:
+                _retire_fee_bundle(artifact_dir)
+            return _mis
         found = fee_wallet_entry(key, cfg, injected=d.get("fee_entry"))
         if not found:
             if legs == 0:
@@ -4979,10 +5008,10 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         # before the gate reads the ledger, so "/deposit again" is not
         # "full" for two days about details nobody was shown.
         # ...AN INTAKE DEPOSIT'S RELEASE WAITS FOR ITS BTC ADDRESS, asked
-        # after the jitter and the Tor check (_release_undelivered), and
-        # only if the gate needed that place: until then the gate counts it
-        # as released, and if the address turns out used, the deposit is
-        # refused there -- still before anything is minted or quoted.
+        # after the jitter and the Tor check (_release_undelivered): until
+        # then the gate counts it as released, and if the gate needed that
+        # place and the address turns out used, the deposit is refused
+        # there -- still before anything is minted or quoted.
         if params.get("replaces"):
             _rel = _release_undelivered(artifact_dir, params["replaces"],
                                         params.get("owner"), key=key,
@@ -5075,23 +5104,29 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         _vt(isolated_proxy(key["tor_proxy"], "verify"))
 
     # THE DEFERRED RELEASE (see the gate): asked now, after the jitter and
-    # the Tor check. Used, or nobody answered: the place stays, and this
-    # deposit is refused as it would have been -- before anything is minted
-    # or quoted.
-    # ...AND ONLY WHEN THE GATE NEEDED THAT PLACE (residual of the release
-    # review). The look puts the old deposit's BTC address on the wire in
-    # the same wake that asks about this deposit's new one, and a server
-    # that answers both can link them as one client's retry (see
-    # _release_undelivered). With room to spare, nothing asks: the record
-    # keeps its place until it ages out (DEPOSIT_PLACE_TTL_S), which is
-    # what it did before releases existed, and this deposit is admitted.
-    if _btc_release is not None and _btc_release_needed:
+    # the Tor check. Used, or nobody answered: the place stays, and when
+    # the gate needed it this deposit is refused as it would have been --
+    # before anything is minted or quoted.
+    # ASKED WHETHER OR NOT THIS DEPOSIT NEEDED THE PLACE, and that is a
+    # choice between two costs, made knowingly. The look puts the old
+    # deposit's BTC address on the wire in the wake that then asks about
+    # this deposit's new one, and a server answering both can guess from
+    # the timing that they are one client's retry (_release_undelivered
+    # states it). Asking only when the gate needed the place was tried
+    # (15a68c4) and reverted: this is the one wake that carries `replaces`
+    # -- the pager forgets it once it is answered -- so a place not
+    # released now is held until it ages out (DEPOSIT_PLACE_TTL_S), and it
+    # is the NEXT client's deposit that meets "full" for two days about
+    # details nobody was ever shown. Skipping it would put that loss on a
+    # second person to spare the first a link between two of their own
+    # addresses, on a server that answers both -- a link, not a name: the
+    # look says whose neither address is.
+    if _btc_release is not None:
         if _release_undelivered(artifact_dir, _btc_release,
                                 params.get("owner"), key=key,
-                                unused=d.get("btc_unused")) is not True:
+                                unused=d.get("btc_unused")) is not True \
+                and _btc_release_needed:
             _at_capacity(n, _pending + 1, ceiling)
-    elif _btc_release is not None:
-        integrity_log("wake", "release_btc_not_needed")
 
     handle = proto.new_handle()
     # EVERYTHING PAST THE LEDGER REPORTS BACK, including a refusal. An earlier
@@ -5960,10 +5995,9 @@ def _release_undelivered(artifact_dir: Path, h: str, owner, key=None,
     guess from the timing that they are one client's -- a retry. (Each
     address is asked of the server its own script hash picks first, so
     with several servers the two often go to different ones; with one,
-    never.) So the look is made only when the gate NEEDS that place to
-    admit the new deposit (_run_validated); with room to spare the record
-    is not released and nothing is asked. When it is needed, the hazard
-    stands: both were that client's, and neither look names them.
+    never.) Both were that client's, and neither look names them. It is
+    asked on every such wake, needed or not: _run_validated says why
+    skipping it costs the next client instead.
 
     NOT BEFORE THE JITTER AND THE TOR CHECK (the review of this change):
     the gate that needs the answer runs before both, and a look there put
@@ -7538,14 +7572,16 @@ def _recover_pending_mixes(key: dict, accounts, led: dict) -> bool:
     # money on them.
     #
     # THE CAUSE IS CLOSED WHERE IT STARTED: GhostSpiral stores the wallet,
-    # flushed to the device, after its first batch of mints and again after
-    # its last, before its first relay, and stops if it cannot
+    # flushed to the device, before it mints, after its first batch of
+    # mints and again after its last, before its first relay; the vault's
+    # runs are receive mode, where each of those stops the run if it cannot
     # (persist_minted). Its first batch is the mix accounts, so a mix that
     # got as far as moving anything reads back non-empty here, and an EMPTY
-    # read means it stopped before that first store, with nothing relayed.
-    # What an empty read still cannot be told apart from is a wallet file
-    # that is not the one the mix stored to: an older copy restored, or
-    # another file opened. For that the mark is still kept (every job that
+    # read means it stopped between minting and storing, with nothing
+    # relayed -- the accounts it forgot hold nothing. What an empty read
+    # still cannot be told apart from is a wallet file that is not the one
+    # the mix stored to: an older copy restored, or another file opened. For
+    # that the mark is still kept (every job that
     # mints stays refused mix_unsettled) for PENDING_EMPTY_MAX wakes and
     # only then let go, said on the chain -- the operator's cue to check the
     # wallet at the machine.

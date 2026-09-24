@@ -657,10 +657,12 @@ check("a shred that fails is on the chain and does not take the sweep down",
 _rfs = _SRC_A.split("def run_fee_sweep(")[1].split("\ndef ")[0]
 # THREE, SINCE THE HOSTILE REVIEW: a stop between legs retires it too (the
 # leg's bundle was already written, and the stop raised past the other two).
-# test_wake_agent drives that one; this counts the sites.
+# FOUR, SINCE THE REVIEW OF THE FEE-WALLET CHECK: it is asked before every
+# leg, and one refused after a leg has run leaves that leg's bundle behind
+# unless it retires it. test_wake_agent drives both; this counts the sites.
 check("...and run_fee_sweep retires it on the failed leg, on a stop between "
-      "legs, AND after the last",
-      _rfs.count("_retire_fee_bundle(artifact_dir)") == 3
+      "legs, on a later leg the fee-wallet check refused, AND after the last",
+      _rfs.count("_retire_fee_bundle(artifact_dir)") == 4
       and "_CHILD_STARTED[0] = True" in _rfs)
 
 print("\n== the rest of the pass: shapes a behaviour cannot see ==")

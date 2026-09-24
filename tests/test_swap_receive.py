@@ -694,9 +694,12 @@ def test_receive_is_stored_before_it_is_handed_out():
     real, sys.stdout = sys.stdout, io.StringIO()
     try:
         _b = crw.mint_one_receive(FakeRPC(), args)
+        _said_ok = sys.stdout.getvalue()
         _order = list(calls)
         calls.clear()
+        sys.stdout = io.StringIO()
         _b2 = crw.mint_one_receive(FakeRPC(store_ok=False), args)
+        _said_failed = sys.stdout.getvalue()
     finally:
         sys.stdout = real
         _gc.time.sleep, os.sync = _sleep, _sync
@@ -718,6 +721,13 @@ def test_receive_is_stored_before_it_is_handed_out():
           calls.count("store") == 3 and "sync" not in calls
           and ("wallet", "store_failed") in logged
           and _b2 is not None and os.path.exists(str(_b2[1])))
+    # RUN BY HAND THERE IS NO LEDGER to catch what a later cut would cost,
+    # and the failure went to the chain alone (the review of this change).
+    check("...and SAYS so on the terminal, with what to do -- a store that "
+          "succeeded says nothing of the kind",
+          "did not write this address's account" in _said_failed
+          and "orderly" in _said_failed
+          and "did not write" not in _said_ok)
 
 
 def test_count_refuses_a_repeating_wallet():

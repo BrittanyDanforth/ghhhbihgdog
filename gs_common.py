@@ -3744,6 +3744,45 @@ def create_fresh_account(rpc, label: str = "") -> int:
     return idx
 
 
+def signing_keys_file(path) -> str:
+    """The keys file a wallet named `path` is signed with: `~` expanded, a
+    trailing `.keys` dropped from the name, the rest resolved, and `.keys`
+    put back -- what GhostSpiral's resolve_wallet_file and airgap_tx_signer
+    both do to --wallet-file before monero-wallet-cli opens it. "" for an
+    empty path.
+
+    THE KEYS FILE, NOT THE NAME. Pairing asked whether `path` OR
+    `path.keys` existed, so a wallet cache with no keys beside it, or the
+    wallets DIRECTORY itself, passed, and the signer refused it later --
+    after the wake, the boot and the fan-out plan."""
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    p = os.path.expanduser(p)
+    _dir, _name = os.path.split(p)
+    if _name.endswith(".keys"):
+        p = os.path.join(_dir, _name[:-len(".keys")])
+    return os.path.realpath(p) + ".keys"
+
+
+def signing_files(path) -> set:
+    """The files a wallet named `path` is signed with (signing_keys_file):
+    the realpath of its base and of its keys file, symlinks followed. Empty
+    for an empty path.
+
+    TWO WALLETS ARE ONE WALLET WHEN THESE MEET, whatever the strings say:
+    `mix.keys` and `mix` name the same spend key, and so does a `fee.keys`
+    linked to `mix.keys`. The pairing and the fee sweep both compared the
+    paths as typed (realpath of each), which saw neither. A COPY of the
+    mixing wallet's keys under another name is not caught here -- no path
+    comparison can see that -- and is what the wallet-rpc questions after
+    it are for (fee_wallet_mismatch, and the same at pairing)."""
+    k = signing_keys_file(path)
+    if not k:
+        return set()
+    return {k[:-len(".keys")], os.path.realpath(k)}
+
+
 def store_wallet(rpc, tries: int = 3, pause: float = 2.0) -> None:
     """Have wallet-rpc write its wallet file NOW. Raises RuntimeError.
 
@@ -3775,13 +3814,15 @@ def store_wallet(rpc, tries: int = 3, pause: float = 2.0) -> None:
     the page cache, and a cut in the next few seconds loses it just as
     surely as no store at all. os.sync() on Linux returns once every
     filesystem on THIS machine has been written out. On the vault that is
-    where the wallet file is: the keyfile's --rpc is "this machine's
-    wallet-rpc", and the ledger that records whose accounts these are is
-    written tmp -> fsync -> rename (atomic_write_json), so after this the
-    two survive a cut together. NOT COVERED, stated: a wallet-rpc on another
-    machine (GhostSpiral run by hand against one over --tor-proxy) stores on
-    that machine, which this flush does not reach. There, what reaches the
-    disk after a store is up to that machine.
+    where the wallet file is when the keyfile's --rpc is this machine's own
+    wallet-rpc, as OPSEC_SETUP.md sets the vault up -- a setup, not a check:
+    pairing does not refuse a remote --rpc. The ledger that records whose
+    accounts these are is written tmp -> fsync -> rename
+    (atomic_write_json), so with the wallet on this machine the two survive
+    a cut together. NOT COVERED, stated: a wallet-rpc on another machine
+    (GhostSpiral run by hand against one over --tor-proxy, or a vault paired
+    to one) stores on that machine, which this flush does not reach. There,
+    what reaches the disk after a store is up to that machine.
 
     Asked `tries` times, `pause` seconds apart: a wallet-rpc busy with a
     refresh can time out once and answer the next time. The request has no
@@ -3811,6 +3852,99 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     connection is rejected to prevent clearnet IP leaks.
     """
     return MoneroRPC(url, proxy_url=proxy_url)
+
+
+def rpc_endpoint(url):
+    """(host, port) of a wallet-rpc URL as MoneroRPC connects to it: every
+    loopback spelling as one host, and no port as the port it then uses
+    (18083). None when it does not parse or names no host.
+
+    For telling two wallet-rpcs apart CHEAPLY, before any wallet is asked:
+    `http://localhost:18083` and `http://127.0.0.1:18083/` are one process,
+    and so is `http://127.0.0.1` beside `:18083`. Nothing rests on it --
+    an endpoint says which port answered, not which wallet it has open."""
+    try:
+        _p = urlparse(str(url or "").strip())
+        _h = (_p.hostname or "").lower()
+        if _h in ("localhost", "::1") or _h.startswith("127."):
+            _h = "loopback"
+        return (_h, _p.port or 18083) if _h else None
+    except ValueError:
+        return None
+
+
+def _is_subaddress_index(ix) -> bool:
+    """A wallet-rpc `index` answer: {"major": int, "minor": int}, and not
+    bools (True == 1)."""
+    return (isinstance(ix, dict)
+            and all(isinstance(ix.get(k), int)
+                    and not isinstance(ix.get(k), bool)
+                    and ix.get(k) >= 0 for k in ("major", "minor")))
+
+
+def wallet_rpc_owns(url, address, proxy_url=None, connect=None):
+    """What the monero-wallet-rpc at `url` says of `address`, asked with
+    get_address_index: True, False or None.
+
+    True -- it answered an index: the address is in its subaddress table.
+    False -- it answered wallet-rpc's error -2 (monero-python's
+    WrongAddress), which it gives for an address that is not in that table
+    or does not parse on its network: either way, not its own.
+    None -- ANY OTHER ANSWER IS NO ANSWER: down, no wallet open (-13),
+    busy, an error of any other kind, an index of the wrong shape. The
+    first versions of the fee-wallet checks read every error as "foreign",
+    so a mixing wallet-rpc that was down passed the one check that tells
+    the fee wallet from the mixing wallet.
+
+    connect_rpc's own refusals (a URL it will not speak to) are SystemExit
+    and pass through: the pairing wants their message on the terminal, and
+    the agent, which must not exit on a question, catches them itself.
+
+    A SUBADDRESS TABLE HAS AN END. wallet2 keeps every subaddress up to 200
+    past the highest one it has handed out in each account (its lookahead),
+    and no further. A wallet with the SAME keys answers "foreign" for one
+    minted deeper than that elsewhere -- so "foreign" says the address is
+    not in THIS table, not that the keys are different. wallet_rpc_primary
+    is the question that says that.
+
+    `connect` stands in for connect_rpc (a test's wallet-rpc); the answer is
+    read here either way, so a fake cannot be read by other rules."""
+    try:
+        from monero.exceptions import WrongAddress as _Foreign
+    except Exception:                                        # noqa: BLE001
+        _Foreign = None
+    try:
+        ix = ((connect or connect_rpc)(str(url or ""),
+                                       proxy_url=proxy_url or None)
+              .raw_request("get_address_index", {"address": str(address)})
+              or {}).get("index")
+    except Exception as e:                                   # noqa: BLE001
+        return False if _Foreign is not None and isinstance(e, _Foreign) \
+            else None
+    return True if _is_subaddress_index(ix) else None
+
+
+def wallet_rpc_primary(url, proxy_url=None, connect=None):
+    """The primary address of the wallet the monero-wallet-rpc at `url` has
+    open (get_address, account 0), or None when it gives none.
+
+    THE ONE ANSWER THAT SAYS WHETHER TWO WALLET-RPCS HOLD THE SAME KEYS. A
+    primary address is the public spend key and the public view key, so two
+    wallets with the same one are one wallet -- a copy, a view-only twin, the
+    same file opened twice -- whatever their files are called and however
+    deep either has minted. The subaddress questions (wallet_rpc_owns)
+    cannot say that past the lookahead. SystemExit and `connect` as
+    there."""
+    try:
+        a = ((connect or connect_rpc)(str(url or ""),
+                                      proxy_url=proxy_url or None)
+             .raw_request("get_address", {"account_index": 0,
+                                          "address_index": [0]})
+             or {}).get("address")
+    except Exception:                                        # noqa: BLE001
+        return None
+    a = a.strip() if isinstance(a, str) else ""
+    return a or None
 
 
 #: Bytes per transaction used to turn monerod's per-BYTE fee into a per-

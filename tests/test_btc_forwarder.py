@@ -142,8 +142,13 @@ class Net:
                  look_error=None, post_error=None, routes=None,
                  factor=Decimal(1), submit=None, seen=None, clock=None,
                  spends=None, funding=None, truncated=None, pools=None,
-                 lastblock=None, sources=None):
+                 lastblock=None, sources=None, txstatus=None):
         self.factor = factor                     # quote vs oracle, x
+        # WHAT THORNODE SAYS OF ONE INBOUND (/thorchain/tx/status/<TXID>):
+        # a dict, a callable given the TXID asked about, or an exception to
+        # raise. None -- the default -- answers
+        # nothing, as a THORNode that knows nothing of the txid would.
+        self.txstatus = txstatus
         # WHERE A HAND MOVE'S UNNAMED INPUTS CAME FROM (bcast.input_sources):
         # a dict {(txid, vout): value | False | None}, or an exception to
         # raise. None -- the default -- raises "not modelled": a fixture
@@ -251,6 +256,12 @@ class Net:
             return self.pools.get(url.rsplit("/", 1)[-1])
         if url.endswith("/thorchain/lastblock"):
             return self.lastblock
+        if "/thorchain/tx/status/" in url:
+            if isinstance(self.txstatus, Exception):
+                raise self.txstatus
+            if callable(self.txstatus):
+                return self.txstatus(url.rsplit("/", 1)[-1])
+            return self.txstatus
         return self.thornode
 
     def _submit(self, raw_hex, expected_txid, address, servers, proxy_url,
@@ -5170,18 +5181,24 @@ def _kept_one():
 
 
 def _offwin(hidden, sources, named_extra=(), runs=1, hex_of=None,
-            utxos=(), rargs=("--returns-max", "0")):
+            utxos=(), rargs=("--returns-max", "0"), name_kept=True,
+            after=(), hidden_vout=0):
     """Kept money moved beside `hidden` inputs [(txid, value)] that the
     spend's BYTES spend and its listing does not name (the window missed
     them), and `named_extra` ones it does. `sources` is what the lookup
     answers. `utxos` is what the look lists (a look that has not seen
-    the move), `rargs` the run's arguments. One entry per run: (code,
-    kinds, lookup calls, plan, net)."""
+    the move), `rargs` the run's arguments. `name_kept=False` lists the
+    move with the kept output's funding off the window too (its bytes
+    spend it; the listing names none of it), `after` are spends listed
+    after the move, `hidden_vout` the output index the hidden inputs
+    spend. One entry per run: (code, kinds, lookup calls, plan, net)."""
     _pk, _ofk, _hxk = _kept_one()
-    _named = [{"tx_hash": _HKx, "vout": 0, "value": 150000}] + [
+    _kept_in = [{"tx_hash": _HKx, "vout": 0, "value": 150000}]
+    _named = (_kept_in if name_kept else []) + [
         {"tx_hash": t, "vout": 0, "value": v} for t, v in named_extra]
-    _all = _named + [{"tx_hash": t, "vout": 0, "value": v or 1}
-                     for t, v in hidden]
+    _all = (_named if name_kept else _kept_in + _named) + [
+        {"tx_hash": t, "vout": hidden_vout, "value": v or 1}
+        for t, v in hidden]
     _tx = T.build_unsigned(_all, [(140000, _IN_SPK)], locktime=850010)
     _sw = {"txid": _tx.txid().hex(), "height": 850011,
            "hex": hex_of if hex_of is not None else _tx.serialize().hex(),
@@ -5189,8 +5206,8 @@ def _offwin(hidden, sources, named_extra=(), runs=1, hex_of=None,
     out = []
     for _ in range(runs):
         _n = Net(utxos=[dict(u) for u in utxos],
-                 spends=[_listed(_pk, _hxk), _sw], fee=10,
-                 submit=_ACCEPTED, seen=_SEEN0, sources=sources)
+                 spends=[_listed(_pk, _hxk), _sw] + [dict(a) for a in after],
+                 fee=10, submit=_ACCEPTED, seen=_SEEN0, sources=sources)
         _c, _o, _p, _ = _reconcile(_n, _ofk, *rargs)
         out.append((_c, [k for _s, k in _n.kinds], _n.source_calls,
                     json.load(open(_ofk)), _n))
@@ -5205,8 +5222,8 @@ check("kept money moved beside 90,000 sat of THIS address that the history's "
       and "kept_moved" not in _ow[0][1])
 check("...having asked about that input alone, of the deposit's own "
       "address, with what the history named left out",
-      len(_ow[0][2]) == 1 and (_HKx, 0) in set(map(tuple,
-                                                   _ow[0][2][0]["skip"]))
+      len(_ow[0][2]) == 1 and _ow[0][2][0]["address"] == _ADDR0
+      and (_HKx, 0) in set(map(tuple, _ow[0][2][0]["skip"]))
       and (_HOW, 0) not in set(map(tuple, _ow[0][2][0]["skip"])))
 _ow = _offwin([(_HOW, 300)], {(_HOW, 0): 300}, runs=2)
 _pw = _ow[0][3]
@@ -5250,19 +5267,72 @@ check("an input nobody could answer for: the move is UNDECIDED -- the run "
       and not _ow[0][3].get("returned_moved")
       and [_HKx, 0] in ((_ow[0][3].get("returned_kept") or {})
                         .get("outpoints") or []))
+# ONE OF THIS ADDRESS'S TRANSACTIONS THAT WAS NOT READ COUNTS AS MORE (the
+# review of the first version). The lookup answers None only for an input
+# whose previous transaction the address's own history lists and that it
+# did not read -- past bcast.INPUT_SOURCE_MAX. Undecided, it was a
+# structure a seed holder could build on purpose: pad the move with this
+# address's own dust transactions until the real one is past the limit,
+# and the move was never the alarm, only a run that failed.
 _ow = _offwin([(_HUK, 50000)], {(_HUK, 0): None})
-check("...and the same for a server that answered for the others and not "
-      "this one", _ow[0][0] == F.EXIT_FAILED
-      and "hand_move_undecided" in _ow[0][1])
-_ow = _offwin([(_HOW, 90000), (_HUK, 1)], {(_HOW, 0): 90000,
-                                          (_HUK, 0): None})
-check("...but what IS known already over the line is the alarm, unknowns "
-      "or not", _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+check("an input of this address's own transactions that was not read "
+      "(past the limit) is MORE than the allowance: the alarm, not "
+      "'undecided'",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
       and "hand_move_undecided" not in _ow[0][1])
-_ow = _offwin([], {}, hex_of=_moved["hex"])
-check("a listed move whose bytes are not its txid's names nothing, and a "
-      "move nothing names is not the operator's hand: the alarm",
-      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1])
+_ow = _offwin([(_HUK, 1)], F.watch.BtcWatchError("no server answered"),
+              named_extra=[(_HKd2, _dlw + 1)])
+check("...and what IS known already over the line is the alarm even when "
+      "no server completed the lookup",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+      and "hand_move_undecided" not in _ow[0][1])
+# AN UNDECIDED MOVE DOES NOT HIDE THE SPENDS AFTER IT (the review of the
+# first version: it failed the run at once, and a foreign spend listed
+# after it was never examined -- "undecided" on every run, the alarm never
+# raised, for as long as no server would answer).
+_THEFT = _move_tx([{"tx_hash": _HKd1, "vout": 0, "value": 500000}])
+_ow = _offwin([(_HUK, 50000)], F.watch.BtcWatchError("no server answered"),
+              after=[_THEFT])
+check("an undecided move followed by a spend that is not the operator's: "
+      "the ALARM, not 'undecided'",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+      and "hand_move_undecided" not in _ow[0][1])
+# AN OUTPOINT A FORWARD OF OURS SIGNED is this address's and never kept: a
+# move that spends it conflicts with our signature. Over the line at once,
+# and not asked about (the review: it was asked, needlessly, and a server
+# that did not answer made it 'undecided').
+_ow = _offwin([(_H1, 200000)], F.watch.BtcWatchError("never asked"))
+check("a move beside an outpoint our forward signed: the alarm, with no "
+      "lookup at all",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+      and _ow[0][2] == [])
+# A MOVE WHOSE KEPT INPUT THE HISTORY DID NOT NAME: the kept output's
+# funding pushed off the window too, so the listing names none of the
+# move's inputs. Its bytes do; it read as a leaked seed until it left the
+# window.
+_ow = _offwin([], {}, name_kept=False)
+check("a move whose listing names none of its inputs, whose bytes spend "
+      "the kept output: the operator's hand, not the alarm",
+      _ow[0][0] == F.EXIT_OK and "kept_moved" in _ow[0][1]
+      and "foreign_spend" not in _ow[0][1]
+      and [_HKx, 0] in (_ow[0][3].get("returned_moved") or []))
+_ow = _offwin([(_HOW, 300)], {(_HOW, 0): 300}, name_kept=False)
+check("...and beside dust of this address the window missed too: the "
+      "hand, with that dust counted",
+      _ow[0][0] == F.EXIT_OK and "kept_moved_with_dust" in _ow[0][1]
+      and [_HOW, 0] in (_ow[0][3].get("returned_dust") or []))
+# BYTES THAT SPEND THE KEPT OUTPUT, listed under ANOTHER txid: were they
+# believed, they would name kept money and read as the hand. (Bytes of a
+# spend of something else read as the alarm either way, which is what this
+# used, so it could not see the txid check go.)
+_other_kept = _move_tx([{"tx_hash": _HKx, "vout": 0, "value": 150000}],
+                       send=100000)
+_ow = _offwin([], {}, hex_of=_other_kept["hex"])
+check("a listed move whose bytes are not its txid's names nothing -- even "
+      "bytes that spend exactly the kept output -- and a move nothing names "
+      "is not the operator's hand: the alarm",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+      and "kept_moved" not in _ow[0][1])
 _ow = _offwin([(_HOW, 300)], W.PinMismatch("tls: pin"))
 check("a pin mismatch while asking is the refusal the history read gives "
       "(pin_mismatch), nothing recorded",
@@ -5976,6 +6046,131 @@ check("its inputs read as spent and only the caught-out server lists what "
       and ("forward", "unwitnessed_spent") in _nw6.kinds
       and ("forward", "history_inconsistent") not in _nw6.kinds
       and json.load(open(_ofw6))["tx_hex"] == _hxw6)
+
+# WHAT THE SERVERS CANNOT SETTLE, THE THORNODE CAN (C4a, the residual of the
+# stage 3 review): a forward listed by its acceptor alone, every other
+# server down, stayed `sent` even once mined. ThorChain finalising our
+# inbound is a witness that is not an Electrum server at all.
+
+
+def _txst(txid, completed=True, height=850100, chain="BTC"):
+    """/thorchain/tx/status/<TXID> as a THORNode answers it."""
+    _cc = {"completed": True, "chain": chain}
+    if height is not None:
+        _cc["external_observed_height"] = height
+    return {"tx": {"id": str(txid).upper(), "chain": chain,
+                   "memo": "=:XMR.XMR:x"},
+            "stages": {"inbound_observed": {"completed": True,
+                                            "final_count": 80},
+                       "inbound_confirmation_counted": _cc,
+                       "inbound_finalised": {"completed": completed}}}
+
+
+def _acc_only(txstatus, height=0, thornode=True):
+    """The first send accepted by s.onion, the other server (u.onion) down,
+    and the acceptor alone listing it at `height`. Returns (code, plan,
+    net)."""
+    _na = Net(submit=_ACCEPTED, seen=_NOT_ASKED)
+    _c0, _o0, _pa, _ofa = run(_na, "--electrum", "u.onion", broadcast=True)
+    _hxa = _na.submits[0]["raw_hex"]
+    _n = Net(utxos=[], spends=[{**_listed(_pa, _hxa, height=height),
+                                "server": "s.onion"}],
+             submit=_ACCEPTED, seen=_NOT_ASKED, txstatus=txstatus)
+    _args = (("--reconcile",) + (_TN if thornode else ())
+             + ("--electrum", "u.onion"))
+    _c, _o, _p, _ = run(_n, *_args, dry_run=False, outfile=_ofa)
+    return _c, _p, _n, _pa, _hxa
+
+
+def _asked_status(n):
+    return [u for u, _p in n.gets if "/thorchain/tx/status/" in u]
+
+
+# The acceptor lists it in its MEMPOOL (0); ThorChain has it in a block.
+_cT, _pT, _nT, _paT, _hxT = _acc_only(_txst, height=0)
+check("listed only by its acceptor, every other server down, and ThorChain "
+      "has FINALISED it: taken as listed -- seen at ThorChain's height, the "
+      "witness named, the kept bytes dropped, nothing sent",
+      _cT == F.EXIT_OK and ("forward", "listed_thornode_witnessed") in
+      _nT.kinds and ("forward", "listed_unconfirmed") not in _nT.kinds
+      and _pT["seen"] is True and _pT["seen_height"] == 850100
+      and _pT["seen_server"] == "thornode" and _pT["tx_hex"] is None
+      and _nT.submits == [])
+check("...having asked the THORNode about exactly this txid, on a circuit "
+      "of its own",
+      [u for u in _asked_status(_nT)] == [
+          "https://tn.example/thorchain/tx/status/" + _paT["txid"].upper()]
+      and [p for u, p in _nT.gets if "/thorchain/tx/status/" in u]
+      == [F.isolated_proxy(_PROXY, "forward:txstatus")])
+_cT, _pT, _nT, _, _hxT = _acc_only(lambda t: _txst(t, completed=False),
+                                   height=850100)
+check("...observed but NOT finalised: no witness -- unconfirmed as before, "
+      "the bytes kept, never seen",
+      _cT == F.EXIT_OK and ("forward", "listed_unconfirmed") in _nT.kinds
+      and ("forward", "listed_thornode_witnessed") not in _nT.kinds
+      and _pT["seen"] is False and _pT["tx_hex"] == _hxT)
+_cT, _pT, _nT, _, _hxT = _acc_only(lambda t: _txst("ab" * 32), height=850100)
+check("...an answer about ANOTHER transaction is no witness",
+      _pT["seen"] is False and _pT["tx_hex"] == _hxT
+      and ("forward", "listed_unconfirmed") in _nT.kinds)
+_cT, _pT, _nT, _, _hxT = _acc_only(lambda t: _txst(t, chain="ETH"),
+                                   height=850100)
+check("...nor one about another chain's inbound",
+      _pT["seen"] is False and _pT["tx_hex"] == _hxT)
+_cT, _pT, _nT, _, _hxT = _acc_only(lambda t: _txst(t, height=None),
+                                   height=0)
+check("...finalised with no height, and the acceptor listing it in its "
+      "mempool: no height to record, so no witness",
+      _pT["seen"] is False and _pT["tx_hex"] == _hxT)
+_cT, _pT, _nT, _, _hxT = _acc_only(lambda t: _txst(t, height=None),
+                                   height=850050)
+check("...while finalised with no height of its own takes the height the "
+      "acceptor listed it at",
+      _pT["seen"] is True and _pT["seen_height"] == 850050
+      and _pT["seen_server"] == "thornode")
+_cT, _pT, _nT, _, _hxT = _acc_only(OSError("down"), height=850100)
+check("...a THORNode that does not answer is no witness, and the chain "
+      "says it could not be read",
+      _cT == F.EXIT_OK and _pT["seen"] is False and _pT["tx_hex"] == _hxT
+      and ("forward", "txstatus_fetch_fail:OSError") in _nT.kinds)
+_cT, _pT, _nT, _, _hxT = _acc_only(_txst, height=850100, thornode=False)
+check("...and a pair that names no THORNode asks none: unconfirmed as "
+      "before", _pT["seen"] is False and _asked_status(_nT) == [])
+# THE CAUGHT-OUT SERVER'S LISTING, nobody else to ask: FAILED as
+# unwitnessed_spent above. ThorChain finalising it settles that too.
+_pw6t, _ofw6t, _hxw6t = _liar_plan()
+_nw6t = Net(utxos=[], spends=[_by(_pw6t, _hxw6t, "t.onion")],
+            submit=_ACCEPTED, seen=_NOT_ASKED, txstatus=_txst)
+_c, _o, _p6t, _ = _reconcile(_nw6t, _ofw6t, *_LIARS)
+check("listed only by the caught-out server, nobody else to ask, and "
+      "ThorChain has finalised it: listed -- not FAILED as unwitnessed_spent",
+      _c == F.EXIT_OK and ("forward", "unwitnessed_spent") not in _nw6t.kinds
+      and ("forward", "listed_thornode_witnessed") in _nw6t.kinds
+      and _p6t["seen"] is True and _nw6t.submits == [])
+# ...AND A LISTING A SERVER VOUCHES FOR PUTS NO TXID TO THE THORNODE.
+_pw3t, _ofw3t, _hxw3t = _liar_plan()
+_nw3t = Net(utxos=[], spends=[_by(_pw3t, _hxw3t, "t.onion")],
+            submit=_ACCEPTED, seen={**_SEEN0, "server": "u.onion"},
+            txstatus=_txst)
+_c, _o, _p3t, _ = _reconcile(_nw3t, _ofw3t, *_LIARS)
+check("a listing another server confirms asks the THORNode nothing",
+      _c == F.EXIT_OK and _p3t["seen_server"] == "u.onion"
+      and _asked_status(_nw3t) == [])
+# ...AND NOTHING BUT A TXID GOES INTO ITS URL: the plan's txid is ours, but
+# a path built from a file on a disk is checked where it is built.
+_tx_asked = []
+_tx_sg = F.safe_get
+F.safe_get = lambda url, proxies=None, **k: (_tx_asked.append(url), {})[1]
+try:
+    _tx_bad = [F.thornode_inbound_height("https://tn.example", _PROXY, _t)
+               for _t in ("../lastblock", "ab" * 31, "zz" * 32, "")]
+    F.thornode_inbound_height("https://tn.example", _PROXY, "ab" * 32)
+finally:
+    F.safe_get = _tx_sg
+check("a txid that is not 64 hex characters is not put into the THORNode's "
+      "URL at all -- and a real one is",
+      _tx_bad == [None] * 4 and len(_tx_asked) == 1
+      and _tx_asked[0].endswith("/thorchain/tx/status/" + "AB" * 32))
 
 # AN ACCEPTOR THAT RELAYS NOTHING IS TRIED LAST (the residual of the stage
 # 3 review): first in the rotation, it took every re-send of the same

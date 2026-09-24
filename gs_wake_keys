@@ -92,7 +92,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
     SWAP_MEMO_MAX_BYTES, SWAP_MEMO_POLICY_BYTES, atomic_write_json,
-    integrity_log, install_signal_handlers, secure_mkdir, wipe_covers,
+    integrity_log, install_signal_handlers, rpc_endpoint, secure_mkdir,
+    signing_files, signing_keys_file, wipe_covers,
 )
 import gs_wake_proto as proto                                # noqa: E402
 from decimal import Decimal                                  # noqa: E402
@@ -554,7 +555,8 @@ def _is_loopback_url(url: str) -> bool:
 
 
 def _mint_fee_address(args) -> str:
-    """One subaddress of the FEE wallet, minted once, and checked foreign.
+    """One subaddress of the FEE wallet, minted once, on a wallet shown to
+    be a different one from the mixing wallet, and checked foreign to it.
 
     ASKED OF THE FEE WALLET-RPC ITSELF, not derived here: subaddress
     derivation written from memory is a way to pay every cut to an address
@@ -565,7 +567,38 @@ def _mint_fee_address(args) -> str:
     publishes RECEIVE addresses, never this one), and one address is what the
     sweep can find all of.
     """
-    from gs_common import connect_rpc
+    # THE TWO WALLET-RPCS MUST HOLD DIFFERENT KEYS, and each must SAY which
+    # -- asked BEFORE anything is minted, so pairing the mixing wallet as
+    # the fee wallet mints nothing on it. The same questions the agent asks
+    # before every sweep leg (fee_wallet_mismatch), answered by the same
+    # code (gs_common), so the pairing and the sweep cannot read one answer
+    # two ways. The primary addresses first: a primary address IS the public
+    # keys, so equal ones are one wallet however the files are named --
+    # which the fee address alone cannot show past wallet2's subaddress
+    # lookahead. Then, once minted, the fee address: the mixing wallet must
+    # answer -2 ("foreign") for it. ANY OTHER ANSWER IS NO ANSWER (the review
+    # of the fee sweep's check): a mixing wallet-rpc that was down, locked or
+    # had no wallet open was read as "foreign", and a fee address minted on
+    # the mixing wallet was paired -- the one case this exists for.
+    # connect_rpc's own refusals (a URL it will not speak to) exit with their
+    # own message. What all of it rests on is fee_wallet_mismatch's to say:
+    # honest wallet-rpcs on this box's loopback.
+    from gs_common import connect_rpc, wallet_rpc_owns, wallet_rpc_primary
+    _p_mix = wallet_rpc_primary(args.rpc, proxy_url=args.tor_proxy)
+    _p_fee = wallet_rpc_primary(args.fee_rpc, proxy_url=args.tor_proxy)
+    if _p_mix is None or _p_fee is None:
+        sys.exit(f"[!] the wallet-rpc at "
+                 f"{'--rpc' if _p_mix is None else '--fee-rpc'} did not name "
+                 f"the wallet it has open, so the fee wallet cannot be shown "
+                 f"to be a different wallet from the mixing wallet. Start it "
+                 f"with its wallet open, and pair again. Nothing was "
+                 f"written.")
+    if _p_mix == _p_fee:
+        sys.exit("[!] the wallet-rpc at --fee-rpc is serving the SAME wallet "
+                 "as the one at --rpc -- the same keys, whatever the files "
+                 "are called. The fee wallet must be a different wallet, or "
+                 "a client's withdrawal spends your fees. Nothing was "
+                 "written.")
     try:
         fee = connect_rpc(args.fee_rpc)
         r = fee.raw_request("create_address",
@@ -579,47 +612,41 @@ def _mint_fee_address(args) -> str:
                  f"address ({type(e).__name__}: {str(e)[:80]}).\n"
                  f"    Is the fee wallet-rpc running on this box, with the "
                  f"fee wallet open? Nothing was written.")
-    # THE MIXING WALLET MUST NOT OWN IT. get_address_index errors on a
-    # foreign address, which is the answer wanted; an index back means the
-    # two wallet-rpcs are serving the same wallet.
-    try:
-        mix = connect_rpc(args.rpc)
-        ix = (mix.raw_request("get_address_index", {"address": addr})
-              or {}).get("index")
-    except Exception:                                        # noqa: BLE001
-        ix = None
-    if isinstance(ix, dict) and isinstance(ix.get("major"), int) \
-            and not isinstance(ix.get("major"), bool):
+    _mine = wallet_rpc_owns(args.rpc, addr, proxy_url=args.tor_proxy)
+    if _mine is True:
         sys.exit("[!] the fee address minted from --fee-rpc belongs to the "
                  "wallet at --rpc: the two wallet-rpcs are serving the SAME "
                  "wallet. The fee wallet must be a different wallet, or a "
                  "client's withdrawal spends your fees. Nothing was written.")
+    if _mine is None:
+        sys.exit("[!] the wallet-rpc at --rpc did not answer whether the fee "
+                 "address minted from --fee-rpc is its own, so the two cannot "
+                 "be shown to be different wallets. Start it with the mixing "
+                 "wallet open, and pair again. Nothing was written.")
     # THE SWEEP'S DESTINATIONS MUST BE OUTSIDE BOTH WALLETS. Into the fee
-    # wallet is a loop; into the mixing wallet turns your fees into a
-    # deposit the next client's withdrawal spends. Both wallet-rpcs are on
-    # this box and answer get_address_index, so this is the moment to ask.
+    # wallet is a loop. Into the mixing wallet it lands on whichever account
+    # holds that address: one the vault has recorded as a client's, whose
+    # next withdrawal spends it, or one nobody's withdrawal reaches. Both
+    # wallet-rpcs are on this box and answer get_address_index, so this is
+    # the moment to ask -- and, as above, only "foreign" is foreign. An
+    # address a wallet handed out itself is always in its table; one derived
+    # from the same keys elsewhere, past the lookahead, is not, and passes.
     for _label, _url in (("the fee wallet", args.fee_rpc),
                          ("the mixing wallet", args.rpc)):
-        try:
-            _w = connect_rpc(_url)
-            for _sa in args.fee_sweep_to:
-                try:
-                    _six = (_w.raw_request("get_address_index",
-                                           {"address": _sa}) or {}).get("index")
-                except Exception:                            # noqa: BLE001
-                    continue                     # foreign: the answer wanted
-                if isinstance(_six, dict) and isinstance(_six.get("major"), int) \
-                        and not isinstance(_six.get("major"), bool):
-                    sys.exit(f"[!] --fee-sweep-to {_sa[:12]}... is an address "
-                             f"of {_label}. A sweep has to land OUTSIDE both "
-                             f"wallets: into the fee wallet it goes round in "
-                             f"a circle, into the mixing wallet it becomes a "
-                             f"deposit the next withdrawal spends. Nothing "
-                             f"was written.")
-        except SystemExit:
-            raise
-        except Exception:                                    # noqa: BLE001
-            pass
+        for _sa in args.fee_sweep_to:
+            _o = wallet_rpc_owns(_url, _sa, proxy_url=args.tor_proxy)
+            if _o is True:
+                sys.exit(f"[!] --fee-sweep-to {_sa[:12]}... is an address "
+                         f"of {_label}. A sweep has to land OUTSIDE both "
+                         f"wallets: into the fee wallet it goes round in "
+                         f"a circle, into the mixing wallet it lands on an "
+                         f"account a client's withdrawal may spend or none "
+                         f"reaches. Nothing was written.")
+            if _o is None:
+                sys.exit(f"[!] the wallet-rpc of {_label} did not answer "
+                         f"whether --fee-sweep-to {_sa[:12]}... is its own. "
+                         f"Start it with its wallet open, and pair again. "
+                         f"Nothing was written.")
     # IN FULL, ON THIS TERMINAL: the keyfile that carries it is sealed, and a
     # run started at the desk (gs_console, or GhostSpiral by hand) takes its
     # cut only to an address it is given -- this one, in GS_USAGE_FEE_ADDRESS.
@@ -931,7 +958,14 @@ def _validate(args) -> None:
     # A WARNING AND NOT A REFUSAL. An operator who wants no fee at all is
     # making a legitimate choice, and forcing an address on them to silence a
     # warning would be worse than the warning.
-    if args.allow_withdraw and not (args.usage_fee_address or []):
+    #
+    # AND ONLY WHEN IT IS TRUE. A fee wallet (--fee-rpc) is the other answer
+    # to where the cut goes -- the keyfile names its fee address as the one
+    # destination -- and a pairing with one was told "a withdrawal started
+    # from the chat takes NO usage fee" and asked for --usage-fee-address,
+    # which the same pairing then refuses beside --fee-rpc.
+    if args.allow_withdraw and not (args.usage_fee_address or []) \
+            and not args.fee_rpc:
         print()
         print("  [!] No --usage-fee-address, and this pair lets a phone spend")
         print("      from the wallet. Two consequences, both worth knowing")
@@ -947,8 +981,9 @@ def _validate(args) -> None:
         print("         it stays until you move it. Sweep any such account")
         print("         off this wallet at the desk.")
         print()
-        print("      Give --usage-fee-address (repeat it for several) to take")
-        print("      a fee, or continue if you meant to take no fee.")
+        print("      Give --fee-rpc (a fee wallet on this box, swept to")
+        print("      your own addresses) or --usage-fee-address to take a")
+        print("      fee, or continue if you meant to take no fee.")
         print()
     if args.wallet_file and not os.path.isabs(args.wallet_file):
         sys.exit(f"[!] --wallet-file {args.wallet_file!r} is relative. The "
@@ -974,12 +1009,20 @@ def _validate(args) -> None:
     #
     # Either name counts: monero-wallet-cli takes `<name>` and keeps the keys
     # in `<name>.keys`, and an operator who points at the wrong one of the two
-    # has not made the mistake this is about.
-    if args.wallet_file and not (os.path.exists(args.wallet_file)
-                                 or os.path.exists(args.wallet_file + ".keys")):
+    # has not made the mistake this is about. BUT THE KEYS FILE IS THE ONE
+    # THAT HAS TO BE THERE: this asked whether `<name>` OR `<name>.keys`
+    # existed, so a wallet cache with its keys moved away -- or the wallets
+    # DIRECTORY, typed one component short -- passed, and the signer refused
+    # it at the signing step all the same. Asked now of the file the signer
+    # opens (gs_common.signing_keys_file: what GhostSpiral and
+    # airgap_tx_signer do to the name), and that it is a file.
+    if args.wallet_file and not os.path.isfile(
+            signing_keys_file(args.wallet_file)):
         sys.exit(
             f"[!] --wallet-file {args.wallet_file!r} does not exist on this "
-            f"box.\n"
+            f"box (its .keys file,\n"
+            f"    {signing_keys_file(args.wallet_file)}, is not there -- "
+            f"that is the file that signs).\n"
             f"    Pairing runs on the vault, so this is the machine the "
             f"wallet has to be on -- and\n"
             f"    a keyfile naming a wallet that is not there fails at the "
@@ -1007,20 +1050,28 @@ def _validate(args) -> None:
         if not _is_loopback_url(args.fee_rpc):
             sys.exit(f"[!] --fee-rpc {args.fee_rpc!r} is not a loopback URL. "
                      f"The fee wallet-rpc lives on this box, like --rpc.")
-        if args.fee_rpc.rstrip("/") == str(args.rpc).rstrip("/"):
+        # THE ENDPOINT, NOT THE STRING: `http://localhost:18083` and
+        # `http://127.0.0.1:18083/` are one wallet-rpc, and so is a URL with
+        # no port beside `:18083`. The same comparison the sweep makes.
+        if rpc_endpoint(args.fee_rpc) is not None \
+                and rpc_endpoint(args.fee_rpc) == rpc_endpoint(args.rpc):
             sys.exit("[!] --fee-rpc is the same wallet-rpc as --rpc, so the "
                      "fee wallet would BE the mixing wallet -- the exact "
                      "thing the fee wallet exists to avoid.")
         if not os.path.isabs(args.fee_wallet_file):
             sys.exit(f"[!] --fee-wallet-file {args.fee_wallet_file!r} is "
                      f"relative; give an absolute path, like --wallet-file.")
-        if not (os.path.exists(args.fee_wallet_file)
-                or os.path.exists(args.fee_wallet_file + ".keys")):
+        if not os.path.isfile(signing_keys_file(args.fee_wallet_file)):
             sys.exit(f"[!] --fee-wallet-file {args.fee_wallet_file!r} does "
-                     f"not exist on this box. A sweep would fail at the "
-                     f"SIGNING step with its fan-out already relayed.")
-        if args.wallet_file and os.path.realpath(args.fee_wallet_file) \
-                == os.path.realpath(args.wallet_file):
+                     f"not exist on this box (its .keys file is not there). "
+                     f"A sweep would fail at the SIGNING step with its "
+                     f"fan-out already relayed.")
+        # THE FILES SIGNED WITH, NOT THE PATHS AS TYPED (signing_files):
+        # `mix.keys` beside `mix`, or a `fee.keys` linked to `mix.keys`, is
+        # the mixing wallet's spend key. A copy under another name is not
+        # a path question; the wallet-rpcs are asked that at the mint.
+        if signing_files(args.fee_wallet_file) \
+                & signing_files(args.wallet_file):
             sys.exit("[!] --fee-wallet-file is --wallet-file: the fee wallet "
                      "must be a different wallet from the one being mixed.")
         for _sa in args.fee_sweep_to:

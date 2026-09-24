@@ -591,37 +591,61 @@ def spends_of(address, servers, proxy_url, *, network="main",
     raise BtcWatchError(f"no Electrum server answered (last: {why})")
 
 
-#: How many funding transactions input_sources fetches for one spend. A
-#: spend that names more inputs than this, beyond those the caller already
-#: knows, has the rest answered None (unknown).
-INPUT_SOURCE_MAX = 8
+#: How many previous transactions input_sources fetches for one spend --
+#: only ones the address's own history lists, the only ones that can pay
+#: it. An input of one past this is answered None, which the forwarder
+#: counts as more than the dust allowance. Public, like every bound here:
+#: a real hand move takes a handful of this address's outputs.
+INPUT_SOURCE_MAX = 16
 
 
 def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
                   timeout=DEFAULT_TIMEOUT, transport_factory=None, skip=(),
                   limit=INPUT_SOURCE_MAX):
     """Where the inputs of one transaction came from, as far as this
-    address is concerned: {(txid, vout): value} for an input whose previous
-    output PAYS the address, False for one that pays anything else, None
-    for one whose previous transaction could not be read -- for every
-    outpoint the transaction's own bytes spend, less `skip` (those the
-    caller already knows). Read-only, over Tor on the address's circuit,
-    one session on the first server that answers. Raises BtcWatchError
-    when no server answered at all.
+    address is concerned, for every outpoint the transaction's own bytes
+    spend less `skip` (those the caller already knows):
+
+        int    its previous output PAYS the address: that output's value;
+        False  it does not -- its previous transaction is not in the
+               address's history, so none of its outputs pays the
+               address, or it is and that output pays something else;
+        None   its previous transaction is in the history and was not
+               read: past `limit`, or an output it does not have.
+
+    Read-only, over Tor on the address's broadcast circuit, in ONE session:
+    the address's history, then the previous transactions it lists. Any
+    failure of that session -- a server saying it has no transaction its
+    own history lists among them -- moves to the next server (the review
+    of the first version: a server's "no such transaction" was read as
+    unknown and kept, so one server that would not answer jammed the move
+    with others configured). Raises BtcWatchError when no server completed
+    a session.
 
     WHY (residual of the dust allowance): spends_of names a spend's inputs
     from the funding transactions in its window, so an output of this
     address funded before the window -- a flood's doing -- is not among
     them, and a move of kept money beside it read as the operator's hand,
-    whatever it took. The transaction's own bytes name every input; the
-    previous transaction of each is fetched by its txid and checked to BE
-    that transaction (Broadcaster.transaction recomputes the id). So this
-    rests on the hash, not on the server's word: a server can refuse an
-    answer (None, which the caller counts against the spend) but cannot
-    make an input pay somewhere it does not.
+    whatever it took.
 
-    AT MOST `limit` previous transactions are fetched; an input past that
-    is None. A real hand move spends a handful of outputs."""
+    BOUNDED BY WHAT CAN PAY, not by how many inputs there are (the same
+    review): the first version fetched every unnamed input's previous
+    transaction up to eight, so an honest wallet sweeping nine other
+    addresses beside the kept money could never be decided, and eight
+    other addresses' outputs placed in front of a large one of THIS
+    address pushed it past the limit. An input whose previous transaction
+    the history does not list costs no fetch at all now, however many
+    there are; the fetches are of this address's own transactions.
+
+    WHAT IT RESTS ON, stated. A previous transaction that is read is
+    checked to be its txid's (Broadcaster.transaction recomputes the id),
+    so no server can make that input pay somewhere it does not. "Not in
+    the history" is the server's word that the transaction never touched
+    the address, and a server that leaves one out can make an input of
+    this address read as another's. That is the trust the reconciliation
+    already places in the history -- a server that leaves a spend out
+    hides it from the reconciliation altogether -- and no more; the
+    servers are the operator's own, pinned (OPSEC_SETUP.md)."""
     spk = btx.address_script(address, network).data
     try:
         tx = Transaction.parse(bytes.fromhex(str(raw_hex or "")))
@@ -633,13 +657,9 @@ def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
         o = (i.txid.hex(), int(i.vout))
         if o not in _skip and o not in ask:
             ask.append(o)
-    out = {o: None for o in ask}
     if not ask:
-        return out
-    prev_ids = []
-    for t, _v in ask:
-        if t not in prev_ids and len(prev_ids) < max(0, int(limit)):
-            prev_ids.append(t)
+        return {}
+    _cap = max(0, int(limit))
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
     last = None
@@ -649,28 +669,29 @@ def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
         try:
             with Broadcaster(transport) as b:
                 b.handshake()
-                if hasattr(transport, "extend"):
-                    transport.extend(min(PER_ENTRY_S * len(prev_ids),
+                listed = {e["tx_hash"] for e in b.history(scripthash)}
+                fetch = []
+                for t, _v in ask:
+                    if t in listed and t not in fetch and len(fetch) < _cap:
+                        fetch.append(t)
+                if fetch and hasattr(transport, "extend"):
+                    transport.extend(min(PER_ENTRY_S * len(fetch),
                                          READ_EXTENSION_MAX_S))
-                for t in prev_ids:
-                    try:
-                        got[t] = Transaction.parse(
-                            bytes.fromhex(b.transaction(t)))
-                    except ServerError:
-                        # The server ANSWERED that it has no such
-                        # transaction: unknown, and the session goes on.
-                        # Anything else -- a connection that died, bytes
-                        # that are not the transaction asked for -- ends
-                        # this server's session, and the next is asked.
-                        got[t] = None
+                for t in fetch:
+                    got[t] = Transaction.parse(bytes.fromhex(b.transaction(t)))
         except PinMismatch:
             raise
         except (BtcWatchError, OSError) as ex:
             last = ex
             continue
+        out = {}
         for t, v in ask:
+            if t not in listed:
+                out[(t, v)] = False
+                continue
             ptx = got.get(t)
             if ptx is None or not 0 <= v < len(ptx.vout):
+                out[(t, v)] = None
                 continue
             o = ptx.vout[v]
             out[(t, v)] = (int(o.value) if o.script_pubkey.data == spk

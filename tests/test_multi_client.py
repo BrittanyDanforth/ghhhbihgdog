@@ -778,7 +778,7 @@ check("NON-VACUITY: on the intake WITHOUT the flag the deposit is not "
 # the injected look reach it, or no intake deposit is ever released.
 
 
-def _env_rel_btc(unused_answer, ceiling=45):
+def _env_rel_btc(unused_answer, ceiling=45, age_s=0):
     d, kf, _ = _env(ceiling, 1)
     key = P.unlock_keyfile(json.loads(kf.read_text()), b"")
     key.update({"btc_account_xpub": _UZPUB, "btc_electrum": ["s.onion"],
@@ -788,7 +788,8 @@ def _env_rel_btc(unused_answer, ceiling=45):
     os.chmod(kf, 0o400)
     led = A._load_ledger(d)
     led["handles"]["E000"].update(
-        {"admitted": int(time.time()) // 600 * 600, "btc_index": 0})
+        {"admitted": (int(time.time()) - int(age_s)) // 600 * 600,
+         "btc_index": 0})
     A._save_handles(d, led["handles"], led["owners"])
     asked, order, kinds = [], [], []
     _b = _note("receive_and_quote", {"amount_sat": 5000000, "owner": OX,
@@ -832,27 +833,40 @@ check("...and at the stock ceiling, where that place IS the capacity, the "
       _eb2 is not None and getattr(_eb2, "code", None) == "at_capacity"
       and "child" not in _ob2
       and (_bb2.result or {}).get("phase") == "full")
-# ...AND ONLY WHEN THE GATE NEEDS THAT PLACE. The look puts the old deposit's
-# BTC address on the wire in the wake that then asks about the new one, and
-# a server answering both can link them as one client's retry. With room to
-# spare it is not asked: the old record keeps its place until it ages out,
-# and the new deposit is admitted.
+# ...AND ASKED EVEN WHEN THE GATE HAS ROOM (the review of 15a68c4, which
+# skipped it then). This wake is the only one that carries `replaces` --
+# the pager forgets it once the deposit is answered -- so a place not
+# released now is held for two days, and the NEXT client's deposit is the
+# one refused "full" for it. The look's linkage hazard is stated beside it.
 # (This fixture pairs no OP_RETURN policy, so an admitted intake deposit is
 # refused a few lines later, op_return_too_small, as the ones above are:
 # what is asked here is the gate's answer and what went on the wire.)
 _rb3, _ab3, _ob3, _eb3, _bb3 = _env_rel_btc(True, ceiling=90)
-check("with ROOM for both, the old deposit's BTC address is NOT asked, it is "
-      "not released, and the gate admits the new deposit",
-      _ab3 == [] and not _rb3 and "tor" in _ob3
-      and getattr(_eb3, "code", None) != "at_capacity")
-check("...and the chain says the release was not needed",
-      "release_btc_not_needed" in (_env_rel_btc.kinds or [])
-      and "deposit_released" not in (_env_rel_btc.kinds or []))
+check("with ROOM for both, the old deposit's BTC address is STILL asked, "
+      "after the jitter and the Tor check, and the place is released -- "
+      "the next client does not meet 'full' for it",
+      _ab3[:1] == [_A0] and isinstance(_rb3, int)
+      and _ob3.index("tor") < _ob3.index(_A0)
+      and getattr(_eb3, "code", None) != "at_capacity"
+      and "deposit_released" in (_env_rel_btc.kinds or []))
 _rb4, _ab4, _ob4, _eb4, _bb4 = _env_rel_btc(False, ceiling=90)
-check("...a used address changes nothing then: not asked, and not refused "
-      "at_capacity",
-      _ab4 == [] and "tor" in _ob4
-      and getattr(_eb4, "code", None) != "at_capacity")
+check("...and a USED address with room: asked, the place kept, and this "
+      "deposit not refused at_capacity -- the gate did not need that place",
+      _ab4[:1] == [_A0] and not _rb4
+      and getattr(_eb4, "code", None) != "at_capacity"
+      and "release_btc_unconfirmed" in (_env_rel_btc.kinds or []))
+# ...AND A PLACE THE GATE NEVER COUNTED IS NOT COUNTED AFTER THE LOOK. The
+# old deposit aged out unpaid, so it held no place when the gate ran; its
+# address used or not, refusing on "the place stays" would count a place
+# nobody holds. The ceiling is set to exactly what the gate admits: this
+# wallet's accounts and one deposit's reserve.
+_rb5, _ab5, _ob5, _eb5, _bb5 = _env_rel_btc(
+    False, ceiling=4 + A.deposit_reserve_accounts(),
+    age_s=P.DEPOSIT_PLACE_TTL_S + 3600)
+check("...and an old deposit that held no place (aged out unpaid), its "
+      "address used: asked, and this deposit not refused at_capacity for a "
+      "place nobody holds -- at a ceiling with room for exactly one",
+      _ab5[:1] == [_A0] and getattr(_eb5, "code", None) != "at_capacity")
 _d7, _kf7, _b7 = _env(45, 0)
 _o7, _e7 = _run(_kf7, _b7, _d7, None)
 check("...a refusal for any other reason carries none",

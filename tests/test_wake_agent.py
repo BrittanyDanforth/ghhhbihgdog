@@ -147,14 +147,67 @@ def new_env(job="receive_and_quote", params=None):
     return d, kf, key, bell
 
 
-def _fs_wallet_answer(url, address):
-    """A correctly paired vault's wallets, as get_address_index answers them:
-    the fee wallet-rpc owns the fee address, and every other wallet answers
-    it with an error, as monero-wallet-rpc does for a foreign address. The
-    fee sweep asks this before it reads a balance (fee_wallet_mismatch)."""
-    if url == _FS_KEY["fee_rpc"] and address == _FS_ADDR:
-        return {"major": 0, "minor": 1}
-    raise RuntimeError("Address doesn't belong to the wallet")
+#: The primary addresses the two wallet-rpcs name: real, checksummed mainnet
+#: addresses, so the loopback wallet-rpc further down -- which monero-python
+#: itself parses -- can answer with them too.
+_FS_PRIMARY_MIX = ("44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3Xjrp"
+                   "DtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A")
+_FS_PRIMARY_FEE = ("42Wz2Zm75sf8u5PXzAzCPDViDAyJnBL5u5mc5QVGBZXFELDdPS88"
+                   "cmA9tbFA7UYwiw1XnsMix9ToSBja8Lfq8fA7VakABjr")
+
+
+def _fs_wallets(owners=None, primaries=None, index=None, down=(),
+                errors=None, index_errors=None):
+    """connect_rpc as this box's wallet-rpcs answer the fee-wallet questions
+    (fee_wallet_mismatch), for `connect=`.
+
+    get_address_index: a URL in `owners` (the fee wallet-rpc by default)
+    answers an index for the fee address -- `index` in place of one, when
+    given -- and every other answers -2, monero-python's WrongAddress, which
+    is what monero-wallet-rpc answers for an address not in its table.
+    get_address: `primaries[url]`, by default each wallet-rpc its own.
+    A URL in `down`, or one nothing is set up for, refuses the connection;
+    `errors[url]` is raised on every call to it, `index_errors[url]` on its
+    get_address_index alone."""
+    from monero.exceptions import WrongAddress
+    _own = {_FS_KEY["fee_rpc"]} if owners is None else set(owners)
+    _prim = ({_FS_KEY["rpc_primary"]: _FS_PRIMARY_MIX,
+              _FS_KEY["fee_rpc"]: _FS_PRIMARY_FEE}
+             if primaries is None else dict(primaries))
+    _err = dict(errors or {})
+    _ierr = dict(index_errors or {})
+
+    class _Rpc:
+        def __init__(self, url):
+            self.url = url
+
+        def raw_request(self, method, params):
+            if self.url in _err:
+                raise _err[self.url]
+            if method == "get_address_index":
+                if self.url in _ierr:
+                    raise _ierr[self.url]
+                if self.url in _own and params.get("address") == _FS_ADDR:
+                    return {"index": ({"major": 0, "minor": 1}
+                                      if index is None else index)}
+                raise WrongAddress("Address doesn't belong to the wallet")
+            if method == "get_address":
+                return {"address": _prim.get(self.url, "")}
+            raise AssertionError(f"unexpected wallet call {method}")
+
+    def _connect(url, proxy_url=None):
+        if url in down or (url not in _prim and url not in _own
+                           and url not in _err):
+            raise ConnectionError("connection refused")
+        return _Rpc(url)
+    return _connect
+
+
+def _fs_wallet_rpc(url, proxy_url=None):
+    """A correctly paired vault's two wallet-rpcs (_fs_wallets' defaults):
+    each names its own wallet, the fee wallet-rpc owns the fee address, the
+    mixing one answers -2 for it. The fee sweep asks before every leg."""
+    return _fs_wallets()(url, proxy_url)
 
 
 def deps_for(d, bell, **over):
@@ -192,7 +245,7 @@ def deps_for(d, bell, **over):
                 # The fee sweep arms a backstop before it spends, like a
                 # withdrawal; a scratch vault has no systemd to arm one on.
                 extend_deadman=lambda s: True,
-                address_index=_fs_wallet_answer)
+                wallet_rpc=_fs_wallet_rpc)
     base.update(over)
     base["_posted"] = posted
     base["_ran"] = ran
@@ -3289,8 +3342,8 @@ finally:
 # from it -- so that is where the operator is told.
 check("fee: pairing warns when a phone may spend from a wallet and no "
       "off-wallet destination is named",
-      "if args.allow_withdraw and not (args.usage_fee_address or []):"
-      in _kp_src)
+      "if args.allow_withdraw and not (args.usage_fee_address or []) \\\n"
+      "            and not args.fee_rpc:" in _kp_src)
 check("fee: ...and says both consequences, not just the missing fee -- and "
       "the second truthfully: with owner sets an old desk cut is nobody's, "
       "left for the desk, never picked up by a chat withdrawal",
@@ -3301,7 +3354,8 @@ check("fee: ...and it is a warning, not a refusal -- taking no fee is a "
       "legitimate choice and forcing an address to silence a warning is worse",
       "or continue if you meant to take no fee" in _kp_src
       and "sys.exit" not in _kp_src.split(
-          "if args.allow_withdraw and not (args.usage_fee_address or []):")[1]
+          "if args.allow_withdraw and not (args.usage_fee_address or []) \\\n"
+          "            and not args.fee_rpc:")[1]
           .split("if args.wallet_file")[0])
 # AND THE PAGE THAT RECOMMENDS THE EMPTY BOX SAYS WHEN NOT TO.
 _cons_src = open(os.path.join(REPO, "gs_console"), encoding="utf-8").read()
@@ -3488,8 +3542,13 @@ for _a, _label, _want in (
 _wf_dir = tempfile.mkdtemp(prefix="gs_wf_")
 _wf_real = os.path.join(_wf_dir, "vault")
 open(_wf_real, "w").write("x")
+open(_wf_real + ".keys", "w").write("x")
 _wf_keys = os.path.join(_wf_dir, "other")
 open(_wf_keys + ".keys", "w").write("x")
+#: A wallet CACHE with no keys beside it -- the keys moved to cold storage,
+#: or never copied over -- which the signer cannot sign with.
+_wf_cache = os.path.join(_wf_dir, "cacheonly")
+open(_wf_cache, "w").write("x")
 
 
 def _pairs_with(wallet_file):
@@ -3521,6 +3580,17 @@ check("pairing: ...and so does one where only <name>.keys is present, which "
       _pairs_with(_wf_keys) is None)
 check("pairing: ...and omitting --wallet-file entirely is still valid",
       _pairs_with(None) is None)
+# THE KEYS FILE IS THE ONE THAT HAS TO BE THERE. The check asked whether
+# `<name>` OR `<name>.keys` existed, so a cache with its keys gone, or the
+# wallets DIRECTORY typed one component short, paired -- and the signer
+# refused it at the signing step, after the wake and the fan-out plan.
+check("pairing: a wallet cache with no .keys beside it is REFUSED -- the "
+      "keys file is what signs",
+      "does not exist" in (_pairs_with(_wf_cache) or ""))
+check("pairing: ...and so is a directory, which exists and signs nothing",
+      "does not exist" in (_pairs_with(_wf_dir) or ""))
+check("pairing: ...and monero's `.keys` spelling of a real wallet pairs",
+      _pairs_with(_wf_real + ".keys") is None)
 shutil.rmtree(_wf_dir, ignore_errors=True)
 
 # ---- AND THE DEPOSIT AMOUNT IS BOUNDED BY THE BOX THAT ACTS ON IT -------
@@ -4433,7 +4503,7 @@ try:
         deps = {"fee_entry": _entry, "live_floor": lambda k, w: floor,
                 "clock": _clock, "extend_deadman": _arm,
                 "run_child": _rc,
-                "address_index": wallets or _fs_wallet_answer}
+                "wallet_rpc": wallets or _fs_wallet_rpc}
         with contextlib.redirect_stdout(io.StringIO()) as _o:
             code = A.run_fee_sweep(key or _FS_KEY, _sw_dir, deps, dry_run)
         return code, ran, _o.getvalue()
@@ -4571,19 +4641,17 @@ try:
     # takes the largest output on whatever wallet answers the fee port, as
     # the host's. A fee wallet-rpc restarted on the mixing wallet swept a
     # client's deposit to the operator, as an ordinary sweep.
-    def _wallets(owners):
-        """get_address_index as the wallets answer it: the URLs in `owners`
-        own the fee address, every other one errors."""
-        def _ask(url, address):
-            if url in owners and address == _FS_ADDR:
-                return {"major": 0, "minor": 1}
-            raise RuntimeError("Address doesn't belong to the wallet")
-        return _ask
+    def _wallets(owners, **kw):
+        """_fs_wallets with the fee address owned by the wallet-rpcs at
+        `owners`; every other one answers -2 for it."""
+        return _fs_wallets(owners=owners, **kw)
 
+    from monero.backends.jsonrpc.exceptions import RPCError as _RPCErr
     _MIX_EP = _FS_KEY["rpc_primary"]
     _FEE_EP = _FS_KEY["fee_rpc"]
-    check("sweep/wallet: a correctly paired vault -- the fee wallet-rpc owns "
-          "the fee address, the mixing wallet does not -- is not refused",
+    check("sweep/wallet: a correctly paired vault -- two wallets naming "
+          "different primary addresses, the fee wallet-rpc owning the fee "
+          "address, the mixing one answering -2 for it -- is not refused",
           A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets({_FEE_EP})) == "")
     _fs_entry_reads.clear()
     _cwu, _rwu, _owu = _sweep([int(0.6 * _XMR)], wallets=_wallets(set()))
@@ -4602,11 +4670,60 @@ try:
           "is read",
           _cwm == "wallet_is_mixing" and _rwm == [] and not _fs_entry_reads
           and "MIXING wallet" in _owm)
+    # THE MIXING WALLET-RPC DOWN IS NO ANSWER (the review of this check).
+    # The scenario: the fee wallet-rpc is serving the mixing wallet, whose
+    # table has the fee address, and the mixing wallet-rpc is down. Its
+    # error was read as "foreign", the fee wallet-rpc answered an index, and
+    # the sweep ran on the clients' money.
+    _both_own = {_FEE_EP, _MIX_EP}
+    for _why, _w in (
+            ("refuses the connection",
+             _wallets(_both_own, down={_MIX_EP})),
+            ("has no wallet open (-13)",
+             _wallets(_both_own, errors={_MIX_EP: _RPCErr("No wallet file")})),
+            ("names its wallet but errors on the fee address",
+             _wallets(_both_own,
+                      index_errors={_MIX_EP: _RPCErr("busy")}))):
+        _fs_entry_reads.clear()
+        _cdn, _rdn, _ = _sweep([int(0.6 * _XMR)], wallets=_w)
+        check(f"sweep/wallet: a mixing wallet-rpc that {_why} has not said "
+              f"the fee address is foreign -- nothing is read or swept",
+              _cdn == "wallet_unverified" and _rdn == []
+              and not _fs_entry_reads)
+    # A COPY OF THE MIXING WALLET, FEE ADDRESS PAST ITS LOOKAHEAD. wallet2's
+    # table ends 200 past the deepest subaddress handed out, so the mixing
+    # wallet answers -2 for a fee address a copy minted deeper -- and every
+    # subaddress question passes. The primary addresses are the same.
+    _fs_entry_reads.clear()
+    _ccp, _rcp, _ocp = _sweep(
+        [int(0.6 * _XMR)],
+        wallets=_wallets({_FEE_EP}, primaries={_MIX_EP: _FS_PRIMARY_MIX,
+                                               _FEE_EP: _FS_PRIMARY_MIX}))
+    check("sweep/wallet: a fee wallet-rpc naming the MIXING wallet's primary "
+          "address is the mixing wallet, even when the mixing wallet-rpc "
+          "answers -2 for the fee address -- refused before any balance",
+          _ccp == "wallet_is_mixing" and _rcp == [] and not _fs_entry_reads
+          and "MIXING wallet" in _ocp)
+    check("sweep/wallet: ...and a wallet-rpc that names no primary address "
+          "(either one) has not answered",
+          A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets(
+              {_FEE_EP}, primaries={_MIX_EP: _FS_PRIMARY_MIX, _FEE_EP: ""}))
+          == "wallet_unverified"
+          and A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets(
+              {_FEE_EP}, primaries={_MIX_EP: "", _FEE_EP: _FS_PRIMARY_FEE}))
+          == "wallet_unverified")
     _k_alias = dict(_FS_KEY, fee_rpc=_MIX_EP.replace("127.0.0.1", "localhost"))
     check("sweep/wallet: the mixing wallet-rpc under another loopback name is "
           "the mixing wallet-rpc, whatever the wallets answer",
           A.fee_wallet_mismatch(_k_alias, A.fee_sweep_config(_k_alias),
                                 _wallets({_k_alias["fee_rpc"]}))
+          == "wallet_is_mixing")
+    _k_noport = dict(_FS_KEY, rpc_primary="http://127.0.0.1:18083",
+                     fee_rpc="http://localhost")
+    check("sweep/wallet: ...and so is a fee-rpc URL with NO port, which "
+          "connect_rpc connects to 18083 -- the mixing one's port",
+          A.fee_wallet_mismatch(_k_noport, A.fee_sweep_config(_k_noport),
+                                _wallets({"http://localhost"}))
           == "wallet_is_mixing")
     _wf_dir = Path(tempfile.mkdtemp(prefix="feewf_"))
     (_wf_dir / "mix").write_text("")
@@ -4621,16 +4738,56 @@ try:
     check("sweep/wallet: ...and a different file is not",
           A.fee_wallet_mismatch(dict(_FS_KEY, wallet_file=str(_wf_dir / "mix")),
                                 _cfg, _wallets({_FEE_EP})) == "")
+    # THE FILE THAT SIGNS IS <base>.keys. `mix.keys` beside `mix`, and a
+    # `fee.keys` linked to `mix.keys` under another base name, are the
+    # mixing wallet's spend key; comparing the paths as typed saw neither.
+    (_wf_dir / "mix.keys").write_text("")
+    os.symlink(_wf_dir / "mix.keys", _wf_dir / "fee.keys")
+    for _why, _fwf in (("spelled with .keys", "mix.keys"),
+                       ("reached through a linked .keys file", "fee")):
+        _k_kf = dict(_FS_KEY, wallet_file=str(_wf_dir / "mix"),
+                     fee_wallet_file=str(_wf_dir / _fwf))
+        check(f"sweep/wallet: the mixing wallet {_why} is the mixing wallet",
+              A.fee_wallet_mismatch(_k_kf, A.fee_sweep_config(_k_kf),
+                                    _wallets({_FEE_EP})) == "wallet_is_mixing")
     check("sweep/wallet: an index that is a bool is no answer (True == 1)",
-          A.fee_wallet_mismatch(_FS_KEY, _cfg,
-                                lambda u, a: {"major": True, "minor": 1})
+          A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets(
+              {_FEE_EP}, index={"major": True, "minor": 1}))
           == "wallet_unverified")
-
-    def _down(url, address):
-        raise ConnectionError("connection refused")
     check("sweep/wallet: a fee wallet-rpc that cannot be reached is not "
           "shown to be the fee wallet, and nothing is swept",
-          A.fee_wallet_mismatch(_FS_KEY, _cfg, _down) == "wallet_unverified")
+          A.fee_wallet_mismatch(_FS_KEY, _cfg,
+                                _wallets({_FEE_EP}, down={_FEE_EP}))
+          == "wallet_unverified")
+    try:
+        _se_mis = A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets(
+            {_FEE_EP}, index_errors={_MIX_EP: SystemExit("[!] refused")}))
+    except BaseException as e:                               # noqa: BLE001
+        _se_mis = f"raised {type(e).__name__}"
+    check(f"sweep/wallet: a wallet probe that EXITS on the fee-address "
+          f"question (connect_rpc's refusals are SystemExit) is no answer, "
+          f"not an exit out of the agent ({_se_mis})",
+          _se_mis == "wallet_unverified")
+    # ASKED BEFORE EVERY LEG. A leg is hours; the fee port can be serving
+    # the mixing wallet by the time the next one would start.
+    _sw_calls = [0]
+
+    def _turns_after_one_leg(url, proxy_url=None):
+        _sw_calls[0] += 1
+        # One check is four connections (two primaries, two fee-address
+        # answers); after the first, the fee port names the mixing wallet.
+        return (_fs_wallets() if _sw_calls[0] <= 4 else _fs_wallets(
+            primaries={_MIX_EP: _FS_PRIMARY_MIX,
+                       _FEE_EP: _FS_PRIMARY_MIX}))(url, proxy_url)
+    _ctl, _rtl, _otl = _sweep([int(0.6 * _XMR), int(0.6 * _XMR), None],
+                              wallets=_turns_after_one_leg)
+    check("sweep/wallet: a fee wallet-rpc that turns into the mixing wallet "
+          "after a leg stops the sweep before the next -- one leg ran, and "
+          "the refusal says so rather than 'nothing was spent'",
+          _ctl == "wallet_is_mixing" and len(_rtl) == 1
+          and "1 leg(s) ran before this" in _otl
+          and "Nothing was read or spent" not in _otl
+          and not (_sw_dir / A.FEE_SWEEP_BUNDLE).exists())
     # THE REAL PATH, not injected: two wallet-rpc URLs nothing listens on.
     # Both answer with an error, so the fee wallet is unverified -- and the
     # probe neither crashes nor exits.
@@ -4648,6 +4805,111 @@ try:
     check(f"sweep/wallet: the uninjected probe against wallets that do not "
           f"answer says unverified ({_real_mis})",
           _real_mis == "wallet_unverified")
+    # ...AND AGAINST WALLET-RPCS THAT DO ANSWER. Two JSON-RPC servers on
+    # loopback that speak monero-wallet-rpc's wire -- get_accounts (which
+    # monero-python asks when it connects), get_address, get_address_index,
+    # and error -2 / -13 as the real one sends them -- so the path from the
+    # socket to the verdict is the shipped one, monero-python included.
+    # Without this the checks above proved only what a fake was told.
+    import http.server as _hs_fs
+    import threading as _th_fs
+
+    def _jsonrpc_wallet(primary, owns=(), open_=True, index_code=None,
+                        mints=None, calls=None):
+        """A monero-wallet-rpc on loopback, as far as these questions go:
+        `owns` are the addresses its table has, `mints` what create_address
+        hands out (and then owns), `index_code` an error code every
+        get_address_index answers with instead, and `calls` a list the
+        methods asked are appended to."""
+        _owns = set(owns)
+
+        class _H(_hs_fs.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                _req = json.loads(self.rfile.read(
+                    int(self.headers.get("Content-Length") or 0)))
+                _m, _p = _req.get("method"), _req.get("params") or {}
+                if calls is not None:
+                    calls.append(_m)
+                _out = {"jsonrpc": "2.0", "id": _req.get("id")}
+                if not open_:
+                    _out["error"] = {"code": -13, "message": "No wallet file"}
+                elif _m == "create_address" and mints:
+                    _owns.add(mints)
+                    _out["result"] = {"address": mints, "address_index": 1,
+                                      "address_indices": [1],
+                                      "addresses": [mints]}
+                elif _m == "get_address_index" and index_code is not None:
+                    _out["error"] = {"code": index_code, "message": "busy"}
+                elif _m == "get_accounts":
+                    _out["result"] = {"subaddress_accounts": [
+                        {"account_index": 0, "base_address": primary,
+                         "balance": 0, "unlocked_balance": 0,
+                         "label": "Primary account", "tag": ""}],
+                        "total_balance": 0, "total_unlocked_balance": 0}
+                elif _m == "get_address":
+                    _out["result"] = {"address": primary, "addresses": [
+                        {"address": primary, "address_index": 0,
+                         "label": "Primary account", "used": False}]}
+                elif _m == "get_address_index" and _p.get("address") in _owns:
+                    _out["result"] = {"index": {"major": 0, "minor": 1}}
+                elif _m == "get_address_index":
+                    _out["error"] = {"code": -2, "message":
+                                     "Address doesn't belong to the wallet"}
+                else:
+                    _out["error"] = {"code": -32601,
+                                     "message": "Method not found"}
+                _b = json.dumps(_out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(_b)))
+                self.end_headers()
+                self.wfile.write(_b)
+        _srv = _hs_fs.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        _th_fs.Thread(target=_srv.serve_forever, daemon=True).start()
+        return _srv, f"http://127.0.0.1:{_srv.server_address[1]}"
+
+    def _real_verdict(mix_kw, fee_kw):
+        _ms, _mu = _jsonrpc_wallet(**mix_kw)
+        _fsv, _fu = _jsonrpc_wallet(**fee_kw)
+        try:
+            _k = dict(_FS_KEY, rpc_primary=_mu, fee_rpc=_fu)
+            with contextlib.redirect_stderr(io.StringIO()):
+                return A.fee_wallet_mismatch(_k, A.fee_sweep_config(_k))
+        except BaseException as e:                           # noqa: BLE001
+            return f"raised {type(e).__name__}"
+        finally:
+            _ms.shutdown()
+            _fsv.shutdown()
+
+    _rv_ok = _real_verdict({"primary": _FS_PRIMARY_MIX},
+                           {"primary": _FS_PRIMARY_FEE, "owns": {_FS_ADDR}})
+    check(f"sweep/wallet: two real JSON-RPC wallets, correctly paired, pass "
+          f"through the uninjected path ({_rv_ok!r})", _rv_ok == "")
+    _rv_copy = _real_verdict({"primary": _FS_PRIMARY_MIX},
+                             {"primary": _FS_PRIMARY_MIX, "owns": {_FS_ADDR}})
+    check(f"sweep/wallet: ...a fee port serving a copy of the mixing wallet "
+          f"is the mixing wallet ({_rv_copy!r})",
+          _rv_copy == "wallet_is_mixing")
+    _rv_mix = _real_verdict({"primary": _FS_PRIMARY_MIX, "owns": {_FS_ADDR}},
+                            {"primary": _FS_PRIMARY_FEE, "owns": {_FS_ADDR}})
+    check(f"sweep/wallet: ...a mixing wallet that answers an index for the "
+          f"fee address is the mixing wallet ({_rv_mix!r})",
+          _rv_mix == "wallet_is_mixing")
+    _rv_closed = _real_verdict({"primary": _FS_PRIMARY_MIX, "open_": False},
+                               {"primary": _FS_PRIMARY_FEE,
+                                "owns": {_FS_ADDR}})
+    check(f"sweep/wallet: ...and a mixing wallet-rpc with no wallet open "
+          f"(-13) has not answered ({_rv_closed!r})",
+          _rv_closed == "wallet_unverified")
+    _rv_busy = _real_verdict({"primary": _FS_PRIMARY_MIX, "index_code": -1},
+                             {"primary": _FS_PRIMARY_FEE, "owns": {_FS_ADDR}})
+    check(f"sweep/wallet: ...nor one that names its wallet and answers the "
+          f"fee address with an error that is not -2 ({_rv_busy!r}) -- only "
+          f"-2 is 'foreign'",
+          _rv_busy == "wallet_unverified")
     # connect_rpc EXITS on a URL it will not speak to (https://, for one):
     # the probe is a question, and a wallet it cannot reach has not answered.
     _k_https = dict(_k_real, fee_rpc=_k_real["fee_rpc"].replace("http://",
@@ -4700,7 +4962,7 @@ try:
                         live_floor=lambda k, w: "0.0270",
                         run_child=lambda argv, env, budget: (
                             ran.append(list(argv)), (0, False))[1],
-                        address_index=wallets or _fs_wallet_answer)
+                        wallet_rpc=wallets or _fs_wallet_rpc)
         out, err, text = run(kf, deps, dry_run=dry_run)
         return err, ran, slept
 
@@ -4793,8 +5055,12 @@ finally:
 _fw_dir2 = tempfile.mkdtemp(prefix="gs_fw_")
 _fw_mix = os.path.join(_fw_dir2, "vault")
 open(_fw_mix, "w").write("x")
+open(_fw_mix + ".keys", "w").write("x")
 _fw_file = os.path.join(_fw_dir2, "fee")
 open(_fw_file, "w").write("x")
+open(_fw_file + ".keys", "w").write("x")
+_fw_cache = os.path.join(_fw_dir2, "feecache")
+open(_fw_cache, "w").write("x")
 
 
 def _pairs_fee(extra):
@@ -5129,7 +5395,8 @@ check("pairing/fee: a fee wallet file that is the mixing wallet file is refused"
           ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
            _fw_mix, "--fee-sweep-to", _FS_TO[0]]) or ""))
 check("pairing/fee: a non-loopback fee rpc, a relative or missing fee wallet "
-      "file, and a bad sweep address are each refused",
+      "file (a cache with no .keys beside it is missing), and a bad sweep "
+      "address are each refused",
       "loopback" in (_pairs_fee(["--fee-rpc", "http://10.0.0.5:18085",
                                  "--fee-wallet-file", _fw_file,
                                  "--fee-sweep-to", _FS_TO[0]]) or "")
@@ -5139,6 +5406,9 @@ check("pairing/fee: a non-loopback fee rpc, a relative or missing fee wallet "
       and "does not exist" in (_pairs_fee(
           ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
            os.path.join(_fw_dir2, "nope"), "--fee-sweep-to", _FS_TO[0]]) or "")
+      and "does not exist" in (_pairs_fee(
+          ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
+           _fw_cache, "--fee-sweep-to", _FS_TO[0]]) or "")
       and "not a usable Monero address" in (_pairs_fee(
           ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
            _fw_file, "--fee-sweep-to", "notanaddress"]) or ""))
@@ -5163,6 +5433,117 @@ check("pairing/fee: the fee address is minted by the fee wallet-rpc itself, "
       and _kp_src.index("_mint_fee_address(args) if args.fee_rpc")
       < _kp_src.index("srv = _listen(args)")
       and "serving the SAME" in _kp_src)
+# THE SAME WALLET UNDER ANOTHER SPELLING. The file comparison was realpath
+# of each path as typed, and the endpoint comparison a string compare.
+os.symlink(_fw_mix + ".keys", os.path.join(_fw_dir2, "linked.keys"))
+for _why, _fwf in (("spelled with .keys", _fw_mix + ".keys"),
+                   ("through a linked .keys file under another name",
+                    os.path.join(_fw_dir2, "linked"))):
+    check(f"pairing/fee: the mixing wallet {_why} is refused as the mixing "
+          f"wallet",
+          "must be a different wallet" in (_pairs_fee(
+              ["--fee-rpc", "http://127.0.0.1:18085", "--fee-wallet-file",
+               _fwf, "--fee-sweep-to", _FS_TO[0]]) or ""))
+for _url in ("http://localhost:18083", "http://127.0.0.1",
+             "http://127.0.0.1:18083/"):
+    check(f"pairing/fee: --fee-rpc {_url} beside the default --rpc is the "
+          f"same wallet-rpc",
+          "same wallet-rpc" in (_pairs_fee(
+              ["--fee-rpc", _url, "--fee-wallet-file", _fw_file,
+               "--fee-sweep-to", _FS_TO[0]]) or ""))
+
+# THE MINT ITSELF, DRIVEN against wallet-rpcs on loopback that speak the real
+# wire (_jsonrpc_wallet above), through gs_common's questions and
+# monero-python -- not a grep for the refusal's wording.
+_MINTED = "8" + "d" * 94
+
+
+def _mint_with(mix_kw, fee_kw, dests=(_FS_TO[0],)):
+    """(returned address or refusal text, the fee wallet-rpc's calls)."""
+    _fee_calls = []
+    _ms, _mu = _jsonrpc_wallet(**mix_kw) if mix_kw is not None else (None, "")
+    _fsv, _fu = _jsonrpc_wallet(mints=_MINTED, calls=_fee_calls, **fee_kw)
+    if _ms is None:
+        _sk = __import__("socket").socket()
+        _sk.bind(("127.0.0.1", 0))
+        _mu = f"http://127.0.0.1:{_sk.getsockname()[1]}"
+        _sk.close()
+    _a = types.SimpleNamespace(rpc=_mu, fee_rpc=_fu, fee_sweep_to=list(dests),
+                               tor_proxy="socks5h://127.0.0.1:9050")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return _K._mint_fee_address(_a), _fee_calls
+    except SystemExit as e:
+        return f"refused: {e}", _fee_calls
+    finally:
+        if _ms is not None:
+            _ms.shutdown()
+        _fsv.shutdown()
+
+
+_mt_ok, _mt_ok_calls = _mint_with({"primary": _FS_PRIMARY_MIX},
+                                  {"primary": _FS_PRIMARY_FEE})
+check(f"pairing/mint: two different wallets pair, and the fee address is "
+      f"the one the fee wallet-rpc minted ({str(_mt_ok)[:40]})",
+      _mt_ok == _MINTED and "create_address" in _mt_ok_calls)
+_mt_down, _mt_down_calls = _mint_with(None, {"primary": _FS_PRIMARY_FEE})
+check("pairing/mint: a mixing wallet-rpc that is DOWN is no answer -- the "
+      "pairing is refused, and nothing is minted (it was read as 'foreign' "
+      "and paired)",
+      str(_mt_down).startswith("refused")
+      and "did not name the wallet" in _mt_down
+      and "create_address" not in _mt_down_calls)
+_mt_same, _mt_same_calls = _mint_with({"primary": _FS_PRIMARY_MIX},
+                                      {"primary": _FS_PRIMARY_MIX})
+check("pairing/mint: a fee wallet-rpc serving the mixing wallet's keys is "
+      "refused before anything is minted, whatever the fee address would "
+      "have answered",
+      "SAME wallet" in str(_mt_same)
+      and "create_address" not in _mt_same_calls)
+_mt_owned, _ = _mint_with({"primary": _FS_PRIMARY_MIX, "owns": {_MINTED}},
+                          {"primary": _FS_PRIMARY_FEE})
+check("pairing/mint: a minted fee address the mixing wallet answers an "
+      "index for is refused",
+      "belongs to the wallet at --rpc" in str(_mt_owned))
+_mt_busy, _ = _mint_with({"primary": _FS_PRIMARY_MIX, "index_code": -1},
+                         {"primary": _FS_PRIMARY_FEE})
+check("pairing/mint: a mixing wallet-rpc answering the fee address with an "
+      "error that is not -2 has not said 'foreign' -- refused",
+      "did not answer whether the fee" in str(_mt_busy))
+_mt_dest, _ = _mint_with({"primary": _FS_PRIMARY_MIX},
+                         {"primary": _FS_PRIMARY_FEE, "owns": {_FS_TO[0]}})
+check("pairing/mint: a sweep destination the fee wallet owns is refused",
+      "OUTSIDE both" in str(_mt_dest) and "the fee wallet" in str(_mt_dest))
+_mt_dest2, _ = _mint_with({"primary": _FS_PRIMARY_MIX, "owns": {_FS_TO[0]}},
+                          {"primary": _FS_PRIMARY_FEE})
+check("pairing/mint: ...and so is one the mixing wallet owns",
+      "OUTSIDE both" in str(_mt_dest2)
+      and "the mixing wallet" in str(_mt_dest2))
+_mt_dest3, _ = _mint_with({"primary": _FS_PRIMARY_MIX},
+                          {"primary": _FS_PRIMARY_FEE, "index_code": -1})
+check("pairing/mint: ...and one a wallet-rpc answers with an error that is "
+      "not -2 is refused as unanswered, not paired as foreign",
+      "did not answer" in str(_mt_dest3)
+      and "--fee-sweep-to" in str(_mt_dest3))
+# THE NO-FEE WARNING SAYS WHAT IS TRUE. With a fee wallet the cut lands on
+# its fee address; the warning said the chat takes NO usage fee and asked
+# for --usage-fee-address, which the pairing then refuses beside --fee-rpc.
+
+
+def _pair_says(extra):
+    with contextlib.redirect_stdout(io.StringIO()) as _o:
+        _r = _pairs_fee(extra)
+    return _r, _o.getvalue()
+
+
+_nw_fee = _pair_says(_FEE_OK)
+_nw_none = _pair_says([])
+check("fee: a pairing WITH a fee wallet passes and is not told it takes no "
+      "fee -- and one with neither destination still is",
+      _nw_fee[0] is None and "takes NO usage fee" not in _nw_fee[1]
+      and _nw_none[0] is None and "takes NO usage fee" in _nw_none[1]
+      and "--fee-rpc" in _nw_none[1])
 
 # ===========================================================================
 print("\n== forward_to_swap: the BTC forward, gated on its OWN switch ==")
@@ -8517,6 +8898,7 @@ check("stage8: ...and a keyfile with no sealed section says so instead of "
 #: the wrong refusal until this was driven properly.
 _ib_wallet = Path(tempfile.mkdtemp(prefix="feewal_")) / "fee.wallet"
 _ib_wallet.write_text("")
+Path(str(_ib_wallet) + ".keys").write_text("")
 _ib_argv = list(_PAIR_ARGV) + ["--out", tempfile.mkdtemp(),
                                "--fee-rpc", "http://127.0.0.1:18084",
                                "--fee-wallet-file", str(_ib_wallet),
@@ -11391,7 +11773,7 @@ try:
                                   if _fs_seq and _fs_seq[0] else None),
             "live_floor": lambda k, w: "0.0270",
             "clock": lambda: 0.0, "extend_deadman": lambda s: True,
-            "run_child": _fs_run, "address_index": _fs_wallet_answer})
+            "run_child": _fs_run, "wallet_rpc": _fs_wallet_rpc})
     _fs_r = None
 except A.Stopping as e:
     _fs_r = e
