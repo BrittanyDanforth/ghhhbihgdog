@@ -202,6 +202,9 @@ bcast_seen = bcast.seen
 # READ-ONLY, in the same module: the address's spends, for a forward that
 # went out and whose plan was never written (stage 5).
 bcast_spends = bcast.spends_of
+# ...and where a hand move's inputs came from, for the ones the history's
+# window did not name (the dust allowance's residual).
+bcast_sources = bcast.input_sources
 
 
 def _history_truncated(total):
@@ -2354,6 +2357,21 @@ def _memo_is_ours(tx_hex, dest_xmr):
     return memo, ours
 
 
+def _spend_outpoints(s):
+    """Every outpoint a listed spend's own bytes spend, as a set of
+    (txid, vout), or None when the bytes do not parse or are not the
+    listed txid's. The reader recomputes the id from the hex; checked here
+    too, on the side that acts on it (as _own_inputs does)."""
+    from embit.transaction import Transaction as _Tx
+    try:
+        _tx = _Tx.parse(bytes.fromhex(str(s.get("hex") or "")))
+    except Exception:                                        # noqa: BLE001
+        return None
+    if _tx.txid().hex() != str(s.get("txid") or "").lower():
+        return None
+    return {(i.txid.hex(), int(i.vout)) for i in _tx.vin}
+
+
 def _own_inputs(spends, plans, signed=()):
     """Name the inputs of every listed spend that is a forward of ours
     (a txid in `plans`, or one this tool recorded before sending it --
@@ -2763,9 +2781,13 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # the operator's hand. An output this tool signed for is never kept;
     # a foreign spend of it conflicts with our signature and IS the alarm.
     _kept_ops, _signed_ops = set(), set()
+    # Inputs of an accepted hand move that pay OTHER addresses (see
+    # `hand_inputs_elsewhere` below): a fact of the chain, read once.
+    _elsewhere = set()
     for _p in [plan] + chain:
         if not isinstance(_p, dict):
             continue
+        _elsewhere |= _pairs(_p.get("hand_inputs_elsewhere"))
         _rk = _p.get("returned_kept")
         _kept_ops |= _pairs((_rk or {}).get("outpoints")
                             if isinstance(_rk, dict) else None)
@@ -2789,10 +2811,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     _adopted = []
     # THE DUST ALLOWANCE IS ONE, FOR THE DEPOSIT, NOT ONE PER SPEND (the
     # review of 657deae): three spends, each taking one kept output and
-    # the allowance beside it, took three allowances unnoticed -- and a
-    # mark naming a stranger's dust outputs gave a seed holder one spend,
-    # and one allowance, per dust output. What earlier moves took beside
-    # kept money is on the chain (`returned_dust`) and counts against it.
+    # the allowance beside it, took three allowances without the alarm --
+    # and a mark naming a stranger's dust outputs gave a seed holder one
+    # spend, and one allowance, per dust output. What earlier moves took
+    # beside kept money is on the chain (`returned_dust`) and counts
+    # against it.
     _dust_used = sum(_vals.get(o, 0) for o in {
         o for _p0 in [plan] + chain for o in _pair_list(
             _p0.get("returned_dust") if isinstance(_p0, dict) else None)})
@@ -2822,19 +2845,73 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # -- twice what one input costs at the highest rate this pair
         # pays -- is the operator's hand too. NOTHING SECRET: the line is
         # public. It bounds two things and says so: a seed holder can take
-        # that much beyond the kept money unnoticed (as they can the kept
-        # money itself, below), and a stranger who wants the alarm must
-        # pay more than that to the address, into the operator's sweep --
-        # ONE allowance for the deposit, across every such move (below).
-        # An extra with no value counts as more. WHAT THIS CANNOT SEE,
-        # stated (the review of this fix): the history names only the
-        # inputs whose funding it read, so an extra funded off the window
-        # -- a flood's doing -- is not in the spend at all, and a move of
-        # kept money beside it reads as the operator's hand whatever it
-        # took. KEEP_EXTRA_MAX bounds what that costs; nothing here can.
-        _extra_ins = _ins - _kept_ops
+        # that much beyond the kept money WITHOUT THE ALARM -- the chain
+        # says kept_moved_with_dust and no run fails foreign_spend -- as
+        # they can the kept money itself (below); and a stranger who wants
+        # the alarm must pay more than that to the address, into the
+        # operator's sweep. ONE allowance for the deposit, across every
+        # such move (below).
+        # An extra with no value counts as more.
+        # ...AND WHAT THE WINDOW DID NOT NAME IS ASKED ABOUT (the residual
+        # the review of this fix stated): the history names only the
+        # inputs whose funding it read, so an output of this address funded
+        # before the window -- a flood's doing -- was not in the spend at
+        # all, and a move of kept money beside it read as the operator's
+        # hand whatever it took. The spend's own bytes name every input
+        # (_spend_outpoints). One they name and the history does not is
+        # asked where it came from (bcast.input_sources: each funding
+        # transaction is checked to be its txid's). Paying this address, it
+        # is an extra like the others, worth what it pays. Paying another
+        # address, it is not this deposit's money -- the operator's wallet
+        # may move several addresses at once -- and it is recorded
+        # (`hand_inputs_elsewhere`) so no later run asks again. A kept,
+        # leftover or moved output of ours already, it is kept money and
+        # needs no asking. What cannot be answered -- no server, a refusal,
+        # more inputs than bcast.INPUT_SOURCE_MAX -- leaves the move
+        # UNDECIDED unless what is known already puts it over the line: the
+        # run fails, nothing is signed, and the next run asks again. That
+        # is not the seed-leak alarm, which is for a spend the evidence
+        # shows is not the operator's hand. Rests on the txid hash and the
+        # seed, not on a server's word: a server can refuse to answer, not
+        # make an input pay somewhere it does not.
         _hand = bool(_kept_ops and _ins and _ins & _kept_ops)
-        if _hand and _extra_ins:
+        _off, _else_new, _unknown = {}, set(), set()
+        if _hand:
+            _all = _spend_outpoints(s)
+            if _all is None:
+                # Bytes that do not parse, or are not the listed txid's,
+                # name nothing -- and a move nothing names is not shown to
+                # be the operator's.
+                _hand = False
+            else:
+                _unnamed = _all - _ins - _elsewhere
+                for _o in _unnamed & _kept_ops:
+                    _off[_o] = _vals.get(_o)
+                _ask = sorted(_unnamed - _kept_ops)
+                if _ask:
+                    try:
+                        _src = bcast_sources(
+                            s["hex"], address, servers, args.tor_proxy,
+                            network=args.network, timeout=args.timeout,
+                            skip=sorted(_all - set(_ask)))
+                    except watch.PinMismatch as e:
+                        raise Refused("pin_mismatch", str(e))
+                    except watch.BtcWatchError:
+                        _src = {}
+                    for _o in _ask:
+                        _sv = (_src or {}).get(_o)
+                        if _sv is False:
+                            _else_new.add(_o)
+                        elif isinstance(_sv, int) \
+                                and not isinstance(_sv, bool) and _sv >= 0:
+                            _off[_o] = _sv
+                        else:
+                            _unknown.add(_o)
+        # Everything this spend took from THIS address: what the history
+        # named, and what the bytes named and the chain said pays it.
+        _ins_all = _ins | set(_off)
+        _extra_ins = _ins_all - _kept_ops
+        if _hand and (_extra_ins or _unknown):
             _xval = {}
             for i in (s.get("inputs") or []):
                 if not isinstance(i, dict):
@@ -2846,11 +2923,27 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                     _xval[_o] = (_v if isinstance(_v, int)
                                  and not isinstance(_v, bool) and _v > 0
                                  else None)
-            _hand = (not _extra_ins & _signed_ops
-                     and None not in _xval.values()
-                     and _dust_used + sum(_xval.values())
-                     <= dust_line(int(args.feerate_ceiling)))
-            if _hand:
+            for _o in _extra_ins - set(_xval):
+                _v = _off.get(_o)
+                _xval[_o] = (_v if isinstance(_v, int)
+                             and not isinstance(_v, bool) and _v > 0
+                             else None)
+            _over = bool(_extra_ins & _signed_ops
+                         or None in _xval.values()
+                         or _dust_used + sum(_xval.values())
+                         > dust_line(int(args.feerate_ceiling)))
+            if _over:
+                _hand = False
+            elif _unknown:
+                integrity_log("forward", "hand_move_undecided")
+                print(f"[!] the kept outputs were moved by a spend this tool "
+                      f"did not sign (txid {s['txid']}), beside "
+                      f"{len(_unknown)} input(s) whose source could not be "
+                      "read. Nothing is signed; the next reconciliation "
+                      "asks again. A move of the kept outputs in a "
+                      "transaction of its own is decided at once.")
+                raise SystemExit(EXIT_FAILED)
+            elif _extra_ins:
                 integrity_log("forward", "kept_moved_with_dust")
         if _hand:
             # MONEY THE VAULT KEPT, MOVED BY HAND (the documented remedy
@@ -2864,16 +2957,20 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # matched is cleared below once nothing is left to keep.
             _seen_moved = _pair_list(plan.get("returned_moved"))
             _dirty = False
-            if not _ins <= set(_seen_moved):
+            # What the history named, and what the bytes named and the
+            # chain said pays this address, each with what it is worth.
+            _in_dicts = [i for i in (s.get("inputs") or [])
+                         if isinstance(i, dict)] + [
+                {"tx_hash": _o[0], "vout": _o[1], "value": _v}
+                for _o, _v in sorted(_off.items())]
+            if not _ins_all <= set(_seen_moved):
                 # What was recorded stays in its order; this move's inputs
                 # follow, the largest first (see the keep cap above).
                 plan["returned_moved"] = [list(o) for o in _pair_list(
                     _seen_moved
                     + [(i.get("tx_hash") or "", i.get("vout") or 0)
-                       for i in _largest_first(
-                           [i for i in (s.get("inputs") or [])
-                            if isinstance(i, dict)])])]
-                _note_values(plan, s.get("inputs"))
+                       for i in _largest_first(_in_dicts)])]
+                _note_values(plan, _in_dicts)
                 _dirty = True
             # ...AND THE DUST TAKEN BESIDE IT, against the one allowance.
             if _extra_ins:
@@ -2882,6 +2979,14 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                     + sorted(_extra_ins))]
                 _dust_used += sum(_xval.values())
                 _dirty = True
+            # ...AND WHAT IT TOOK FROM OTHER ADDRESSES, so no later run
+            # asks the network about the same inputs again.
+            if _else_new:
+                plan["hand_inputs_elsewhere"] = [list(o) for o in _pair_list(
+                    _pair_list(plan.get("hand_inputs_elsewhere"))
+                    + sorted(_else_new))]
+                _elsewhere |= _else_new
+                _dirty = True
             # ...AND TAKEN OFF THE MARK, whatever else this run does: a
             # bump the ceiling refuses leaves the current plan as it is,
             # and a mark that still named outputs `returned_moved` said
@@ -2889,9 +2994,10 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # over the fix). What is left stays marked, recounted; nothing
             # left, no mark.
             _rk = plan.get("returned_kept")
-            if isinstance(_rk, dict) and _pairs(_rk.get("outpoints")) & _ins:
+            if isinstance(_rk, dict) \
+                    and _pairs(_rk.get("outpoints")) & _ins_all:
                 _left = [o for o in _pair_list(_rk.get("outpoints"))
-                         if o not in _ins]
+                         if o not in _ins_all]
                 if _left:
                     _val = {(str(u["tx_hash"]).lower(), int(u["vout"])):
                             int(u["value"]) for u in picture["utxos"]}
@@ -2904,7 +3010,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                 _dirty = True
             if _dirty:
                 write_plan(args.outfile, plan)
-            _moved_ins |= _ins
+            _moved_ins |= _ins_all
             integrity_log("forward", "kept_moved")
             print(f"  reconcile: the kept outputs were moved by a spend "
                   f"this tool did not sign (txid {s['txid']}): the "

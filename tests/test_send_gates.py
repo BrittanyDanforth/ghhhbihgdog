@@ -529,6 +529,26 @@ class _PastGuard(Exception):
     pass
 
 
+class _StoreRPC:
+    """The wallet, as far as main() asks it anything before the swap: it
+    STORES (GhostSpiral.persist_minted, after the entry set is minted) and
+    answers nothing else. Every other request errors -- what the bare
+    object() this replaces did, and what reject_self_exit reads as a foreign
+    address."""
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.stores = 0
+
+    def raw_request(self, method, params=None):
+        if method == "store":
+            self.stores += 1
+            if not self.ok:
+                raise RuntimeError("Failed to save wallet")
+            return {}
+        raise RuntimeError(f"not modelled here: {method}")
+
+
 def _drive_main(exit_to, receive=False):
     """Run the REAL main() to the swap. Returns ('past', None) if the guard
     allowed the run through, or ('abort', msg) if it stopped it."""
@@ -548,7 +568,8 @@ def _drive_main(exit_to, receive=False):
         ghost.check_daemon_relay_egress = lambda *a, **k: {
             "verdict": "tor", "onion": 4, "clear": 0, "detail": "ok"}
         ghost.connect_rpc = lambda *a, **k: object()
-        ghost.stage0_preflight = lambda *a, **k: (object(), object(), D("0.001"))
+        ghost.stage0_preflight = lambda *a, **k: (_StoreRPC(), object(),
+                                                  D("0.001"))
         ghost.stage1_joinmarket = lambda *a, **k: []
         ghost.resolve_mix_account = lambda *a, **k: None
         ghost.create_subs = lambda *a, **k: (list(subs_fixture),
@@ -744,9 +765,13 @@ class _SplitStop(Exception):
     """Raised from the quote poster once every chunk has been quoted."""
 
 
-def _drive_split(n_chunks, wallets=6):
-    """Run the REAL main() to the swap quotes. Returns the posted payloads."""
+def _drive_split(n_chunks, wallets=6, store_ok=True):
+    """Run the REAL main() to the swap quotes. Returns the posted payloads.
+    What the wallet had stored when each quote went out is left in
+    _drive_split.stores_at_post."""
     posted = []
+    _wallet = _StoreRPC(store_ok)
+    _drive_split.stores_at_post = []
     subs_fixture = [_addr(2000 + i) for i in range(wallets + 4)]
     idx_fixture = {a: (30 + i, 1) for i, a in enumerate(subs_fixture)}
     entry_fixture = [(_addr(3000 + i), 60 + i, 1) for i in range(n_chunks)]
@@ -765,7 +790,8 @@ def _drive_split(n_chunks, wallets=6):
         ghost.check_daemon_relay_egress = lambda *a, **k: {
             "verdict": "tor", "onion": 4, "clear": 0, "detail": "ok"}
         ghost.connect_rpc = lambda *a, **k: object()
-        ghost.stage0_preflight = lambda *a, **k: (object(), object(), D("0.001"))
+        ghost.stage0_preflight = lambda *a, **k: (_wallet, object(),
+                                                  D("0.001"))
         ghost.stage1_joinmarket = lambda *a, **k: []
         ghost.resolve_mix_account = lambda *a, **k: None
         ghost.create_subs = lambda *a, **k: (list(subs_fixture),
@@ -787,6 +813,7 @@ def _drive_split(n_chunks, wallets=6):
         ghost.run_lock = _nolock
 
         def _post(url, payload, proxy):
+            _drive_split.stores_at_post.append(_wallet.stores)
             posted.append(dict(payload))
             if len(posted) >= n_chunks:
                 # Everything this test is about has happened by now; stop
@@ -844,6 +871,20 @@ check("e2e: ...and NO two chunks carry the same BTC amount, so the deposits "
       len({p["sellAmount"] for p in _posted}) == 3)
 check("e2e: ...while still summing to exactly what was asked for",
       sum((D(p["sellAmount"]) for p in _posted), D(0)) == D("0.6"))
+# THE ENTRY SET IS ON DISK BEFORE A QUOTE NAMES IT. A quote request is the
+# first time an entry address leaves this machine. A wallet that forgot the
+# entry after a power cut mints it again for the next run, and two swaps then
+# pay one address (see GhostSpiral.persist_minted).
+check("e2e: the wallet had STORED the entry set before the first quote went "
+      f"out ({_drive_split.stores_at_post[:1]})",
+      bool(_drive_split.stores_at_post)
+      and _drive_split.stores_at_post[0] >= 1)
+_posted_ns, _err_ns = _drive_split(3, store_ok=False)
+check("e2e: a wallet that will NOT store stops the run before any quote is "
+      "posted", _posted_ns == [] and _err_ns is not None
+      and "would not write" in _err_ns)
+check("e2e: ...saying nothing was published or spent",
+      _err_ns is not None and "Nothing has been published" in _err_ns)
 
 # MANUAL MODE MUST LIST EVERY ENTRY ADDRESS. It prints a thor_swap_preparer
 # command for the operator to run by hand; printing only the first --dests
@@ -869,7 +910,8 @@ def _drive_manual(n_chunks, wallets=6):
         ghost.check_daemon_relay_egress = lambda *a, **k: {
             "verdict": "tor", "onion": 4, "clear": 0, "detail": "ok"}
         ghost.connect_rpc = lambda *a, **k: object()
-        ghost.stage0_preflight = lambda *a, **k: (object(), object(), D("0.001"))
+        ghost.stage0_preflight = lambda *a, **k: (_StoreRPC(), object(),
+                                                  D("0.001"))
         ghost.stage1_joinmarket = lambda *a, **k: []
         ghost.resolve_mix_account = lambda *a, **k: None
         ghost.create_subs = lambda *a, **k: (list(subs_fixture),

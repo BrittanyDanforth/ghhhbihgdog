@@ -3744,6 +3744,66 @@ def create_fresh_account(rpc, label: str = "") -> int:
     return idx
 
 
+def store_wallet(rpc, tries: int = 3, pause: float = 2.0) -> None:
+    """Have wallet-rpc write its wallet file NOW. Raises RuntimeError.
+
+    A NEW ACCOUNT LIVES IN MEMORY UNTIL THE WALLET STORES. Read in monero's
+    v0.18 source rather than assumed: create_account is
+    wallet2::add_subaddress_account, which grows the in-memory account list
+    and writes nothing. wallet_rpc_server calls wallet2::store() on a `store`
+    request, on stop_wallet, on open/close/create (storing the wallet it is
+    leaving) and when the process shuts down in an orderly way -- and at no
+    other time. A power cut before one of those leaves a file that never had
+    the account. The wallet then lists the accounts it had before, and its
+    next create_account hands out the same index again.
+
+    When nothing was ever paid to that account the reissue costs nothing.
+    When a run has already moved money onto it, the same account goes to
+    whatever mints next. On the vault that is the next owner, recorded as
+    theirs, with the first owner's money on it. A refresh derives the
+    account again only once it has scanned an output paid to it (the
+    subaddress lookahead), which is after the fact and not bounded by
+    anything this toolchain controls.
+
+    So a caller stores after its last mint and before anything is paid to
+    what it minted. wallet2::store writes a `.new` file and renames it over
+    the old one, so a cut during the store leaves one file or the other,
+    never half of each.
+
+    ...AND THEN THE KERNEL IS ASKED TO PUT IT ON THE DEVICE. wallet2 does
+    not fsync what it writes, so a store that has answered can still be in
+    the page cache, and a cut in the next few seconds loses it just as
+    surely as no store at all. os.sync() on Linux returns once every
+    filesystem on THIS machine has been written out. On the vault that is
+    where the wallet file is: the keyfile's --rpc is "this machine's
+    wallet-rpc", and the ledger that records whose accounts these are is
+    written tmp -> fsync -> rename (atomic_write_json), so after this the
+    two survive a cut together. NOT COVERED, stated: a wallet-rpc on another
+    machine (GhostSpiral run by hand against one over --tor-proxy) stores on
+    that machine, which this flush does not reach. There, what reaches the
+    disk after a store is up to that machine.
+
+    Asked `tries` times, `pause` seconds apart: a wallet-rpc busy with a
+    refresh can time out once and answer the next time. The request has no
+    result fields to check, so a call that does not raise is the only answer
+    there is.
+    """
+    _last = None
+    _n = max(1, int(tries))
+    for _i in range(_n):
+        try:
+            rpc.raw_request("store", {})
+        except Exception as e:                               # noqa: BLE001
+            _last = e
+            if _i + 1 < _n:
+                time.sleep(pause)
+            continue
+        os.sync()
+        return
+    raise RuntimeError(f"store failed ({type(_last).__name__}: "
+                       f"{str(_last)[:60]})")
+
+
 def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     """Connect to monero-wallet-rpc extracting host and port from URL.
 

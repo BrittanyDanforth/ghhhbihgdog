@@ -147,6 +147,16 @@ def new_env(job="receive_and_quote", params=None):
     return d, kf, key, bell
 
 
+def _fs_wallet_answer(url, address):
+    """A correctly paired vault's wallets, as get_address_index answers them:
+    the fee wallet-rpc owns the fee address, and every other wallet answers
+    it with an error, as monero-wallet-rpc does for a foreign address. The
+    fee sweep asks this before it reads a balance (fee_wallet_mismatch)."""
+    if url == _FS_KEY["fee_rpc"] and address == _FS_ADDR:
+        return {"major": 0, "minor": 1}
+    raise RuntimeError("Address doesn't belong to the wallet")
+
+
 def deps_for(d, bell, **over):
     posted = []
     ran = []
@@ -181,7 +191,8 @@ def deps_for(d, bell, **over):
                 tor_bootstrapped=lambda u: True, wipe_covers=lambda p: True,
                 # The fee sweep arms a backstop before it spends, like a
                 # withdrawal; a scratch vault has no systemd to arm one on.
-                extend_deadman=lambda s: True)
+                extend_deadman=lambda s: True,
+                address_index=_fs_wallet_answer)
     base.update(over)
     base["_posted"] = posted
     base["_ran"] = ran
@@ -4389,13 +4400,16 @@ try:
     _fee_snap_dir = Path(tempfile.mkdtemp(prefix="feesnap_"))
     _fee_snap = []
 
+    _fs_entry_reads = []
+
     def _sweep(entries, floor="0.0270", dry_run=False, key=None,
-               clock_step=0, rc=0, deadman=True):
+               clock_step=0, rc=0, deadman=True, wallets=None):
         ran = []
         seq = list(entries)
         tick = [0]
 
         def _entry():
+            _fs_entry_reads.append(1)
             v = seq.pop(0) if seq else None
             return (0, 3, _FS_ADDR, v) if v else None
 
@@ -4418,7 +4432,8 @@ try:
             return (rc, False)
         deps = {"fee_entry": _entry, "live_floor": lambda k, w: floor,
                 "clock": _clock, "extend_deadman": _arm,
-                "run_child": _rc}
+                "run_child": _rc,
+                "address_index": wallets or _fs_wallet_answer}
         with contextlib.redirect_stdout(io.StringIO()) as _o:
             code = A.run_fee_sweep(key or _FS_KEY, _sw_dir, deps, dry_run)
         return code, ran, _o.getvalue()
@@ -4551,6 +4566,112 @@ try:
           in _AGENT_SRC
           and 'rpc = connect_rpc(rpc_url or key["rpc_primary"],' in _AGENT_SRC)
 
+    # THE FEE WALLET HAS TO BE THE FEE WALLET (fee_wallet_mismatch). Pairing
+    # refused a fee wallet that was the mixing wallet, once; the entry above
+    # takes the largest output on whatever wallet answers the fee port, as
+    # the host's. A fee wallet-rpc restarted on the mixing wallet swept a
+    # client's deposit to the operator, as an ordinary sweep.
+    def _wallets(owners):
+        """get_address_index as the wallets answer it: the URLs in `owners`
+        own the fee address, every other one errors."""
+        def _ask(url, address):
+            if url in owners and address == _FS_ADDR:
+                return {"major": 0, "minor": 1}
+            raise RuntimeError("Address doesn't belong to the wallet")
+        return _ask
+
+    _MIX_EP = _FS_KEY["rpc_primary"]
+    _FEE_EP = _FS_KEY["fee_rpc"]
+    check("sweep/wallet: a correctly paired vault -- the fee wallet-rpc owns "
+          "the fee address, the mixing wallet does not -- is not refused",
+          A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets({_FEE_EP})) == "")
+    _fs_entry_reads.clear()
+    _cwu, _rwu, _owu = _sweep([int(0.6 * _XMR)], wallets=_wallets(set()))
+    check("sweep/wallet: a fee wallet-rpc that does not answer for the fee "
+          "address -- serving the mixing wallet, a copy of it, any other -- "
+          "sweeps NOTHING and reads no balance",
+          _cwu == "wallet_unverified" and _rwu == [] and not _fs_entry_reads)
+    check("...and says nothing was read or spent, and what to look at",
+          "Nothing was read or spent" in _owu
+          and "which wallet each wallet-rpc" in _owu)
+    _fs_entry_reads.clear()
+    _cwm, _rwm, _owm = _sweep([int(0.6 * _XMR)],
+                              wallets=_wallets({_FEE_EP, _MIX_EP}))
+    check("sweep/wallet: a fee address the MIXING wallet also owns -- the "
+          "two are one wallet -- is refused by that name, before any balance "
+          "is read",
+          _cwm == "wallet_is_mixing" and _rwm == [] and not _fs_entry_reads
+          and "MIXING wallet" in _owm)
+    _k_alias = dict(_FS_KEY, fee_rpc=_MIX_EP.replace("127.0.0.1", "localhost"))
+    check("sweep/wallet: the mixing wallet-rpc under another loopback name is "
+          "the mixing wallet-rpc, whatever the wallets answer",
+          A.fee_wallet_mismatch(_k_alias, A.fee_sweep_config(_k_alias),
+                                _wallets({_k_alias["fee_rpc"]}))
+          == "wallet_is_mixing")
+    _wf_dir = Path(tempfile.mkdtemp(prefix="feewf_"))
+    (_wf_dir / "mix").write_text("")
+    os.symlink(_wf_dir / "mix", _wf_dir / "alias")
+    _k_wf = dict(_FS_KEY, wallet_file=str(_wf_dir / "mix"),
+                 fee_wallet_file=str(_wf_dir / "alias"))
+    check("sweep/wallet: a fee wallet FILE that is the mixing wallet's, "
+          "through a symlink, is refused even when the fee wallet-rpc "
+          "answers -- the file is what the sweep signs with",
+          A.fee_wallet_mismatch(_k_wf, A.fee_sweep_config(_k_wf),
+                                _wallets({_FEE_EP})) == "wallet_is_mixing")
+    check("sweep/wallet: ...and a different file is not",
+          A.fee_wallet_mismatch(dict(_FS_KEY, wallet_file=str(_wf_dir / "mix")),
+                                _cfg, _wallets({_FEE_EP})) == "")
+    check("sweep/wallet: an index that is a bool is no answer (True == 1)",
+          A.fee_wallet_mismatch(_FS_KEY, _cfg,
+                                lambda u, a: {"major": True, "minor": 1})
+          == "wallet_unverified")
+
+    def _down(url, address):
+        raise ConnectionError("connection refused")
+    check("sweep/wallet: a fee wallet-rpc that cannot be reached is not "
+          "shown to be the fee wallet, and nothing is swept",
+          A.fee_wallet_mismatch(_FS_KEY, _cfg, _down) == "wallet_unverified")
+    # THE REAL PATH, not injected: two wallet-rpc URLs nothing listens on.
+    # Both answer with an error, so the fee wallet is unverified -- and the
+    # probe neither crashes nor exits.
+    import socket as _sock_fs
+    _s_fs = _sock_fs.socket()
+    _s_fs.bind(("127.0.0.1", 0))
+    _free = _s_fs.getsockname()[1]
+    _s_fs.close()
+    _k_real = dict(_FS_KEY, rpc_primary=f"http://127.0.0.1:{_free}",
+                   fee_rpc=f"http://127.0.0.1:{_free + 1 if _free < 65535 else _free - 1}")
+    try:
+        _real_mis = A.fee_wallet_mismatch(_k_real, A.fee_sweep_config(_k_real))
+    except BaseException as e:                               # noqa: BLE001
+        _real_mis = f"raised {type(e).__name__}"
+    check(f"sweep/wallet: the uninjected probe against wallets that do not "
+          f"answer says unverified ({_real_mis})",
+          _real_mis == "wallet_unverified")
+    # connect_rpc EXITS on a URL it will not speak to (https://, for one):
+    # the probe is a question, and a wallet it cannot reach has not answered.
+    _k_https = dict(_k_real, fee_rpc=_k_real["fee_rpc"].replace("http://",
+                                                                "https://"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            _https_mis = A.fee_wallet_mismatch(_k_https,
+                                               A.fee_sweep_config(_k_https))
+    except BaseException as e:                               # noqa: BLE001
+        _https_mis = f"raised {type(e).__name__}"
+    check(f"sweep/wallet: a fee wallet-rpc URL connect_rpc refuses to speak "
+          f"to is unverified, not an exit out of the agent ({_https_mis})",
+          _https_mis == "wallet_unverified")
+    _fs_log.clear()
+    A.integrity_log = lambda st, kind, *a, **k: _fs_log.append(kind)
+    try:
+        _sweep([int(0.6 * _XMR)], wallets=_wallets(set()))
+    finally:
+        A.integrity_log = _saved_il_fs
+    check("sweep/wallet: the chain says which, and that no sweep started",
+          "fee_sweep:wallet_unverified" in _fs_log
+          and "fee_sweep:start" not in _fs_log)
+
     # THE IDLE-BOOT HOOK: a boot with no job runs the sweep only when asked.
     def _one_shot_entry():
         _left = [1]
@@ -4562,7 +4683,7 @@ try:
             return None
         return _e
 
-    def _idle_boot(on_idle, unreachable=False, dry_run=False):
+    def _idle_boot(on_idle, unreachable=False, dry_run=False, wallets=None):
         d, kf, key, bell = new_env()
         key2 = dict(key, **_FS_KEY, fee_sweep_on_idle_boot=on_idle)
         key2["artifact_dir"] = str(d)
@@ -4578,7 +4699,8 @@ try:
                         fee_entry=_one_shot_entry(),
                         live_floor=lambda k, w: "0.0270",
                         run_child=lambda argv, env, budget: (
-                            ran.append(list(argv)), (0, False))[1])
+                            ran.append(list(argv)), (0, False))[1],
+                        address_index=wallets or _fs_wallet_answer)
         out, err, text = run(kf, deps, dry_run=dry_run)
         return err, ran, slept
 
@@ -4593,6 +4715,10 @@ try:
     check("sweep/idle: without it -- the default -- a no-job boot is boot, "
           "sit, shut down, and nothing spends",
           _e_off is not None and _e_off.code == "no_job" and _r_off == [])
+    _e_mix, _r_mix, _ = _idle_boot(True, wallets=_wallets(set()))
+    check("sweep/idle: an idle boot whose fee wallet-rpc is serving another "
+          "wallet runs NO sweep, and the boot still ends as 'no job'",
+          _e_mix is not None and _e_mix.code == "no_job" and _r_mix == [])
     check("sweep/idle: the sweep runs AFTER the no-job dwell, so a stranger's "
           "packet sees the same shape either way",
           _AGENT_SRC.index("_sleep(_rng.randint(NO_JOB_DWELL_LO_S")
@@ -11265,7 +11391,7 @@ try:
                                   if _fs_seq and _fs_seq[0] else None),
             "live_floor": lambda k, w: "0.0270",
             "clock": lambda: 0.0, "extend_deadman": lambda s: True,
-            "run_child": _fs_run})
+            "run_child": _fs_run, "address_index": _fs_wallet_answer})
     _fs_r = None
 except A.Stopping as e:
     _fs_r = e

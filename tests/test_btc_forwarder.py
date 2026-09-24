@@ -142,8 +142,15 @@ class Net:
                  look_error=None, post_error=None, routes=None,
                  factor=Decimal(1), submit=None, seen=None, clock=None,
                  spends=None, funding=None, truncated=None, pools=None,
-                 lastblock=None):
+                 lastblock=None, sources=None):
         self.factor = factor                     # quote vs oracle, x
+        # WHERE A HAND MOVE'S UNNAMED INPUTS CAME FROM (bcast.input_sources):
+        # a dict {(txid, vout): value | False | None}, or an exception to
+        # raise. None -- the default -- raises "not modelled": a fixture
+        # whose bytes spend something its listing does not name reaches
+        # the network in no test by accident. Every call recorded.
+        self.sources_result = sources
+        self.source_calls = []
         # THORCHAIN'S POOLS, as the THORNode reports them (the stage 2
         # read: the price a sending forward is measured against when the
         # oracle is out of reach). The default agrees with _ORACLE; a dict
@@ -279,10 +286,20 @@ class Net:
             return list(r or []), list(self.funding_result or [])
         return list(r or [])
 
+    def _sources(self, raw_hex, address, servers, proxy_url, **kw):
+        self.source_calls.append({"hex": raw_hex, "address": address, **kw})
+        r = self.sources_result
+        if r is None:
+            raise F.watch.BtcWatchError("input_sources: not modelled here")
+        if isinstance(r, BaseException):
+            raise r
+        return dict(r)
+
     def install(self):
         F.look = self.look
         F.safe_post = self.safe_post
         F.safe_get = self.safe_get
+        F.bcast_sources = self._sources
         F.bcast_submit = (_REAL_SUBMIT if self.submit_result == "real"
                           else self._submit)
         F.bcast_seen = (_REAL_SEEN if self.seen_result == "real"
@@ -1574,6 +1591,22 @@ def _spend_tx(memo_text=None, send=190000):
 
 
 _OURS = _spend_tx("=:XMR.XMR:" + _DEST + ":123456/1/0")
+
+
+def _move_tx(inputs, send=120000):
+    """A spend whose BYTES spend exactly `inputs` [{tx_hash, vout, value}],
+    listed with those inputs -- what the history reader produces. The hand
+    moves below used to be _spend_tx's bytes (which spend _H1:0, the first
+    deposit's output a forward of ours had already spent) listed as
+    spending the kept output: two spends of one outpoint, and a listing
+    that named inputs its own transaction did not spend. The reconcile now
+    reads a hand move's inputs from its bytes, so the fixture has to be one
+    that can exist."""
+    tx = T.build_unsigned([dict(i) for i in inputs], [(send, _IN_SPK)],
+                          locktime=_TIP)
+    return {"txid": tx.txid().hex(), "height": 850001,
+            "hex": tx.serialize().hex(),
+            "inputs": [dict(i) for i in inputs], "server": "s.onion"}
 
 
 def _new_of():
@@ -3961,9 +3994,7 @@ _c, _o, _p, _ = _reconcile(_nM1, _ofM)
 check("(setup) the third return is kept, and the mark names its outpoints",
       _c == F.EXIT_OK
       and (_p.get("returned_kept") or {}).get("outpoints") == [[_HK3, 0]])
-_moved = {**_spend_tx(None, send=120000), "inputs": [{"tx_hash": _HK3,
-                                                       "vout": 0,
-                                                       "value": 130000}]}
+_moved = _move_tx([{"tx_hash": _HK3, "vout": 0, "value": 130000}])
 _nM2 = Net(utxos=[], spends=_lM + [_lM3, _moved], fee=10)
 _c, _o, _p, _ = _reconcile(_nM2, _ofM)
 check("a later spend of EXACTLY the kept outputs by a transaction this tool "
@@ -4035,9 +4066,8 @@ for _rmax in ((), ("--returns-max", "5")):
     check(f"...and the run after ({_bound}), K mined and the look caught "
           "up: the operator's hand still, no seed-leak alarm",
           _c == F.EXIT_OK and ("forward", "foreign_spend") not in _nS2.kinds)
-_moved2 = {**_spend_tx(None, send=120000),
-           "inputs": [{"tx_hash": _HK3, "vout": 0, "value": 130000},
-                      {"tx_hash": _H2, "vout": 1, "value": 140000}]}
+_moved2 = _move_tx([{"tx_hash": _HK3, "vout": 0, "value": 130000},
+                    {"tx_hash": _H2, "vout": 1, "value": 140000}])
 _nM3 = Net(utxos=[], spends=_lM + [_moved2], fee=10)
 _c, _o, _p, _ = _reconcile(_nM3, _ofM)
 check("...a spend that takes MORE than the kept outputs is still the alarm",
@@ -4103,8 +4133,7 @@ check("re-paired with a HIGHER bound, the bump CARRIES the kept output and "
       _c == F.EXIT_OK and _p["reconcile_reason"] == "bumped"
       and any((i["tx_hash"], i["vout"]) == (_HK3, 0) for i in _p["inputs"])
       and not any(isinstance(q.get("returned_kept"), dict) for q in _chainB2))
-_rbf = {**_spend_tx(None, send=120000),
-        "inputs": [{"tx_hash": _HK3, "vout": 0, "value": 130000}]}
+_rbf = _move_tx([{"tx_hash": _HK3, "vout": 0, "value": 130000}])
 _nB23 = Net(utxos=[], spends=_lB2 + [_lB23u, _rbf], fee=30)
 _c, _o, _p, _ = _reconcile(_nB23, _ofB2, "--returns-max", "3")
 check("...so a spend of exactly that output by a transaction this tool did "
@@ -5118,6 +5147,144 @@ _cT6, _, _, _ = _reconcile(_nT6, _ofT4, "--returns-max", "0")
 check("NON-VACUITY: the first move alone, read again on a later run, is "
       "still the operator's hand (its dust is not counted twice)",
       _cT6 == F.EXIT_OK and ("forward", "foreign_spend") not in _nT6.kinds)
+# WHAT THE HISTORY'S WINDOW DID NOT NAME IS ASKED ABOUT (the residual the
+# review of 657deae stated): the history names only the inputs whose funding
+# it read, so an output of this address funded before the window -- a
+# flood's doing -- was not in the spend at all, and a move of kept money
+# beside it read as the operator's hand WHATEVER IT TOOK. The spend's own
+# bytes name every input; one they name and the history does not is asked
+# where it came from (bcast.input_sources, each funding transaction checked
+# against its txid).
+_HOW = "8a" * 32          # an output of THIS address, funded off the window
+_HEL = "9a" * 32          # an output of another address, in the same move
+_HUK = "ab" * 31 + "cd"   # an input nobody could answer for
+
+
+def _kept_one():
+    """A first send, then 150,000 sat come back and are KEPT."""
+    _pk, _ofk, _hxk = _first_send()
+    _reconcile(Net(utxos=[{"tx_hash": _HKx, "vout": 0, "value": 150000,
+                           "confirmations": 3}],
+                   spends=[_listed(_pk, _hxk)]), _ofk, "--returns-max", "0")
+    return _pk, _ofk, _hxk
+
+
+def _offwin(hidden, sources, named_extra=(), runs=1, hex_of=None,
+            utxos=(), rargs=("--returns-max", "0")):
+    """Kept money moved beside `hidden` inputs [(txid, value)] that the
+    spend's BYTES spend and its listing does not name (the window missed
+    them), and `named_extra` ones it does. `sources` is what the lookup
+    answers. `utxos` is what the look lists (a look that has not seen
+    the move), `rargs` the run's arguments. One entry per run: (code,
+    kinds, lookup calls, plan, net)."""
+    _pk, _ofk, _hxk = _kept_one()
+    _named = [{"tx_hash": _HKx, "vout": 0, "value": 150000}] + [
+        {"tx_hash": t, "vout": 0, "value": v} for t, v in named_extra]
+    _all = _named + [{"tx_hash": t, "vout": 0, "value": v or 1}
+                     for t, v in hidden]
+    _tx = T.build_unsigned(_all, [(140000, _IN_SPK)], locktime=850010)
+    _sw = {"txid": _tx.txid().hex(), "height": 850011,
+           "hex": hex_of if hex_of is not None else _tx.serialize().hex(),
+           "inputs": _named, "server": "s.onion"}
+    out = []
+    for _ in range(runs):
+        _n = Net(utxos=[dict(u) for u in utxos],
+                 spends=[_listed(_pk, _hxk), _sw], fee=10,
+                 submit=_ACCEPTED, seen=_SEEN0, sources=sources)
+        _c, _o, _p, _ = _reconcile(_n, _ofk, *rargs)
+        out.append((_c, [k for _s, k in _n.kinds], _n.source_calls,
+                    json.load(open(_ofk)), _n))
+    return out
+
+
+_ow = _offwin([(_HOW, 90000)], {(_HOW, 0): 90000})
+check("kept money moved beside 90,000 sat of THIS address that the history's "
+      "window did not name: the alarm (foreign_spend, FAILED) -- it read as "
+      "the operator's hand whatever the move took",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+      and "kept_moved" not in _ow[0][1])
+check("...having asked about that input alone, of the deposit's own "
+      "address, with what the history named left out",
+      len(_ow[0][2]) == 1 and (_HKx, 0) in set(map(tuple,
+                                                   _ow[0][2][0]["skip"]))
+      and (_HOW, 0) not in set(map(tuple, _ow[0][2][0]["skip"])))
+_ow = _offwin([(_HOW, 300)], {(_HOW, 0): 300}, runs=2)
+_pw = _ow[0][3]
+check("...300 sat of it instead is dust beside kept money: the operator's "
+      "hand, said with_dust, the input recorded as moved and as dust, with "
+      "its value",
+      _ow[0][0] == F.EXIT_OK and "kept_moved_with_dust" in _ow[0][1]
+      and "foreign_spend" not in _ow[0][1]
+      and [_HOW, 0] in (_pw.get("returned_moved") or [])
+      and [_HOW, 0] in (_pw.get("returned_dust") or [])
+      and (_pw.get("outpoint_values") or {}).get(f"{_HOW}:0") == 300)
+check("...and the run after is the same hand, asks nothing, and does not "
+      "count the dust twice",
+      _ow[1][0] == F.EXIT_OK and "kept_moved" in _ow[1][1]
+      and "foreign_spend" not in _ow[1][1] and _ow[1][2] == [])
+_dlw = F.dust_line(200)
+_ow = _offwin([(_HOW, _dlw - 300)], {(_HOW, 0): _dlw - 300},
+              named_extra=[(_HKd2, 300)])
+_ow2 = _offwin([(_HOW, _dlw - 299)], {(_HOW, 0): _dlw - 299},
+               named_extra=[(_HKd2, 300)])
+check("...what the window missed and what it named count against ONE "
+      "allowance: exactly the line together is the hand, one satoshi over "
+      "is the alarm",
+      _ow[0][0] == F.EXIT_OK and "kept_moved_with_dust" in _ow[0][1]
+      and _ow2[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow2[0][1])
+_ow = _offwin([(_HEL, 50000)], {(_HEL, 0): False}, runs=2)
+check("an input of ANOTHER address beside the kept money (the operator's "
+      "wallet moving several at once) is not this deposit's money: the hand, "
+      "no dust, and recorded so no later run asks again",
+      _ow[0][0] == F.EXIT_OK and "kept_moved" in _ow[0][1]
+      and "kept_moved_with_dust" not in _ow[0][1]
+      and [_HEL, 0] in (_ow[0][3].get("hand_inputs_elsewhere") or [])
+      and [_HEL, 0] not in (_ow[0][3].get("returned_moved") or [])
+      and _ow[1][0] == F.EXIT_OK and _ow[1][2] == [])
+_ow = _offwin([(_HUK, 50000)], F.watch.BtcWatchError("no server answered"))
+check("an input nobody could answer for: the move is UNDECIDED -- the run "
+      "fails, nothing is recorded as moved, and it is NOT the seed-leak "
+      "alarm",
+      _ow[0][0] == F.EXIT_FAILED and "hand_move_undecided" in _ow[0][1]
+      and "foreign_spend" not in _ow[0][1] and "kept_moved" not in _ow[0][1]
+      and not _ow[0][3].get("returned_moved")
+      and [_HKx, 0] in ((_ow[0][3].get("returned_kept") or {})
+                        .get("outpoints") or []))
+_ow = _offwin([(_HUK, 50000)], {(_HUK, 0): None})
+check("...and the same for a server that answered for the others and not "
+      "this one", _ow[0][0] == F.EXIT_FAILED
+      and "hand_move_undecided" in _ow[0][1])
+_ow = _offwin([(_HOW, 90000), (_HUK, 1)], {(_HOW, 0): 90000,
+                                          (_HUK, 0): None})
+check("...but what IS known already over the line is the alarm, unknowns "
+      "or not", _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1]
+      and "hand_move_undecided" not in _ow[0][1])
+_ow = _offwin([], {}, hex_of=_moved["hex"])
+check("a listed move whose bytes are not its txid's names nothing, and a "
+      "move nothing names is not the operator's hand: the alarm",
+      _ow[0][0] == F.EXIT_FAILED and "foreign_spend" in _ow[0][1])
+_ow = _offwin([(_HOW, 300)], W.PinMismatch("tls: pin"))
+check("a pin mismatch while asking is the refusal the history read gives "
+      "(pin_mismatch), nothing recorded",
+      _ow[0][0] == 2 and "refused:pin_mismatch" in _ow[0][1]
+      and not _ow[0][3].get("returned_moved"))
+# ...AND WHAT IT TOOK IS GONE, whatever a look that has not seen the move
+# says: under a raised bound, 20,000 sat of this address that the window
+# missed -- accepted as dust beside the kept money -- and still listed
+# unspent by the look, is not signed over again.
+_ow = _offwin([(_HOW, 20000)], {(_HOW, 0): 20000},
+              utxos=[{"tx_hash": _HOW, "vout": 0, "value": 20000,
+                      "confirmations": 5}],
+              rargs=("--returns-max", "5"))
+check("a look that still lists the input the window missed, under a raised "
+      "bound: the operator's hand, and NOTHING signed over that input",
+      _ow[0][0] == F.EXIT_OK and "kept_moved" in _ow[0][1]
+      and _ow[0][4].submits == [] and _ow[0][4].posts == [])
+_ow = _offwin([], {})
+check("NON-VACUITY: a move whose bytes spend only what the history named "
+      "asks nothing and is the hand, as before",
+      _ow[0][0] == F.EXIT_OK and "kept_moved" in _ow[0][1]
+      and _ow[0][2] == [])
 # THE KEEP LIST RIDING ON THE HISTORY WINDOW IS BOUNDED (the review of the
 # leftover fix): a stranger's flood of separate payments, recorded as
 # leftover, put hundreds of txids on top of the window and jammed every

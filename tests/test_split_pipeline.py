@@ -110,6 +110,10 @@ class RPC:
             return {"account_index": RPC.acct}
         if m == "incoming_transfers":
             return {"transfers": [{"amount": 10**12, "spent": False}]}
+        if m == "store":
+            # GhostSpiral stores after each batch of mints (persist_minted);
+            # the real wallet-rpc answers an empty result.
+            return {}
         raise AssertionError("unexpected RPC: " + m)
     def get_subaddress_balance(self, account_index=0, address_index=0):
         v = BAL.get((int(account_index), int(address_index)), 0)

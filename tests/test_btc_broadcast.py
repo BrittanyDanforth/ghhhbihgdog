@@ -1002,6 +1002,91 @@ try:
 except W.PinMismatch:
     _pm = "raised"
 check("a PinMismatch is raised at once", _pm == "raised")
+
+# ===========================================================================
+print("\n== input_sources(): where a spend's inputs came from ==")
+# A spend of one of the address's outputs and one of ANOTHER address's, as
+# the operator's wallet may make when it moves kept money: its bytes name
+# both, and each previous transaction says whom it paid.
+_OTHERP = T.build_unsigned([{"tx_hash": "55" * 32, "vout": 0,
+                             "value": 70000}], [(60000, _OTHER_SPK)])
+_OTHERP_ID, _OTHERP_HEX = _OTHERP.txid().hex(), _OTHERP.serialize().hex()
+_MIXED = T.build_unsigned([{"tx_hash": _FUND_ID, "vout": 2, "value": 250000},
+                           {"tx_hash": _OTHERP_ID, "vout": 0, "value": 60000}],
+                          [(300000, _OTHER_SPK)])
+_MIXED_HEX = _MIXED.serialize().hex()
+_SRC_TXS = {_FUND_ID: _FUND_HEX, _OTHERP_ID: _OTHERP_HEX}
+
+
+def _sources(*fts, servers=None, **kw):
+    f = _factory(*fts)
+    r = B.input_sources(_MIXED_HEX, _A0, servers or _SERVERS[:len(fts)]
+                        or _SERVERS, _PROXY, transport_factory=f, **kw)
+    return r, f.seen, fts
+
+
+_rs, _ss, _fs = _sources(_FT(transactions=_SRC_TXS))
+check("each input answered from its own previous transaction: this "
+      "address's output is its value, another address's is False",
+      _rs == {(_FUND_ID, 2): 250000, (_OTHERP_ID, 0): False})
+check("...in ONE session on the address's broadcast circuit, one "
+      "transaction.get per previous transaction and no history read",
+      _fs[0].methods == ["server.version"]
+      + ["blockchain.transaction.get"] * 2
+      and _ss["tags"] == ["btcsend:" + _A0])
+_rs, _, _fs = _sources(_FT(transactions=_SRC_TXS), skip=[(_FUND_ID, 2)])
+check("what the caller already knows (`skip`) is not asked about",
+      _rs == {(_OTHERP_ID, 0): False}
+      and _fs[0].methods.count("blockchain.transaction.get") == 1)
+_rs, _, _ = _sources(_FT(transactions={_FUND_ID: _FUND_HEX}))
+check("a previous transaction the server does not have is None (unknown), "
+      "not a reason to guess", _rs == {(_FUND_ID, 2): 250000,
+                                        (_OTHERP_ID, 0): None})
+_rs, _ss, _ = _sources(_FT(transactions={_FUND_ID: _FUND_HEX,
+                                          _OTHERP_ID: _FUND_HEX}),
+                       _FT(transactions=_SRC_TXS), servers=_TWO)
+check("a server that hands back another transaction under the id asked for "
+      "is left, and the next one's session answers: the hash decides, not "
+      "the server",
+      _rs == {(_FUND_ID, 2): 250000, (_OTHERP_ID, 0): False}
+      and sorted(_ss["hosts"]) == ["s1.onion", "s2.onion"])
+check("...and when that server is the only one, nothing is answered for "
+      "it: RAISED",
+      _refused(B.input_sources, _MIXED_HEX, _A0, _SERVERS, _PROXY,
+               transport_factory=_factory(_FT(transactions={
+                   _FUND_ID: _FUND_HEX, _OTHERP_ID: _FUND_HEX}))))
+_rs, _, _fs = _sources(_FT(transactions=_SRC_TXS), limit=1)
+check("at most `limit` previous transactions are fetched; the rest are None",
+      _rs == {(_FUND_ID, 2): 250000, (_OTHERP_ID, 0): None}
+      and _fs[0].methods.count("blockchain.transaction.get") == 1
+      and B.INPUT_SOURCE_MAX >= 1)
+_BADV = T.build_unsigned([{"tx_hash": _FUND_ID, "vout": 7, "value": 1}],
+                         [(1, _OTHER_SPK)])
+_rb = B.input_sources(_BADV.serialize().hex(), _A0, _SERVERS, _PROXY,
+                      transport_factory=_factory(_FT(transactions=_SRC_TXS)))
+check("an input naming an output its previous transaction does not have is "
+      "None", _rb == {(_FUND_ID, 7): None})
+check("a spend whose bytes do not parse is refused",
+      _refused(B.input_sources, "zz", _A0, _SERVERS, _PROXY,
+               transport_factory=_never))
+check("no server answered: RAISED",
+      _refused(B.input_sources, _MIXED_HEX, _A0, _SERVERS, _PROXY,
+               transport_factory=_factory(_FT("down"))))
+_rs, _ss, _ = _sources(_FT(transactions={**_SRC_TXS,
+                                         _OTHERP_ID: OSError("cut")}),
+                       _FT(transactions=_SRC_TXS), servers=_TWO)
+check("a server that hangs up mid-session is routed around, and the next "
+      "one's session answers all of it",
+      _rs == {(_FUND_ID, 2): 250000, (_OTHERP_ID, 0): False}
+      and sorted(_ss["hosts"]) == ["s1.onion", "s2.onion"])
+try:
+    B.input_sources(_MIXED_HEX, _A0, _TWO, _PROXY,
+                    transport_factory=_factory(_FT(pin_mismatch=True),
+                                               _FT(transactions=_SRC_TXS)))
+    _pm2 = "returned"
+except W.PinMismatch:
+    _pm2 = "raised"
+check("a PinMismatch is raised at once", _pm2 == "raised")
 _bt = B.Broadcaster(_FT(transactions={_FUND_ID: "zz", _SPEND1_ID: _FUND_HEX}))
 _bt.__enter__()
 check("Broadcaster.transaction refuses a bad id, non-hex, and a transaction "

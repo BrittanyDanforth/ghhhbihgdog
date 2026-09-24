@@ -1805,6 +1805,60 @@ for _resp, _why in [
         _refused = True
     check(f"mix account: REFUSES {_why}", _refused)
 
+# gs_common.store_wallet: a new account is in wallet-rpc's memory until it
+# stores, and wallet2 does not fsync what it stores. So the helper stores,
+# then has the kernel write the filesystems out -- and only after a store that
+# answered, since flushing after a failed one would claim nothing.
+_sw_log = []
+
+
+class _StoreRPC:
+    def __init__(self, fail_first=0):
+        self.fail_first = fail_first
+
+    def raw_request(self, m, p=None):
+        _sw_log.append(m)
+        if m != "store":
+            raise AssertionError("unexpected: " + m)
+        if self.fail_first > 0:
+            self.fail_first -= 1
+            raise RuntimeError("Failed to save wallet")
+        return {}
+
+
+def _sw(rpc, **k):
+    """store_wallet's error text, or None if it returned. Never raises: a
+    mutation that makes it raise where it should not must be a red check,
+    not a suite that dies before its RESULT line."""
+    _sw_log.clear()
+    try:
+        gs.store_wallet(rpc, pause=0, **k)
+    except Exception as e:                                   # noqa: BLE001
+        return str(e) or type(e).__name__
+    return None
+
+
+_real_sync = os.sync
+os.sync = lambda: _sw_log.append("sync")
+try:
+    _sw_err = _sw(_StoreRPC())
+    check("store_wallet: stores, THEN flushes to the device",
+          _sw_err is None and _sw_log == ["store", "sync"])
+    _sw_err = _sw(_StoreRPC(fail_first=2))
+    check("store_wallet: a wallet that answers the third time is stored, and "
+          "flushed once, after the store that answered",
+          _sw_err is None and _sw_log == ["store", "store", "store", "sync"])
+    _sw_err = _sw(_StoreRPC(fail_first=99))
+    check("store_wallet: a wallet that never stores RAISES after three tries",
+          _sw_err is not None and _sw_log == ["store", "store", "store"])
+    check("...naming the failure, not flushing as if it had worked",
+          _sw_err is not None and "store failed" in _sw_err
+          and "sync" not in _sw_log)
+    _sw(_StoreRPC(fail_first=99), tries=1)
+    check("store_wallet: tries=1 asks once", _sw_log == ["store"])
+finally:
+    os.sync = _real_sync
+
 # ...and both callers must go through it rather than keeping a private copy.
 # Source-text checks go through code_only(), which blanks comments and
 # docstrings. Six checks in this suite have gone red because they matched a

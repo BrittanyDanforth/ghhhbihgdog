@@ -61,7 +61,7 @@ from gs_common import (
     swap_arrival_floor,
     progress_line,
     isolated_proxy,
-    create_fresh_account, run_lock, rpc_lock_scope,
+    create_fresh_account, store_wallet, run_lock, rpc_lock_scope,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     MAX_SPLIT, fmt_btc, SATOSHI_BTC,
     validate_xmr_address, accept_floor,
@@ -8814,6 +8814,47 @@ def resolve_swap_deposits(args, proxy, jm_utxos, receive_mode, entry_addr,
     return swap_deposits
 
 
+def persist_minted(rpc_primary, stage: str, nothing_yet: str) -> None:
+    """Write the accounts this run has minted to the wallet file, or stop.
+
+    Called twice from main(). The first call comes after the mix accounts and
+    the entry are minted, before the swap's deposit instructions exist. The
+    second comes after the last mint (the change-sweep accounts), before
+    stage 5 relays anything. Nothing in a run used to ask the wallet to
+    store, and wallet-rpc does not store on its own (gs_common.store_wallet
+    says when it does). A power cut during the hours of relays left a
+    wallet file without the accounts the run had paid money into. That
+    wallet lists the accounts it had before, and hands the same indices out
+    to the next thing that mints. On the vault, the ledger then recorded
+    them as the NEXT owner's, with the first owner's money on them. The
+    agent's recovery (_recover_pending_mixes) could only wait for a refresh
+    to derive them again, and let go after three wakes.
+
+    IT STOPS RATHER THAN GOES ON. At the first call nothing has been
+    published, so stopping costs nothing. At the second the swap may have
+    settled: rule 7 of AGENTS.md is about exactly that moment, and the
+    usage fee waives there instead of stopping. This one cannot waive,
+    because what would be waived is the record of whose money is on which
+    account, for hours of relays. The first call has already shown this
+    wallet can store, so the second failing means the wallet lost its disk
+    during the run. Nothing is relayed. The money stays on the entry, which
+    the first call stored.
+    """
+    try:
+        store_wallet(rpc_primary)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log(stage, "wallet_store_FAILED")
+        sys.exit(
+            f"[!] The wallet would not write the accounts this run created "
+            f"to its file ({str(e)[:60]}).\n"
+            f"    A power cut now would lose them, and the next run would "
+            f"create the same\n"
+            f"    accounts again while this run's money sat on them. "
+            f"{nothing_yet}\n"
+            f"    Check that the wallet file's disk is writable, then run "
+            f"again.")
+
+
 def main():
     install_signal_handlers()
 
@@ -8976,6 +9017,12 @@ def main():
         # swap has landed.
         refuse_thin_mix(subs, ENTRY_ADDRS, decoy_addrs, args.wallets,
                         _num_decoys, len(ENTRY_SET))
+        # THE ENTRY AND THE MIX ACCOUNTS ARE ON DISK BEFORE ANY SWAP NAMES
+        # THEM. See persist_minted: a wallet that forgot the entry after a
+        # power cut would mint it again for the next run, and two swaps would
+        # pay one address.
+        persist_minted(rpc_primary, "stage3",
+                       "Nothing has been published and nothing spent.")
 
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
@@ -9236,6 +9283,13 @@ def main():
         # before it reads the wallet -- see _stage5_run's landing gate.
         _dag_ix, _sweep_tg = _landing_targets(addr_index, dag_plan,
                                               change_sweep_jobs)
+        # EVERY ACCOUNT THE ROUNDS PAY INTO IS ON DISK BEFORE THE FIRST ONE
+        # RELAYS. build_change_sweep_jobs, just above, is the last mint of the
+        # run, and _stage5_run's entry veil is its first relay. See
+        # persist_minted.
+        persist_minted(rpc_primary, "stage5",
+                       "Nothing has been relayed: the money is still on "
+                       "the entry.")
 
         # HOW LONG THIS WILL TAKE, BEFORE IT STARTS. The delays are the
         # dominant cost and nothing said so -- see estimate_runtime. An

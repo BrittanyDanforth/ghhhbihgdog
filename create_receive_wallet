@@ -38,7 +38,7 @@ from gs_common import (
     integrity_log, integrity_log_once, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json,
     install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
-    create_fresh_account,
+    create_fresh_account, store_wallet,
 )
 
 
@@ -234,16 +234,26 @@ def mint_one_receive(wallet_rpc, args, seen_addrs=None, seen_accts=None,
             f"anywhere by this run.")
 
     # WRITTEN TO DISK NOW, NOT AT SHUTDOWN. monero-wallet-rpc keeps a new
-    # account and subaddress in memory until it stores, which it does on an
-    # orderly stop and on its own schedule. This tool runs on a machine that
+    # account and subaddress in memory until it stores, which it does when
+    # asked and on an orderly stop, and at no other time (read in its source;
+    # gs_common.store_wallet has the detail -- this said "and on its own
+    # schedule", which it does not have). This tool runs on a machine that
     # is powered off minutes later by a timer, sometimes by a cut: an
     # address published here and then forgotten by the wallet is minted
-    # AGAIN for the next deposit -- two deposits, one address, and the wake
-    # agent's ledger check (bundle_reused) is the only thing left to catch
-    # it. A store that fails is not a mint that failed: the address is real
-    # and owned; it is logged and the run goes on.
+    # AGAIN for the next deposit -- two deposits, one address. store_wallet
+    # also flushes the write to the device, so the answer means the disk.
+    #
+    # A STORE THAT FAILS IS NOT A MINT THAT FAILED, and here, unlike
+    # GhostSpiral's (persist_minted, which stops), the run goes on. Nothing
+    # has been paid to this address yet, and what a later cut would cost is
+    # caught before anything is published or spent: the wake agent's ledger,
+    # which is fsynced, refuses the next deposit that is handed an account
+    # someone holds (bundle_reused) and every withdrawal while the wallet
+    # lists fewer accounts than the ledger gave out (wallet_accounts_behind).
+    # GhostSpiral's accounts have money on them within the hour; this one
+    # has none until the client pays.
     try:
-        wallet_rpc.raw_request("store", {})
+        store_wallet(wallet_rpc)
     except Exception:                                        # noqa: BLE001
         integrity_log("wallet", "store_failed")
 

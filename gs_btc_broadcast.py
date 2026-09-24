@@ -591,6 +591,96 @@ def spends_of(address, servers, proxy_url, *, network="main",
     raise BtcWatchError(f"no Electrum server answered (last: {why})")
 
 
+#: How many funding transactions input_sources fetches for one spend. A
+#: spend that names more inputs than this, beyond those the caller already
+#: knows, has the rest answered None (unknown).
+INPUT_SOURCE_MAX = 8
+
+
+def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
+                  timeout=DEFAULT_TIMEOUT, transport_factory=None, skip=(),
+                  limit=INPUT_SOURCE_MAX):
+    """Where the inputs of one transaction came from, as far as this
+    address is concerned: {(txid, vout): value} for an input whose previous
+    output PAYS the address, False for one that pays anything else, None
+    for one whose previous transaction could not be read -- for every
+    outpoint the transaction's own bytes spend, less `skip` (those the
+    caller already knows). Read-only, over Tor on the address's circuit,
+    one session on the first server that answers. Raises BtcWatchError
+    when no server answered at all.
+
+    WHY (residual of the dust allowance): spends_of names a spend's inputs
+    from the funding transactions in its window, so an output of this
+    address funded before the window -- a flood's doing -- is not among
+    them, and a move of kept money beside it read as the operator's hand,
+    whatever it took. The transaction's own bytes name every input; the
+    previous transaction of each is fetched by its txid and checked to BE
+    that transaction (Broadcaster.transaction recomputes the id). So this
+    rests on the hash, not on the server's word: a server can refuse an
+    answer (None, which the caller counts against the spend) but cannot
+    make an input pay somewhere it does not.
+
+    AT MOST `limit` previous transactions are fetched; an input past that
+    is None. A real hand move spends a handful of outputs."""
+    spk = btx.address_script(address, network).data
+    try:
+        tx = Transaction.parse(bytes.fromhex(str(raw_hex or "")))
+    except Exception:                                        # noqa: BLE001
+        raise BtcWatchError("input_sources: the transaction does not parse")
+    _skip = {(str(t).lower(), int(v)) for t, v in (skip or ())}
+    ask = []
+    for i in tx.vin:
+        o = (i.txid.hex(), int(i.vout))
+        if o not in _skip and o not in ask:
+            ask.append(o)
+    out = {o: None for o in ask}
+    if not ask:
+        return out
+    prev_ids = []
+    for t, _v in ask:
+        if t not in prev_ids and len(prev_ids) < max(0, int(limit)):
+            prev_ids.append(t)
+    scripthash, order, make = _prepare(address, network, servers, proxy_url,
+                                       transport_factory, timeout)
+    last = None
+    for host, port, pin in order:
+        transport = make(host, port, pin)
+        got = {}
+        try:
+            with Broadcaster(transport) as b:
+                b.handshake()
+                if hasattr(transport, "extend"):
+                    transport.extend(min(PER_ENTRY_S * len(prev_ids),
+                                         READ_EXTENSION_MAX_S))
+                for t in prev_ids:
+                    try:
+                        got[t] = Transaction.parse(
+                            bytes.fromhex(b.transaction(t)))
+                    except ServerError:
+                        # The server ANSWERED that it has no such
+                        # transaction: unknown, and the session goes on.
+                        # Anything else -- a connection that died, bytes
+                        # that are not the transaction asked for -- ends
+                        # this server's session, and the next is asked.
+                        got[t] = None
+        except PinMismatch:
+            raise
+        except (BtcWatchError, OSError) as ex:
+            last = ex
+            continue
+        for t, v in ask:
+            ptx = got.get(t)
+            if ptx is None or not 0 <= v < len(ptx.vout):
+                continue
+            o = ptx.vout[v]
+            out[(t, v)] = (int(o.value) if o.script_pubkey.data == spk
+                           else False)
+        return out
+    why = str(last) if isinstance(last, BtcWatchError) \
+        else type(last).__name__
+    raise BtcWatchError(f"no Electrum server answered (last: {why})")
+
+
 def _history_once(txid, scripthash, order, make, stop=None):
     """One pass over the servers: the first that answers decides. Returns
     (entry_or_None, host, cert_sha256); raises BtcWatchError when no

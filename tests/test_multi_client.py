@@ -778,8 +778,8 @@ check("NON-VACUITY: on the intake WITHOUT the flag the deposit is not "
 # the injected look reach it, or no intake deposit is ever released.
 
 
-def _env_rel_btc(unused_answer):
-    d, kf, _ = _env(45, 1)
+def _env_rel_btc(unused_answer, ceiling=45):
+    d, kf, _ = _env(ceiling, 1)
     key = P.unlock_keyfile(json.loads(kf.read_text()), b"")
     key.update({"btc_account_xpub": _UZPUB, "btc_electrum": ["s.onion"],
                 "btc_network": "main", "deposit_in_chat": True})
@@ -790,16 +790,23 @@ def _env_rel_btc(unused_answer):
     led["handles"]["E000"].update(
         {"admitted": int(time.time()) // 600 * 600, "btc_index": 0})
     A._save_handles(d, led["handles"], led["owners"])
-    asked, order = [], []
+    asked, order, kinds = [], [], []
     _b = _note("receive_and_quote", {"amount_sat": 5000000, "owner": OX,
                                      "replaces": "E000"})
-    _o, _e = _run(kf, _b, d, 4, subaddress_total=_zero,
-                  sleep=lambda s: order.append("jitter"),
-                  verify_tor=lambda: order.append("tor"),
-                  run_child=lambda argv, env, budget: (
-                      order.append("child"), (0, False))[1],
-                  btc_unused=lambda a: (asked.append(a), order.append(a),
-                                        unused_answer)[2])
+    _il = A.integrity_log
+    A.integrity_log = lambda st, kind, *a, **k: (kinds.append(kind),
+                                                 _il(st, kind, *a, **k))[1]
+    try:
+        _o, _e = _run(kf, _b, d, 4, subaddress_total=_zero,
+                      sleep=lambda s: order.append("jitter"),
+                      verify_tor=lambda: order.append("tor"),
+                      run_child=lambda argv, env, budget: (
+                          order.append("child"), (0, False))[1],
+                      btc_unused=lambda a: (asked.append(a), order.append(a),
+                                            unused_answer)[2])
+    finally:
+        A.integrity_log = _il
+    _env_rel_btc.kinds = kinds
     return (A._load_ledger(d)["handles"]["E000"].get("released"), asked,
             order, _e, _b)
 
@@ -825,6 +832,27 @@ check("...and at the stock ceiling, where that place IS the capacity, the "
       _eb2 is not None and getattr(_eb2, "code", None) == "at_capacity"
       and "child" not in _ob2
       and (_bb2.result or {}).get("phase") == "full")
+# ...AND ONLY WHEN THE GATE NEEDS THAT PLACE. The look puts the old deposit's
+# BTC address on the wire in the wake that then asks about the new one, and
+# a server answering both can link them as one client's retry. With room to
+# spare it is not asked: the old record keeps its place until it ages out,
+# and the new deposit is admitted.
+# (This fixture pairs no OP_RETURN policy, so an admitted intake deposit is
+# refused a few lines later, op_return_too_small, as the ones above are:
+# what is asked here is the gate's answer and what went on the wire.)
+_rb3, _ab3, _ob3, _eb3, _bb3 = _env_rel_btc(True, ceiling=90)
+check("with ROOM for both, the old deposit's BTC address is NOT asked, it is "
+      "not released, and the gate admits the new deposit",
+      _ab3 == [] and not _rb3 and "tor" in _ob3
+      and getattr(_eb3, "code", None) != "at_capacity")
+check("...and the chain says the release was not needed",
+      "release_btc_not_needed" in (_env_rel_btc.kinds or [])
+      and "deposit_released" not in (_env_rel_btc.kinds or []))
+_rb4, _ab4, _ob4, _eb4, _bb4 = _env_rel_btc(False, ceiling=90)
+check("...a used address changes nothing then: not asked, and not refused "
+      "at_capacity",
+      _ab4 == [] and "tor" in _ob4
+      and getattr(_eb4, "code", None) != "at_capacity")
 _d7, _kf7, _b7 = _env(45, 0)
 _o7, _e7 = _run(_kf7, _b7, _d7, None)
 check("...a refusal for any other reason carries none",

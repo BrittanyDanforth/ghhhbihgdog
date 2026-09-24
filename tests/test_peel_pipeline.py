@@ -91,7 +91,7 @@ EXIT_ADDR = addr(9999)
 class Run:
     """One driven pipeline: its wallet, its rounds and what they moved."""
 
-    def __init__(self, stop_at_peel=None, peel=True):
+    def __init__(self, stop_at_peel=None, peel=True, stores_ok=None):
         self.subs = [addr(2000 + i) for i in range(WALLETS + 4)]
         self.idx = {a: (30 + i, 1) for i, a in enumerate(self.subs)}
         self.bal = {}                    # (acct, sub) -> atomic
@@ -104,6 +104,23 @@ class Run:
         self.peel = peel
         self.carrier_waits = []
         self.acct = 200
+        # WHAT THE WALLET FILE HOLDS. wallet-rpc writes its accounts to disk
+        # only on `store` (gs_common.store_wallet), so an account minted
+        # after the last store is one a power cut forgets. `stores_ok` is
+        # how many stores succeed before every later one fails (None:
+        # all of them succeed).
+        self.stored = set()
+        self.stores_ok = stores_ok
+        self.store_calls = 0
+        # Accounts minted but not yet stored, at the moment of each round's
+        # relay and of each swap quote -- the two things that put this run's
+        # money, or a public reference to its address, onto them.
+        self.unstored_at_round = []
+        self.unstored_at_post = []
+        self.minted_at_post = []
+        self.posts = 0
+        self.ilog = []
+        self.exit_text = ""
 
     # -- the wallet ------------------------------------------------------
     def pair_of(self, a):
@@ -144,6 +161,13 @@ class Run:
                     return {"account_index": run.acct}
                 if m == "incoming_transfers":
                     return {"transfers": [{"amount": 10 ** 12, "spent": False}]}
+                if m == "store":
+                    run.store_calls += 1
+                    if run.stores_ok is not None \
+                            and run.store_calls > run.stores_ok:
+                        raise RuntimeError("Failed to save wallet")
+                    run.stored = set(run.minted)
+                    return {}
                 raise AssertionError("unexpected RPC: " + m)
 
             def get_subaddress_balance(self, account_index=0, address_index=0):
@@ -162,6 +186,7 @@ class Run:
         d = json.loads(open(path).read())
         txs = d.get("txs", [])
         meta = d.get("meta", {})
+        self.unstored_at_round.append(set(self.minted) - self.stored)
         self.rounds.append((label, txs))
         snap = dict(self.bal)
         delta = {}
@@ -232,6 +257,17 @@ class Run:
                 out.append((a, acct, ix))
             return out
 
+        def quote(url, payload, proxy):
+            # The quote request is where the entry address first leaves this
+            # machine: the aggregator is told where to pay.
+            self.posts += 1
+            self.unstored_at_post.append(set(self.minted) - self.stored)
+            self.minted_at_post.append(len(self.minted))
+            return {"routes": [{
+                "expectedBuyAmount": "12.0",
+                "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
+                "targetAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}]}
+
         stubs = dict(
             verify_tor=lambda *a, **k: None,
             require_resources=lambda *a, **k: None,
@@ -249,7 +285,7 @@ class Run:
             validate_xmr_address=lambda *a, **k: None,
             resolve_wallet_password=lambda *a, **k: None,
             resolve_sensitive_inputs=lambda *a, **k: None,
-            integrity_log=lambda *a, **k: None,
+            integrity_log=lambda *a, **k: self.ilog.append(a),
             integrity_log_once=lambda *a, **k: None,
             secure_delay=lambda *a, **k: None,
             reject_self_exit=lambda *a, **k: None,
@@ -260,10 +296,7 @@ class Run:
                 True, self.bal.get((ac, sb), 0)),
             _change_residue=lambda a, ac, sb: self.bal.get((ac, sb), 0),
             report_completion=lambda *a, **k: None,
-            safe_post=lambda url, payload, proxy: {"routes": [{
-                "expectedBuyAmount": "12.0",
-                "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
-                "targetAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}]},
+            safe_post=quote,
             btc_per_xmr_oracle=lambda *a, **k: None,
             wait_for_swap_arrival=lambda fn, floor_, n: dict(
                 zip(("state", "total", "unlocked"), ("funded",) + fn())),
@@ -292,6 +325,7 @@ class Run:
                 g.main()
             self.outcome = "returned"
         except SystemExit as e:
+            self.exit_text = str(e.code)
             self.outcome = "SystemExit: " + str(e.code)[:300]
         except Exception as e:                               # noqa: BLE001
             self.outcome = f"CRASHED {type(e).__name__}: {e}"
@@ -372,6 +406,52 @@ _fees = FEE * (len(full.peels) + len(full.dag) + len(full.exits) + 1)
 check(f"value is conserved: {full.left_wallet / 10**12:.4f} XMR out + fees "
       f"== {ENTRY_ATOMIC / 10**12} XMR in",
       full.left_wallet + _fees == ENTRY_ATOMIC)
+
+
+# ===========================================================================
+# EVERY ACCOUNT IS ON DISK BEFORE A QUOTE NAMES IT OR A ROUND PAYS IT.
+#
+# wallet-rpc holds a new account in memory until it stores, and nothing in a
+# run asked it to. A power cut during the relays left a wallet file without
+# the accounts the run had paid into: the wallet handed the same indices to
+# whatever minted next, which on the vault is the next owner. The fake wallet
+# above records what a store has written; these read it at the two moments
+# that matter.
+print("\n== the wallet file holds every account before money reaches it ==")
+check("the run mints accounts BEFORE the swap quote and AFTER it -- the two "
+      "batches, so a single store in either place would not do "
+      f"({full.minted_at_post[:1]} of {len(full.minted)})",
+      bool(full.minted_at_post)
+      and 0 < full.minted_at_post[0] < len(full.minted))
+check("no swap quote names an entry the wallet file does not hold",
+      full.posts >= 1 and all(not s for s in full.unstored_at_post))
+check("no round relays while an account it can pay into is only in memory",
+      bool(full.rounds) and all(not s for s in full.unstored_at_round))
+
+_s0 = Run(stores_ok=0).go()
+check("a wallet that will not store stops the run BEFORE the swap is quoted "
+      f"({_s0.outcome[:80]})",
+      _s0.outcome.startswith("SystemExit") and _s0.posts == 0
+      and _s0.rounds == [])
+check("...saying so, and that nothing was published or spent",
+      "would not write" in _s0.exit_text
+      and "Nothing has been published and nothing spent" in _s0.exit_text)
+check("...after asking three times, not once",
+      _s0.store_calls == 3)
+check("...and the chain says which stage stopped",
+      ("stage3", "wallet_store_FAILED") in _s0.ilog)
+
+_s1 = Run(stores_ok=1).go()
+check("a store that fails AFTER the swap (the last mint's) relays NOTHING "
+      f"({_s1.outcome[:80]})",
+      _s1.outcome.startswith("SystemExit") and _s1.posts >= 1
+      and _s1.rounds == [])
+check("...and says the money has not moved",
+      "would not write" in _s1.exit_text
+      and "Nothing has been relayed" in _s1.exit_text)
+check("...and the chain says it was stage 5's",
+      ("stage5", "wallet_store_FAILED") in _s1.ilog
+      and ("stage3", "wallet_store_FAILED") not in _s1.ilog)
 
 
 # ===========================================================================
@@ -459,6 +539,18 @@ _ffees = FEE * (len(_fanouts) + len(_sweeps) + len(fan.dag) + len(fan.exits) + 1
 check(f"...and value is conserved: {fan.left_wallet / 10**12:.4f} XMR out + "
       f"fees == {ENTRY_ATOMIC / 10**12} XMR in",
       fan.left_wallet + _ffees == ENTRY_ATOMIC)
+# THE LAST MINT IS THE CHANGE-SWEEP ACCOUNTS, and only a fan-out has them (a
+# peel chain has no change location). So this is the run that shows the
+# second store comes after build_change_sweep_jobs, not merely after the
+# plan: every round, the entry veil first, sees those accounts on disk.
+check("the change sweep pays an account this run MINTED (so the check below "
+      "is about a real mint)",
+      bool(_sweeps) and all((fan.pair_of(t["dst"]) or (None,))[0]
+                            in fan.minted for t in _sweeps))
+check("the fan-out's change-sweep accounts are on disk before the first round "
+      "relays",
+      bool(_sweeps) and bool(fan.rounds)
+      and all(not s for s in fan.unstored_at_round))
 
 
 _finished()

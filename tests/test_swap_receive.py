@@ -638,6 +638,88 @@ def test_count_mints_independent_receives():
           not _exited and _asked == [False])
 
 
+def test_receive_is_stored_before_it_is_handed_out():
+    """The account and subaddress are on disk before the bundle names them.
+
+    monero-wallet-rpc holds a new account in memory until it stores. A cut
+    after the address is handed out, before the wallet stored it, left a
+    wallet that minted the same address again for the next deposit. The
+    store is gs_common.store_wallet, which also flushes it to the device.
+    A FAILED store is logged and the run goes on (see the comment at the
+    call: nothing has been paid to the address yet, and the agent's ledger
+    refuses what a later cut would cost).
+    """
+    import gs_common as _gc
+    calls = []
+    bundles_at_store = []
+
+    class FakeRPC:
+        def __init__(self, store_ok=True):
+            self.store_ok = store_ok
+            self.n = 40
+
+        def raw_request(self, m, p=None):
+            calls.append(m)
+            if m == "create_account":
+                self.n += 1
+                return {"account_index": self.n}
+            if m == "get_address":
+                return {"addresses": [{"address_index": p["address_index"][0],
+                                       "address": "8" + "B" * 94}]}
+            if m == "validate_address":
+                return {"valid": True, "integrated": False,
+                        "subaddress": True, "nettype": "mainnet"}
+            if m == "store":
+                bundles_at_store.append(len(os.listdir(outdir)))
+                if not self.store_ok:
+                    raise RuntimeError("Failed to save wallet")
+                return {}
+            raise AssertionError("unexpected RPC: " + m)
+
+        def new_subaddress_indexed(self, account_index, label=""):
+            calls.append("create_address")
+            return "8" + "B" * 94, 1
+
+    outdir = tempfile.mkdtemp(prefix="gs_store_")
+    logged = []
+    crw.newnym = lambda *a, **k: None
+    crw.integrity_log = lambda *a, **k: logged.append(a)
+    _sleep, _sync = _gc.time.sleep, os.sync
+    _gc.time.sleep = lambda s: None
+    os.sync = lambda: calls.append("sync")
+    args = types.SimpleNamespace(account=None, label="",
+                                 rpc="http://127.0.0.1:18083",
+                                 output_dir=outdir, count=1)
+    import io
+    real, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        _b = crw.mint_one_receive(FakeRPC(), args)
+        _order = list(calls)
+        calls.clear()
+        _b2 = crw.mint_one_receive(FakeRPC(store_ok=False), args)
+    finally:
+        sys.stdout = real
+        _gc.time.sleep, os.sync = _sleep, _sync
+        crw.integrity_log = lambda *a, **k: None
+
+    check("receive: the wallet STORES after the account and the subaddress "
+          "are minted",
+          all(x in _order for x in ("store", "create_account",
+                                    "create_address"))
+          and _order.index("store") > _order.index("create_account")
+          and _order.index("store") > _order.index("create_address"))
+    check("...and the store is flushed to the device",
+          "store" in _order and "sync" in _order
+          and _order.index("sync") == _order.index("store") + 1)
+    check("...before any bundle names the address",
+          bundles_at_store[:1] == [0])
+    check("receive: a store that FAILS is asked again, then logged, and the "
+          "receive still completes",
+          calls.count("store") == 3 and "sync" not in calls
+          and ("wallet", "store_failed") in logged
+          and _b2 is not None and os.path.exists(str(_b2[1])))
+
+
 def test_count_refuses_a_repeating_wallet():
     """--count N must REFUSE a wallet-rpc that hands back the same answer.
 
