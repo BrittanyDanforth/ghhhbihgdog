@@ -450,15 +450,31 @@ check("never found, wait 30 at 15: polls at 0, 15 and 30, then stops -- "
 # slices of at most a second, so the caller can still write down what it
 # sent inside the agent's ten-second grace instead of being killed with
 # nothing on disk.
-_slept, _t = [], [0.0]
-_r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=90, interval_s=15,
-              sleeper=lambda s: (_slept.append(s), _t.__setitem__(
-                  0, _t[0] + s)), clock=lambda: _t[0],
-              stop=lambda: _t[0] >= 3)
+_slept, _t, _asks = [], [0.0], [0]
+
+
+def _stop_at_3():
+    # A wait that does NOT end on the stop stops sleeping and polls on a
+    # clock that no longer moves: bounded here, so that is a red check and
+    # not a suite that never finishes.
+    _asks[0] += 1
+    if _asks[0] > 200:
+        raise RuntimeError("the wait did not end on the stop")
+    return _t[0] >= 3
+
+
+try:
+    _r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=90,
+                  interval_s=15, sleeper=lambda s: (_slept.append(s),
+                                                    _t.__setitem__(
+                                                        0, _t[0] + s)),
+                  clock=lambda: _t[0], stop=_stop_at_3)
+except RuntimeError:
+    _r = None
 check("a stop three seconds into the first sleep ends the wait there: one "
       "poll, three one-second slices, not seen but asked",
-      _r["seen"] is False and _r["polls"] == 1 and _r["asked"] is True
-      and _slept == [1.0, 1.0, 1.0])
+      _r is not None and _r["seen"] is False and _r["polls"] == 1
+      and _r["asked"] is True and _slept == [1.0, 1.0, 1.0])
 _slept, _t = [], [0.0]
 _r, _ = _seen(*[_FT(history=[]) for _ in range(5)], wait_s=30, interval_s=15,
               sleeper=lambda s: (_slept.append(s), _t.__setitem__(
