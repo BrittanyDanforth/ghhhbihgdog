@@ -7092,7 +7092,7 @@ with _PinnedClock() as _c:
         lambda n, cf: ("done", "leftover" if cf == _LA else "sent"), 30)
 check("NON-VACUITY: a top-up past a hold for good is news, and said: "
       "\"sending it on now\" twice, the second at the top-up's start",
-      _hs[-1] == (21.0, _LA + _LB)
+      _hs[-1:] == [(21.0, _LA + _LB)]
       and sum(1 for t, b in _hps if _SON in t) == 2)
 # _btc_keep_past_clock, CLAUSE BY CLAUSE, and the bound over all of them.
 with _PinnedClock() as _c:
