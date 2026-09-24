@@ -5544,10 +5544,18 @@ class Pager:
             _was_forwarding = e.get("state") == "forwarding"
             _from_fwd = bool(e.pop("from_forwarded", False))
             _start_conf = e.pop("start_conf", None)
-            # THIS END'S OWN START OF A FORWARD OF MONEY BACK, answered: the
-            # vault ran over the confirmed total this end saw.
-            _own = _was_forwarding and _from_fwd and isinstance(
+            _start_at = e.pop("start_at", None)
+            # THIS END'S OWN START, answered -- from the forwarded look or
+            # from `seen` alike: the vault ran over the confirmed total this
+            # end saw when it started it.
+            _own = _was_forwarding and isinstance(
                 _start_conf, int) and not isinstance(_start_conf, bool)
+            try:
+                _start_at = float(_start_at)
+            except (TypeError, ValueError):
+                _start_at = time.time()
+            if not (0.0 < _start_at <= time.time()):
+                _start_at = time.time()
             if out == "done":
                 # THE RUN FINISHED: whatever it said, the automatic retries
                 # of a refused or failed forward start over from here.
@@ -5572,6 +5580,10 @@ class Pager:
                 e["recheck_after"] = self._btc_recheck_draw()
                 e.pop("retry_after", None)
                 e.pop("fee_tries", None)
+                # ...AND NO HOLD SURVIVES IT, as none survives `unsure`
+                # itself: a hold is about a total the vault answered with a
+                # word this end read, and this word it could not.
+                self._btc_unhold(e)
                 return
             if out == "done" and phase in ("sent", "unsure"):
                 # Gone from the address, or may be: the vault's word is the
@@ -5602,19 +5614,43 @@ class Pager:
                 # window's look started the same refused forward again, each
                 # answer resetting the entry's clock: a wake a window, for
                 # good. Now the entry is `forwarded` and HOLDS the confirmed
-                # total this end's start saw: no start again until it
-                # changes (a top-up is news; so is money leaving). An answer
-                # to a start this end did not make (a recheck of a forward
-                # that mined meanwhile, a tap) holds whatever the next look
-                # sees. Its clock is the forward's: already forwarded, it
-                # keeps the one it had, so the entry expires on schedule.
+                # total this end's start saw (a top-up is news; so is money
+                # leaving) -- FOR A WHILE THE FIRST TIME, FOR GOOD THE
+                # SECOND. The vault's server can be a block behind this
+                # end's: a `leftover` for a total that holds a payment it
+                # has not seen yet was a hold for good on money nobody had
+                # refused, and the entry expired with it on the address. So
+                # the first `leftover` for a total holds it LEFTOVER_WINDOWS
+                # recheck windows from the start's look, and the look after
+                # that asks once more; a second `leftover` for the same
+                # total -- the vault has now seen it twice, hours apart --
+                # holds it until it changes. Two wakes a total, not one a
+                # window. An answer to a start this end did not make (a
+                # recheck, a tap) has no total yet: the next look takes the
+                # one it sees, and the while starts from this answer. Its
+                # clock is the forward's: already forwarded, it keeps the
+                # one it had, so the entry expires on schedule -- after the
+                # one more ask, which btc_tick waits for (_btc_hold_runs).
                 if not (_was_forwarding and _from_fwd
                         and e.get("sent_at")):
                     e["sent_at"] = time.time()
+                _once = e.get("leftover_once")
                 e["state"] = "forwarded"
-                e["word"] = "forwarded"
+                e["word"] = "leftover"
                 self._btc_unhold(e)
-                e["held_conf"] = _start_conf if _own else -1
+                if not _own:
+                    e["held_conf"] = -1
+                    e["held_until"] = time.time() + float(
+                        self.LEFTOVER_WINDOWS) * float(self.btc_recheck_s)
+                elif _once == _start_conf and not isinstance(_once, bool):
+                    e["held_conf"] = _start_conf
+                    e["leftover_once"] = _start_conf
+                else:
+                    e["held_conf"] = _start_conf
+                    e["leftover_once"] = _start_conf
+                    e["held_until"] = _start_at + float(
+                        self.LEFTOVER_WINDOWS) * float(self.btc_recheck_s)
+                    self._btc_look_from(e, _start_at)
                 e.pop("retry_after", None)
                 e.pop("rechecked_at", None)
                 e.pop("fee_tries", None)
@@ -5624,21 +5660,31 @@ class Pager:
                 # THE VAULT RAN OVER MONEY THIS END SAW AND SENT NOTHING, and
                 # said only that the forward on record is in a block: an old
                 # vault's word for `leftover`, or a vault whose server has not
-                # seen the money this end's has. Held on the same total, but
-                # for a doubling while (two recheck windows, then four, eight,
-                # sixteen), not for good -- a lagging server catches up, and
-                # a hold without end would strand money it had not seen yet.
-                # The clock is not reset: the forward that mined is the same.
+                # seen the money this end's has. Held on the same total for a
+                # doubling while (two recheck windows from the start's look,
+                # then four), and FOR GOOD at the third: a lagging server
+                # catches up in blocks, not in days, and a doubling with no
+                # end was a start every few windows for as long as the entry
+                # lived -- and a hold measured from the answer, not the look,
+                # ran a window past what it said. The clock is the forward's
+                # when the look started it; a start from `seen` is a forward
+                # this end has just heard went out, and starts a fresh one.
                 try:
                     _n = max(0, int(e.get("held_tries") or 0)) + 1
                 except (TypeError, ValueError):
                     _n = 1
+                if not (_from_fwd and e.get("sent_at")):
+                    e["sent_at"] = time.time()
                 e["state"] = "forwarded"
                 e["word"] = phase
                 e["held_conf"] = _start_conf
                 e["held_tries"] = _n
-                e["held_until"] = time.time() + float(
-                    self.btc_recheck_s) * float(2 ** min(_n, 4))
+                if _n <= int(self.HELD_TIMED_TRIES):
+                    e["held_until"] = _start_at + float(
+                        self.btc_recheck_s) * float(2 ** _n)
+                    self._btc_look_from(e, _start_at)
+                else:
+                    e.pop("held_until", None)
                 e.pop("retry_after", None)
                 e.pop("rechecked_at", None)
                 e.pop("fee_tries", None)
@@ -5908,12 +5954,64 @@ class Pager:
         return float(self.btc_fee_retry_s) * float(
             2 ** min(tries - 1, int(self.FEE_RETRY_DOUBLINGS)))
 
+    #: Recheck windows a FIRST `leftover` for a total holds it before the
+    #: look asks once more (the second holds it for good): enough for a
+    #: vault server a few blocks behind to catch up, short enough that the
+    #: ask comes well inside the entry's life.
+    LEFTOVER_WINDOWS = 2
+    #: Bare `forwarded` answers to this end's own start held for a doubling
+    #: while (2, then 4 windows) before the next one holds for good.
+    HELD_TIMED_TRIES = 2
+    #: Recheck windows past a timed hold's end that btc_tick keeps a
+    #: forwarded entry its clock would otherwise forget: the look after the
+    #: end comes within one, and a start the reserve put off, one more.
+    HOLD_SLACK_WINDOWS = 2
+
     @staticmethod
     def _btc_unhold(e) -> None:
         """Forget a hold on money the vault already answered for (the
-        forwarded look's `held_conf`, wire 11)."""
-        for _k in ("held_conf", "held_until", "held_tries"):
+        forwarded look's `held_conf`, wire 11), and the `leftover` it heard
+        once: an answer about anything else starts the count again."""
+        for _k in ("held_conf", "held_until", "held_tries", "leftover_once"):
             e.pop(_k, None)
+
+    @staticmethod
+    def _btc_look_stamp(e) -> float:
+        """The forwarded look's own stamp (btc_tick writes it before the
+        look), or now for an entry that has none that makes sense."""
+        _now = time.time()
+        try:
+            _at = float(e.get("looked_at") or 0.0)
+        except (TypeError, ValueError):
+            return _now
+        return _at if 0.0 < _at <= _now else _now
+
+    @staticmethod
+    def _btc_look_from(e, at: float) -> None:
+        """Count a held entry's look windows from its start's look: a start
+        from `seen` left the forwarded look's stamp wherever it last was,
+        and the first window after the answer came at once."""
+        try:
+            _was = float(e.get("looked_at") or 0.0)
+        except (TypeError, ValueError):
+            _was = 0.0
+        if at > _was:
+            e["looked_at"] = float(at)
+
+    def _btc_hold_runs(self, e, now: float) -> bool:
+        """Whether a forwarded entry is inside a TIMED hold, or the slack
+        after it in which the look asks once more (HOLD_SLACK_WINDOWS):
+        btc_tick does not forget it meanwhile. A hold for good, or none, is
+        not. Pure; no lock."""
+        if not e or e.get("state") != "forwarded" \
+                or e.get("held_conf") is None:
+            return False
+        try:
+            _u = float(e.get("held_until"))
+        except (TypeError, ValueError):
+            return False
+        return now < _u + float(self.HOLD_SLACK_WINDOWS) * float(
+            self.btc_recheck_s)
 
     def _btc_early_wait(self, e) -> None:
         """The wait after a forward this end started that the vault found
@@ -5987,13 +6085,23 @@ class Pager:
             # ...AND A SENT ONE, the same window after it went out: a refund
             # comes back within hours, and one that has not come back by
             # then is not coming.
+            # ...BUT NOT A FORWARDED ONE WHOSE HOLD STILL OWES AN ASK (wire
+            # 11): a `leftover` or a bare `forwarded` near the end of that
+            # window set a while whose one more ask fell after it, and the
+            # entry was forgotten first -- with a payment in its total the
+            # vault had not seen, never sent on by itself. Bounded: the
+            # while, and HOLD_SLACK_WINDOWS after it -- per answer. Rests on
+            # no secret: a stranger who pays the spent address again makes a
+            # new total, a new start and a new while, and so keeps the entry
+            # (and its look a window) alive for as long as they pay fees.
             for _h in [k for k, v in opened.items()
                        if (v["state"] == "not_seen"
                            and _now - float(v.get("since") or _now)
                            >= proto.DEPOSIT_PLACE_TTL_S)
                        or (v["state"] in ("sent", "forwarded", "kept")
                            and _now - float(v.get("sent_at") or _now)
-                           >= proto.DEPOSIT_PLACE_TTL_S)]:
+                           >= proto.DEPOSIT_PLACE_TTL_S
+                           and not self._btc_hold_runs(v, _now))]:
                 opened.pop(_h, None)
                 # ...AND FORGOTTEN AS SENT (stage 6): an ask about a
                 # forward this end no longer remembers is the forward's
@@ -6268,16 +6376,25 @@ class Pager:
                 # What starts is said as a first payment is; the vault's
                 # answer (sent, kept, ...) takes it from there.
                 # ...NOT AGAIN FOR THE SAME MONEY (wire 11). The vault
-                # answered this confirmed total already: `leftover` (no rate
-                # carries it) holds it until it changes; a bare `forwarded`
-                # to this end's own start holds it for a doubling while. A
-                # hold set by an answer this end did not start is taken on
-                # what this look sees. Any change -- a top-up, money leaving
-                # -- is news, and releases it.
+                # answered this confirmed total already, and the hold its
+                # answer set says for how long (_btc_forward_result): a
+                # while, then one more ask, then for good. A hold set by an
+                # answer this end did not start is taken on what this look
+                # sees -- and still asked once more when its while is over,
+                # because money that landed between the vault's look and
+                # this one is in that total and the vault never saw it.
+                # Any change -- a top-up, money leaving -- is news, and
+                # releases it. None of this is a defence: it rests on no
+                # secret, and a stranger who knows the spent address can
+                # make "news" whenever they pay a fee for it -- up to two
+                # background starts each (the start and its one more ask;
+                # both leave the reserve for taps), and each renews the
+                # entry's life past its clock while the while runs.
                 _held = e.get("held_conf")
                 if isinstance(_held, int) and not isinstance(_held, bool):
                     if _held < 0:
                         e["held_conf"] = conf
+                        e["leftover_once"] = conf
                         return
                     if conf == _held and (
                             e.get("held_until") is None
@@ -6301,9 +6418,12 @@ class Pager:
                 # ...REMEMBERED ON THE ENTRY, for the answer: a `delayed`
                 # puts it back to `forwarded` (looked at once a window),
                 # not `seen` (looked at every tick); a `leftover` or a bare
-                # `forwarded` holds the total this start was made for.
+                # `forwarded` holds the total this start was made for, its
+                # while counted from this look (btc_tick's stamp), so "two
+                # windows" is the second look after it, not the third.
                 e["from_forwarded"] = True
                 e["start_conf"] = conf
+                e["start_at"] = self._btc_look_stamp(e)
                 e["said"].discard("confirmed")
                 self._btc_sent_set().discard(h)
                 # (No "btc_returned_seen" on the chain: the poke that
@@ -6383,6 +6503,17 @@ class Pager:
                     # so a lost race does not cost a wake at the next
                     # tick. Every answer to the run rewrites or pops it.
                     e["state"] = "forwarding"
+                    # ...AND THE TOTAL THIS START WAS MADE FOR, as the
+                    # forwarded look records it: a `leftover` or a bare
+                    # `forwarded` can answer a start from here too (money
+                    # back that went `returned`, a stall retry of a
+                    # forwarded look's start), and without it the answer
+                    # read as one this end did not start. Its hold was then
+                    # taken on whatever the NEXT look saw -- a window later,
+                    # a second payment inside it, and that payment was held
+                    # as though the vault had refused it too.
+                    e["start_conf"] = conf
+                    e["start_at"] = time.time()
                     say, start = "confirmed", True
                 elif state == "confirmed":
                     # SETTLED, AND THIS END CANNOT WAKE YET (a job is
@@ -6481,6 +6612,7 @@ class Pager:
                 e["state"] = "forwarded" if _from_forwarded else "seen"
                 e.pop("from_forwarded", None)
                 e.pop("start_conf", None)
+                e.pop("start_at", None)
 
     #: The watcher's wake, when each address keeps its own schedule: a
     #: tick looks at one due address at most, so it wakes often and at
@@ -6578,11 +6710,14 @@ class Pager:
                 _cn = self._label(cid, h)
             except BaseException:                            # noqa: BLE001
                 _cn = "?"                        # never the bare handle
-            # A FORWARDED DEPOSIT HOLDING MONEY THAT STAYS (a `leftover`
-            # hold: no end to it) says so, not "sent on, confirmed" alone.
+            # A FORWARDED DEPOSIT HOLDING MONEY THE VAULT SAID STAYS (its
+            # `leftover`, for the total still held) says so, not "sent on,
+            # confirmed" alone. Keyed on the vault's word, not on the hold's
+            # shape: a bare `forwarded` held for good is not that sentence,
+            # and a first `leftover` still to be asked once more is.
             _st = ("leftover" if e["state"] == "forwarded"
-                   and e.get("held_conf") is not None
-                   and e.get("held_until") is None else e["state"])
+                   and e.get("word") == "leftover"
+                   and e.get("held_conf") is not None else e["state"])
             lines.append(f"{_cn}: {self.BTC_STATE_WORDS.get(_st, _st)}")
         return "\n".join(lines)
 

@@ -5929,6 +5929,20 @@ for _plan_l, _want, _why in (
         ({**_ACC, "seen_height": 850002}, "leftover", "a mined forward"),
         ({**_ACC, "seen_height": 0}, "sent", "a forward in the mempool"),
         ({**_kpl, "seen_height": 850002}, "kept", "a mined forward, kept"),
+        # ...AND A PLAN SUPERSEDED BY A FORWARD OF OURS THAT MINED, whatever
+        # its own outcome says (a re-send that reached no server wrote
+        # `unreachable` over it): the record moved, and the money back is
+        # the same leftover -- answered `forwarded`, it was the wake a
+        # window again. Its superseder still in the mempool is not mined:
+        # `sent`, the superseder's (the plan reads accepted by it).
+        ({"broadcast": True, "broadcast_outcome": "unreachable",
+          "seen": False, "superseded_by": "ee" * 32,
+          "superseded_height": 850030}, "leftover",
+         "a superseded plan whose superseder mined"),
+        ({"broadcast": True, "broadcast_outcome": "unreachable",
+          "seen": False, "superseded_by": "ee" * 32,
+          "superseded_height": 0}, "sent",
+         "a superseded plan whose superseder has not mined"),
         ({"broadcast": False, "broadcast_outcome": None, "seen": False},
          "", "a rehearsal plan")):
     _o, _e, _ran, _dd, _bb = _fwd_run_both(_SENT_REC, _SEND_KEY, 2, _plan_l,

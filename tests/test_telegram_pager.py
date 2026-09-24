@@ -6661,22 +6661,24 @@ _lo, _loj = _fwd_look_started()            # the look saw 100,000 confirmed
 _loe = _lo.btc_open["B4A1"]
 _lo_sent_at = _loe.get("sent_at")
 _lo._btc_forward_result("B4A1", "done", "leftover", 111)
-check("a `leftover` answer to this end's own start: forwarded, HOLDING the "
-      "total that start was made for, its clock not reset, the XMR side the "
-      "next ask", _loe["state"] == "forwarded"
-      and _loe.get("held_conf") == 100000 and _loe.get("held_until") is None
+check("a FIRST `leftover` answer to this end's own start: forwarded, HOLDING "
+      "the total that start was made for -- for LEFTOVER_WINDOWS recheck "
+      "windows, not for good -- its clock not reset, the XMR side the next "
+      "ask",
+      _loe["state"] == "forwarded"
+      and _loe.get("held_conf") == 100000
+      and _loe.get("leftover_once") == 100000
+      and abs(float(_loe.get("held_until") or 0) - time.time()
+              - getattr(_lo, "LEFTOVER_WINDOWS", 2) * _lo.btc_recheck_s) < 60
       and _lo_sent_at and _loe.get("sent_at") == _lo_sent_at
       and "B4A1" in _lo._btc_sent_set())
 _lo_n = len(_loj)
-for _ in range(6):
-    _open_window(_lo)
-    _lo.btc_tick(look=_look_returning("confirmed", conf=100000))
-check("...six recheck windows later, the same money still there: NOT ONE "
-      "more start", len(_loj) == _lo_n and _loe["state"] == "forwarded")
 _open_window(_lo)
 _lo.btc_tick(look=_look_returning("confirmed", conf=150000))
 check("...and a top-up is news: more confirmed than the hold starts the "
-      "forward again", len(_loj) == _lo_n + 1 and "held_conf" not in _loe)
+      "forward again, and the hold and the leftover it heard both go",
+      len(_loj) == _lo_n + 1 and "held_conf" not in _loe
+      and "leftover_once" not in _loe)
 _lm, _lmj = _fwd_look_started()
 _lm._btc_forward_result("B4A1", "done", "leftover", 111)
 _lm_held = _lm.btc_open["B4A1"].get("held_conf") == 100000
@@ -6689,8 +6691,395 @@ _open_window(_lm)
 _lm.btc_tick(look=_look_returning("confirmed", conf=100000))
 check("...and money that comes back after that is news again: started",
       len(_lmj) == 2)
+_lm._btc_forward_result("B4A1", "done", "leftover", 111)
+check("...and its `leftover` is a FIRST one again -- a while, not for good: "
+      "the one the vault gave before was about money that left",
+      _lm.btc_open["B4A1"].get("held_until") is not None)
+# `leftover` ANSWERING A START THIS END DID NOT MAKE (the recheck of a
+# forward that mined meanwhile): no total to hold yet, so the next look's.
+_lr, _lrs, _lrj = _watch_pager()
+_lr.btc_servers = [("s.onion", 50002, None)]
+_lr.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_lr.limits.headroom = lambda: 9
+_lr._btc_forward_result("B4A1", "done", "sent", 111)
+_lr._btc_forward_result("B4A1", "done", "leftover", 111)
+_lre = _lr.btc_open["B4A1"]
+check("a `leftover` answer to a recheck: forwarded, the hold to be taken at "
+      "the next look, its while counted from this answer",
+      _lre["state"] == "forwarded" and _lre.get("held_conf") == -1
+      and abs(float(_lre.get("held_until") or 0) - time.time()
+              - getattr(_lr, "LEFTOVER_WINDOWS", 2) * _lr.btc_recheck_s) < 60)
+for _ in range(3):
+    _open_window(_lr)
+    _lr.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...the next look takes the hold on what it sees, as the leftover the "
+      "vault gave, and starts nothing inside the while",
+      _lre.get("held_conf") == 100000 and _lre.get("leftover_once") == 100000
+      and _lrj == [])
+check("/balance names a forwarded deposit whose returned money stays there",
+      "some came back and stays there" in _lr._btc_balance_text(111))
+
+
+# THE HOLD ON A CLOCK THAT MOVES (the review of wire 11). Every check above
+# runs on the wall clock and opens each window by rewinding the look's
+# stamp, so a timed hold never ended in any of them -- "six windows later,
+# not one more start" held against a hold that was never over. These move
+# time itself, a tick every ten minutes, and have the vault answer each
+# start ten minutes after it.
+class _PinnedClock:
+    """time.time() pinned to a number these checks move. The pager's `time`
+    IS the time module, so this moves every clock in the process -- and is
+    put back whatever happens inside."""
+    def __init__(self, t0=1_800_000_000.0):
+        self.t = float(t0)
+
+    def __enter__(self):
+        self._real = time.time
+        time.time = lambda: self.t
+        return self
+
+    def __exit__(self, *a):
+        time.time = self._real
+
+
+_HR = 3600.0
+_LA, _LB = 20000, 100000       # money back no rate carries; a real payment
+
+
+def _held_pager():
+    """A deposit whose forward mined as the clock starts: `forwarded`, its
+    forward's clock and its look's stamp both now."""
+    p, ps, pj = _watch_pager()
+    p.btc_servers = [("s.onion", 50002, None)]
+    p.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+    p.limits.headroom = lambda: 9
+    p._btc_forward_result("B4A1", "done", "forwarded", 111)
+    p.btc_open["B4A1"]["looked_at"] = time.time()
+    return p, ps, pj
+
+
+def _hold_drive(c, p, jobs, conf_at, answer, hours, at=None):
+    """Tick for `hours` on the pinned clock: every ten minutes a tick whose
+    look sees conf_at(hours since the start) confirmed; each start is
+    answered ten minutes later with answer(n, total it was made for) ->
+    (out, word). `at` maps an hour to a callable run once at that tick (a
+    tap's answer). Stops at `sent` or when the entry is forgotten. Returns
+    (starts [(hour, total)], words, hour it was forgotten or None)."""
+    t0, starts, words, gone, pending = c.t, [], [], None, None
+    at = dict(at or {})
+    while c.t < t0 + hours * _HR:
+        c.t += 600
+        _off = (c.t - t0) / _HR
+        for _k in sorted(k for k in at if _off >= k - 1e-9):
+            at.pop(_k)()
+        if pending is not None and c.t >= pending[0]:
+            _out, _w = answer(len(words) + 1, pending[1])
+            pending = None
+            words.append(_w)
+            p._btc_forward_result("B4A1", _out, _w, 111)
+            if _w == "sent":
+                break
+        _cf = int(conf_at(_off))
+        _n0 = len(jobs)
+        if pending is None and "B4A1" in p.btc_open:
+            p.btc_tick(look=_look_returning(
+                "confirmed" if _cf else "not_seen", conf=_cf))
+        if "B4A1" not in p.btc_open:
+            gone = round(_off, 2)
+            break
+        if len(jobs) > _n0:
+            starts.append((round(_off, 2), _cf))
+            pending = (c.t + 600, _cf)
+    return starts, words, gone
+
+
+def _drive_safe(*a, **k):
+    """_hold_drive, a crash reported as no result rather than a dead suite
+    (a crash proves nothing about the checks after it)."""
+    try:
+        return _hold_drive(*a, **k)
+    except Exception as ex:                                  # noqa: BLE001
+        print(f"  [drive crashed: {type(ex).__name__}: {ex}]")
+        return [], [], "crashed"
+
+
+def _a_from(h):
+    """Money back of _LA from hour `h`."""
+    return lambda off: _LA if off >= h else 0
+
+
+# THE MOTIVATING CASE, ON A CLOCK: money back no rate carries, the vault
+# answering `leftover` to every start. Two starts for it over the entry's
+# whole life -- the one that heard it, and the one more ask LEFTOVER_WINDOWS
+# windows later, exactly (the second look after the start's, not the
+# third) -- and then the entry expires on its forward's clock.
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hs, _hw, _hg = _drive_safe(_c, _hp, _hpj, _a_from(1),
+                                lambda n, cf: ("done", "leftover"), 60)
+check("money back no rate carries, `leftover` to every start: TWO starts "
+      "over the entry's life, two recheck windows apart, then none; the "
+      "entry forgotten on its forward's clock (48 h)",
+      _hs == [(3.0, _LA), (9.0, _LA)] and _hw == ["leftover", "leftover"]
+      and _hg == 48.0)
+# THE VAULT'S SERVER A BLOCK BEHIND (finding F2): the client pays again to
+# the same address; this end sees that payment settled and starts the
+# forward, and the vault -- not yet seeing it -- answers `leftover` about
+# the total WITH it. That was a hold for good on money nobody refused: the
+# entry expired with the payment on the address. It is asked once more.
+_lag = {"n": 0}
+
+
+def _ans_lag(n, cf):
+    if cf == _LA:
+        return ("done", "leftover")
+    _lag["n"] += 1
+    return ("done", "leftover" if _lag["n"] == 1 else "sent")
+
+
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hs, _hw, _hg = _drive_safe(
+        _c, _hp, _hpj, lambda off: (_LA if off >= 1 else 0)
+        + (_LB if off >= 10 else 0), _ans_lag, 72)
+check("a `leftover` from a vault a block behind, about a total holding a "
+      "second payment it had not seen: asked once more when the while ends, "
+      "and the payment SENT ON -- not held until the entry is forgotten",
+      _hs[-2:] == [(12.0, _LA + _LB), (18.0, _LA + _LB)]
+      and _hw[-1:] == ["sent"] and _hg is None)
+# ...AND A START THIS END MADE FROM `seen` IS STILL ITS OWN (finding F1). A
+# forwarded look's start whose run died goes back to `seen` for its stall
+# retry; the retry's `leftover` read as an answer to a start this end did
+# not make, the hold was taken on whatever the NEXT look saw -- a window
+# later, a second payment inside it -- and that payment was held as though
+# the vault had refused it too.
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hs, _hw, _hg = _drive_safe(
+        _c, _hp, _hpj, lambda off: (_LA if off >= 1 else 0)
+        + (_LB if off >= 5 else 0),
+        lambda n, cf: (("failed", "") if n == 1 else
+                       ("done", "leftover" if cf == _LA else "sent")),
+        72)
+check("a stall retry started from `seen` and answered `leftover`: held on "
+      "ITS total, so a payment that lands before the next look is news -- "
+      "started at the first look after it lands and sent on, not held with "
+      "it",
+      _hs == [(3.0, _LA), (4.17, _LA), (7.17, _LA + _LB)]
+      and _hw == ["", "leftover", "sent"] and _hg is None)
+# ...AND NEAR THE END OF THE ENTRY'S LIFE (finding F3): the same lag two days
+# after the forward mined set a while whose one more ask fell after the
+# entry's clock ran out, and the entry was forgotten first. For both words
+# a vault that has not seen the money answers: `leftover`, and a bare
+# `forwarded` (an old vault's word for it).
+for _lw in ("leftover", "forwarded"):
+    _lag = {"n": 0}
+
+    def _ans_late(n, cf, _lw=_lw):
+        if cf == _LA:
+            return ("done", _lw)
+        _lag["n"] += 1
+        return ("done", _lw if _lag["n"] == 1 else "sent")
+
+    with _PinnedClock() as _c:
+        _hp, _hps, _hpj = _held_pager()
+        _hs, _hw, _hg = _drive_safe(
+            _c, _hp, _hpj, lambda off: (_LA if off >= 1 else 0)
+            + (_LB if off >= 44 else 0), _ans_late, 72)
+    check(f"a lagging `{_lw}` about a second payment 45 h into a 48 h "
+          f"entry: the one more ask still happens after the entry's clock "
+          f"has run out, and the payment is sent on",
+          _hs[-2:] == [(45.0, _LA + _LB), (51.0, _LA + _LB)]
+          and _hw[-1:] == ["sent"] and _hg is None)
+# A BARE `forwarded` TO EVERY START (an old vault that has no `leftover`):
+# held two windows, then four, then FOR GOOD -- the doubling had no end, a
+# start every few windows for as long as the entry lived, and each while
+# was measured from the answer, so ran a window past what it said.
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hs, _hw, _hg = _drive_safe(_c, _hp, _hpj, _a_from(1),
+                                lambda n, cf: ("done", "forwarded"), 60)
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _drive_safe(_c, _hp, _hpj, _a_from(1),
+                lambda n, cf: ("done", "forwarded"), 22)
+    _hbal2 = _hp._btc_balance_text(111)
+    _hbal2_held = ((_hp.btc_open.get("B4A1") or {}).get("held_conf") == _LA
+                   and "held_until" not in _hp.btc_open["B4A1"])
+check("a bare `forwarded` to every start: three starts, two and then four "
+      "windows apart, then none; forgotten on the forward's clock",
+      _hs == [(3.0, _LA), (9.0, _LA), (21.0, _LA)] and _hg == 48.0)
+# THE WINDOWS ARE THE CONSTANTS', NOT NUMBERS WRITTEN INTO THE BRANCHES:
+# moved on the instance, the starts move with them (AGENTS.md rule 3 -- a
+# check that only compares today's numbers passes for a hardcoded copy).
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hp.LEFTOVER_WINDOWS = 3
+    _hs_l, _, _ = _drive_safe(_c, _hp, _hpj, _a_from(1),
+                              lambda n, cf: ("done", "leftover"), 30)
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hp.HELD_TIMED_TRIES = 1
+    _hs_f, _, _ = _drive_safe(_c, _hp, _hpj, _a_from(1),
+                              lambda n, cf: ("done", "forwarded"), 30)
+check("LEFTOVER_WINDOWS moved to 3: the one more ask comes three windows "
+      "after the start; HELD_TIMED_TRIES moved to 1: the second bare answer "
+      "holds for good", _hs_l == [(3.0, _LA), (12.0, _LA)]
+      and _hs_f == [(3.0, _LA), (9.0, _LA)])
+# ...AND A `leftover` AFTER A TIMED BARE HOLD is a first one, with a while
+# of its own -- not the rest of the old one, and not the doubling's count.
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _hs, _hw, _hg = _drive_safe(
+        _c, _hp, _hpj, _a_from(1),
+        lambda n, cf: ("done", "forwarded" if n == 1 else "leftover"), 60)
+check("bare `forwarded`, then `leftover` for good: three starts at the "
+      "windows each answer set, then none",
+      _hs == [(3.0, _LA), (9.0, _LA), (15.0, _LA)]
+      and _hw == ["forwarded", "leftover", "leftover"] and _hg == 48.0)
+# A TAP'S `leftover` (a start this end did not make): the next look takes
+# the total, and the while ends in one more ask -- which is the one that
+# finds a payment that landed between the vault's look and this end's.
+for _lb_at, _want_s, _want_w, _want_g, _why in (
+        (5, [(9.0, _LA + _LB)], ["sent"], None,
+         "a payment before the next look is asked about and sent on"),
+        (99, [(9.0, _LA)], ["leftover"], 49.5,
+         "the same money heard twice is held for good: one start")):
+    with _PinnedClock() as _c:
+        _hp, _hps, _hpj = _held_pager()
+        _hs, _hw, _hg = _drive_safe(
+            _c, _hp, _hpj, lambda off, _b=_lb_at: (_LA if off >= 1 else 0)
+            + (_LB if off >= 2 and _b < 99 else 0),
+            lambda n, cf: ("done", "leftover" if cf == _LA else "sent"), 60,
+            at={1.5: lambda _p=_hp: _p._btc_forward_result(
+                "B4A1", "done", "leftover", 111)})
+    check(f"a tap's `leftover`, then the looks: {_why}",
+          _hs == _want_s and _hw == _want_w and _hg == _want_g)
+# /balance SAYS THE VAULT'S WORD, NOT THE HOLD'S SHAPE: a bare `forwarded`
+# held for good is "sent on, confirmed"; a `leftover` still owed one more
+# ask already says what the vault said.
+_hbal3 = ""
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _drive_safe(_c, _hp, _hpj, _a_from(1),
+                lambda n, cf: ("done", "leftover"), 4)
+    _hbal3 = _hp._btc_balance_text(111)
+    _hp.limits.headroom = lambda: 0        # the reserve: no start
+    _open_window(_hp)
+    _hp.btc_tick(look=_look_returning("confirmed", conf=_LA + 1000))
+    _hbal4 = _hp._btc_balance_text(111)
+check("/balance: a first `leftover` (still to be asked once more) says the "
+      "money stays there", "some came back and stays there" in _hbal3)
+check("/balance: a hold for good on a bare `forwarded` does NOT say the "
+      "money stays there -- the vault never said so",
+      _hbal2_held and "sent on, confirmed" in _hbal2
+      and "some came back and stays there" not in _hbal2)
+check("/balance: and once a change released the hold (not yet asked about), "
+      "the leftover sentence goes with it",
+      "sent on, confirmed" in _hbal4
+      and "some came back and stays there" not in _hbal4
+      and (_hp.btc_open.get("B4A1") or {}).get("state") == "forwarded")
+# A HOLD IS ABOUT A TOTAL THE VAULT ANSWERED IN A WORD THIS END READ. Any
+# answer that is not `leftover` or a bare `forwarded` ends it -- `kept`,
+# `returned`, a word this end lacks -- and the one heard before with it: or
+# a hold for good on money the vault's latest answer was about outlived it.
+for _w2, _then, _why in (
+        ("kept", "forwarded", "`kept`, then a tap's `forwarded`"),
+        (pg.proto.PHASE_UNKNOWN, "forwarded",
+         "a word this end lacks, then a recheck's `forwarded`")):
+    with _PinnedClock() as _c:
+        _hp, _hps, _hpj = _held_pager()
+        _drive_safe(_c, _hp, _hpj, _a_from(1),
+                    lambda n, cf: ("done", "leftover"), 10)
+        _pre = dict(_hp.btc_open.get("B4A1") or {})
+        _hp._btc_forward_result("B4A1", "done", _w2, 111)
+        _hp._btc_forward_result("B4A1", "done", _then, 111)
+        _n0 = len(_hpj)
+        _open_window(_hp)
+        _hp.btc_tick(look=_look_returning("confirmed", conf=_LA))
+    check(f"a hold for good, then {_why}: the next look asks about the "
+          f"money again", _pre.get("held_conf") == _LA
+          and "held_until" not in _pre and len(_hpj) == _n0 + 1)
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _drive_safe(_c, _hp, _hpj, _a_from(1),
+                lambda n, cf: ("done", "leftover"), 10)
+    _c.t += 2.5 * _HR                  # the forwarded look's stamp: 9 h
+    _hp._btc_forward_result("B4A1", "done", "returned", 111)
+    _c.t += 600
+    _n0 = len(_hpj)
+    _hp.btc_tick(look=_look_returning("confirmed", conf=_LA))
+    _started = len(_hpj) == _n0 + 1
+    _c.t += 600
+    _hp._btc_forward_result("B4A1", "done", "leftover", 111)
+    _hre = _hp.btc_open.get("B4A1") or {}
+    _hru = _hre.get("held_until")
+    _hrcalls = []
+    _c.t += 600
+    _hp.btc_tick(look=_look_returning("confirmed", conf=_LA,
+                                      calls=_hrcalls))
+check("a hold for good, then `returned`: watched as money seen and started "
+      "from there, and ITS `leftover` is a first one -- a while, then one "
+      "more ask", _started and _hre.get("state") == "forwarded"
+      and _hre.get("held_conf") == _LA and _hru is not None)
+check("...and that start's windows count from ITS look: no look at once "
+      "after the answer, the forwarded look's stamp moved to the start",
+      _hrcalls == [])
+# ...AND A BARE `forwarded` TO THAT START FROM `seen` starts a fresh clock
+# (it is a forward this end has just heard went out), and its while counts
+# from the start: the forward's old clock would forget the entry at 48 h
+# from the FIRST forward, with money that came back since still owed a look.
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _drive_safe(_c, _hp, _hpj, _a_from(1),
+                lambda n, cf: ("done", "leftover"), 10)
+    _c.t += 2.5 * _HR
+    _hp._btc_forward_result("B4A1", "done", "returned", 111)
+    _c.t += 600
+    _hp.btc_tick(look=_look_returning("confirmed", conf=_LA))
+    _hbs_at = _c.t
+    _c.t += 600
+    _hp._btc_forward_result("B4A1", "done", "forwarded", 111)
+    _hbe = dict(_hp.btc_open.get("B4A1") or {})
+    _hbn = _c.t
+check("a bare `forwarded` to a start made from `seen`: held from that "
+      "start's look for two windows, and the forward's clock starts now",
+      _hbe.get("state") == "forwarded" and _hbe.get("held_conf") == _LA
+      and _hbe.get("sent_at") == _hbn
+      and _hbe.get("held_until") == _hbs_at + 2 * _hp.btc_recheck_s)
+# A START STAMPED IN THE FUTURE (a clock stepped back since: a Pi has no
+# clock of its own until the network sets it) does not stretch the while.
+with _PinnedClock() as _c:
+    _hp, _hps, _hpj = _held_pager()
+    _c.t += 3 * _HR
+    _hp.btc_tick(look=_look_returning("confirmed", conf=_LA))
+    _hp.btc_open["B4A1"]["start_at"] = _c.t + 30 * 86400
+    _hp._btc_forward_result("B4A1", "done", "leftover", 111)
+    _hfu = float((_hp.btc_open.get("B4A1") or {}).get("held_until") or 0)
+    _hfn = _c.t
+check("a start stamped in the future: the while counts from now instead",
+      len(_hpj) == 1 and 0 < _hfu <= _hfn
+      + getattr(_hp, "LEFTOVER_WINDOWS", 2) * _hp.btc_recheck_s + 1)
+# THE ENTRY'S CLOCK AND A TIMED HOLD, directly: past the forward's 48 h an
+# entry whose hold still owes its ask is kept -- until HOLD_SLACK_WINDOWS
+# after the while -- and one held for good is forgotten at once.
 _lx, _lxj = _fwd_look_started()
 _lx._btc_forward_result("B4A1", "done", "leftover", 111)
+_lx.btc_open["B4A1"]["sent_at"] = (time.time()
+                                   - pg.proto.DEPOSIT_PLACE_TTL_S - 1)
+_lx.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("a timed hold past the forward's clock: KEPT, its ask still owed",
+      "B4A1" in _lx.btc_open and len(_lxj) == 1)
+_lx_kept = "B4A1" in _lx.btc_open
+_lx.btc_open.setdefault("B4A1", {"state": "gone"})["held_until"] = (
+    time.time() - getattr(_lx, "HOLD_SLACK_WINDOWS", 2) * _lx.btc_recheck_s
+    - 1)
+_lx.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...and forgotten once the slack after the while has passed",
+      _lx_kept and "B4A1" not in _lx.btc_open)
+_lx, _lxj = _fwd_look_started()
+_lx._btc_forward_result("B4A1", "done", "leftover", 111)
+_lx.btc_open["B4A1"].pop("held_until", None)          # held for good
 _lx.btc_open["B4A1"]["sent_at"] = (time.time()
                                    - pg.proto.DEPOSIT_PLACE_TTL_S - 1)
 _lx.btc_tick(look=_look_returning("confirmed", conf=100000))
@@ -6699,8 +7088,8 @@ check("...and a held entry EXPIRES on the forward's own clock (every answer "
       and len(_lxj) == 1)
 # A BARE `forwarded` TO THIS END'S OWN START: an old vault's word for it, or
 # a vault whose server has not seen the money this end's has. Held for a
-# doubling while, not for good -- a lagging server catches up, and a hold
-# without end would strand money it had not seen yet.
+# doubling while first -- a lagging server catches up, and a hold without
+# end would strand money it had not seen yet.
 _lb, _lbj = _fwd_look_started()
 _lbe = _lb.btc_open["B4A1"]
 _lb_sent_at = _lbe.get("sent_at")
@@ -6731,27 +7120,7 @@ _lb._btc_forward_result("B4A1", "done", "sent", 111)
 check("...and a forward that went out clears every hold",
       len(_lbj) == 3 and _lbe["state"] == "sent"
       and not any(k in _lbe for k in ("held_conf", "held_until",
-                                      "held_tries")))
-# `leftover` ANSWERING A START THIS END DID NOT MAKE (the recheck of a
-# forward that mined meanwhile): no total to hold yet, so the next look's.
-_lr, _lrs, _lrj = _watch_pager()
-_lr.btc_servers = [("s.onion", 50002, None)]
-_lr.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
-_lr.limits.headroom = lambda: 9
-_lr._btc_forward_result("B4A1", "done", "sent", 111)
-_lr._btc_forward_result("B4A1", "done", "leftover", 111)
-_lre = _lr.btc_open["B4A1"]
-check("a `leftover` answer to a recheck: forwarded, the hold to be taken at "
-      "the next look", _lre["state"] == "forwarded"
-      and _lre.get("held_conf") == -1)
-for _ in range(3):
-    _open_window(_lr)
-    _lr.btc_tick(look=_look_returning("confirmed", conf=100000))
-check("...the next look takes the hold on what it sees and starts nothing, "
-      "nor do the ones after", _lre.get("held_conf") == 100000
-      and _lrj == [])
-check("/balance names a forwarded deposit whose returned money stays there",
-      "some came back and stays there" in _lr._btc_balance_text(111))
+                                      "held_tries", "leftover_once")))
 _ln, _lns, _lnj = _watch_pager()
 _ln.btc_open.pop("B4A1", None)
 _ln._btc_forward_result("B4A1", "done", "leftover", 111)
