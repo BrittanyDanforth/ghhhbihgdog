@@ -111,6 +111,16 @@ def with_owner(params):
     return params
 
 
+# THIS PROCESS'S OWN WALLET-RPC ENDPOINT (never dialled: every wallet call
+# here is injected). The vault's run guard is an abstract socket keyed on
+# the endpoint -- one namespace for the whole machine -- and it probes by
+# binding the name. On the stock 127.0.0.1:18083, two suites run in
+# parallel read each other's probe, or test_concurrency's hold, as "a mix
+# is running": a refused job, red on a parallel run and green alone.
+_PID_PORT = 30000 + os.getpid() % 20000
+_RPC_EP = f"http://127.0.0.1:{_PID_PORT + 2}"
+
+
 def new_env(job="receive_and_quote", params=None):
     """A scratch vault: keyfile, artifact dir, and a doorbell holding one job."""
     d = Path(tempfile.mkdtemp(prefix="wakeagent_"))
@@ -119,7 +129,7 @@ def new_env(job="receive_and_quote", params=None):
            "peer_public": PI.public_key.encode().hex(),
            "doorbell_url": "http://10.0.0.9:8770",
            "tor_proxy": "socks5h://127.0.0.1:9050",
-           "rpc_primary": "http://127.0.0.1:18083",
+           "rpc_primary": _RPC_EP,
            "artifact_dir": str(d),
            "account_ceiling": 45}
     kf = d / "tp.key"
@@ -600,7 +610,11 @@ check("...and AFTER the job, not instead of it", order == ["job", "power_off"])
 # same machine -- and watch ends first and powers it off mid-mix.
 print("\n-- and whether anybody is here, asked when it is acted on --")
 _lg_dir = Path(tempfile.mkdtemp(prefix="lateguard_"))
-_LG_RPC = "http://127.0.0.1:18083"
+# A PORT OF THIS PROCESS'S OWN (see test_concurrency's _EP): the lock held
+# below is machine-wide, and on the stock endpoint it refused every other
+# suite's vault run for as long as it was held.
+_LG_PORT = _PID_PORT
+_LG_RPC = f"http://127.0.0.1:{_LG_PORT}"
 A._LATE_GUARD["dir"] = _lg_dir
 A._LATE_GUARD["rpc"] = _LG_RPC
 check("late: an empty machine says nobody is here",
@@ -632,7 +646,8 @@ check("late: ...and it is released when the mix ends, with nothing to delete",
 # KEYED ON THE WALLET, not on the machine: two runs against different
 # wallet-rpc endpoints are independent, which is the claim the refusal makes.
 _lg_other = _gsc_pat._scope_lock(
-    _gsc_pat.rpc_lock_scope("http://127.0.0.1:18099"), "GhostSpiral")
+    _gsc_pat.rpc_lock_scope(f"http://127.0.0.1:{_LG_PORT + 1}"),
+    "GhostSpiral")
 try:
     check("late: a mix against a DIFFERENT wallet does not hold this box up",
           A.somebody_is_here() == "")
@@ -658,7 +673,7 @@ check("late: ...and disarms the deadman when it refuses, so the timer does "
 # anyway, because they set _LATE_GUARD by hand. This one drives preflight.
 A._LATE_GUARD.clear()
 _pf_dir = Path(tempfile.mkdtemp(prefix="pfguard_"))
-_pf_key = {"rpc_primary": "http://127.0.0.1:18083",
+_pf_key = {"rpc_primary": _LG_RPC,
            "tor_proxy": "socks5h://127.0.0.1:9050",
            "artifact_dir": str(_pf_dir), "account_ceiling": 45}
 _pf_probes = {"unit_is_active": lambda u: True,
@@ -671,7 +686,7 @@ except Exception:                                            # noqa: BLE001
     pass
 check("late: preflight records the wallet-rpc endpoint from the KEYFILE, not "
       "from the stub dict, or the lock half never runs in production",
-      A._LATE_GUARD.get("rpc") == "http://127.0.0.1:18083")
+      A._LATE_GUARD.get("rpc") == _LG_RPC)
 # ...AND preflight ITSELF REFUSES when a mix holds that wallet, which is the
 # check that has never once been true: it read artifact_dir/".ghostspiral.lock"
 # and GhostSpiral locks a path relative to cwd.
@@ -1255,7 +1270,7 @@ print("\n== the job whitelist is unreachable from a note ==")
 # job instead.
 _argvs = []
 _k = {"tor_proxy": "socks5h://127.0.0.1:9050",
-      "rpc_primary": "http://127.0.0.1:18083", "amount_ladder": ["0.01"],
+      "rpc_primary": _RPC_EP, "amount_ladder": ["0.01"],
       # The spending job refuses to compose without this -- see "the spending
       # job can actually sign" below. A fixture missing it made the whole
       # sweep-over-JOBS loop raise instead of reporting, which is the
@@ -1380,7 +1395,7 @@ def _ledger_env(prefix, spent_rc=0, acct=9, sub=4):
     _b.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
                               "address": _XMR_SAMPLE, "account_index": acct,
                               "subaddress_index": sub,
-                              "rpc_endpoint": "http://127.0.0.1:18083"}))
+                              "rpc_endpoint": _RPC_EP}))
     _s = _d / "thor_pairs_A3F1.json"
     _s.write_text("{}")
     (_d / A.HANDLES_FILE).write_text(json.dumps(
@@ -1458,7 +1473,7 @@ def _reuse_env(prefix, acct=7, sub=2, new_pair=(8, 1)):
     _b.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
                               "address": _XMR_SAMPLE, "account_index": acct,
                               "subaddress_index": sub,
-                              "rpc_endpoint": "http://127.0.0.1:18083"}))
+                              "rpc_endpoint": _RPC_EP}))
     (_d / A.HANDLES_FILE).write_text(json.dumps(
         {"A01D": {"bundle": str(_b), "slip": None, "minted": 1}}))
     _runs = []
@@ -1470,7 +1485,7 @@ def _reuse_env(prefix, acct=7, sub=2, new_pair=(8, 1)):
                 {"schema": "gs_receive_wallet_v1", "address": _XMR_SAMPLE,
                  "account_index": new_pair[0],
                  "subaddress_index": new_pair[1],
-                 "rpc_endpoint": "http://127.0.0.1:18083"}))
+                 "rpc_endpoint": _RPC_EP}))
         return 0, False
     return _d, _b, _runs, _runner
 
@@ -2201,7 +2216,7 @@ check("minout: ...because a cut below its spend cost is WAIVED and the mix "
 # A floor computed and never put on the argv is the "declared in one place,
 # never wired to the thing that runs" shape this repo keeps finding.
 _mo_base = {"tor_proxy": "socks5h://127.0.0.1:9050",
-            "rpc_primary": "http://127.0.0.1:18083",
+            "rpc_primary": _RPC_EP,
             "rpc_daemon": "http://127.0.0.1:18081",
             "artifact_dir": "/var/lib/ghostspiral"}
 for _lbl, _mok, _want in (
@@ -2341,8 +2356,20 @@ try:
     class _LvRpc:
         def raw_request(self, m, p=None):
             _lv_calls.append((m, dict(p or {})))
-            return {"balance": 1_500_000_000_000,
-                    "unlocked_balance": 1_000_000_000_000}
+            # Two subaddresses unlocking: 0.4 and 0.3 XMR. Summed they are
+            # 0.7; the next withdrawal takes ONE of them.
+            return {"balance": 1_700_000_000_000,
+                    "unlocked_balance": 1_000_000_000_000,
+                    "per_subaddress": [
+                        {"account_index": 1, "address_index": 1,
+                         "balance": 1_000_000_000_000,
+                         "unlocked_balance": 1_000_000_000_000},
+                        {"account_index": 2, "address_index": 1,
+                         "balance": 400_000_000_000,
+                         "unlocked_balance": 0},
+                        {"account_index": 3, "address_index": 2,
+                         "balance": 300_000_000_000,
+                         "unlocked_balance": 0}]}
     # _locked_value imports connect_rpc from gs_common at call time, so the
     # module attribute is what to stand in for.
     _lv_saved_connect = _gsc_pat.connect_rpc
@@ -2351,14 +2378,49 @@ try:
         _lv = A._locked_value({"rpc_primary": "x", "tor_proxy": ""})
     finally:
         _gsc_pat.connect_rpc = _lv_saved_connect
-    check("chain: the locked figure is balance minus unlocked across every "
-          "account, in XMR",
-          _lv == _GS.Decimal("0.5")
+    check("chain: the still-unlocking figure is the LARGEST single "
+          "subaddress unlocking (0.4), not the sum (0.7): the withdrawal it "
+          "invites takes one entry (the vault review, rule 2)",
+          _lv == _GS.Decimal("0.4")
           and _lv_calls == [("get_balance", {"account_index": 0,
                                              "all_accounts": True})])
 finally:
     A._funded_entry = _ml_saved
 
+# UNLOCKED DUST DOES NOT HIDE A DEPOSIT STILL UNLOCKING (the vault review):
+# the unlocking figure was asked only when NOTHING was unlocked, so a
+# returning client's leftover under the floor made a finished withdrawal
+# say "nothing more" about four XMR a few blocks from spendable.
+_md_d = Path(tempfile.mkdtemp(prefix="md_"))
+A._save_handles(_md_d, {}, {OWNER: {"accounts": [7, 9]}})
+_md_saved = (A._funded_entry, A._locked_value, A._more_floor)
+try:
+    A._more_floor = lambda key, depth: _GS.Decimal("0.1")
+    A._locked_value = lambda key, owned_accounts=None: _GS.Decimal("4")
+    A._funded_entry = lambda key, owned_accounts=None: (
+        7, 1, _XMR_SAMPLE, 2 * 10 ** 9)
+    _md_dust = A._phase_of("withdraw", _md_d, key={}, status="done",
+                           owner=OWNER, depth=1)
+    A._funded_entry = lambda key, owned_accounts=None: None
+    _md_none = A._phase_of("withdraw", _md_d, key={}, status="done",
+                           owner=OWNER, depth=1)
+    A._locked_value = lambda key, owned_accounts=None: _GS.Decimal("0.01")
+    A._funded_entry = lambda key, owned_accounts=None: (
+        7, 1, _XMR_SAMPLE, 2 * 10 ** 9)
+    _md_small = A._phase_of("withdraw", _md_d, key={}, status="done",
+                            owner=OWNER, depth=1)
+finally:
+    A._funded_entry, A._locked_value, A._more_floor = _md_saved
+check("a finished withdrawal with 0.002 XMR unlocked (under the floor) and "
+      "4 XMR still unlocking says `more_locked`, as it does with no dust",
+      _md_dust == "more_locked" and _md_none == "more_locked")
+check("NON-VACUITY: dust unlocked and dust unlocking is nothing more",
+      _md_small == "")
+
+check("the words the vault puts on a refusal are the protocol's refusal "
+      "words and no others (one set, read by the by-hand doorbell too)",
+      set(A._REFUSAL_PHASE.values())
+      == set(getattr(P, "REFUSAL_PHASES", ())))
 # THE BUDGET IS SIZED FROM THE DEEPEST ROW, so adding a fourth depth without
 # raising the budget goes red here rather than in production at hour thirteen.
 _deepest = max(_t for _w, _t in P.WITHDRAW_DEPTHS.values())
@@ -3031,7 +3093,7 @@ check("fee: pairing refuses the same address given twice",
 # roughly one withdrawal in N drew the colliding one and died while the rest
 # worked.
 print("\n-- withdrawing to an address the cut is also paid to --")
-_FK = {"tor_proxy": "socks5h://x", "rpc_primary": "http://127.0.0.1:18083",
+_FK = {"tor_proxy": "socks5h://x", "rpc_primary": _RPC_EP,
        "rpc_daemon": "http://127.0.0.1:18081", "wallet_file": "/w",
        "allow_withdraw": True, "usage_fee_addresses": _FA}
 
@@ -3196,7 +3258,7 @@ _wallet = ([[_sub(0, 0.0, "user-entry")]] + [[] for _ in range(8)]
            + [[_sub(2, 0.44, "operator-cut-from-the-desk")]])
 try:
     _gc.connect_rpc = lambda *a, **k: _FeeWallet(_wallet)
-    _fk = {"rpc_primary": "http://127.0.0.1:18083", "tor_proxy": ""}
+    _fk = {"rpc_primary": _RPC_EP, "tor_proxy": ""}
     _picked = A._funded_entry(_fk)
     check("fee: a cut minted at the DESK is what the next woken withdrawal "
           "picks up, because _funded_entry knows only 'largest unlocked'",
@@ -3218,9 +3280,12 @@ check("fee: pairing warns when a phone may spend from a wallet and no "
       "off-wallet destination is named",
       "if args.allow_withdraw and not (args.usage_fee_address or []):"
       in _kp_src)
-check("fee: ...and says both consequences, not just the missing fee",
+check("fee: ...and says both consequences, not just the missing fee -- and "
+      "the second truthfully: with owner sets an old desk cut is nobody's, "
+      "left for the desk, never picked up by a chat withdrawal",
       "takes NO usage fee" in _kp_src
-      and "will pick it up and send it to" in _kp_src)
+      and "It is nobody's to withdraw from the chat" in _kp_src
+      and "will pick it up and send it to" not in _kp_src)
 check("fee: ...and it is a warning, not a refusal -- taking no fee is a "
       "legitimate choice and forcing an address to silence a warning is worse",
       "or continue if you meant to take no fee" in _kp_src
@@ -3298,7 +3363,7 @@ shutil.rmtree(_pk_dir, ignore_errors=True)
 # withdrawal completed, the fee account WAS the largest output, so the next
 # /withdraw -- which the pager itself suggests -- mixed the operator's
 # revenue and paid it to the address the chat named. It waives now.
-_fee_key = {"rpc_primary": "http://127.0.0.1:18083",
+_fee_key = {"rpc_primary": _RPC_EP,
             "rpc_daemon": "http://127.0.0.1:18081",
             "tor_proxy": "socks5h://127.0.0.1:9050",
             "wallet_file": "/w", "artifact_dir": "/tmp",
@@ -4197,7 +4262,7 @@ check("report: every call site hands the sleep dependency through, so the "
 print("\n== the fee wallet and its sweep ==")
 _FS_ADDR = "8" + "a" * 94
 _FS_TO = ["4" + "b" * 94, "4" + "c" * 94]
-_FS_KEY = {"rpc_primary": "http://127.0.0.1:18083",
+_FS_KEY = {"rpc_primary": _RPC_EP,
            "rpc_daemon": "http://127.0.0.1:18081",
            "tor_proxy": "socks5h://127.0.0.1:9050",
            "fee_rpc": "http://127.0.0.1:18085", "fee_wallet_file": "/w/fee",
@@ -4232,6 +4297,24 @@ check("sweep/config: a depth the protocol does not have, a non-positive "
       and _cfg_refused(fee_sweep_min_xmr="0") == "fee_sweep_misconfigured"
       and _cfg_refused(fee_sweep_min_xmr="lots") == "fee_sweep_misconfigured"
       and _cfg_refused(fee_address="") == "fee_sweep_misconfigured")
+# A SWITCH THAT MOVES MONEY IS A BOOLEAN, NEVER COERCED (the vault review):
+# bool("false") and bool("no") are True, and a hand edit meant as "off" ran
+# the fee wallet's mix on every boot the doorbell did not answer. And a
+# depth of `true` read as depth 1 (True == 1, and hashes as 1).
+check("sweep/config: an idle-boot switch that is not a boolean -- the "
+      "strings 'false', 'no' and '' and the number 1 -- is REFUSED, never "
+      "read as on or off",
+      all(_cfg_refused(fee_sweep_on_idle_boot=_v) == "fee_sweep_misconfigured"
+          for _v in ("false", "no", "", 1)))
+check("NON-VACUITY: true is on, false is off, absent is off",
+      A.fee_sweep_config(dict(_FS_KEY, fee_sweep_on_idle_boot=True))
+      ["on_idle_boot"] is True
+      and A.fee_sweep_config(dict(_FS_KEY, fee_sweep_on_idle_boot=False))
+      ["on_idle_boot"] is False
+      and A.fee_sweep_config(_FS_KEY)["on_idle_boot"] is False)
+check("sweep/config: a depth of `true` is refused, not read as depth 1",
+      _cfg_refused(fee_sweep_depth=True) == "fee_sweep_misconfigured"
+      and A.fee_sweep_config(dict(_FS_KEY, fee_sweep_depth=1))["depth"] == 1)
 check("sweep/config: a sweep aimed at the fee address itself is refused -- "
       "it would go round in a circle",
       _cfg_refused(fee_sweep_to=[_FS_ADDR, _FS_TO[0]])
@@ -4912,6 +4995,7 @@ check("pairing/fee: any one of the three without the others is refused",
       and "go together" in (_pairs_fee(["--fee-sweep-to", _FS_TO[0]]) or ""))
 check("pairing/fee: a fee wallet-rpc that is the mixing wallet-rpc is refused",
       "same wallet-rpc" in (_pairs_fee(
+          # the pairing's own default --rpc, which this pair is left on
           ["--fee-rpc", "http://127.0.0.1:18083", "--fee-wallet-file",
            _fw_file, "--fee-sweep-to", _FS_TO[0]]) or ""))
 check("pairing/fee: a fee wallet file that is the mixing wallet file is refused",
@@ -5494,6 +5578,52 @@ check("a quote-less record's stand-in (the plan it superseded) still counts "
 check("NON-VACUITY: with the stand-in's own quote absent too, nothing "
       "stands in", _pairs_x(_R5, [dict(_S3, expected_xmr=None), _W, _R1])
       == Decimal("0.8123"))
+# ...AND A PART OF THE RECORD THAT CAME BACK COMES OUT OF ITS STAND-IN (the
+# review of 657deae): the refund names the record, and the stand-in was
+# looked up under its own txid -- the whole quote counted for a record
+# ThorChain refunded half of.
+# (A million sat each, the record and the plan it superseded spending the
+# same money: half of a smaller forward is inside the slack of a FULL
+# refund, which drops the record whole -- a different branch.)
+_RFW = {"txid": "5e" * 32, "vout": 0, "value": 500000, "of": "99" * 32,
+        "verified": True, "full": False, "outbound_fee_sat": 0}
+_Wm = dict(_W, send_sat=1000000)
+_S3m = dict(_S3, send_sat=1000000)
+check("(the fixture) a million sat back of a million: FULL -- the record "
+      "and its stand-in drop out, P1 + P5",
+      _pairs_x(_R5, [dict(_S3m, refunds=[dict(_RFW, value=1000000)]), _Wm,
+                     _R1]) == Decimal("0.8123"))
+check("a quote-less record refunded HALF: its stand-in counts half its "
+      "quote -- P1 + half the stand-in + P5",
+      _pairs_x(_R5, [dict(_S3m, refunds=[_RFW]), _Wm, _R1])
+      == Decimal("0.49365") + Decimal("0.186865") + Decimal("0.31865"))
+check("...and so with the namer CURRENT and the refund on the record's own "
+      "file", _pairs_x(_S3m, [dict(_Wm, refunds=[_RFW])])
+      == Decimal("0.186865"))
+# ...AND THE STAND-IN IS STILL THE PLAN IT IS (the review of that fix): the
+# stand-in renamed to the record's txid dropped itself when the namer was a
+# BUMP of the record (`replaces` = the record) that the record then beat,
+# and ranked as the record over a live re-sign of the same money.
+_Wb = _pq("99", None, "c2", ts=150)
+_Bb = _pq("44", "0.37373", "c2", ts=250, replaces="99" * 32,
+          superseded_by="99" * 32)
+check("a stand-in that is a BUMP of the record it stands for still counts: "
+      "one swap for that money, plus the next forward's",
+      _pairs_x(_R5, [_Bb, _Wb]) == Decimal("0.37373") + Decimal("0.31865"))
+check("...and half of it when the record was refunded half",
+      _pairs_x(_R5, [dict(_Bb, send_sat=1000000),
+                     dict(_Wb, send_sat=1000000, refunds=[_RFW])])
+      == Decimal("0.186865") + Decimal("0.31865"))
+_P0r = _pq("44", "0.40", "c2", ts=100, superseded_by="99" * 32)
+_Rr = _pq("99", None, "c2", ts=150)
+_Er = _pq("e1", "0.35", "c2", ts=300)
+check("a stale stand-in does not outrank a live re-sign of the same money: "
+      "the re-sign's quote counts",
+      _pairs_x(_Er, [_P0r, _Rr]) == Decimal("0.35"))
+check("NON-VACUITY: the same refund named for ANOTHER forward takes nothing "
+      "from the stand-in",
+      _pairs_x(_R5, [dict(_S3m, refunds=[dict(_RFW, of="ee" * 32)]), _Wm,
+                     _R1]) == Decimal("1.18603"))
 # A FORWARD THORCHAIN REFUNDED DOES NOT COUNT (third self-doubt pass): its
 # swap never happened, and expecting its output kept the watcher on
 # "partial" for ever. Only a VERIFIED refund (its money from ThorChain's
@@ -5968,23 +6098,41 @@ for _st, _ph in (("delayed", "delayed"), ("short", "short"),
 
 
 # THE DEPOSIT'S PLACE RUNS FROM THE LATEST SIGN OF ITS MONEY (the review
-# of the stage 4 read): settled and held by today's fee, or come back to
-# be sent on, stamps the record; `seen`, `short` and `not_seen` do not --
-# a stranger's dust on an address in the chat says either of the first
-# two, and must not hold the intake's place.
+# of the stage 4 read): settled and held by today's fee stamps the record;
+# `seen`, `short`, `returned` and `not_seen` do not -- a stranger's dust on
+# an address in the chat says any of the first three (`returned` is any
+# unsettled new output beside a forward of ours: the review of 657deae
+# drove 300 sat to it), and must not hold the intake's place.
 _bucket_now = int(time.time()) // 600 * 600
-for _st in ("delayed", "returned"):
+for _st in ("delayed",):
     _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _st)
     _st_at = _rec_of(_dd).get("btc_money_at")
     check(f"a forward answering '{_st}' stamps the record's money time (a "
           "600 s bucket, now) -- its place is held from here",
           isinstance(_st_at, int) and _st_at % 600 == 0
           and _bucket_now - 600 <= _st_at <= _bucket_now + 600)
-for _st in ("seen", "short", "not_seen"):
+for _st in ("seen", "short", "not_seen", "returned"):
     _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _st)
     check(f"NON-VACUITY: a forward answering '{_st}' stamps nothing",
           (_bb.result or {}).get("status") == "done"
           and "btc_money_at" not in _rec_of(_dd))
+# `delayed` HOLDS THE PLACE UNTIL A FORWARD SAYS OTHERWISE (the residual of
+# the stage 4 review): on a two-day clock, a fee spike that outlasted the
+# Pi's retries -- or a Pi restart, which forgets them -- gave the place away.
+_o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, "delayed")
+check("a forward answering `delayed` marks the record btc_delayed (a 600 s "
+      "bucket)", isinstance(_rec_of(_dd).get("btc_delayed"), int)
+      and _rec_of(_dd)["btc_delayed"] % 600 == 0)
+for _st in ("not_seen", "seen", "short", "returned"):
+    _o, _e, _ran, _dd, _bb = _fwd_run_rc(
+        {**_FWD_REC, "btc_delayed": 1700000400}, _SEND_KEY, 2, _st)
+    check(f"...and a later `{_st}` from a forward of it clears the mark",
+          (_bb.result or {}).get("status") == "done"
+          and "btc_delayed" not in _rec_of(_dd))
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(
+    {**_FWD_REC, "btc_delayed": 1700000400}, _SEND_KEY, _ACC)
+check("...and so does a forward that SENT", _e is None
+      and "btc_delayed" not in _rec_of(_dd))
 _o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC)
 _sent_at = _rec_of(_dd).get("btc_money_at")
 check("a forward that SENT stamps it too, beside forward_sent",
@@ -5996,6 +6144,69 @@ check("NON-VACUITY: a rehearsal (nothing sent) does not -- its first-run "
       "`forwarded` bucket is what counts for it",
       "btc_money_at" not in _rec_of(_dd)
       and isinstance(_rec_of(_dd).get("forwarded"), int))
+
+
+def _fwd_run_over(rec, before, after, state=None, rc=0):
+    """A reconciliation of a SENT handle as it really runs: the plan the
+    last run left (`before`) is on disk when the wake starts, and the fake
+    child rewrites it (`after`) and, with `state`, writes this run's word.
+    Returns the record the ledger holds after."""
+    dd, kk, bb = _fwd_env(rec, _SEND_KEY)
+    (dd / "btc_forward_A3F1.json").write_text(json.dumps(before))
+
+    def child(argv, env_extra, budget):
+        _of = Path(argv[argv.index("--outfile") + 1])
+        _of.write_text(json.dumps(after))
+        if state:
+            _of.with_suffix(".status.json").write_text(
+                json.dumps({"state": state}))
+        return rc, False
+
+    dp = deps_for(dd, bb, extend_deadman=lambda s: True, run_child=child)
+    os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+    try:
+        run(kk, dp)
+    finally:
+        os.environ.pop("GS_BTC_SEED", None)
+    return _rec_of(dd)
+
+
+# A TAP ON A FORWARD THAT MINED LONG AGO IS NOT MONEY IN FLIGHT (the review
+# of 657deae): every "has it arrived?" on a sent handle runs a
+# reconciliation, and each one stamped "now" -- the place held for as long
+# as the client kept asking, after the XMR had landed and left.
+_old_at = _bucket_now - 10 * 86400
+_sentrec = {**_FWD_REC, "forward_sent": True, "forwarded": _old_at,
+            "btc_money_at": _old_at}
+_mined = {**_ACC, "seen_height": 850002}
+_pool = {**_ACC, "seen_height": 0}
+check("a reconciliation of a forward mined BEFORE this run and still mined "
+      "leaves the money time where it was",
+      _fwd_run_over(_sentrec, _mined, _mined).get("btc_money_at") == _old_at)
+check("...and so does one whose only word is `returned` (a stranger's "
+      "unconfirmed dust beside it)",
+      _fwd_run_over(_sentrec, _mined, _mined, "returned", 2)
+      .get("btc_money_at") == _old_at)
+check("NON-VACUITY: the run that FIRST finds it mined stamps now -- the "
+      "swap lands within the grace from here",
+      _fwd_run_over(_sentrec, _pool, _mined).get("btc_money_at")
+      not in (None, _old_at))
+check("NON-VACUITY: a forward of money come back, after a forward that "
+      "mined (the chain's new plan, in the mempool), stamps now",
+      _fwd_run_over(_sentrec, _mined, _pool).get("btc_money_at")
+      not in (None, _old_at))
+check("NON-VACUITY: a forward still in the mempool stamps now",
+      _fwd_run_over(_sentrec, _pool, _pool).get("btc_money_at")
+      not in (None, _old_at))
+check("NON-VACUITY: a mined forward whose replacement today's fee will not "
+      "carry (`delayed`) stamps now",
+      _fwd_run_over(_sentrec, _mined, _mined, "delayed", 2)
+      .get("btc_money_at") not in (None, _old_at))
+_ssup = {"broadcast": True, "broadcast_outcome": "ambiguous",
+         "superseded_by": "ab" * 32, "superseded_height": 850003}
+check("...a plan superseded by a forward of ours that mined counts as "
+      "mined (its own txid never will)",
+      _fwd_run_over(_sentrec, _ssup, _ssup).get("btc_money_at") == _old_at)
 
 
 def _fwd_run_both(rec, key_extra, rc, plan, state):
@@ -6025,6 +6236,13 @@ def _fwd_run_both(rec, key_extra, rc, plan, state):
     return out, err, ran, dd, bb
 
 
+_o, _e, _ran, _dd, _bb = _fwd_run_both(
+    {**_FWD_REC, "forward_sent": True},
+    _SEND_KEY, 2, {**_ACC, "seen_height": 0}, "delayed")
+check("NON-VACUITY: a reconciliation whose OWN word is `delayed` (money "
+      "come back, or a replacement, today's fee would not carry) sets it, "
+      "though a plan was written", isinstance(
+          _rec_of(_dd).get("btc_delayed"), int))
 # A RECONCILIATION'S OWN WORD, OVER A PLAN THAT SAYS THE MONEY MOVED. The
 # real --reconcile refuses with `returned` (money came back, not settled)
 # or `delayed` (a replacement, or a fresh forward of returned money, that
@@ -6364,7 +6582,17 @@ check("...and the M3 reply carries NO slip and NO plain for a done forward "
       and _bb.result.get("slip") == "" and _bb.result.get("plain") == {})
 _pf = _dd / "btc_forward_A3F1.json"
 _pf.write_text("{}")
-A._retire_files({"forward_plan": str(_pf)})
+def _retire2(rec, artifact_dir):
+    """_retire_files as it is called now (record, artifact dir); a build
+    whose one-argument form is all it has is asked that way, so its
+    answer -- not a TypeError -- is what the checks below read."""
+    try:
+        return A._retire_files(rec, artifact_dir)
+    except TypeError:
+        return A._retire_files(rec)
+
+
+_retire2({"forward_plan": str(_pf)}, _dd)
 check("_retire_files takes the forward plan with the handle's other files "
       "for a record with no deposit address of the host's",
       not _pf.exists())
@@ -6372,8 +6600,8 @@ _pf.write_text("{}")
 _sl, _bd = _dd / "thor_pairs_A3F1.json", _dd / "wallet_fwd_A3F1.json"
 _sl.write_text("{}")
 _bd.write_text("{}")
-A._retire_files({"forward_plan": str(_pf), "slip": str(_sl),
-                 "bundle": str(_bd), "btc_index": 3})
+_retire2({"forward_plan": str(_pf), "slip": str(_sl),
+                 "bundle": str(_bd), "btc_index": 3}, _dd)
 check("...but an INTAKE record's forward plan STAYS when its slip goes: "
       "the chain is what a later return to the host's own address is "
       "reconciled by (the MED pass after the deep read)",
@@ -6433,6 +6661,73 @@ _BK = {**_k4, "btc_account_xpub": _ZPUB, "btc_electrum": ["s.onion"],
 _SHARED_IN = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 _MEMO4 = "=:XMR.XMR:" + _XMR_SAMPLE + ":0/1/0"
 
+# AN UNDELIVERED INTAKE DEPOSIT IS RELEASED ONLY ONCE ITS BTC ADDRESS IS
+# FRESH (the review of 657deae): its client pays the BTC address, nothing
+# reaches the subaddress until a forward runs, and the Pi does not watch a
+# deposit whose pay message it saw fail -- so a record released on "the
+# chat never got it" met an empty subaddress and gave its place away while
+# the client's BTC sat on the address.
+
+
+def _rel_intake(unused, rec_extra=None, key=None):
+    _d = Path(tempfile.mkdtemp(prefix="relbtc_"))
+    _rec = {"bundle": str(_d / "w.json"), "slip": str(_d / "s.json"),
+            "owner": OWNER, "btc_index": 1, **(rec_extra or {})}
+    A._save_handles(_d, {"A3F1": _rec}, {})
+    _asked = []
+
+    def _u(addr):
+        _asked.append(addr)
+        if isinstance(unused, Exception):
+            raise unused
+        return unused
+    try:
+        _r = A._release_undelivered(_d, "A3F1", OWNER,
+                                    key=_BK if key is None else key,
+                                    unused=_u)
+    except TypeError:
+        # A build whose release takes no key: asked as it is, so its
+        # answer -- not a TypeError -- is what the checks read.
+        _r = A._release_undelivered(_d, "A3F1", OWNER)
+    return (_r, A._load_ledger(_d)["handles"]["A3F1"].get("released"),
+            _asked)
+
+
+_r, _rl, _ak = _rel_intake(True)
+check("an undelivered intake deposit whose BTC address the network says was "
+      "never used IS released -- and the address asked is its own",
+      _r is True and isinstance(_rl, int) and _ak == [_ADDR[1]])
+_r, _rl, _ak = _rel_intake(False)
+check("...one whose address HAS been used (the client paid; the message did "
+      "reach them) is NOT: it keeps its place", _r is False and not _rl
+      and _ak == [_ADDR[1]])
+_r, _rl, _ak = _rel_intake(OSError("tor down"))
+check("...nor one whose address nobody could be asked about",
+      _r is False and not _rl)
+_r, _rl, _ak = _rel_intake(True, key={k: v for k, v in _BK.items()
+                                      if k != "btc_account_xpub"})
+check("...nor on a keyfile with no account xpub to derive it (nothing "
+      "asked)", _r is False and not _rl and _ak == [])
+_r, _rl, _ak = _rel_intake(True, rec_extra={"btc_chain": "0" * 16})
+check("...nor a record of another account's chain (nothing asked: this "
+      "pair would ask about an address nobody paid)",
+      _r is False and not _rl and _ak == [])
+A._STOP_SIGNAL["term"] = True
+try:
+    try:
+        _rs = _rel_intake(True)
+        _rs_stopped = False
+    except A.Stopping:
+        _rs_stopped = True
+finally:
+    A._STOP_SIGNAL["term"] = False
+check("...and a stop asked for asks nobody: the look is not started past "
+      "systemd's stop (a Tor circuit's wait, and the SIGKILL twenty seconds "
+      "behind it)", _rs_stopped)
+_r, _rl, _ak = _rel_intake(True, rec_extra={"btc_index": None})
+check("NON-VACUITY: a record OFF the intake is released without asking",
+      _r is True and isinstance(_rl, int) and _ak == [])
+
 
 def _btc_env(prefix, handles=None):
     d = Path(tempfile.mkdtemp(prefix=prefix))
@@ -6444,10 +6739,14 @@ def _btc_env(prefix, handles=None):
     def runner(argv, env_extra, budget_s):
         runs.append(list(argv))
         if "create_receive_wallet" in " ".join(argv):
+            # A FRESH ACCOUNT PER MINT, as create_receive_wallet makes one
+            # (create_fresh_account): 8 for the first, then 9, 10...
+            # Every deposit on account 8 was a wallet going backwards,
+            # which the deposit now refuses (the vault review, rule 8).
             (d / f"wallet_new_{len(runs)}.json").write_text(json.dumps(
                 {"schema": "gs_receive_wallet_v1", "address": _XMR_SAMPLE,
-                 "account_index": 8, "subaddress_index": len(runs),
-                 "rpc_endpoint": "http://127.0.0.1:18083"}))
+                 "account_index": 7 + len(runs), "subaddress_index": 1,
+                 "rpc_endpoint": _RPC_EP}))
         if "thor_swap_preparer" in " ".join(argv):
             Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps([{
                 "schema": "thor_pairs_v1", "btc_in": "0.05",
@@ -7156,7 +7455,7 @@ _b5e = _d5e / "wallet_old.json"
 _b5e.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
                             "address": _XMR_SAMPLE, "account_index": 8,
                             "subaddress_index": 1,
-                            "rpc_endpoint": "http://127.0.0.1:18083"}))
+                            "rpc_endpoint": _RPC_EP}))
 _, _runs5e, _run5e = _btc_env("btc5e_unused_")
 (_d5e / A.HANDLES_FILE).write_text(json.dumps({"handles": {
     "A0A0": {"bundle": str(_b5e), "minted": 1, "btc_index": 5,
@@ -7809,7 +8108,7 @@ _S8_PI = P.derive_state_half(PI.encode().hex())
 #: The argv a real vault pairing takes. Up here because two sections use
 #: it: the driven pairing below, and the idle-boot refusal before it.
 _PAIR_ARGV = ["pair", "--artifact-dir", "/var/lib/gs",
-              "--rpc", "http://127.0.0.1:18083",
+              "--rpc", _RPC_EP,
               "--btc-xpub", _BTC_XPUB_OK, "--allow-btc-forward",
               "--btc-electrum", "s.onion", "--thornode", "https://tn.example",
               "--op-return-max-bytes", "140", "--deposit-in-chat"]
@@ -8033,7 +8332,7 @@ check("halfless: a sealed store beside a keyfile with no half refuses "
 # THE HAND PATHS. Both boots that have no note -- the fee sweep and the
 # recovery CLI -- take the half on argv, and refuse clearly without it.
 _hd, _hkf, _hkey, _, _, _hinner = _stage8_env(
-    extra={"fee_rpc": "http://127.0.0.1:18083",
+    extra={"fee_rpc": _RPC_EP,
            "fee_wallet_file": "/tmp/fee.wallet",
            "fee_address": "9" + "f" * 94,
            "fee_sweep_to": ["9" + "e" * 94]})
@@ -8056,7 +8355,7 @@ check("stage8: ...and _by_hand with the right half opens it, so the flag "
               {"settings.json": json.dumps(_hinner, sort_keys=True)},
               bytes.fromhex(_SEAL_HALF), _S8_PI,
               schema=P.SETTINGS_SCHEMA)})),
-          _S8_PI.hex(), "a test")["fee_rpc"] == "http://127.0.0.1:18083")
+          _S8_PI.hex(), "a test")["fee_rpc"] == _RPC_EP)
 _ubuf = io.StringIO()
 with contextlib.redirect_stdout(_ubuf):
     _urc = A.unseal_key_cli(types.SimpleNamespace(
@@ -8181,7 +8480,7 @@ _ks_payload = {"role": "thinkpad", "secret": TP.encode().hex(),
                "peer_public": PI.public_key.encode().hex(),
                "doorbell_url": "http://10.0.0.9:8770",
                "artifact_dir": "/var/lib/gs", "tor_proxy": "socks5h://x:9050",
-               "rpc_primary": "http://127.0.0.1:18083",
+               "rpc_primary": _RPC_EP,
                "state_half": _SEAL_HALF, **_S8_SETTINGS}
 _ks_out = _K._seal_settings(dict(_ks_payload), _S8_PI.hex())
 check("stage8: the PAIRING's own seal is opened by the AGENT's own reader, "
@@ -9075,13 +9374,13 @@ _ospent7 = []
 _o_rf7 = A._retire_files
 
 
-def _rf7(rec):
+def _rf7(rec, *a):
     try:
         _ospent7.append(json.loads((_od7 / A.HANDLES_FILE).read_text())[
             "handles"]["A3F1"].get("spent"))
     except Exception:                                        # noqa: BLE001
         _ospent7.append("unreadable")
-    return _o_rf7(rec)
+    return _o_rf7(rec, *a)
 
 
 A._retire_files = _rf7
@@ -9204,7 +9503,7 @@ def _legacy_run(wallet, plans=None, pair=(9, 4), bundle_exists=False):
         _bp.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
                                    "address": _XMR_SAMPLE,
                                    "account_index": 9, "subaddress_index": 4,
-                                   "rpc_endpoint": "http://127.0.0.1:18083"}))
+                                   "rpc_endpoint": _RPC_EP}))
     rec = {**_FWD_REC, "bundle": str(_bp), "spent": True,
            "forward_sent": True, "slip": None}
     if pair is not None:
@@ -9287,10 +9586,21 @@ _nb5 = _ld5 / "wallet_nb5.json"
 _nb5.write_text("{}")
 _ns5 = _ld5 / "thor_pairs_nb5.json"
 _ns5.write_text("{}")
-A._retire_files({"bundle": str(_nb5), "slip": str(_ns5)})
+_retire2({"bundle": str(_nb5), "slip": str(_ns5)}, _ld5)
 check("stage5/late: NON-VACUITY -- a paid-out record with no deposit address "
       "of the host's still has its bundle shredded with its slip",
       not _nb5.exists() and not _ns5.exists())
+# ...AND ONLY INSIDE THE ARTIFACT DIRECTORY, as the heal (the vault review,
+# a guard on one side of a boundary): a record naming a path elsewhere had
+# it shredded by the withdrawal's cleanup while the heal refused it.
+_out5 = Path(tempfile.mkdtemp(prefix="elsewhere_")) / "not_ours.json"
+_out5.write_text("{}")
+_in5 = _ld5 / "thor_pairs_in5.json"
+_in5.write_text("{}")
+_retire2({"bundle": str(_out5), "slip": str(_in5)}, _ld5)
+check("a paid-out record naming a file OUTSIDE the artifact directory: that "
+      "file is left alone, the one inside still goes",
+      _out5.exists() and not _in5.exists())
 
 
 # ===========================================================================
@@ -9528,7 +9838,7 @@ check("stage8/dry: with NO doorbell listening -- a hand boot -- the dry run "
 # THE FEE WALLET, WHICH THE DRY RUN PROMISED AND NOTHING CHECKED.
 _fwd = Path(tempfile.mkdtemp(prefix="dryfee_"))
 _fdd, _fdkf, _, _fdbell, _, _ = _stage8_env(
-    extra={"fee_rpc": "http://127.0.0.1:18083",
+    extra={"fee_rpc": _RPC_EP,
            "fee_wallet_file": str(_fwd / "fee.wallet"),
            "fee_address": "9" + "f" * 94,
            "fee_sweep_to": ["9" + "e" * 94]})
@@ -9786,6 +10096,245 @@ check("review: ...and the next wake records what that mix minted as the "
       "owner's, and clears the mark",
       _pm_rec is True and 10 in _pm_l2["owners"][OWNER]["accounts"]
       and A.PENDING_MIX_FIELD not in _pm_l2["owners"][OWNER])
+# NOTHING NEW IS NOT "IT MINTED NOTHING" (the review of this change): a
+# power cut mid-mix leaves a wallet that lists `before` until it re-derives
+# what the mix minted; the mark cleared on that first read, the next
+# owner's mix minted the same indices as HIS, with the first owner's money
+# on them. An empty read keeps the mark, counted through the ledger, for
+# PENDING_EMPTY_MAX wakes.
+_pe_d = Path(tempfile.mkdtemp(prefix="pe_"))
+A._save_handles(_pe_d, {}, {OWNER: {"accounts": [5],
+                                    A.PENDING_MIX_FIELD: [0, 5, 9]}})
+_pe_kinds, _pe_marks = [], []
+_o_il_pe = A.integrity_log
+A.integrity_log = lambda st, k, *a, **kw: _pe_kinds.append(k)
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        for _w in range(getattr(A, "PENDING_EMPTY_MAX", 1)):
+            _pe_l = A._load_ledger(_pe_d)
+            A._recover_pending_mixes(_k, lambda: {0, 5, 9}, _pe_l)
+            A._save_handles(_pe_d, _pe_l["handles"], _pe_l["owners"])
+            _pe_marks.append(A.PENDING_MIX_FIELD
+                             in A._load_ledger(_pe_d)["owners"][OWNER])
+finally:
+    A.integrity_log = _o_il_pe
+check("a wallet that shows NOTHING new for a mark keeps it -- every job that "
+      "mints still refused -- through the ledger's save and load, and lets "
+      "it go only after PENDING_EMPTY_MAX wakes, said on the chain",
+      len(_pe_marks) == 3 and _pe_marks == [True, True, False]
+      and _pe_kinds.count("owner_accounts_not_found") == 2
+      and "owner_accounts_none_found" in _pe_kinds)
+_pe_l = A._load_ledger(_pe_d)
+_pe_l["owners"][OWNER][A.PENDING_MIX_FIELD] = [0, 5, 9]
+_pe_l["owners"][OWNER][getattr(A, "PENDING_EMPTY_FIELD", "x")] = 2
+with contextlib.redirect_stdout(io.StringIO()):
+    A._recover_pending_mixes(_k, lambda: {0, 5, 9, 10, 11}, _pe_l)
+check("NON-VACUITY: once the wallet shows what the mix minted, it is the "
+      "marked owner's and the mark and its count go",
+      {10, 11} <= set(_pe_l["owners"][OWNER]["accounts"])
+      and A.PENDING_MIX_FIELD not in _pe_l["owners"][OWNER]
+      and getattr(A, "PENDING_EMPTY_FIELD", "x")
+      not in _pe_l["owners"][OWNER])
+# A MARK THAT CANNOT BE SETTLED STOPS EVERYTHING THAT MINTS (the vault
+# review, rule 8): a wallet busy for a few seconds left the mark standing
+# and the job went on -- a deposit minted the next client's account, the
+# recovery gave it to the earlier owner, and that owner's withdrawal spent
+# the other client's deposit. A retry of the same owner's mix wrote a new
+# mark over the old, and the first mix's accounts belonged to nobody.
+_us_sleep, A.time.sleep = A.time.sleep, (lambda s: None)
+_us_out = {}
+for _uj, _up in (("receive_and_quote", {"amount_sat": 5000000,
+                                        "owner": "b" * 16}),
+                 ("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1,
+                               "owner": OWNER}),
+                 ("swap_status", {"handle": "A3F1", "owner": OWNER}),
+                 ("watch", {"handle": "A3F1", "owner": OWNER}),
+                 ("forward_to_swap", {"handle": "A3F1", "owner": OWNER})):
+    _us_d, _us_runs, _us_run = _ledger_env("unsettled_")
+    _us_raw = json.loads((_us_d / A.HANDLES_FILE).read_text())
+    (_us_d / A.HANDLES_FILE).write_text(json.dumps(
+        {"handles": _us_raw,
+         "owners": {OWNER: {"accounts": [9], A.PENDING_MIX_FIELD: [0, 9]}}}))
+    _o_il_us = A.integrity_log
+    _us_kinds = []
+    A.integrity_log = lambda st, kind, *a, **k: _us_kinds.append(kind)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                A._dispatch(_uj, _up, _k, _us_d, "D5E6", _us_run,
+                            "job-us", accounts=lambda: None,
+                            reuse_balance=lambda k, a, s: 1,
+                            funded=lambda: (9, 4, _XMR_SAMPLE,
+                                            5_000_000_000_000))
+                _us_err = None
+            except A.Refused as e:
+                _us_err = e.code
+            except BaseException as e:                       # noqa: BLE001
+                _us_err = type(e).__name__
+    finally:
+        A.integrity_log = _o_il_us
+    _us_out[_uj] = (_us_err, list(_us_runs),
+                    json.loads((_us_d / A.HANDLES_FILE).read_text())[
+                        "owners"][OWNER].get(A.PENDING_MIX_FIELD),
+                    "mix_unsettled" in _us_kinds)
+A.time.sleep = _us_sleep
+check("a mix's mark the wallet cannot settle: the next client's DEPOSIT is "
+      "refused mix_unsettled before anything runs, the mark untouched",
+      _us_out["receive_and_quote"][0] == "mix_unsettled"
+      and _us_out["receive_and_quote"][1] == []
+      and _us_out["receive_and_quote"][2] == [0, 9]
+      and _us_out["receive_and_quote"][3])
+check("...and so is the same owner's retry of the withdrawal -- the mark is "
+      "never written over", _us_out["withdraw"][0] == "mix_unsettled"
+      and _us_out["withdraw"][1] == [] and _us_out["withdraw"][2] == [0, 9])
+check("NON-VACUITY: a probe mints nothing and is not refused for it",
+      _us_out["swap_status"][0] != "mix_unsettled")
+check("...and so do a watch and a forward -- they mint nothing (whatever "
+      "else refuses them here, it is not the mark)",
+      _us_out["watch"][0] != "mix_unsettled"
+      and _us_out["forward_to_swap"][0] != "mix_unsettled")
+_um_led = {"owners": {OWNER: {"accounts": [9],
+                              A.PENDING_MIX_FIELD: [0, 9]}}}
+try:
+    A._mark_pending_mix(_um_led, "c" * 16, [0, 9, 10])
+    _um_err = None
+except A.Refused as e:
+    _um_err = e.code
+check("...and the mark itself is never written beside or over another",
+      _um_err == "mix_unsettled"
+      and "c" * 16 not in _um_led["owners"])
+# AN ACCOUNT IS ONE OWNER'S (the vault review, rule 8): a wallet whose
+# account list went backwards re-mints a MIX's account, and the deposit
+# check compared deposit records only -- the next client got an account
+# another owner's withdrawal could spend.
+_rb_d = Path(tempfile.mkdtemp(prefix="rollback_"))
+_rb_b = _rb_d / "wallet_x.json"
+_rb_b.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
+                             "address": _XMR_SAMPLE, "account_index": 1,
+                             "subaddress_index": 1,
+                             "rpc_endpoint": _RPC_EP}))
+A._save_handles(_rb_d, {"A3F1": {"bundle": str(_rb_b), "slip": None,
+                                 "spent": True, "pair": [1, 1],
+                                 "owner": OWNER}},
+                {OWNER: {"accounts": [1, 7, 8, 9]}})
+_rb_ran = []
+
+
+def _rb_run(argv, env_extra, budget_s):
+    _rb_ran.append(" ".join(argv))
+    if "create_receive_wallet" in " ".join(argv):
+        (_rb_d / "wallet_new.json").write_text(json.dumps(
+            {"schema": "gs_receive_wallet_v1", "address": _XMR_SAMPLE,
+             "account_index": _rb_acct[0], "subaddress_index": 1,
+             "rpc_endpoint": _RPC_EP}))
+    return 0, False
+
+
+def _rb_deposit(acct):
+    _rb_acct[0] = acct
+    _rb_ran.clear()
+    for _f in _rb_d.glob("wallet_new*.json"):
+        _f.unlink()
+    _o_il_rb = A.integrity_log
+    A.integrity_log = lambda *a, **k: None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                A._dispatch("receive_and_quote",
+                            {"amount_sat": 5000000, "owner": "b" * 16},
+                            {"tor_proxy": "socks5h://127.0.0.1:9050",
+                             "rpc_primary": _RPC_EP},
+                            _rb_d, "B7C2", _rb_run, "job-rb",
+                            reuse_balance=lambda k, a, s: 1)
+                return None
+            except A.Refused as e:
+                return e.code
+    finally:
+        A.integrity_log = _o_il_rb
+
+
+_rb_acct = [7]
+_rb_c1 = _rb_deposit(7)
+_rb_led1 = A._load_ledger(_rb_d)
+check("a fresh mint that answers an account another owner holds through a "
+      "MIX (the wallet went backwards): refused before the quote, and the "
+      "account stays that owner's alone",
+      _rb_c1 == "bundle_reused"
+      and not any("thor_swap_preparer" in r for r in _rb_ran)
+      and "b" * 16 not in _rb_led1["owners"]
+      and _rb_led1["owners"][OWNER]["accounts"] == [1, 7, 8, 9])
+_rb_c2 = _rb_deposit(12)
+check("NON-VACUITY: a truly fresh account is taken and becomes the new "
+      "owner's", _rb_c2 is None
+      and A._load_ledger(_rb_d)["owners"]["b" * 16]["accounts"] == [12])
+_cf_led = {"owners": {OWNER: {"accounts": [7]}}}
+_o_il_cf, _cf_k = A.integrity_log, []
+A.integrity_log = lambda st, kind, *a, **k: _cf_k.append(kind)
+try:
+    A._add_owner_accounts(_cf_led, "b" * 16, {7, 13})
+finally:
+    A.integrity_log = _o_il_cf
+_klog = []
+_ksaved = A.integrity_log
+A.integrity_log = lambda st, k, *a, **kw: _klog.append(k)
+try:
+    _sh_led = {"owners": {"a" * 16: {"accounts": [4, 5]},
+                          "b" * 16: {"accounts": [5]}}}
+    _sh_a = A._owner_accounts(_sh_led, "a" * 16)
+    _sh_b = A._owner_accounts(_sh_led, "b" * 16)
+finally:
+    A.integrity_log = _ksaved
+check("an account an EARLIER build left in two owners' sets is neither's to "
+      "spend from the phone -- the guard on the side that spends too -- and "
+      "the chain says so",
+      _sh_a == {4} and _sh_b == set()
+      and "owner_account_conflict" in _klog)
+check("NON-VACUITY: an owner's own accounts are theirs",
+      A._owner_accounts({"owners": {"a" * 16: {"accounts": [4, 5]}}},
+                        "a" * 16) == {4, 5})
+check("the ledger never gives one owner an account another holds: 7 stays "
+      "the first owner's alone, 13 is the second's, and the chain says so",
+      _cf_led["owners"][OWNER]["accounts"] == [7]
+      and _cf_led["owners"]["b" * 16]["accounts"] == [13]
+      and "owner_account_conflict" in _cf_k)
+# ...AND A MIX DOES NOT START ON A WALLET THAT LOST ACCOUNTS THE LEDGER KNOWS.
+_wb_out = {}
+for _wb_list in ({0, 1, 9}, {0, 1, 7, 8, 9}):
+    _wb_d, _wb_runs, _wb_run = _ledger_env("behind_")
+    _wb_raw = json.loads((_wb_d / A.HANDLES_FILE).read_text())
+    (_wb_d / A.HANDLES_FILE).write_text(json.dumps(
+        {"handles": _wb_raw,
+         "owners": {OWNER: {"accounts": [9]}, "b" * 16: {"accounts": [7, 8]}}}))
+    _o_il_wb = A.integrity_log
+    A.integrity_log = lambda *a, **k: None
+    _o_pw_wb = os.environ.get("GS_WALLET_PASSWORD")
+    os.environ["GS_WALLET_PASSWORD"] = "hunter2"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1,
+                                         "owner": OWNER},
+                            _k, _wb_d, "C4D5", _wb_run, "job-wb",
+                            accounts=(lambda _l=_wb_list: set(_l)),
+                            funded=lambda: (9, 4, _XMR_SAMPLE,
+                                            5_000_000_000_000))
+                _wb_out[len(_wb_list)] = (None, len(_wb_runs))
+            except A.Refused as e:
+                _wb_out[len(_wb_list)] = (e.code, len(_wb_runs))
+            except BaseException as e:                       # noqa: BLE001
+                _wb_out[len(_wb_list)] = (type(e).__name__, len(_wb_runs))
+    finally:
+        A.integrity_log = _o_il_wb
+        if _o_pw_wb is None:
+            os.environ.pop("GS_WALLET_PASSWORD", None)
+        else:
+            os.environ["GS_WALLET_PASSWORD"] = _o_pw_wb
+check("a withdrawal on a wallet that no longer lists accounts the ledger "
+      "gave an owner: refused wallet_accounts_behind before the mix runs",
+      _wb_out.get(3) == ("wallet_accounts_behind", 0))
+check("NON-VACUITY: every recorded account listed, the mix runs",
+      _wb_out.get(5, ("?",))[0] != "wallet_accounts_behind"
+      and _wb_out.get(5, (None, 0))[1] >= 1)
 
 # AN EMPTY VALUE IS THE HAND COMMAND, REFUSED -- never a wake.
 _ew = []

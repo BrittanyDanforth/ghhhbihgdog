@@ -494,6 +494,14 @@ PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
           "delayed", "returned", "forwarded", "kept", "leftover",
           "unwatched")
 
+#: THE WORDS A REFUSAL MAY CARRY, and no others: the vault puts one on a
+#: refused result (gs_wake_agent._REFUSAL_PHASE, pinned to this set by the
+#: tests) and the by-hand doorbell renders one only from here -- a second
+#: list there was the same state decided twice, and a vault on another
+#: build that paired `refused` with any other word was rendered as though
+#: that word were a reason.
+REFUSAL_PHASES = ("full", "unwatched")
+
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
 #: on the Pi in the count that answers "full", on the vault in the account
@@ -2612,7 +2620,7 @@ _owner_field.spec = "owner ^[0-9a-f]{16}$"
 #: WHY A REGEX AND NOT A CHECKSUM. A full Monero address check needs the
 #: network byte and a Keccak checksum, which this file cannot do without a
 #: crypto dependency it does not have; the VAULT re-validates properly
-#: (validate_xmr_address, an RPC round trip) before a single coin moves. What
+#: (validate_xmr_address, a local checksum check) before a single coin moves. What
 #: this gate is for is narrower and it is the part that must not be skipped:
 #: nothing shaped like a FLAG, a path, a URL or a shell fragment may travel,
 #: because the value crosses a machine boundary and is handed to a subprocess

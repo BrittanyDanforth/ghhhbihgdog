@@ -227,7 +227,7 @@ def _prepare(address, network, servers, proxy_url, transport_factory,
 
 def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
            network="main", timeout=DEFAULT_TIMEOUT, transport_factory=None,
-           stop=None):
+           stop=None, last=None):
     """Hand the signed transaction to the network. See the module header
     for the four outcomes. Returns
         {outcome, server, cert_sha256, codes, attempts, mismatched,
@@ -265,7 +265,16 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
     server list blamed, a re-send's `accepted` written over -- about a
     list it never finished. A rejection or an unreachable that is only
     the stop's is not the network's word, and the caller must not act on
-    it as one."""
+    it as one.
+
+    `last` names servers tried only after every other one: those that
+    accepted an earlier transaction of this forward that no other server
+    ever listed, and those that answered a txid not ours. First in the
+    rotation, a server that says "accepted" and relays nothing took every
+    re-send of the same bytes, run after run, and the network never had
+    them (the review of the stage 3 fixes). Tried last, not dropped: it
+    may be the one that relays today. Rests on some other configured
+    server being honest; nothing here is secret."""
     raw = _check_hex(raw_hex)
     want = _check_txid(expected_txid)
     try:
@@ -277,6 +286,9 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
                             "the txid names")
     _scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                         transport_factory, timeout)
+    _last = {h for h in (last or ()) if isinstance(h, str) and h}
+    order = ([o for o in order if o[0] not in _last]
+             + [o for o in order if o[0] in _last])
     codes, attempts, mismatched, ambiguous = [], 0, 0, False
     liars = []
     pinned = stopped = False

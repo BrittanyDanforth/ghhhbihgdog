@@ -2017,8 +2017,13 @@ class Pager:
             if not isinstance(_pending, list):
                 _pending = self._wizard_retry = []
             _pending.extend(retry)
-        integrity_log("pager", "wizard_burned" if gone == len(mids)
-                      else "wizard_burn_partial")
+        # NOTHING ON THE CHAIN WHEN IT WENT (the Pi-side OPSEC review): a
+        # confirmed wizard is how every deposit and withdrawal starts, and
+        # `wizard_burned` written just before the poke dated each of them.
+        # What the operator needs is that deletes are failing here -- said
+        # once per process, as a configuration kind is.
+        if gone != len(mids):
+            self._config_once("wizard_burn_partial")
 
     def retry_wizard_deletes(self, max_deletes: int = 8) -> int:
         """Try again, every tick, on the wizard messages whose delete never
@@ -2042,7 +2047,7 @@ class Pager:
                     keep.append((cid, mid, sent))
         self._wizard_retry = keep
         if gone:
-            integrity_log("pager", "wizard_burned_late")
+            self._config_once("wizard_burned_late")
         return gone
 
     def begin_convo(self, chat_id: int, kind: str = "depo") -> None:
@@ -2769,8 +2774,9 @@ class Pager:
                 # you may retry is not one.
                 c.tries += 1
                 if c.tries > self.DEPTH_RETRIES:
+                    # (No chain line: only the withdrawal's depth step
+                    # gets here, so a kind for it named the job.)
                     self._end_convo(chat_id)
-                    integrity_log("pager", "convo_exhausted")
                     self.send(chat_id, "no: cancelled — start again with "
                                        "/withdraw.")
                     return True
@@ -2992,6 +2998,11 @@ class Pager:
             return True
         except Exception as e:                               # noqa: BLE001
             print(f"  [!] reply failed: {_redact(e)}")
+            # NOTED FOR THE JOB'S WORKER, whatever the job (_worker writes
+            # reply_undelivered once after the job's replies): written only
+            # where a deposit's details or a withdrawal's report were lost,
+            # the kind beside the outcome named which of the two it was.
+            _LAST_MID.failed = True
             return False
 
     def arm_burn(self, *_a) -> None:
@@ -3795,7 +3806,9 @@ class Pager:
                 if not self.send(chat_id, _msg):
                     time.sleep(SLIP_RETRY_S)
                     if not self.send(chat_id, _msg):
-                        integrity_log("pager", "result_undelivered")
+                        # The leg's report is lost: _worker says so on the
+                        # chain, in the one kind every job's lost reply gets.
+                        _LAST_MID.failed = True
                 # ARMED AFTER THE REPORT, NOT INSTEAD OF IT. If the send above
                 # failed twice the operator has no idea a leg finished, and
                 # starting another one silently is the worst thing this could
@@ -3815,11 +3828,16 @@ class Pager:
                 if _next_leg:
                     self._chain = (chat_id, dict(params), _leg + 1)
                 elif _more:
-                    # THE CAP IS LOGGED HERE AND SAID ABOVE. A second send
+                    # THE CAP IS SAID ABOVE, AND ONLY THERE. A second send
                     # was what contradicted the first one; the sentence it
                     # carried now lives in _msg, chosen by the same _next_leg
-                    # that decides whether a leg is actually armed.
-                    integrity_log("pager", "run_capped")
+                    # that decides whether a leg is actually armed. It is no
+                    # longer written to the chain (the Pi-side OPSEC audit):
+                    # only a chained withdrawal is ever capped, so the kind
+                    # dated a multi-leg SPEND on the card -- the timetable
+                    # the chain's "no job word" rule took `poke:withdraw`
+                    # off for.
+                    pass
                 return
             if plain and chat_id < 0:
                 # A GROUP IS A BROADCAST SURFACE, AND A PAYLOAD IS NOT FOR ONE.
@@ -3850,7 +3868,7 @@ class Pager:
                 # The SEALED slip is still sent to a group: it is sealed to a
                 # key nobody in the room holds, which is the whole argument
                 # for putting one in a chat at all.
-                integrity_log("pager", "payload_withheld_group")
+                self._config_once("payload_withheld_group")
                 self.send(chat_id,
                           f"{chat_name(job)}: quoted. Confirmation number: {_cn}\n"
                           f"The deposit details are NOT posted here — this is "
@@ -3885,7 +3903,7 @@ class Pager:
                           "own and this pager has no --btc-electrum, so it "
                           "was NOT shown: restart with --btc-electrum "
                           "(OPSEC_SETUP.md).")
-                    integrity_log("pager", "intake_unwatched")
+                    self._config_once("intake_unwatched")
                     self.send(chat_id, UNWATCHED_ANSWER,
                               buttons=MENU_BUTTONS)
                     return
@@ -3951,7 +3969,7 @@ class Pager:
                 if _ok:
                     self._btc_pay_message(h, getattr(_LAST_MID, "mid", None))
                     return
-                integrity_log("pager", "pay_undelivered")
+                _LAST_MID.failed = True
                 self._btc_forget(h)
                 self._mark_undelivered(chat_id, h, job)
                 self.send(chat_id,
@@ -3982,7 +4000,7 @@ class Pager:
                     time.sleep(SLIP_RETRY_S)
                     _ok = self.send(chat_id, _note)
                 if not _ok:
-                    integrity_log("pager", "note_undelivered")
+                    _LAST_MID.failed = True
                     self._mark_undelivered(chat_id, h, job)
                     self.send(chat_id,
                               f"{chat_name(job)}: the payment details did not "
@@ -4100,7 +4118,7 @@ class Pager:
                           f"Confirmation number: {_cn}",
                           buttons=self._handle_buttons(h, job, chat_id))
             else:
-                integrity_log("pager", "slip_undelivered")
+                _LAST_MID.failed = True
                 self._mark_undelivered(chat_id, h, job)
                 # NOT "/watch {h}". That was the first version of this line and
                 # it is wrong: watch waits for a payment to LAND on a bundle,
@@ -4151,10 +4169,9 @@ class Pager:
             # it gets the generic line like any other refusal.
             _rphase = (pending.result or {}).get("phase") or ""
             if _rphase == "full" and job == "receive_and_quote":
-                integrity_log("pager", "refused_full")
                 self.send(chat_id, FULL_ANSWER, buttons=MENU_BUTTONS)
             elif _rphase == "unwatched" and job == "receive_and_quote":
-                integrity_log("pager", "intake_unwatched")
+                self._config_once("intake_unwatched")
                 self.send(chat_id, UNWATCHED_ANSWER, buttons=MENU_BUTTONS)
             else:
                 self.send(chat_id,
@@ -4247,8 +4264,10 @@ class Pager:
             # "Check before trying again" was the whole of this message, which
             # is true and does not say what to check or what the risk of not
             # checking is.
+            # (No chain line of its own: `outcome:collected_no_result` is
+            # already there for every job, and a kind written for this one
+            # named it a withdrawal -- the Pi-side OPSEC review.)
             if job == "withdraw":
-                integrity_log("pager", "run_unresolved")
                 self.send(chat_id,
                           "withdraw: it was picked up and never reported "
                           "back.\n"
@@ -4292,8 +4311,13 @@ class Pager:
         so it says exactly that rather than guessing a comfortable answer, and
         it is careful not to imply the money is safe.
         """
+        _LAST_MID.failed = False
         try:
             self.poke(chat_id, job, params)
+            # A REPLY OF THIS JOB'S DID NOT GO THROUGH, AT LEAST ONCE: one
+            # line, the same for every job (the Pi-side OPSEC review).
+            if getattr(_LAST_MID, "failed", False):
+                integrity_log("pager", "reply_undelivered")
         except BaseException as e:                           # noqa: BLE001
             # send() itself may be what failed. It never raises (it returns
             # whether it landed), but this is the last line of defence and it
@@ -4823,7 +4847,7 @@ class Pager:
             # 5-20 minute jitter and one of twelve daily slots, and returns a
             # refusal with no reason on it -- which reads as "try again".
             if self.handle_job.get(_h) in self.UNWATCHABLE_JOBS:
-                integrity_log("pager", "unwatchable_handle")
+                # (No chain line: only a withdrawal's label gets here.)
                 self.send(cid,
                           "no: that confirmation number is from a "
                           "withdrawal, not a deposit, and there is nothing "
@@ -4962,7 +4986,7 @@ class Pager:
         if str(cb.get("data") or "").startswith("d:"):
             _c = self.convos.get(cid)
             if not (_c and _c.alive(self.clock) and _c.awaiting_depth()):
-                integrity_log("pager", "callback_depth_stale")
+                # (No chain line: depth buttons are the withdrawal's alone.)
                 if _id is not None:
                     self.answer_callback(
                         _id, "no: that button is from an earlier question. "
@@ -5081,7 +5105,10 @@ class Pager:
             # flight is never refused their own /check or /withdraw for this.
             if self._full_for(cid, job):
                 _give_back()
-                integrity_log("pager", "refused_full")
+                # NOT ON THE CHAIN (the Pi-side OPSEC audit): only a deposit
+                # is ever refused for room, so the kind dated a deposit
+                # attempt on the card. The vault's own reserve refusal is on
+                # the vault's chain; this end's answer is the chat's.
                 self.send(cid, FULL_ANSWER)
                 return False
             # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the
@@ -5484,7 +5511,9 @@ class Pager:
                   f"address, so this end cannot watch it: set --btc-network "
                   f"to the network the vault is paired on. The tap still "
                   f"asks the forward.")
-            integrity_log("pager", "address_unwatchable")
+            # Once per process (_config_once): written per deposit it dated
+            # each deposit on the card (the Pi-side OPSEC review).
+            self._config_once("address_unwatchable")
             return
         lock, opened = self._btc()
         with lock:
@@ -6382,7 +6411,7 @@ class Pager:
                       f"answered for {self._look_fail_ticks} ticks "
                       f"({_why}): check --tor-proxy, --btc-electrum and "
                       f"--btc-network.")
-                integrity_log("pager", "looks_failing")
+                self._config_once("looks_failing")
         elif _answered:
             self._look_fail_ticks = 0
         # THE RECHECK, WHEN NOBODY TAPPED (stage 6). A forward the network
@@ -6877,11 +6906,16 @@ class Pager:
             if _last and _now - _last < float(self.ALERT_MIN_GAP_S):
                 return
             self.__dict__["_alert_last"] = _now
-            integrity_log("pager", "operator_alerted")
+            # Once per process: written per alert, it dated each failed
+            # forward of the intake on the card (the Pi-side OPSEC review).
+            self._config_once("operator_alerted")
             _w = "stopped" if word == "stopped" else "failed"
-            self.send(_to, f"{chat_name(job)}: {_w} for a deposit in "
-                           f"another chat. It needs someone at the other "
-                           f"end.")
+            # NOT "for a deposit in another chat" (the Pi-side OPSEC
+            # review): every alert is about another chat by construction,
+            # and saying so told whoever reads this transcript that the bot
+            # serves several people -- the shape of the arrangement.
+            self.send(_to, f"{chat_name(job)}: {_w}. It needs someone at "
+                           f"the other end.")
         except BaseException as ex:                          # noqa: BLE001
             print(f"  [!] the operator alert did not send: "
                   f"{_redact(ex)[:120]}")
@@ -7030,6 +7064,20 @@ class Pager:
         try:
             with self._PLACES_LOCK:
                 self._places()[owner_token(self.key, cid)] = time.time()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    def _config_once(self, kind: str) -> None:
+        """A CONFIGURATION kind on the chain, once per process, never per
+        job (the Pi-side OPSEC audit). Written on every deposit it concerned,
+        it dated each deposit attempt on the card -- a job word by another
+        name. Once is what the operator needs: this end is set up wrong."""
+        try:
+            _said = self.__dict__.setdefault("_config_said", set())
+            if kind in _said:
+                return
+            _said.add(kind)
+            integrity_log("pager", kind)
         except Exception:                                    # noqa: BLE001
             pass
 
@@ -8027,6 +8075,15 @@ def main(argv=None) -> int:
         print(f"  [!] integrity chain unavailable ({type(e).__name__}); "
               f"starting anyway. Check the working directory in the unit.")
     _pager = Pager(args, token, key, proxies)
+    # CONFIGURATION KINDS WHOSE CONDITION IS KNOWN NOW are written now (the
+    # Pi-side OPSEC review): written at the first deposit they concerned,
+    # even once per process, they dated that deposit after every restart.
+    # The vault's mode is not known here, so `intake_unwatched` says only
+    # that this end could not watch an intake's address.
+    if any(int(c) < 0 for c in (getattr(_pager, "allow", None) or ())):
+        _pager._config_once("payload_withheld_group")
+    if not _pager.btc_servers:
+        _pager._config_once("intake_unwatched")
     # THE RESTART HOLD, LIFTED BY A PERSON (the review of the hold). The card
     # now keeps the longest job's window for every job, so a pager that died
     # during a five-minute check refuses everything for most of a day. The

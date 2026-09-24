@@ -314,7 +314,13 @@ def _scoped_child(cwd, endpoint, q, ready, hold_s):
         q.put("blocked")
 
 
-_EP = "http://127.0.0.1:18083"
+# A PORT OF THIS PROCESS'S OWN: the scope lock is an abstract socket, one
+# namespace for the whole machine, and held here on the stock endpoint for
+# seconds it read as "a mix is running" to every other suite's vault run
+# against 127.0.0.1:18083 at that moment -- a refused job there, red on a
+# parallel run and green alone.
+_EPP = 30000 + os.getpid() % 20000
+_EP = f"http://127.0.0.1:{_EPP}"
 _d1 = Path(tempfile.mkdtemp(prefix="gs_lk_a_"))
 _d2 = Path(tempfile.mkdtemp(prefix="gs_lk_b_"))
 _q4 = _mp.Queue(); _r4 = _mp.Event()
@@ -332,7 +338,8 @@ check("run lock: a second run in a DIFFERENT DIRECTORY against the SAME "
 # resources; a guard that refused them would be a lockout, not a lock.
 _q6 = _mp.Queue()
 _far = _mp.Process(target=_scoped_child,
-                   args=(str(_d2), "http://127.0.0.1:18085", _q6, None, 0.2))
+                   args=(str(_d2), f"http://127.0.0.1:{_EPP + 1}", _q6,
+                         None, 0.2))
 _far.start(); _far.join()
 check("run lock: ...but a run against a DIFFERENT wallet-rpc still proceeds",
       _q6.get() == "won")

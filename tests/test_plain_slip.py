@@ -1398,7 +1398,8 @@ _ok[0] = True
 _PG_SRC_M = open(os.path.join(REPO, "gs_telegram_pager"),
                  encoding="utf-8").read()
 check("...and the source records that outcome under a kind that names no job",
-      "note_undelivered" in _PG_SRC_M
+      "reply_undelivered" in _PG_SRC_M
+      and "note_undelivered" not in _PG_SRC_M
       and "Do NOT send without it" not in _PG_SRC_M)
 
 # ===========================================================================

@@ -73,11 +73,21 @@ DB = load("gs_doorbell")
 pg = load("gs_telegram_pager")
 import nacl.public as NP                                     # noqa: E402
 
+# THIS PROCESS'S OWN WALLET-RPC ENDPOINT (never dialled: every wallet call
+# here is injected). The vault's run guard is an abstract socket keyed on
+# the endpoint -- one namespace for the whole machine -- and it probes by
+# binding the name. On the stock 127.0.0.1:18083, two suites run in
+# parallel read each other's probe, or test_concurrency's hold, as "a mix
+# is running": a refused job, red on a parallel run and green alone.
+_PID_PORT = 30000 + os.getpid() % 20000
+_RPC_EP = f"http://127.0.0.1:{_PID_PORT + 2}"
+
+
 XMR = ("44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaB"
        "YBb98uNbr2VBBEt7f2wfn3RVGQBEP3A")
 OX, OY = "a" * 16, "b" * 16
 _K = {"tor_proxy": "socks5h://127.0.0.1:9050",
-      "rpc_primary": "http://127.0.0.1:18083",
+      "rpc_primary": _RPC_EP,
       "wallet_file": "/var/lib/gs/spend.wallet"}
 _saved_il = A.integrity_log
 A.integrity_log = lambda *a, **k: None
@@ -87,7 +97,7 @@ def _bundle(d, name, acct, sub):
     p = d / name
     p.write_text(json.dumps({"schema": "gs_receive_wallet_v1", "address": XMR,
                              "account_index": acct, "subaddress_index": sub,
-                             "rpc_endpoint": "http://127.0.0.1:18083"}))
+                             "rpc_endpoint": _RPC_EP}))
     return p
 
 
@@ -139,15 +149,24 @@ class _Wallet:
             return {"subaddress_accounts": [{"account_index": i}
                                             for i in (0, 1, 2, 3)]}
         if m == "get_balance":
+            def _sub(i):
+                amt = self.per.get(i, 0) * 10 ** 12
+                # Y's account also holds 5 XMR still unlocking.
+                bal = amt + (5 * 10 ** 12 if i == 2 else 0)
+                return ({"account_index": i, "address_index": 1,
+                         "address": XMR, "balance": bal,
+                         "unlocked_balance": amt} if bal else None)
             if p.get("all_accounts"):
-                return {"balance": 1400 * 10 ** 12, "unlocked_balance": 1350 * 10 ** 12}
+                _subs = [x for x in map(_sub, (1, 2, 3)) if x]
+                return {"balance": sum(x["balance"] for x in _subs),
+                        "unlocked_balance": sum(x["unlocked_balance"]
+                                                for x in _subs),
+                        "per_subaddress": _subs}
             i = p.get("account_index")
-            amt = self.per.get(i, 0) * 10 ** 12
-            return {"balance": amt + (5 * 10 ** 12 if i == 2 else 0),
-                    "unlocked_balance": amt,
-                    "per_subaddress": [{"account_index": i, "address_index": 1,
-                                        "address": XMR, "unlocked_balance": amt}]
-                    if amt else []}
+            x = _sub(i)
+            return {"balance": x["balance"] if x else 0,
+                    "unlocked_balance": x["unlocked_balance"] if x else 0,
+                    "per_subaddress": [x] if x else []}
         return {}
 
 
@@ -181,9 +200,11 @@ check("injected entries are filtered the same way, so a harness cannot hand a "
       is None
       and A._funded_entry(_K, injected=lambda: (2, 1, XMR, 5),
                           owned_accounts={2}) == (2, 1, XMR, 5))
-check("locked value is summed over the owner's accounts alone",
-      _lock_y == Decimal(5) and _lock_x == Decimal(0)
-      and _lock_all == Decimal(50) and _lock_none == Decimal(0))
+check("the still-unlocking figure is taken over the owner's accounts alone "
+      "-- the largest subaddress with money unlocking, as the entry it will "
+      "become (Y's 305), never X's",
+      _lock_y == Decimal(305) and _lock_x == Decimal(0)
+      and _lock_all == Decimal(305) and _lock_none == Decimal(0))
 
 # ===========================================================================
 print("\n== dispatch: a withdrawal spends the asker's own, marks it, shreds it ==")
@@ -409,7 +430,7 @@ def _env(ceiling=45, pending=0):
            "peer_public": PI.public_key.encode().hex(),
            "doorbell_url": "http://10.0.0.9:8770",
            "tor_proxy": "socks5h://127.0.0.1:9050",
-           "rpc_primary": "http://127.0.0.1:18083",
+           "rpc_primary": _RPC_EP,
            "artifact_dir": str(d), "account_ceiling": ceiling}
     kf = d / "tp.key"
     kf.write_text(json.dumps(P.lock_keyfile(key, b"", role="thinkpad")))
@@ -580,9 +601,36 @@ check("NON-VACUITY: the same month-old record with the swap's XMR still on "
       A._deposit_pending({**_ghost, "btc_index": 3, "forward_sent": True,
                           "btc_money_at": _recent, "forwarded": _recent},
                          {}, _month, ask=_some) is True)
+check("settled money a fee spike holds (`delayed`, a month ago, no answer "
+      "since), the subaddress empty: the place is HELD -- a mix still to "
+      "come, whatever the clock",
+      A._deposit_pending({**_ghost, "btc_index": 3,
+                          "btc_delayed": _recent}, {}, _month, ask=_zero)
+      is True)
+_kx = {"btc_account_xpub": ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4"
+                             "wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGD"
+                             "tKsAYz2oz2AGutZYs")}
+check("...but not one issued on ANOTHER BTC account of the seed (a re-pair): "
+      "its forward is refused before it runs, nothing would ever clear the "
+      "mark, and it keeps the two-day clock instead of a place for good",
+      A._deposit_pending({**_ghost, "btc_index": 3, "btc_delayed": _recent,
+                          "btc_chain": "0" * 16}, _kx, _month, ask=_zero)
+      is False
+      and A._deposit_pending({**_ghost, "btc_index": 3,
+                              "btc_delayed": _recent,
+                              "btc_chain": A._xpub_id(_kx)}, _kx, _month,
+                             ask=_zero) is True)
+check("NON-VACUITY: the same record without the mark lets it go, and a "
+      "mark that is not a bucket (true) is no mark",
+      A._deposit_pending({**_ghost, "btc_index": 3}, {}, _month, ask=_zero)
+      is False
+      and A._deposit_pending({**_ghost, "btc_index": 3,
+                              "btc_delayed": True}, {}, _month, ask=_zero)
+      is False)
 check("...and a stamp on a record off the intake (no btc_index) changes "
       "nothing: it is asked about as before",
-      A._deposit_pending({**_ghost, "btc_money_at": _recent}, {}, _now,
+      A._deposit_pending({**_ghost, "btc_money_at": _recent,
+                          "btc_delayed": _recent}, {}, _now,
                          ask=_zero) is False)
 check("NON-VACUITY: an intake deposit whose forward never ran is asked "
       "about as before -- nothing on it, past the TTL: no place",
@@ -725,6 +773,58 @@ _du3, _ku3, _bu3 = _env_unw(True, False)
 _ou3, _eu3 = _run(_ku3, _bu3, _du3, 3)
 check("NON-VACUITY: on the intake WITHOUT the flag the deposit is not "
       "refused for it", _eu3 is None or _eu3.code != "intake_unwatched")
+# ...AND ON THE INTAKE THE RELEASE ASKS THE DEPOSIT'S BTC ADDRESS FIRST (the
+# review of 657deae), through the run as it is wired: the paired key and
+# the injected look reach it, or no intake deposit is ever released.
+
+
+def _env_rel_btc(unused_answer):
+    d, kf, _ = _env(45, 1)
+    key = P.unlock_keyfile(json.loads(kf.read_text()), b"")
+    key.update({"btc_account_xpub": _UZPUB, "btc_electrum": ["s.onion"],
+                "btc_network": "main", "deposit_in_chat": True})
+    os.chmod(kf, 0o600)
+    kf.write_text(json.dumps(P.lock_keyfile(key, b"", role="thinkpad")))
+    os.chmod(kf, 0o400)
+    led = A._load_ledger(d)
+    led["handles"]["E000"].update(
+        {"admitted": int(time.time()) // 600 * 600, "btc_index": 0})
+    A._save_handles(d, led["handles"], led["owners"])
+    asked, order = [], []
+    _b = _note("receive_and_quote", {"amount_sat": 5000000, "owner": OX,
+                                     "replaces": "E000"})
+    _o, _e = _run(kf, _b, d, 4, subaddress_total=_zero,
+                  sleep=lambda s: order.append("jitter"),
+                  verify_tor=lambda: order.append("tor"),
+                  run_child=lambda argv, env, budget: (
+                      order.append("child"), (0, False))[1],
+                  btc_unused=lambda a: (asked.append(a), order.append(a),
+                                        unused_answer)[2])
+    return (A._load_ledger(d)["handles"]["E000"].get("released"), asked,
+            order, _e, _b)
+
+
+_A0 = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+_rb1, _ab1, _ob1, _eb1, _bb1 = _env_rel_btc(True)
+check("an undelivered INTAKE deposit, its BTC address never used: released "
+      "through the run, its own address asked first",
+      isinstance(_rb1, int) and _ab1[:1] == [_A0])
+check("...and asked only AFTER the jitter and the full Tor check (the "
+      "review of the release): a deposit address on the wire before them "
+      "is the moment the jitter exists to hide, past the check that "
+      "refuses a proxy that is not Tor",
+      _A0 in _ob1 and "jitter" in _ob1 and "tor" in _ob1
+      and _ob1.index("jitter") < _ob1.index(_A0)
+      and _ob1.index("tor") < _ob1.index(_A0))
+_rb2, _ab2, _ob2, _eb2, _bb2 = _env_rel_btc(False)
+check("...its BTC address USED (the client paid): not released -- the "
+      "place is kept", not _rb2 and _ab2[:1] == [_A0])
+check("...and at the stock ceiling, where that place IS the capacity, the "
+      "deposit is refused at_capacity -- the word 'full', after the Tor "
+      "check and before anything is minted",
+      _eb2 is not None and getattr(_eb2, "code", None) == "at_capacity"
+      and "child" not in _ob2
+      and (_bb2.result or {}).get("phase") == "full")
 _d7, _kf7, _b7 = _env(45, 0)
 _o7, _e7 = _run(_kf7, _b7, _d7, None)
 check("...a refusal for any other reason carries none",

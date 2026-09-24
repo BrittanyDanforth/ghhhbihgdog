@@ -1410,8 +1410,9 @@ leaving its address box empty so a fresh account was minted per run, onto
 run's exit had swept everything else out. `plan_usage_fee` now waives the cut
 on every path when no destination off the wallet is given, so nothing mints a
 fee onto the mixing wallet any more. What remains is history: a cut an
-*older* desk run minted is still there, and the next chat withdrawal will
-spend it as a deposit. Sweep such accounts off at the desk before pairing;
+*older* desk run minted is still there. It is no client's: a chat
+withdrawal spends only its asker's own accounts (the owner ledger), so it
+stays on the wallet until you move it. Sweep such accounts off at the desk;
 `gs_wake_keys pair` says so.
 
 **A mix a wake did not see the end of is settled by the next one.** Before a
@@ -1738,7 +1739,16 @@ first two on the vault where they cannot be talked around from a phone:
   because the default wallet lookahead is. To serve K people at twenty hops:
   recreate both wallets with a large lookahead (`--subaddress-lookahead
   400:50` and up), pair with `--account-ceiling` ≈ 30 K plus what the wallet
-  already holds, and rotate the wallet when it fills.
+  already holds, and rotate the wallet when it fills. A rotation is a
+  fresh ledger too: the vault refuses a withdrawal on a wallet that no
+  longer lists every account its ledger gave an owner
+  (`wallet_accounts_behind`, the guard against a wallet that went
+  backwards), so paid-out clients' records must go with the old wallet --
+  move any money still on it by hand first. A deposit `delayed` on a BTC
+  account the pair no longer uses (re-paired with another
+  `--btc-account`) is held for the ordinary two days from its last sign,
+  not at any age: nothing on the new pair can forward it, so nothing
+  would ever let it go. Move that money by hand.
   A deposit whose details never reached the chat (Telegram refused the
   message twice) still holds its place on the vault. The pager remembers
   it, in memory only, and names it in that chat's next deposit note
@@ -1747,17 +1757,27 @@ first two on the vault where they cannot be talked around from a phone:
   "full" for two days. This waives only the youth grace: a deposit with
   money on its address, one whose forward ran within the grace, or one
   whose wallet cannot be asked keeps its place, because a send that looked
-  failed may still have landed. A pager restart forgets the handle, and
+  failed may still have landed. On the intake the deposit's BTC address is
+  asked first, since no forward runs for a deposit the Pi does not watch:
+  it is released only if the network says the address was never used, and
+  a used address, or no answer, keeps the place (`release_btc_unconfirmed`
+  in the chain). That rests on the server's word: a lying one can admit
+  one deposit too many. A pager restart forgets the handle, and
   the old two-day rule applies.
   An intake deposit paid on the BTC side holds its place for the same two
   days from the LATEST sign of that money, not from its admission: a
-  forward that sent (or reconciled one in flight), or one that answered
-  `delayed` or `returned`. After that the XMR subaddress decides, where
+  forward that sent, one that found its forward still in flight or first
+  found it mined, or one that answered `delayed`. A tap on a forward mined
+  earlier does not restart the two days, and neither does `returned`,
+  which a stranger's dust on the address also produces. After that the XMR subaddress decides, where
   the swap's money sits until the mix takes it. It is never held for good
   on the strength of a forward alone: that closed the intake permanently
-  once a withdrawal leg failed after moving the money. A fee spike that
-  outlasts the Pi's own retries lets the place go two days after the last
-  `delayed`, and a tap on the deposit takes it back.
+  once a withdrawal leg failed after moving the money. Settled money that
+  today's fee will not carry (`delayed`) holds its place at any age, until
+  a forward of that deposit answers anything else -- sent, nothing there,
+  short, returned. It is a mix still to come, as money on the subaddress
+  is. If you move such money by hand, ask about the deposit once more (a
+  tap): the answer lets its place go.
   A pager started without `--btc-electrum` says so in every deposit
   request (`unwatched`, wire 12). A vault on the intake then refuses
   before minting, quoting or taking a place (`intake_unwatched` in both
@@ -2846,7 +2866,19 @@ can pay more to the same address. Once a forward has gone out, a tap past
 the recheck window — and the watcher's own recheck, once per window — runs
 the RECONCILIATION on the vault (`STAGE6_PLAN.md`): it reads the address's
 history from your Electrum server and confirms the transaction is listed,
-re-sends the kept bytes if it is not, re-signs a fresh forward if the
+re-sends the kept bytes if it is not (while the bytes are kept, a listing
+by a server caught answering a transaction id not ours, or by the one
+that accepted them while another can be asked, is checked with another
+server first; a server that took a transaction no other server then
+listed is tried LAST by every later submit of that forward, so one that
+says "accepted" and relays nothing cannot take every re-send; a listing
+by the acceptor alone that no other server confirms is acted on as
+listed but never taken as proof — the bytes stay kept and are pushed
+once more to the others, and the phone hears `sent`, not `forwarded`,
+even after it is mined, for as long as no other server answers. A
+server list whose other entries are dead leaves every forward there,
+with `listed_unconfirmed` on the chain each run: fix the list),
+re-signs a fresh forward if the
 network dropped it, REPLACES a forward that has sat in the mempool past
 `--btc-bump-after` at a rate under today's estimate (the bump: the same
 outpoints signed again, whole, at today's rate, priced to beat every
@@ -2878,7 +2910,15 @@ window a tap asks the forward again. Move the money by hand at the vault
 (the plan file names the outputs under `returned_kept`; a spend of exactly
 those is recognised as your hand, `kept_moved`, taken off the mark and
 written on the plan as `returned_moved` so every later run recognises it
-too, not as a leaked seed), or re-pair with a higher bound and let the next
+too, not as a leaked seed — and so is one that took, beside them, outputs
+that landed after the mark worth together no more than twice what one
+input costs at the pair's fee ceiling, a stranger's dust your wallet swept
+with them, said on the chain as `kept_moved_with_dust`. That is ONE
+allowance for the deposit, across every such move, recorded on the plan
+(`returned_dust`). It is public, so a leaked seed can take that much
+beyond the kept money without the alarm, as it can the kept money itself;
+and an input whose funding fell off the history window — a flood's doing —
+is not seen in a spend at all), or re-pair with a higher bound and let the next
 window's tap send it on. The mark follows the current plan: a bump or a
 re-sign at the bound leaves the kept money out and carries the mark onto
 its own plan, so the phone keeps hearing `kept` and not `sent`; under a
@@ -3053,7 +3093,7 @@ there: `gs_doorbell`, which persists nothing but the keyfile, and
 | file | what it holds |
 |---|---|
 | `pager_state.json` | the last 24 hours' wake stamps in 5-minute buckets — the daily cap reads them, and nothing older is written back — the update cursor, and while a wake is in flight the latest moment it can still be running: the **longest job's** window, whatever is running, because each job's own window is a public constant and on the card it named the job. (A restart mid-wake therefore holds for that long; the restart message says so. If you *know* nothing is running — the ThinkPad is off in front of you — start the pager once with `--clear-restart-hold`.) `gs_common`'s own wipe-list calls this "a dated record of every time you woke the vault from a phone — which is exactly the correlation the jitters exist to break". |
-| `integrity_chain.log` | **kept for `--chain-keep-days` (7 by default), then retired**: older lines go, and what is kept starts at an anchor line carrying the last retired hash, so it still verifies and a head you noted inside the window still matches (note it more often than the window, or it is retired with its lines). What it holds: `poke`, `collected` (for every job, beside the outcome — it used to be written only by the long jobs, at the moment of collection, so a card taken mid-wake said a withdrawal was running), `outcome:<out>`, `burn_signal`, `messages_burned`, `start`, the watcher's `looks_failing`, `address_unwatchable`, `intake_unwatched` and `pin_mismatch` (configuration, not a deposit: `pin_mismatch` is a pinned `--btc-electrum` server presenting another certificate -- an interception, or a renewed certificate -- which leaves the deposits whose rotation starts at it unwatched until it is repinned; under the shipped unit, whose output goes to `/dev/null`, these kinds are the ONLY record of it, so read the chain after a certificate renewal) and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. The intake's per-deposit kinds went the same way: `btc_watch_forgotten` was written a public constant (two days) after a deposit opened or its forward went out, dating the poke before it, and `forward_recheck` / `btc_returned_seen` named the job of a poke already chained. |
+| `integrity_chain.log` | **kept for `--chain-keep-days` (7 by default), then retired**: older lines go, and what is kept starts at an anchor line carrying the last retired hash, so it still verifies and a head you noted inside the window still matches (note it more often than the window, or it is retired with its lines). What it holds: `poke`, `collected` (for every job, beside the outcome — it used to be written only by the long jobs, at the moment of collection, so a card taken mid-wake said a withdrawal was running), `outcome:<out>`, `burn_signal`, `start`, `reply_undelivered` (one line after any job one of whose replies did not go through at the first try, the same for every job -- it was written only where a deposit's details or a withdrawal's report were lost, three deposit kinds and one withdrawal kind before that, and beside the outcome it named which), the configuration kinds -- `intake_unwatched` and `payload_withheld_group`, written at `start` when the condition is known then (no `--btc-electrum`; a group chat allowed), and `address_unwatchable`, `looks_failing`, `operator_alerted`, `wizard_burn_partial` and `wizard_burned_late`, each written ONCE per process (written per event, they dated each deposit or forward, and a wizard burned whole -- how every deposit and withdrawal starts -- writes nothing) -- and `pin_mismatch` (configuration, not a deposit: `pin_mismatch` is a pinned `--btc-electrum` server presenting another certificate -- an interception, or a renewed certificate -- which leaves the deposits whose rotation starts at it unwatched until it is repinned; under the shipped unit, whose output goes to `/dev/null`, these kinds are the ONLY record of it, so read the chain after a certificate renewal) and the refusal kinds -- **no job word**: it used to hold `poke:withdraw` and `outcome:withdraw:done` per run, a timetable of spends against probes for the life of the card. Kinds only one flow could reach went too: `run_unresolved` (a withdrawal picked up and never reported: `outcome:collected_no_result` already says it, for every job), and the withdrawal wizard's `convo_exhausted`, `callback_depth_stale` and `unwatchable_handle`. What remains that one flow alone can still write is the rare `chain_start_failed` (the next leg of a withdrawal could not start). The intake's per-deposit kinds went the same way: `btc_watch_forgotten` was written a public constant (two days) after a deposit opened or its forward went out, dating the poke before it, and `forward_recheck` / `btc_returned_seen` named the job of a poke already chained. |
 | `pager.log` | whatever the unit's `ExecStartPre` writes, plus anything you redirect there. |
 
 **What the window still gives, stated plainly.** Inside the kept window each

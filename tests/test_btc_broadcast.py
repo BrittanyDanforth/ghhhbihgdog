@@ -381,6 +381,27 @@ _r = _submit_stop(_f, _TWO, lambda: False)
 check("NON-VACUITY: a stop that is never raised changes nothing -- the "
       "second server is dialled and accepts",
       len(_f.seen["hosts"]) == 2 and _r["outcome"] == "accepted")
+# SERVERS NAMED `last` ARE TRIED AFTER EVERY OTHER (the residual of the
+# stage 3 review): an acceptor that relays nothing, first in the rotation,
+# took every re-send.
+_f = _factory(_FT("accept"), _FT("accept"))
+try:
+    _r = B.submit(_HEX, _TXID, _A0, _TWO, _PROXY, transport_factory=_f,
+                  last=[W.server_order(_TWO, _SH)[0][0]])
+except TypeError:
+    _r = {"server": "(no last parameter)"}
+check("last= naming the first in rotation: the second is tried first, and "
+      "takes it", _f.seen["hosts"][:1] == [W.server_order(_TWO, _SH)[1][0]]
+      and _r["server"] == W.server_order(_TWO, _SH)[1][0])
+_f = _factory(_FT("reject", code=-26), _FT("accept"))
+try:
+    _r = B.submit(_HEX, _TXID, _A0, _TWO, _PROXY, transport_factory=_f,
+                  last=[W.server_order(_TWO, _SH)[0][0]])
+except TypeError:
+    _r = {"server": "(no last parameter)"}
+check("...and it is TRIED, not dropped, when the others refuse",
+      len(_f.seen["hosts"]) == 2
+      and _r["server"] == W.server_order(_TWO, _SH)[0][0])
 # A LIST THE STOP CUT SHORT SAYS SO (the review of the stage 3 read): one
 # relay-policy "no" and the stop read `rejected` -- "every server that
 # answered" -- with the second server never tried.

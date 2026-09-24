@@ -856,6 +856,47 @@ for _fph in ("sent", "unsure", "forwarded"):
           and "rehearsal" not in _t5 and "Handle" not in _t5
           and "deposit address" not in _t5)
 
+# ---- A REFUSAL THAT CARRIES A WORD SAYS IT -----------------------------
+#
+# The by-hand path rendered "full" alone; a hand-poked deposit with
+# `unwatched` set was refused with the word `unwatched` and the terminal
+# said the vault "did not say why" (the review of 657deae).
+for _rw in ("full", "unwatched"):
+    _rf = Bell("receive_and_quote", params={"amount_sat": 5000000})
+    _rf.close()
+    _rf.pending.result = {"status": "refused", "handle": "", "slip": "",
+                          "plain": {}, "phase": _rw}
+    _bufr = io.StringIO()
+    with contextlib.redirect_stdout(_bufr):
+        _rcr = DB.report(_rf.pending)
+    check(f"a refusal carrying the word {_rw!r} prints the protocol's own "
+          "sentence for it, not 'did not say why'",
+          _rcr == 1 and P.PHASE_LINES[_rw] in _bufr.getvalue()
+          and "did not say why" not in _bufr.getvalue())
+_rf = Bell("receive_and_quote", params={"amount_sat": 5000000})
+_rf.close()
+_rf.pending.result = {"status": "refused", "handle": "", "slip": "",
+                      "plain": {}, "phase": ""}
+_bufr = io.StringIO()
+with contextlib.redirect_stdout(_bufr):
+    _rcr = DB.report(_rf.pending)
+check("NON-VACUITY: a refusal with no word still says it did not say why",
+      _rcr == 1 and "did not say why" in _bufr.getvalue())
+_rf = Bell("receive_and_quote", params={"amount_sat": 5000000})
+_rf.close()
+_rf.pending.result = {"status": "refused", "handle": "", "slip": "",
+                      "plain": {}, "phase": "moved"}
+_bufr = io.StringIO()
+with contextlib.redirect_stdout(_bufr):
+    _rcr = DB.report(_rf.pending)
+check("...and a refusal paired with a word that is NO refusal word (a vault "
+      "on another build) is not rendered as a reason",
+      _rcr == 1 and P.PHASE_LINES["moved"] not in _bufr.getvalue()
+      and "did not say why" in _bufr.getvalue())
+check("the refusal words are the protocol's one set, and the vault puts no "
+      "other on a refusal",
+      set(getattr(P, "REFUSAL_PHASES", ())) == {"full", "unwatched"})
+
 # ---- A FINISHED SPEND IS NOT A READY DEPOSIT ---------------------------
 #
 # report() branched on the OUTCOME and never on the job, so a completed

@@ -1840,12 +1840,18 @@ def report(pending: Pending) -> int:
         print(f"")
         return 0
     if out == "refused":
-        # THE ONE REFUSAL THAT CARRIES A WORD is rendered here the way the
-        # chat renders it, so the by-hand path and the chat do not drift.
+        # A REFUSAL THAT CARRIES A WORD is rendered here the way the chat
+        # renders it, so the by-hand path and the chat do not drift. EVERY
+        # refusal word the protocol names (REFUSAL_PHASES), not "full"
+        # alone (the review of 657deae): `unwatched` is the other, and a
+        # hand-poked deposit that sets the field reached "it did not say
+        # why" about a refusal that did. Only those: another word on a
+        # refusal is not a reason, and is not rendered as one.
         _rph = (pending.result or {}).get("phase") or ""
-        if _rph == "full":
+        if _rph in getattr(proto, "REFUSAL_PHASES", ()) \
+                and _rph in proto.PHASE_LINES:
             print(f"  [!] Vault refused job {pending.job}: "
-                  f"{proto.PHASE_LINES.get('full', 'full')}")
+                  f"{proto.PHASE_LINES[_rph]}")
             return 1
         print(f"  [!] Vault REFUSED job {pending.job}. It did not say why, "
               f"deliberately — the reason is on the vault's terminal.")

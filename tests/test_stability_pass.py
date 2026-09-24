@@ -668,9 +668,11 @@ check("the withdrawal minimum is the wire's shallowest depth, not a literal",
       A._MIN_OUT_WALLETS == P.WITHDRAW_DEPTHS[min(P.WITHDRAW_DEPTHS)][0])
 check("the status file is taken off the disk once it has been reported",
       _SRC_A.count("(artifact_dir / STATUS_FILE).unlink()") >= 2)
-check("the doorbell's console says the 'full' line for a full vault",
-      "if _rph == \"full\":" in _SRC_DB
-      and "proto.PHASE_LINES.get('full'" in _SRC_DB)
+check("the doorbell's console says the 'full' line for a full vault -- "
+      "through the protocol's one set of refusal words, which holds it",
+      'getattr(proto, "REFUSAL_PHASES", ())' in _SRC_DB
+      and "proto.PHASE_LINES[_rph]" in _SRC_DB
+      and "full" in getattr(P, "REFUSAL_PHASES", ()))
 check("the chain's prev comes from the tail reader, never a whole-file read",
       "prev = _last_chain_prev(log_path)" in _SRC_GC
       and "read_text().splitlines()" not in

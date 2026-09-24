@@ -469,8 +469,11 @@ def build_cli() -> argparse.ArgumentParser:
     #
     # gs_wake_agent's _withdraw_fee_argv passes --usage-fee only when this
     # field is set, because a freshly minted account lands ON THE MIXING
-    # WALLET and _funded_entry -- which picks the largest unlocked output and
-    # has no notion of whose it is -- hands it to the NEXT withdrawal. So an
+    # WALLET, and _funded_entry -- which picked the largest unlocked output
+    # with no notion of whose it was -- handed it to the NEXT withdrawal.
+    # (Since owner sets, a chat withdrawal spends only its asker's accounts,
+    # and such an account is nobody's: it stays on the wallet for a person
+    # at the desk.) So an
     # operator who followed this help paired the "recommended" way and took no
     # fee at all, on every withdrawal, for as long as the job existed, while
     # being told the opposite.
@@ -938,11 +941,11 @@ def _validate(args) -> None:
         print("         The cut can only be taken to somewhere off this")
         print("         wallet, and nowhere off it has been named.")
         print("      2. A cut that an OLDER desk run minted onto this wallet")
-        print("         (before the tool stopped doing that) is still there,")
-        print("         and the next withdrawal started from the chat")
-        print("         will pick it up and send it to whatever address the")
-        print("         chat names, as if it were a deposit. Sweep any such")
-        print("         account off this wallet at the desk BEFORE pairing.")
+        print("         (before the tool stopped doing that) is still there.")
+        print("         It is nobody's to withdraw from the chat -- a chat")
+        print("         withdrawal spends only its asker's own accounts -- so")
+        print("         it stays until you move it. Sweep any such account")
+        print("         off this wallet at the desk.")
         print()
         print("      Give --usage-fee-address (repeat it for several) to take")
         print("      a fee, or continue if you meant to take no fee.")

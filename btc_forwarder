@@ -159,6 +159,45 @@ def _distrusted(sub, plan=None):
     if isinstance(plan, dict):
         out += list(plan.get("broadcast_distrusted") or ())
     return sorted({h for h in out if isinstance(h, str) and h})
+
+
+def _unwitnessed_of(plan):
+    """The servers that ACCEPTED a transaction of this forward that no
+    other server then listed (`broadcast_unwitnessed`) -- for a plan from
+    before the field, its acceptor when nothing confirmed it. Tried last
+    by every later submit (_suspects): a server that says "accepted" and
+    relays nothing, first in the rotation, took every re-send of the same
+    bytes and the network never had them."""
+    if not isinstance(plan, dict):
+        return set()
+    out = {h for h in (plan.get("broadcast_unwitnessed") or ())
+           if isinstance(h, str) and h}
+    _acc = plan.get("broadcast_server")
+    if "broadcast_unwitnessed" not in plan and plan.get("seen") is not True \
+            and isinstance(_acc, str) and _acc:
+        out.add(_acc)
+    return out
+
+
+def _unwitnessed_after(prior, sub, seen_r):
+    """`prior` after a submit and its seen: the acceptor joins it when no
+    other server listed what it took, and leaves it when one did."""
+    out = set(prior)
+    _acc = (sub or {}).get("server")
+    if isinstance(_acc, str) and _acc:
+        if seen_r and seen_r.get("seen"):
+            out.discard(_acc)
+        else:
+            out.add(_acc)
+    return sorted(out)
+
+
+def _suspects(plan):
+    """Who a submit for this forward tries LAST (bcast.submit's `last`):
+    the unwitnessed acceptors and the servers caught answering a txid not
+    ours. Tried last, never dropped; rests on another server being
+    honest."""
+    return sorted(_unwitnessed_of(plan) | set(_distrusted(None, plan)))
 bcast_seen = bcast.seen
 # READ-ONLY, in the same module: the address's spends, for a forward that
 # went out and whose plan was never written (stage 5).
@@ -1190,6 +1229,29 @@ def todays_rate(args, picture):
     return est
 
 
+def thor_btc_entry(entries):
+    """THORNode's one BTC inbound entry in `entries`, or a refusal: none or
+    several (inbound_unverified), or trading halted or paused
+    (chain_halted). Asked of this run's one read BEFORE the quote as well
+    as by the cross-check after it (the review of 657deae): refused only
+    after the quote, a THORNode outage or a halt sent the aggregator the
+    destination and the amount on every retry of a run that could never
+    sign. Minimising what reaches one party, not a defence: it rests on no
+    secret."""
+    btc = [e for e in entries if isinstance(e, dict)
+           and e.get("chain") == _THOR_BTC_CHAIN]
+    if len(btc) != 1:
+        raise Refused("inbound_unverified", "THORNode lists no single BTC "
+                      "inbound")
+    entry = btc[0]
+    if any(entry.get(k) for k in ("halted", "chain_trading_paused",
+                                   "global_trading_paused",
+                                   "chain_lp_actions_paused")):
+        raise Refused("chain_halted", "ThorChain reports BTC trading halted "
+                      "or paused; a payment now would sit unswapped")
+    return entry
+
+
 def cross_check_inbound(inbound, thornode_url, proxy_url, entries=None):
     """THORNode's own inbound_addresses, on a second circuit: the BTC
     entry must exist, must not be halted, and must name the SAME address
@@ -1208,17 +1270,7 @@ def cross_check_inbound(inbound, thornode_url, proxy_url, entries=None):
     (fetch_inbound_entries); else it is fetched here."""
     if entries is None:
         entries = fetch_inbound_entries(thornode_url, proxy_url)
-    btc = [e for e in entries if isinstance(e, dict)
-           and e.get("chain") == _THOR_BTC_CHAIN]
-    if len(btc) != 1:
-        raise Refused("inbound_unverified", "THORNode lists no single BTC "
-                      "inbound")
-    entry = btc[0]
-    if any(entry.get(k) for k in ("halted", "chain_trading_paused",
-                                   "global_trading_paused",
-                                   "chain_lp_actions_paused")):
-        raise Refused("chain_halted", "ThorChain reports BTC trading halted "
-                      "or paused; a payment now would sit unswapped")
+    entry = thor_btc_entry(entries)
     if str(entry.get("address") or "").lower() != str(inbound).lower():
         raise Refused("inbound_mismatch",
                       "the aggregator's inbound address is NOT the one "
@@ -1636,8 +1688,12 @@ def _plan_of_spend(spend, tx, memo, network, index, address, dest_xmr,
     except Exception:                                        # noqa: BLE001
         inbound = None
     ins = [i for i in (spend.get("inputs") or []) if isinstance(i, dict)]
-    in_sat = sum(int(i["value"]) for i in ins)
-    _named = {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in ins}
+    # ...AND AN INPUT NAMED FROM OUR OWN BYTES WITH NO VALUE (_own_inputs:
+    # an outpoint no plan of the chain recorded) is not named for the fee.
+    _valued = [i for i in ins if isinstance(i.get("value"), int)
+               and not isinstance(i.get("value"), bool) and i["value"] >= 0]
+    in_sat = sum(int(i["value"]) for i in _valued)
+    _named = {(str(i["tx_hash"]).lower(), int(i["vout"])) for i in _valued}
     _all = {(v.txid.hex(), int(v.vout)) for v in tx.vin}
     fee_sat = (in_sat - sum(int(o.value) for o in tx.vout)
                if _all and _named == _all else None)
@@ -1977,6 +2033,85 @@ def _pairs(seq):
     return out
 
 
+def _pair_list(seq):
+    """_pairs in the order the plan records them, each once: the kept and
+    leftover marks list the LARGEST first (_largest_first), and which of
+    their funding transactions the history read fetches under
+    KEEP_EXTRA_MAX is taken in that order. NEVER raises."""
+    out, seen = [], set()
+    if not isinstance(seq, (list, tuple)):
+        return out
+    for _o in seq:
+        try:
+            _p = (str(_o[0]).lower(), int(_o[1]))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if _p not in seen:
+            seen.add(_p)
+            out.append(_p)
+    return out
+
+
+def _note_values(plan, outputs):
+    """Record on `plan` what each of `outputs` is worth (`outpoint_values`,
+    "txid:vout" -> sat): the marks name outpoints only, and the keep list
+    orders what it reads by value (_values_of) -- a kept output already
+    moved, or a move's inputs, are on no look to read it from."""
+    _m = plan.get("outpoint_values")
+    _m = dict(_m) if isinstance(_m, dict) else {}
+    for u in outputs or ():
+        if not isinstance(u, dict):
+            continue
+        try:
+            _k = f"{str(u['tx_hash']).lower()}:{int(u['vout'])}"
+        except (KeyError, TypeError, ValueError):
+            continue
+        _v = u.get("value")
+        if isinstance(_v, int) and not isinstance(_v, bool) and _v >= 0:
+            _m[_k] = _v
+    if _m:
+        plan["outpoint_values"] = _m
+
+
+def _values_of(plans):
+    """{(txid, vout): sat} from every plan's `outpoint_values`. NEVER
+    raises: a corrupt entry is skipped."""
+    out = {}
+    for p in plans or ():
+        _m = p.get("outpoint_values") if isinstance(p, dict) else None
+        if not isinstance(_m, dict):
+            continue
+        for _k, _v in _m.items():
+            _t, _, _vo = str(_k).rpartition(":")
+            try:
+                _key = (_t.lower(), int(_vo))
+            except ValueError:
+                continue
+            if isinstance(_v, int) and not isinstance(_v, bool) and _v >= 0:
+                out.setdefault(_key, _v)
+    return out
+
+
+def _largest_first(utxos):
+    """`utxos` ordered by value, the largest first (then by outpoint, so
+    one set of outputs is always written one way): how the kept and
+    leftover marks list what they name. A stranger's dust sorted beside a
+    refund by txid filled the KEEP_EXTRA_MAX funding reads the reconcile
+    takes from the mark (the review of 657deae), and the refund's own was
+    left off -- its hand move then read as a leaked seed. First by value,
+    a flood has to outbid the money it would crowd out, output by output.
+    That is a cost to the flooder, not a secret: the cap and the order
+    are public."""
+    def _k(u):
+        try:
+            _v = int(u.get("value") or 0)
+        except (TypeError, ValueError):
+            _v = 0
+        return (-_v, str(u.get("tx_hash") or "").lower(),
+                int(u.get("vout") or 0))
+    return sorted(utxos, key=_k)
+
+
 def _chain_plans(outfile):
     """Every plan of ours on the chain at `outfile` (the current file
     included), oldest last as _plan_chain lists them. _plan_file, not
@@ -2219,30 +2354,113 @@ def _memo_is_ours(tx_hex, dest_xmr):
     return memo, ours
 
 
+def _own_inputs(spends, plans, signed=()):
+    """Name the inputs of every listed spend that is a forward of ours
+    (a txid in `plans`, or one this tool recorded before sending it --
+    `signed`, signed_txids) from its OWN transaction: every outpoint its
+    vin spends, with the value a plan of the chain recorded for that
+    outpoint where one did. In place.
+
+    RECORDED AND UNPLANNED TOO (the review of 657deae): a bump whose run
+    died before its plan is ours (adopted below) and is in no plan yet.
+    With the funding of our inputs no longer fetched, under a flood its
+    inputs read as none -- history_inconsistent, and a plan adopted with
+    no inputs and no fee, never bumped again. A bump spends the outpoints
+    of the plan it replaces, so their values are that plan's.
+
+    A forward of ours spends only this address's outputs -- it is signed
+    with this index's key and nothing else -- so its vin IS its inputs.
+    The history reader names only the inputs whose funding transaction it
+    read, and one whose funding fell off the window was listed with fewer
+    (or none): its inputs then read neither unspent nor consumed. The hex
+    is the listed txid's own (the reader recomputes the id from it), so
+    this rests on nothing the server can choose -- and it is checked again
+    here. No value where the plan kept none: nothing reads the value of
+    our own spend's inputs."""
+    from embit.transaction import Transaction as _Tx
+    _by = {str(p.get("txid") or "").lower(): p for p in plans
+           if isinstance(p, dict) and p.get("txid")}
+    _signed = {str(t).lower() for t in (signed or ())}
+    _known = {}
+    for p in plans:
+        if isinstance(p, dict):
+            for i in (p.get("inputs") or []):
+                if isinstance(i, dict):
+                    try:
+                        _known.setdefault((str(i["tx_hash"]).lower(),
+                                           int(i["vout"])), i.get("value"))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+    for s in spends:
+        _t = str(s.get("txid") or "").lower()
+        p = _by.get(_t)
+        if p is None and _t not in _signed:
+            continue
+        try:
+            _tx = _Tx.parse(bytes.fromhex(str(s.get("hex") or "")))
+        except Exception:                                    # noqa: BLE001
+            continue
+        # The reader recomputes the id from the hex; checked HERE too, on
+        # the side that acts on it: bytes that are not the listed txid's
+        # name nothing of it.
+        if _tx.txid().hex() != str(s.get("txid") or "").lower():
+            continue
+        _vin = _tx.vin
+        _val = dict(_known)
+        for i in list((p or {}).get("inputs") or []) \
+                + list(s.get("inputs") or []):
+            if isinstance(i, dict):
+                try:
+                    _k = (str(i["tx_hash"]).lower(), int(i["vout"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if _val.get(_k) is None:
+                    _val[_k] = i.get("value")
+        s["inputs"] = [{"tx_hash": v.txid.hex(), "vout": int(v.vout),
+                        "value": _val.get((v.txid.hex(), int(v.vout)))}
+                       for v in _vin]
+
+
 #: How many txids that funded kept, hand-moved or leftover outputs the
 #: reconciliation's history read fetches beyond its window (reconcile's
-#: keep list). Our own forwards and what funded their inputs are always
-#: read; these ride on top, and a budgeted read cannot carry hundreds.
+#: keep list). Our own forwards are always read (their inputs are named
+#: from their own bytes, _own_inputs, not from what funded them); these
+#: ride on top, and a budgeted read cannot carry hundreds.
 KEEP_EXTRA_MAX = 20
 
 
 def _witnessed(args, plan, spends, address, servers):
     """`spends` as the reconciliation may act on them: the current plan's
     own transaction, while its signed bytes are KEPT (the network has not
-    been shown to hold it), stays listed only on the word of a server that
-    can be its witness -- the rule the send's own `seen` keeps: never a
-    server that answered a submit with a txid not ours
+    been shown to hold it), is taken as listed only on the word of a
+    server that can be its witness -- the rule the send's own `seen`
+    keeps: never a server that answered a submit with a txid not ours
     (`broadcast_distrusted`), and not the one that accepted it while
     another can be asked. Listed by one of those, the address is asked
-    once more, of the others. Not listed there, the listing is left out
-    ("dropped") and the run goes on as for a transaction that is not
-    listed -- the same bytes sent again, which cannot spend anything
-    twice. With nobody else to ask, a caught-out server's listing is
-    dropped too, and the acceptor's is kept but UNCONFIRMED: the bytes
-    stay kept and the plan is not marked seen -- a server that is down
-    for a while is not a lie, and failing every run until it is back
-    would say "failed" about a forward that may well have gone.
-    Returns (spends, "" | "dropped" | "unconfirmed").
+    once more, of the others. Returns (spends, state):
+
+      ""            listed by a witness, or confirmed by one now.
+      "unconfirmed" listed only by a server that took the bytes and was
+                    not seen to relay them. Acted on as listed --
+                    the bump reads it -- and never taken as proof: the
+                    bytes stay kept and the plan is not marked seen. When
+                    another server was asked and does not list it, the
+                    same bytes are PUSHED to the others (_push_elsewhere,
+                    by the listed branch, unless this run replaces them):
+                    an acceptor that relays nothing reaches the network
+                    through them, and a node whose relay policy refuses
+                    the memo -- the split STAGE3_PLAN.md 3.3 documents --
+                    refuses the push and nothing changes. (The review of
+                    the stage 3 fixes: "not in the other server's mempool"
+                    was read as a lie, the listing dropped, the stuck
+                    forward never bumped, and with the look asked of the
+                    acceptor the run FAILED on every recheck.)
+      "contradicted" listed by a CAUGHT-OUT server and not by a server
+                    asked now: left out, and the same bytes are sent again
+                    even when the look reads the inputs spent -- the look
+                    may be the liar's too.
+      "unwitnessed" listed by a caught-out server and nobody else could be
+                    asked: left out; the bytes stay kept.
 
     THE REVIEW OF THE STAGE 3 READ: `seen` left the caught-out server out,
     and the next run's history read took it -- the first server that
@@ -2252,6 +2470,7 @@ def _witnessed(args, plan, spends, address, servers):
     some other configured server being honest, which is all a second
     opinion is; with none left to ask, the bytes stay kept."""
     txid = str(plan.get("txid") or "").lower()
+    args._push_skip = None
     if not plan.get("tx_hex") or not txid:
         return spends, ""
     hit = next((x for x in spends if str(x.get("txid")).lower() == txid),
@@ -2260,15 +2479,26 @@ def _witnessed(args, plan, spends, address, servers):
         return spends, ""
     distrust = _distrusted(None, plan)
     acceptor = plan.get("broadcast_server")
+    # EVERY SERVER THAT TOOK THESE BYTES AND WAS NOT SEEN TO RELAY THEM, not
+    # the latest acceptor alone (the review of 657deae): one that accepted
+    # a first send nobody listed, before a re-send went to another, listed
+    # them the next run and was taken as proof -- the plan saying "seen by
+    # it" and "tried last as unwitnessed" at once.
+    _accs = set(_unwitnessed_of(plan))
+    if isinstance(acceptor, str) and acceptor:
+        _accs.add(acceptor)
     by = hit.get("server")
-    if by not in distrust and not (by == acceptor and len(servers) > 1):
+    # HOSTS, NOT ENTRIES: `seen` leaves servers out by host, so one host
+    # configured on two ports is one server here too (the review of the
+    # stage 3 fixes: counted as two, the second opinion asked nobody).
+    _hosts = {x[0] for x in servers if isinstance(x, (tuple, list)) and x}
+    if by not in distrust and not (by in _accs and len(_hosts) > 1):
         return spends, ""
     try:
         sr = bcast_seen(txid, address, servers, args.tor_proxy,
                         network=args.network, timeout=args.timeout,
                         wait_s=0, interval_s=args.seen_interval,
-                        avoid=[acceptor] if isinstance(acceptor, str)
-                        and acceptor else [],
+                        avoid=sorted(_accs),
                         stop=shutdown_requested, distrust=distrust)
     except watch.PinMismatch as e:
         raise Refused("pin_mismatch", str(e))
@@ -2277,20 +2507,71 @@ def _witnessed(args, plan, spends, address, servers):
     if sr["seen"]:
         hit["server"], hit["height"] = sr["server"], sr["height"]
         return spends, ""
-    if not sr["asked"] and by not in distrust:
+    if by not in distrust:
         integrity_log("forward", "listed_unconfirmed")
-        print("  reconcile: our transaction is listed by the server that "
-              "accepted it, and no other server could be asked to confirm "
-              "it; the signed bytes stay kept.")
+        print("  reconcile: our transaction is listed only by a server that "
+              "accepted it, and "
+              + ("no other server lists it" if sr["asked"]
+                 else "no other server could be asked")
+              + "; acted on as listed, the signed bytes kept.")
+        # THE PUSH IS THE LISTED BRANCH'S TO MAKE, after it knows whether
+        # this run replaces the forward (the review of 657deae): pushed
+        # here, the original went out a moment before its own replacement
+        # -- the timing BUMP_WINDOW exists to spread -- and was wasted.
+        if sr["asked"]:
+            args._push_skip = sorted(_accs | {by})
         return spends, "unconfirmed"
     integrity_log("forward", "listed_unwitnessed")
     print("  reconcile: our transaction is listed only by a server that "
-          "cannot vouch for it (the one that accepted it, or one that "
-          "answered a transaction not ours), and "
+          "answered a transaction not ours, and "
           + ("no other server lists it" if sr["asked"]
              else "no other server could be asked")
           + "; the signed bytes stay kept.")
-    return [x for x in spends if x is not hit], "dropped"
+    return ([x for x in spends if x is not hit],
+            "contradicted" if sr["asked"] else "unwitnessed")
+
+
+def _push_elsewhere(args, plan, address, servers, skip):
+    """Hand the current plan's KEPT bytes to every server but the one that
+    accepted them, once: the same transaction, so it spends nothing twice
+    and changes nothing on the plan but whom it distrusts. What it answers
+    is logged, and read by the next run's second opinion. Never raises; a
+    stop skips it."""
+    if shutdown_requested():
+        return
+    others = [x for x in servers if isinstance(x, (tuple, list)) and x
+              and x[0] not in set(skip or ())]
+    if not others:
+        return
+    try:
+        sub = bcast_submit(plan["tx_hex"], str(plan.get("txid") or "").lower(),
+                           address, others, args.tor_proxy,
+                           network=args.network, timeout=args.timeout,
+                           stop=shutdown_requested,
+                           last=_distrusted(None, plan))
+    except watch.PinMismatch:
+        # SAID AS WHAT IT IS (the review of 657deae): under the shipped
+        # unit this chain line is the only record of an interception.
+        integrity_log("forward", "pin_mismatch")
+        return
+    except Exception:                                        # noqa: BLE001
+        integrity_log("forward", "push_failed")
+        return
+    integrity_log("forward", f"pushed_{sub.get('outcome')}")
+    # ...AND A SERVER THAT TOOK THE PUSH IS AN ACCEPTOR LIKE THE FIRST: no
+    # witness for bytes it was handed until another lists them, and tried
+    # last by later submits (_unwitnessed_of).
+    _pa = sub.get("server")
+    if sub.get("outcome") == bcast.OUTCOME_ACCEPTED \
+            and isinstance(_pa, str) and _pa:
+        plan["broadcast_unwitnessed"] = sorted(_unwitnessed_of(plan) | {_pa})
+    # A SERVER THE PUSH CAUGHT ANSWERING A TXID NOT OURS is no witness from
+    # here on, as one the send caught is (_distrusted): on the plan, which
+    # the listed branch writes after this, or the next run's second
+    # opinion could ask it and take its "listed" as proof.
+    plan["broadcast_distrusted"] = _distrusted(sub, plan)
+    print(f"  reconcile: the same transaction handed to the other "
+          f"server(s): {sub.get('outcome')}")
 
 
 def reconcile(args, plan, picture, address, index, servers, dest_xmr):
@@ -2330,33 +2611,56 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     for whoever holds the seed to copy (SIGNED_SCHEMA). Money come back but not yet settled is
     the word `returned` and a refusal: sent on when it settles."""
     # OUR OWN TRANSACTIONS ARE READ WHEREVER THEY SIT in a history longer
-    # than the window: every forward in the plan chain and what funded its
-    # inputs. A dust flood that pushed them off the newest MAX_HISTORY left
-    # our forward's inputs neither unspent nor consumed -- the safe
-    # history_inconsistent, on every run, for good.
+    # than the window: every forward in the plan chain. A dust flood that
+    # pushed one off the newest MAX_HISTORY left our forward's inputs
+    # neither unspent nor consumed -- the safe history_inconsistent, on
+    # every run, for good. NOT WHAT FUNDED THEIR INPUTS (the review of the
+    # keep cap): those were read so the history reader could name our
+    # forward's inputs, one fetch each, and a forward carrying hundreds of
+    # inputs -- a flood of forwardable payments, sent on together -- put
+    # hundreds of fetches on top of the window, past the read's budget:
+    # history_unavailable on every run. Our forward's inputs are named
+    # from its own transaction instead (_own_inputs, below).
     _chain0 = _chain_plans(args.outfile)
-    _keep, _kept_f, _left_f = set(), set(), set()
+    # WHAT EACH MARKED OUTPOINT IS WORTH: recorded when the mark was written
+    # (_note_values), else what the look shows.
+    _vals = _values_of([plan] + _chain0)
+    for _u0 in picture.get("utxos") or ():
+        try:
+            _vals.setdefault((str(_u0["tx_hash"]).lower(), int(_u0["vout"])),
+                             int(_u0["value"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    _keep, _cands, _seq = set(), [], 0
     for _p0 in [plan] + _chain0:
         if _p0.get("txid"):
             _keep.add(str(_p0["txid"]).lower())
-        for _i0 in (_p0.get("inputs") or []):
-            if isinstance(_i0, dict) and _i0.get("tx_hash"):
-                _keep.add(str(_i0["tx_hash"]).lower())
         # ...AND WHAT FUNDED THE KEPT AND THE HAND-MOVED OUTPUTS: pushed off
         # the window by a flood, a hand move of them was listed with no
         # inputs, matched no kept outpoint, and read as a foreign spend --
         # "the seed has leaked" -- on every run until it left the window.
+        # THE LARGEST FIRST, ACROSS EVERY MARK (the review of 657deae):
+        # ordered mark by mark, a move of a refund and twenty-five dust
+        # outputs filled the cap before the refund kept since was reached,
+        # and its hand move then read as a leaked seed. By value, a flood
+        # has to outbid the money it would crowd out, output by output; a
+        # value no plan recorded and no look shows goes last, moved and
+        # kept before leftover, in the marks' own order.
         _rk0 = _p0.get("returned_kept")
         _rl0 = _p0.get("returned_leftover")
-        _kept_f |= {str(_t0).lower() for _t0, _v0 in (
-            _pairs((_rk0 or {}).get("outpoints")
-                   if isinstance(_rk0, dict) else None)
-            | _pairs(_p0.get("returned_moved")))}
-        _left_f |= {str(_t0).lower() for _t0, _v0 in _pairs(
-            (_rl0 or {}).get("outpoints") if isinstance(_rl0, dict)
-            else None)}
-    # ...AT MOST KEEP_EXTRA_MAX OF THOSE, kept and moved before leftover
-    # (the review of that fix). A `leftover` records whatever came back,
+        for _cat, _ops in (
+                (0, _pair_list(_p0.get("returned_moved"))),
+                (0, _pair_list((_rk0 or {}).get("outpoints")
+                               if isinstance(_rk0, dict) else None)),
+                (1, _pair_list((_rl0 or {}).get("outpoints")
+                               if isinstance(_rl0, dict) else None))):
+            for _o0 in _ops:
+                _v0 = _vals.get(_o0)
+                _cands.append((((0, -_v0, _cat, _seq) if _v0 is not None
+                                else (1, 0, _cat, _seq)), _o0[0]))
+                _seq += 1
+    _cands.sort(key=lambda c: c[0])
+    # ...AT MOST KEEP_EXTRA_MAX OF THOSE, the largest first (above). A `leftover` records whatever came back,
     # and a stranger's flood of separate small payments -- each its own
     # funding transaction -- put hundreds of txids on top of the window,
     # past what the read's budget allows: history_unavailable on every run
@@ -2366,9 +2670,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # foreign spend -- FAILED, nothing signed -- until that move leaves
     # the window itself; one with any input funded inside it still reads
     # as the operator's hand.
-    _extra = [t for t in sorted(_kept_f) if t not in _keep]
-    _extra += [t for t in sorted(_left_f)
-               if t not in _keep and t not in _kept_f]
+    _extra, _seen_x = [], set(_keep)
+    for _c0, t in _cands:
+        if t not in _seen_x:
+            _seen_x.add(t)
+            _extra.append(t)
     _keep |= set(_extra[:KEEP_EXTRA_MAX])
     try:
         _res = bcast_spends(address, servers, args.tor_proxy,
@@ -2387,6 +2693,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # alone -- the stage-5 shape -- is taken as knowing of no memo.
     spends, paid = (_res if isinstance(_res, tuple) and len(_res) == 2
                     else (_res, []))
+    _sent_here = signed_txids(args.outfile)      # read once for the run
+    _own_inputs(spends, [plan] + _chain0, _sent_here)
     spends, _witness = _witnessed(args, plan, spends, address, servers)
     chain = _chain0
     ours = {str(p.get("txid") or "").lower() for p in chain
@@ -2472,7 +2780,6 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                                for i in (_p.get("inputs") or [])
                                if isinstance(i, dict)])
     _kept_ops -= _signed_ops
-    _sent_here = signed_txids(args.outfile)
     listed = {s["txid"]: s for s in spends}
     # WHAT A LISTED HAND MOVE SPENDS is gone, whatever the look says: the
     # look is another session, perhaps another server, and one that has
@@ -2480,6 +2787,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # consumed below with our own forwards' inputs.
     _moved_ins = set()
     _adopted = []
+    # THE DUST ALLOWANCE IS ONE, FOR THE DEPOSIT, NOT ONE PER SPEND (the
+    # review of 657deae): three spends, each taking one kept output and
+    # the allowance beside it, took three allowances unnoticed -- and a
+    # mark naming a stranger's dust outputs gave a seed holder one spend,
+    # and one allowance, per dust output. What earlier moves took beside
+    # kept money is on the chain (`returned_dust`) and counts against it.
+    _dust_used = sum(_vals.get(o, 0) for o in {
+        o for _p0 in [plan] + chain for o in _pair_list(
+            _p0.get("returned_dust") if isinstance(_p0, dict) else None)})
     for s in spends:
         if s["txid"] in ours:
             continue
@@ -2495,20 +2811,76 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             continue
         _ins = {(str(i.get("tx_hash") or "").lower(), int(i.get("vout") or 0))
                 for i in (s.get("inputs") or []) if isinstance(i, dict)}
-        if _kept_ops and _ins and _ins <= _kept_ops:
+        # ...AND DUST THAT LANDED AFTER THE MARK, SWEPT BESIDE IT (the review
+        # of 657deae): after `kept` the Pi stops asking, so no run rewrites
+        # the mark when a stranger's few hundred satoshis land on the
+        # address; the operator's wallet sweep -- the documented remedy --
+        # then took them with the kept money, matched no mark, and read as
+        # a leaked seed on every run, the deposit never forwarded again.
+        # A move that takes kept money and, beside it, outputs no plan of
+        # ours signed for, worth together at most dust_line(the ceiling)
+        # -- twice what one input costs at the highest rate this pair
+        # pays -- is the operator's hand too. NOTHING SECRET: the line is
+        # public. It bounds two things and says so: a seed holder can take
+        # that much beyond the kept money unnoticed (as they can the kept
+        # money itself, below), and a stranger who wants the alarm must
+        # pay more than that to the address, into the operator's sweep --
+        # ONE allowance for the deposit, across every such move (below).
+        # An extra with no value counts as more. WHAT THIS CANNOT SEE,
+        # stated (the review of this fix): the history names only the
+        # inputs whose funding it read, so an extra funded off the window
+        # -- a flood's doing -- is not in the spend at all, and a move of
+        # kept money beside it reads as the operator's hand whatever it
+        # took. KEEP_EXTRA_MAX bounds what that costs; nothing here can.
+        _extra_ins = _ins - _kept_ops
+        _hand = bool(_kept_ops and _ins and _ins & _kept_ops)
+        if _hand and _extra_ins:
+            _xval = {}
+            for i in (s.get("inputs") or []):
+                if not isinstance(i, dict):
+                    continue
+                _o = (str(i.get("tx_hash") or "").lower(),
+                      int(i.get("vout") or 0))
+                if _o in _extra_ins:
+                    _v = i.get("value")
+                    _xval[_o] = (_v if isinstance(_v, int)
+                                 and not isinstance(_v, bool) and _v > 0
+                                 else None)
+            _hand = (not _extra_ins & _signed_ops
+                     and None not in _xval.values()
+                     and _dust_used + sum(_xval.values())
+                     <= dust_line(int(args.feerate_ceiling)))
+            if _hand:
+                integrity_log("forward", "kept_moved_with_dust")
+        if _hand:
             # MONEY THE VAULT KEPT, MOVED BY HAND (the documented remedy
             # for a return past the bound): expected, not an alarm. Only
             # a seed holder can spend from the address, and a leaked seed
-            # that took ONLY the kept outputs took what the operator was
-            # about to move anyway; one that took more fails below.
+            # that took ONLY the kept outputs (and dust beside them, see
+            # above) took what the operator was about to move anyway; one
+            # that took more fails below.
             # RECORDED ON THE PLAN AT ONCE, and written: the same spend is
             # in the history on every later run, and the kept mark it
             # matched is cleared below once nothing is left to keep.
-            _seen_moved = _pairs(plan.get("returned_moved"))
+            _seen_moved = _pair_list(plan.get("returned_moved"))
             _dirty = False
-            if not _ins <= _seen_moved:
-                plan["returned_moved"] = sorted(
-                    [list(o) for o in (_seen_moved | _ins)])
+            if not _ins <= set(_seen_moved):
+                # What was recorded stays in its order; this move's inputs
+                # follow, the largest first (see the keep cap above).
+                plan["returned_moved"] = [list(o) for o in _pair_list(
+                    _seen_moved
+                    + [(i.get("tx_hash") or "", i.get("vout") or 0)
+                       for i in _largest_first(
+                           [i for i in (s.get("inputs") or [])
+                            if isinstance(i, dict)])])]
+                _note_values(plan, s.get("inputs"))
+                _dirty = True
+            # ...AND THE DUST TAKEN BESIDE IT, against the one allowance.
+            if _extra_ins:
+                plan["returned_dust"] = [list(o) for o in _pair_list(
+                    _pair_list(plan.get("returned_dust"))
+                    + sorted(_extra_ins))]
+                _dust_used += sum(_xval.values())
                 _dirty = True
             # ...AND TAKEN OFF THE MARK, whatever else this run does: a
             # bump the ceiling refuses leaves the current plan as it is,
@@ -2518,7 +2890,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # left, no mark.
             _rk = plan.get("returned_kept")
             if isinstance(_rk, dict) and _pairs(_rk.get("outpoints")) & _ins:
-                _left = sorted(_pairs(_rk.get("outpoints")) - _ins)
+                _left = [o for o in _pair_list(_rk.get("outpoints"))
+                         if o not in _ins]
                 if _left:
                     _val = {(str(u["tx_hash"]).lower(), int(u["vout"])):
                             int(u["value"]) for u in picture["utxos"]}
@@ -2730,7 +3103,8 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # satoshis beside them, matched no kept outpoint, and read as "the
         # seed has leaked" on every run after, the deposit never forwarded
         # again. Anyone who knows the address can plant that dust.
-        _back = [unspent[o] for o in _kept_ex if o in unspent]
+        _back = _largest_first([unspent[o] for o in _kept_ex
+                                if o in unspent])
         plan["returned_kept"] = {
             "outputs": len(_back),
             "sat": sum(int(u["value"]) for u in _back),
@@ -2745,6 +3119,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             # operator's hand (kept_moved) and not a leaked seed.
             "outpoints": [[str(u.get("tx_hash") or "").lower(),
                            int(u.get("vout") or 0)] for u in _back]}
+        _note_values(plan, _back)
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         write_plan(args.outfile, plan)
         integrity_log("forward", "returned_kept")
@@ -2844,6 +3219,12 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # instead, and the mark goes: this tool is moving it.
         if stuck is None or not _at_limit:
             plan.pop("returned_kept", None)
+        # THE PUSH OF AN UNCONFIRMED LISTING (_witnessed), when this run
+        # does not replace the forward: a bump spends the same outpoints
+        # at today's rate, and the original handed out beside it is waste
+        # and a timing tell.
+        if vars(args).get("_push_skip") is not None and stuck is None:
+            _push_elsewhere(args, plan, address, servers, args._push_skip)
         write_plan(args.outfile, plan)
         integrity_log("forward", "reconciled_listed")
         where = ("in the mempool" if hit["height"] <= 0
@@ -2855,35 +3236,17 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             return _then
         print(f"  plan updated: {args.outfile}")
         return "done", EXIT_OK
-    # NOT LISTED. Where are the inputs it spent?
-    if plan_inputs and plan_inputs <= set(unspent):
-        if plan.get("tx_hex"):
-            integrity_log("forward", "resend")
-            print("  reconcile: our transaction is not listed and its inputs "
-                  "are still unspent; the signed bytes were kept. Sending "
-                  "the same transaction again.")
-            # ...and, should every server refuse them, the fresh forward
-            # that follows leaves out the kept money AND every outpoint a
-            # listed forward of ours already spends (third element) -- the
-            # same list the evicted branch below re-signs against. It
-            # carried only the kept money: when the look and the history
-            # came from different servers (each fails over on its own), an
-            # outpoint our listed forward X spends read as unspent, and the
-            # rejected re-send's fresh forward signed over it again -- a
-            # second spend of an input we had already spent, the thing
-            # select_inputs' NEVER TWICE exists to stop.
-            return "resend", plan["tx_hex"], sorted(consumed | set(_kept_ex))
-        integrity_log("forward", "evicted")
-        print("  reconcile: our transaction is not listed and its inputs are "
-              "still unspent, and no bytes were kept (it was listed once). "
-              "Re-signing a fresh forward of the same money"
-              + (", leaving out what came back past the bound" if _kept_ex
-                 else "") + ".")
-        return "forward", sorted(consumed | set(_kept_ex)), "evicted"
-    # THE FORWARDS OF OURS OVER THIS PLAN'S INPUTS: the superseder is one
-    # of them, never simply the newest of ours -- a newer forward of
-    # returned money over other outpoints, in the mempool, was named, and
-    # `forwarded` for this plan waited on an unrelated transaction.
+    # NOT LISTED. FIRST, THE FORWARDS OF OURS OVER THIS PLAN'S INPUTS --
+    # before any re-send (the review of 657deae): a listing left out as
+    # contradicted, or a look from a server that has not seen our other
+    # forward, sent these bytes again beside a listed forward of ours that
+    # spends the same outpoints -- a second signature over an input we had
+    # already spent, into the mempool beside our own, or rejected after the
+    # original mined and the plan then rebuilt over it. Superseded is what
+    # this plan is; nothing is sent for it. The superseder is one of them,
+    # never simply the newest of ours -- a newer forward of returned money
+    # over other outpoints, in the mempool, was named, and `forwarded` for
+    # this plan waited on an unrelated transaction.
     _over = [s for s in spends if s["txid"] in ours
              and plan_inputs & {(str(i["tx_hash"]).lower(), int(i["vout"]))
                                 for i in s["inputs"]}]
@@ -2909,7 +3272,35 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         if _then is not None:
             return _then
         return "done", EXIT_OK
-    if _witness == "dropped":
+    # NOT LISTED, AND NO FORWARD OF OURS SPENDS ITS INPUTS: where are they?
+    if plan_inputs and (plan_inputs <= set(unspent)
+                        or _witness == "contradicted"):
+        if plan.get("tx_hex"):
+            integrity_log("forward", "resend")
+            print("  reconcile: our transaction is not listed and its inputs "
+                  + ("are still unspent" if plan_inputs <= set(unspent)
+                     else "read as spent only where it was listed")
+                  + "; the signed bytes were kept. Sending the same "
+                  "transaction again.")
+            # ...and, should every server refuse them, the fresh forward
+            # that follows leaves out the kept money AND every outpoint a
+            # listed forward of ours already spends (third element) -- the
+            # same list the evicted branch below re-signs against. It
+            # carried only the kept money: when the look and the history
+            # came from different servers (each fails over on its own), an
+            # outpoint our listed forward X spends read as unspent, and the
+            # rejected re-send's fresh forward signed over it again -- a
+            # second spend of an input we had already spent, the thing
+            # select_inputs' NEVER TWICE exists to stop.
+            return "resend", plan["tx_hex"], sorted(consumed | set(_kept_ex))
+        integrity_log("forward", "evicted")
+        print("  reconcile: our transaction is not listed and its inputs are "
+              "still unspent, and no bytes were kept (it was listed once). "
+              "Re-signing a fresh forward of the same money"
+              + (", leaving out what came back past the bound" if _kept_ex
+                 else "") + ".")
+        return "forward", sorted(consumed | set(_kept_ex)), "evicted"
+    if _witness == "unwitnessed":
         # ...AND ITS INPUTS READ AS SPENT: only the unwitnessed listing
         # accounts for that, and nobody who can vouch confirms it (one
         # server, caught out at the submit). Not "the server contradicts
@@ -2939,13 +3330,14 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     stale (a policy or a fee the network no longer takes) and its inputs
     are still ours, so a fresh forward at today's fee follows."""
     txid = str(plan.get("txid") or "").lower()
+    _prior_unw = _unwitnessed_of(plan)
     stop_before_send("re-sending")
     record_signed(args.outfile, txid)
     integrity_log("forward", "resending")
     try:
         sub = bcast_submit(tx_hex, txid, address, servers, args.tor_proxy,
                            network=args.network, timeout=args.timeout,
-                           stop=shutdown_requested)
+                           stop=shutdown_requested, last=_suspects(plan))
     except watch.PinMismatch:
         raise Refused("pin_mismatch",
                       "a pinned Electrum server presented another "
@@ -3015,6 +3407,8 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     integrity_log("forward",
                   "broadcast_seen" if seen_r["seen"] else "broadcast_unseen")
     plan["broadcast"] = True
+    plan["broadcast_unwitnessed"] = _unwitnessed_after(_prior_unw, sub,
+                                                       seen_r)
     plan["seen"] = bool(seen_r["seen"])
     plan["seen_height"] = seen_r["height"]
     plan["seen_server"] = seen_r["server"]
@@ -3514,13 +3908,18 @@ def main(argv=None):
                 # run, so no refund or payment to the deposit ever went
                 # through again. Everything unspent that no forward of ours
                 # spends, dust included (a hand move takes what is there).
-                _left = sorted({(str(u["tx_hash"]).lower(), int(u["vout"]))
-                                for u in picture["utxos"]}
-                               - {(str(t).lower(), int(v))
-                                  for t, v in exclude})
+                # The largest first, as a kept mark (_largest_first).
+                _left, _seen0 = [], {(str(t).lower(), int(v))
+                                     for t, v in exclude}
+                for u in _largest_first(picture["utxos"]):
+                    _o0 = (str(u["tx_hash"]).lower(), int(u["vout"]))
+                    if _o0 not in _seen0:
+                        _seen0.add(_o0)
+                        _left.append(_o0)
                 if _left and isinstance(plan0, dict):
                     plan0["returned_leftover"] = {
                         "outpoints": [list(o) for o in _left]}
+                    _note_values(plan0, picture["utxos"])
                     # NOT IN PLACE OF THE WORD: a plan that cannot be
                     # written must not turn this refusal into a crash with
                     # no status. The next run answers `leftover` again and
@@ -3560,6 +3959,16 @@ def main(argv=None):
                       "could be read, so the quote could not be measured "
                       "against any price but its own; nothing was quoted or "
                       "signed, and it is tried again later")
+    # THORNODE'S WORD ON THE BTC INBOUND BEFORE THE AGGREGATOR IS ASKED
+    # (the review of 657deae): the quote names the destination and the
+    # amount to the aggregator, and a run the cross-check will refuse --
+    # the node the operator named unreachable, no BTC entry, trading
+    # halted -- asked for one on every retry. After the fee step, whose
+    # word a THORNode outage must not take (_thor_entries_once), and after
+    # the price references, whose `delayed` it must not take either; the
+    # same one read the cross-check uses.
+    if args.thornode:
+        thor_btc_entry(_thor_entries_or_refuse(args))
     inbound, memo, expected = fetch_quote(send_sat, dest_xmr, args.tor_proxy)
     quoted_at = _clock()                   # the clock the broadcast reads
     inbound_spk = validate_inbound(inbound, args.network)
@@ -3659,9 +4068,14 @@ def main(argv=None):
             "outbound_fee_sat": outbound_fee})
         integrity_log("forward", "sending")
         try:
+            # ...THE SERVERS THIS FORWARD'S EARLIER TRANSACTIONS FOUND
+            # WANTING TRIED LAST (_suspects), on a reconciliation's fresh
+            # forward: a server that took the evicted or rejected one and
+            # relayed nothing would take this one first too.
             sub = bcast_submit(tx.serialize().hex(), txid, address, servers,
                                args.tor_proxy, network=args.network,
-                               timeout=args.timeout, stop=shutdown_requested)
+                               timeout=args.timeout, stop=shutdown_requested,
+                               last=_suspects(plan0) if why else None)
         except watch.PinMismatch:
             raise Refused("pin_mismatch",
                           "a pinned Electrum server presented another "
@@ -3714,7 +4128,8 @@ def main(argv=None):
                                 wait_s=args.seen_wait,
                                 interval_s=args.seen_interval,
                                 avoid=_vouchers_not(sub), stop=shutdown_requested,
-                                distrust=_distrusted(sub))
+                                distrust=_distrusted(
+                                    sub, plan0 if why else None))
         except watch.PinMismatch:
             seen_r = {"seen": False, "height": None, "server": None,
                       "cert_sha256": None, "polls": 0, "asked": False,
@@ -3751,7 +4166,12 @@ def main(argv=None):
         "broadcast_mismatched": sub["mismatched"] if sub else 0,
         # WHO IS NO WITNESS FOR THIS FORWARD (_distrusted): read by the
         # next run's reconciliation before it drops kept bytes.
-        "broadcast_distrusted": _distrusted(sub),
+        "broadcast_distrusted": _distrusted(sub, plan0 if why else None),
+        # ...AND WHO ACCEPTED WITHOUT A WITNESS (_unwitnessed_of): tried
+        # last by the next submit of this forward.
+        "broadcast_unwitnessed": (
+            _unwitnessed_after(_unwitnessed_of(plan0) if why else (), sub,
+                               seen_r) if sub else []),
         "seen": bool(seen_r and seen_r["seen"]),
         "seen_height": seen_r["height"] if seen_r else None,
         "seen_server": seen_r["server"] if seen_r else None,

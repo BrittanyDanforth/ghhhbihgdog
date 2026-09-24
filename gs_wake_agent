@@ -1879,7 +1879,8 @@ def fee_sweep_config(key: dict):
                       "fee_sweep_to in this keyfile is not a list of "
                       "addresses.")
     depth = key.get("fee_sweep_depth", 2)
-    if depth not in proto.WITHDRAW_DEPTHS:
+    # NOT A BOOL: True == 1 and hashes as 1, so `true` read as depth 1.
+    if isinstance(depth, bool) or depth not in proto.WITHDRAW_DEPTHS:
         raise Refused("fee_sweep_misconfigured",
                       f"fee_sweep_depth {depth!r} is not a depth this "
                       f"protocol has.")
@@ -1905,7 +1906,14 @@ def fee_sweep_config(key: dict):
             "wallet_file": str(bits["fee_wallet_file"]).strip(),
             "dests": [a.strip() for a in dests],
             "depth": int(depth), "min_xmr": min_xmr, "address": addr,
-            "on_idle_boot": bool(key.get("fee_sweep_on_idle_boot"))}
+            # A SWITCH THAT MOVES MONEY IS A BOOLEAN, NEVER COERCED (the
+            # vault review: 3f9b060 made the spending switches so and left
+            # this one): bool("false") and bool("no") are True, and a hand
+            # edit meant as "off" ran the fee wallet's mix on every boot
+            # the doorbell did not answer -- a stranger's magic packet
+            # among them.
+            "on_idle_boot": _key_switch(key, "fee_sweep_on_idle_boot",
+                                        "fee_sweep_misconfigured")}
 
 
 def fee_wallet_entry(key: dict, cfg: dict, injected=None):
@@ -3208,7 +3216,8 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
             part that came back: the quote scaled by what ThorChain kept."""
             _s = int(p.get("send_sat") or 0)
             _e = Decimal(str(p["expected_xmr"]))
-            _b = min(int(_back.get(str(p.get("txid") or "").lower(), 0)), _s)
+            _b = min(int(_back.get(str(p.get("_refund_of") or p.get("txid")
+                                       or "").lower(), 0)), _s)
             if _b <= 0 or _s <= 0:
                 return _s, _e
             _e2 = (_e * Decimal(_s - _b) / Decimal(_s)).quantize(
@@ -3265,7 +3274,18 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
                     or _stand.get("dest_xmr") != plan.get("dest_xmr") \
                     or any(p is _stand for p in counted):
                 continue
-            counted.append(_stand)
+            # ...WHAT CAME BACK OF THE RECORD COMES OUT OF IT (the review of
+            # 657deae): a refund names the forward the network listed --
+            # the record -- so _share looked the stand-in up under its own
+            # txid, found nothing come back, and counted the whole quote
+            # for a record ThorChain had refunded half of: the watcher
+            # waited for more than could land and said `short` for ever.
+            # ONLY the refund is read under the record's txid (`_refund_of`,
+            # never written anywhere): renamed to it outright, the stand-in
+            # ranked as the record over a live re-sign of the same money,
+            # and a namer that `replaces` the record dropped itself as
+            # replaced -- a swap counted neither way (the review of that).
+            counted.append(dict(_stand, _refund_of=_r))
         # A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP (stage 6). A
         # bump spends the same outpoints again at today's rate, and the
         # new plan names the old in `replaces`; counting both would tell
@@ -4843,6 +4863,7 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                       f"{len(recent)} wakes in the last 24 h, which is the "
                       f"budget. Refusing.")
 
+    _btc_release, _btc_release_needed = None, False
     if job == "receive_and_quote":
         # A DEPOSIT THE ASKING END CANNOT WATCH IS REFUSED HERE (wire 12),
         # before anything is minted, quoted or counted: on the intake the
@@ -4861,9 +4882,17 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         # THE CHAT'S PREVIOUS DEPOSIT NEVER REACHED IT (wire 12). Released
         # before the gate reads the ledger, so "/deposit again" is not
         # "full" for two days about details nobody was shown.
+        # ...AN INTAKE DEPOSIT'S RELEASE WAITS FOR ITS BTC ADDRESS, asked
+        # after the jitter and the Tor check (_release_undelivered): until
+        # then the gate counts it as released, and if the gate needed that
+        # place and the address turns out used, the deposit is refused
+        # there -- still before anything is minted or quoted.
         if params.get("replaces"):
-            _release_undelivered(artifact_dir, params["replaces"],
-                                 params.get("owner"))
+            _rel = _release_undelivered(artifact_dir, params["replaces"],
+                                        params.get("owner"), key=key,
+                                        defer_btc=True)
+            if _rel == "btc":
+                _btc_release = params["replaces"]
         ceiling = int(key.get("account_ceiling", 45))
         n = _account_count(key, _accounts)
         if n is None:
@@ -4899,22 +4928,19 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         # one keeps its place at any age, and one that cannot be asked
         # about counts as paid. Nothing else changes for it: its accounts
         # stay its owner's and a late payment is still theirs to withdraw.
-        _pending = sum(
-            1 for _r in _load_ledger(artifact_dir)["handles"].values()
+        _pending, _held = 0, False
+        for _h, _r in _load_ledger(artifact_dir)["handles"].items():
             if _deposit_pending(_r, key, now_wall,
-                                ask=d.get("subaddress_total")))
-        _need = n + deposit_reserve_accounts() * (_pending + 1)
-        if _need > ceiling:
-            integrity_log("wake", "at_capacity")
-            raise Refused("at_capacity",
-                          f"this wallet holds {n} accounts, {_pending} "
-                          f"deposit(s) are admitted and not yet paid out, and "
-                          f"each may still mint up to "
-                          f"{deposit_reserve_accounts()}: {_need} against a "
-                          f"ceiling of {ceiling}. Refusing to admit another "
-                          f"until some are paid out, or the wallet is "
-                          f"recreated with a larger lookahead and the ceiling "
-                          f"raised (OPSEC_SETUP.md 4f).")
+                                ask=d.get("subaddress_total")):
+                if _h == _btc_release:
+                    _held = True
+                else:
+                    _pending += 1
+        _at_capacity(n, _pending, ceiling)
+        # Would the gate have refused with that deposit still counted?
+        # Then its release is what admits this one.
+        _btc_release_needed = bool(_btc_release and _held) and (
+            n + deposit_reserve_accounts() * (_pending + 2) > ceiling)
 
     # WRITE THE LEDGER BEFORE DISPATCH. If power is lost mid-job, the next boot
     # must refuse this job_id rather than run it twice -- a second slip would
@@ -4951,6 +4977,17 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
         # keeps its format refusals; the request itself is isolated.
         validate_proxy(key["tor_proxy"])
         _vt(isolated_proxy(key["tor_proxy"], "verify"))
+
+    # THE DEFERRED RELEASE (see the gate): asked now, after the jitter and
+    # the Tor check. Used, or nobody answered: the place stays, and when
+    # the gate needed it this deposit is refused as it would have been --
+    # before anything is minted or quoted.
+    if _btc_release is not None:
+        if _release_undelivered(artifact_dir, _btc_release,
+                                params.get("owner"), key=key,
+                                unused=d.get("btc_unused")) is not True \
+                and _btc_release_needed:
+            _at_capacity(n, _pending + 1, ceiling)
 
     handle = proto.new_handle()
     # EVERYTHING PAST THE LEDGER REPORTS BACK, including a refusal. An earlier
@@ -5260,7 +5297,17 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             # about what a piconero is.
             _left_xmr = Decimal(str(_left[3])) / Decimal(10 ** 12)
             _floor = _more_floor(key, depth)
-            return "more_left" if _left_xmr >= _floor else ""
+            if _left_xmr >= _floor:
+                return "more_left"
+            # ...AND UNLOCKED DUST DOES NOT HIDE A DEPOSIT STILL UNLOCKING
+            # (the vault review): a returning client's leftover under the
+            # floor made this "nothing more" about four XMR a few blocks
+            # from spendable -- the unlocking figure was asked only when
+            # nothing at all was unlocked.
+            _locked = _locked_value(key, owned_accounts=_owned)
+            if _locked is not None and _locked >= _floor:
+                return "more_locked"
+            return ""
         except Exception:                                    # noqa: BLE001
             # The wallet could not be asked. "" is honest: the operator is
             # told the withdrawal finished and nothing more, which is where
@@ -5442,18 +5489,25 @@ def _funded_entry(key: dict, injected=None, rpc_url: str = None,
 
 def _locked_value(key: dict, injected=None, rpc_url: str = None,
                   owned_accounts=None):
-    """XMR on this wallet that has arrived and not yet unlocked, or None.
+    """The largest single subaddress's balance that has not all unlocked
+    yet, in XMR -- what the next withdrawal's entry will be once it has --
+    or None when the wallet could not be asked. Nothing is spent from
+    this; it decides whether a finished withdrawal says "more is here,
+    still unlocking" or "nothing more was found". None is treated by the
+    caller as "" (say nothing), never as "more".
 
-    ONE NUMBER, NOT AN ENTRY. Nothing is spent from this; it decides whether
-    a finished withdrawal says "more is here, still unlocking" or "nothing
-    more was found", and for that the wallet's own total is the honest figure
-    -- the arrival is on SOME subaddress, and which one is the next leg's
-    question, asked when it can be answered. None when the wallet could not
-    be asked, which the caller treats as "" (say nothing), never as "more".
+    ONE SUBADDRESS, NOT THE SUM (the vault review, rule 2: one state
+    decided twice). The sum was compared with the mix floor, while the
+    withdrawal it invites takes ONE entry -- the largest unlocked output,
+    per subaddress (_funded_entry) -- and refuses under the floor. Two
+    arrivals each under it summed over it: "Run /withdraw again in a
+    while", and that withdrawal spent a wake to be refused
+    below_mix_minimum. Asked the same way the entry is chosen, the answer
+    is one the next step can act on.
 
-    `owned_accounts` scopes it the way _funded_entry is scoped: the sum over
-    the owner's accounts alone, so one client is never told another's
-    arrival is "still unlocking". An empty set is zero, not the wallet.
+    `owned_accounts` scopes it the way _funded_entry is scoped: the owner's
+    accounts alone, so one client is never told another's arrival is
+    "still unlocking". An empty set is zero, not the wallet.
     """
     if injected is not None:
         return injected()
@@ -5466,15 +5520,24 @@ def _locked_value(key: dict, injected=None, rpc_url: str = None,
         else:
             _queries = [{"account_index": int(_i), "all_accounts": False}
                         for _i in sorted(owned_accounts)]
-        _locked = 0
+        _best = 0
         for _q in _queries:
             r = rpc.raw_request("get_balance", _q) or {}
-            _bal, _unl = r.get("balance"), r.get("unlocked_balance")
-            for _v in (_bal, _unl):
-                if not isinstance(_v, int) or isinstance(_v, bool):
+            _subs = r.get("per_subaddress")
+            if _subs is None:
+                _subs = []
+            if not isinstance(_subs, list):
+                return None
+            for _sub in _subs:
+                if not isinstance(_sub, dict):
                     return None
-            _locked += max(_bal - _unl, 0)
-        return Decimal(str(_locked)) / Decimal(10 ** 12)
+                _bal, _unl = _sub.get("balance"), _sub.get("unlocked_balance")
+                for _v in (_bal, _unl):
+                    if not isinstance(_v, int) or isinstance(_v, bool):
+                        return None
+                if _bal > _unl and _bal > _best:
+                    _best = _bal
+        return Decimal(str(_best)) / Decimal(10 ** 12)
     except Exception:                                        # noqa: BLE001
         return None
 
@@ -5508,7 +5571,7 @@ def _bundle_pair(rec: dict):
 _INTAKE_KEEPS = ("bundle", "forward_plan")
 
 
-def _retire_files(rec: dict) -> None:
+def _retire_files(rec: dict, artifact_dir: Path) -> None:
     """Shred a paid-out deposit's slip and bundle. The record keeps its
     (account, subaddress) pair and its spent flag; the files kept the deposit
     address, the memo naming the receive address in full, the amounts and the
@@ -5540,7 +5603,18 @@ def _retire_files(rec: dict) -> None:
     subaddress, which this record keeps as `pair`; and the wallet's
     endpoint, which the keyfile beside it holds. It goes with the plan, at
     the hand-run wipe (wallet_*.json). The slip -- the memo, the amounts --
-    is not needed by any reconciliation and still goes now."""
+    is not needed by any reconciliation and still goes now.
+
+    ONLY INSIDE `artifact_dir`, as _heal_retired (the vault review, a guard
+    on one side of a boundary): every file a deposit has is written there,
+    and a record naming a path elsewhere -- damaged, or edited by hand --
+    had it shredded by the withdrawal's cleanup while the heal refused the
+    same path. A limit on what a bad record can cost, not a defence against
+    whoever can write this disk."""
+    try:
+        _root = Path(artifact_dir).resolve()
+    except (OSError, ValueError):
+        return
     for _k in ("slip", "bundle", "forward_plan"):
         _p = rec.get(_k)
         if not _p:
@@ -5548,6 +5622,9 @@ def _retire_files(rec: dict) -> None:
         if _k in _INTAKE_KEEPS and rec.get("btc_index") is not None:
             continue
         try:
+            if Path(str(_p)).resolve().parent != _root:
+                integrity_log("wake", f"retire_refused:{_k}")
+                continue
             if Path(_p).is_file():
                 secure_delete_or_warn(Path(_p), f"a paid-out deposit's {_k}")
         except Exception:                                    # noqa: BLE001
@@ -5598,7 +5675,7 @@ def _heal_retired(artifact_dir: Path) -> int:
         if not mine:
             continue
         mine["btc_index"] = rec.get("btc_index")
-        _retire_files(mine)
+        _retire_files(mine, artifact_dir)
         touched += 1
     if touched:
         integrity_log("wake", "retired_leftovers")
@@ -5719,12 +5796,32 @@ def _rebuild_retired_bundle(key: dict, artifact_dir: Path, handle: str,
     return str(target)
 
 
-def _release_undelivered(artifact_dir: Path, h: str, owner) -> bool:
+def _at_capacity(n: int, pending: int, ceiling: int) -> None:
+    """Refuse `at_capacity` when this wallet's `n` accounts, and what
+    `pending` admitted deposits and this one may still mint, pass the
+    ceiling (see the gate in _run_validated)."""
+    _need = n + deposit_reserve_accounts() * (pending + 1)
+    if _need > ceiling:
+        integrity_log("wake", "at_capacity")
+        raise Refused("at_capacity",
+                      f"this wallet holds {n} accounts, {pending} "
+                      f"deposit(s) are admitted and not yet paid out, and "
+                      f"each may still mint up to "
+                      f"{deposit_reserve_accounts()}: {_need} against a "
+                      f"ceiling of {ceiling}. Refusing to admit another "
+                      f"until some are paid out, or the wallet is "
+                      f"recreated with a larger lookahead and the ceiling "
+                      f"raised (OPSEC_SETUP.md 4f).")
+
+
+def _release_undelivered(artifact_dir: Path, h: str, owner, key=None,
+                         unused=None, defer_btc=False):
     """Mark handle `h` RELEASED: its details never reached the chat that
     asked (the pager says so, wire 12's `replaces`), so it gives up the
     youth grace that holds an unpaid deposit's place in the reserve
-    (_deposit_pending). Returns whether a record was marked. Never raises:
-    a deposit is not refused over the one before it.
+    (_deposit_pending). Returns whether a record was marked. Never raises
+    (a stop asked for aside, which is not a refusal): a deposit is not
+    refused over the one before it.
 
     ONLY THE ASKING OWNER'S OWN RECORD, and it rests on the pairing secret:
     only the paired Pi can seal a note, and the owner token in it is the
@@ -5738,7 +5835,34 @@ def _release_undelivered(artifact_dir: Path, h: str, owner) -> bool:
     gets for being young; the evidence still decides: money on its BTC
     side within the grace (_paid_since), money on its address, or a wallet
     that cannot be asked keeps the place as before. Nothing is shredded and the record stays: its label still
-    answers, and money that does arrive is still that client's."""
+    answers, and money that does arrive is still that client's.
+
+    ...AND AN INTAKE DEPOSIT'S EVIDENCE IS ON ITS BTC ADDRESS FIRST (the
+    review of 657deae). Its client pays this machine's BTC address, and
+    nothing reaches the XMR subaddress until a forward runs -- which the
+    Pi starts only while it watches the deposit, and a deposit whose pay
+    message it saw fail it does not watch. Released, that record met the
+    evidence with no forward behind it and an empty subaddress, and its
+    place went to the next deposit while the first client's BTC sat on the
+    address: two mixes to come against a reserve for one. So the address is
+    asked first (_btc_unused_live, `unused` injected in tests): released
+    only when the network says it was never used. Used, or nobody
+    answered, or a record of another chain this pair cannot derive: the
+    place is kept. Rests on the server's word, not on a secret: a server
+    that lies "unused" admits one deposit too many; one that lies "used"
+    keeps a place for two days, as before the release existed. A HAZARD,
+    STATED: the look runs in the wake that then asks about the next
+    address, each on its own circuit, and a server that answers both can
+    guess from the timing that they are one client's -- a retry. Both were
+    that client's; neither look names them.
+
+    NOT BEFORE THE JITTER AND THE TOR CHECK (the review of this change):
+    the gate that needs the answer runs before both, and a look there put
+    a deposit address on the wire at the moment the jitter exists to
+    decorrelate, ahead of the check that refuses a proxy which is not Tor.
+    So `defer_btc` answers "btc" for an intake record without asking
+    anyone; the gate counts it as released, and _run_validated asks, and
+    releases or refuses, after both."""
     try:
         led = _load_ledger(artifact_dir)
         rec = (led.get("handles") or {}).get(h)
@@ -5748,6 +5872,24 @@ def _release_undelivered(artifact_dir: Path, h: str, owner) -> bool:
             return False
         if rec.get("released"):
             return False
+        if rec.get("btc_index") is not None and defer_btc:
+            return "btc"
+        if rec.get("btc_index") is not None:
+            _stop_if_asked()
+            _idx = rec.get("btc_index")
+            _fresh = False
+            if isinstance(key, dict) and key.get("btc_account_xpub") \
+                    and isinstance(_idx, int) and not isinstance(_idx, bool) \
+                    and _on_this_chain(rec, key):
+                try:
+                    _addr = _btc_address(key, _idx)
+                    _fresh = (unused or (lambda a: _btc_unused_live(key, a))
+                              )(_addr) is True
+                except Exception:                            # noqa: BLE001
+                    _fresh = False
+            if not _fresh:
+                integrity_log("wake", "release_btc_unconfirmed")
+                return False
         rec["released"] = int(time.time()) // 600 * 600
         _save_handles(artifact_dir, led["handles"], led["owners"])
         integrity_log("wake", "deposit_released")
@@ -5810,9 +5952,10 @@ def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
     # paid deposit read as a ghost after DEPOSIT_PLACE_TTL_S and gave its
     # place to the next client: two mixes to come against a reserve for one.
     # So the grace runs again from the LATEST SIGN OF THAT MONEY
-    # (_paid_since: a forward that sent or rehearsed, a `delayed` or
-    # `returned` answer), and after it the subaddress decides as for any
-    # deposit -- where the swap's XMR sits until the mix takes it.
+    # (_paid_since: a forward that sent or rehearsed, one still in flight
+    # or first found mined, a `delayed` answer), and after it the
+    # subaddress decides as for any deposit -- where the swap's XMR sits
+    # until the mix takes it.
     # NOT "a forward ran, so for ever" (the review of that fix): the XMR
     # that landed can leave without the record being marked spent -- a
     # withdrawal leg that failed after the mix moved it, the owner's next
@@ -5820,6 +5963,22 @@ def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
     # any age, which at the stock ceiling is the intake closed for good.
     _paid = _paid_since(rec)
     if _paid is not None and int(now) - _paid < proto.DEPOSIT_PLACE_TTL_S:
+        return True
+    # SETTLED ON THE BTC SIDE AND HELD BY TODAY'S FEE: pending at any age,
+    # until a forward of it answers anything but `delayed` (see where the
+    # mark is made). Not the stage 4 read's "a forward ran, so for ever":
+    # that held a place after the money had LEFT; this one the forward has
+    # just seen settled on this machine's address. A deposit whose money
+    # was moved by hand meanwhile is let go by the next ask of it.
+    # ...ON THIS PAIR'S CHAIN ONLY (the vault review): a forward of a record
+    # issued on another BTC account is refused btc_chain_changed before any
+    # child runs, so nothing would ever clear the mark -- a place held for
+    # good, at the stock ceiling the intake closed. Such a record keeps the
+    # two-day clock from its last sign, like any other.
+    if rec.get("btc_index") is not None \
+            and isinstance(rec.get("btc_delayed"), int) \
+            and not isinstance(rec.get("btc_delayed"), bool) \
+            and (not isinstance(key, dict) or _on_this_chain(rec, key)):
         return True
     _pair = _bundle_pair(rec)
     if _pair is None:
@@ -5831,7 +5990,8 @@ def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
 def _paid_since(rec: dict):
     """The latest sign of money on an intake deposit's BTC side (a 600 s
     bucket), or None: `btc_money_at` (every forward run that sent, found
-    its plan's money in flight, or answered `delayed` or `returned`) or,
+    its plan's money in flight or first found it mined, or answered
+    `delayed`) or,
     for a record from before it, `forwarded` (the first forward's bucket).
     None off the intake. Neither says an amount."""
     if rec.get("btc_index") is None:
@@ -5915,6 +6075,24 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # this job mints anything, so the difference is still that mix's.
     if _recover_pending_mixes(key, accounts, led):
         _save_handles(artifact_dir, handles, led["owners"])
+    # ...AND WHEN IT CANNOT BE SETTLED, NOTHING THAT MINTS RUNS (the vault
+    # review, rule 8). The recovery gives the marked owner every account the
+    # wallet holds beyond the ones its mix started from. A wallet busy for a
+    # few seconds left the mark standing and the job went on: a deposit
+    # minted the next client's account, the next wake's recovery gave it to
+    # the earlier owner, and that owner's withdrawal spent the other
+    # client's deposit -- whose /check then said "moved". A retry of the
+    # same owner's mix wrote a new mark over the old one, and the accounts
+    # the first mix had moved their money onto belonged to nobody. Refused
+    # here, before anything runs; a probe or a forward mints nothing and
+    # goes on. Rests on the one-job-per-boot rule, not on anything secret.
+    if job in _MINTING_JOBS and _pending_marks(led):
+        integrity_log("wake", "mix_unsettled")
+        raise Refused("mix_unsettled",
+                      "an earlier mix's accounts are not recorded yet (the "
+                      "wallet could not be asked), and this job would create "
+                      "more: nothing was run and nothing was spent. Ask "
+                      "again in a few minutes.")
     # WHOSE JOB. Off the validated note, never off a chat: the vault holds an
     # opaque token and a ledger of what that token's money created. Never
     # absent on the wire -- a hand-poked job carries HOST_OWNER (the
@@ -6060,6 +6238,24 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 "the wallet could not say which accounts it holds, so a mix "
                 "now could not record what it creates as this owner's. "
                 "Nothing was spent; ask again in a few minutes.")
+        # ...AND IT MUST LIST EVERY ACCOUNT THE LEDGER GAVE AN OWNER (the
+        # vault review, rule 8). A list that went backwards -- a wallet file
+        # restored from a backup, a power cut before it was stored --
+        # re-mints those accounts during the mix, and "the accounts now less
+        # the accounts before" then gives another owner's accounts to this
+        # one. Refused here, before the mix, where it costs nothing.
+        _owned_all = {i for r in (led.get("owners") or {}).values()
+                      if isinstance(r, dict) for i in (r.get("accounts")
+                                                       or [])}
+        if _owner and _owned_all - set(_accts_before):
+            integrity_log("wake", "wallet_accounts_behind")
+            raise Refused(
+                "wallet_accounts_behind",
+                "the wallet does not list accounts this machine has recorded "
+                "as holding clients' money -- its account list has gone "
+                "backwards. A mix now would create accounts that are already "
+                "someone's. Nothing was spent; check the wallet at the "
+                "machine.")
         # ...AND WRITTEN DOWN BEFORE THE MIX STARTS (the review of this
         # pass): held only in memory, it died with a power cut, an OOM kill
         # or the SIGKILL that follows a stop, and what the mix had minted
@@ -6384,6 +6580,13 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
     # fresh -- never a hole in the chain, never a mark ahead of nothing.
     _reuse_idx = None
     before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
+    _fw_run = ""
+    # WHETHER THE FORWARD ON RECORD WAS ALREADY IN A BLOCK BEFORE THIS RUN
+    # (read off the plan the last run left): a run that finds it mined for
+    # the first time is the last one that holds the deposit's place from
+    # the BTC side (see the forward mark below).
+    _mined_before = (job == "forward_to_swap" and bool(handle)
+                     and _forward_mined(artifact_dir, handle))
     for i, argv in enumerate(steps):
         # BETWEEN STEPS, BEFORE THE WORK THAT PREPARES THE NEXT ONE (the
         # review of the uncovered dimensions). run_child refuses to spawn once
@@ -6432,9 +6635,20 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                 # later spent as one pile, linked on-chain. Refused before
                 # the quote, so nothing is published for it.
                 _np = _bundle_pair({"bundle": new[0]})
-                if _np is not None and any(
+                # ...AND ITS ACCOUNT MUST BE NO OWNER'S YET (the vault
+                # review, rule 8). The check above compares deposit
+                # records' address pairs, and a mix mints up to twenty-nine
+                # accounts to a deposit's one: a list that went backwards
+                # re-mints a MIX's account far more often than a deposit's,
+                # and handed it to the next client beside the owner whose
+                # mix made it -- whose withdrawal could then spend this
+                # deposit. A fresh mint is a fresh account; one an owner
+                # already holds is the wallet going backwards.
+                _held_by = _account_owners(led, _np[0]) \
+                    if _np is not None else set()
+                if _np is not None and (_held_by or any(
                         _bundle_pair(_r) == _np for _r in handles.values()
-                        if _r.get("bundle")):
+                        if _r.get("bundle"))):
                     integrity_log("wake", "receive_bundle_duplicate")
                     raise Refused(
                         "bundle_reused",
@@ -6790,14 +7004,40 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             _fw = _forward_status_word(artifact_dir, handle)
             if _fw:
                 # MONEY ON THE BTC SIDE WITH A SWAP STILL TO COME: settled
-                # and held by today's fee, or come back to be sent on. The
-                # deposit's place in the reserve runs from here again
-                # (_paid_since). Not `seen` or `short`: a stranger's dust on
-                # an address in the chat says either, and must not hold the
-                # intake's place.
-                if _fw in ("delayed", "returned") and handle in handles:
+                # and held by today's fee. The deposit's place in the
+                # reserve runs from here again (_paid_since). Not `seen`,
+                # `short` or `returned`: a stranger's dust on an address in
+                # the chat says any of them -- `returned` is any new output
+                # not yet settled beside a forward of ours, 300 sat
+                # included, which the forwarder cannot tell from a refund
+                # until it settles (classify_returns reads confirmed
+                # outputs only) -- and must not hold the intake's place.
+                # A real refund does not need it: it lands within the grace
+                # of the forward it refunds, and the forward of it, once
+                # settled, stamps again. One that lands later than that
+                # leaves the place free until then; a hazard stated, not
+                # guarded. (`delayed` is not a stranger's to say for
+                # nothing: it is settled money a forward in the pair's fee
+                # band would carry -- theirs to lose into this swap.)
+                if _fw == "delayed" and handle in handles:
                     handles[handle]["btc_money_at"] = \
                         int(time.time()) // 600 * 600
+                # ...AND `delayed` HOLDS IT UNTIL A FORWARD SAYS OTHERWISE
+                # (the residual of the stage 4 review): settled money on
+                # this machine's own address that today's fee will not
+                # carry is a mix still to come, as money on the subaddress
+                # is. On a two-day clock from the last `delayed`, a fee
+                # spike that outlasted the Pi's retries -- or a Pi restart,
+                # which forgets them -- gave its place to the next client.
+                # Cleared by any other answer from a forward of it: sent,
+                # nothing there (a hand move), short, returned.
+                _fw_run = _fw
+                if handle in handles:
+                    if _fw == "delayed":
+                        handles[handle]["btc_delayed"] = \
+                            int(time.time()) // 600 * 600
+                    else:
+                        handles[handle].pop("btc_delayed", None)
                 continue
         if rc != 0:
             if hard:
@@ -6896,8 +7136,24 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # run, or a reconciliation of one, holds the deposit's place for a
         # grace from here -- long enough for the swap to land on the
         # subaddress, which then holds it -- and no longer.
-        if handles[handle]["forward_sent"]:
+        # WHILE IT IS IN FLIGHT, AND ONCE MORE ON THE RUN THAT FINDS IT
+        # MINED (the review of 657deae): stamped by every reconciliation,
+        # a forward that mined weeks ago was "money in flight as of now"
+        # on each tap of "has it arrived?" -- every reconcile of a sent
+        # handle reaches here -- and its place was held for as long as
+        # the client kept asking, after its XMR had landed and left. The
+        # money left the BTC side when the forward mined; the swap lands
+        # within the grace from the run that first saw that, and the
+        # subaddress holds the place from there.
+        _mined_now = _forward_mined(artifact_dir, handle)
+        if handles[handle]["forward_sent"] \
+                and not (_mined_now and _mined_before):
             handles[handle]["btc_money_at"] = int(time.time()) // 600 * 600
+        # A PLAN WAS WRITTEN: the money went out, or was rehearsed on its
+        # way -- unless this very run's word was `delayed` (a replacement,
+        # or returned money, today's fee would not carry), which set it.
+        if _fw_run != "delayed":
+            handles[handle].pop("btc_delayed", None)
         # THE PAIRS REWRITE READS THE PLAN THE FORWARD JUST WROTE. The
         # outpoints it spent were accumulated on the record too, as "the
         # ledger's copy, read by the pairs rewrite and by the operator" --
@@ -6940,7 +7196,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # the job; the ledger keeps the pair.
     _save_handles(artifact_dir, handles, led["owners"])
     for _rec in _retire_after:
-        _retire_files(_rec)
+        _retire_files(_rec, artifact_dir)
     if _spent_pair is not None and bundle:
         try:
             if Path(bundle).is_file():
@@ -7023,14 +7279,36 @@ def _load_ledger(d: Path) -> dict:
                 owners[k][PENDING_MIX_FIELD] = sorted(
                     {a for a in _pm if isinstance(a, int)
                      and not isinstance(a, bool) and a >= 0})
+                # ...and how many wakes found nothing new for it: dropped
+                # here, the count never reached its bound and the mark --
+                # every minting job refused with it -- stood for good.
+                _pe = r.get(PENDING_EMPTY_FIELD)
+                if isinstance(_pe, int) and not isinstance(_pe, bool) \
+                        and 0 < _pe < PENDING_EMPTY_MAX:
+                    owners[k][PENDING_EMPTY_FIELD] = _pe
     return {"handles": handles, "owners": owners}
 
 
 def _owner_accounts(led: dict, owner) -> set:
-    """The wallet accounts this owner may spend from. Empty when unknown."""
+    """The wallet accounts this owner may spend from. Empty when unknown.
+
+    LESS EVERY ACCOUNT ANOTHER OWNER'S SET ALSO HOLDS (the review of this
+    change, rule 8): _add_owner_accounts no longer writes an account into
+    two sets, but a ledger an earlier build wrote may hold one there
+    already -- and either owner's withdrawal then spent the other's money,
+    the record of it marked spent, no chain line. The guard on the side
+    that spends as well as the side that writes: such an account is
+    neither's to spend from the phone; the money on it is settled by a
+    person at the machine. Said on the chain (owner_account_conflict)."""
     if not owner:
         return set()
-    return set((led.get("owners") or {}).get(owner, {}).get("accounts") or [])
+    _owners = led.get("owners") or {}
+    _mine = set((_owners.get(owner) or {}).get("accounts") or [])
+    _theirs = {i for o, r in _owners.items() if o != owner
+               and isinstance(r, dict) for i in (r.get("accounts") or [])}
+    if _mine & _theirs:
+        integrity_log("wake", "owner_account_conflict")
+    return _mine - _theirs
 
 
 def _read_accounts_patiently(key: dict, accounts=None):
@@ -7081,8 +7359,31 @@ def _attribute_mix_accounts(key: dict, accounts, led: dict, owner,
 PENDING_MIX_FIELD = "mix_before"
 
 
+#: The jobs whose tools create wallet accounts: a deposit's receive wallet,
+#: a withdrawal's mix. Nothing else may run while a mix's accounts are
+#: unrecorded (see _dispatch).
+_MINTING_JOBS = ("receive_and_quote", "withdraw")
+
+
+def _pending_marks(led: dict) -> list:
+    """The owners whose mix an earlier wake did not see the end of."""
+    return [o for o, r in (led.get("owners") or {}).items()
+            if isinstance(r, dict)
+            and isinstance(r.get(PENDING_MIX_FIELD), list)]
+
+
 def _mark_pending_mix(led: dict, owner, before) -> None:
-    """Write down the accounts a mix is about to start from."""
+    """Write down the accounts a mix is about to start from. NEVER OVER
+    ANOTHER MARK (the vault review): written over, the first mix's accounts
+    were in nobody's set; beside another owner's, the recovery would give
+    both of them the same accounts. _dispatch refuses a minting job while a
+    mark stands; this is the same rule at the place the mark is made."""
+    if _pending_marks(led):
+        integrity_log("wake", "mix_unsettled")
+        raise Refused("mix_unsettled",
+                      "an earlier mix's accounts are not recorded yet; "
+                      "nothing was run and nothing was spent. Ask again in "
+                      "a few minutes.")
     _o = led.setdefault("owners", {}).setdefault(owner, {"accounts": []})
     _o[PENDING_MIX_FIELD] = sorted(int(i) for i in before
                                    if isinstance(i, int)
@@ -7093,6 +7394,13 @@ def _clear_pending_mix(led: dict, owner) -> None:
     _o = (led.get("owners") or {}).get(owner)
     if isinstance(_o, dict):
         _o.pop(PENDING_MIX_FIELD, None)
+        _o.pop(PENDING_EMPTY_FIELD, None)
+
+
+#: How many wakes a mark whose wallet shows NOTHING new is kept before it
+#: is let go (_recover_pending_mixes), and where the count is kept.
+PENDING_EMPTY_MAX = 3
+PENDING_EMPTY_FIELD = "mix_empty_reads"
 
 
 def _recover_pending_mixes(key: dict, accounts, led: dict) -> bool:
@@ -7105,35 +7413,73 @@ def _recover_pending_mixes(key: dict, accounts, led: dict) -> bool:
     between that wake and this one. The machine is off between wakes; a
     mix run BY HAND on it in between would have its accounts given to the
     owner too, and the line below says so, so the operator can check."""
-    _pend = [(o, r) for o, r in (led.get("owners") or {}).items()
-             if isinstance(r, dict) and isinstance(r.get(PENDING_MIX_FIELD),
-                                                   list)]
+    _pend = [(o, led["owners"][o]) for o in _pending_marks(led)]
     if not _pend:
         return False
     _now = _read_accounts_patiently(key, accounts)
     if _now is None:
         integrity_log("wake", "owner_accounts_unreadable")
         return False
+    # NOTHING NEW IS NOT "IT MINTED NOTHING" (the review of this change): a
+    # power cut mid-mix leaves a wallet file that never stored what the mix
+    # minted, and it lists `before` again until it has synced past the
+    # mix's own outputs and derived those accounts anew. Cleared on that
+    # first read, the next owner's mix minted the same indices and they
+    # were recorded as HIS -- with the first owner's money on them. So an
+    # empty read keeps the mark (every job that mints stays refused
+    # mix_unsettled) for PENDING_EMPTY_MAX wakes, and only then lets it go,
+    # said on the chain: a mix killed before it minted anything has nothing
+    # to find. RESIDUAL, stated: a wallet that has not derived them by
+    # then, or derived only some, is not caught here; the chain line is
+    # the operator's cue to check the wallet at the machine.
+    _done = 0
     for _o, _r in _pend:
         _before = set(_r.get(PENDING_MIX_FIELD) or [])
-        _add_owner_accounts(led, _o, set(_now) - _before)
+        _new = set(_now) - _before
+        if not _new:
+            _tries = _r.get(PENDING_EMPTY_FIELD)
+            _tries = (_tries if isinstance(_tries, int)
+                      and not isinstance(_tries, bool) else 0) + 1
+            if _tries < PENDING_EMPTY_MAX:
+                _r[PENDING_EMPTY_FIELD] = _tries
+                integrity_log("wake", "owner_accounts_not_found")
+                continue
+            integrity_log("wake", "owner_accounts_none_found")
+        _add_owner_accounts(led, _o, _new)
         _clear_pending_mix(led, _o)
-    integrity_log("wake", "owner_accounts_recovered")
-    agent_say(f"  [*] {len(_pend)} earlier mix(es) did not see their end on "
-              f"a wake; the accounts they minted are now recorded as their "
-              f"owner's. If anything was run BY HAND on this wallet since, "
-              f"check the ledger.")
+        _done += 1
+    if _done:
+        integrity_log("wake", "owner_accounts_recovered")
+        agent_say(f"  [*] {_done} earlier mix(es) did not see their end on "
+                  f"a wake; the accounts they minted are now recorded as "
+                  f"their owner's. If anything was run BY HAND on this "
+                  f"wallet since, check the ledger.")
     return True
 
 
+def _account_owners(led: dict, idx) -> set:
+    """The owner tokens whose set holds wallet account `idx`."""
+    return {o for o, r in (led.get("owners") or {}).items()
+            if isinstance(r, dict) and idx in (r.get("accounts") or [])}
+
+
 def _add_owner_accounts(led: dict, owner, idxs) -> None:
-    """Record accounts as this owner's. Account 0 is never recorded."""
+    """Record accounts as this owner's. Account 0 is never recorded, and
+    NEITHER IS ONE ANOTHER OWNER HOLDS (the vault review, rule 8): two sets
+    holding one account let either owner's withdrawal spend the other's
+    money. That only happens when the wallet's account list went backwards
+    and re-minted it; the account is left to the owner who had it, and the
+    chain says so -- the money on it may be this owner's, which a person
+    at the machine settles, never a withdrawal from the phone."""
     if not owner:
         return
     _o = led.setdefault("owners", {}).setdefault(owner, {"accounts": []})
     _have = set(_o.get("accounts") or [])
     for _i in idxs or ():
         if isinstance(_i, int) and not isinstance(_i, bool) and _i > 0:
+            if _account_owners(led, _i) - {owner}:
+                integrity_log("wake", "owner_account_conflict")
+                continue
             _have.add(_i)
     _o["accounts"] = sorted(_have)
 

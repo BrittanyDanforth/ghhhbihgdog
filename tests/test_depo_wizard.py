@@ -1762,6 +1762,16 @@ _all_sent += [(0, v) for v in P.PHASE_LINES.values()]
 # ...and the one-sentence withdraw closer, which lives beside them for the
 # same reason and is sent verbatim by the pager and the doorbell.
 _all_sent.append((0, P.WITHDRAW_NO_MORE_LINE))
+# ...AND THE TWO MORE THAT LIVE THERE AND REACH THE CHAT (the Pi-side OPSEC
+# audit): the unknown-word line, and the deposit instructions plain_lines
+# renders in both shapes -- their fixed sentences, with values that carry
+# no word of their own. A third and fourth surface this scan did not see.
+_all_sent.append((0, P.PHASE_UNKNOWN_LINE))
+for _pl_shape in ({"b": "0.05", "d": "addr", "x": "1.2", "h": "A3F1"},
+                  {"b": "0.05", "d": "addr", "x": "1.2", "h": "A3F1",
+                   "m": "note"}):
+    _all_sent += [(0, _l) for _l in P.plain_lines(_pl_shape, label="L")
+                  if _l.strip()]
 
 # AND THE REPLIES THAT ARE BUILT, NOT WRITTEN -- the same lesson as PHASE_LINES
 # above, learned a second time and this time closed properly.

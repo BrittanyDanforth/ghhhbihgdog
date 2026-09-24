@@ -2999,9 +2999,10 @@ check("chain: the leg number is carried by start_job, not by the slot the "
 # one silently is the worst thing this could do.
 # THE CHAIN KINDS ARE JOB-AGNOSTIC NOW: the undeliverable-result kind dropped
 # its "withdraw_" prefix (see the list at the top of _worker).
-_arm = _SRC_PG_EARLY.split('integrity_log("pager", "result_undelivered")')[1]
+_arm = (_SRC_PG_EARLY.split("# The leg's report is lost: _worker says so")
+        + [""])[1]
 check("chain: the next leg is armed below the report, not instead of it",
-      _arm.index("self._chain = (chat_id") > 0)
+      _arm.find("self._chain = (chat_id") > 0)
 
 
 print("\n== /status cannot be leaned on ==")
@@ -4948,6 +4949,22 @@ check("an intake card on an end with no --btc-electrum: the address is NOT "
       and "B4A1" not in _np_._btc()[1]
       and "intake_unwatched" in _ilog
       and "--btc-electrum" in _iout.getvalue())
+# ...AND ONCE PER PROCESS, not once per deposit (the Pi-side OPSEC audit):
+# written on every deposit it concerned, a configuration kind dated each
+# attempt on the card -- a job word by another name.
+_ilog2 = []
+pg.integrity_log = lambda st, kind, *a, **k: _ilog2.append(kind)
+try:
+    for _k in ("intake_unwatched", "payload_withheld_group",
+               "payload_withheld_group"):
+        getattr(_np_, "_config_once", lambda k: _ilog2.append(k))(_k)
+finally:
+    pg.integrity_log = _ilsaved
+check("a configuration kind is on the chain ONCE per process: the deposit "
+      "above said intake_unwatched, and asking again says nothing; another "
+      "kind twice is said once",
+      _ilog.count("intake_unwatched") == 1
+      and _ilog2 == ["payload_withheld_group"])
 _bp, _bs = _depo_done(_PLAIN_BTC)
 _bt = [t for t, _b in _bs]
 _pay = [t for t in _bt if "here is how to pay" in t]
@@ -5074,13 +5091,14 @@ check("the pay message dropped ONCE is sent again and lands: the address is "
           and not t.startswith("<dropped>")) == 1
       and (_pf1._btc()[1].get("B4A1") or {}).get("addr") == _BTC_ADDR
       and not any("did not get through" in t for t in _pt1)
-      and "pay_undelivered" not in _pil1)
+      and "reply_undelivered" not in _pil1)
 _pf2, _pt2, _pil2 = _depo_pay_fails(2)
 check("...dropped TWICE: the watch entry goes (nothing was published to watch "
-      "for), the chain says pay_undelivered, and the client is told there "
+      "for), the chain says reply_undelivered (no job word), and the client "
+      "is told there "
       "is nothing to pay yet and to /deposit again",
       "B4A1" not in _pf2._btc()[1]
-      and "pay_undelivered" in _pil2
+      and "reply_undelivered" in _pil2 and "pay_undelivered" not in _pil2
       and any("did not get through" in t and "/deposit again" in t
               for t in _pt2)
       and not any("here is how to pay" in t and not t.startswith("<dropped>")
@@ -5679,7 +5697,9 @@ check("a forward that FAILED for one chat: that chat hears 'forward: "
       "failed.' and --alert-chat hears ONE line with no digit, no handle "
       "and none of the banned words",
       any(c == 111 and t.startswith("forward: failed") for c, t in _asent)
-      and len(_aline) == 1 and "another chat" in _aline[0]
+      and len(_aline) == 1
+      and _aline[0] == "forward: failed. It needs someone at the other end."
+      and "another chat" not in _aline[0]
       and not any(ch.isdigit() for ch in _aline[0])
       and "B4A1" not in _aline[0]
       and not any(w in _aline[0].lower().split() for w in _BANNED_HERE))
@@ -5696,9 +5716,9 @@ for _cfg, _why in ((111, "the deposit's own chat"), (333, "a chat outside "
                    (None, "no alert chat configured")):
     _apx, _asx = _forward_outcome_pager("failed", alert_chat=_cfg)
     check(f"...nothing extra when the alert chat is {_why}: no line about "
-          "'another chat' anywhere, and nothing outside the deposit's chat",
+          "alert line anywhere, and nothing outside the deposit's chat",
           [t for c, t in _asx if c not in (111,)] == []
-          and not any("another chat" in t for c, t in _asx))
+          and not any("It needs someone" in t for c, t in _asx))
 for _oc in ("refused", "done"):
     _apx, _asx = _forward_outcome_pager(_oc, alert_chat=222)
     check(f"...and a forward that ended `{_oc}` alerts nobody",
@@ -6696,7 +6716,7 @@ check("a kept forward: the deposit's chat hears the protocol's sentence, the "
       "operator's chat hears once that a forward was stopped for another "
       "chat, and neither line carries a digit after the label",
       any(c == 111 and pg.proto.PHASE_LINES["kept"] in t for c, t in _kfs)
-      and any(c == 222 and "stopped for a deposit in another chat" in t
+      and any(c == 222 and "forward: stopped. It needs someone at the other end." in t
               for c, t in _kfs)
       and not any(c == 222 and any(ch.isdigit() for ch in t)
                   for c, t in _kfs)
@@ -6748,7 +6768,7 @@ check("when the automatic retries are spent (stalled) the operator's chat "
       "hears its own sentence",
       (_ka.btc_open.get("B4A1") or {}).get("state") == "stalled"
       and len(_kalines) == 1
-      and "stopped for a deposit in another chat" in _kalines[0]
+      and "forward: stopped. It needs someone at the other end." in _kalines[0]
       and not any(ch.isdigit() for ch in _kalines[0])
       and any(c == 111 and "did not go through, again" in t
               for c, t in _kasends))
@@ -7267,7 +7287,7 @@ with _PinnedClock() as _c:
     _hs, _hw, _hg = _drive_safe(_c, _hp, _hpj, _a_from(1),
                                 lambda n, cf: ("done", "delayed"), 120)
 _nl = [(t, b) for t, b in _hps if _NOLONGER in t]
-_nlal = [t for t, b in _hps if "stopped for a deposit in another chat" in t]
+_nlal = [t for t, b in _hps if "forward: stopped. It needs someone at the other end." in t]
 check("money back, every start answered `delayed`: retried past the "
       "forward's clock, and forgotten OWED_GRACE_S after it (96 h), not at "
       "it", any(h > 48 for h, _ in _hs) and all(h < 96 for h, _ in _hs)
@@ -7675,7 +7695,7 @@ check("a leftover forward: the chat hears the protocol's sentence -- no "
       "digit, none of the banned words -- and the operator's chat hears once "
       "that a forward was stopped for another chat",
       _lline and any(c == 111 and _lline in t for c, t in _lfs)
-      and any(c == 222 and "stopped for a deposit in another chat" in t
+      and any(c == 222 and "forward: stopped. It needs someone at the other end." in t
               for c, t in _lfs)
       and not any(ch.isdigit() for ch in _lline)
       and not any(w in _lline.lower().replace(".", " ").replace(",", " ")
@@ -8016,6 +8036,81 @@ _lb.btc_tick(look=_look_returning("seen", unconf=5000000))
 check("...and so does the watcher's own line",
       any(t.startswith("?:") for t, _b in _lbs)
       and not any("B4A1" in t for t, _b in _lbs))
+
+
+# ===========================================================================
+print("\n== the chain names no job: the review of the Pi-side kinds ==")
+# A REPLY OF ANY JOB THAT DID NOT GO THROUGH is one kind, written by the
+# worker: it was written only where a deposit's details or a withdrawal's
+# report were lost, and beside the outcome it named which of the two.
+_rk_p, _ = _room_pager({111}, ())
+del _rk_p.send                         # the REAL send, over a dead transport
+_rk_p._set_in_flight = lambda *a, **k: None
+_rk_log = []
+_rk_il, _rk_post = pg.integrity_log, pg.safe_post
+pg.integrity_log = lambda st, k, *a, **kw: _rk_log.append(k)
+
+
+def _dead_post(*a, **k):
+    raise OSError("down")
+
+
+try:
+    pg.safe_post = _dead_post
+    _rk_p.poke = lambda cid, job, params: _rk_p.send(cid, "check: not yet")
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            _rk_p._worker(111, "swap_status", {})
+        except BaseException:                                # noqa: BLE001
+            pass
+    _rk_dead = list(_rk_log)
+    _rk_log.clear()
+    pg.safe_post = lambda *a, **k: {"ok": True, "result": {"message_id": 5}}
+    _rk_p._remember = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            _rk_p._worker(111, "swap_status", {})
+        except BaseException:                                # noqa: BLE001
+            pass
+    _rk_live = list(_rk_log)
+finally:
+    pg.integrity_log, pg.safe_post = _rk_il, _rk_post
+check("a /check whose reply did not go through writes reply_undelivered -- "
+      "the kind is every job's, not a deposit's or a withdrawal's",
+      "reply_undelivered" in _rk_dead)
+check("NON-VACUITY: a reply that landed writes nothing",
+      "reply_undelivered" not in _rk_live)
+# A WIZARD BURNED WHOLE WRITES NOTHING: it is how every deposit and
+# withdrawal starts, and `wizard_burned` before the poke dated each of them.
+# A partial burn is the operator's cue, once per process.
+_wb_p, _ = _room_pager({111}, ())
+_wb_log = []
+pg.integrity_log = lambda st, k, *a, **kw: _wb_log.append(k)
+try:
+    _wb_p.delete_message = lambda cid, m: True
+    _wb_p.convos[111] = _ty4.SimpleNamespace(mids=[1, 2])
+    _wb_p._end_convo(111)
+    _wb_whole = list(_wb_log)
+    _wb_p.delete_message = lambda cid, m: None
+    for _i in range(2):
+        _wb_p.convos[111] = _ty4.SimpleNamespace(mids=[3 + _i])
+        _wb_p._end_convo(111)
+    _wb_part = list(_wb_log)
+finally:
+    pg.integrity_log = _rk_il
+check("a wizard burned whole writes NOTHING on the chain",
+      _wb_whole == [])
+check("...one whose deletes fail says so ONCE per process",
+      _wb_part.count("wizard_burn_partial") == 1
+      and "wizard_burned" not in _wb_part)
+# CONFIGURATION KINDS KNOWN AT START ARE WRITTEN AT START: written at the
+# first deposit they concerned, they dated it after every restart.
+check("the start writes the configuration kinds whose condition it knows "
+      "(a group allowed; no BTC servers) -- before any deposit",
+      "_pager._config_once(\"payload_withheld_group\")" in _SRC_PG_EARLY
+      and "_pager._config_once(\"intake_unwatched\")" in _SRC_PG_EARLY
+      and _SRC_PG_EARLY.index("_pager._config_once(\"intake_unwatched\")")
+      < _SRC_PG_EARLY.index("return _pager.run()"))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
