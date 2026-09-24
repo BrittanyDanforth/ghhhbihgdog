@@ -208,7 +208,12 @@ test in `tests/test_wake_agent.py` and an anchor in `tests/mutation_sweep.py`.
   then died", and a paid-out deposit's slip and bundle were shredded before
   the ledger was saved and minutes before the seal. A finished job is now
   sealed before it is reported, the ledger is written before the shred, and
-  each wake retires again what the ledger says was paid out.
+  each wake retires again what the ledger says was paid out. (Not all of
+  it, on an INTAKE record -- a BTC deposit address of the host's: its
+  bundle and forward plan stay until the hand-run wipe, because money can
+  reach that address after the payout and the reconciliation that forwards
+  it reads both. The stage 5 read found the bundle shredded there, and
+  every such return refused `bad_bundle`. See `_retire_files`.)
 * **The job log and the chain** — see the struck lines in §3. The job log is
   sealed with the store on a run that went wrong (a clean run still shreds
   it first); the chain is sealed and `state_open` joins the lines written

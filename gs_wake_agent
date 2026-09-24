@@ -3066,7 +3066,9 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
     payment complete when that one landed and the first was still in
     flight. What is sent and what is quoted are summed over the plan and
     its rotated predecessors that moved money and were not superseded. A
-    reconstructed plan (no quote survives a crash) contributes nothing.
+    reconstructed plan carries the quote its signed record kept; one from a
+    record without a quote contributes nothing itself, and the plan it
+    superseded stands in for it.
     Returns whether the file was rewritten. Never raises."""
     try:
         path = rec.get("slip")
@@ -3178,17 +3180,44 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
                 Decimal("0.000000000001"), rounding="ROUND_DOWN")
             return _s - _b, _e2
 
+        def _is_record(p):
+            return bool(_record) and str(p.get("txid") or "").lower() \
+                == _record
+
         def _counts(p):
-            return (isinstance(p, dict) and p.get("broadcast") is True
-                    and p.get("broadcast_outcome") in ("accepted",
-                                                       "ambiguous")
-                    and (not p.get("superseded_by")
-                         or (_record and str(p.get("txid") or "").lower()
-                             == _record))
+            # THE RECORD COUNTS WHATEVER ITS OWN FILE SAYS OF ITS SEND: the
+            # network lists it, so it moved. A re-send every server rejected
+            # rewrote its plan `broadcast False`; when that one mined after
+            # all (the fresh forward beside it then superseded by it), it
+            # failed this test and the fresh forward was superseded -- the
+            # swap counted zero times.
+            return (isinstance(p, dict)
+                    and ((p.get("broadcast") is True
+                          and p.get("broadcast_outcome") in ("accepted",
+                                                             "ambiguous"))
+                         or _is_record(p))
+                    and (not p.get("superseded_by") or _is_record(p))
                     and p.get("expected_xmr") not in (None, "")
                     and p.get("dest_xmr") == plan.get("dest_xmr")
                     and str(p.get("txid") or "").lower() not in _refunded)
         counted = [p for p in [plan] + list(chain or ()) if _counts(p)]
+        # ...AND A RECORD WITH NO QUOTE HAS A STAND-IN: the plan it
+        # superseded, whose quote was for the same money (the record spent
+        # its inputs). A forward sent and killed before its plan, rebuilt
+        # from the chain by a build whose signed record kept no quote, is
+        # quote-less; the plan it superseded was dropped for being
+        # superseded; and the swap counted neither way -- the watcher said
+        # "complete" a swap early. Not when the record was refunded in full:
+        # then that swap did not happen, and neither counts.
+        if _record and not any(_is_record(p) for p in counted) \
+                and _record not in _refunded \
+                and not any(_is_record(p) and p.get("expected_xmr")
+                            not in (None, "")
+                            for p in [plan] + list(chain or ())
+                            if isinstance(p, dict)) \
+                and plan.get("expected_xmr") not in (None, "") \
+                and str(plan.get("superseded_by") or "").lower() == _record:
+            counted.append(plan)
         # A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP (stage 6). A
         # bump spends the same outpoints again at today's rate, and the
         # new plan names the old in `replaces`; counting both would tell
@@ -5391,6 +5420,11 @@ def _bundle_pair(rec: dict):
     return None
 
 
+# What a paid-out INTAKE record keeps past its payout: what a later
+# reconciliation of the host's own deposit address reads. See _retire_files.
+_INTAKE_KEEPS = ("bundle", "forward_plan")
+
+
 def _retire_files(rec: dict) -> None:
     """Shred a paid-out deposit's slip and bundle. The record keeps its
     (account, subaddress) pair and its spent flag; the files kept the deposit
@@ -5409,12 +5443,26 @@ def _retire_files(rec: dict) -> None:
     ever. It stays until the hand-run wipe, which covers every
     btc_forward_*.json; a record with no deposit address of the host's
     (quoted for the client to pay ThorChain directly) has no chain to
-    keep and its plan goes with the rest."""
+    keep and its plan goes with the rest.
+
+    NOR ITS BUNDLE (the stage 5 read). The reconciliation that plan chain
+    exists for is a forwarder run, and the forwarder takes the swap's
+    destination from the bundle (--dest-from-receive-wallet) before it
+    asks the network anything. Shredded here with the plan kept, every
+    later return to the address -- the refund of a swap that filled part
+    of the way and paid out, a client paying the address once more -- met
+    `bad_bundle` for ever: the plan kept for a run that could not start.
+    Nothing new stays on the disk for it. The bundle is the destination
+    address, which the kept plan names as `dest_xmr`; the account and
+    subaddress, which this record keeps as `pair`; and the wallet's
+    endpoint, which the keyfile beside it holds. It goes with the plan, at
+    the hand-run wipe (wallet_*.json). The slip -- the memo, the amounts --
+    is not needed by any reconciliation and still goes now."""
     for _k in ("slip", "bundle", "forward_plan"):
         _p = rec.get(_k)
         if not _p:
             continue
-        if _k == "forward_plan" and rec.get("btc_index") is not None:
+        if _k in _INTAKE_KEEPS and rec.get("btc_index") is not None:
             continue
         try:
             if Path(_p).is_file():
@@ -5450,6 +5498,12 @@ def _heal_retired(artifact_dir: Path) -> int:
             continue
         mine = {}
         for _k in ("slip", "bundle", "forward_plan"):
+            # WHAT AN INTAKE RECORD KEEPS IS NOT A LEFTOVER. Counted as one,
+            # every wake after such a payout touched the record, shredded
+            # nothing, and wrote `retired_leftovers` to the chain: a line
+            # that said a crash had been healed, every wake, about none.
+            if _k in _INTAKE_KEEPS and rec.get("btc_index") is not None:
+                continue
             _p = rec.get(_k)
             try:
                 if (isinstance(_p, str) and _p
@@ -5848,8 +5902,10 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             # evicted one, forwards money that came back, or FAILS on a
             # spend that is not ours. The invariant is one signature per
             # OUTPOINT while a spend of it may be in the network, kept by
-            # the forwarder from its plan chain and mirrored on this
-            # record as `forward_inputs`. A reconciliation may SEND, so a
+            # the forwarder from its plan chain -- and there only: the
+            # ledger's copy (`forward_inputs`) was read by nothing and named
+            # the client's transactions, and the host-privacy pass took it
+            # off (see the mark below). A reconciliation may SEND, so a
             # pair whose sending switch was turned off since is refused
             # here rather than handed a mode it may not run.
             if not _btc_broadcast_on(key):
@@ -6526,8 +6582,14 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # plain --broadcast path: no history read, no exclusions, the
         # chain's current plan overwritten unrotated, about a deposit
         # whose first forward the network once accepted.
+        # ...AND A RUN THAT RECONCILED IS ONE THAT WAS SENT: it only ran
+        # because the ledger or the plan on disk said the money moved. With
+        # the ledger mark missing (the agent died between the first send
+        # and its save), the mark was read off the plan alone -- and that
+        # plan, rewritten by a re-send every server rejected, said False:
+        # the "once sent" above held only when the mark was already set.
         handles[handle]["forward_sent"] = bool(
-            handles[handle].get("forward_sent")
+            handles[handle].get("forward_sent") or _reconcile
             or _forward_outcome(artifact_dir, handle)[0])
         # THE PAIRS REWRITE READS THE PLAN THE FORWARD JUST WROTE. The
         # outpoints it spent were accumulated on the record too, as "the

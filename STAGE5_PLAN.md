@@ -105,10 +105,13 @@ client's money sit now, and who can move it?":
 HANDLE; the thing that must never happen twice is a signature over the
 same OUTPOINT. A refund, a client's second payment, an evicted forward —
 each puts money on the address that has never been forwarded, and a rule
-on the handle strands all of them. The ledger records the outpoints each
-forward spent (`forward_inputs`), and a run may sign only outputs not on
-that list. The handle's `forward_sent` stays as the fact "a forward went
-out", not as a lock.
+on the handle strands all of them. The plan chain records the outpoints
+each forward spent, and a run may sign only outputs not on that list. The
+handle's `forward_sent` stays as the fact "a forward went out", not as a
+lock. (As first built the ledger kept a copy, `forward_inputs`; nothing
+read it and every entry named a client's transaction, so the host-privacy
+pass removed it; the mark block of `_dispatch` in gs_wake_agent says
+so.)
 
 **The repeat run is the reconciliation, not a no-op.** Stage 4 turned the
 tap after `sent` into a run that answers from the plan. Stage 5 makes that
@@ -175,7 +178,7 @@ one of these, in this order, each a status word and an action:
 | our txid listed at height > 0 | `sent` | nothing; writes `{state: confirmed}` beside the plan (depth stays on the vault) |
 | our txid listed at height ≤ 0 | `sent` | nothing (still confirming) |
 | not listed; inputs still unspent; hex kept | `unsure` → re-sent | `submit` the SAME bytes again; the outcome updates the plan (`resends`), `seen` polled |
-| not listed; inputs still unspent; no hex | `returned` | the outputs are money never sent: a FRESH forward of them (new quote, new signature, new plan; the old plan kept as `btc_forward_<handle>.<n>.json`); the ledger's `forward_inputs` grows |
+| not listed; inputs still unspent; no hex | `returned` | the outputs are money never sent: a FRESH forward of them (new quote, new signature, new plan; the old plan kept as `btc_forward_<handle>.<n>.json`); the chain's outpoints grow |
 | not listed; inputs spent by a tx that is not ours | FAILED, no word; kind `forward_foreign_spend` | nothing is signed. Only a leaked key does this; the phone hears "failed", which is true of the machine, and the operator reads the kind at the vault |
 | new unspent outputs beyond the forwarded inputs (a refund, or a second payment) | `returned` | a fresh forward of the new outputs only, as above, once they settle to `min_conf` (a refund is a normal payment to the address) |
 | the outputs are gone, our txid is in the history, and there is no plan (case 1 of section 1) | `sent` | the history shows our spend; the ledger learns `forward_sent`, the plan is reconstructed from the history (txid, inputs) with `reconstructed: true`. "Our txid" is one in `btc_forward_<h>.signed.json`, written before the bytes were sent -- not a memo naming the destination, which every forward publishes and a seed thief can copy |
@@ -185,9 +188,11 @@ withdrawal", and a forward that went out is `sent`. `_phase_of` reads the
 new `{state}` words: `confirmed` → `sent`; `resent` → `unsure` or `sent`
 by the new outcome; `returned` → `returned`. A run that could ask nobody
 is a failure, as today.
-The once-per-outpoint rule lives in the forwarder (`forward_inputs` from
-the plan chain) and in `_dispatch` (the ledger's list), both, and the
-sweep proves a second signature over a listed outpoint is refused.
+The once-per-outpoint rule lives in the forwarder, read from the plan
+chain, and only there: the ledger's copy this section first planned was
+built, read by nothing, and removed (it named every client's transaction
+on a disk that unlocks itself). The sweep proves a second signature over a
+listed outpoint is refused.
 
 ### 3.2 Fee spikes: `delayed`, and the pager tries again
 
@@ -273,13 +278,17 @@ one word each; the plan chain carries the numbers, 0600, on the vault.
 
 ### 3.10 What only a box with Tor can prove
 
-`tests/real_btc_forward_testnet.py` grows a second act on the same funded
-address: a forward whose broadcast is deliberately sent to a server that
-will not relay it (policy 80), then `--reconcile` finding it unlisted and
-re-sending to the one that will; and a third act that pays the address
-again after the forward and shows `--reconcile` answering `returned` and
-forwarding the new outputs only. THORChain's acceptance of the memo stays
-unprovable off mainnet; the file's header keeps saying so.
+PLANNED here, and NOT what was built (read back in the stage 5 review):
+`tests/real_btc_forward_testnet.py` was to drive a broadcast deliberately
+sent to a server that will not relay it, then `--reconcile` re-sending,
+and a second payment to the address answered `returned` and forwarded on
+its own. What it drives is act E, `--reconcile` finding the forward
+listed against a real history, and act F, the bump. The re-send, the
+evicted re-sign and returned money are NOT driven on a real network; the
+script's header says so and tells the operator how to act the last one
+by hand (pay address 0 again, run the same argv with `--reconcile`).
+Those rows are proven against the in-process server only.
+THORChain's acceptance of the memo stays unprovable off mainnet.
 
 ---
 
@@ -300,7 +309,7 @@ unprovable off mainnet; the file's header keeps saying so.
    step; test_btc_forwarder drives every row against the mock server
    (history and listunspent scenarios), including a foreign spend.
 6. **The agent**: `_dispatch` runs the reconciliation instead of answering
-   from the plan; `forward_inputs` on the ledger; the pairs rewrite (3.4);
+   from the plan; the pairs rewrite (3.4);
    `ledger_wiped` and the pruning exemption (3.6); `_phase_of` for the new
    words. test_wake_agent, test_wake_endtoend (a returned deposit forwarded
    again on the real path; a delayed one).

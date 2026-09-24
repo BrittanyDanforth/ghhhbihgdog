@@ -6001,6 +6001,40 @@ check("a rejected re-send then a fee refusal: 'delayed', and forward_sent "
       "stays True -- the next wake is a reconciliation, not a fresh send",
       _e is None and (_bb.result or {}).get("phase") == "delayed"
       and _rec_of(_dd).get("forward_sent") is True)
+# ...AND WITH THE LEDGER MARK MISSING: the agent died between the first
+# send and its ledger save, so only the plan on disk says the money moved.
+# The run reconciles; the kept re-send is rejected everywhere and the fresh
+# forward refused on today's fee, which leaves the plan saying broadcast
+# False -- and the mark, read off that plan alone, was False: the next wake
+# a plain --broadcast (no history read, the plan overwritten unrotated).
+_dM, _kM, _bM = _fwd_env(_FWD_REC, _SEND_KEY)
+(_dM / "btc_forward_A3F1.json").write_text(json.dumps(
+    {**_ACC, "seen_height": 0}))
+_ranM = []
+
+
+def _childM(argv, env_extra, budget):
+    _ranM.append(list(argv))
+    _of = Path(argv[argv.index("--outfile") + 1])
+    _of.write_text(json.dumps(_rej))
+    _of.with_suffix(".status.json").write_text(json.dumps(
+        {"state": "delayed"}))
+    return 2, False
+
+
+_dpM = deps_for(_dM, _bM, extend_deadman=lambda s: True, run_child=_childM)
+os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+try:
+    _oM, _eM, _ = run(_kM, _dpM)
+except Exception as _xM:                                     # noqa: BLE001
+    _oM, _eM = None, _xM
+finally:
+    os.environ.pop("GS_BTC_SEED", None)
+check("no ledger mark, a plan on disk that says it went: the run "
+      "RECONCILES, and after a rejected re-send and a fee refusal the mark "
+      "is True -- the next wake reconciles again, never a plain --broadcast",
+      _eM is None and bool(_ranM) and "--reconcile" in _ranM[0]
+      and _rec_of(_dM).get("forward_sent") is True)
 # A PLAN SUPERSEDED BY A FORWARD OF OURS THAT MINED IS `forwarded` whatever
 # its own outcome says: a re-send that could reach no server once wrote
 # `unreachable` over the earlier `accepted`, and the plan read as never
@@ -6229,13 +6263,18 @@ _sl.write_text("{}")
 _bd.write_text("{}")
 A._retire_files({"forward_plan": str(_pf), "slip": str(_sl),
                  "bundle": str(_bd), "btc_index": 3})
-check("...but an INTAKE record's forward plan STAYS when its slip and "
-      "bundle go: the chain is what a later return to the host's own "
-      "address is reconciled by (the MED pass after the deep read)",
-      _pf.exists() and not _sl.exists() and not _bd.exists())
+check("...but an INTAKE record's forward plan STAYS when its slip goes: "
+      "the chain is what a later return to the host's own address is "
+      "reconciled by (the MED pass after the deep read)",
+      _pf.exists() and not _sl.exists())
+check("...AND ITS BUNDLE STAYS: the reconciliation is a forwarder run that "
+      "takes the swap's destination from it, and a shredded one refused "
+      "every later return bad_bundle (the stage 5 read)",
+      _bd.exists())
 # missing_ok: on a copy that shreds the plan the check above reads RED, and
 # this cleanup must not turn that into a dead suite (NO-RESULT in the sweep).
 _pf.unlink(missing_ok=True)
+_bd.unlink(missing_ok=True)
 _o, _e, _ran = _fwd_run({**_FWD_REC, "bundle": None, "minted": 3}, _FWD_KEY)
 check("a handle naming no single bundle has no destination: "
       "handle_not_forwardable", _o is None
@@ -8858,6 +8897,98 @@ check("stage7/heal: a paid-out deposit's files are shredded only AFTER the "
       "ledger on the disk says spent -- a kill between the two used to "
       "leave 'unspent' beside a deposit whose files were gone",
       _ospent7 == [True])
+
+# A LATE REFUND AFTER THE PAYOUT (the stage 5 read). An INTAKE deposit (the
+# host's own BTC address) is forwarded, the swap pays out and is withdrawn;
+# then money reaches the address again -- a streaming swap's refund, or the
+# client paying it once more -- and the Pi asks. The forward branch admits a
+# spent intake record for exactly this, and the run is a --reconcile of the
+# forwarder, which reads the destination from the record's bundle before it
+# asks the network anything. The withdrawal shredded that bundle, so every
+# such run was refused bad_bundle for ever. Driven through the real
+# withdrawal, the real heal and the real forward branch.
+_ld5, _lruns5, _lrun5 = _ledger_env("late5_")
+_lh5 = json.loads((_ld5 / A.HANDLES_FILE).read_text())
+_lp5 = _ld5 / "btc_forward_A3F1.json"
+_lp5.write_text(json.dumps({**_ACC, "seen_height": 850000}))
+_lh5["A3F1"].update({"btc_index": 3, "forward_sent": True,
+                     "forward_plan": str(_lp5)})
+(_ld5 / A.HANDLES_FILE).write_text(json.dumps(_lh5))
+_lb5 = Path(_lh5["A3F1"]["bundle"])
+_o_il5 = A.integrity_log
+_ll5 = []
+A.integrity_log = lambda *a, **k: _ll5.append(a[1] if len(a) > 1 else "")
+_o_pw5 = os.environ.get("GS_WALLET_PASSWORD")
+os.environ["GS_WALLET_PASSWORD"] = ""
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            A._dispatch("withdraw", {"exit_to": _XMR_SAMPLE, "depth": 1},
+                        _k, _ld5, "C4D5", _lrun5, "job-l5",
+                        funded=lambda: (9, 4, _XMR_SAMPLE,
+                                        5_000_000_000_000))
+        except A.Refused as e:
+            _ll5.append(f"refused:{e.code}")
+    _lr5 = _rec_of(_ld5)
+    _ll5.clear()
+    _lhn5 = A._heal_retired(_ld5)
+finally:
+    A.integrity_log = _o_il5
+    if _o_pw5 is None:
+        os.environ.pop("GS_WALLET_PASSWORD", None)
+    else:
+        os.environ["GS_WALLET_PASSWORD"] = _o_pw5
+check("stage5/late: a paid-out INTAKE deposit keeps its bundle and plan -- "
+      "only its slip goes",
+      _lr5.get("spent") is True and _lb5.is_file() and _lp5.is_file()
+      and not (_ld5 / "thor_pairs_A3F1.json").exists())
+check("stage5/late: ...and the next wake's heal leaves them, and says "
+      "nothing: what such a record keeps is not a crash's leftover (every "
+      "wake wrote `retired_leftovers` about a plan it did not shred)",
+      _lhn5 == 0 and "retired_leftovers" not in _ll5
+      and _lb5.is_file() and _lp5.is_file())
+# ...and the Pi's ask then reaches a forwarder that can start.
+_dL5, _kL5, _bL5 = _fwd_env(_lr5, _SEND_KEY)
+_ranL5, _destL5 = [], []
+
+
+def _childL5(argv, env_extra, budget):
+    _ranL5.append(list(argv))
+    try:
+        from gs_common import load_receive_bundle
+        _destL5.append(load_receive_bundle(
+            argv[argv.index("--dest-from-receive-wallet") + 1])["address"])
+    except Exception as _xL5:                                # noqa: BLE001
+        _destL5.append(f"refused: {type(_xL5).__name__}")
+    _of = Path(argv[argv.index("--outfile") + 1])
+    _of.write_text(json.dumps(_ACC))
+    return 0, False
+
+
+_dpL5 = deps_for(_dL5, _bL5, extend_deadman=lambda s: True,
+                 run_child=_childL5)
+os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+try:
+    _oL5, _eL5, _ = run(_kL5, _dpL5)
+except Exception as _xL5:                                    # noqa: BLE001
+    _oL5, _eL5 = None, _xL5
+finally:
+    os.environ.pop("GS_BTC_SEED", None)
+check("stage5/late: the ask about that address runs the forwarder's "
+      "--reconcile, and the destination it is handed LOADS -- the swap's "
+      "own XMR address, not bad_bundle",
+      bool(_ranL5) and "--reconcile" in _ranL5[0]
+      and _destL5 == [_XMR_SAMPLE])
+# NON-VACUITY: a record quoted for the client to pay ThorChain directly
+# (no btc_index) has no chain to reconcile, and its bundle still goes.
+_nb5 = _ld5 / "wallet_nb5.json"
+_nb5.write_text("{}")
+_ns5 = _ld5 / "thor_pairs_nb5.json"
+_ns5.write_text("{}")
+A._retire_files({"bundle": str(_nb5), "slip": str(_ns5)})
+check("stage5/late: NON-VACUITY -- a paid-out record with no deposit address "
+      "of the host's still has its bundle shredded with its slip",
+      not _nb5.exists() and not _ns5.exists())
 
 
 # ===========================================================================

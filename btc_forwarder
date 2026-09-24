@@ -1192,8 +1192,9 @@ def write_status(outfile, state):
 
 #: EVERY TRANSACTION THIS TOOL SENDS, BY TXID, RECORDED BEFORE ITS BYTES
 #: LEAVE THE BOX: btc_forward_<h>.signed.json beside the plan, sealed and
-#: wiped with it (btc_forward_*.json). Txids only -- a transaction is read
-#: from a file only from a plan (_plan_file).
+#: wiped with it (btc_forward_*.json). Txids, and the QUOTE each was sent
+#: under (signed_quote) -- never the transaction: one is read from a file
+#: only from a plan (_plan_file).
 #:
 #: A spend of the deposit address that no plan named was judged ours by its
 #: memo, an OP_RETURN naming this deposit's destination. That memo is on
@@ -1221,19 +1222,30 @@ def signed_path(outfile):
     return Path(outfile).with_suffix(".signed.json")
 
 
-def _read_signed(outfile):
-    """The txids in the record, oldest first, each 64 lowercase hex; the
-    file yields nothing else. [] when there is none; raises (OSError,
-    ValueError) for one that is there and unreadable."""
+def _read_signed_doc(outfile):
+    """(txids oldest first, {txid: quote}) from the record: each txid 64
+    lowercase hex, each quote a dict; the file yields nothing else.
+    ([], {}) when there is none; raises (OSError, ValueError) for one that
+    is there and unreadable."""
     try:
         with open(signed_path(outfile), encoding="utf-8") as fh:
             doc = json.load(fh)
     except FileNotFoundError:
-        return []
+        return [], {}
     if not isinstance(doc, dict) or doc.get("schema") != SIGNED_SCHEMA \
             or not isinstance(doc.get("txids"), list):
         raise ValueError("not a record of this tool's sent transactions")
-    return [t for t in doc["txids"] if isinstance(t, str) and _TXID_RE.match(t)]
+    txids = [t for t in doc["txids"] if isinstance(t, str) and _TXID_RE.match(t)]
+    quotes = doc.get("quotes")
+    quotes = ({t: q for t, q in quotes.items()
+               if isinstance(t, str) and t in txids and isinstance(q, dict)}
+              if isinstance(quotes, dict) else {})
+    return txids, quotes
+
+
+def _read_signed(outfile):
+    """The txids in the record, oldest first (_read_signed_doc)."""
+    return _read_signed_doc(outfile)[0]
 
 
 def signed_txids(outfile):
@@ -1247,27 +1259,62 @@ def signed_txids(outfile):
         return set()
 
 
-def record_signed(outfile, txid):
-    """Add `txid` to the record, synced to disk, BEFORE its bytes are
-    handed to any server. Fails closed: a record that cannot be written is
-    a refusal, and nothing is sent."""
+def signed_quote(outfile, txid):
+    """The quote `txid` was sent under, as record_signed wrote it before
+    the bytes left, or None (none recorded, a record from before the field,
+    an unreadable one, or a figure that is not one). A plan REBUILT from the
+    chain (reconcile_emptied, an adopted spend) carries it, so the vault's
+    pairs rewrite counts that swap: with no quote it counted for nothing,
+    and the XMR side called a deposit complete when an earlier swap's
+    Monero landed while this one's was still coming. Our own record, on
+    the vault's disk, sealed with the plans: the same figure the plan
+    would have held."""
+    try:
+        q = _read_signed_doc(outfile)[1].get(str(txid).lower())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(q, dict):
+        return None
+    exp = finite_decimal(q.get("expected_xmr"))
+    worst = finite_decimal(q.get("worst_case_xmr"))
+    if exp is None or exp <= 0 or exp > XMR_QUOTE_MAX \
+            or worst is None or worst <= 0 or worst > exp:
+        return None
+    out = {"expected_xmr": str(exp), "worst_case_xmr": str(worst),
+           "memo_limit_base_units": None, "outbound_fee_sat": None}
+    for _k in ("memo_limit_base_units", "outbound_fee_sat"):
+        _v = q.get(_k)
+        if isinstance(_v, int) and not isinstance(_v, bool) and _v >= 0:
+            out[_k] = _v
+    return out
+
+
+def record_signed(outfile, txid, quote=None):
+    """Add `txid` to the record -- with the `quote` it is sent under, when
+    given -- synced to disk, BEFORE its bytes are handed to any server.
+    Re-recording a txid keeps the quote it had. Fails closed: a record that
+    cannot be written is a refusal, and nothing is sent."""
     txid = str(txid).lower()
     if not _TXID_RE.match(txid):
         raise Refused("signed_record_failed",
                       "the transaction has no txid to record; nothing was "
                       "sent")
     try:
-        have = _read_signed(outfile)
+        have, quotes = _read_signed_doc(outfile)
     except (OSError, ValueError):
         # What it held is in the plan chain, save a send that died before
         # its plan -- which then reads as foreign: an alarm to check, the
         # safe side. A fresh record, said on the chain.
         integrity_log("forward", "signed_record_reset")
-        have = []
+        have, quotes = [], {}
     keep = [t for t in have if t != txid][-(SIGNED_KEEP - 1):] + [txid]
+    quotes = {t: q for t, q in quotes.items() if t in keep}
+    if isinstance(quote, dict):
+        quotes[txid] = dict(quote)
     path = signed_path(outfile)
     try:
-        atomic_write_json({"schema": SIGNED_SCHEMA, "txids": keep}, path)
+        atomic_write_json({"schema": SIGNED_SCHEMA, "txids": keep,
+                           "quotes": quotes}, path)
         # ...and the NAME synced too: the rename is what makes the record
         # exist, and a power cut straight after the broadcast is the case
         # it is for.
@@ -1293,13 +1340,16 @@ _op_return_data = btx.op_return_data
 
 
 def _plan_of_spend(spend, tx, memo, network, index, address, dest_xmr,
-                   tip):
+                   tip, quote=None):
     """A plan REBUILT FROM A FORWARD OF OURS FOUND ON THE CHAIN whose sending
     run did not live to write one (a power cut, the agent's deadman or job
     budget, a kill in the seen wait): txid, inputs and their values, what
     reached the inbound, the fee and the vsize off the transaction itself,
-    the memo. Marked `reconstructed`; no quote survives a crash, so it
-    carries none (and the vault's pairs rewrite counts it for nothing).
+    the memo. Marked `reconstructed`. The QUOTE is the one record_signed
+    kept beside the txid before the bytes left (`quote`, signed_quote), so
+    the vault's pairs rewrite counts this swap; a record from before that
+    field has none, and then the rewrite lets the plan this one superseded
+    stand in for it (gs_wake_agent._reconcile_pairs).
 
     `spend` is a listing from bcast_spends ({txid, height, hex, inputs,
     server}), `tx` its parsed transaction. THE FEE ONLY WHEN EVERY INPUT IS
@@ -1326,6 +1376,7 @@ def _plan_of_spend(spend, tx, memo, network, index, address, dest_xmr,
     if fee_sat is not None and fee_sat < 0:
         fee_sat = None
     vsize = btx.measure(tx)[0]
+    q = quote if isinstance(quote, dict) else {}
     return {
         "schema": PLAN_SCHEMA,
         "network": network,
@@ -1354,7 +1405,7 @@ def _plan_of_spend(spend, tx, memo, network, index, address, dest_xmr,
         "tip": tip,
         "inbound": inbound,
         "inbound_cross_checked": False,
-        "outbound_fee_sat": None,
+        "outbound_fee_sat": q.get("outbound_fee_sat"),
         "memo": memo,
         "memo_quoted": None,
         "memo_limit_set": None,
@@ -1368,9 +1419,11 @@ def _plan_of_spend(spend, tx, memo, network, index, address, dest_xmr,
         "vsize": vsize,
         "feerate_real_sat_vb": (fee_sat // vsize if vsize
                                 and fee_sat is not None else None),
-        "expected_xmr": None,                    # no quote survives a crash
-        "worst_case_xmr": None,
-        "memo_limit_base_units": None,
+        # THE QUOTE, when the record kept it (signed_quote); a crash loses
+        # everything else of the run.
+        "expected_xmr": q.get("expected_xmr"),
+        "worst_case_xmr": q.get("worst_case_xmr"),
+        "memo_limit_base_units": q.get("memo_limit_base_units"),
         "affiliate_bps": None,
         "dest_xmr": dest_xmr,
         "txid": spend["txid"],
@@ -1454,7 +1507,8 @@ def reconcile_emptied(address, index, servers, proxy_url, network, timeout,
               "leaked.")
         raise SystemExit(EXIT_FAILED)
     plan = _plan_of_spend(last, tx, memo, network, index, address,
-                          dest_xmr, tip)
+                          dest_xmr, tip,
+                          quote=signed_quote(outfile, last["txid"]))
     inbound, send_sat = plan["inbound"], plan["send_sat"]
     in_sat, fee_sat, vsize = (plan["settled_sat"], plan["fee_sat"],
                               plan["vsize"])
@@ -1951,8 +2005,11 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # inputs, matched no kept outpoint, and read as a foreign spend --
         # "the seed has leaked" -- on every run until it left the window.
         _rk0 = _p0.get("returned_kept")
+        _rl0 = _p0.get("returned_leftover")
         for _t0, _v0 in (_pairs((_rk0 or {}).get("outpoints")
                                 if isinstance(_rk0, dict) else None)
+                         | _pairs((_rl0 or {}).get("outpoints")
+                                  if isinstance(_rl0, dict) else None)
                          | _pairs(_p0.get("returned_moved"))):
             _keep.add(str(_t0).lower())
     try:
@@ -2045,6 +2102,12 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         _rk = _p.get("returned_kept")
         _kept_ops |= _pairs((_rk or {}).get("outpoints")
                             if isinstance(_rk, dict) else None)
+        # ...AND WHAT A `leftover` ANSWER SAID STAYS THERE (returned_leftover):
+        # money no rate carries, which the operator moves by hand the same
+        # way. Rests on the seed alone, as the kept mark does.
+        _rl = _p.get("returned_leftover")
+        _kept_ops |= _pairs((_rl or {}).get("outpoints")
+                            if isinstance(_rl, dict) else None)
         _kept_ops |= _pairs(_p.get("returned_moved"))
         _signed_ops |= _pairs([(i.get("tx_hash"), i.get("vout"))
                                for i in (_p.get("inputs") or [])
@@ -2143,16 +2206,22 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # was -- the verdict below, and the agent's word, are still read off it.
     # Its `carried_refunds` are the rounds among its inputs no plan of ours
     # spends (round_outpoints over this run's refunds and the chain), as
-    # main() counts a fresh forward's. NOT `replaces`: a replacement found
-    # this way carries no quote, so the pairs rewrite counts it for nothing,
-    # and naming the plan it replaced would drop that one too -- a swap
-    # counted neither way. Written once: next run it is in the chain, so in
-    # `ours`, and not adopted again.
+    # main() counts a fresh forward's. Its QUOTE is the one the record kept
+    # (signed_quote), so the vault's pairs rewrite counts this swap. That
+    # was claimed here once with no quote to back it: this comment said
+    # leaving `replaces` off avoided "a swap counted neither way", while
+    # the plan the replacement superseded was dropped as superseded and
+    # the replacement, quote-less, counted nothing -- the XMR side called
+    # the deposit complete a swap early. NOT `replaces`: the reconciliation
+    # marks the plan it replaced superseded, which is the rewrite's rule for
+    # which of the two counts. Written once: next run it is in the chain, so
+    # in `ours`, and not adopted again.
     for s, _memo in _adopted:
         from embit.transaction import Transaction as _Tx
         _ap = _plan_of_spend(s, _Tx.parse(bytes.fromhex(s["hex"])), _memo,
                              args.network, index, address, dest_xmr,
-                             picture.get("tip"))
+                             picture.get("tip"),
+                             quote=signed_quote(args.outfile, s["txid"]))
         _new = _outpoints(_ap["inputs"]) - _signed_ops
         _rounds = round_outpoints(_ap["inputs"], plan.get("refunds"),
                                   [plan] + chain)
@@ -2187,7 +2256,22 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                 for i in s["inputs"]} | _moved_ins
     unspent = {(str(u["tx_hash"]).lower(), int(u["vout"])): u
                for u in picture["utxos"]}
-    fresh = {k: u for k, u in unspent.items() if k not in consumed}
+    # ...AND NOT DUST AT EVERY RATE THIS PAIR PAYS: an output at or under
+    # dust_line(the floor) is left behind by select_inputs at every rate in
+    # the band, so it is not money that came back -- it is money no forward
+    # of this pair can carry. Counted as returned, a stranger's hundred
+    # satoshis to a spent address was forwarded (refused, nothing_economic),
+    # answered `leftover` -- "some came back ... Check" to the client and a
+    # "stopped" line to the operator -- and, at --returns-max, marked KEPT
+    # while our own forward sat in the mempool: the phone heard `kept` and
+    # the Pi stopped rechecking a forward that had not confirmed. Anyone who
+    # knows the address can pay dust to it; this rests on nothing secret,
+    # only on the dust line being the pair's own. (A bump's `must` inputs
+    # are not asked about here: they are marked after this returns, and
+    # they are a listed forward's inputs, so in `consumed` already.)
+    _dust_floor = dust_line(int(args.feerate_floor))
+    fresh = {k: u for k, u in unspent.items() if k not in consumed
+             and int(u.get("value") or 0) > _dust_floor}
     settled_new = [u for u in fresh.values()
                    if u["confirmations"] >= args.min_conf
                    and u["confirmations"] >= 1]
@@ -2254,6 +2338,22 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         """The verdict when money that came back is NOT sent on again
         (--returns-max), or None when it is."""
         if not _at_limit:
+            return None
+        # ...ONLY MONEY A FORWARD COULD CARRY IS KEPT BY THE BOUND. What no
+        # rate in the band forwards -- settled or not (weighed as if it had
+        # settled) -- is not held back by --returns-max; it cannot move
+        # anyway. Marked kept, it made the phone hear `kept` and the Pi stop
+        # rechecking our own forward while it sat in the mempool. Not kept,
+        # it goes the ordinary way: a refused forward, `leftover` once ours
+        # has mined, `sent` while it has not.
+        _as_settled = [dict(u, confirmations=max(int(u["confirmations"]),
+                                                 int(args.min_conf), 1))
+                       for u in outputs]
+        if not forwards_in_band(_as_settled, args.min_conf,
+                                int(args.feerate_floor),
+                                int(args.feerate_ceiling), (),
+                                args.op_return_max_bytes,
+                                args.min_send_sat):
             return None
         plan["returned_kept"] = {
             "outputs": len(outputs),
@@ -3000,6 +3100,28 @@ def main(argv=None):
             # back since is what stays.
             elif _word == STATUS_SHORT and why == "returned":
                 _word = STATUS_LEFTOVER
+                # ...AND WHICH OUTPUTS STAY, recorded on the current plan as
+                # a kept return's are: the client heard "it stays there.
+                # Check.", and the operator who then moved them by hand was
+                # read as a leaked seed -- `foreign_spend` on every later
+                # run, so no refund or payment to the deposit ever went
+                # through again. Everything unspent that no forward of ours
+                # spends, dust included (a hand move takes what is there).
+                _left = sorted({(str(u["tx_hash"]).lower(), int(u["vout"]))
+                                for u in picture["utxos"]}
+                               - {(str(t).lower(), int(v))
+                                  for t, v in exclude})
+                if _left and isinstance(plan0, dict):
+                    plan0["returned_leftover"] = {
+                        "outpoints": [list(o) for o in _left]}
+                    # NOT IN PLACE OF THE WORD: a plan that cannot be
+                    # written must not turn this refusal into a crash with
+                    # no status. The next run answers `leftover` again and
+                    # writes it then.
+                    try:
+                        write_plan(args.outfile, plan0)
+                    except OSError:
+                        integrity_log("forward", "leftover_unrecorded")
             write_status(args.outfile, _word)
         raise
 
@@ -3089,7 +3211,11 @@ def main(argv=None):
         # ON DISK BEFORE THE BYTES LEAVE: the one mark that tells this
         # forward, found on the chain with no plan, from a copy of its memo
         # (SIGNED_SCHEMA says why).
-        record_signed(args.outfile, txid)
+        record_signed(args.outfile, txid, quote={
+            "expected_xmr": str(expected_xmr),
+            "worst_case_xmr": str(worst_xmr),
+            "memo_limit_base_units": memo_limit,
+            "outbound_fee_sat": outbound_fee})
         integrity_log("forward", "sending")
         try:
             sub = bcast_submit(tx.serialize().hex(), txid, address, servers,

@@ -1447,7 +1447,8 @@ check("EMPTIED BY OUR OWN FORWARD (its txid recorded before it was sent, "
 check("...the reconstructed plan reads as SENT to the agent (broadcast, "
       "accepted, seen) and carries what the chain shows: the txid, the "
       "inputs and their values, what reached the inbound, the fee, the "
-      "memo, the destination -- and no hex, no quote",
+      "memo, the destination -- and no hex, and no quote: its record, "
+      "written by a build before the quote was kept, holds none",
       _p is not None and _p["broadcast"] is True
       and _p["broadcast_outcome"] == "accepted" and _p["seen"] is True
       and _p["txid"] == _OURS["txid"] and _p["seen_height"] == 850001
@@ -1554,6 +1555,19 @@ check("...and the next run finds that very forward on the emptied address "
       "and reconstructs its plan: sent, not a leaked seed",
       _c == F.EXIT_OK and _p is not None and _p.get("reconstructed") is True
       and _p["txid"] == _dtx and ("forward", "foreign_spend") not in _nd2.kinds)
+# ...CARRYING THE QUOTE IT WAS SENT UNDER (the stage 5 read): the record
+# keeps it beside the txid before the bytes leave. Rebuilt without it, the
+# vault's pairs rewrite counted this swap for nothing. Compared with what
+# the fake aggregator quoted the killed run, not with the record's own copy.
+_ndq = (str((Decimal(_nd.posts[-1][1]["sellAmount"]) / _ORACLE)
+            .quantize(Decimal("0.00000001"))) if _nd.posts else None)
+check("...and the rebuilt plan carries the killed run's own quote, so the "
+      "XMR side is told what to expect from this swap",
+      _p is not None and _ndq is not None
+      and _p.get("expected_xmr") is not None
+      and Decimal(str(_p["expected_xmr"])) == Decimal(_ndq)
+      and _p.get("worst_case_xmr") is not None
+      and Decimal(str(_p["worst_case_xmr"])) <= Decimal(_ndq))
 # A RECORD THAT CANNOT BE WRITTEN SENDS NOTHING.
 _real_awj = F.atomic_write_json
 
@@ -3017,21 +3031,27 @@ check("the forwarder names no Electrum method that spends: the broadcast is "
 # shown them. No --rebroadcast flag, no other read.
 # TWO FILES ARE READ, AND ONE OF THEM CAN HOLD A TRANSACTION: the plan.
 # The other is the record of sent txids, and it yields 64-hex strings and
-# nothing else (driven above, "a record yields only 64-hex txids").
+# the quote each was sent under -- figures, checked by signed_quote --
+# and nothing else (driven above, "a record yields only 64-hex txids").
 _jl = [_m.start() for _m in re.finditer(r"json\.load\(", _src)]
 
 
 def _inside(fn):
-    _a = _src.index(f"def {fn}(")
-    _b = _src.index("\ndef ", _a + 1)
-    return sum(1 for _j in _jl if _a < _j < _b)
+    """json.load calls inside `fn`, or -1 when there is no such function:
+    a red check on a source without it, not a dead suite."""
+    _a = _src.find(f"def {fn}(")
+    if _a < 0:
+        return -1
+    _b = _src.find("\ndef ", _a + 1)
+    return sum(1 for _j in _jl if _a < _j < (_b if _b > 0 else len(_src)))
 
 
 check("the forwarder reads a transaction from a file to send it ONLY in "
       "--reconcile, from its own plan (schema checked), the kept bytes; the "
-      "one other file it parses is the txid record, inside _read_signed",
+      "one other file it parses is the txid record, inside "
+      "_read_signed_doc",
       "--rebroadcast" not in _src and len(_jl) == 2
-      and _inside("_plan_file") == 1 and _inside("_read_signed") == 1
+      and _inside("_plan_file") == 1 and _inside("_read_signed_doc") == 1
       and "json.loads(" not in _src
       and 'plan.get("schema") != PLAN_SCHEMA' in _src
       and 'if plan.get("tx_hex"):' in _src
@@ -4268,8 +4288,9 @@ _chA = _chain_files(_ofA)
 _wtx = Transaction.parse(bytes.fromhex(_wA["raw_hex"]))
 _wfee = 150000 - sum(int(o.value) for o in _wtx.vout)
 check("the next run ADOPTS it and records it as a plan -- rebuilt from the "
-      "transaction (its txid, its input, the fee it really pays, no quote), "
-      "filed as a ROTATED predecessor, the current plan unchanged",
+      "transaction (its txid, its input, the fee it really pays, and the "
+      "quote the signed record kept before the send), filed as a ROTATED "
+      "predecessor, the current plan unchanged",
       _c == F.EXIT_OK and ("forward", "adopted_spend") in _nA.kinds
       and ("forward", "adopted_planned") in _nA.kinds
       and len(_chA) == 2 and _chA[0]["txid"] == _pA1["txid"]
@@ -4279,7 +4300,9 @@ check("the next run ADOPTS it and records it as a plan -- rebuilt from the "
       and [(i["tx_hash"], i["vout"]) for i in _chA[1]["inputs"]]
       == [(_HA2, 0)]
       and _chA[1]["fee_sat"] == _wfee and _wfee > 0
-      and _chA[1]["expected_xmr"] is None
+      and _chA[1]["expected_xmr"] is not None
+      and _chA[1]["expected_xmr"]
+      == (F.signed_quote(_ofA, _wA["txid"]) or {}).get("expected_xmr")
       and not _chA[1].get("replaces"))
 check("...and it COUNTS toward --returns-max: the round it carried is one "
       "(a refund-sized return), so with --returns-max 1 the SECOND return "
@@ -4486,6 +4509,268 @@ check("a rebuilt plan the disk will not take: said on the chain, and the "
       _c == F.EXIT_OK and ("forward", "adopted_plan_unwritten") in _nW.kinds
       and len(F._plan_chain(_ofW)) == 1 and _nW.submits == []
       and isinstance((_p or {}).get("returned_kept"), dict))
+
+# THE XMR SIDE EXPECTS EVERY SWAP THAT WENT OUT, ONCE (the stage 5 review).
+# The vault's pairs rewrite (gs_wake_agent._reconcile_pairs) sums the quotes
+# of the forwards that moved money; a forward it counts zero times makes the
+# watcher call the deposit complete when an EARLIER swap's Monero lands. Each
+# case is driven through the real forwarder and then the real rewrite; the
+# swap's quote is taken from the fake aggregator (the sell amount it was
+# asked about, at its fixed price) or from a plan a LIVE run wrote -- never
+# from the rebuilt plan whose quote is the thing under test.
+print("\n== the pairs rewrite counts every swap that went out, once ==")
+
+
+def _pairs_expect(of):
+    """The expected_xmr the vault's real pairs rewrite writes over the plan
+    chain at `of` (the current plan, and the rotated ones as the agent
+    reads them)."""
+    _slip = of + ".pairs.json"
+    with open(_slip, "w") as _fh:
+        json.dump([{"dest_xmr": _DEST, "btc_in": "0.002",
+                    "expected_xmr": "99"}], _fh)
+    _cur = json.load(open(of))
+    _ch = [json.load(open(f)) for f in F._plan_chain(of)[1:]]
+    try:
+        _AG._reconcile_pairs({"slip": _slip}, _cur, _ch)
+        return Decimal(str(json.load(open(_slip))[0]["expected_xmr"]))
+    except Exception as ex:                                  # noqa: BLE001
+        print(f"  [pairs rewrite crashed: {type(ex).__name__}: {ex}]")
+        return None
+
+
+def _quoted(net):
+    """What the fake aggregator quoted for the LAST forward it was asked
+    about: its sell amount at its own price (Net.safe_post)."""
+    return (Decimal(net.posts[-1][1]["sellAmount"]) / _ORACLE).quantize(
+        Decimal("0.00000001"))
+
+
+# (a1) A FRESH FORWARD OF RETURNED MONEY, SENT AND KILLED BEFORE ITS PLAN.
+_pQ1b, _ofQb, _hxQ1b = _first_send()
+_nQb = _DieInSeen(utxos=_RA1, spends=[_listed(_pQ1b, _hxQ1b)], fee=10,
+                  submit=_ACCEPTED, seen=_SEEN0)
+try:
+    _reconcile(_nQb, _ofQb)
+except _Died:
+    pass
+_wQb = _nQb.submits[0]
+_nQb2 = Net(utxos=[], spends=[_listed(_pQ1b, _hxQ1b), _listing(_wQb, _IN_A1)],
+            fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_reconcile(_nQb2, _ofQb)
+_wantQb = Decimal(str(_pQ1b["expected_xmr"])) + _quoted(_nQb)
+check("a forward of returned money sent and killed before its plan, adopted "
+      "later: the XMR side expects BOTH swaps -- the first and the killed "
+      "one's own quote, kept in the signed record before it was sent",
+      _pairs_expect(_ofQb) == _wantQb
+      and F.signed_quote(_ofQb, _wQb["txid"]) is not None)
+# (a2) A BUMP OF THE RETURNED FORWARD, SENT AND KILLED: the plan it
+# replaced is superseded by it, and it was quote-less -- neither counted.
+_pT1, _ofT, _hxT1 = _first_send()
+_nT2 = Net(utxos=_RA1, spends=[_listed(_pT1, _hxT1)], fee=2,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pT2, _ = _reconcile(_nT2, _ofT, "--feerate-floor", "1")
+_hxT2 = _nT2.submits[0]["raw_hex"]
+_nT3 = _DieInSeen(utxos=[], spends=[_listed(_pT1, _hxT1),
+                                    _listed(_pT2, _hxT2, height=0,
+                                            inputs=_IN_A1)],
+                  fee=40, submit=_ACCEPTED, seen=_SEEN0)
+try:
+    _reconcile(_nT3, _ofT, "--bump-after", "0")
+except _Died:
+    pass
+_wT = _nT3.submits[0] if _nT3.submits else {"txid": "", "raw_hex": ""}
+_nT4 = Net(utxos=[], spends=[_listed(_pT1, _hxT1),
+                             _listing(_wT, _IN_A1, height=0)],
+           fee=2, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pT4, _ = _reconcile(_nT4, _ofT)
+check("a bump sent and killed, adopted, the plan it replaced superseded by "
+      "it: the XMR side expects the first swap and the BUMP's quote -- the "
+      "returned swap once, not zero times",
+      _pT4.get("superseded_by") == _wT["txid"]
+      and _pairs_expect(_ofT) == Decimal(str(_pT1["expected_xmr"]))
+      + _quoted(_nT3))
+# (c) THE SAME, FROM A SIGNED RECORD WITH NO QUOTE (written before the
+# field): the plan the bump superseded stands in for it.
+_pU1, _ofU, _hxU1 = _first_send()
+_nU2 = Net(utxos=_RA1, spends=[_listed(_pU1, _hxU1)], fee=2,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pU2, _ = _reconcile(_nU2, _ofU, "--feerate-floor", "1")
+_hxU2 = _nU2.submits[0]["raw_hex"]
+_nU3 = _DieInSeen(utxos=[], spends=[_listed(_pU1, _hxU1),
+                                    _listed(_pU2, _hxU2, height=0,
+                                            inputs=_IN_A1)],
+                  fee=40, submit=_ACCEPTED, seen=_SEEN0)
+try:
+    _reconcile(_nU3, _ofU, "--bump-after", "0")
+except _Died:
+    pass
+_wU = _nU3.submits[0] if _nU3.submits else {"txid": "", "raw_hex": ""}
+_rec = json.load(open(F.signed_path(_ofU)))
+_rec.pop("quotes", None)
+with open(F.signed_path(_ofU), "w") as _fh:
+    json.dump(_rec, _fh)
+_nU4 = Net(utxos=[], spends=[_listed(_pU1, _hxU1),
+                             _listing(_wU, _IN_A1, height=0)],
+           fee=2, submit=_ACCEPTED, seen=_SEEN0)
+_reconcile(_nU4, _ofU)
+check("...and from a signed record that kept no quote: the superseded plan "
+      "stands in -- the returned swap counted once, at its own quote",
+      _pairs_expect(_ofU) == Decimal(str(_pU1["expected_xmr"]))
+      + Decimal(str(_pU2["expected_xmr"])))
+# (b) A RE-SEND EVERY SERVER REJECTED, A FRESH FORWARD, AND THEN THE
+# ORIGINAL MINES AFTER ALL: its plan says broadcast False, the fresh one is
+# superseded by it -- and the swap counted zero times.
+_pV1, _ofV, _hxV1 = _first_send()
+_nV2 = Net(utxos=_RA1, spends=[_listed(_pV1, _hxV1)], fee=10,
+           submit=_ACCEPTED, seen=_NOT_SEEN)
+_c, _o, _pV2, _ = _reconcile(_nV2, _ofV)
+_hxV2 = _nV2.submits[0]["raw_hex"]
+# (at another rate: at the same one, with the jitter pinned here, the
+# fresh forward is byte for byte the original -- one txid, nothing to
+# supersede)
+_nV3 = Net(utxos=_RA1, spends=[_listed(_pV1, _hxV1)], fee=12,
+           submit=[_REJECTED, _ACCEPTED], seen=_SEEN0)
+_c, _o, _pV3, _ = _reconcile(_nV3, _ofV)
+_nV4 = Net(utxos=[], spends=[_listed(_pV1, _hxV1),
+                             _listed(_pV2, _hxV2, inputs=_IN_A1)],
+           fee=10, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pV4, _ = _reconcile(_nV4, _ofV)
+_rotV2 = [q for q in (json.load(open(f)) for f in F._plan_chain(_ofV)[1:])
+          if q.get("txid") == _pV2["txid"]]
+check("a rejected re-send, a fresh forward, and then the ORIGINAL mines: "
+      "the XMR side expects the first swap and the original's -- the one "
+      "the network named, though its own file says broadcast False",
+      _pV3.get("reconcile_reason") == "rejected"
+      and _pV3["txid"] != _pV2["txid"]
+      and _pV4.get("superseded_by") == _pV2["txid"]
+      and _rotV2 and _rotV2[0].get("broadcast") is False
+      and _pairs_expect(_ofV) == Decimal(str(_pV1["expected_xmr"]))
+      + Decimal(str(_pV2["expected_xmr"])))
+# NON-VACUITY: the same bump sequence where the run LIVED counts the same
+# two swaps -- what the killed one must match.
+_pW1, _ofW2, _hxW1 = _first_send()
+_nW2 = Net(utxos=_RA1, spends=[_listed(_pW1, _hxW1)], fee=2,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pW2, _ = _reconcile(_nW2, _ofW2, "--feerate-floor", "1")
+_hxW2 = _nW2.submits[0]["raw_hex"]
+_nW3 = Net(utxos=[], spends=[_listed(_pW1, _hxW1),
+                             _listed(_pW2, _hxW2, height=0, inputs=_IN_A1)],
+           fee=40, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pW3, _ = _reconcile(_nW3, _ofW2, "--bump-after", "0")
+check("NON-VACUITY: the bump where the run lived -- two swaps expected, the "
+      "bump's quote for the second",
+      _pW3.get("replaces") == _pW2["txid"]
+      and _pairs_expect(_ofW2) == Decimal(str(_pW1["expected_xmr"]))
+      + _quoted(_nW3))
+
+# A STRANGER'S DUST IS NOT MONEY THAT CAME BACK (the stage 5 review). An
+# output at or under the dust line at the pair's floor is left behind at
+# every rate the pair pays; counted as returned, 100 sat to a spent address
+# read `leftover` -- "some came back ... Check" and an operator alert -- and,
+# at --returns-max, marked our mempool forward KEPT: the Pi stopped
+# rechecking a forward that had not confirmed. Anyone who knows the address
+# can pay it dust.
+print("\n== dust is not money that came back; the bound keeps only what moves ==")
+_HD = "d1" * 32
+for _dv, _dh, _dx, _dwant, _dwhy in (
+        (100, 850002, (), None, "100 sat after the forward mined: nothing"),
+        (100, 0, ("--returns-max", "0"), None,
+         "100 sat at the bound, our forward in the mempool: not kept"),
+        (600, 0, ("--returns-max", "0"), "leftover",
+         "600 sat (not dust at 1 sat/vB, forwardable at no rate) at the "
+         "bound: not KEPT -- what no rate carries is not held by the bound")):
+    _pD1, _ofD, _hxD1 = _first_send()
+    _nD = Net(utxos=[{"tx_hash": _HD, "vout": 0, "value": _dv,
+                      "confirmations": 5}],
+              spends=[_listed(_pD1, _hxD1, height=_dh)], fee=10,
+              submit=_ACCEPTED, seen=_SEEN0)
+    _c, _o, _p, _ = _reconcile(_nD, _ofD, *_dx)
+    _curD = json.load(open(_ofD))
+    check(f"returned-money edge: {_dwhy}",
+          "returned_kept" not in _curD and _status_of(_ofD) == _dwant
+          and ("forward", "returned_kept") not in _nD.kinds
+          and _nD.submits == [] and _nD.posts == [])
+_pD2, _ofD2, _hxD2 = _first_send()
+_nD2 = Net(utxos=[{"tx_hash": _HD, "vout": 0, "value": 150000,
+                   "confirmations": 5}],
+           spends=[_listed(_pD2, _hxD2, height=0)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nD2, _ofD2, "--returns-max", "0")
+check("NON-VACUITY: a return a forward could carry, at the bound: KEPT, as "
+      "before", isinstance(json.load(open(_ofD2)).get("returned_kept"), dict)
+      and _nD2.submits == [])
+# `leftover` MONEY MOVED BY HAND IS THE OPERATOR'S HAND, as a kept return
+# is: the client heard "it stays there. Check.", and the operator who moved
+# it was read as a leaked seed on every later run -- no refund or payment
+# to the deposit ever went through again.
+_HL = "d2" * 32
+_pL1, _ofL, _hxL1 = _first_send()
+_nL1 = Net(utxos=[{"tx_hash": _HL, "vout": 0, "value": 3000,
+                   "confirmations": 5}],
+           spends=[_listed(_pL1, _hxL1)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_cL1, _o, _p, _ = _reconcile(_nL1, _ofL)
+_hand = T.build_unsigned([{"tx_hash": _HL, "vout": 0, "value": 3000}],
+                         [(2500, _IN_SPK)], locktime=850010)
+_handS = {"txid": _hand.txid().hex(), "height": 850011,
+          "hex": _hand.serialize().hex(),
+          "inputs": [{"tx_hash": _HL, "vout": 0, "value": 3000}],
+          "server": "s.onion"}
+_lk = []
+for _r in (2, 3):
+    _nLr = Net(utxos=[], spends=[_listed(_pL1, _hxL1), _handS], fee=10,
+               submit=_ACCEPTED, seen=_SEEN0)
+    _cr, _or, _pr, _ = _reconcile(_nLr, _ofL)
+    _lk.append((_cr, ("forward", "kept_moved") in _nLr.kinds,
+                ("forward", "foreign_spend") in _nLr.kinds))
+check("money a `leftover` said stays there, moved by hand: the operator's "
+      "hand (kept_moved), every run after -- never `the seed has leaked`",
+      _status_of(_ofL) is not None
+      and (json.load(open(_ofL)).get("returned_leftover") or {}).get(
+          "outpoints") == [[_HL, 0]]
+      and _lk == [(F.EXIT_OK, True, False), (F.EXIT_OK, True, False)])
+_nLf = Net(utxos=[], spends=[_listed(_pL1, _hxL1),
+                             {**_handS, "inputs": [
+                                 {"tx_hash": _HL, "vout": 0, "value": 3000},
+                                 {"tx_hash": "d3" * 32, "vout": 0,
+                                  "value": 90000}]}], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nLf, _ofL)
+check("NON-VACUITY: a spend that takes the leftover AND more is still the "
+      "alarm", _c == F.EXIT_FAILED
+      and ("forward", "foreign_spend") in _nLf.kinds)
+# ...AND A PLAN THAT CANNOT BE WRITTEN THERE DOES NOT TAKE THE WORD WITH
+# IT: the record is written from inside the refusal, and a full disk there
+# used to leave no status at all -- the Pi reading a failed machine where
+# the answer was `leftover`.
+_pL9, _ofL9, _hxL9 = _first_send()
+_nL9 = Net(utxos=[{"tx_hash": _HL, "vout": 0, "value": 3000,
+                   "confirmations": 5}],
+           spends=[_listed(_pL9, _hxL9)], fee=10, submit=_ACCEPTED,
+           seen=_SEEN0)
+_o_wp9 = F.write_plan
+
+
+def _wp9(path, plan):
+    if isinstance(plan, dict) and plan.get("returned_leftover"):
+        raise OSError(28, "No space left on device")
+    return _o_wp9(path, plan)
+
+
+F.write_plan = _wp9
+try:
+    _c9 = _reconcile(_nL9, _ofL9)[0]
+except BaseException as _x9:                                 # noqa: BLE001
+    _c9 = f"raised {type(_x9).__name__}"
+finally:
+    F.write_plan = _o_wp9
+check("a `leftover` whose record cannot be written still answers "
+      "`leftover`, the refusal it was, and says on the chain that the "
+      "outputs went unrecorded",
+      _c9 == _cL1 == F.EXIT_REFUSED and _status_of(_ofL9) == "leftover"
+      and ("forward", "leftover_unrecorded") in _nL9.kinds
+      and "returned_leftover" not in json.load(open(_ofL9)))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

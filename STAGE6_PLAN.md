@@ -266,9 +266,12 @@ an old Pi refuses a new vault's M3 carrying it, loud.
   (`_btc_setting(key, "btc_bump_after_s", 7200, 600, 7 * 86400)`).
 - `gs_wake_keys pair --btc-bump-after SECONDS` (default 7200, floor 600),
   written as `btc_bump_after_s`; validated at pairing like the others.
-- The mark block is unchanged: `forward_sent` from `_forward_outcome`,
-  `forward_inputs` the union (the same outpoints again), the pairs
-  rewrite with 3.3.
+- The mark block: `forward_sent` from `_forward_outcome`, never lowered
+  once set (a reconciliation, or a record already marked, keeps it True
+  whatever the newest plan says -- a re-send every server rejected writes
+  `broadcast: false` on a plan whose money went out earlier), and the
+  pairs rewrite with 3.3. No `forward_inputs`: the ledger names no
+  transaction, and a record that carries one is stripped.
 
 ### 3.6 The pager
 

@@ -873,9 +873,20 @@ try:
     print("\n== nothing readable crosses to the Pi ==")
     check("the bundles and the slip stayed on the VAULT",
           "wallet_e2e_1.json" in _bay_files_c1)
-    check("...and the next wake retired them once the deposit was paid out, "
-          "rather than keeping a who-sent-what line for a closed job",
-          "wallet_e2e_1.json" not in " ".join(os.listdir(_bay)))
+    # THE FIRST DEPOSIT WAS GIVEN A BTC INDEX ABOVE, to drive the forward,
+    # so it is an INTAKE record: its bundle stays with its plan chain after
+    # the payout -- money can reach the host's own address later, and the
+    # reconciliation that forwards it takes its destination from the bundle
+    # (gs_wake_agent._retire_files; the shredding of everything else a
+    # paid-out record names is pinned in test_wake_agent, stage7/heal).
+    # This used to read "retired", and went red when the late return was
+    # made reconcilable: the fake quote here writes no slip, so the bundle
+    # was all it ever looked at.
+    check("...and after the payout the next wake KEEPS this intake record's "
+          "bundle, beside its plan, for a late return's reconciliation",
+          "wallet_e2e_1.json" in os.listdir(_bay)
+          and f"btc_forward_{out1[2]}.json" in os.listdir(_bay)
+          and A._load_ledger(_bay)["handles"][out1[2]].get("spent") is True)
     _report = io.StringIO()
     with contextlib.redirect_stdout(_report):
         DB.report(p1)

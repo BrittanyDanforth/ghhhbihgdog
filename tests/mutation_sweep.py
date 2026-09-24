@@ -4565,7 +4565,7 @@ MUTATIONS = [
   '    else:\n        hex_reason = None',
   '    else:\n        hex_reason = "unseen"',
   ['test_btc_forwarder']),
- ('a forward that may have moved money is not marked sent', 'gs_wake_agent', '        handles[handle]["forward_sent"] = bool(\n            handles[handle].get("forward_sent")\n            or _forward_outcome(artifact_dir, handle)[0])', '        handles[handle]["forward_sent"] = False', ['test_wake_agent']),
+ ('a forward that may have moved money is not marked sent', 'gs_wake_agent', '        handles[handle]["forward_sent"] = bool(\n            handles[handle].get("forward_sent") or _reconcile\n            or _forward_outcome(artifact_dir, handle)[0])', '        handles[handle]["forward_sent"] = False', ['test_wake_agent']),
  ('a plan whose two broadcast fields disagree is read as moved', 'gs_wake_agent',
   '        moved = (plan.get("broadcast") is True\n                 and outcome in ("accepted", "ambiguous"))',
   '        moved = plan.get("broadcast") is True',
@@ -4748,10 +4748,8 @@ MUTATIONS = [
   '            if False:\n                continue',
   ['test_wake_agent']),
  ("the record's stale superseded mark drops it from the count", 'gs_wake_agent',
-  '                    and (not p.get("superseded_by")\n'
-  '                         or (_record and str(p.get("txid") or "").lower()\n'
-  '                             == _record))',
-  '                    and not p.get("superseded_by")',
+  '                    and (not p.get("superseded_by") or _is_record(p))\n',
+  '                    and not p.get("superseded_by")\n',
   ['test_wake_agent']),
  ('a superseded plan whose superseder mined is still the word sent', 'gs_wake_agent',
   '        return (bool(plan.get("superseded_by"))\n'
@@ -5420,7 +5418,7 @@ MUTATIONS = [
   ['test_wake_agent']),
  ('forward_sent is rewritten from the latest plan, downgrading it',
   'gs_wake_agent',
-  '            handles[handle].get("forward_sent")\n            or _forward_outcome(',
+  '            handles[handle].get("forward_sent") or _reconcile\n            or _forward_outcome(',
   '            False\n            or _forward_outcome(',
   ['test_wake_agent']),
  ('a superseded plan reads as never sent', 'gs_wake_agent',
@@ -6547,10 +6545,8 @@ MUTATIONS = [
   ['test_wake_agent']),
  ("a paid-out intake record's plan chain is shredded with its slip",
   'gs_wake_agent',
-  '        if _k == "forward_plan" and rec.get("btc_index") is not None:\n'
-  '            continue',
-  '        if False:\n'
-  '            continue',
+  '_INTAKE_KEEPS = ("bundle", "forward_plan")\n',
+  '_INTAKE_KEEPS = ("bundle",)\n',
   ['test_wake_agent']),
  # MED PASS: the intake floor rides on the pairing to the pager.
  ('the vault sends no intake floor in the pairing info',
@@ -8353,7 +8349,11 @@ MUTATIONS = [
   '    if not memo_ours:\n',
   ['test_btc_forwarder']),
  ('a forward is sent before its txid is recorded', 'btc_forwarder',
-  '        record_signed(args.outfile, txid)\n'
+  '        record_signed(args.outfile, txid, quote={\n'
+  '            "expected_xmr": str(expected_xmr),\n'
+  '            "worst_case_xmr": str(worst_xmr),\n'
+  '            "memo_limit_base_units": memo_limit,\n'
+  '            "outbound_fee_sat": outbound_fee})\n'
   '        integrity_log("forward", "sending")\n',
   '        integrity_log("forward", "sending")\n',
   ['test_btc_forwarder']),
@@ -8368,8 +8368,8 @@ MUTATIONS = [
   '    keep = [t for t in have if t != txid] + [txid]\n',
   ['test_btc_forwarder']),
  ('the sent record yields whatever it holds', 'btc_forwarder',
-  '    return [t for t in doc["txids"] if isinstance(t, str) and _TXID_RE.match(t)]\n',
-  '    return list(doc["txids"])\n',
+  '    txids = [t for t in doc["txids"] if isinstance(t, str) and _TXID_RE.match(t)]\n',
+  '    txids = list(doc["txids"])\n',
   ['test_btc_forwarder']),
  # ---- wt17d: the review of 8b10525 ---------------------------------------
  ('every name of a hard-linked file is counted, whatever the sweep makes of it',
@@ -8621,6 +8621,75 @@ MUTATIONS = [
   '    for _id in (_w.chain_id, _w.legacy_chain_id):\n',
   '    for _id in (_w.chain_id,):\n',
   ['test_wake_agent']),
+ # ---- the stage 5 read: pairs, forward_sent, leftover, dust, late refund --
+ ('a quote-less record has no stand-in: its swap counts for nothing', 'gs_wake_agent',
+  '                and str(plan.get("superseded_by") or "").lower() == _record:\n'
+  '            counted.append(plan)\n',
+  '                and str(plan.get("superseded_by") or "").lower() == _record:\n'
+  '            pass\n',
+  ['test_btc_forwarder']),
+ ("the record counts only when its own file says it was sent", 'gs_wake_agent',
+  '                                                             "ambiguous"))\n'
+  '                         or _is_record(p))\n',
+  '                                                             "ambiguous")))\n',
+  ['test_btc_forwarder']),
+ ("a reconciliation's own run does not keep the forward_sent mark", 'gs_wake_agent',
+  '            handles[handle].get("forward_sent") or _reconcile\n            or _forward_outcome(',
+  '            handles[handle].get("forward_sent")\n            or _forward_outcome(',
+  ['test_wake_agent']),
+ ("a paid-out intake record's bundle is shredded with its slip", 'gs_wake_agent',
+  '_INTAKE_KEEPS = ("bundle", "forward_plan")\n',
+  '_INTAKE_KEEPS = ("forward_plan",)\n',
+  ['test_wake_agent']),
+ ("every paid-out record keeps its bundle and plan, intake or not", 'gs_wake_agent',
+  '        if _k in _INTAKE_KEEPS and rec.get("btc_index") is not None:\n'
+  '            continue\n'
+  '        try:\n',
+  '        if _k in _INTAKE_KEEPS:\n'
+  '            continue\n'
+  '        try:\n',
+  ['test_wake_agent']),
+ ("the heal counts what an intake record keeps as a leftover", 'gs_wake_agent',
+  '            if _k in _INTAKE_KEEPS and rec.get("btc_index") is not None:\n'
+  '                continue\n',
+  '            if False:\n'
+  '                continue\n',
+  ['test_wake_agent']),
+ ('a forward is recorded without the quote it is sent under', 'btc_forwarder',
+  '        record_signed(args.outfile, txid, quote={\n',
+  '        record_signed(args.outfile, txid, quote=None and {\n',
+  ['test_btc_forwarder']),
+ ('a plan rebuilt from an emptied address drops the kept quote', 'btc_forwarder',
+  '                          quote=signed_quote(outfile, last["txid"]))\n',
+  '                          quote=None)\n',
+  ['test_btc_forwarder']),
+ ('an adopted plan drops the kept quote', 'btc_forwarder',
+  '                             quote=signed_quote(args.outfile, s["txid"]))\n',
+  '                             quote=None)\n',
+  ['test_btc_forwarder']),
+ ('dust on a spent address is money that came back', 'btc_forwarder',
+  '             and int(u.get("value") or 0) > _dust_floor}\n',
+  '             }\n',
+  ['test_btc_forwarder']),
+ ('the bound keeps money no rate in the band carries', 'btc_forwarder',
+  '        if not forwards_in_band(_as_settled, args.min_conf,\n',
+  '        if False and forwards_in_band(_as_settled, args.min_conf,\n',
+  ['test_btc_forwarder']),
+ ('a leftover does not record which outputs stay', 'btc_forwarder',
+  '                    plan0["returned_leftover"] = {\n',
+  '                    plan0["returned_leftover_x"] = {\n',
+  ['test_btc_forwarder']),
+ ('a hand move of leftover money reads as a leaked seed', 'btc_forwarder',
+  '        _rl = _p.get("returned_leftover")\n',
+  '        _rl = None\n',
+  ['test_btc_forwarder']),
+ ('a leftover record that cannot be written takes the word with it', 'btc_forwarder',
+  '                    except OSError:\n'
+  '                        integrity_log("forward", "leftover_unrecorded")\n',
+  '                    except KeyError:\n'
+  '                        integrity_log("forward", "leftover_unrecorded")\n',
+  ['test_btc_forwarder']),
+
 ]
 
 
