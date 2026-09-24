@@ -135,13 +135,30 @@ bcast_submit = bcast.submit
 
 
 def _vouchers_not(sub):
-    """The servers `seen` must not take the word of, from a submit's
-    result: the one that accepted (it cannot vouch for itself) and every
-    one that answered a txid not ours (caught out once already). In
-    memory only -- a server's name is never written to the plan from
-    here."""
-    out = [sub.get("server")] + list(sub.get("mismatched_servers") or ())
-    return [h for h in out if isinstance(h, str) and h]
+    """The server `seen` should not take the word of when another can be
+    asked, from a submit's result: the one that accepted (it cannot vouch
+    for itself)."""
+    h = sub.get("server")
+    return [h] if isinstance(h, str) and h else []
+
+
+def _distrusted(sub, plan=None):
+    """The servers `seen` must NEVER take the word of: every one that
+    answered a submit with a txid not ours -- this submit's
+    (`mismatched_servers`) and every earlier one's this plan recorded
+    (`broadcast_distrusted`). Caught out once, such a server is no witness
+    for this forward again, even as the only one configured (seen's
+    `distrust`). ON THE PLAN, not in memory only (the review of the stage 3
+    read): the next run's reconciliation read the address from the first
+    server that answered -- the one caught out -- which listed the txid it
+    had been handed, and the kept bytes were dropped as proven about a
+    transaction the network never had. The plan already names the
+    accepting and the listing server; this is a name of the same kind,
+    on the vault, and it never reaches the Pi or the chat."""
+    out = list((sub or {}).get("mismatched_servers") or ())
+    if isinstance(plan, dict):
+        out += list(plan.get("broadcast_distrusted") or ())
+    return sorted({h for h in out if isinstance(h, str) and h})
 bcast_seen = bcast.seen
 # READ-ONLY, in the same module: the address's spends, for a forward that
 # went out and whose plan was never written (stage 5).
@@ -340,7 +357,10 @@ def fee_band(rate, floor, ceiling):
 
     ABOVE THE CEILING IS REFUSED, not clamped: a server saying 5000 sat/vB
     is broken or hostile, and silently paying the ceiling instead would
-    still be a decision made for money on a number nobody trusts.
+    still be a decision made for money on a number nobody trusts. (With a
+    THORNode named, todays_rate has already bounded the estimate by
+    ThorChain's own rate -- a number the run does trust -- so what reaches
+    here over the ceiling is ThorChain saying the network is there.)
 
     BELOW THE FLOOR PAYS THE FLOOR. The floor is the operator's "never
     less than this" (a rate under which their own node will not relay, or
@@ -940,10 +960,13 @@ def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
                           if _name == "price oracle" else "pool_unusable")
             print(f"  [!] the {_name} could not be compared to the quote")
         elif dev > max_slippage:
+            # THE STOP AS PAIRED, not rounded (the review of the stop
+            # becoming pairable): 150 bps read "over the 2%" about 1.8%.
+            _stop = format((Decimal(str(max_slippage)) * 100).normalize(),
+                           "f")
             raise Refused("quote_deviates",
                           f"the quote sits {dev * 100:.1f}% from the "
-                          f"{_name}, over the {max_slippage * 100:.0f}% this "
-                          "box accepts")
+                          f"{_name}, over the {_stop}% this box accepts")
         elif dev > Decimal("0.05"):
             print(f"  [!] the quote sits {dev * 100:.1f}% from the {_name}")
     return exp, worst
@@ -1041,32 +1064,49 @@ def thornode_btc_height(thornode_url, proxy_url):
 GAS_RATE_CAP_X = 2
 
 
-def fetch_inbound_entries(thornode_url, proxy_url):
-    """THORNode's inbound_addresses, on its own circuit: a list, or a
-    refusal (inbound_unverified). Asked ONCE per run, before the fee is
-    decided: its BTC entry caps the fee estimate (thorchain_fee_cap) and is
-    what cross_check_inbound later holds the aggregator's inbound to."""
+class _InboundUnread(Exception):
+    """THORNode's inbound list could not be read. A fact, not yet a
+    refusal: Refused logs and prints the moment it is built, and the fee
+    step reads the list before the run knows whether it will pay at all."""
+
+
+def _fetch_inbound(thornode_url, proxy_url):
+    """THORNode's inbound_addresses, on its own circuit: a list, or
+    _InboundUnread carrying the refusal's words."""
     proxies = isolated_proxy(proxy_url, "forward:inbound")
     try:
         entries = safe_get(f"{thornode_url.rstrip('/')}/thorchain/"
                            "inbound_addresses", proxies)
     except Exception as e:                                   # noqa: BLE001
         integrity_log("forward", f"inbound_fetch_fail:{type(e).__name__}")
-        raise Refused("inbound_unverified",
-                      f"THORNode's inbound list could not be fetched "
-                      f"({type(e).__name__}); refusing to pay an address "
-                      "only the aggregator vouched for")
+        raise _InboundUnread(f"THORNode's inbound list could not be fetched "
+                             f"({type(e).__name__}); refusing to pay an "
+                             "address only the aggregator vouched for")
     if not isinstance(entries, list):
-        raise Refused("inbound_unverified", "THORNode's inbound list is not "
-                      "a list")
+        raise _InboundUnread("THORNode's inbound list is not a list")
     return entries
 
 
-def thorchain_fee_cap(entries, floor):
+def fetch_inbound_entries(thornode_url, proxy_url):
+    """THORNode's inbound_addresses: a list, or a refusal
+    (inbound_unverified)."""
+    try:
+        return _fetch_inbound(thornode_url, proxy_url)
+    except _InboundUnread as e:
+        raise Refused("inbound_unverified", str(e))
+
+
+def thorchain_fee_cap(entries, floor, ceiling):
     """The highest fee rate (sat/vB) a server's estimate is taken at, from
     ThorChain's own BTC gas rate in `entries`: GAS_RATE_CAP_X times it,
-    never under the operator's floor. None when the entry carries no usable
-    rate (the estimate then stands as it always did).
+    never under the operator's floor -- and never over the operator's
+    ceiling while ThorChain's own rate is within it (the review of this
+    fix: twice a rate of 150 is over a ceiling of 200, and a server naming
+    5000 then had the forward `delayed` for as long as it led, with
+    ThorChain itself saying the network is inside the band). Over the
+    ceiling only when ThorChain's own rate is: then the network is there,
+    and fee_band refuses it as it should. None when the entry carries no
+    usable rate (the estimate then stands as it always did).
 
     THE STAGE 2 READ: the fee estimate is ONE server's answer to the look,
     bounded only by the operator's ceiling. A server that named just under
@@ -1087,8 +1127,67 @@ def thorchain_fee_cap(entries, floor):
     rate = finite_decimal(btc[0].get("gas_rate"))
     if rate is None or rate <= 0 or rate > 100000:
         return None
-    return max(int(floor), int((rate * GAS_RATE_CAP_X)
-                               .to_integral_value(rounding=ROUND_CEILING)))
+    cap = int((rate * GAS_RATE_CAP_X).to_integral_value(
+        rounding=ROUND_CEILING))
+    if rate <= int(ceiling):
+        cap = min(cap, int(ceiling))
+    return max(int(floor), cap)
+
+
+def _thor_entries_once(args):
+    """THORNode's inbound list for this run: fetched at most ONCE, when first
+    wanted, and None when the run names no THORNode or it could not be read.
+    NOT a refusal here (the review of the fee cap): fetched before the fee
+    step and fatal, a THORNode outage turned the fee step's own word --
+    `short`, `seen`, `delayed` -- into a wordless inbound_unverified, and
+    the Pi into stall retries. The failure is kept, and is the cross-check's
+    refusal (_thor_entries_or_refuse) when the run gets that far: the SAME
+    read, so a node that failed the fee step and answered a second ask
+    never has the fee decided unbounded and the inbound vouched for."""
+    if not args.thornode:
+        return None
+    if "_thor_entries" not in vars(args):
+        try:
+            args._thor_entries = _fetch_inbound(args.thornode,
+                                                args.tor_proxy)
+        except _InboundUnread as e:
+            args._thor_entries = e
+    got = args._thor_entries
+    return got if isinstance(got, list) else None
+
+
+def _thor_entries_or_refuse(args):
+    """This run's one THORNode read for the cross-check, or its refusal."""
+    got = _thor_entries_once(args)
+    if got is None:
+        raise Refused("inbound_unverified", str(args._thor_entries))
+    return got
+
+
+def todays_rate(args, picture):
+    """THE fee rate this run acts on, decided ONCE for both readers: the
+    reconciliation's bump decision and main's fee step (the review of the
+    fee cap: the bump read the server's raw estimate and the fee step paid
+    the cap, so a forward stuck at the cap was bumped one sat/vB a window,
+    for ever -- one state decided twice). The operator's --feerate-sat-vb
+    when given; else the server's estimate, bounded by ThorChain's own
+    (thorchain_fee_cap) when the run names a THORNode that answers. Said
+    once a run when it bounds it."""
+    if args.feerate_sat_vb:
+        return args.feerate_sat_vb
+    est = picture.get("fee_sat_vb")
+    cap = thorchain_fee_cap(_thor_entries_once(args), args.feerate_floor,
+                            args.feerate_ceiling)
+    if cap is not None and isinstance(est, int) \
+            and not isinstance(est, bool) and est > cap:
+        if not vars(args).get("_fee_bound_said"):
+            args._fee_bound_said = True
+            integrity_log("forward", "fee_estimate_over_thorchain")
+            print(f"  [!] the server's fee estimate ({est} sat/vB) is not "
+                  f"credible beside ThorChain's own; today's rate is taken "
+                  f"as {cap}")
+        return cap
+    return est
 
 
 def cross_check_inbound(inbound, thornode_url, proxy_url, entries=None):
@@ -2120,6 +2219,80 @@ def _memo_is_ours(tx_hex, dest_xmr):
     return memo, ours
 
 
+#: How many txids that funded kept, hand-moved or leftover outputs the
+#: reconciliation's history read fetches beyond its window (reconcile's
+#: keep list). Our own forwards and what funded their inputs are always
+#: read; these ride on top, and a budgeted read cannot carry hundreds.
+KEEP_EXTRA_MAX = 20
+
+
+def _witnessed(args, plan, spends, address, servers):
+    """`spends` as the reconciliation may act on them: the current plan's
+    own transaction, while its signed bytes are KEPT (the network has not
+    been shown to hold it), stays listed only on the word of a server that
+    can be its witness -- the rule the send's own `seen` keeps: never a
+    server that answered a submit with a txid not ours
+    (`broadcast_distrusted`), and not the one that accepted it while
+    another can be asked. Listed by one of those, the address is asked
+    once more, of the others. Not listed there, the listing is left out
+    ("dropped") and the run goes on as for a transaction that is not
+    listed -- the same bytes sent again, which cannot spend anything
+    twice. With nobody else to ask, a caught-out server's listing is
+    dropped too, and the acceptor's is kept but UNCONFIRMED: the bytes
+    stay kept and the plan is not marked seen -- a server that is down
+    for a while is not a lie, and failing every run until it is back
+    would say "failed" about a forward that may well have gone.
+    Returns (spends, "" | "dropped" | "unconfirmed").
+
+    THE REVIEW OF THE STAGE 3 READ: `seen` left the caught-out server out,
+    and the next run's history read took it -- the first server that
+    answered -- at its word. It listed the txid it had been handed, the
+    kept bytes were dropped as proven, and the forward sat "listed" on
+    every run after about a transaction the network never had. Rests on
+    some other configured server being honest, which is all a second
+    opinion is; with none left to ask, the bytes stay kept."""
+    txid = str(plan.get("txid") or "").lower()
+    if not plan.get("tx_hex") or not txid:
+        return spends, ""
+    hit = next((x for x in spends if str(x.get("txid")).lower() == txid),
+               None)
+    if hit is None:
+        return spends, ""
+    distrust = _distrusted(None, plan)
+    acceptor = plan.get("broadcast_server")
+    by = hit.get("server")
+    if by not in distrust and not (by == acceptor and len(servers) > 1):
+        return spends, ""
+    try:
+        sr = bcast_seen(txid, address, servers, args.tor_proxy,
+                        network=args.network, timeout=args.timeout,
+                        wait_s=0, interval_s=args.seen_interval,
+                        avoid=[acceptor] if isinstance(acceptor, str)
+                        and acceptor else [],
+                        stop=shutdown_requested, distrust=distrust)
+    except watch.PinMismatch as e:
+        raise Refused("pin_mismatch", str(e))
+    except watch.BtcWatchError:
+        sr = {"seen": False, "asked": False}
+    if sr["seen"]:
+        hit["server"], hit["height"] = sr["server"], sr["height"]
+        return spends, ""
+    if not sr["asked"] and by not in distrust:
+        integrity_log("forward", "listed_unconfirmed")
+        print("  reconcile: our transaction is listed by the server that "
+              "accepted it, and no other server could be asked to confirm "
+              "it; the signed bytes stay kept.")
+        return spends, "unconfirmed"
+    integrity_log("forward", "listed_unwitnessed")
+    print("  reconcile: our transaction is listed only by a server that "
+          "cannot vouch for it (the one that accepted it, or one that "
+          "answered a transaction not ours), and "
+          + ("no other server lists it" if sr["asked"]
+             else "no other server could be asked")
+          + "; the signed bytes stay kept.")
+    return [x for x in spends if x is not hit], "dropped"
+
+
 def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     """What became of the forward the plan describes, and what to do
     (STAGE5_PLAN.md 3.1). Reads the address's spends (read-only) beside
@@ -2162,7 +2335,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # our forward's inputs neither unspent nor consumed -- the safe
     # history_inconsistent, on every run, for good.
     _chain0 = _chain_plans(args.outfile)
-    _keep = set()
+    _keep, _kept_f, _left_f = set(), set(), set()
     for _p0 in [plan] + _chain0:
         if _p0.get("txid"):
             _keep.add(str(_p0["txid"]).lower())
@@ -2175,12 +2348,28 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # "the seed has leaked" -- on every run until it left the window.
         _rk0 = _p0.get("returned_kept")
         _rl0 = _p0.get("returned_leftover")
-        for _t0, _v0 in (_pairs((_rk0 or {}).get("outpoints")
-                                if isinstance(_rk0, dict) else None)
-                         | _pairs((_rl0 or {}).get("outpoints")
-                                  if isinstance(_rl0, dict) else None)
-                         | _pairs(_p0.get("returned_moved"))):
-            _keep.add(str(_t0).lower())
+        _kept_f |= {str(_t0).lower() for _t0, _v0 in (
+            _pairs((_rk0 or {}).get("outpoints")
+                   if isinstance(_rk0, dict) else None)
+            | _pairs(_p0.get("returned_moved")))}
+        _left_f |= {str(_t0).lower() for _t0, _v0 in _pairs(
+            (_rl0 or {}).get("outpoints") if isinstance(_rl0, dict)
+            else None)}
+    # ...AT MOST KEEP_EXTRA_MAX OF THOSE, kept and moved before leftover
+    # (the review of that fix). A `leftover` records whatever came back,
+    # and a stranger's flood of separate small payments -- each its own
+    # funding transaction -- put hundreds of txids on top of the window,
+    # past what the read's budget allows: history_unavailable on every run
+    # for good, the jam MAX_HISTORY's window exists to close. The cap is
+    # public and rests on nothing secret; it bounds the read. Past it, a
+    # hand move whose EVERY input was funded off the window reads as a
+    # foreign spend -- FAILED, nothing signed -- until that move leaves
+    # the window itself; one with any input funded inside it still reads
+    # as the operator's hand.
+    _extra = [t for t in sorted(_kept_f) if t not in _keep]
+    _extra += [t for t in sorted(_left_f)
+               if t not in _keep and t not in _kept_f]
+    _keep |= set(_extra[:KEEP_EXTRA_MAX])
     try:
         _res = bcast_spends(address, servers, args.tor_proxy,
                             network=args.network, timeout=args.timeout,
@@ -2198,6 +2387,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # alone -- the stage-5 shape -- is taken as knowing of no memo.
     spends, paid = (_res if isinstance(_res, tuple) and len(_res) == 2
                     else (_res, []))
+    spends, _witness = _witnessed(args, plan, spends, address, servers)
     chain = _chain0
     ours = {str(p.get("txid") or "").lower() for p in chain
             if p.get("txid")}
@@ -2438,6 +2628,15 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # only on the dust line being the pair's own. (A bump's `must` inputs
     # are not asked about here: they are marked after this returns, and
     # they are a listed forward's inputs, so in `consumed` already.)
+    # WHAT IT DOES NOT COVER (the review of this fix): at the stock floor of
+    # 1 the line is 138 sat, under the smallest output a node relays (294
+    # for P2WPKH), so there it filters only what a miner took off-policy. A
+    # stranger's RELAYABLE payment is over it, and is money that came back:
+    # `leftover` once the forward has mined, which is true of it -- it came
+    # back and nothing can carry it. The line is public and anyone can pay
+    # just over it; this is about what no forward of this pair can carry,
+    # not about who paid. At a floor of 3 (414 sat) it does filter
+    # relayable dust.
     _dust_floor = dust_line(int(args.feerate_floor))
     fresh = {k: u for k, u in unspent.items() if k not in consumed
              and int(u.get("value") or 0) > _dust_floor}
@@ -2465,8 +2664,7 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # fee, instead of a second forward beside a stuck one. The current
     # plan is the first candidate and the chain's predecessors the rest
     # (stuck_forward says why).
-    _est = (args.feerate_sat_vb if args.feerate_sat_vb
-            else picture.get("fee_sat_vb"))
+    _est = todays_rate(args, picture)
     # The window is DRAWN, never the flag's exact number (BUMP_WINDOW): a
     # replacement at a fixed offset after the transaction it replaces is
     # this host's signature on a pair of public transactions.
@@ -2524,20 +2722,29 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                                 args.op_return_max_bytes,
                                 args.min_send_sat):
             return None
+        # WHAT THE MARK NAMES IS WHAT A HAND MOVE TAKES: everything on the
+        # address that is not ours in flight (_kept_ex), DUST INCLUDED (the
+        # review of the dust fix). `outputs` leaves out what no forward can
+        # carry, and the mark named only those -- so the operator's wallet
+        # sweep, the documented remedy, spent a stranger's few hundred
+        # satoshis beside them, matched no kept outpoint, and read as "the
+        # seed has leaked" on every run after, the deposit never forwarded
+        # again. Anyone who knows the address can plant that dust.
+        _back = [unspent[o] for o in _kept_ex if o in unspent]
         plan["returned_kept"] = {
-            "outputs": len(outputs),
-            "sat": sum(int(u["value"]) for u in outputs),
+            "outputs": len(_back),
+            "sat": sum(int(u["value"]) for u in _back),
             "settled": bool(settled),
             "forwards_of_returned": _returned_n,
             # ...how many of them are VERIFIED ThorChain refunds; the
             # rest are payments, or claims nothing rests on.
-            "refunds": sum(1 for u in outputs
+            "refunds": sum(1 for u in _back
                            if (str(u.get("tx_hash") or "").lower(),
                                int(u.get("vout") or 0)) in _refund_ops),
             # ...and WHICH, so a later spend of exactly these reads as the
             # operator's hand (kept_moved) and not a leaked seed.
             "outpoints": [[str(u.get("tx_hash") or "").lower(),
-                           int(u.get("vout") or 0)] for u in outputs]}
+                           int(u.get("vout") or 0)] for u in _back]}
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         write_plan(args.outfile, plan)
         integrity_log("forward", "returned_kept")
@@ -2605,14 +2812,17 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
 
     if txid in listed:
         hit = listed[txid]
-        plan["seen"] = True
-        plan["seen_height"] = hit["height"]
-        plan["seen_server"] = hit.get("server")
-        plan["seen_asked"] = True
-        if plan.get("broadcast_outcome") != bcast.OUTCOME_ACCEPTED:
-            plan["broadcast_outcome"] = bcast.OUTCOME_ACCEPTED
-        plan["broadcast"] = True
-        plan["tx_hex"], plan["tx_hex_reason"] = None, None
+        # ...UNCONFIRMED (_witnessed): listed by the acceptor alone, nobody
+        # else to ask. Acted on as listed, never taken as proof.
+        if _witness != "unconfirmed":
+            plan["seen"] = True
+            plan["seen_height"] = hit["height"]
+            plan["seen_server"] = hit.get("server")
+            plan["seen_asked"] = True
+            if plan.get("broadcast_outcome") != bcast.OUTCOME_ACCEPTED:
+                plan["broadcast_outcome"] = bcast.OUTCOME_ACCEPTED
+            plan["broadcast"] = True
+            plan["tx_hex"], plan["tx_hex_reason"] = None, None
         plan["reconciled_ts"] = int(time.time()) // 600 * 600
         # THE NETWORK HAS NAMED THIS TRANSACTION AS THE RECORD: a
         # superseded mark from an earlier run -- a lagging server that
@@ -2699,6 +2909,18 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         if _then is not None:
             return _then
         return "done", EXIT_OK
+    if _witness == "dropped":
+        # ...AND ITS INPUTS READ AS SPENT: only the unwitnessed listing
+        # accounts for that, and nobody who can vouch confirms it (one
+        # server, caught out at the submit). Not "the server contradicts
+        # itself": the operator needs to hear what would settle it.
+        integrity_log("forward", "unwitnessed_spent")
+        print("[!] reconcile: the plan's inputs read as spent, and the "
+              "only transaction that spends them is ours as listed by a "
+              "server that cannot vouch for it; no other server confirms "
+              "it. Nothing is signed. A server this forward can take the "
+              "word of (--electrum) settles it.")
+        raise SystemExit(EXIT_FAILED)
     integrity_log("forward", "history_inconsistent")
     print("[!] reconcile: the plan's inputs are neither unspent nor consumed "
           "by any transaction the server lists; the server's history and "
@@ -2731,10 +2953,21 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     except watch.BtcWatchError as e:
         raise Refused("bad_args", str(e))
     outcome = sub["outcome"]
+    if sub.get("stopped") and outcome not in bcast.MAYBE_MOVED:
+        # A STOP CUT THE LIST SHORT and nothing left: what the servers
+        # reached said is not the network's word (submit's `stopped`).
+        # Written as `rejected`, the plan's `accepted` became "never went
+        # out" and a fresh forward was quoted and signed under the stop.
+        # The plan is left as it was; the next run sends the same bytes.
+        integrity_log("forward", "stopped_during_send")
+        print(f"[!] a stop was asked while re-sending; nothing moved "
+              f"({sub['attempts']} of {len(servers)} server(s) tried)")
+        raise SystemExit(EXIT_FAILED)
     integrity_log("forward", f"broadcast_{outcome}")
     plan["resends"] = int(plan.get("resends") or 0) + 1
     plan["resend_outcome"] = outcome
     plan["reconciled_ts"] = int(time.time()) // 600 * 600
+    plan["broadcast_distrusted"] = _distrusted(sub, plan)
     if outcome == bcast.OUTCOME_UNREACHABLE:
         # NOTHING WAS SENT THIS TIME, so the earlier send's outcome stands:
         # this attempt is recorded beside it (resend_outcome), never over
@@ -2772,7 +3005,8 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
                             network=args.network, timeout=args.timeout,
                             wait_s=args.seen_wait,
                             interval_s=args.seen_interval,
-                            avoid=_vouchers_not(sub), stop=shutdown_requested)
+                            avoid=_vouchers_not(sub), stop=shutdown_requested,
+                            distrust=plan["broadcast_distrusted"])
     except watch.PinMismatch:
         seen_r = {"seen": False, "height": None, "server": None,
                   "cert_sha256": None, "polls": 0, "asked": False,
@@ -3200,25 +3434,12 @@ def main(argv=None):
                       f"nothing is settled at this address to {args.min_conf} "
                       "confirmations; ask again later")
 
-    # THORNODE'S INBOUND LIST, ONCE, BEFORE THE FEE (the stage 2 read): its
-    # BTC entry bounds the server's fee estimate (thorchain_fee_cap) and is
-    # what the aggregator's inbound is held to after the quote.
-    thor_entries = (fetch_inbound_entries(args.thornode, args.tor_proxy)
-                    if args.thornode else None)
-    _estimate = args.feerate_sat_vb or picture.get("fee_sat_vb")
-    _fcap = (thorchain_fee_cap(thor_entries, args.feerate_floor)
-             if not args.feerate_sat_vb else None)
-    if _fcap is not None and isinstance(_estimate, int) \
-            and not isinstance(_estimate, bool) and _estimate > _fcap:
-        integrity_log("forward", "fee_estimate_over_thorchain")
-        print(f"  [!] the server's fee estimate ({_estimate} sat/vB) is over "
-              f"{GAS_RATE_CAP_X}x ThorChain's own; paying {_fcap}")
-        _estimate = _fcap
-
     # 2. the fee, sized against the largest transaction the policy allows,
-    #    over the inputs worth spending at that rate
+    #    over the inputs worth spending at that rate -- TODAY'S RATE as this
+    #    run decided it (todays_rate), the same number the bump read.
     try:
-        rate = fee_band(_estimate, args.feerate_floor, args.feerate_ceiling)
+        rate = fee_band(todays_rate(args, picture), args.feerate_floor,
+                        args.feerate_ceiling)
         chosen, skipped_dust, unsettled, left_over = spendable(
             picture["utxos"], args.min_conf, rate, exclude,
             args.op_return_max_bytes, args.min_send_sat)
@@ -3354,9 +3575,9 @@ def main(argv=None):
     cross_checked, outbound_fee = False, None
     lock_tip = picture["tip"]
     if args.thornode:
-        dust, outbound_fee = cross_check_inbound(inbound, args.thornode,
-                                                 args.tor_proxy,
-                                                 entries=thor_entries)
+        dust, outbound_fee = cross_check_inbound(
+            inbound, args.thornode, args.tor_proxy,
+            entries=_thor_entries_or_refuse(args))
         cross_checked = True
         # ...AND ON THE HEIGHT nLockTime CARRIES (thornode_btc_height): the
         # lower of the look's tip and ThorChain's last observed block.
@@ -3448,6 +3669,20 @@ def main(argv=None):
         except watch.BtcWatchError as e:
             raise Refused("bad_args", str(e))
         outcome = sub["outcome"]
+        if sub.get("stopped") and outcome not in bcast.MAYBE_MOVED:
+            # A STOP CUT THE LIST SHORT and nothing left (submit's
+            # `stopped`): one relay-policy "no" and the stop read "every
+            # server that answered rejected it ... the server list needs
+            # one that relays it", with servers never tried; a stop before
+            # the first read "no Electrum server could be reached (0
+            # tried)". Neither is the network's word. Nothing was sent, as
+            # when the stop lands a moment earlier (stop_before_send).
+            integrity_log("forward", "stopped_during_send")
+            _cd = f"; codes {sub['codes']}" if sub["codes"] else ""
+            print(f"[!] a stop was asked while sending; nothing moved "
+                  f"({sub['attempts']} of {len(servers)} server(s) "
+                  f"tried{_cd})")
+            raise SystemExit(EXIT_FAILED)
         integrity_log("forward", f"broadcast_{outcome}")
         if sub.get("pin_mismatch"):
             integrity_log("forward", "send_pin_mismatch")
@@ -3478,7 +3713,8 @@ def main(argv=None):
                                 network=args.network, timeout=args.timeout,
                                 wait_s=args.seen_wait,
                                 interval_s=args.seen_interval,
-                                avoid=_vouchers_not(sub), stop=shutdown_requested)
+                                avoid=_vouchers_not(sub), stop=shutdown_requested,
+                                distrust=_distrusted(sub))
         except watch.PinMismatch:
             seen_r = {"seen": False, "height": None, "server": None,
                       "cert_sha256": None, "polls": 0, "asked": False,
@@ -3513,6 +3749,9 @@ def main(argv=None):
         "broadcast_codes": sub["codes"] if sub else [],
         "broadcast_attempts": sub["attempts"] if sub else 0,
         "broadcast_mismatched": sub["mismatched"] if sub else 0,
+        # WHO IS NO WITNESS FOR THIS FORWARD (_distrusted): read by the
+        # next run's reconciliation before it drops kept bytes.
+        "broadcast_distrusted": _distrusted(sub),
         "seen": bool(seen_r and seen_r["seen"]),
         "seen_height": seen_r["height"] if seen_r else None,
         "seen_server": seen_r["server"] if seen_r else None,

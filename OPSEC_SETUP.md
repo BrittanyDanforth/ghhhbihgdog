@@ -1739,6 +1739,30 @@ first two on the vault where they cannot be talked around from a phone:
   recreate both wallets with a large lookahead (`--subaddress-lookahead
   400:50` and up), pair with `--account-ceiling` ≈ 30 K plus what the wallet
   already holds, and rotate the wallet when it fills.
+  A deposit whose details never reached the chat (Telegram refused the
+  message twice) still holds its place on the vault. The pager remembers
+  it, in memory only, and names it in that chat's next deposit note
+  (`replaces`, wire 12). The vault then stops holding it on its youth
+  alone (`deposit_released` in the chain), so "/deposit again" is not
+  "full" for two days. This waives only the youth grace: a deposit with
+  money on its address, one whose forward ran within the grace, or one
+  whose wallet cannot be asked keeps its place, because a send that looked
+  failed may still have landed. A pager restart forgets the handle, and
+  the old two-day rule applies.
+  An intake deposit paid on the BTC side holds its place for the same two
+  days from the LATEST sign of that money, not from its admission: a
+  forward that sent (or reconciled one in flight), or one that answered
+  `delayed` or `returned`. After that the XMR subaddress decides, where
+  the swap's money sits until the mix takes it. It is never held for good
+  on the strength of a forward alone: that closed the intake permanently
+  once a withdrawal leg failed after moving the money. A fee spike that
+  outlasts the Pi's own retries lets the place go two days after the last
+  `delayed`, and a tap on the deposit takes it back.
+  A pager started without `--btc-electrum` says so in every deposit
+  request (`unwatched`, wire 12). A vault on the intake then refuses
+  before minting, quoting or taking a place (`intake_unwatched` in both
+  chains), and the chat hears that a deposit cannot be made there until
+  that end is set up. Restart the pager with `--btc-electrum`.
 - **Wakes.** A deposit, a check or two and a withdrawal is about four wakes
   per person per cycle against the vault's `--daily-wake-budget` (12). Size
   it at ~3 K. The Pi's own courtesy limits are shared by every chat too:

@@ -633,6 +633,10 @@ BUSY_ANSWER = ("no: busy right now with something that cannot be interrupted "
 #: capacity (phase "full", when this box's memory of the places was wrong)
 #: and this box's own refusal from memory are the same words.
 FULL_ANSWER = proto.PHASE_LINES["full"]
+#: ...AND SO IS "UNWATCHED": the vault's refusal of a deposit this end said
+#: it could not watch, and this end's own refusal to show one it was handed
+#: anyway, are one state and say one sentence (AGENTS.md rule 2).
+UNWATCHED_ANSWER = proto.PHASE_LINES["unwatched"]
 #: "Not settable here." IS THE STRING EXIT_ANSWER WAS FIXED FOR, left standing
 #: one line below the fix. That note says an answer naming no alternative
 #: "reads as a refusal to say rather than a fact about the design", and speed
@@ -3550,6 +3554,10 @@ class Pager:
             # A DEPOSIT IN FLIGHT HOLDS A PLACE. See inflight_owners.
             if job == "receive_and_quote":
                 self._hold_place(chat_id)
+                # ...AND THE ONE WHOSE DETAILS NEVER ARRIVED HAS BEEN
+                # ANSWERED FOR: this deposit's note carried it (start_job).
+                # Set again below if THIS one's details fail too.
+                self._undelivered().pop(chat_id, None)
             # THE LABEL THIS CHAT SEES. Built once, here, so every branch
             # below prints the same string the buttons carry and the operator
             # can type back. "----" is what a reply with no usable handle got
@@ -3865,16 +3873,20 @@ class Pager:
                 # address is shown: nothing is paid to an address this end
                 # would promise to watch and never look at, and whose button
                 # after a restart asks the swap side "nothing yet" for ever.
+                # THE SECOND SIDE OF THE BOUNDARY: this end now says
+                # `unwatched` in the request and the vault refuses before it
+                # issues anything, so reaching here means a vault that did
+                # not read the flag. Said in the vault's refusal's words --
+                # "Try again later" was the same refusal again, later. (The
+                # print is for a run by hand; the shipped unit discards it,
+                # and the chain carries the kind.)
                 if not self.btc_servers:
                     print("  [!] the vault issued a BTC deposit address of its "
                           "own and this pager has no --btc-electrum, so it "
                           "was NOT shown: restart with --btc-electrum "
                           "(OPSEC_SETUP.md).")
                     integrity_log("pager", "intake_unwatched")
-                    self.send(chat_id,
-                              f"{chat_name(job)}: this deposit could not be "
-                              f"set up here, so there is nothing to pay. "
-                              f"Nothing was spent. Try again later.",
+                    self.send(chat_id, UNWATCHED_ANSWER,
                               buttons=MENU_BUTTONS)
                     return
                 self._btc_register(h, plain.get("d", ""), chat_id)
@@ -3941,6 +3953,7 @@ class Pager:
                     return
                 integrity_log("pager", "pay_undelivered")
                 self._btc_forget(h)
+                self._mark_undelivered(chat_id, h, job)
                 self.send(chat_id,
                           f"{chat_name(job)}: the payment details did not "
                           f"get through, so there is nothing to pay yet. "
@@ -3970,6 +3983,7 @@ class Pager:
                     _ok = self.send(chat_id, _note)
                 if not _ok:
                     integrity_log("pager", "note_undelivered")
+                    self._mark_undelivered(chat_id, h, job)
                     self.send(chat_id,
                               f"{chat_name(job)}: the payment details did not "
                               f"get through, so there is nothing to pay yet. "
@@ -4087,6 +4101,7 @@ class Pager:
                           buttons=self._handle_buttons(h, job, chat_id))
             else:
                 integrity_log("pager", "slip_undelivered")
+                self._mark_undelivered(chat_id, h, job)
                 # NOT "/watch {h}". That was the first version of this line and
                 # it is wrong: watch waits for a payment to LAND on a bundle,
                 # so it cannot hand back a deposit address the operator never
@@ -4138,6 +4153,9 @@ class Pager:
             if _rphase == "full" and job == "receive_and_quote":
                 integrity_log("pager", "refused_full")
                 self.send(chat_id, FULL_ANSWER, buttons=MENU_BUTTONS)
+            elif _rphase == "unwatched" and job == "receive_and_quote":
+                integrity_log("pager", "intake_unwatched")
+                self.send(chat_id, UNWATCHED_ANSWER, buttons=MENU_BUTTONS)
             else:
                 self.send(chat_id,
                           f"{chat_name(job)}: refused before it started"
@@ -5146,6 +5164,22 @@ class Pager:
             self._chain_leg = int(leg)
             self.limits.record()
             integrity_log("pager", "poke")
+            # THE DEPOSIT WHOSE DETAILS NEVER REACHED THIS CHAT, if there is
+            # one: the vault stops holding its place on the youth rule
+            # (wire 12, `replaces`). Absent otherwise -- an older vault
+            # refuses the field, so it is carried only when it says something.
+            if job == "receive_and_quote":
+                _prev = self._undelivered_for(cid)
+                if _prev:
+                    params["replaces"] = _prev
+                # ...AND WHETHER THIS END CAN WATCH A DEPOSIT ADDRESS AT
+                # ALL (wire 12, `unwatched`): a vault on the intake refuses
+                # before it mints, quotes or takes a place. The card cannot
+                # tell this end whether the vault is on the intake (a card
+                # from before the pairing carried the floor), so it is said
+                # whenever it is true, and a vault off the intake ignores it.
+                if not self.btc_servers:
+                    params["unwatched"] = True
             # SAY HOW LONG, BECAUSE "A WHILE" IS NOT A NUMBER ANYONE CAN WAIT
             # OUT. This said "working. This takes a while." for every job, and
             # the jobs are not alike: a status probe is minutes and a
@@ -6964,6 +6998,32 @@ class Pager:
     #: Guards inflight_owners across the poll and worker threads. Re-entrant
     #: because _hold_place and _drop_place take it and then call _places().
     _PLACES_LOCK = threading.RLock()
+
+    def _undelivered(self) -> dict:
+        """chat id -> (handle, when): this chat's latest deposit whose
+        details never reached it. MEMORY ONLY, like the watch list: a handle
+        on the card beside a chat is a record of who asked. A restart forgets
+        it, and the vault then holds that deposit's place on the youth rule
+        as it always did."""
+        return self.__dict__.setdefault("undelivered_deposits", {})
+
+    def _mark_undelivered(self, cid: int, h: str, job: str) -> None:
+        """Remember that deposit `h`'s details did not reach chat `cid`, so
+        its next deposit tells the vault (start_job, `replaces`)."""
+        if job == "receive_and_quote" and isinstance(h, str) \
+                and proto.HANDLE_RE.match(h):
+            self._undelivered()[cid] = (h, time.time())
+
+    def _undelivered_for(self, cid: int):
+        """The handle to name in this chat's next deposit note, or None --
+        and none once the vault's own grace would have ended anyway."""
+        _u = self._undelivered().get(cid)
+        if not _u:
+            return None
+        if time.time() - float(_u[1]) >= proto.DEPOSIT_PLACE_TTL_S:
+            self._undelivered().pop(cid, None)
+            return None
+        return _u[0]
 
     def _hold_place(self, cid: int) -> None:
         """This chat's place is alive as of now (taken, or kept)."""

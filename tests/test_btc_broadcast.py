@@ -281,7 +281,8 @@ check("ACCEPTED: the server answered with our txid -- outcome accepted, the "
       "server named, one attempt, no codes, no mismatch",
       _r == {"outcome": "accepted", "server": "s1.onion", "cert_sha256": None,
              "codes": [], "attempts": 1, "mismatched": 0,
-             "mismatched_servers": [], "pin_mismatch": False})
+             "mismatched_servers": [], "pin_mismatch": False,
+             "stopped": False})
 check("...the session spoke server.version then the broadcast and NOTHING "
       "else, with the hex lower-cased as the one parameter",
       _ft.methods == ["server.version", "blockchain.transaction.broadcast"]
@@ -380,6 +381,25 @@ _r = _submit_stop(_f, _TWO, lambda: False)
 check("NON-VACUITY: a stop that is never raised changes nothing -- the "
       "second server is dialled and accepts",
       len(_f.seen["hosts"]) == 2 and _r["outcome"] == "accepted")
+# A LIST THE STOP CUT SHORT SAYS SO (the review of the stage 3 read): one
+# relay-policy "no" and the stop read `rejected` -- "every server that
+# answered" -- with the second server never tried.
+_f = _factory(_FT("reject", code=-26), _FT("accept"))
+_r = _submit_stop(_f, _TWO, lambda: bool(_f.seen["hosts"]))
+check("a stop after the first server's rejection, the second untried: the "
+      "result says `stopped`, so no caller reads the list's verdict into it",
+      len(_f.seen["hosts"]) == 1 and _r["outcome"] == "rejected"
+      and _r.get("stopped") is True)
+_f = _factory(_FT("accept"))
+_r = _submit_stop(_f, _SERVERS, lambda: True)
+check("...and a stop before the first dial: unreachable AND stopped",
+      _r["outcome"] == "unreachable" and _r.get("stopped") is True)
+_f = _factory(_FT("reject", code=-26), _FT("reject", code=-26))
+_r = _submit_stop(_f, _TWO, lambda: len(_f.seen["hosts"]) >= 2)
+check("NON-VACUITY: a stop raised only once EVERY server has answered cuts "
+      "nothing short -- `rejected` is the list's word, not stopped",
+      len(_f.seen["hosts"]) == 2 and _r["outcome"] == "rejected"
+      and _r.get("stopped") is False)
 _f = _factory(_FT("accept", pin_mismatch=True), _FT("accept"))
 try:
     B.submit(_HEX, _TXID, _A0, _TWO, _PROXY, transport_factory=_f)
@@ -657,6 +677,63 @@ check("...and with every server avoided nobody is asked, at once: not "
       "seen, not asked -- the caller keeps the bytes",
       _s["hosts"] == [] and _r["seen"] is False and _r["asked"] is False
       and _r["polls"] == 0)
+# A SERVER CAUGHT OUT IS NO WITNESS EVEN ALONE (the review of the stage 3
+# read): `avoid` gives way with one server configured, and a lone server
+# that had answered a txid not ours then vouched for our own.
+
+
+def _seen_d(*fts, **kw):
+    """_seen with `distrust`; a seen that takes none is a red check, not a
+    dead suite."""
+    try:
+        return _seen(*fts, **kw)
+    except TypeError:
+        return ({"seen": "(no distrust parameter)", "asked": None,
+                 "polls": None, "server": None},
+                {"hosts": ["(no distrust parameter)"]})
+
+
+_r, _s = _seen_d(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_SERVERS, wait_s=0, distrust=["s1.onion"])
+check("distrust= naming the ONE configured server: it is not asked -- not "
+      "seen, not asked, no poll, no connection",
+      _s["hosts"] == [] and _r["seen"] is False and _r["asked"] is False
+      and _r["polls"] == 0)
+_r, _s = _seen_d(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_SERVERS, wait_s=0, distrust=["elsewhere.onion"])
+check("NON-VACUITY: distrust= naming a server not configured changes "
+      "nothing -- the one server is asked and vouches",
+      _s["hosts"] == ["s1.onion"] and _r["seen"] is True)
+_r, _s = _seen_d(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_TWO, wait_s=0, avoid=_first, distrust=[_second])
+check("the acceptor avoided and the only other server distrusted: the "
+      "distrusted one is as though never configured, and the acceptor -- "
+      "the one server left -- is asked, never the liar",
+      _s["hosts"] == [_first] and _r["seen"] is True
+      and _r["server"] == _first)
+_r, _s = _seen_d(_FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               _FT(history=[{"tx_hash": _TXID, "height": 0}]),
+               servers=_S3x, wait_s=0, avoid=_o3[0], distrust=[_o3[1]])
+check("...while a third, trusted server is left, the acceptor still gives "
+      "way to it", _s["hosts"] == [_o3[2]])
+_seen_bad = {}
+for _nm, _kw in (("every server avoided", {"avoid": [_first, _second]}),
+                 ("every server distrusted", {"distrust": [_first,
+                                                           _second]})):
+    try:
+        B.seen(_TXID, _A0, _TWO, _PROXY, transport_factory=_never,
+               wait_s=-5, interval_s=0, **_kw)
+        _seen_bad[_nm] = "returned"
+    except W.BtcWatchError:
+        _seen_bad[_nm] = "refused"
+    except (TypeError, AssertionError) as _x:
+        _seen_bad[_nm] = type(_x).__name__
+check("a bad wait is refused whatever is left out -- it was accepted "
+      "whenever every server happened to be avoided",
+      _seen_bad == {"every server avoided": "refused",
+                    "every server distrusted": "refused"})
 # A HEIGHT NO TIP MAY HAVE IS NOT A HEIGHT (the stage 3 read): 10**30 read
 # as mined.
 _r, _ = _seen(_FT(history=[{"tx_hash": _TXID,

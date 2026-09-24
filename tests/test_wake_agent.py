@@ -5163,7 +5163,13 @@ _o, _e, _ran = _fwd_run({k: v for k, v in _FWD_REC.items()
                          if k != "btc_index"}, _FWD_KEY)
 check("...and so is one from before the field existed",
       _o is None and getattr(_e, "code", None) == "no_btc_deposit")
-_o, _e, _ran = _fwd_run({**_FWD_REC, "spent": True}, _FWD_KEY)
+# (A bundle that is THERE: a missing one on a paid-out intake record is the
+# rebuild's business -- stage5/legacy below -- and this fixture's path was
+# never a file, which the faked forwarder never asked about.)
+_spent_bundle = Path(tempfile.mkdtemp(prefix="spentb_")) / "wallet_s.json"
+_spent_bundle.write_text("{}")
+_o, _e, _ran = _fwd_run({**_FWD_REC, "spent": True,
+                         "bundle": str(_spent_bundle)}, _FWD_KEY)
 check("an INTAKE handle whose subaddress was paid out is NOT refused "
       "already_moved: paid out is the XMR side's word, and money can reach "
       "the host's own address after it (a partial swap's late refund, a "
@@ -5439,6 +5445,55 @@ check("...a returned deposit's second swap still SUMS with the first (no "
                          {**_NEW, "replaces": None},
                          chain=[_PLAN_Q]) is True
       and json.loads(_ppb.read_text())[0]["expected_xmr"] == "2.56")
+# EVERY SWAP COUNTS ONCE, WHICHEVER PLAN IS CURRENT (the review of stage 5):
+# the record counted only while it was the CURRENT plan's `superseded_by`,
+# so one more forward rotated that plan aside and the record -- the
+# original that mined after all, its own file saying broadcast False --
+# dropped out: the watcher called the deposit complete a swap early.
+_ppr = _pd / "thor_pairs_rot.json"
+
+
+def _pairs_x(plan, chain):
+    _ppr.write_text(json.dumps([{"dest_xmr": _XMR_SAMPLE, "btc_in": "0.05",
+                                 "expected_xmr": "1.5"}]))
+    A._reconcile_pairs({"slip": str(_ppr)}, plan, chain=chain)
+    return Decimal(json.loads(_ppr.read_text())[0]["expected_xmr"])
+
+
+def _pq(txid, quote, op, **kw):
+    return {"broadcast": True, "broadcast_outcome": "accepted",
+            "expected_xmr": quote, "dest_xmr": _XMR_SAMPLE,
+            "send_sat": 100000, "txid": txid * 32,
+            "inputs": [{"tx_hash": op * 32, "vout": 0}], **kw}
+
+
+_R1 = _pq("11", "0.49365", "a1", ts=100)
+_R2 = _pq("22", "0.36865", "a2", ts=200, broadcast=False,
+          broadcast_outcome="rejected")
+_R3 = _pq("33", "0.36738", "a2", ts=300, superseded_by="22" * 32)
+_R5 = _pq("55", "0.31865", "a3", ts=400)
+check("(the fixture) with the superseded plan CURRENT, the original that "
+      "mined counts: P1 + P2", _pairs_x(_R3, [_R2, _R1]) == Decimal("0.8623"))
+check("...and with one more forward current and that plan rotated aside, "
+      "the original STILL counts: P1 + P2 + P5, not P1 + P5",
+      _pairs_x(_R5, [_R3, _R2, _R1]) == Decimal("1.18095"))
+# ...THE FRESHER NAMER WINS where marks disagree: a rotated plan's mark can
+# be stale (it is never rewritten), the current plan's cannot.
+_X = _pq("77", "1.0", "b2", ts=100, superseded_by="88" * 32)
+_Y = _pq("88", "2.0", "b2", ts=200)
+_C = _pq("66", "0.5", "b2", ts=300, superseded_by="77" * 32)
+check("the current plan names X, a rotated X names Y over the same money: X "
+      "counts (the fresher word), Y does not, the current plan does not -- "
+      "even with Y the newer file", _pairs_x(_C, [_Y, _X]) == Decimal("1"))
+# ...AND THE STAND-IN GOES WITH THE PLAN THAT NAMED THE RECORD.
+_W = _pq("99", None, "c2", ts=150)
+_S3 = _pq("44", "0.37373", "c2", ts=250, superseded_by="99" * 32)
+check("a quote-less record's stand-in (the plan it superseded) still counts "
+      "once that plan is rotated aside: P1 + stand-in + P5",
+      _pairs_x(_R5, [_S3, _W, _R1]) == Decimal("1.18603"))
+check("NON-VACUITY: with the stand-in's own quote absent too, nothing "
+      "stands in", _pairs_x(_R5, [dict(_S3, expected_xmr=None), _W, _R1])
+      == Decimal("0.8123"))
 # A FORWARD THORCHAIN REFUNDED DOES NOT COUNT (third self-doubt pass): its
 # swap never happened, and expecting its output kept the watcher on
 # "partial" for ever. Only a VERIFIED refund (its money from ThorChain's
@@ -5910,6 +5965,37 @@ for _st, _ph in (("delayed", "delayed"), ("short", "short"),
           and (_bb.result or {}).get("status") == "done"
           and "forwarded" not in _rec_of(_dd)
           and not _rec_of(_dd).get("forward_sent"))
+
+
+# THE DEPOSIT'S PLACE RUNS FROM THE LATEST SIGN OF ITS MONEY (the review
+# of the stage 4 read): settled and held by today's fee, or come back to
+# be sent on, stamps the record; `seen`, `short` and `not_seen` do not --
+# a stranger's dust on an address in the chat says either of the first
+# two, and must not hold the intake's place.
+_bucket_now = int(time.time()) // 600 * 600
+for _st in ("delayed", "returned"):
+    _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _st)
+    _st_at = _rec_of(_dd).get("btc_money_at")
+    check(f"a forward answering '{_st}' stamps the record's money time (a "
+          "600 s bucket, now) -- its place is held from here",
+          isinstance(_st_at, int) and _st_at % 600 == 0
+          and _bucket_now - 600 <= _st_at <= _bucket_now + 600)
+for _st in ("seen", "short", "not_seen"):
+    _o, _e, _ran, _dd, _bb = _fwd_run_rc(_FWD_REC, _SEND_KEY, 2, _st)
+    check(f"NON-VACUITY: a forward answering '{_st}' stamps nothing",
+          (_bb.result or {}).get("status") == "done"
+          and "btc_money_at" not in _rec_of(_dd))
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(_FWD_REC, _SEND_KEY, _ACC)
+_sent_at = _rec_of(_dd).get("btc_money_at")
+check("a forward that SENT stamps it too, beside forward_sent",
+      _rec_of(_dd).get("forward_sent") is True and isinstance(_sent_at, int)
+      and _bucket_now - 600 <= _sent_at <= _bucket_now + 600)
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(
+    _FWD_REC, _FWD_KEY, {"broadcast": False, "broadcast_outcome": None})
+check("NON-VACUITY: a rehearsal (nothing sent) does not -- its first-run "
+      "`forwarded` bucket is what counts for it",
+      "btc_money_at" not in _rec_of(_dd)
+      and isinstance(_rec_of(_dd).get("forwarded"), int))
 
 
 def _fwd_run_both(rec, key_extra, rc, plan, state):
@@ -9107,6 +9193,94 @@ check("stage5/late: the ask about that address runs the forwarder's "
       "own XMR address, not bad_bundle",
       bool(_ranL5) and "--reconcile" in _ranL5[0]
       and _destL5 == [_XMR_SAMPLE])
+# ...AND A RECORD AN EARLIER BUILD ALREADY RETIRED (paid out before the
+# bundle was kept): the bundle is gone and only the plans and the pair
+# remain. Rebuilt only when the WALLET says it holds the plans' destination
+# at exactly that pair; refused, with nothing written or run, otherwise.
+def _legacy_run(wallet, plans=None, pair=(9, 4), bundle_exists=False):
+    dd, kk, bb = _fwd_env(_FWD_REC, _SEND_KEY)
+    _bp = dd / "wallet_recv_legacy.json"
+    if bundle_exists:
+        _bp.write_text(json.dumps({"schema": "gs_receive_wallet_v1",
+                                   "address": _XMR_SAMPLE,
+                                   "account_index": 9, "subaddress_index": 4,
+                                   "rpc_endpoint": "http://127.0.0.1:18083"}))
+    rec = {**_FWD_REC, "bundle": str(_bp), "spent": True,
+           "forward_sent": True, "slip": None}
+    if pair is not None:
+        rec["pair"] = list(pair)
+    (dd / A.HANDLES_FILE).write_text(json.dumps({"A3F1": rec}))
+    for _name, _pl in (plans or {"btc_forward_A3F1.json":
+                                 {**_ACC, "dest_xmr": _XMR_SAMPLE}}).items():
+        (dd / _name).write_text(json.dumps(_pl))
+    ran, dests, asked, kinds = [], [], [], []
+
+    def child(argv, env_extra, budget):
+        ran.append(list(argv))
+        try:
+            from gs_common import load_receive_bundle
+            dests.append(load_receive_bundle(
+                argv[argv.index("--dest-from-receive-wallet") + 1])["address"])
+        except Exception as _x:                              # noqa: BLE001
+            dests.append(f"refused: {type(_x).__name__}")
+        Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps(_ACC))
+        return 0, False
+
+    def _wai(key, addr):
+        asked.append(addr)
+        if isinstance(wallet, Exception):
+            raise wallet
+        return wallet
+    _o_wai, _o_il = getattr(A, "_wallet_address_index", None), A.integrity_log
+    A._wallet_address_index = _wai
+    dp = deps_for(dd, bb, extend_deadman=lambda s: True, run_child=child)
+    os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+    try:
+        A.integrity_log = lambda st, kind, *a, **k: kinds.append(kind)
+        try:
+            out, err, _t = run(kk, dp)
+        except Exception as e:                               # noqa: BLE001
+            out, err = None, e
+    finally:
+        A._wallet_address_index, A.integrity_log = _o_wai, _o_il
+        os.environ.pop("GS_BTC_SEED", None)
+    return out, err, ran, dests, asked, kinds, _bp
+
+
+_lo, _le, _lr, _ld, _la, _lk, _lb = _legacy_run((9, 4))
+check("stage5/legacy: a paid-out intake record with its bundle shredded by an "
+      "earlier build -- the wallet holds the plans' destination at the "
+      "recorded pair: the bundle is rebuilt, and the reconciliation runs "
+      "with that destination",
+      _le is None and _lr and "--reconcile" in _lr[0]
+      and _ld == [_XMR_SAMPLE] and _la == [_XMR_SAMPLE]
+      and "bundle_rebuilt" in _lk
+      and oct(os.stat(_lb).st_mode & 0o777) == "0o600")
+for _wal, _why, _kind in (((9, 5), "at another pair", "bundle_rebuild_mismatch"),
+                          (None, "not at all", "bundle_rebuild_mismatch"),
+                          (OSError("down"), "could not be asked",
+                           "bundle_rebuild_unconfirmed")):
+    _lo, _le, _lr, _ld, _la, _lk, _lb = _legacy_run(_wal)
+    check(f"stage5/legacy: the wallet holds that destination {_why}: refused "
+          f"bundle_unrecoverable, nothing written, nothing run, the chain "
+          f"says which",
+          getattr(_le, "code", None) == "bundle_unrecoverable"
+          and _lr == [] and not _lb.exists() and _kind in _lk)
+_lo, _le, _lr, _ld, _la, _lk, _lb = _legacy_run((9, 4), plans={
+    "btc_forward_A3F1.json": {**_ACC, "dest_xmr": _XMR_SAMPLE},
+    "btc_forward_A3F1.1.json": {**_ACC, "dest_xmr": "4" + "B" * 94}})
+check("stage5/legacy: plans that name two destinations: refused before the "
+      "wallet is even asked", getattr(_le, "code", None)
+      == "bundle_unrecoverable" and _la == [] and _lr == [])
+_lo, _le, _lr, _ld, _la, _lk, _lb = _legacy_run((9, 4), pair=None)
+check("stage5/legacy: no pair on the record: refused, nothing written",
+      getattr(_le, "code", None) == "bundle_unrecoverable"
+      and not _lb.exists() and _lr == [])
+_lo, _le, _lr, _ld, _la, _lk, _lb = _legacy_run(OSError("never asked"),
+                                                bundle_exists=True)
+check("stage5/legacy: NON-VACUITY -- a record whose bundle is there is not "
+      "rebuilt: the wallet is not asked and the run goes as it did",
+      _le is None and _lr and _la == [] and "bundle_rebuilt" not in _lk)
 # NON-VACUITY: a record quoted for the client to pay ThorChain directly
 # (no btc_index) has no chain to reconcile, and its bundle still goes.
 _nb5 = _ld5 / "wallet_nb5.json"

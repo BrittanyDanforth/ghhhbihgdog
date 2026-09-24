@@ -322,6 +322,12 @@ for flag in ("--job", "--amount", "--count", "--handle", "--param"):
           f"/proc/<pid>/cmdline, which is mode 0444",
           flag not in help_text)
 for raw, why in (('{"job":"receive_and_quote","amount_sat":5000000}', None),
+                 ('{"job":"receive_and_quote","amount_sat":5000000,'
+                  '"replaces":"B4A1"}', None),
+                 ('{"job":"receive_and_quote","amount_sat":5000000,'
+                  '"replaces":"b4a1"}', "a replaces that is not a handle"),
+                 ('{"job":"watch","handle":"B4A1","replaces":"C5D6"}',
+                  "an optional field on a job that has none"),
                  ('{"job":"run_pipeline"}', "a spending job"),
                  ('{"job":"GhostSpiral"}', "the mix itself"),
                  ('{"job":"receive_new","count":9}', "an out-of-range count"),

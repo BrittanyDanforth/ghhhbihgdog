@@ -1740,7 +1740,7 @@ def _sent_strings(tree):
     # has no string constant for the send-argument walk above to find.
     for name in ("HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
                  "BUSY_ANSWER", "BUSY_ANSWER_MINE", "FULL_ANSWER",
-                 "EVENT_LINES"):
+                 "UNWATCHED_ANSWER", "EVENT_LINES"):
         for n in tree.body:
             if isinstance(n, _ast.Assign) and getattr(
                     n.targets[0], "id", "") == name:
@@ -1843,11 +1843,13 @@ _RUNTIME_SENDS = {"slip", "_msg", "memo", "text"}
 # _busy_answer(cid) is a composed reply like the questions above: it returns
 # one of two module constants (BUSY_ANSWER_MINE for the chat whose job runs,
 # BUSY_ANSWER for anyone else), both walked by the constant scan. FULL_ANSWER
-# is the new capacity refusal, a constant sent directly like BUSY_ANSWER.
+# is the new capacity refusal, a constant sent directly like BUSY_ANSWER;
+# UNWATCHED_ANSWER the same, and like FULL_ANSWER it is a PHASE_LINES entry,
+# which the proto scan below reads.
 _COVERED_SENDS = ({"self." + n + "()" for n, _t in _COMPOSED if n[0] == "_"}
                   | {"welcome_text(self.burn_after, self.key)"}
                   | {"HELP", "FEE_ANSWER", "SPEED_ANSWER", "EXIT_ANSWER",
-                     "BUSY_ANSWER", "FULL_ANSWER"}
+                     "BUSY_ANSWER", "FULL_ANSWER", "UNWATCHED_ANSWER"}
                   | {"self._busy_answer(cid)", "self._busy_answer(chat_id)"}
                   # The working line is composed (scanned via _COMPOSED above);
                   # the note is a runtime value off the quote, sent alone.

@@ -1248,6 +1248,60 @@ check("`leftover` is a phase word the doorbell knows, with its own sentence: "
 check("...and WIRE_VERSION was bumped for it: an old Pi reads the word as "
       "unknown and says UPDATE BOTH BOXES", P.WIRE_VERSION >= 11)
 
+# THE ONE OPTIONAL FIELD (wire 12): a deposit may name the chat's previous
+# deposit whose details never reached it. Carried only then, so an older
+# vault refuses it loud, an older pager never sends it; nothing else may be
+# absent, and nothing unknown may be present.
+def _rq(extra):
+    b = {"job_id": P.new_job_id(), "challenge": P.new_challenge().hex(),
+         "job": "receive_and_quote", "amount_sat": 5000000,
+         "owner": "0123456789abcdef"}
+    b.update(extra)
+    try:
+        return P.validate_job(b)[2]
+    except P.WakeError as e:
+        return e
+
+
+check("a deposit note may carry `replaces` (a handle), and it comes back "
+      "typed", _rq({"replaces": "B4A1"}) == {
+          "amount_sat": 5000000, "owner": "0123456789abcdef",
+          "replaces": "B4A1"})
+check("...and may leave it out: nothing is invented for it",
+      _rq({}) == {"amount_sat": 5000000, "owner": "0123456789abcdef"})
+check("...a `replaces` that is not a handle is refused, not dropped",
+      all(isinstance(_rq({"replaces": v}), P.WakeError)
+          for v in ("b4a1", "", "B4A1X", 1, None)))
+check("...and the optional set is not a door for other keys: an unknown one "
+      "beside it is still refused",
+      isinstance(_rq({"replaces": "B4A1", "extra": 1}), P.WakeError))
+def _watch_with_replaces():
+    try:
+        P.validate_job({"job_id": P.new_job_id(),
+                        "challenge": P.new_challenge().hex(),
+                        "job": "watch", "handle": "B4A1",
+                        "owner": "0123456789abcdef", "replaces": "C5D6"})
+        return "accepted"
+    except P.WakeError:
+        return "refused"
+
+
+check("...nor for other jobs: a watch note carrying it is refused",
+      _watch_with_replaces() == "refused")
+check("...and WIRE_VERSION was bumped for it", P.WIRE_VERSION >= 12)
+check("a deposit note may carry `unwatched: true` (the asking end has no BTC "
+      "servers), and it comes back typed",
+      _rq({"unwatched": True}) == {"amount_sat": 5000000,
+                                   "owner": "0123456789abcdef",
+                                   "unwatched": True})
+check("...and only exactly true: 1, \"true\" and false are refused, never "
+      "coerced (an absent key is the no)",
+      all(isinstance(_rq({"unwatched": v}), P.WakeError)
+          for v in (1, "true", False, None, 0)))
+check("...and `unwatched` is a phase word the Pi knows, with its own line",
+      P.phase_is_known("unwatched") and "unwatched" in P.PHASE_LINES
+      and not any(ch.isdigit() for ch in P.PHASE_LINES["unwatched"]))
+
 # LAST LINE BEFORE THE RESULT. fail_loudly_on_crash disarms itself when this
 # is called, so a check BELOW it that DIES prints no RESULT line -- which the
 # sweep scores NO-RESULT and its own header says "proves nothing". The call

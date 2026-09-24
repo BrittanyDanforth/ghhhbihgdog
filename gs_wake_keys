@@ -421,7 +421,9 @@ def build_cli() -> argparse.ArgumentParser:
                    help="the lowest fee rate a forward will pay (default 1)")
     p.add_argument("--feerate-ceiling-sat-vb", type=int, default=200,
                    help="the highest fee rate a forward will pay; a server "
-                        "estimate above it is refused, not clamped "
+                        "estimate above it is refused, not clamped -- unless "
+                        "the pair's THORNode says ThorChain's own rate is "
+                        "within it, when the estimate is bounded by that "
                         "(default 200)")
     p.add_argument("--max-affiliate-bps", type=int, default=0,
                    help="the largest affiliate fee (basis points) a quoted "

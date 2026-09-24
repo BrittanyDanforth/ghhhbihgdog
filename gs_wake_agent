@@ -3093,12 +3093,26 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
     Returns whether the file was rewritten. Never raises."""
     try:
         path = rec.get("slip")
-        # THE RECORD: the forward of ours the reconciliation found listed
-        # spending the current plan's inputs, when it marked the current
-        # plan superseded. That one counts even if its own (older) file
-        # says it was superseded in turn -- a rotated plan is never
-        # rewritten, so its mark can be stale; the current plan's is not.
-        _record = str(plan.get("superseded_by") or "").lower()
+        # THE RECORDS: a forward of ours the reconciliation found listed
+        # spending a plan's inputs, when it marked that plan superseded.
+        # One counts even if its own (older) file says it was superseded in
+        # turn -- a rotated plan is never rewritten, so its mark can be
+        # stale -- and where two marks disagree the FRESHER NAMER wins: the
+        # current plan's, then the newest rotated one's (the chain comes
+        # newest first). ANY PLAN'S MARK NAMES ONE, not the current plan's
+        # alone (the review of "every swap counts once"): a rejected
+        # re-send, its fresh forward superseded by the original that mined
+        # after all, then one more forward of money that came back -- the
+        # superseded plan rotated aside with its mark, and the original,
+        # whose own file says broadcast False, dropped out of the sum. The
+        # watcher then called the deposit complete a whole swap early.
+        _named = {}
+        for _pos, _np in enumerate([plan] + list(chain or ())):
+            if not isinstance(_np, dict):
+                continue
+            _r = str(_np.get("superseded_by") or "").lower()
+            if _r and _r not in _named:
+                _named[_r] = (_pos, _np)
         # A FORWARD THORCHAIN REFUNDED DOES NOT COUNT (third self-doubt
         # pass): its swap did not happen, and expecting its output kept
         # the watcher on "partial" for ever about a deposit whose
@@ -3202,8 +3216,7 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
             return _s - _b, _e2
 
         def _is_record(p):
-            return bool(_record) and str(p.get("txid") or "").lower() \
-                == _record
+            return str(p.get("txid") or "").lower() in _named
 
         def _counts(p):
             # THE RECORD COUNTS WHATEVER ITS OWN FILE SAYS OF ITS SEND: the
@@ -3230,15 +3243,29 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
         # superseded; and the swap counted neither way -- the watcher said
         # "complete" a swap early. Not when the record was refunded in full:
         # then that swap did not happen, and neither counts.
-        if _record and not any(_is_record(p) for p in counted) \
-                and _record not in _refunded \
-                and not any(_is_record(p) and p.get("expected_xmr")
-                            not in (None, "")
-                            for p in [plan] + list(chain or ())
-                            if isinstance(p, dict)) \
-                and plan.get("expected_xmr") not in (None, "") \
-                and str(plan.get("superseded_by") or "").lower() == _record:
-            counted.append(plan)
+        # ...THE PLAN THAT NAMED IT, whether it is current or rotated aside
+        # since (the same review: the stand-in went with the next forward).
+        # A rotated namer stands in only for a record the chain HOLDS
+        # without a quote: marks are made only for forwards of ours, each
+        # filed as a plan, so a rotated mark naming one the chain does not
+        # hold is not a swap this can vouch for. The current plan's may
+        # name one whose plan could not be written this run.
+        _held = {str(p.get("txid") or "").lower()
+                 for p in [plan] + list(chain or ()) if isinstance(p, dict)}
+        for _r, (_pos, _stand) in _named.items():
+            if (_pos != 0 and _r not in _held) \
+                    or any(str(p.get("txid") or "").lower() == _r
+                           for p in counted) \
+                    or _r in _refunded \
+                    or any(str(p.get("txid") or "").lower() == _r
+                           and p.get("expected_xmr") not in (None, "")
+                           for p in [plan] + list(chain or ())
+                           if isinstance(p, dict)) \
+                    or _stand.get("expected_xmr") in (None, "") \
+                    or _stand.get("dest_xmr") != plan.get("dest_xmr") \
+                    or any(p is _stand for p in counted):
+                continue
+            counted.append(_stand)
         # A REPLACED PLAN AND ITS REPLACEMENT ARE ONE SWAP (stage 6). A
         # bump spends the same outpoints again at today's rate, and the
         # new plan names the old in `replaces`; counting both would tell
@@ -3265,7 +3292,9 @@ def _reconcile_pairs(rec: dict, plan: dict, chain=()) -> bool:
 
         def _rank(p):
             _ts = p.get("ts")
-            return (str(p.get("txid") or "").lower() == _record,
+            _t = str(p.get("txid") or "").lower()
+            return (_t in _named,
+                    -_named[_t][0] if _t in _named else 0,
                     float(_ts) if isinstance(_ts, (int, float))
                     and not isinstance(_ts, bool) else 0.0)
         kept, spent = [], set()
@@ -4745,16 +4774,22 @@ def run_once(args, deps: dict = None) -> tuple:
         # started and did not finish, and the pager already renders it without
         # any promise about the money: "Some of it may already have moved ...
         # CHECK THE BALANCE before running it again."
-        # ONE REFUSAL CARRIES A WORD: "full" (at_capacity), because "wait,
+        # TWO REFUSALS CARRY A WORD: "full" (at_capacity), because "wait,
         # this frees up" is the one reason a person can act on and it names
-        # nothing about this wallet. Every other reason stays here.
+        # nothing about this wallet; and "unwatched" (intake_unwatched),
+        # because the fix is at the asking end and waiting is not it. Every
+        # other reason stays here.
         report_back(key, job_id, challenge.hex(),
                     "failed" if _CHILD_STARTED[0] else "refused", "",
-                    phase=("full" if isinstance(e, Refused)
-                           and e.code == "at_capacity"
+                    phase=(_REFUSAL_PHASE.get(e.code, "")
+                           if isinstance(e, Refused)
                            and not _CHILD_STARTED[0] else ""),
                     poster=d.get("post_record"), sleeper=d.get("sleep"))
         raise e
+
+
+#: The refusals the Pi is told a word about (proto.PHASES), and no other.
+_REFUSAL_PHASE = {"at_capacity": "full", "intake_unwatched": "unwatched"}
 
 
 def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
@@ -4809,6 +4844,26 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
                       f"budget. Refusing.")
 
     if job == "receive_and_quote":
+        # A DEPOSIT THE ASKING END CANNOT WATCH IS REFUSED HERE (wire 12),
+        # before anything is minted, quoted or counted: on the intake the
+        # client pays an address of this machine's that the Pi alone
+        # watches and says "received" about, and the Pi refused to show one
+        # only AFTER it had been issued -- the reserve's place then held for
+        # two days, and the next /deposit after the operator's fix was
+        # "full". Off the intake the flag changes nothing.
+        if params.get("unwatched") is True and btc_mode(key):
+            integrity_log("wake", "intake_unwatched")
+            raise Refused("intake_unwatched",
+                          "the pager that asked has no BTC servers to watch "
+                          "a deposit address with, and this pair issues one "
+                          "per deposit; nothing was minted or quoted. "
+                          "Restart it with --btc-electrum (OPSEC_SETUP.md).")
+        # THE CHAT'S PREVIOUS DEPOSIT NEVER REACHED IT (wire 12). Released
+        # before the gate reads the ledger, so "/deposit again" is not
+        # "full" for two days about details nobody was shown.
+        if params.get("replaces"):
+            _release_undelivered(artifact_dir, params["replaces"],
+                                 params.get("owner"))
         ceiling = int(key.get("account_ceiling", 45))
         n = _account_count(key, _accounts)
         if n is None:
@@ -5577,6 +5632,131 @@ def _subaddress_total(key: dict, acct: int, sub: int, injected=None):
         return None
 
 
+def _wallet_address_index(key: dict, address: str):
+    """(account, subaddress) at which this machine's wallet holds `address`,
+    or None when its answer names none; RAISES on any error. The wallet's own
+    answer (get_address_index), over rpc_primary. wallet-rpc answers a
+    FOREIGN address with an error too (see wallet_owned_fee_addresses), and
+    that error is not told apart from an unreachable wallet here: the one
+    caller refuses either way, in words true of both."""
+    from gs_common import connect_rpc
+    rpc = connect_rpc(key["rpc_primary"], proxy_url=key.get("tor_proxy", ""))
+    res = rpc.raw_request("get_address_index", {"address": address})
+    ix = (res or {}).get("index") if isinstance(res, dict) else None
+    if not isinstance(ix, dict):
+        return None
+    a, s = ix.get("major"), ix.get("minor")
+    if any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+           for v in (a, s)):
+        return None
+    return (a, s)
+
+
+def _rebuild_retired_bundle(key: dict, artifact_dir: Path, handle: str,
+                            rec: dict) -> str:
+    """The receive bundle of a paid-out intake record, written back where
+    the record names it, from what the vault still holds -- or a refusal
+    (`bundle_unrecoverable`), before anything runs.
+
+    WHERE THE DESTINATION COMES FROM, AND WHAT IT RESTS ON. The plan chain
+    names it (`dest_xmr`, every forward of this deposit, which _retire_files
+    keeps for an intake record) and the record kept the (account,
+    subaddress) pair when it was paid out. Neither is taken on its own
+    word: every plan must name the SAME destination, and the WALLET must say
+    it holds that address at exactly that pair (_wallet_address_index). A
+    swap's destination is where money goes, so this rests on the wallet,
+    the one party here that knows which addresses are this machine's -- not
+    on a file a damaged disk could have changed. A wallet that cannot be
+    asked, a pair it does not confirm, plans that disagree or name nothing,
+    or a record naming a path outside the artifact directory: refused, and
+    the operator can move the money by hand as before."""
+    _p = rec.get("pair")
+    pair = (tuple(int(v) for v in _p)
+            if isinstance(_p, list) and len(_p) == 2
+            and all(isinstance(v, int) and not isinstance(v, bool)
+                    and v >= 0 for v in _p) else None)
+    dests = set()
+    for _pl in [_read_json(artifact_dir / f"btc_forward_{handle}.json")] \
+            + _forward_chain(artifact_dir, handle):
+        if isinstance(_pl, dict) and _pl.get("dest_xmr"):
+            dests.add(str(_pl["dest_xmr"]))
+    try:
+        target = Path(str(rec.get("bundle")))
+        inside = target.resolve().parent == artifact_dir.resolve()
+    except (OSError, ValueError):
+        inside = False
+    if pair is None or len(dests) != 1 or not inside:
+        integrity_log("wake", "bundle_unrecoverable")
+        raise Refused("bundle_unrecoverable",
+                      f"handle {handle} was paid out by an earlier build that "
+                      "shredded its receive bundle, and what the vault kept "
+                      "cannot rebuild it (no single destination on its plans, "
+                      "no recorded pair, or a path outside the artifact "
+                      "directory). Nothing was run. Money that reached its "
+                      "BTC address since is the seed's to move by hand.")
+    dest = dests.pop()
+    try:
+        held = _wallet_address_index(key, dest)
+    except Exception:                                        # noqa: BLE001
+        held = "unasked"
+    if held != pair:
+        integrity_log("wake", "bundle_rebuild_unconfirmed"
+                      if held == "unasked" else "bundle_rebuild_mismatch")
+        raise Refused("bundle_unrecoverable",
+                      f"handle {handle}'s receive bundle must be rebuilt, and "
+                      "the wallet did not confirm it holds the destination "
+                      "its plans name at the pair this deposit was paid out "
+                      "from (it could not be asked, or it answered otherwise)."
+                      " Nothing was run and nothing was written; the chain "
+                      "line says which. Check the wallet at the machine.")
+    atomic_write_json({"schema": "gs_receive_wallet_v1",
+                       "address": dest,
+                       "account_index": pair[0],
+                       "subaddress_index": pair[1],
+                       "rpc_endpoint": key.get("rpc_primary", "")},
+                      target, perms=0o600)
+    integrity_log("wake", "bundle_rebuilt")
+    return str(target)
+
+
+def _release_undelivered(artifact_dir: Path, h: str, owner) -> bool:
+    """Mark handle `h` RELEASED: its details never reached the chat that
+    asked (the pager says so, wire 12's `replaces`), so it gives up the
+    youth grace that holds an unpaid deposit's place in the reserve
+    (_deposit_pending). Returns whether a record was marked. Never raises:
+    a deposit is not refused over the one before it.
+
+    ONLY THE ASKING OWNER'S OWN RECORD, and it rests on the pairing secret:
+    only the paired Pi can seal a note, and the owner token in it is the
+    one it derives from the asking chat. A record with no owner (from
+    before owners existed), another owner's, a paid-out one, or a handle
+    this ledger does not know is left alone.
+
+    NOT "NEVER PAID". A send the Pi saw fail may still have reached the
+    chat -- a reply lost after Telegram took the message -- and the client
+    may have paid. So the release waives only the grace an UNPAID deposit
+    gets for being young; the evidence still decides: money on its BTC
+    side within the grace (_paid_since), money on its address, or a wallet
+    that cannot be asked keeps the place as before. Nothing is shredded and the record stays: its label still
+    answers, and money that does arrive is still that client's."""
+    try:
+        led = _load_ledger(artifact_dir)
+        rec = (led.get("handles") or {}).get(h)
+        if not isinstance(rec, dict) or not owner \
+                or rec.get("owner") != owner or rec.get("spent") is True:
+            integrity_log("wake", "release_not_applied")
+            return False
+        if rec.get("released"):
+            return False
+        rec["released"] = int(time.time()) // 600 * 600
+        _save_handles(artifact_dir, led["handles"], led["owners"])
+        integrity_log("wake", "deposit_released")
+        return True
+    except Exception:                                        # noqa: BLE001
+        integrity_log("wake", "release_not_applied")
+        return False
+
+
 def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
     """Does this handle record still hold a place in the account reserve?
 
@@ -5617,25 +5797,48 @@ def _deposit_pending(rec: dict, key: dict, now: int, ask=None) -> bool:
     _adm = rec.get("admitted")
     if not isinstance(_adm, int) or isinstance(_adm, bool):
         _adm = 0
-    if int(now) - _adm < proto.DEPOSIT_PLACE_TTL_S:
+    # ...UNLESS ITS DETAILS NEVER REACHED THE CHAT (`released`, see
+    # _release_undelivered): then it is judged on the evidence at once,
+    # as an old one is.
+    if int(now) - _adm < proto.DEPOSIT_PLACE_TTL_S \
+            and not rec.get("released"):
         return True
-    # AN INTAKE DEPOSIT WHOSE FORWARD RAN WAS PAID (the stage 4 read). Its
-    # client paid the host's BTC address, not the XMR subaddress, and that
-    # stays empty until the forward's swap lands -- hours after the forward,
-    # or days while a fee spike holds it `delayed`. Asked about it alone,
-    # a paid deposit read as a ghost after DEPOSIT_PLACE_TTL_S and gave its
-    # place to the next client: two mixes to come against a reserve for
-    # one. A forward that ran (a rehearsal's `forwarded`, a send's
-    # `forward_sent`) found settled money there. One that has not run yet
-    # is asked about as before.
-    if rec.get("btc_index") is not None and (rec.get("forward_sent")
-                                             or rec.get("forwarded")):
+    # AN INTAKE DEPOSIT PAID ON THE BTC SIDE (the stage 4 read). Its client
+    # paid the host's BTC address, not the XMR subaddress, and that stays
+    # empty until the forward's swap lands -- hours after the forward, or
+    # days while a fee spike holds it `delayed`. Asked about it alone, a
+    # paid deposit read as a ghost after DEPOSIT_PLACE_TTL_S and gave its
+    # place to the next client: two mixes to come against a reserve for one.
+    # So the grace runs again from the LATEST SIGN OF THAT MONEY
+    # (_paid_since: a forward that sent or rehearsed, a `delayed` or
+    # `returned` answer), and after it the subaddress decides as for any
+    # deposit -- where the swap's XMR sits until the mix takes it.
+    # NOT "a forward ran, so for ever" (the review of that fix): the XMR
+    # that landed can leave without the record being marked spent -- a
+    # withdrawal leg that failed after the mix moved it, the owner's next
+    # leg spending from the mix accounts -- and the place was then held at
+    # any age, which at the stock ceiling is the intake closed for good.
+    _paid = _paid_since(rec)
+    if _paid is not None and int(now) - _paid < proto.DEPOSIT_PLACE_TTL_S:
         return True
     _pair = _bundle_pair(rec)
     if _pair is None:
         return True
     _total = (ask or _subaddress_total)(key, _pair[0], _pair[1])
     return _total != 0
+
+
+def _paid_since(rec: dict):
+    """The latest sign of money on an intake deposit's BTC side (a 600 s
+    bucket), or None: `btc_money_at` (every forward run that sent, found
+    its plan's money in flight, or answered `delayed` or `returned`) or,
+    for a record from before it, `forwarded` (the first forward's bucket).
+    None off the intake. Neither says an amount."""
+    if rec.get("btc_index") is None:
+        return None
+    _ts = [v for v in (rec.get("btc_money_at"), rec.get("forwarded"))
+           if isinstance(v, int) and not isinstance(v, bool) and v > 0]
+    return max(_ts) if _ts else None
 
 
 def _reusable_receive(key: dict, handles: dict, balance=None, owner=None):
@@ -6018,6 +6221,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
                           "the seed's still; this pair cannot find it. Nothing "
                           "was run. Re-pair with the account it was issued "
                           "on to forward it, or move it by hand.")
+        # A PAID-OUT INTAKE RECORD WHOSE BUNDLE AN EARLIER BUILD SHREDDED
+        # (the stage 5 read kept it from 2ead043 on; records paid out before
+        # that have none). The forwarder reads the swap's destination from
+        # it before anything else, so every later return to the host's
+        # address was refused bad_bundle for ever. Rebuilt here from what
+        # the vault still holds, and only if the WALLET agrees -- see
+        # _rebuild_retired_bundle.
+        if rec.get("spent") is True and not Path(str(bundle)).is_file():
+            bundle = _rebuild_retired_bundle(key, artifact_dir,
+                                             params["handle"], rec)
         # THE DEPOSIT'S OWN LABEL, not the fresh one drawn above: the plan
         # file is named for the deposit it forwards, and the reply names the
         # handle the operator asked about (as the watching jobs do).
@@ -6574,7 +6787,17 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         # rather than "the machine FAILED". Any other non-zero exit is a
         # failure as before: no status file, no word.
         if rc != 0 and job == "forward_to_swap" and not hard:
-            if _forward_status_word(artifact_dir, handle):
+            _fw = _forward_status_word(artifact_dir, handle)
+            if _fw:
+                # MONEY ON THE BTC SIDE WITH A SWAP STILL TO COME: settled
+                # and held by today's fee, or come back to be sent on. The
+                # deposit's place in the reserve runs from here again
+                # (_paid_since). Not `seen` or `short`: a stranger's dust on
+                # an address in the chat says either, and must not hold the
+                # intake's place.
+                if _fw in ("delayed", "returned") and handle in handles:
+                    handles[handle]["btc_money_at"] = \
+                        int(time.time()) // 600 * 600
                 continue
         if rc != 0:
             if hard:
@@ -6669,6 +6892,12 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
         handles[handle]["forward_sent"] = bool(
             handles[handle].get("forward_sent") or _reconcile
             or _forward_outcome(artifact_dir, handle)[0])
+        # ...AND THE MONEY IS IN FLIGHT AS OF NOW (_paid_since): a sending
+        # run, or a reconciliation of one, holds the deposit's place for a
+        # grace from here -- long enough for the swap to land on the
+        # subaddress, which then holds it -- and no longer.
+        if handles[handle]["forward_sent"]:
+            handles[handle]["btc_money_at"] = int(time.time()) // 600 * 600
         # THE PAIRS REWRITE READS THE PLAN THE FORWARD JUST WROTE. The
         # outpoints it spent were accumulated on the record too, as "the
         # ledger's copy, read by the pairs rewrite and by the operator" --

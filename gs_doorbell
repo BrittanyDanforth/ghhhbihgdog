@@ -1069,12 +1069,21 @@ def read_job_from_stdin(stream=None) -> tuple:
     spec = proto.JOBS[job]
     got = set(body) - {"job"}
     want = set(spec["schema"])
-    if got != want:
+    opt = set(spec.get("optional") or {})
+    if not (want <= got <= want | opt):
         raise Doorbell(
-            f"{job} takes exactly {sorted(want) or 'no parameters'}; got "
-            f"{sorted(got) or 'none'}.")
+            f"{job} takes exactly {sorted(want) or 'no parameters'}"
+            + (f" (and optionally {sorted(opt)})" if opt else "")
+            + f"; got {sorted(got) or 'none'}.")
     params = {}
     for k, check in spec["schema"].items():
+        try:
+            params[k] = check(body[k])
+        except proto.WakeError as e:
+            raise Doorbell(f"{job} parameter {k!r}: {e}") from None
+    for k, check in (spec.get("optional") or {}).items():
+        if k not in body:
+            continue
         try:
             params[k] = check(body[k])
         except proto.WakeError as e:

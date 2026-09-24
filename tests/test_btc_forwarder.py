@@ -1740,11 +1740,15 @@ check("...and the rebuilt plan carries the killed run's own quote, so the "
 _nv = Net(submit=dict(_ACCEPTED, mismatched=1,
                       mismatched_servers=["t.onion"]), seen=_SEEN0)
 _c, _o, _p, _ = run(_nv, broadcast=True)
-check("a sending run hands submit the shutdown flag, and seen the "
-      "accepting server AND the one that answered a foreign txid to avoid",
+check("a sending run hands submit the shutdown flag, seen the accepting "
+      "server to avoid, and the one that answered a foreign txid to "
+      "DISTRUST -- never asked even alone (the review of the stage 3 read)",
       _nv.submits and _nv.submits[0].get("stop") is F.shutdown_requested
-      and _nv.seens and _nv.seens[0].get("avoid") == ["s.onion", "t.onion"]
-      and "t.onion" not in json.dumps(_p or {}))
+      and _nv.seens and _nv.seens[0].get("avoid") == ["s.onion"]
+      and _nv.seens[0].get("distrust") == ["t.onion"])
+check("...and the plan names it, for the next run's reconciliation "
+      "(broadcast_distrusted)",
+      (_p or {}).get("broadcast_distrusted") == ["t.onion"])
 # A RECORD THAT CANNOT BE WRITTEN SENDS NOTHING.
 _real_awj = F.atomic_write_json
 
@@ -4879,6 +4883,77 @@ _c, _o, _p, _ = _reconcile(_nD2, _ofD2, "--returns-max", "0")
 check("NON-VACUITY: a return a forward could carry, at the bound: KEPT, as "
       "before", isinstance(json.load(open(_ofD2)).get("returned_kept"), dict)
       and _nD2.submits == [])
+# THE KEPT MARK NAMES WHAT A SWEEP TAKES, DUST INCLUDED (the review of the
+# dust fix): it named only the forwardable outputs, so the operator's
+# wallet sweep -- the documented remedy -- spent a stranger's dust beside
+# them and read as "the seed has leaked" on every run after.
+_HK = "d3" * 32
+_pK1, _ofK, _hxK1 = _first_send(seen=_SEEN0)
+_nK1 = Net(utxos=[{"tx_hash": _HD, "vout": 0, "value": 150000,
+                   "confirmations": 5},
+                  {"tx_hash": _HK, "vout": 0, "value": 100,
+                   "confirmations": 5}],
+           spends=[_listed(_pK1, _hxK1, height=0)], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nK1, _ofK, "--returns-max", "0")
+_mkK = json.load(open(_ofK)).get("returned_kept") or {}
+check("money kept at the bound beside a stranger's dust: the mark names "
+      "BOTH outpoints, and counts what it names",
+      sorted(map(tuple, _mkK.get("outpoints") or [])) == [(_HD, 0), (_HK, 0)]
+      and _mkK.get("outputs") == 2 and _mkK.get("sat") == 150100)
+_sweep = T.build_unsigned([{"tx_hash": _HD, "vout": 0, "value": 150000},
+                           {"tx_hash": _HK, "vout": 0, "value": 100}],
+                          [(149000, _IN_SPK)], locktime=850010)
+_sweepS = {"txid": _sweep.txid().hex(), "height": 850011,
+           "hex": _sweep.serialize().hex(),
+           "inputs": [{"tx_hash": _HD, "vout": 0, "value": 150000},
+                      {"tx_hash": _HK, "vout": 0, "value": 100}],
+           "server": "s.onion"}
+_nK2 = Net(utxos=[], spends=[_listed(_pK1, _hxK1), _sweepS], fee=10,
+           submit=_ACCEPTED, seen=_SEEN0)
+_cK2, _o, _p, _ = _reconcile(_nK2, _ofK, "--returns-max", "0")
+check("...and the operator's sweep of everything on the address is their "
+      "hand (kept_moved), never a foreign spend",
+      _cK2 == F.EXIT_OK and ("forward", "kept_moved") in _nK2.kinds
+      and ("forward", "foreign_spend") not in _nK2.kinds)
+# THE KEEP LIST RIDING ON THE HISTORY WINDOW IS BOUNDED (the review of the
+# leftover fix): a stranger's flood of separate payments, recorded as
+# leftover, put hundreds of txids on top of the window and jammed every
+# reconciliation for good.
+_pF1, _ofF, _hxF1 = _first_send()
+_pFx = json.load(open(_ofF))
+_pFx["returned_kept"] = {"outputs": 2, "sat": 2, "settled": True,
+                         "forwards_of_returned": 0, "refunds": 0,
+                         "outpoints": [["e1" * 32, 0], ["e2" * 32, 0]]}
+_pFx["returned_leftover"] = {"outpoints": [["%064x" % (0x1000 + _i), 0]
+                                           for _i in range(60)]}
+json.dump(_pFx, open(_ofF, "w"))
+_nF = Net(utxos=[], spends=[_listed(_pF1, _hxF1)], fee=10,
+          submit=_ACCEPTED, seen=_SEEN0)
+_reconcile(_nF, _ofF)
+_kF = set((_nF.spend_calls[0] if _nF.spend_calls else {}).get("keep_txids")
+          or ())
+_ownF = {_pF1["txid"]} | {str(i["tx_hash"]).lower()
+                          for i in _pF1["inputs"]}
+check("sixty leftover funding txids on the plan: the history read is asked "
+      "for our own and at most KEEP_EXTRA_MAX more, the kept ones first",
+      _ownF <= _kF and len(_kF - _ownF) == getattr(F, "KEEP_EXTRA_MAX", -1)
+      and {"e1" * 32, "e2" * 32} <= _kF)
+# A STRANGER'S RELAYABLE PAYMENT IS MONEY THAT CAME BACK, and says so (the
+# review of the dust fix: its claim covered only what no node relays). At
+# the stock floor the dust line is under the smallest output a node relays,
+# so 294 sat after the forward mined is `leftover` -- true: it came back
+# and nothing can carry it. At a floor of 3 the same 294 is under the line.
+for _dfl, _dwant in (("1", "leftover"), ("3", None)):
+    _pR1, _ofR, _hxR1 = _first_send()
+    _nR = Net(utxos=[{"tx_hash": _HD, "vout": 0, "value": 294,
+                      "confirmations": 5}],
+              spends=[_listed(_pR1, _hxR1)], fee=10, submit=_ACCEPTED,
+              seen=_SEEN0)
+    _reconcile(_nR, _ofR, "--feerate-floor", _dfl)
+    check(f"294 sat after the forward mined, floor {_dfl}: "
+          f"{_dwant or 'nothing'} (the line is the pair's own dust line)",
+          _status_of(_ofR) == _dwant and _nR.submits == [])
 # `leftover` MONEY MOVED BY HAND IS THE OPERATOR'S HAND, as a kept return
 # is: the client heard "it stays there. Check.", and the operator who moved
 # it was read as a leaked seed on every later run -- no refund or payment
@@ -4950,6 +5025,231 @@ check("a `leftover` whose record cannot be written still answers "
       _c9 == _cL1 == F.EXIT_REFUSED and _status_of(_ofL9) == "leftover"
       and ("forward", "leftover_unrecorded") in _nL9.kinds
       and "returned_leftover" not in json.load(open(_ofL9)))
+
+# ONE RATE A RUN, READ BY THE BUMP AND PAID BY THE FEE STEP (the review of
+# the fee cap): the bump read the server's raw estimate and the fee step
+# paid the cap, so a forward stuck at the cap was bumped one sat/vB a
+# window, for ever -- a fresh quote, a fresh signature, a same-outpoint RBF
+# pair on the chain each time.
+_nb0 = Net(fee=150, thornode=_GAS, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pb0, _ofb = run(_nb0, broadcast=True)
+_hxb = _nb0.submits[0]["raw_hex"] if _nb0.submits else ""
+_pb = json.load(open(_ofb))
+_pb["ts"] = int(time.time()) - 4 * 3600
+json.dump(_pb, open(_ofb, "w"))
+# In the mempool (height 0): a listed spend in a block is never bumped, and
+# this pair of checks read one there first, both passing without a bump
+# ever being possible.
+_nb1 = Net(utxos=[], spends=[_listed(_pb, _hxb, height=0)], fee=150,
+           thornode=_GAS, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pb1, _ = _reconcile(_nb1, _ofb, "--bump-after", "0")
+check("a forward paid at ThorChain's bound, the server still saying 150: "
+      "the reconciliation does NOT bump it -- today's rate is the same "
+      "bounded number the fee step paid",
+      _c == F.EXIT_OK and ("forward", "reconcile_bumped") not in _nb1.kinds
+      and _nb1.submits == [])
+_nb2 = Net(utxos=[], spends=[_listed(_pb, _hxb, height=0)], fee=150,
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pb2, _ = _reconcile(_nb2, _ofb, "--bump-after", "0")
+check("NON-VACUITY: with no ThorChain rate the same forward IS bumped to "
+      "the server's 150", ("forward", "reconcile_bumped") in _nb2.kinds
+      and (_pb2 or {}).get("feerate_target_sat_vb") == 150)
+# A BOUND OVER THE CEILING, WHILE THORCHAIN'S OWN RATE IS INSIDE IT, IS THE
+# CEILING: twice 150 is 300, over 200, and a server naming 5000 had the
+# forward `delayed` for as long as it led -- after "paying 300" was said.
+_GAS150 = [{**_GAS[0], "gas_rate": "150"}]
+_nc1 = Net(fee=5000, thornode=_GAS150, submit=_ACCEPTED, seen=_SEEN0,
+           utxos=[{"tx_hash": _H1, "vout": 0, "value": 20000000,
+                   "confirmations": 5}])
+_c, _o, _pc1, _ = run(_nc1, broadcast=True)
+check("ThorChain at 150 inside a 200 ceiling, a server naming 5000: the "
+      "forward pays the ceiling and signs -- no `delayed`, and nothing said "
+      "about paying a rate it then refused",
+      _c == 0 and (_pc1 or {}).get("feerate_target_sat_vb") == 200
+      and "paying" not in _o)
+_nc2 = Net(fee=5000, thornode=[{**_GAS[0], "gas_rate": "250"}],
+           submit=_ACCEPTED, seen=_SEEN0,
+           utxos=[{"tx_hash": _H1, "vout": 0, "value": 20000000,
+                   "confirmations": 5}])
+_c, _o, _pc2, _ofc2 = run(_nc2, broadcast=True)
+check("NON-VACUITY: ThorChain's own rate OVER the ceiling is the network "
+      "being there: refused fee_out_of_band, `delayed`",
+      ("forward", "refused:fee_out_of_band") in _nc2.kinds
+      and _status_of(_ofc2) == "delayed")
+# A THORNODE OUTAGE DOES NOT TAKE THE FEE STEP'S WORD (the review of the
+# fee cap): fetched before the fee and fatal, it turned `short` into a
+# wordless inbound_unverified and the Pi into stall retries.
+_nd1 = Net(utxos=[{"tx_hash": _H1, "vout": 0, "value": 12000,
+                   "confirmations": 5}], fee=10,
+           thornode=OSError("down"), submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pd1, _ofd1 = run(_nd1, "--feerate-floor", "10", broadcast=True)
+check("THORNode down, 12,000 sat settled at a floor of 10: the fee step's "
+      "own word (`short`) is written, as it was before THORNode was asked "
+      "for the fee -- and no inbound_unverified refusal is said or logged "
+      "about a run that never got to the cross-check",
+      _status_of(_ofd1) == "short"
+      and ("forward", "refused:fee_eats_deposit") in _nd1.kinds
+      and ("forward", "refused:inbound_unverified") not in _nd1.kinds
+      and "inbound_unverified" not in _o)
+_nd2 = Net(fee=10, thornode=OSError("down"), submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _pd2, _ = run(_nd2, broadcast=True)
+check("NON-VACUITY: THORNode down on a run that gets as far as the "
+      "cross-check is still refused inbound_unverified, nothing sent",
+      ("forward", "refused:inbound_unverified") in _nd2.kinds
+      and _nd2.submits == [])
+check("...and THORNode was asked ONCE: the fee step's failed read is the "
+      "cross-check's refusal, never a second ask that could answer",
+      len([g for g in _nd2.gets if "inbound_addresses" in str(g)]) == 1)
+# THE STOP AS PAIRED: 150 bps read "over the 2%" about a quote 1.8% off.
+_ns1 = Net(factor=Decimal("0.982"))
+_c, _o, _p, _k = _refusal(_ns1, "--max-slippage", "0.015")
+check("a quote 1.8% off against a stop of 1.5%: the refusal says 1.5%, not "
+      "a rounding of it", _k == "quote_deviates" and "over the 1.5%" in _o)
+
+# A STOP THAT CUT THE SUBMIT SHORT IS A STOP (the review of the stage 3
+# read): one relay-policy "no", the stop, and the run refused
+# broadcast_rejected -- "every server that answered ... the server list
+# needs one that relays it" -- with a server never tried.
+_SREJ = {**_REJECTED, "codes": [-26], "attempts": 1, "stopped": True}
+_nq1 = Net(submit=_SREJ, seen=_SEEN0)
+_c, _o, _pq1, _ = run(_nq1, "--electrum", "u.onion", broadcast=True)
+check("a stop after one server's rejection, another never tried: exit "
+      "FAILED as a stop, nothing moved, no plan -- NOT a refusal blaming "
+      "the server list",
+      _c == F.EXIT_FAILED and _pq1 is None
+      and ("forward", "stopped_during_send") in _nq1.kinds
+      and ("forward", "refused:broadcast_rejected") not in _nq1.kinds
+      and "a stop was asked while sending" in _o
+      and "1 of 2 server(s) tried" in _o and "relays it" not in _o)
+_nq1c = Net(submit={**_SREJ, "stopped": False}, seen=_SEEN0)
+_c, _o, _p, _ = run(_nq1c, "--electrum", "u.onion", broadcast=True)
+check("NON-VACUITY: the same rejection with no stop is the refusal it was",
+      ("forward", "refused:broadcast_rejected") in _nq1c.kinds
+      and ("forward", "stopped_during_send") not in _nq1c.kinds)
+_nq2 = Net(submit={**_UNREACHABLE, "attempts": 0, "stopped": True},
+           seen=_SEEN0)
+_c, _o, _pq2, _ = run(_nq2, broadcast=True)
+check("a stop before the first dial: a stop, not \"no Electrum server "
+      "could be reached (0 tried)\"",
+      _c == F.EXIT_FAILED and _pq2 is None
+      and ("forward", "stopped_during_send") in _nq2.kinds
+      and "could be reached" not in _o)
+_nq2a = Net(submit={**_AMBIGUOUS, "stopped": True}, seen=_NOT_ASKED)
+_c, _o, _pq2a, _ = run(_nq2a, broadcast=True)
+check("...but a stopped submit whose bytes LEFT is still `ambiguous`: the "
+      "plan is written and the bytes kept -- money that may have moved is "
+      "never reported as a stop",
+      _pq2a is not None and _pq2a["broadcast_outcome"] == "ambiguous"
+      and _pq2a["tx_hex"] and ("forward", "stopped_during_send")
+      not in _nq2a.kinds)
+# ...AND IN A RE-SEND: the plan's `accepted` was written over `rejected`,
+# and a fresh forward was quoted and signed under the stop.
+_pq3, _ofq3, _hxq3 = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_nq3 = Net(utxos=_UNSPENT0, spends=[], submit=[_SREJ, _ACCEPTED],
+           seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_nq3, _ofq3, "--electrum", "u.onion")
+_pq3b = json.load(open(_ofq3))
+check("a re-send the stop cut short after one rejection: the plan still "
+      "says accepted with the bytes kept, nothing quoted or signed after, "
+      "exit FAILED",
+      _c == F.EXIT_FAILED and len(_nq3.submits) == 1 and _nq3.posts == []
+      and _pq3b["broadcast_outcome"] == "accepted"
+      and _pq3b["broadcast"] is True and _pq3b["tx_hex"] == _hxq3
+      and len(F._plan_chain(_ofq3)) == 1
+      and ("forward", "stopped_during_send") in _nq3.kinds
+      and ("forward", "resend_rejected") not in _nq3.kinds)
+# A SERVER CAUGHT OUT IS NO WITNESS ON THE NEXT RUN EITHER (the review of
+# the stage 3 read): the reconciliation's history read took the first
+# server that answered -- the one that had answered a txid not ours --
+# and its listing dropped the kept bytes.
+_SUBX = {**_ACCEPTED, "mismatched": 1, "mismatched_servers": ["t.onion"]}
+
+
+def _liar_plan():
+    _pl, _ofl, _hxl = _first_send(submit=_SUBX, seen=_NOT_ASKED)
+    return _pl, _ofl, _hxl
+
+
+def _by(plan, hx, server):
+    return {**_listed(plan, hx, height=0), "server": server}
+
+
+_pw1, _ofw1, _hxw1 = _liar_plan()
+check("(the fixture) the first send kept its bytes and named the caught-out "
+      "server", _pw1["tx_hex"] == _hxw1
+      and _pw1.get("broadcast_distrusted") == ["t.onion"])
+_nw1 = Net(utxos=_UNSPENT0, spends=[_by(_pw1, _hxw1, "t.onion")],
+           submit=_ACCEPTED, seen=_NOT_SEEN)
+_c, _o, _p, _ = _reconcile(_nw1, _ofw1)
+check("listed ONLY by the server that answered a txid not ours, and a "
+      "trusted server does not list it: NOT taken as listed -- the kept "
+      "bytes are sent again, the same bytes, and stay kept",
+      _nw1.seens and _nw1.seens[0].get("distrust") == ["t.onion"]
+      and ("forward", "listed_unwitnessed") in _nw1.kinds
+      and ("forward", "reconciled_listed") not in _nw1.kinds
+      and len(_nw1.submits) == 1 and _nw1.submits[0]["raw_hex"] == _hxw1
+      and _p["tx_hex"] == _hxw1 and _p["seen"] is False)
+check("...and the re-send's own seen distrusts it too, from the plan",
+      len(_nw1.seens) == 2 and _nw1.seens[1].get("distrust") == ["t.onion"]
+      and _p.get("broadcast_distrusted") == ["t.onion"])
+_pw2, _ofw2, _hxw2 = _liar_plan()
+_nw2 = Net(utxos=_UNSPENT0, spends=[_by(_pw2, _hxw2, "t.onion")],
+           submit=_ACCEPTED, seen=_NOT_ASKED)
+_c, _o, _p, _ = _reconcile(_nw2, _ofw2)
+check("...and with nobody else to ask, the bytes stay kept too",
+      ("forward", "listed_unwitnessed") in _nw2.kinds
+      and _p["tx_hex"] == _hxw2 and _p["seen"] is False)
+_pw3, _ofw3, _hxw3 = _liar_plan()
+_nw3 = Net(utxos=[], spends=[_by(_pw3, _hxw3, "t.onion")],
+           submit=_ACCEPTED, seen={**_SEEN0, "server": "u.onion"})
+_c, _o, _p, _ = _reconcile(_nw3, _ofw3)
+check("NON-VACUITY: a trusted server confirms the listing: listed, the bytes "
+      "dropped, the witness recorded, nothing sent",
+      _c == F.EXIT_OK and ("forward", "reconciled_listed") in _nw3.kinds
+      and _p["tx_hex"] is None and _p["seen"] is True
+      and _p["seen_server"] == "u.onion" and _nw3.submits == [])
+_pw4, _ofw4, _hxw4 = _liar_plan()
+_nw4 = Net(utxos=[], spends=[_by(_pw4, _hxw4, "s.onion")],
+           submit=_ACCEPTED, seen=_NOT_SEEN)
+_c, _o, _p, _ = _reconcile(_nw4, _ofw4)
+check("NON-VACUITY: listed by a server that is no liar (the one server, "
+      "which accepted it): no second ask, listed as before",
+      _nw4.seens == [] and ("forward", "reconciled_listed") in _nw4.kinds
+      and _p["tx_hex"] is None)
+# THE ACCEPTOR, WITH ANOTHER SERVER CONFIGURED, IS NO WITNESS FOR ITSELF --
+# at the send (seen's avoid) and now at the reconciliation too.
+_nw5a = Net(submit=_ACCEPTED, seen=_NOT_ASKED)
+_c, _o, _pw5, _ofw5 = run(_nw5a, "--electrum", "u.onion", broadcast=True)
+_hxw5 = _nw5a.submits[0]["raw_hex"]
+_nw5 = Net(utxos=_UNSPENT0, spends=[_by(_pw5, _hxw5, "s.onion")],
+           submit=_ACCEPTED, seen=_NOT_SEEN)
+_c, _o, _p, _ = _reconcile(_nw5, _ofw5, "--electrum", "u.onion")
+check("two servers, listed only by the one that accepted it and not by the "
+      "other: the bytes are sent again and kept",
+      _nw5.seens and _nw5.seens[0].get("avoid") == ["s.onion"]
+      and ("forward", "listed_unwitnessed") in _nw5.kinds
+      and _p["tx_hex"] == _hxw5)
+_nw7 = Net(utxos=[], spends=[_by(_pw5, _hxw5, "s.onion")],
+           submit=_ACCEPTED, seen=_NOT_ASKED)
+_c, _o, _p7, _ = _reconcile(_nw7, _ofw5, "--electrum", "u.onion")
+check("...listed only by the acceptor with the other server DOWN (nobody "
+      "else could be asked): acted on as listed -- nothing re-sent, not "
+      "FAILED -- but never taken as proof: the bytes stay kept, not seen",
+      _c == F.EXIT_OK and _nw7.submits == []
+      and ("forward", "listed_unconfirmed") in _nw7.kinds
+      and ("forward", "unwitnessed_spent") not in _nw7.kinds
+      and _p7["tx_hex"] == _hxw5 and _p7["seen"] is False)
+_pw6, _ofw6, _hxw6 = _liar_plan()
+_nw6 = Net(utxos=[], spends=[_by(_pw6, _hxw6, "t.onion")],
+           submit=_ACCEPTED, seen=_NOT_ASKED)
+_c, _o, _p6, _ = _reconcile(_nw6, _ofw6)
+check("its inputs read as spent and only the caught-out server lists what "
+      "spent them: FAILED, nothing signed, and said as that -- not \"the "
+      "server's history and unspent set contradict each other\"",
+      _c == F.EXIT_FAILED and _nw6.submits == [] and _nw6.posts == []
+      and ("forward", "unwitnessed_spent") in _nw6.kinds
+      and ("forward", "history_inconsistent") not in _nw6.kinds
+      and json.load(open(_ofw6))["tx_hex"] == _hxw6)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

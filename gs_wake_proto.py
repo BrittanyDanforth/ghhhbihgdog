@@ -227,7 +227,20 @@ import time
 #: on. As with 5, 7, 8 and 9: no record changes shape, the closed
 #: vocabulary grows, an old Pi reads the word as unknown and says UPDATE
 #: BOTH BOXES. Update both boxes together.
-WIRE_VERSION = 11
+#:
+#: 12: receive_and_quote gains two OPTIONAL fields. `replaces` -- the
+#: handle of this chat's previous deposit whose details never reached the
+#: chat, so the vault stops holding its place in the reserve on the youth
+#: rule alone (the stage 4 read: "/deposit again" answered "full" for two
+#: days); sent only after such a failure. `unwatched` -- the asking pager
+#: has no BTC servers, so a vault on the intake refuses before it mints or
+#: takes a place, with one new phase word, `unwatched`; sent on EVERY
+#: deposit from a pager started without --btc-electrum. An old vault
+#: refuses a note carrying either (an unexpected key), loud and before
+#: anything runs -- for `unwatched`, at the first /deposit of a
+#: half-upgraded pair -- and an old Pi reads the new word as unknown. An
+#: old pager sends neither. Update both boxes together.
+WIRE_VERSION = 12
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -454,6 +467,11 @@ BTC_INDEX_GAP = 20
 #:              Pi's own soft cap says the same words from memory; this is
 #:              the vault saying them when the Pi's memory was wrong (a
 #:              restart forgot who holds a place).
+#:   unwatched  a deposit was refused because the asking pager cannot watch
+#:              the address this vault would issue for it (wire 12's
+#:              `unwatched`). ON A REFUSAL, before anything was minted or
+#:              quoted: the other refusal with words, because the fix is at
+#:              the Pi's end and "wait" is not it.
 #:   sent       a forward was handed to the Bitcoin network: a server took
 #:              it. ON A DONE FORWARD ONLY. Says nothing about depth.
 #:   unsure     a forward's bytes left and no server confirmed taking them:
@@ -473,7 +491,8 @@ BTC_INDEX_GAP = 20
 #:              operator. Says nothing about how much, or why it came back.
 PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck", "more_left",
           "more_locked", "moved", "partial", "full", "sent", "unsure",
-          "delayed", "returned", "forwarded", "kept", "leftover")
+          "delayed", "returned", "forwarded", "kept", "leftover",
+          "unwatched")
 
 #: HOW LONG AN UNPAID DEPOSIT HOLDS A PLACE, on both boxes. A deposit that
 #: reported done and was never paid would otherwise hold its place forever:
@@ -1021,6 +1040,13 @@ PHASE_LINES = {
     # else -- it never follows a label, because there is no deposit.
     "full": "no: this is full at the moment and cannot take another right "
             "now. Try again later — space frees up as things finish.",
+    # THE OTHER REFUSAL WITH WORDS (wire 12): a deposit this end could not
+    # watch. The vault's refusal of an `unwatched` deposit and the Pi's own
+    # refusal to show one it was handed anyway say it in these words, so
+    # the two cannot drift -- one said "Try again later", and later was
+    # the same refusal. Nothing about which end, which setting, or why.
+    "unwatched": "no: a deposit cannot be made here until this end is set "
+                 "up to watch it. Nothing was spent.",
 }
 
 
@@ -2538,6 +2564,17 @@ def _handle_field(v):
 
 _handle_field.spec = "handle ^[0-9A-F]{4}$"
 
+
+def _true_field(v):
+    """A flag that is carried only to say yes: exactly true, never 1, "1"
+    or false -- an absent key is the no."""
+    if v is not True:
+        raise WakeError("expected true")
+    return v
+
+
+_true_field.spec = "true"
+
 #: WHOSE JOB THIS IS, WITHOUT SAYING WHO. Sixteen hex characters: the first
 #: eight bytes of an HMAC the pager computes over its own chat id, under a key
 #: derived from the pairing secret (gs_telegram_pager.owner_token). The vault
@@ -3148,6 +3185,21 @@ JOBS = {
         "schema": {"amount_sat": _int_range(DEPOSIT_MIN_SAT,
                                             DEPOSIT_MAX_SAT),
                    "owner": _owner_field},
+        # THE OPTIONAL FIELDS ON THE WIRE (wire 12). `replaces`: the handle
+        # of this chat's previous deposit whose details never reached it.
+        # The pager sends it only then; without it, "/deposit again" met the
+        # old deposit's place in the reserve for two days -- "full", at the
+        # stock ceiling, where one deposit in flight IS the capacity.
+        # `unwatched`: the asking pager has no BTC servers to watch a
+        # deposit address with, so a vault on the intake refuses BEFORE it
+        # mints, quotes or takes a place (phase "unwatched"). It used to be
+        # refused at the Pi after the vault had issued it -- the address
+        # never shown, and the place held two days, so the next /deposit
+        # after the operator's fix was "full". OPTIONAL, not exact-set
+        # fields, so each is carried only when it has something to say: an
+        # older vault refuses a note carrying one (an unexpected key, loud,
+        # before anything runs), and an older pager never sends one.
+        "optional": {"replaces": _handle_field, "unwatched": _true_field},
         "tools": ("create_receive_wallet", "thor_swap_preparer"),
         "budget_s": 1800,
     },
@@ -3444,9 +3496,13 @@ def validate_job(body: dict) -> tuple:
     reserved = {"job", "job_id", "challenge", "state_half"}
     got = set(body) - reserved
     want = set(spec["schema"])
-    if got != want:
+    # A JOB'S OPTIONAL FIELDS (spec["optional"]) may be absent; nothing else
+    # may. Still no unknown key: an old agent refuses a field it does not
+    # know, which is what makes carrying one loud rather than ignored.
+    opt = set(spec.get("optional") or {})
+    if not (want <= got <= want | opt):
         missing = sorted(want - got)
-        extra = sorted(k for k in (got - want))
+        extra = sorted(k for k in (got - want - opt))
         bits = []
         if missing:
             bits.append(f"missing {missing}")
@@ -3457,6 +3513,13 @@ def validate_job(body: dict) -> tuple:
                         + ", ".join(bits))
     params = {}
     for k, check in spec["schema"].items():
+        try:
+            params[k] = check(body[k])
+        except WakeError as e:
+            raise WakeError(f"wake note field {k!r}: {e}") from None
+    for k, check in (spec.get("optional") or {}).items():
+        if k not in body:
+            continue
         try:
             params[k] = check(body[k])
         except WakeError as e:

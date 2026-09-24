@@ -432,7 +432,22 @@ def _env(ceiling=45, pending=0):
     return d, kf, bell
 
 
+def _note(job, body):
+    """The doorbell's pending wake for `body`, or a stand-in whose run is
+    a refusal: a doorbell that refuses the note's fields is a red check
+    below, not a dead suite."""
+    try:
+        return DB.Pending({"secret": PI.encode().hex(),
+                           "peer_public": TP.public_key.encode().hex()},
+                          job, body, clock=lambda: 0.0)
+    except Exception:                                        # noqa: BLE001
+        return types.SimpleNamespace(result=None, _unbuilt=True)
+
+
 def _run(kf, bell, d, n_accounts, **extra):
+    if getattr(bell, "_unbuilt", False):
+        return None, types.SimpleNamespace(code="(the doorbell refused the "
+                                                "note)")
     def post(url, path, rec, timeout=30):
         if path == "/window":
             return 200, bell.window
@@ -465,6 +480,10 @@ def _run(kf, bell, d, n_accounts, **extra):
                               deps), None
         except A.Refused as e:
             return None, e
+        except Exception as e:                               # noqa: BLE001
+            # A note the vault refuses to read (a field it does not know) is
+            # a red check below, not a dead suite.
+            return None, types.SimpleNamespace(code=type(e).__name__)
 
 
 _d1, _kf1, _b1 = _env(45, 0)
@@ -531,13 +550,40 @@ check("paid out, or never quoted, was never pending",
 # the host's BTC address, and the XMR subaddress this asks about stays
 # empty until the forward's swap lands. Past the TTL it gave its place away
 # while its mix was still to come.
-check("an INTAKE deposit whose forward ran keeps its place past the TTL, "
-      "its XMR address still empty (the swap has not landed)",
-      A._deposit_pending({**_ghost, "btc_index": 3, "forward_sent": True},
-                         {}, _now, ask=_zero) is True
+_recent = _now - 3600
+check("an INTAKE deposit whose forward went out within the grace keeps its "
+      "place past the admission TTL, its XMR address still empty (the swap "
+      "has not landed)",
+      A._deposit_pending({**_ghost, "btc_index": 3, "forward_sent": True,
+                          "btc_money_at": _recent}, {}, _now, ask=_zero)
+      is True
       and A._deposit_pending({**_ghost, "btc_index": 3,
-                              "forwarded": 1700000000},
+                              "forwarded": _recent},
                              {}, _now, ask=_zero) is True)
+check("...and so does one whose settled money a fee spike holds `delayed` "
+      "(its forward has not run, and answered delayed within the grace)",
+      A._deposit_pending({**_ghost, "btc_index": 3,
+                          "btc_money_at": _recent}, {}, _now, ask=_zero)
+      is True)
+# ...BUT NOT FOR EVER (the review of that fix): the XMR that landed can
+# leave without the record being marked spent -- a withdrawal leg that
+# failed after the mix moved it, then the owner's next leg -- and a place
+# held at any age is, at the stock ceiling, the intake closed for good.
+_month = _now + 30 * 86400
+check("a month after its forward, the subaddress empty: the place is let go "
+      "-- the money came and went; the grace does not run for ever",
+      A._deposit_pending({**_ghost, "btc_index": 3, "forward_sent": True,
+                          "btc_money_at": _recent, "forwarded": _recent},
+                         {}, _month, ask=_zero) is False)
+check("NON-VACUITY: the same month-old record with the swap's XMR still on "
+      "its subaddress (the mix to come) keeps its place",
+      A._deposit_pending({**_ghost, "btc_index": 3, "forward_sent": True,
+                          "btc_money_at": _recent, "forwarded": _recent},
+                         {}, _month, ask=_some) is True)
+check("...and a stamp on a record off the intake (no btc_index) changes "
+      "nothing: it is asked about as before",
+      A._deposit_pending({**_ghost, "btc_money_at": _recent}, {}, _now,
+                         ask=_zero) is False)
 check("NON-VACUITY: an intake deposit whose forward never ran is asked "
       "about as before -- nothing on it, past the TTL: no place",
       A._deposit_pending({**_ghost, "btc_index": 3}, {}, _now, ask=_zero)
@@ -589,6 +635,96 @@ _o9, _e9 = _run(_kf9, _b9, _d9, 4, subaddress_total=_some)
 check("NON-VACUITY: the same young record WITH its slip still refuses the "
       "next deposit at_capacity",
       _o9 is None and _e9 is not None and _e9.code == "at_capacity")
+# THE CHAT'S LAST DEPOSIT NEVER REACHED IT (wire 12, `replaces`; the stage
+# 4 read). "/deposit again" met that deposit's place for two days -- "full",
+# at the stock ceiling where one deposit in flight IS the capacity. The next
+# deposit's note names it, and the vault stops holding it on the youth rule
+# alone. The record here is YOUNG, so only the release can free it.
+
+
+def _env_rel(owner, replaces):
+    d, kf, _ = _env(45, 1)
+    led = A._load_ledger(d)
+    led["handles"]["E000"]["admitted"] = int(time.time()) // 600 * 600
+    A._save_handles(d, led["handles"], led["owners"])
+    body = {"amount_sat": 5000000, "owner": owner}
+    if replaces is not None:
+        body["replaces"] = replaces
+    return d, kf, _note("receive_and_quote", body)
+
+
+_dr1, _kr1, _br1 = _env_rel(OX, "E000")
+_or1, _er1 = _run(_kr1, _br1, _dr1, 4, subaddress_total=_zero)
+check("a deposit naming this chat's previous, undelivered deposit: that one "
+      "is released and the new one admitted at the stock ceiling",
+      _or1 is not None and _or1[1] == "done"
+      and A._load_ledger(_dr1)["handles"]["E000"].get("released"))
+_dr2, _kr2, _br2 = _env_rel(OX, None)
+_or2, _er2 = _run(_kr2, _br2, _dr2, 4, subaddress_total=_zero)
+check("NON-VACUITY: the same deposit WITHOUT the field is refused "
+      "at_capacity, as before", _or2 is None and _er2 is not None
+      and _er2.code == "at_capacity")
+_dr3, _kr3, _br3 = _env_rel(OY, "E000")
+_or3, _er3 = _run(_kr3, _br3, _dr3, 4, subaddress_total=_zero)
+check("ANOTHER owner naming it releases nothing: refused at_capacity, the "
+      "record untouched", _or3 is None and _er3.code == "at_capacity"
+      and not A._load_ledger(_dr3)["handles"]["E000"].get("released"))
+_dr4, _kr4, _br4 = _env_rel(OX, "E000")
+_or4, _er4 = _run(_kr4, _br4, _dr4, 4, subaddress_total=_some)
+check("RELEASED IS NOT 'NEVER PAID': with money on its address (a send the "
+      "Pi saw fail may still have landed) it keeps its place",
+      _or4 is None and _er4.code == "at_capacity")
+_dr5, _kr5, _br5 = _env_rel(OX, "ABCD")
+_or5, _er5 = _run(_kr5, _br5, _dr5, 4, subaddress_total=_zero)
+check("a handle this ledger does not know is not a refusal of the deposit "
+      "for itself: the gate decides as before (at_capacity here, E000 young)",
+      _or5 is None and _er5.code == "at_capacity")
+# A DEPOSIT THE ASKING END CANNOT WATCH (wire 12, `unwatched`): refused
+# on the intake BEFORE anything is minted, quoted or counted, with the word
+# the Pi renders. It was refused at the Pi only after the vault had issued
+# it, and its place was then held two days: the next /deposit after the
+# operator's fix was "full".
+_UZPUB = ("zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r"
+          "1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs")
+
+
+def _env_unw(btc, unwatched):
+    d, _kf, _ = _env(45, 0)
+    key = P.unlock_keyfile(json.loads(_kf.read_text()), b"")
+    if btc:
+        key.update({"btc_account_xpub": _UZPUB, "btc_electrum": ["s.onion"],
+                    "btc_network": "main", "deposit_in_chat": True})
+    os.chmod(_kf, 0o600)
+    _kf.write_text(json.dumps(P.lock_keyfile(key, b"", role="thinkpad")))
+    os.chmod(_kf, 0o400)
+    body = {"amount_sat": 5000000, "owner": OY}
+    if unwatched:
+        body["unwatched"] = True
+    return d, _kf, _note("receive_and_quote", body)
+
+
+_du1, _ku1, _bu1 = _env_unw(True, True)
+_minted_u1 = []
+_ou1, _eu1 = _run(_ku1, _bu1, _du1, 3,
+                  run_child=lambda argv, env, b: (_minted_u1.append(argv),
+                                                  (0, False))[1])
+check("an intake pair asked for a deposit by an end that cannot watch it: "
+      "refused intake_unwatched, NOTHING minted or quoted, no record, and "
+      "the Pi told the word 'unwatched'",
+      _ou1 is None and _eu1 is not None and _eu1.code == "intake_unwatched"
+      and _minted_u1 == [] and not A._load_ledger(_du1)["handles"]
+      and _bu1.result is not None
+      and _bu1.result.get("status") == "refused"
+      and _bu1.result.get("phase") == "unwatched")
+_du2, _ku2, _bu2 = _env_unw(False, True)
+_ou2, _eu2 = _run(_ku2, _bu2, _du2, 3)
+check("NON-VACUITY: off the intake the flag changes nothing -- the deposit "
+      "is admitted and quoted as before",
+      _ou2 is not None and _ou2[1] == "done")
+_du3, _ku3, _bu3 = _env_unw(True, False)
+_ou3, _eu3 = _run(_ku3, _bu3, _du3, 3)
+check("NON-VACUITY: on the intake WITHOUT the flag the deposit is not "
+      "refused for it", _eu3 is None or _eu3.code != "intake_unwatched")
 _d7, _kf7, _b7 = _env(45, 0)
 _o7, _e7 = _run(_kf7, _b7, _d7, None)
 check("...a refusal for any other reason carries none",
@@ -832,6 +968,19 @@ _drive(_rp, "withdraw", {"status": "refused", "handle": "", "slip": "",
 check("...and the word on any job but a deposit is not honoured",
       _rs and "refused before it started" in _rs[-1][1]
       and pg.FULL_ANSWER not in [t for _, t in _rs])
+_rs.clear()
+_drive(_rp, "receive_and_quote", {"status": "refused", "handle": "", "slip": "",
+                                  "plain": {}, "phase": "unwatched"})
+check("a deposit the vault refused as 'unwatched' is answered with that "
+      "sentence -- the same one this end says when it will not show an "
+      "address it was handed -- not the generic line",
+      _rs and _rs[-1][1] == getattr(pg, "UNWATCHED_ANSWER", None)
+      and "refused before it started" not in _rs[-1][1])
+_rs.clear()
+_drive(_rp, "withdraw", {"status": "refused", "handle": "", "slip": "",
+                         "plain": {}, "phase": "unwatched"})
+check("...and not on any other job", _rs
+      and "refused before it started" in _rs[-1][1])
 
 # ===========================================================================
 print("\n== the pager: a chain yields when somebody waited ==")

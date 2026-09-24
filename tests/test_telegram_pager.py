@@ -4943,7 +4943,8 @@ check("an intake card on an end with no --btc-electrum: the address is NOT "
       "the chain",
       not any(_BTC_ADDR in t for t in _nt_)
       and not any("I will say here" in t for t in _nt_)
-      and any("nothing to pay" in t for t in _nt_)
+      and getattr(pg, "UNWATCHED_ANSWER", None) in _nt_
+      and not any("Try again later" in t for t in _nt_)
       and "B4A1" not in _np_._btc()[1]
       and "intake_unwatched" in _ilog
       and "--btc-electrum" in _iout.getvalue())
@@ -5024,6 +5025,48 @@ def _depo_pay_fails(n, chat=111):
     return _fp, [t for t, _b in _fs], _il
 
 
+def _depo_next(fp, chat, handle_back, fail_pay=False):
+    """One more deposit on pager `fp` for `chat`, its note's params captured;
+    the vault answers `handle_back`, and the pay message fails twice when
+    `fail_pay`. Returns the params the doorbell was handed."""
+    _got = {}
+    _orig_send = fp.send
+
+    def _send(cid, t, buttons=None):
+        if fail_pay and "here is how to pay" in t:
+            return False
+        return _orig_send(cid, t, buttons)
+    fp.send = _send
+
+    class _Done:
+        def __init__(self):
+            self.result = {"status": "done", "handle": handle_back,
+                           "slip": "", "plain": dict(_PLAIN_BTC, h=handle_back),
+                           "phase": ""}
+            self.events = []
+
+        def outcome(self):
+            return "done"
+
+    def _rw(args, key, job, params, *a, **k):
+        _got.update(params)
+        return _Done()
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(run_wake=_rw)
+        fp.start_job(chat, "receive_and_quote", {"amount_sat": 5000000})
+        for _ in range(600):
+            if not fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+        fp.send = _orig_send
+    return _got
+
+
 _pf1, _pt1, _pil1 = _depo_pay_fails(1)
 check("the pay message dropped ONCE is sent again and lands: the address is "
       "watched, nothing said about a failure",
@@ -5050,6 +5093,121 @@ check("NON-VACUITY: a slip WITH a memo still gets the shared-inbound "
       "rendering -- the note first, then the block -- and is NOT watched",
       len(_note_i) == 1 and len(_pay_i) == 1 and _note_i[0] < _pay_i[0]
       and "C7D2" not in _sp._btc()[1])
+
+# THE OTHER TWO DELIVERY FAILURES REMEMBER THEIRS TOO, and until now
+# neither had a check that drove it: a shared-inbound NOTE that never got
+# through, and a SEALED SLIP that never got through. Both tell the client
+# to deposit again, and both held the vault's place for two days.
+def _depo_fail(result, drop):
+    """A deposit reported done with `result`, every send `drop` accepts
+    failing. Returns (pager, texts)."""
+    _fp, _fs, _, _ = _tapper((111,))
+    _fp.start_job = pg.Pager.start_job.__get__(_fp, pg.Pager)
+
+    def _send(cid, t, buttons=None):
+        if drop(t):
+            return False
+        _fs.append((t, buttons))
+        return True
+    _fp.send = _send
+
+    class _Done:
+        def __init__(self):
+            self.result = dict(result)
+            self.events = []
+
+        def outcome(self):
+            return "done"
+    _saved = pg._DOORBELL[0]
+    _saved_retry, pg.SLIP_RETRY_S = pg.SLIP_RETRY_S, 0
+    try:
+        pg._DOORBELL[0] = types.SimpleNamespace(run_wake=lambda *a, **k: _Done())
+        _fp.start_job(111, "receive_and_quote", {"amount_sat": 5000000})
+        for _ in range(600):
+            if not _fp.busy.locked():
+                break
+            time.sleep(0.02)
+    finally:
+        pg._DOORBELL[0] = _saved
+        pg.SLIP_RETRY_S = _saved_retry
+    return _fp, [t for t, _b in _fs]
+
+
+# THIS END SAYS IT CANNOT WATCH, IN THE REQUEST (wire 12, `unwatched`), so
+# a vault on the intake refuses before it issues anything.
+_ufp, _ufs, _, _ = _tapper((111,))
+_ufp.start_job = pg.Pager.start_job.__get__(_ufp, pg.Pager)
+_ufp.btc_servers = []
+_u_params = _depo_next(_ufp, 111, "B4A1")
+_wfp, _wfs, _, _ = _tapper((111,))
+_wfp.start_job = pg.Pager.start_job.__get__(_wfp, pg.Pager)
+_wfp.btc_servers = [("s.onion", 50002, None)]
+_w_params = _depo_next(_wfp, 111, "B4A1")
+check("an end with no BTC servers says so in the deposit request "
+      "(unwatched: true); one with servers does not carry the field",
+      _u_params.get("unwatched") is True
+      and _u_params.get("amount_sat") == 5000000
+      and "unwatched" not in _w_params
+      and _w_params.get("amount_sat") == 5000000)
+def _und(fp):
+    """What `fp` remembers as chat 111's undelivered deposit; a pager that
+    remembers nothing of the kind is a red check, not a dead suite."""
+    _f = getattr(fp, "_undelivered_for", None)
+    return _f(111) if _f else "(no memory of undelivered deposits)"
+
+
+_nfp, _nft = _depo_fail({"status": "done", "handle": "C7D2", "slip": "",
+                         "plain": dict(_PLAIN_SHARED), "phase": ""},
+                        lambda t: t.startswith("=:"))
+check("a NOTE that never got through: the chat hears there is nothing to pay "
+      "and to deposit again -- and the next deposit will name it",
+      any("did not get through" in t for t in _nft)
+      and not any(_PLAIN_SHARED["d"] in t for t in _nft)
+      and _und(_nfp) == "C7D2")
+_sfp, _sft = _depo_fail({"status": "done", "handle": "D8E9",
+                         "slip": "SEALED" + "0" * 40, "plain": {},
+                         "phase": ""},
+                        lambda t: t.startswith("SEALED"))
+check("a SEALED SLIP that never got through: said, and remembered the same "
+      "way", any("Did not get through" in t for t in _sft)
+      and _und(_sfp) == "D8E9")
+_ofp, _oft = _depo_fail({"status": "done", "handle": "D8E9",
+                         "slip": "SEALED" + "0" * 40, "plain": {},
+                         "phase": ""}, lambda t: False)
+check("NON-VACUITY: a sealed slip that DID get through is not remembered",
+      any(t.startswith("SEALED") for t in _oft)
+      and _und(_ofp) is None)
+# ...AND THE NEXT DEPOSIT SAYS SO (wire 12, `replaces`; the stage 4 read):
+# "/deposit again" met the undelivered deposit's place on the vault for two
+# days -- "full", at the stock ceiling.
+_nx1 = _depo_next(_pf2, 111, "C5D6")
+check("the next deposit from that chat names the undelivered one to the "
+      "vault (replaces), stamped by start_job beside the owner",
+      _nx1.get("replaces") == "B4A1" and _nx1.get("owner")
+      and _nx1.get("amount_sat") == 5000000)
+_nx2 = _depo_next(_pf2, 111, "D6E7")
+check("...once, while it is the latest: after a deposit that DID arrive, the "
+      "next note names nothing",
+      _nx2.get("amount_sat") == 5000000 and "replaces" not in _nx2)
+_nx3 = _depo_next(_pf2, 111, "E7F8", fail_pay=True)
+_nx4 = _depo_next(_pf2, 111, "F8A9")
+check("...and a deposit whose own details fail is the one the next note "
+      "names", _nx3.get("amount_sat") == 5000000 and "replaces" not in _nx3
+      and _nx4.get("replaces") == "E7F8")
+_pf2._mark_undelivered(222, "ABCD", "receive_and_quote")
+_nx5 = _depo_next(_pf2, 111, "A9B0")
+check("ANOTHER chat's undelivered deposit is never named in this chat's "
+      "note", _nx5.get("amount_sat") == 5000000 and "replaces" not in _nx5)
+_pf2._undelivered()[111] = ("B0C1", time.time()
+                            - pg.proto.DEPOSIT_PLACE_TTL_S - 1)
+_nx6 = _depo_next(_pf2, 111, "C1D2")
+check("...nor one older than the vault's own grace: it has let the place go "
+      "by itself",
+      _nx6.get("amount_sat") == 5000000 and "replaces" not in _nx6)
+_pf2._mark_undelivered(111, "D2E3", "watch")
+check("...and only a DEPOSIT is remembered as undelivered",
+      _und(_pf2) is None)
+
 
 print("\n-- the payment details outlive the timed burn until the payment "
       "is seen --")

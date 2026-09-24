@@ -26,7 +26,11 @@ Two questions are answered here, and the answers are shaped by money:
                          node's RELAY POLICY as consensus -- a pre-Core-30
                          node refuses the 105-byte swap memo the next node
                          relays -- which is why the servers are tried in
-                         turn rather than the first "no" being final.
+                         turn rather than the first "no" being final. A
+                         submit a stop cut short before every server was
+                         tried says so (`stopped`): its "rejected" or
+                         "unreachable" is about the servers it reached,
+                         not the list.
             ambiguous    the bytes LEFT for at least one server and no
                          acceptance came back: a hang-up, a deadline, a
                          server answering with a foreign txid. The money
@@ -227,7 +231,7 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
     """Hand the signed transaction to the network. See the module header
     for the four outcomes. Returns
         {outcome, server, cert_sha256, codes, attempts, mismatched,
-         mismatched_servers, pin_mismatch}
+         mismatched_servers, pin_mismatch, stopped}
     where `codes` are the numeric codes of every rejection, `attempts` how
     many servers were tried and `mismatched` how many answered with a
     txid that was not ours -- `mismatched_servers` names them, for `seen`
@@ -253,7 +257,15 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
     next run). The stage 3 read found the loop deaf to it: over Tor a
     server can take the whole timeout, and systemd's SIGKILL comes twenty
     seconds after its SIGTERM -- a kill mid-submit, with the plan that
-    records the bytes never written."""
+    records the bytes never written.
+
+    `stopped` is True when the stop left a server UNTRIED (the review of
+    that fix): one relay-policy "no" from the first server, the stop, and
+    the caller read `rejected` -- "every server that answered", the
+    server list blamed, a re-send's `accepted` written over -- about a
+    list it never finished. A rejection or an unreachable that is only
+    the stop's is not the network's word, and the caller must not act on
+    it as one."""
     raw = _check_hex(raw_hex)
     want = _check_txid(expected_txid)
     try:
@@ -267,9 +279,10 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
                                         transport_factory, timeout)
     codes, attempts, mismatched, ambiguous = [], 0, 0, False
     liars = []
-    pinned = False
+    pinned = stopped = False
     for host, port, pin in order:
         if stop is not None and stop():
+            stopped = True
             break
         attempts += 1
         transport = make(host, port, pin)
@@ -306,7 +319,7 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
                 "cert_sha256": getattr(transport, "cert_sha256", None),
                 "codes": codes, "attempts": attempts,
                 "mismatched": mismatched, "mismatched_servers": liars,
-                "pin_mismatch": False}
+                "pin_mismatch": False, "stopped": False}
     if ambiguous:
         outcome = OUTCOME_AMBIGUOUS
     elif codes:
@@ -315,7 +328,8 @@ def submit(raw_hex, expected_txid, address, servers, proxy_url, *,
         outcome = OUTCOME_UNREACHABLE
     return {"outcome": outcome, "server": None, "cert_sha256": None,
             "codes": codes, "attempts": attempts, "mismatched": mismatched,
-            "mismatched_servers": liars, "pin_mismatch": pinned}
+            "mismatched_servers": liars, "pin_mismatch": pinned,
+            "stopped": stopped}
 
 
 def history_of(address, servers, proxy_url, *, network="main",
@@ -594,7 +608,7 @@ def _history_once(txid, scripthash, order, make, stop=None):
 def seen(txid, address, servers, proxy_url, *, network="main",
          timeout=DEFAULT_TIMEOUT, wait_s=DEFAULT_SEEN_WAIT_S,
          interval_s=DEFAULT_SEEN_INTERVAL_S, sleeper=None, clock=None,
-         transport_factory=None, avoid=None, stop=None):
+         transport_factory=None, avoid=None, stop=None, distrust=None):
     """Is `txid` in the deposit address's history yet? Polls until it is
     or `wait_s` has passed (at least once; wait_s 0 is one look). Returns
         {seen, height, server, cert_sha256, polls, asked}
@@ -623,6 +637,17 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     None of this rests on a secret: it rests on some OTHER server being
     honest, which is all a second opinion is.
 
+    `distrust` names those caught-out servers apart from the acceptor, and
+    they are left out EVEN WITH ONE SERVER CONFIGURED (the review of that
+    fix): `avoid` gives way when it would leave nobody, which is right for
+    an acceptor -- the one server there is -- and wrong for a server that
+    has already answered with a transaction that is not ours. A lone
+    server caught out that way listed our txid here, and the bytes were
+    dropped on the word of the one server known to lie. Distrusted and
+    alone, it is "nobody could be asked", and the bytes are kept. A
+    distrusted server is as though never configured: the acceptor, when
+    it is the only other one, is the one server there is, and is asked.
+
     `stop`, when given, is asked before every poll, before each server a
     poll fails over to, and during the sleep (in slices of at most a
     second): once it says True the wait ends with what the polls have
@@ -634,17 +659,30 @@ def seen(txid, address, servers, proxy_url, *, network="main",
     want = _check_txid(txid)
     scripthash, order, make = _prepare(address, network, servers, proxy_url,
                                        transport_factory, timeout)
-    _avoid = ({avoid} if isinstance(avoid, str)
-              else {a for a in (avoid or ()) if isinstance(a, str) and a})
-    if _avoid and len(order) > 1:
-        order = [o for o in order if o[0] not in _avoid]
-        if not order:
-            return {"seen": False, "height": None, "server": None,
-                    "cert_sha256": None, "polls": 0, "asked": False}
+    # The arguments are checked BEFORE any early answer: a caller's bad
+    # wait was accepted whenever every server happened to be left out.
     if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)) \
             or wait_s < 0 or isinstance(interval_s, bool) \
             or not isinstance(interval_s, (int, float)) or interval_s <= 0:
         raise BtcWatchError("seen: wait must be >= 0 and interval > 0")
+
+    def _names(x):
+        if isinstance(x, str):
+            return {x} if x else set()
+        return {a for a in (x or ()) if isinstance(a, str) and a}
+    _avoid, _distrust = _names(avoid), _names(distrust)
+    # Distrusted first, as though never configured; THEN the acceptor
+    # gives way only to another server left. Left out while every other
+    # server is a caught-out one, nobody could ever confirm a transaction
+    # the acceptor had relayed and the network mined, and the
+    # reconciliation's second opinion (btc_forwarder._witnessed) would find
+    # no witness for it on any run.
+    order = [o for o in order if o[0] not in _distrust]
+    if _avoid and len(order) > 1:
+        order = [o for o in order if o[0] not in _avoid]
+    if not order:
+        return {"seen": False, "height": None, "server": None,
+                "cert_sha256": None, "polls": 0, "asked": False}
     sleeper = sleeper or time.sleep
     clock = clock or time.monotonic
     deadline = clock() + float(wait_s)
