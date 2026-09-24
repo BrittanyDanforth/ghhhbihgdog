@@ -2164,17 +2164,24 @@ def resend(args, plan, tx_hex, address, servers, kept_exclude=()):
     outcome = sub["outcome"]
     integrity_log("forward", f"broadcast_{outcome}")
     plan["resends"] = int(plan.get("resends") or 0) + 1
+    plan["resend_outcome"] = outcome
+    plan["reconciled_ts"] = int(time.time()) // 600 * 600
+    if outcome == bcast.OUTCOME_UNREACHABLE:
+        # NOTHING WAS SENT THIS TIME, so the earlier send's outcome stands:
+        # this attempt is recorded beside it (resend_outcome), never over
+        # it. Written over, `accepted` became `unreachable` and the plan
+        # read as a forward that never went out -- to the agent (no word
+        # when it confirmed, the next wake a plain --broadcast) and to the
+        # pairs rewrite -- about money the network had accepted.
+        write_plan(args.outfile, plan)
+        print(f"[!] re-send: no Electrum server could be reached "
+              f"({sub['attempts']} tried); nothing moved")
+        raise SystemExit(EXIT_FAILED)
     plan["broadcast_outcome"] = outcome
     plan["broadcast_server"] = sub["server"]
     plan["broadcast_codes"] = sub["codes"]
     plan["broadcast_attempts"] = sub["attempts"]
     plan["broadcast_mismatched"] = sub["mismatched"]
-    plan["reconciled_ts"] = int(time.time()) // 600 * 600
-    if outcome == bcast.OUTCOME_UNREACHABLE:
-        write_plan(args.outfile, plan)
-        print(f"[!] re-send: no Electrum server could be reached "
-              f"({sub['attempts']} tried); nothing moved")
-        raise SystemExit(EXIT_FAILED)
     if outcome == bcast.OUTCOME_REJECTED:
         # STALE BYTES, LIVE MONEY: every server that answered refused the
         # transaction the network once listed. Its inputs are still ours;

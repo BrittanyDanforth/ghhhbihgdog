@@ -2923,6 +2923,16 @@ def _forward_outcome(artifact_dir, handle: str, reader=None) -> tuple:
         outcome = plan.get("broadcast_outcome")
         moved = (plan.get("broadcast") is True
                  and outcome in ("accepted", "ambiguous"))
+        if not moved and plan.get("superseded_by"):
+            # A PLAN SUPERSEDED BY A FORWARD OF OURS moved its money, by
+            # that forward: the reconciliation writes the mark only when
+            # the network lists one of ours spending this plan's inputs.
+            # Whatever this plan's own outcome became after (a re-send
+            # that could reach no server, one every server rejected), it
+            # read as never sent: no word when the record mined, and the
+            # mark dropped forward_sent, so the next wake ran a plain
+            # --broadcast instead of a reconciliation.
+            return True, "accepted"
         return moved, (outcome if moved else None)
     except Exception:                                        # noqa: BLE001
         return False, None
@@ -4965,6 +4975,22 @@ def _phase_of(job: str, artifact_dir: Path, reader=None,
             return ""
         moved, outcome = _forward_outcome(artifact_dir, handle, reader)
         if moved:
+            # THIS RUN'S OWN WORD FIRST, for the two a reconciliation over
+            # a moved plan leaves when it refuses: money came back and is
+            # not settled (`returned`), or a replacement -- or a fresh
+            # forward of returned money -- that today's fee will not carry
+            # (`delayed`). The status file is removed before every child
+            # and written only on a refusal that sent nothing, so a word
+            # here is this run's. Read after the plan, they were answered
+            # `sent` / `forwarded` ("the forward has confirmed. Nothing
+            # more to check" about money sitting back on the address), and
+            # the Pi's branches for them -- watch it again; wait the fee
+            # retry -- never ran. NOT `short` or `arriving`: their
+            # sentences are about a deposit that has not gone, and the
+            # forward this plan records did.
+            _word = _forward_status_word(artifact_dir, handle, reader)
+            if _word in ("returned", "delayed"):
+                return _word
             # MONEY CAME BACK AGAIN AND IS KEPT (third self-doubt pass):
             # this word BEFORE `forwarded`, or the Pi would end its
             # rechecks on a deposit whose money is sitting here, and the
@@ -6432,8 +6458,16 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id,
             handles[handle]["forwarded"] = int(time.time()) // 600 * 600
         handles[handle]["forward_plan"] = \
             str(artifact_dir / f"btc_forward_{handle}.json")
+        # ONCE SENT, ALWAYS RECONCILED: never downgraded. A later plan can
+        # say broadcast False -- a kept re-send every server rejected, and
+        # the fresh forward of the same money then refused on today's fee
+        # -- and rewriting the mark from it sent the next wake down the
+        # plain --broadcast path: no history read, no exclusions, the
+        # chain's current plan overwritten unrotated, about a deposit
+        # whose first forward the network once accepted.
         handles[handle]["forward_sent"] = bool(
-            _forward_outcome(artifact_dir, handle)[0])
+            handles[handle].get("forward_sent")
+            or _forward_outcome(artifact_dir, handle)[0])
         # THE PAIRS REWRITE READS THE PLAN THE FORWARD JUST WROTE. The
         # outpoints it spent were accumulated on the record too, as "the
         # ledger's copy, read by the pairs rewrite and by the operator" --

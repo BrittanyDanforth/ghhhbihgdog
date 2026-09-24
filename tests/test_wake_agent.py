@@ -5846,6 +5846,89 @@ for _st, _ph in (("delayed", "delayed"), ("short", "short"),
           and (_bb.result or {}).get("status") == "done"
           and "forwarded" not in _rec_of(_dd)
           and not _rec_of(_dd).get("forward_sent"))
+
+
+def _fwd_run_both(rec, key_extra, rc, plan, state):
+    """A forward whose fake child writes BOTH the plan and a status word
+    and exits `rc` -- what the real --reconcile leaves when it refuses
+    after finding a forward of ours listed: the accepted plan brought up to
+    date in place (or kept, not rotated, for a fresh forward that refused)
+    and the one word for this run. Returns (out, err, ran, dir, bell)."""
+    dd, kk, bb = _fwd_env(rec, key_extra)
+    ran = []
+
+    def child(argv, env_extra, budget):
+        ran.append((list(argv), dict(env_extra or {})))
+        _of = Path(argv[argv.index("--outfile") + 1])
+        _of.write_text(json.dumps(plan))
+        _of.with_suffix(".status.json").write_text(json.dumps({"state": state}))
+        return rc, False
+
+    dp = deps_for(dd, bb, extend_deadman=lambda s: True, run_child=child)
+    os.environ["GS_BTC_SEED"] = _FWD_MNEMONIC
+    try:
+        out, err, text = run(kk, dp)
+    except Exception as e:                                   # noqa: BLE001
+        out, err = None, e
+    finally:
+        os.environ.pop("GS_BTC_SEED", None)
+    return out, err, ran, dd, bb
+
+
+# A RECONCILIATION'S OWN WORD, OVER A PLAN THAT SAYS THE MONEY MOVED. The
+# real --reconcile refuses with `returned` (money came back, not settled)
+# or `delayed` (a replacement, or a fresh forward of returned money, that
+# today's fee will not carry) and leaves the accepted plan current. The
+# phase came from the plan first, so the Pi heard `sent` or `forwarded`
+# -- "the forward has confirmed. Nothing more to check" about money
+# sitting back on the address -- and its `returned` and `delayed`-on-sent
+# branches, written for exactly these, never ran.
+_SENT_REC = {**_FWD_REC, "forward_sent": True}
+for _h, _plan_word in ((0, "sent"), (850002, "forwarded")):
+    _mv = {**_ACC, "seen_height": _h}
+    for _st in ("returned", "delayed"):
+        _o, _e, _ran, _dd, _bb = _fwd_run_both(_SENT_REC, _SEND_KEY, 2, _mv,
+                                               _st)
+        check(f"a reconciliation that refused '{_st}' over a moved plan "
+              f"(height {_h}) answers '{_st}', not '{_plan_word}', done, and "
+              "the record stays sent", _e is None
+              and "--reconcile" in _ran[0][0]
+              and (_bb.result or {}).get("status") == "done"
+              and (_bb.result or {}).get("phase") == _st
+              and _rec_of(_dd).get("forward_sent") is True)
+    # ...but not `short` or `seen`: their sentences are about a deposit that
+    # has not gone ("arrived, but UNDER what was quoted"; "arriving"), and
+    # the forward this plan records did go.
+    for _st in ("short", "seen"):
+        _o, _e, _ran, _dd, _bb = _fwd_run_both(_SENT_REC, _SEND_KEY, 2, _mv,
+                                               _st)
+        check(f"...'{_st}' over the same moved plan is still the plan's word "
+              f"'{_plan_word}'", _e is None
+              and (_bb.result or {}).get("phase") == _plan_word)
+# ONCE SENT, ALWAYS RECONCILED. A kept re-send that every server rejected
+# writes broadcast False on the plan (the pairs rewrite must not count it);
+# when the fresh forward of the same money is then refused on today's fee,
+# the run is done with a word -- and the mark rewrote forward_sent from
+# that plan, False, so the next wake ran a plain --broadcast: no history
+# read, no exclusions, the chain's current plan overwritten unrotated.
+_rej = {"broadcast": False, "broadcast_outcome": "rejected", "seen": False}
+_o, _e, _ran, _dd, _bb = _fwd_run_both(_SENT_REC, _SEND_KEY, 2, _rej,
+                                       "delayed")
+check("a rejected re-send then a fee refusal: 'delayed', and forward_sent "
+      "stays True -- the next wake is a reconciliation, not a fresh send",
+      _e is None and (_bb.result or {}).get("phase") == "delayed"
+      and _rec_of(_dd).get("forward_sent") is True)
+# A PLAN SUPERSEDED BY A FORWARD OF OURS THAT MINED IS `forwarded` whatever
+# its own outcome says: a re-send that could reach no server once wrote
+# `unreachable` over the earlier `accepted`, and the plan read as never
+# sent -- no word for a forward that confirmed, forward_sent dropped.
+_sup = {"broadcast": True, "broadcast_outcome": "unreachable", "seen": False,
+        "superseded_by": "ee" * 32, "superseded_height": 850030}
+_o, _e, _ran, _dd, _bb = _fwd_run_plan(_SENT_REC, _SEND_KEY, _sup)
+check("a superseded plan whose superseder mined is 'forwarded' and the "
+      "record stays sent, whatever the plan's own outcome says",
+      _e is None and (_bb.result or {}).get("phase") == "forwarded"
+      and _rec_of(_dd).get("forward_sent") is True)
 check("the status-word table maps exactly the five words the forwarder "
       "writes, to words the wire knows",
       A._FORWARD_STATUS_PHASE == {"not_seen": "not_yet", "seen": "arriving",

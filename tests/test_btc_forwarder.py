@@ -1476,6 +1476,20 @@ check("a rejected re-send: a FRESH forward is quoted, signed and sent; the "
       and json.load(open(_chain4[1]))["resends"] == 1
       and ("forward", "resend_rejected") in _n4.kinds
       and ("forward", "reconcile_rejected") in _n4.kinds)
+# (c'') the re-send reaches NO server: nothing was sent this time, and the
+# earlier send's outcome stands. It was overwritten with `unreachable`,
+# and the plan then read as a forward that never went out -- to the agent
+# (no word when it confirmed; the next wake a plain --broadcast) and to
+# the pairs rewrite -- about money the network had once accepted.
+_p4u, _of4u, _hx4u = _first_send(submit=_ACCEPTED, seen=_NOT_SEEN)
+_n4u = Net(utxos=_UNSPENT0, spends=[], submit=_UNREACHABLE, seen=_SEEN0)
+_c, _o, _p, _ = _reconcile(_n4u, _of4u)
+check("an unreachable re-send: exit failed, the plan keeps broadcast True and "
+      "the earlier 'accepted', the attempt recorded beside it, the bytes kept",
+      _c == F.EXIT_FAILED and len(_n4u.submits) == 1
+      and _p["broadcast"] is True and _p["broadcast_outcome"] == "accepted"
+      and _p["resend_outcome"] == "unreachable" and _p["resends"] == 1
+      and _p["tx_hex"] == _hx4u)
 # (d) NOT listed, inputs unspent, no bytes (it was listed once): evicted --
 # re-signed afresh (every input opts into RBF), the old plan rotated.
 _p5, _of5, _hx5 = _first_send()

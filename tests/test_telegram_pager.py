@@ -6533,6 +6533,30 @@ check("...with headroom the forward is started, 'confirmed. Sending it on "
       and len(_rfs) == 1 and "Sending it on now" in _rfs[0][0]
       and (_rf.btc_open.get("B4A1") or {}).get("state") == "forwarding"
       and "B4A1" not in _rf._btc_sent_set())
+# A `delayed` ON A FORWARDED ENTRY IS A WAIT, not a note: the vault would
+# not pay today's fee for what came back, and the forward branch sets the
+# entry's retry_after for it -- which the forwarded look never read, so
+# the next window started the same refused forward again.
+_rd, _rds, _rdj = _watch_pager()
+_rd.btc_servers = [("s.onion", 50002, None)]
+_rd.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")
+_rd.limits.headroom = lambda: 9
+_rd._btc_forward_result("B4A1", "done", "forwarded", 111)
+_rd._btc_forward_result("B4A1", "done", "delayed", 111)
+_rde = _rd.btc_open.get("B4A1") or {}
+check("(setup) a delayed answer on a forwarded entry keeps it forwarded "
+      "with a retry wait", _rde.get("state") == "forwarded"
+      and float(_rde.get("retry_after") or 0) > time.time())
+_rde["looked_at"] = time.time() - _rd.btc_recheck_s - 1
+_rdj.clear()
+_rd.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("...and while that wait runs, settled money above the floor starts "
+      "nothing", _rdj == [] and _rde.get("state") == "forwarded")
+_rde["retry_after"] = time.time() - 1
+_rde["looked_at"] = time.time() - _rd.btc_recheck_s - 1
+_rd.btc_tick(look=_look_returning("confirmed", conf=100000))
+check("NON-VACUITY: ...once it has passed, the next window's look starts it",
+      _rdj == [(111, "forward_to_swap", {"handle": "B4A1"})])
 _rg, _rgs, _rgj = _watch_pager()
 _rg.btc_servers = [("s.onion", 50002, None)]
 _rg.args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050")

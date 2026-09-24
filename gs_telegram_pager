@@ -6153,6 +6153,13 @@ class Pager:
                 if (state != "confirmed" or conf <= 0
                         or conf < int(self.deposit_min_sat or 0)):
                     return
+                # ...AND NOT WHILE A `delayed` WAIT RUNS: the vault would not
+                # pay today's fee for what came back, and the forward branch
+                # set this entry's retry_after (doubling, fee_retry_wait)
+                # for that -- which nothing here read, so the next window's
+                # look started the same refused forward again.
+                if time.time() < float(e.get("retry_after") or 0.0):
+                    return
                 if not self._btc_can_start(background=True):
                     return
                 e["state"] = "forwarding"
