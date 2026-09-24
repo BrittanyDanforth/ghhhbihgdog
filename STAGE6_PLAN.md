@@ -294,6 +294,24 @@ The watch entry keeps the last forward word (`word`) beside `sent_at`.
 - A `sent` or `forwarded` entry forgotten after `DEPOSIT_PLACE_TTL_S` is
   also dropped from the sent set: an ask about a forward this end no
   longer remembers is the forward's question again.
+- ...and it is not forgotten the moment its clock runs out
+  (`_btc_keep_past_clock`): a `forwarded` entry waits for its own
+  schedule's next look -- money that came back after the last look inside
+  the clock was never seen -- and either state waits for an automatic
+  start it is still owed (a timed hold's one more ask, a stall or fee
+  retry, a `sent` entry's recheck held back by `delayed`), each for its
+  wait and `HOLD_SLACK_WINDOWS` after it. Never more than `OWED_GRACE_S`
+  (one more clock) past it; what that ends is said to the chat once, with
+  the tap -- not to the operator: the alert writes a chain line, and one a
+  public constant after the answer that set the clock dates the poke
+  behind it. The bound rests on no secret: it caps what a fee spike, a run
+  that keeps failing, or a stranger paying the spent address again can
+  keep alive.
+- A forward of money back that the FORWARDED LOOK started and whose run
+  failed or was refused goes back to `forwarded` for its stall retries
+  (looked at once a window, its wait read by the look), not `seen` (every
+  tick). A start of the same money again -- a stall retry, a fee retry, a
+  hold's one more ask -- is not said to the chat; money that is news is.
 - `--btc-recheck SECONDS` (default 10800, floor 600); the startup line
   says it must be at least the vault's `--btc-bump-after` to find a bump
   due. `BTC_STATE_WORDS` gains `forwarded: "sent on, confirmed"`.

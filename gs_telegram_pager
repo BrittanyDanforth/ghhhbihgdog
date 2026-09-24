@@ -5630,7 +5630,8 @@ class Pager:
                 # one it sees, and the while starts from this answer. Its
                 # clock is the forward's: already forwarded, it keeps the
                 # one it had, so the entry expires on schedule -- after the
-                # one more ask, which btc_tick waits for (_btc_hold_runs).
+                # one more ask, which btc_tick waits for
+                # (_btc_keep_past_clock).
                 if not (_was_forwarding and _from_fwd
                         and e.get("sent_at")):
                     e["sent_at"] = time.time()
@@ -5855,7 +5856,21 @@ class Pager:
                 except (TypeError, ValueError):
                     _tries = 1
                 if _tries <= int(self.STALL_RETRIES):
-                    e["state"] = "seen"
+                    # ...BACK TO `forwarded` WHEN THE FORWARDED LOOK MADE
+                    # THE START: money that came back after the forward
+                    # mined, to a SPENT address. `seen` is looked at every
+                    # tick, and a run that kept failing (Tor, a server, the
+                    # vault's budget) held the address there for the whole
+                    # of the retries -- about 185 fresh circuits over
+                    # thirty-one hours announcing a spent address, where
+                    # `forwarded` is looked at once a window: the volume
+                    # the window exists to remove, and the rule `delayed`
+                    # and a refused start already follow. The forwarded
+                    # look reads the wait below (retry_after) before it
+                    # starts, and btc_tick keeps the entry past its clock
+                    # while the retry is owed (_btc_keep_past_clock).
+                    e["state"] = ("forwarded" if _was_forwarding and _from_fwd
+                                  else "seen")
                     e["stall_tries"] = _tries
                     # ...never SHORTER than the early wait the entry is
                     # already on: a refusal interleaved with `arriving`
@@ -5962,10 +5977,18 @@ class Pager:
     #: Bare `forwarded` answers to this end's own start held for a doubling
     #: while (2, then 4 windows) before the next one holds for good.
     HELD_TIMED_TRIES = 2
-    #: Recheck windows past a timed hold's end that btc_tick keeps a
-    #: forwarded entry its clock would otherwise forget: the look after the
-    #: end comes within one, and a start the reserve put off, one more.
+    #: Recheck windows past a timed hold's end, or a retry's wait, that
+    #: btc_tick keeps a forwarded entry its clock would otherwise forget:
+    #: the look after the end comes within one, and a start the reserve
+    #: put off, one more.
     HOLD_SLACK_WINDOWS = 2
+    #: Recheck windows past a forwarded entry's clock that btc_tick waits
+    #: for its own schedule to look at it once more -- the most it waits
+    #: when every look since has failed.
+    FINAL_LOOK_WINDOWS = 2
+    #: The most a forwarded entry is kept past its clock, whatever it is
+    #: still owed: one more of the clock itself.
+    OWED_GRACE_S = proto.DEPOSIT_PLACE_TTL_S
 
     @staticmethod
     def _btc_unhold(e) -> None:
@@ -5998,20 +6021,78 @@ class Pager:
         if at > _was:
             e["looked_at"] = float(at)
 
-    def _btc_hold_runs(self, e, now: float) -> bool:
-        """Whether a forwarded entry is inside a TIMED hold, or the slack
-        after it in which the look asks once more (HOLD_SLACK_WINDOWS):
-        btc_tick does not forget it meanwhile. A hold for good, or none, is
-        not. Pure; no lock."""
-        if not e or e.get("state") != "forwarded" \
-                or e.get("held_conf") is None:
+    def _btc_owed(self, e, now: float) -> bool:
+        """Whether an entry is still OWED an automatic start this end
+        promised: a timed hold's one more ask (`forwarded`: held_until), or
+        the start a wait is holding back (retry_after: a `forwarded` entry's
+        stall retry, fee retry or refused start; a `sent` entry's recheck
+        after `delayed`, the replacement the vault would not pay for yet)
+        -- until the wait and HOLD_SLACK_WINDOWS after it. The chat was told
+        "tried again later, by itself" about each of them. Pure; no lock."""
+        _st = e.get("state") if e else None
+        if _st not in ("forwarded", "sent"):
+            return False
+        _slack = float(self.HOLD_SLACK_WINDOWS) * float(self.btc_recheck_s)
+        for _k, _need in (("held_until", _st == "forwarded"
+                           and e.get("held_conf") is not None),
+                          ("retry_after", True)):
+            if not _need:
+                continue
+            try:
+                if now < float(e.get(_k)) + _slack:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _btc_keep_past_clock(self, e, now: float) -> bool:
+        """Whether btc_tick keeps a `forwarded` or `sent` entry whose clock
+        (sent_at + DEPOSIT_PLACE_TTL_S) has run out. Pure; no lock. Yes
+        while either of:
+
+          - A FORWARDED ENTRY'S OWN SCHEDULE HAS NOT LOOKED AT IT SINCE THE
+            CLOCK RAN OUT (look_answered_at). The sweep ran before the look,
+            so money that came back after the last look inside the clock --
+            up to a whole window of it -- was never seen, never sent on by
+            itself, and nothing said so. The look waited for is the one the
+            schedule makes next anyway: no look is made because the clock
+            ran out, so a server learns nothing from it that the looks
+            before it (a window apart since the forward's answer) did not
+            already show. Only an entry with an address is looked at;
+            FINAL_LOOK_WINDOWS windows is the most this waits when every
+            look fails;
+          - it is still owed an automatic start (_btc_owed). Each of those
+            ended where the clock did: a `delayed` or a failed run of money
+            that came back late, a hold's one more ask, a stuck forward's
+            recheck -- forgotten with the start still owed;
+
+        and NEVER MORE THAN OWED_GRACE_S PAST THE CLOCK. That bound rests
+        on no secret and makes nothing safe; it is what caps the rest. A
+        fee spike that does not end, a run that keeps failing, or a stranger
+        who keeps paying the spent address (each payment a new total, a
+        new start, a new while) keeps the entry -- a look a window, a
+        background wake a round -- for one more clock at most, where it was
+        for as long as any of them lasted. What is still owed then is said
+        to the chat once (btc_tick), and the tap still asks."""
+        _st = e.get("state") if e else None
+        if _st not in ("forwarded", "sent"):
             return False
         try:
-            _u = float(e.get("held_until"))
+            _end = float(e.get("sent_at") or 0.0) + float(
+                proto.DEPOSIT_PLACE_TTL_S)
         except (TypeError, ValueError):
             return False
-        return now < _u + float(self.HOLD_SLACK_WINDOWS) * float(
-            self.btc_recheck_s)
+        if now >= _end + float(self.OWED_GRACE_S):
+            return False
+        if _st == "forwarded" and e.get("addr"):
+            try:
+                _ans = float(e.get("look_answered_at") or 0.0)
+            except (TypeError, ValueError):
+                _ans = 0.0
+            if _ans < _end and now < _end + float(
+                    self.FINAL_LOOK_WINDOWS) * float(self.btc_recheck_s):
+                return True
+        return self._btc_owed(e, now)
 
     def _btc_early_wait(self, e) -> None:
         """The wait after a forward this end started that the vault found
@@ -6085,15 +6166,15 @@ class Pager:
             # ...AND A SENT ONE, the same window after it went out: a refund
             # comes back within hours, and one that has not come back by
             # then is not coming.
-            # ...BUT NOT A FORWARDED ONE WHOSE HOLD STILL OWES AN ASK (wire
-            # 11): a `leftover` or a bare `forwarded` near the end of that
-            # window set a while whose one more ask fell after it, and the
-            # entry was forgotten first -- with a payment in its total the
-            # vault had not seen, never sent on by itself. Bounded: the
-            # while, and HOLD_SLACK_WINDOWS after it -- per answer. Rests on
-            # no secret: a stranger who pays the spent address again makes a
-            # new total, a new start and a new while, and so keeps the entry
-            # (and its look a window) alive for as long as they pay fees.
+            _stopped = []
+            # ...BUT NOT A FORWARDED ONE STILL OWED SOMETHING: the look
+            # after its clock ran out (money that came back in the last
+            # window was never seen), or the one more ask of a timed hold,
+            # or the start a retry is waiting for -- each of them used to
+            # end where the clock did, with money on the address that this
+            # end had seen or would have seen, never sent on by itself. At
+            # most OWED_GRACE_S past the clock (_btc_keep_past_clock says
+            # what, and what that bound does not rest on).
             for _h in [k for k, v in opened.items()
                        if (v["state"] == "not_seen"
                            and _now - float(v.get("since") or _now)
@@ -6101,7 +6182,12 @@ class Pager:
                        or (v["state"] in ("sent", "forwarded", "kept")
                            and _now - float(v.get("sent_at") or _now)
                            >= proto.DEPOSIT_PLACE_TTL_S
-                           and not self._btc_hold_runs(v, _now))]:
+                           and not self._btc_keep_past_clock(v, _now))]:
+                # ...STILL OWED A START (OWED_GRACE_S ran out): the chat was
+                # told it is tried again by itself, and from here it is
+                # not. Said once, below, outside the lock.
+                if self._btc_owed(opened[_h], _now):
+                    _stopped.append((_h, opened[_h].get("chat")))
                 opened.pop(_h, None)
                 # ...AND FORGOTTEN AS SENT (stage 6): an ask about a
                 # forward this end no longer remembers is the forward's
@@ -6162,6 +6248,35 @@ class Pager:
                     if self._recheck_due_entry(e, _now)
                     and _now - float(e.get("rechecked_at") or 0.0)
                     >= self._btc_recheck_after(e)]
+        # WHAT THE CAP ENDED, SAID: the chat heard "it is tried again later,
+        # by itself -- nothing to do" (the `delayed` line, the retry line),
+        # and nothing tries it now. One sentence, no figure, the tap under
+        # it. Its time follows OWED_GRACE_S after an answer the same chat
+        # already holds: it tells a reader of the chat nothing the source
+        # does not, and a promise broken in silence is the worse defect
+        # (AGENTS.md rule 2). NOT THE OPERATOR'S ALERT, though a stalled
+        # forward gets one: _alert_operator writes `operator_alerted` to the
+        # chain, and a line OWED_GRACE_S after the answer that set the clock
+        # dates the poke behind that answer -- subtract the public constant
+        # and the card says which poke was an intake forward, the timetable
+        # `btc_watch_forgotten` was removed for. A stalled forward's alert
+        # sits beside its own poke and dates nothing new; a run that keeps
+        # failing still ends there, and alerts there.
+        for _sh, _sc in _stopped:
+            if not isinstance(_sc, int) or isinstance(_sc, bool):
+                continue
+            try:
+                _scn = self._label(_sc, _sh)
+            except BaseException:                            # noqa: BLE001
+                _scn = "?"                       # never the bare handle
+            try:
+                self.send(_sc, f"{_scn}: it is no longer tried again by "
+                               f"itself. Tap below to try it now.",
+                          buttons=self._handle_buttons(_sh, "receive_and_quote",
+                                                       _sc))
+            except BaseException as ex:                      # noqa: BLE001
+                print(f"  [!] a stopped retry was not said: "
+                      f"{_redact(ex)[:120]}")
         _failed = _answered = 0
         _why = ""
         _pin = False
@@ -6361,6 +6476,11 @@ class Pager:
                 # ...REMEMBERED, so a start that is then refused puts the
                 # entry back where it was (the tail below), not on `seen`.
                 _from_forwarded = True
+                # A LOOK THAT ANSWERED, whatever it found: the one btc_tick
+                # waits for before it forgets the entry past its clock
+                # (_btc_keep_past_clock). Stamped here, not with looked_at
+                # before the look -- a look that failed saw nothing.
+                e["look_answered_at"] = time.time()
                 # MONEY BACK AFTER THE FORWARD MINED (third self-doubt
                 # pass, reworked after its own review). The look comes
                 # once per --btc-recheck window (btc_tick), and only
@@ -6389,7 +6509,8 @@ class Pager:
                 # make "news" whenever they pay a fee for it -- up to two
                 # background starts each (the start and its one more ask;
                 # both leave the reserve for taps), and each renews the
-                # entry's life past its clock while the while runs.
+                # entry's life past its clock while the while runs -- at
+                # most OWED_GRACE_S past it (_btc_keep_past_clock).
                 _held = e.get("held_conf")
                 if isinstance(_held, int) and not isinstance(_held, bool):
                     if _held < 0:
@@ -6424,7 +6545,25 @@ class Pager:
                 e["from_forwarded"] = True
                 e["start_conf"] = conf
                 e["start_at"] = self._btc_look_stamp(e)
-                e["said"].discard("confirmed")
+                # SAID ONLY WHEN IT IS NEWS: money that came back, or more
+                # of it. A start of the SAME money again -- a stall retry, a
+                # fee retry (their waits set by the vault's answer), or a
+                # hold's one more ask once its while is over -- is a start
+                # nobody asked for, and the `seen` branch keeps those
+                # silent: the chat heard the vault's own sentence about it.
+                # This branch said "confirmed. Sending it on now." at every
+                # one, so a run that kept failing put it in the chat once a
+                # retry, beside each "failed" -- one rule, now, for both.
+                try:
+                    _again = (int(e.get("stall_tries") or 0) > 0
+                              or int(e.get("fee_tries") or 0) > 0)
+                except (TypeError, ValueError):
+                    _again = False
+                if isinstance(_held, int) and not isinstance(_held, bool) \
+                        and _held >= 0 and conf == _held:
+                    _again = True
+                if not _again:
+                    e["said"].discard("confirmed")
                 self._btc_sent_set().discard(h)
                 # (No "btc_returned_seen" on the chain: the poke that
                 # follows is chained, job-agnostic, like every other.)
