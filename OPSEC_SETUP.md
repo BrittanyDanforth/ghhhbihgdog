@@ -2885,6 +2885,22 @@ money does not move on the aggregator's word alone. And the THORNode URL
 is `https://`, or `http://` to a `.onion` — the check rests on TLS or on
 the onion key; a plaintext clearnet URL is refused at pairing and by the
 forwarder, because over it any Tor exit could answer for THORNode.
+The same node is a sending forward's second opinion on everything one
+Electrum server or the aggregator would otherwise decide alone:
+ThorChain's own BTC.BTC and XMR.XMR pools are the price a quote is
+measured against beside CoinGecko (which is often unreachable over Tor).
+With neither readable a sending run waits (`delayed`) rather than let the
+aggregator's figure set the memo's output limit. A pool ThorChain does
+not swap through is refused the same way. ThorChain's BTC gas rate bounds
+the server's fee estimate (twice ThorChain's rate at most), and its last
+observed BTC block bounds the height written into nLockTime. How far a
+quote may sit from those prices is `--max-slippage-bps` (default 2500,
+100..5000). The stop is public, so a hostile quote can sit just under it;
+a tighter one bounds that loss tighter, at the cost of refusing more
+honest quotes on thin pools. The forwarder also refuses a quoted memo
+with a space or any character outside printable ASCII, or an asset other
+than XMR.XMR: it writes the memo into the OP_RETURN byte for byte, and
+ThorChain refunds what it cannot read, less fees.
 `--btc-account N`
 retires a chain: a vault whose ledger was wiped behind a used account, or
 paired to an account used before, refuses every deposit (`ledger_wiped`)

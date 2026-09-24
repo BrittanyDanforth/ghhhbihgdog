@@ -426,6 +426,14 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--max-affiliate-bps", type=int, default=0,
                    help="the largest affiliate fee (basis points) a quoted "
                         "swap memo may carry (default 0)")
+    p.add_argument("--max-slippage-bps", type=int, default=2500,
+                   help="how far (basis points) a quote may sit from the "
+                        "price oracle or ThorChain's own pool price before "
+                        "the forward refuses it (default 2500, 100..5000). "
+                        "The stop is public: a hostile quote can sit just "
+                        "under it, so a tighter one bounds that loss "
+                        "tighter, at the cost of refusing more honest "
+                        "quotes on thin pools")
     p.add_argument("--btc-bump-after", type=int, default=7200,
                    metavar="SECONDS",
                    help="how long a forward may sit in the mempool at a rate "
@@ -700,6 +708,8 @@ def _validate_btc(args) -> None:
                  "rate past that).")
     if not 0 <= args.max_affiliate_bps <= 1000:
         sys.exit("[!] --max-affiliate-bps must be 0..1000.")
+    if not 100 <= int(getattr(args, "max_slippage_bps", 2500)) <= 5000:
+        sys.exit("[!] --max-slippage-bps must be 100..5000.")
     if not 0 <= int(getattr(args, "btc_bump_after", 7200)) <= 7 * 86400:
         sys.exit("[!] --btc-bump-after must be 0..604800 seconds (a week).")
     if not 0 <= int(getattr(args, "btc_returns_max", 2)) <= 1000:
@@ -1435,6 +1445,11 @@ def do_pair(args) -> int:
         "feerate_floor_sat_vb": int(args.feerate_floor_sat_vb),
         "feerate_ceiling_sat_vb": int(args.feerate_ceiling_sat_vb),
         "max_affiliate_bps": int(args.max_affiliate_bps),
+        # HOW FAR A QUOTE MAY SIT FROM THE PRICE REFERENCES (the stage 2
+        # read): the forwarder's --max-slippage was a public 25% nothing on
+        # the vault could tighten. Written always; a keyfile from before
+        # the field reads as the same 2500 bps.
+        "btc_max_slippage_bps": int(getattr(args, "max_slippage_bps", 2500)),
         # HOW LONG A FORWARD MAY SIT IN THE MEMPOOL before a reconciliation
         # replaces it at today's rate (stage 6). Written always; a keyfile
         # from before the field reads as the same two hours.

@@ -584,3 +584,41 @@ Stated so the next stage does not inherit them silently.
   while fetching and enforcing nothing. Under a host-forward the gap between
   quote and broadcast is seconds rather than a human's minutes, which helps, but
   stage 3 should bound it explicitly rather than inherit the claim.
+
+## 10. Read again after stage 6: what one party's word still decided
+
+Every quote, fee, tip and memo a forward acts on comes from a party that is
+not trusted to be exact. Five of them still decided alone, and each is now
+held to a second source or refused. Nothing below rests on a secret. The
+second source is the THORNode a sending run must name, trusted through
+https and the CA system, or an .onion's key (`watch.thornode_url_ok`).
+
+- **The price.** With CoinGecko out of reach (common over Tor), the
+  aggregator's expected output alone set the memo's output limit, the
+  swap's only on-chain slippage guard, on a forward that SENT. ThorChain's
+  own pools (`thornode_pool_rate`) are now measured beside the oracle,
+  within the stop, each one when it can be read. A sending run with
+  neither is `delayed` before the aggregator is asked, and a pool that is
+  not Available is refused the same way.
+- **The stop.** `--max-slippage` was a public 25% that nothing on the vault
+  could tighten. It is now `--max-slippage-bps` at pairing
+  (`btc_max_slippage_bps`, 100..5000), read strictly by the agent. It is
+  still public: a hostile quote can sit just under it, so it bounds that
+  loss and does not prevent it.
+- **The memo's text.** The bind check strips each field and takes any
+  asset on the XMR chain, while the OP_RETURN carries the memo byte for
+  byte. A space or a no-break space in a field, or `XMR.BOGUS`, was
+  signed as it came, and ThorChain refunds what it cannot read, less fees.
+  The forwarder now takes only printable ASCII with no space, and the
+  asset XMR or XMR.XMR.
+- **The fee estimate.** One server's answer, bounded only by the
+  operator's ceiling: just under it burned up to a fifth of the deposit to
+  miners, and just over it was `delayed` for as long as that server led.
+  It is now capped at twice ThorChain's own BTC gas rate
+  (`thorchain_fee_cap`), read from the inbound list the run fetches once.
+  A rate the operator gave is not capped.
+- **The tip.** One server's answer went into nLockTime, bounded only under
+  the height nLockTime reads as a date. A tip of 499,999,999 made a
+  transaction no node accepts, rejected at every retry behind the same
+  leading server. The locktime is now the lower of the tip and ThorChain's
+  last observed BTC block (`thornode_btc_height`).

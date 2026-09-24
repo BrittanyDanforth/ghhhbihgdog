@@ -732,6 +732,24 @@ def validate_memo(memo, dest_xmr):
                       "the memo binds only when hex-decoded; this tool "
                       "writes the OP_RETURN itself and will not embed a "
                       "hex string as the memo")
+    # ...AND ONLY WHAT THORCHAIN READS AS THIS TOOL READ IT (the stage 2
+    # read). The bind check strips each field it reads and takes any asset
+    # on the XMR chain; the OP_RETURN carries the memo byte for byte. So a
+    # quote whose memo had a space, a no-break space or any other character
+    # outside printable ASCII inside a field -- which str.strip() removes
+    # here and ThorChain does not -- or named an asset such as XMR.BOGUS,
+    # was signed as it came, and ThorChain refunds what it cannot read, less
+    # its fees. The aggregator is not trusted to be exact; nothing secret is
+    # involved -- the format is public, and this is what makes it exact.
+    if any(not 0x21 <= ord(ch) <= 0x7E for ch in text):
+        raise Refused("bad_memo",
+                      "the memo carries a space or a character outside "
+                      "printable ASCII; ThorChain reads each field as "
+                      "written, and this tool writes the memo byte for byte")
+    if text.split(":")[1].upper() not in ("XMR", "XMR.XMR"):
+        raise Refused("bad_memo",
+                      "the memo's asset is not XMR.XMR; ThorChain would "
+                      "refund a swap to an asset it does not have, less fees")
     return text
 
 
@@ -872,10 +890,13 @@ def fit_memo(memo_text, dest_xmr, op_return_limit):
 
 
 def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
-                      oracle_rate):
+                      oracle_rate, pool_rate=None):
     """The quote's Monero: positive, clears the mix floor at the WORST
-    arrival the watcher accepts, and sits within `max_slippage` of the
-    oracle when an oracle is available. Returns (expected, worst_case)."""
+    arrival the watcher accepts, and sits within `max_slippage` of EVERY
+    price reference there is -- the oracle and ThorChain's own pools
+    (thornode_pool_rate) -- each when available. Returns
+    (expected, worst_case). Whether a run may go on with neither is main's
+    call, made before the quote is asked for."""
     exp = finite_decimal(expected)
     if exp is None or exp <= 0:
         raise Refused("expected_unreadable",
@@ -906,37 +927,125 @@ def validate_expected(expected, send_sat, min_out_xmr, max_slippage,
                       f"least {needed} XMR is needed")
     if oracle_rate is None:
         integrity_log("forward", "oracle_unavailable")
-        print("  [!] no price oracle reachable: the quote is NOT cross-checked")
-    else:
+        print("  [!] no price oracle reachable: the quote is NOT cross-checked "
+              "against it")
+    for _rate, _name in ((oracle_rate, "price oracle"),
+                         (pool_rate, "ThorChain pool price")):
+        if _rate is None:
+            continue
         dev = quote_deviation(exp, Decimal(send_sat) / Decimal(10 ** 8),
-                              oracle_rate)
+                              _rate)
         if dev is None:
-            integrity_log("forward", "oracle_unusable")
-            print("  [!] the oracle's answer could not be compared to the quote")
+            integrity_log("forward", "oracle_unusable"
+                          if _name == "price oracle" else "pool_unusable")
+            print(f"  [!] the {_name} could not be compared to the quote")
         elif dev > max_slippage:
             raise Refused("quote_deviates",
-                          f"the quote sits {dev * 100:.1f}% from the price "
-                          f"oracle, over the {max_slippage * 100:.0f}% this "
+                          f"the quote sits {dev * 100:.1f}% from the "
+                          f"{_name}, over the {max_slippage * 100:.0f}% this "
                           "box accepts")
         elif dev > Decimal("0.05"):
-            print(f"  [!] the quote sits {dev * 100:.1f}% from the oracle")
+            print(f"  [!] the quote sits {dev * 100:.1f}% from the {_name}")
     return exp, worst
 
 
-def cross_check_inbound(inbound, thornode_url, proxy_url):
-    """THORNode's own inbound_addresses, on a second circuit: the BTC
-    entry must exist, must not be halted, and must name the SAME address
-    the aggregator gave us. Returns (dust threshold, outbound fee), each
-    in sat or None when the entry did not carry a usable one. THE
-    OUTBOUND FEE IS WHAT A REFUND LACKS: ThorChain refunds the unfilled
-    part of a streaming swap less this fee, and the pairs rewrite on the
-    vault scales the forward's quote by what was actually swapped -- the
-    refund PLUS the fee -- or a small forward reads `short` for ever (the
-    fee is a tenth of a 0.003 BTC forward; the arrival tolerance is a
-    tenth). Recorded on the plan from the node the operator named, at the
-    moment that node is trusted for the inbound address itself; capped at
-    REFUND_FEE_SLACK_SAT, so a lying node can lower what a client is told
-    to expect by no more than the slack a FULL refund already rests on."""
+#: THE SWAP'S OWN PRICE: ThorChain's pools, as the THORNode the operator
+#: named reports them. The pools are what a swap executes against, so this
+#: is the reference a quote's slippage is honestly measured from.
+_THOR_POOLS = ("BTC.BTC", "XMR.XMR")
+
+
+def thornode_pool_rate(thornode_url, proxy_url):
+    """BTC per XMR from ThorChain's own BTC.BTC and XMR.XMR pools, on their
+    own circuit to the THORNode the operator named, or None when either
+    answer cannot be read (said on the chain). Refuses, `pool_unavailable`,
+    when a pool reports a status other than Available: ThorChain does not
+    swap through such a pool, and a payment now would come back less fees.
+
+    THE STAGE 2 READ: with CoinGecko out of reach -- common over Tor -- the
+    aggregator's own figure was the only price a SENDING forward had. It
+    set the memo's output limit, the one on-chain slippage protection, and
+    nothing measured it, so whoever answers as the aggregator chose how
+    little the swap may deliver. This is the second reference, and it rests
+    on the THORNode being who it says (https and the CA system, or an
+    .onion's key -- watch.thornode_url_ok) and on ThorChain's own state:
+    nothing secret. A lying THORNode can move it; so can one already trusted
+    for the inbound address a forward pays."""
+    proxies = isolated_proxy(proxy_url, "forward:pools")
+    base = thornode_url.rstrip("/")
+    per_rune = {}
+    for asset in _THOR_POOLS:
+        try:
+            pool = safe_get(f"{base}/thorchain/pool/{asset}", proxies)
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("forward", f"pool_fetch_fail:{type(e).__name__}")
+            return None
+        if not isinstance(pool, dict) \
+                or str(pool.get("asset") or "").upper() != asset:
+            integrity_log("forward", "pool_unusable")
+            return None
+        if str(pool.get("status") or "").lower() != "available":
+            raise Refused("pool_unavailable",
+                          f"ThorChain's {asset} pool is not available for "
+                          "swaps; a payment now would come back less fees")
+        bal_asset = finite_decimal(pool.get("balance_asset"))
+        bal_rune = finite_decimal(pool.get("balance_rune"))
+        if bal_asset is None or bal_rune is None or bal_asset <= 0 \
+                or bal_rune <= 0:
+            integrity_log("forward", "pool_unusable")
+            return None
+        per_rune[asset] = bal_rune / bal_asset
+    return per_rune["XMR.XMR"] / per_rune["BTC.BTC"]
+
+
+def thornode_btc_height(thornode_url, proxy_url):
+    """ThorChain's last observed BTC block height, on its own circuit to the
+    THORNode the operator named, or None when it cannot be read.
+
+    THE STAGE 2 READ: the tip a forward writes into nLockTime came from ONE
+    server's answer to the look, bounded only under the height nLockTime
+    reads as a date. A server that named 499,999,999 made a transaction no
+    node accepts until that block, every send was rejected as non-final,
+    and the same server leads every retry of that address (the rotation is
+    the address's own). The locktime is the lower of the two heights now:
+    a THORNode a block or two behind costs a locktime a block or two lower,
+    which every node takes. Rests on the THORNode being who it says (https
+    or an .onion, watch.thornode_url_ok), not on anything secret."""
+    proxies = isolated_proxy(proxy_url, "forward:lastblock")
+    try:
+        blocks = safe_get(f"{thornode_url.rstrip('/')}/thorchain/lastblock",
+                          proxies)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("forward", f"lastblock_fetch_fail:{type(e).__name__}")
+        return None
+    if not isinstance(blocks, list):
+        return None
+    btc = [b for b in blocks if isinstance(b, dict)
+           and b.get("chain") == _THOR_BTC_CHAIN]
+    if len(btc) != 1:
+        return None
+    h = btc[0].get("last_observed_in")
+    # No upper bound: a height past the look's tip never lowers min() (the
+    # sweep's mutant of one survived for that reason). A height of 0 or
+    # less would -- to nLockTime 0 -- and is no height.
+    if isinstance(h, bool) or not isinstance(h, int) or h <= 0:
+        return None
+    return h
+
+
+#: HOW FAR OVER THORCHAIN'S OWN BTC GAS RATE a server's fee estimate may
+#: go before it is taken as a lie and ThorChain's figure (times this) is paid
+#: instead. ThorChain's rate already runs above the network's (it pays its
+#: own outbounds generously), so twice it is a busy day, not a quiet one.
+#: Public, like every bound here: it limits what one server's word can cost.
+GAS_RATE_CAP_X = 2
+
+
+def fetch_inbound_entries(thornode_url, proxy_url):
+    """THORNode's inbound_addresses, on its own circuit: a list, or a
+    refusal (inbound_unverified). Asked ONCE per run, before the fee is
+    decided: its BTC entry caps the fee estimate (thorchain_fee_cap) and is
+    what cross_check_inbound later holds the aggregator's inbound to."""
     proxies = isolated_proxy(proxy_url, "forward:inbound")
     try:
         entries = safe_get(f"{thornode_url.rstrip('/')}/thorchain/"
@@ -950,6 +1059,56 @@ def cross_check_inbound(inbound, thornode_url, proxy_url):
     if not isinstance(entries, list):
         raise Refused("inbound_unverified", "THORNode's inbound list is not "
                       "a list")
+    return entries
+
+
+def thorchain_fee_cap(entries, floor):
+    """The highest fee rate (sat/vB) a server's estimate is taken at, from
+    ThorChain's own BTC gas rate in `entries`: GAS_RATE_CAP_X times it,
+    never under the operator's floor. None when the entry carries no usable
+    rate (the estimate then stands as it always did).
+
+    THE STAGE 2 READ: the fee estimate is ONE server's answer to the look,
+    bounded only by the operator's ceiling. A server that named just under
+    it had every forward pay that rate -- up to a fifth of the deposit
+    (MAX_FEE_FRACTION) burned to miners -- and one that named just over it
+    had every forward `delayed`, for as long as it led the rotation. With a
+    THORNode named, its figure bounds that word. Rests on the THORNode being
+    who it says (https or an .onion), not on anything secret."""
+    if not isinstance(entries, list):
+        return None
+    btc = [e for e in entries if isinstance(e, dict)
+           and e.get("chain") == _THOR_BTC_CHAIN]
+    if len(btc) != 1:
+        return None
+    units = btc[0].get("gas_rate_units")
+    if units not in (None, "satsperbyte"):
+        return None
+    rate = finite_decimal(btc[0].get("gas_rate"))
+    if rate is None or rate <= 0 or rate > 100000:
+        return None
+    return max(int(floor), int((rate * GAS_RATE_CAP_X)
+                               .to_integral_value(rounding=ROUND_CEILING)))
+
+
+def cross_check_inbound(inbound, thornode_url, proxy_url, entries=None):
+    """THORNode's own inbound_addresses, on a second circuit: the BTC
+    entry must exist, must not be halted, and must name the SAME address
+    the aggregator gave us. Returns (dust threshold, outbound fee), each
+    in sat or None when the entry did not carry a usable one. THE
+    OUTBOUND FEE IS WHAT A REFUND LACKS: ThorChain refunds the unfilled
+    part of a streaming swap less this fee, and the pairs rewrite on the
+    vault scales the forward's quote by what was actually swapped -- the
+    refund PLUS the fee -- or a small forward reads `short` for ever (the
+    fee is a tenth of a 0.003 BTC forward; the arrival tolerance is a
+    tenth). Recorded on the plan from the node the operator named, at the
+    moment that node is trusted for the inbound address itself; capped at
+    REFUND_FEE_SLACK_SAT, so a lying node can lower what a client is told
+    to expect by no more than the slack a FULL refund already rests on.
+    `entries`, when given, is the list this run already fetched
+    (fetch_inbound_entries); else it is fetched here."""
+    if entries is None:
+        entries = fetch_inbound_entries(thornode_url, proxy_url)
     btc = [e for e in entries if isinstance(e, dict)
            and e.get("chain") == _THOR_BTC_CHAIN]
     if len(btc) != 1:
@@ -2823,12 +2982,14 @@ def main(argv=None):
                       "for THORNode, and its inbound list is the one check "
                       "against an aggregator naming its own address. Re-pair "
                       "with --thornode https://... (gs_wake_keys).")
+    # (A reconciliation is held to this too: it set args.broadcast above.)
     if args.broadcast and not args.thornode:
-        raise Refused("bad_args", "--broadcast needs --thornode: a forward "
-                      "that sends pays the inbound address the aggregator "
-                      "names, and THORNode's own inbound list is the one "
-                      "check against an aggregator naming its own. Pair "
-                      "--thornode (gs_wake_keys) or rehearse with --dry-run.")
+        raise Refused("bad_args", "a run that sends (--broadcast, or "
+                      "--reconcile) needs --thornode: a forward that sends "
+                      "pays the inbound address the aggregator names, and "
+                      "THORNode's own inbound list is the one check against "
+                      "an aggregator naming its own. Pair --thornode "
+                      "(gs_wake_keys) or rehearse with --dry-run.")
     # WHICH ACCOUNT OF THE SEED THE XPUB IS (STAGE5_PLAN.md 3.5): 0 unless
     # the pair was retired to a fresh chain. From the environment like the
     # xpub; absent means 0, which every pair before the field was.
@@ -3039,11 +3200,25 @@ def main(argv=None):
                       f"nothing is settled at this address to {args.min_conf} "
                       "confirmations; ask again later")
 
+    # THORNODE'S INBOUND LIST, ONCE, BEFORE THE FEE (the stage 2 read): its
+    # BTC entry bounds the server's fee estimate (thorchain_fee_cap) and is
+    # what the aggregator's inbound is held to after the quote.
+    thor_entries = (fetch_inbound_entries(args.thornode, args.tor_proxy)
+                    if args.thornode else None)
+    _estimate = args.feerate_sat_vb or picture.get("fee_sat_vb")
+    _fcap = (thorchain_fee_cap(thor_entries, args.feerate_floor)
+             if not args.feerate_sat_vb else None)
+    if _fcap is not None and isinstance(_estimate, int) \
+            and not isinstance(_estimate, bool) and _estimate > _fcap:
+        integrity_log("forward", "fee_estimate_over_thorchain")
+        print(f"  [!] the server's fee estimate ({_estimate} sat/vB) is over "
+              f"{GAS_RATE_CAP_X}x ThorChain's own; paying {_fcap}")
+        _estimate = _fcap
+
     # 2. the fee, sized against the largest transaction the policy allows,
     #    over the inputs worth spending at that rate
     try:
-        rate = fee_band(args.feerate_sat_vb or picture.get("fee_sat_vb"),
-                        args.feerate_floor, args.feerate_ceiling)
+        rate = fee_band(_estimate, args.feerate_floor, args.feerate_ceiling)
         chosen, skipped_dust, unsettled, left_over = spendable(
             picture["utxos"], args.min_conf, rate, exclude,
             args.op_return_max_bytes, args.min_send_sat)
@@ -3140,22 +3315,56 @@ def main(argv=None):
     oracle = btc_per_xmr_oracle(isolated_proxy(args.tor_proxy,
                                                "forward:oracle"),
                                 getter=safe_get)
+    # ...MEASURED AGAINST A PRICE THAT IS NOT THE AGGREGATOR'S (the stage 2
+    # read). A run that may SEND takes one or waits: with the oracle out of
+    # reach the aggregator's figure alone set the memo's output limit, so
+    # whoever answers as the aggregator chose how little the swap may
+    # deliver. ThorChain's own pools, on the THORNode a sending run must
+    # name, are the second reference (thornode_pool_rate); with neither,
+    # nothing is quoted or signed, and the Pi tries again later (`delayed`).
+    # A rehearsal still runs and says it was not cross-checked.
+    pool_rate = None
+    try:
+        if args.thornode:
+            pool_rate = thornode_pool_rate(args.thornode, args.tor_proxy)
+    except Refused:
+        write_status(args.outfile, STATUS_DELAYED)
+        raise
+    if (args.broadcast or args.reconcile) and oracle is None \
+            and pool_rate is None:
+        integrity_log("forward", "no_price_reference")
+        write_status(args.outfile, STATUS_DELAYED)
+        raise Refused("no_price_reference",
+                      "neither the price oracle nor ThorChain's own pools "
+                      "could be read, so the quote could not be measured "
+                      "against any price but its own; nothing was quoted or "
+                      "signed, and it is tried again later")
     inbound, memo, expected = fetch_quote(send_sat, dest_xmr, args.tor_proxy)
     quoted_at = _clock()                   # the clock the broadcast reads
     inbound_spk = validate_inbound(inbound, args.network)
     memo_quoted = validate_memo(memo, dest_xmr)
     expected_xmr, worst_xmr = validate_expected(
-        expected, send_sat, min_out, args.max_slippage, oracle)
+        expected, send_sat, min_out, args.max_slippage, oracle,
+        pool_rate=pool_rate)
     memo_text, memo_limit, affiliate_bps, limit_set = enforce_memo_terms(
         memo_quoted, expected_xmr, worst_xmr, args.max_affiliate_bps)
     memo_b = fit_memo(memo_text, dest_xmr, args.op_return_max_bytes)
 
     # 4. THORNode's word on the inbound, when the operator named a node
     cross_checked, outbound_fee = False, None
+    lock_tip = picture["tip"]
     if args.thornode:
         dust, outbound_fee = cross_check_inbound(inbound, args.thornode,
-                                                 args.tor_proxy)
+                                                 args.tor_proxy,
+                                                 entries=thor_entries)
         cross_checked = True
+        # ...AND ON THE HEIGHT nLockTime CARRIES (thornode_btc_height): the
+        # lower of the look's tip and ThorChain's last observed block.
+        _th = thornode_btc_height(args.thornode, args.tor_proxy)
+        if _th is not None and _th < lock_tip:
+            if lock_tip - _th > 6:
+                integrity_log("forward", "tip_ahead_of_thornode")
+            lock_tip = _th
         if dust is not None and send_sat < dust:
             if send_sat + _jit >= dust:
                 # ONLY THE FEE'S JITTER PUT IT UNDER (self-doubt over the
@@ -3197,7 +3406,7 @@ def main(argv=None):
     # backstop for whatever else the signer declines.
     try:
         tx, txid, vsize, real_rate, signed = build_and_sign(
-            chosen, picture["tip"], inbound_spk, send_sat, fee_sat, memo_b,
+            chosen, lock_tip, inbound_spk, send_sat, fee_sat, memo_b,
             account, index, address, args.network, sign=not args.plan_only)
     except btx.BtcTxError as e:
         raise Refused("build_failed",

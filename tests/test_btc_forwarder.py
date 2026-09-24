@@ -124,6 +124,16 @@ def _bundle(dest=_DEST):
 _BUNDLE = _bundle()
 
 
+#: 50,000 RUNE per BTC and 200 per XMR: 0.004 BTC per XMR, _ORACLE's price.
+_POOLS_AT_ORACLE = {
+    "BTC.BTC": {"asset": "BTC.BTC", "status": "Available",
+                "balance_asset": "10000000000",
+                "balance_rune": "500000000000000"},
+    "XMR.XMR": {"asset": "XMR.XMR", "status": "Available",
+                "balance_asset": "250000000000",
+                "balance_rune": "50000000000000"}}
+
+
 class Net:
     """Everything the forwarder reaches over the network, canned."""
 
@@ -131,8 +141,17 @@ class Net:
                  expected=None, oracle=_ORACLE, thornode=None,
                  look_error=None, post_error=None, routes=None,
                  factor=Decimal(1), submit=None, seen=None, clock=None,
-                 spends=None, funding=None, truncated=None):
+                 spends=None, funding=None, truncated=None, pools=None,
+                 lastblock=None):
         self.factor = factor                     # quote vs oracle, x
+        # THORCHAIN'S POOLS, as the THORNode reports them (the stage 2
+        # read: the price a sending forward is measured against when the
+        # oracle is out of reach). The default agrees with _ORACLE; a dict
+        # {asset: answer} or an exception overrides it.
+        self.pools = _POOLS_AT_ORACLE if pools is None else pools
+        # ThorChain's last observed blocks (/thorchain/lastblock): None by
+        # default -- no height, so the look's tip stands as it always did.
+        self.lastblock = lastblock
         self.clock = clock                       # the quote-age clock
         # A HISTORY LONGER THAN THE READER'S WINDOW (the MED pass): the
         # total spends_of would report through on_truncated, or None.
@@ -219,6 +238,12 @@ class Net:
         self.gets.append((url, proxies))
         if isinstance(self.thornode, Exception):
             raise self.thornode
+        if "/thorchain/pool/" in url:
+            if isinstance(self.pools, Exception):
+                raise self.pools
+            return self.pools.get(url.rsplit("/", 1)[-1])
+        if url.endswith("/thorchain/lastblock"):
+            return self.lastblock
         return self.thornode
 
     def _submit(self, raw_hex, expected_txid, address, servers, proxy_url,
@@ -724,6 +749,22 @@ check("without --dry-run: refused before anything is asked of the network",
 _r("memo_unbound", Net(memo="=:XMR.XMR:" + _OTHER + ":0/1/0"))
 _r("bad_memo", Net(memo=_MEMO + "\n:extra"))
 _r("no_memo", Net(memo=""))
+# WHAT THORCHAIN READS AS WRITTEN IS CHECKED AS WRITTEN (the stage 2 read):
+# the bind check strips each field and takes any asset on the XMR chain,
+# and the OP_RETURN carries the memo byte for byte. Each of these bound,
+# was signed, and ThorChain would have refunded it less its fees.
+for _bm, _why in (("= :XMR.XMR:" + _DEST + ":{LIMIT}/1/0", "a space"),
+                  ("=:XMR.XMR\u00a0:" + _DEST + ":{LIMIT}/1/0",
+                   "a no-break space"),
+                  ("=:XMR.XMR:" + _DEST + " :{LIMIT}/1/0",
+                   "a space after the destination"),
+                  ("=:XMR.BOGUS:" + _DEST + ":{LIMIT}/1/0",
+                   "an asset ThorChain does not have")):
+    check(f"a memo with {_why} is refused bad_memo before anything is "
+          f"signed", _refusal(Net(memo=_bm))[3] == "bad_memo")
+check("NON-VACUITY: the same memo exact, and in lower case, is taken",
+      run(Net(memo="=:xmr.xmr:" + _DEST + ":{LIMIT}/1/0"))[0] == 0
+      and run(Net(memo="=:XMR:" + _DEST + ":{LIMIT}/1/0"))[0] == 0)
 _r("memo_affiliate_fee", Net(memo=_MEMO + ":thorname:1000"), policy=255)
 _r("memo_affiliate_fee", Net(memo=_MEMO + ":thorname:abc"), policy=255)
 check("...an affiliate fee within --max-affiliate-bps is accepted and "
@@ -1119,7 +1160,7 @@ _r("quote_deviates", Net(expected="0.9"))              # ~0.5 quoted -> 1.8x
 _r("quote_deviates", Net(factor=Decimal("0.70")))        # 30% under the oracle
 _out = run(Net(factor=Decimal("1.06")))[1]
 check("a 6% deviation only warns, and the forward signs",
-      "from the oracle" in _out and "SIGNED" in _out)
+      "from the price oracle" in _out and "SIGNED" in _out)
 check("...and 24% passes the default 25% stop, while --max-slippage 0.2 "
       "refuses it", run(Net(factor=Decimal("1.24")))[0] == 0
       and _refusal(Net(factor=Decimal("1.24")), "--max-slippage", "0.2")[3]
@@ -1139,6 +1180,131 @@ def _status_of(outfile):
     return json.load(open(p))["state"] if os.path.exists(p) else None
 
 
+# A SENDING FORWARD IS MEASURED AGAINST A PRICE THAT IS NOT THE
+# AGGREGATOR'S (the stage 2 read). With the oracle out of reach -- common
+# over Tor -- the aggregator's figure alone set the memo's output limit on
+# a forward that SENT: a quote 30% under the market signed and went.
+print("\n== the stage 2 read: ThorChain's own pools, the second reference ==")
+_np1 = Net(oracle=None, factor=Decimal("0.70"), submit=_ACCEPTED,
+           seen=_SEEN0)
+_c, _o, _p, _k = _refusal(_np1, broadcast=True)
+check("the oracle down, a quote 30% under ThorChain's own pool price, a "
+      "SENDING run: refused quote_deviates, nothing sent",
+      _k == "quote_deviates" and _np1.submits == []
+      and "ThorChain pool price" in _o)
+_np1b = Net(oracle=None, factor=Decimal("0.97"), submit=_ACCEPTED,
+            seen=_SEEN0)
+check("NON-VACUITY: the same run with the quote 3% from the pools sends",
+      run(_np1b, broadcast=True)[0] == 0 and len(_np1b.submits) == 1)
+check("...and the pools are read on their OWN circuit, from the THORNode "
+      "the run names",
+      [g for g in _np1b.gets if "/thorchain/pool/" in g[0]]
+      and all(g[0].startswith("https://tn.example/thorchain/pool/")
+              and g[1]["http"] == C.isolated_proxy(_PROXY,
+                                                   "forward:pools")["http"]
+              for g in _np1b.gets if "/thorchain/pool/" in g[0]))
+_np2 = Net(oracle=None, pools={}, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _k = _refusal(_np2, broadcast=True)
+check("the oracle down AND the pools unreadable, a sending run: refused "
+      "no_price_reference BEFORE the aggregator is asked, `delayed` for the "
+      "Pi to try again, nothing sent",
+      _k == "no_price_reference" and _np2.posts == [] and _np2.submits == []
+      and ("forward", "no_price_reference") in _np2.kinds)
+_np2o = Net(oracle=None, pools={}, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _of2 = run(_np2o, broadcast=True)
+check("...the status word is `delayed`", _status_of(_of2) == "delayed")
+_np3 = Net(oracle=None, pools={})
+_c, _o, _p, _ = run(_np3, "--thornode", "https://tn.example")
+check("NON-VACUITY: a REHEARSAL with no reference still runs, and says the "
+      "quote was not cross-checked", _c == 0 and "NOT cross-checked" in _o)
+_np4 = Net(pools={**_POOLS_AT_ORACLE, "XMR.XMR": {
+    **_POOLS_AT_ORACLE["XMR.XMR"], "status": "Staged"}},
+    submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _of4 = run(_np4, broadcast=True)
+check("a pool ThorChain does not swap through (Staged): refused "
+      "pool_unavailable, `delayed`, nothing quoted or sent -- a payment "
+      "now would come back less fees",
+      ("forward", "refused:pool_unavailable") in _np4.kinds
+      and _status_of(_of4) == "delayed" and _np4.posts == []
+      and _np4.submits == [])
+# THE LOCKTIME IS NOT ONE SERVER'S WORD (the stage 2 read): the look's tip
+# went into nLockTime as it came, and a server naming 499,999,999 made a
+# transaction no node takes -- rejected as non-final, every retry, behind
+# the same leading server.
+def _locktime_of(net):
+    return (T.Transaction.parse(bytes.fromhex(net.submits[0]["raw_hex"]))
+            .locktime if net.submits else None)
+
+
+_nlt = Net(lastblock=[{"chain": "BTC", "last_observed_in": _TIP - 20}],
+           submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nlt, broadcast=True)
+check("the look's tip 20 blocks past ThorChain's last observed BTC block: "
+      "the transaction's nLockTime is ThorChain's height, and the chain says "
+      "the tip ran ahead",
+      _c == 0 and _locktime_of(_nlt) == _TIP - 20
+      and ("forward", "tip_ahead_of_thornode") in _nlt.kinds)
+_nlt2 = Net(lastblock=[{"chain": "BTC", "last_observed_in": _TIP + 3}],
+            submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nlt2, broadcast=True)
+check("NON-VACUITY: a THORNode ahead of the look changes nothing -- the "
+      "look's tip is the locktime", _c == 0 and _locktime_of(_nlt2) == _TIP
+      and ("forward", "tip_ahead_of_thornode") not in _nlt2.kinds)
+_nlt3 = Net(lastblock=[{"chain": "BTC", "last_observed_in": 0}],
+            submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nlt3, broadcast=True)
+check("...and a height of 0 is no height: the look's tip stands (taken, it "
+      "would have written nLockTime 0)",
+      _c == 0 and _locktime_of(_nlt3) == _TIP)
+# ONE SERVER'S FEE ESTIMATE IS BOUNDED BY THORCHAIN'S OWN (the stage 2
+# read): just under the ceiling, it had every forward burn up to a fifth of
+# the deposit to miners; just over it, every forward `delayed`.
+_GAS = [{"chain": "BTC", "address": _INBOUND, "halted": False,
+         "gas_rate": "10", "gas_rate_units": "satsperbyte"}]
+_nfc = Net(fee=150, thornode=_GAS, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nfc, broadcast=True)
+check("a server estimate of 150 sat/vB beside ThorChain's 10: the forward "
+      "pays twice ThorChain's, 20, and the chain says the estimate ran over",
+      _c == 0 and (_p or {}).get("feerate_target_sat_vb") == 20
+      and ("forward", "fee_estimate_over_thorchain") in _nfc.kinds)
+_nfc2 = Net(fee=15, thornode=_GAS, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nfc2, broadcast=True)
+check("NON-VACUITY: an estimate under the cap is paid as it came",
+      _c == 0 and (_p or {}).get("feerate_target_sat_vb") == 15
+      and ("forward", "fee_estimate_over_thorchain") not in _nfc2.kinds)
+_nfc3 = Net(fee=5000, thornode=_GAS, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _of3 = run(_nfc3, broadcast=True)
+check("...an estimate over the CEILING is no longer a `delayed` for as long "
+      "as that server leads: ThorChain's figure is paid",
+      _c == 0 and (_p or {}).get("feerate_target_sat_vb") == 20
+      and _status_of(_of3) is None)
+_nfc4 = Net(fee=150, thornode=_GAS, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nfc4, "--feerate-sat-vb", "40", broadcast=True)
+check("...and a rate the OPERATOR gave (--feerate-sat-vb) is theirs: not "
+      "capped", _c == 0 and (_p or {}).get("feerate_target_sat_vb") == 40)
+_nfc5 = Net(fee=150, thornode=[{**_GAS[0], "gas_rate_units": "gwei"}],
+            submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _ = run(_nfc5, broadcast=True)
+check("...and a rate in units this tool does not read bounds nothing: the "
+      "estimate stands", _c == 0
+      and (_p or {}).get("feerate_target_sat_vb") == 150)
+check("THORNode's inbound list is asked ONCE for the run, the cap and the "
+      "cross-check both read it",
+      sum("inbound_addresses" in u for u, _ in _nfc.gets) == 1)
+# THE ORACLE AND THE POOLS EACH MEASURE IT: when they disagree by more than
+# the stop, one of them is wrong, and the quote is not sent on either.
+_np5 = Net(pools={**_POOLS_AT_ORACLE, "XMR.XMR": {
+    **_POOLS_AT_ORACLE["XMR.XMR"], "balance_asset": "175000000000"}},
+    submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _k = _refusal(_np5, broadcast=True)
+check("a quote at the oracle's price but 30% off the pools' is refused "
+      "quote_deviates: every reference is asked", _k == "quote_deviates"
+      and _np5.submits == [])
+_np6 = Net(submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p, _k = _refusal(_np6, "--reconcile", dry_run=False)
+check("a --reconcile without --thornode is refused bad_args, and the "
+      "refusal names both sending modes",
+      _k == "bad_args" and "--reconcile" in _o and _np6.look_calls == [])
 # TODAY'S FEE, NOT THE DEPOSIT: `delayed` -- the same deposit forwards with
 # cheaper blocks, and the Pi tries again by itself (STAGE5_PLAN.md 3.2).
 for _why, _net, _kind in (
@@ -2604,8 +2770,9 @@ _net = Net(thornode=_ok_node)
 _code, _out, _plan, _ = run(_net, "--thornode", "https://thornode.example")
 check("with --thornode the inbound is verified on a second circuit and the "
       "plan says so", _code == 0 and _plan["inbound_cross_checked"] is True
-      and _net.gets and _net.gets[0][0].endswith("/thorchain/inbound_addresses")
-      and _net.gets[0][1]["http"]
+      and [g for g in _net.gets if g[0].endswith("/thorchain/inbound_addresses")]
+      and [g for g in _net.gets if g[0].endswith(
+          "/thorchain/inbound_addresses")][0][1]["http"]
       == C.isolated_proxy(_PROXY, "forward:inbound")["http"]
       and "THORNode-verified" in _out)
 _r("inbound_mismatch", Net(thornode=[{"chain": "BTC", "address": _ADDR0,

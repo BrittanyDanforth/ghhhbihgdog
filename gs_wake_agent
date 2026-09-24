@@ -3584,6 +3584,12 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                           "this machine's keyfile puts the fee-rate floor "
                           "above the ceiling; re-pair.")
         _aff = _btc_setting(key, "max_affiliate_bps", 0, 0, 1000)
+        # HOW FAR A QUOTE MAY SIT FROM THE PRICE REFERENCES (the stage 2
+        # read), in basis points: the keyfile's word, absent means the
+        # forwarder's own 25% it always was. PUBLIC, like every limit
+        # here: a hostile quote can sit just under it, so it bounds the
+        # loss to the aggregator's word and does not prevent it.
+        _slip = _btc_setting(key, "btc_max_slippage_bps", 2500, 100, 5000)
         # HOW LONG A FORWARD MAY SIT IN THE MEMPOOL under today's rate
         # before a reconciliation replaces it (stage 6): the keyfile's
         # word, absent means the two hours it was before the field.
@@ -3633,6 +3639,7 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                 "--feerate-floor", str(_floor),
                 "--feerate-ceiling", str(_ceiling),
                 "--max-affiliate-bps", str(_aff),
+                "--max-slippage", str(Decimal(_slip) / Decimal(10000)),
                 "--bump-after", str(_bump),
                 "--returns-max", str(_returns),
                 # THE SAME MIX FLOOR the quote step is given, so a deposit

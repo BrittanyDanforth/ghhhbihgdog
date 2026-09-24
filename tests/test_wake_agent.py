@@ -4754,6 +4754,9 @@ for _extra, _why in (
         (_BTC_OK + ["--feerate-floor-sat-vb", "50",
                     "--feerate-ceiling-sat-vb", "10"], "an inverted fee band"),
         (_BTC_OK + ["--max-affiliate-bps", "5000"], "an affiliate cap over 10%"),
+        (_BTC_OK + ["--max-slippage-bps", "50"], "a slippage stop under 1%"),
+        (_BTC_OK + ["--max-slippage-bps", "6000"],
+         "a slippage stop over 50%"),
         (_BTC_OK + ["--btc-bump-after", "-1"], "a negative bump window"),
         (_BTC_OK + ["--btc-bump-after", "700000"], "a bump window over a week"),
         (_BTC_OK + ["--thornode", "ftp:/x"], "a THORNode URL that is not http")):
@@ -4770,6 +4773,15 @@ check("pairing/btc: the bump window pairs (a drill's 0 and a week both "
 check("pairing/btc: the keyfile carries the fee band and the affiliate cap",
       '"feerate_floor_sat_vb": int(args.feerate_floor_sat_vb)' in _kp_src
       and '"max_affiliate_bps": int(args.max_affiliate_bps)' in _kp_src)
+check("pairing/btc: the slippage stop pairs at both ends of its range and "
+      "is written as btc_max_slippage_bps, the name the agent reads (the "
+      "stage 2 read: it was a public 25% nothing on the vault could tighten)",
+      _pairs_btc(_BTC_OK + ["--max-slippage-bps", "100"]) is None
+      and _pairs_btc(_BTC_OK + ["--max-slippage-bps", "5000"]) is None
+      and '"btc_max_slippage_bps": int(getattr(args, "max_slippage_bps", '
+      '2500))' in _kp_src
+      and '_btc_setting(key, "btc_max_slippage_bps", 2500, 100, 5000)'
+      in _A_SRC)
 # THE FLOOR IS TOLD AT PAIRING, beside the ceiling it follows from, with
 # the two things the operator can do about it (STAGE5_PLAN.md 3.3).
 _fl_args = _K.build_cli().parse_args(
@@ -5086,10 +5098,23 @@ check("a keyfile carrying the fee band and the affiliate cap puts THOSE on "
       and _argv2[_argv2.index("--feerate-floor") + 1] == "3"
       and _argv2[_argv2.index("--feerate-ceiling") + 1] == "50"
       and _argv2[_argv2.index("--max-affiliate-bps") + 1] == "10")
+check("...and with no slippage stop on the keyfile, the forwarder is handed "
+      "the 25% it always had", bool(_ran2)
+      and ("--max-slippage" in _argv2
+           and _argv2[_argv2.index("--max-slippage") + 1]) == "0.25")
+_o2, _e2, _ran2 = _fwd_run(_FWD_REC, {**_FWD_KEY,
+                                      "btc_max_slippage_bps": 800})
+_argv2 = _ran2[0][0] if _ran2 else []
+check("a keyfile carrying a slippage stop of 800 bps hands the forwarder "
+      "0.08 (the stage 2 read)", bool(_ran2)
+      and ("--max-slippage" in _argv2
+           and _argv2[_argv2.index("--max-slippage") + 1]) == "0.08")
 for _bad in ({"btc_min_conf": 0}, {"btc_min_conf": "2"},
              {"op_return_max_bytes": 300}, {"op_return_max_bytes": True},
              {"feerate_floor_sat_vb": 50, "feerate_ceiling_sat_vb": 10},
-             {"btc_network": "bogus"}, {"max_affiliate_bps": 5000}):
+             {"btc_network": "bogus"}, {"max_affiliate_bps": 5000},
+             {"btc_max_slippage_bps": 50}, {"btc_max_slippage_bps": "2500"},
+             {"btc_max_slippage_bps": True}):
     _o2, _e2, _ran2 = _fwd_run(_FWD_REC, {**_FWD_KEY, **_bad})
     check(f"a keyfile value present and wrong is REFUSED btc_config_malformed, "
           f"never coerced: {_bad}",
