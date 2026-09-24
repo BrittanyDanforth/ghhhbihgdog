@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 from decimal import Decimal
 
@@ -170,14 +171,25 @@ class Net:
         self.look_calls.append((address, servers, proxy_url, kw))
         if self.look_error:
             raise self.look_error
+        # SETTLED AS gs_btc_watch.summarize COUNTS IT: at min_conf, output
+        # by output. Counting every mined output hid each decision that
+        # turns on depth (a payment one block short read as settled), and
+        # the outputs go out as COPIES: main() marks a replacement's
+        # inputs `must` on the dicts it is handed, and a fixture reused
+        # after that would carry the mark into every later Net.
+        _mc = max(1, int(kw.get("min_conf") or 1))
+        confirmed = sum(u["value"] for u in self.utxos
+                        if u["confirmations"] > 0)
         settled = sum(u["value"] for u in self.utxos
-                      if u["confirmations"] > 0)
+                      if u["confirmations"] >= _mc)
         pic = {"state": ("confirmed" if settled
                          else "seen" if self.utxos else "not_seen"),
-               "confirmed_sat": settled, "unconfirmed_sat": 0,
+               "confirmed_sat": confirmed,
+               "unconfirmed_sat": sum(u["value"] for u in self.utxos
+                                      if u["confirmations"] <= 0),
                "settled_sat": settled, "confirmations": 5,
-               "utxos": list(self.utxos), "tip": _TIP, "server": "s.onion",
-               "cert_sha256": None}
+               "utxos": [dict(u) for u in self.utxos], "tip": _TIP,
+               "server": "s.onion", "cert_sha256": None}
         if kw.get("fee_blocks") is not None:
             pic["fee_sat_vb"] = self.fee
         return pic
@@ -1067,6 +1079,89 @@ check("NON-VACUITY: the same outputs with a 1 sat/vB floor are not dust at "
       _c == F.EXIT_REFUSED
       and ("forward", "refused:nothing_economic") in _nDd.kinds
       and _status_of(_of) == "delayed")
+
+
+def _outs(vals, conf=9):
+    """Outputs of these values; a (value, confirmations) pair sets a depth."""
+    out = []
+    for i, v in enumerate(vals):
+        v, c = v if isinstance(v, tuple) else (v, conf)
+        out.append({"tx_hash": "%064x" % (i + 1), "vout": 0, "value": v,
+                    "confirmations": c})
+    return out
+
+
+# NOT DUST, AND STILL NEVER A FORWARD: the one-input floor is not the test.
+# A hundred 200 sat outputs (20,000: twice the one-input floor at 1 sat/vB)
+# pay a hundred-input fee of over a fifth at 1 sat/vB and are dust from
+# 2 up; twenty of 520 carry under the minimum at 1, eat over a fifth at 2
+# and 3, and are dust from 4. No rate in the band forwards either.
+for _vals, _est, _kind, _fl in (([200] * 100, 1, "fee_eats_deposit", "1"),
+                                ([200] * 100, 5, "nothing_economic", "1"),
+                                ([520] * 20, 1, "below_minimum", "1"),
+                                ([1000] * 200, 5, "fee_eats_deposit", "5")):
+    _nX = Net(utxos=_outs(_vals), fee=_est)
+    _c, _o, _p, _of = run(_nX, "--feerate-floor", _fl)
+    check(f"{len(_vals)} outputs of {_vals[0]} sat, estimate {_est}, floor "
+          f"{_fl}: refused {_kind}, and 'short' -- no rate in the band "
+          "forwards them", _c == F.EXIT_REFUSED
+          and ("forward", f"refused:{_kind}") in _nX.kinds
+          and _p is None and _status_of(_of) == "short")
+# ...AND THE CHEAPEST RATE IS NOT ALWAYS THE ONE THAT FORWARDS. 20,000 sat
+# beside a hundred of 140 fails at 1 sat/vB (a 101-input fee over a fifth)
+# and forwards at 2, where the 140s are dust: `delayed`, not `short` --
+# the naive fix (the whole selection's fee at the floor rate) says short.
+_mix = _outs([20000] + [140] * 100)
+_nY = Net(utxos=_mix, fee=1)
+_c, _o, _p, _of = run(_nY)
+check("fails at the floor rate, forwards at a higher one: 'delayed'",
+      _c == F.EXIT_REFUSED
+      and ("forward", "refused:fee_eats_deposit") in _nY.kinds
+      and _status_of(_of) == "delayed")
+check("NON-VACUITY: ...and at an estimate of 2 the same address signs",
+      run(Net(utxos=_mix, fee=2))[0] == 0)
+check("dust_from is the rate from which select_inputs leaves an output of "
+      "that value behind, and not one below it",
+      all(F.select_inputs(_outs([_v]), 1, F.dust_from(_v))[0] == []
+          and (F.dust_from(_v) <= 1
+               or F.select_inputs(_outs([_v]), 1, F.dust_from(_v) - 1)[0])
+          for _v in (1, 137, 138, 139, 276, 277, 1000, 123457)))
+# THE ONE-INPUT FLOOR ITSELF: exactly it forwards at the floor rate, so on
+# a day the estimate is over the ceiling it is `delayed`; a satoshi under
+# it can never go, and is `short`. `<=` for `<` anywhere on that edge
+# stops the Pi retrying a deposit that forwards.
+_flr = T.forward_floor_sat(120, 1, T.FORWARD_MIN_SAT)
+for _v, _w in ((_flr, "delayed"), (_flr - 1, "short")):
+    _nE = Net(fee=500, utxos=_outs([_v]))
+    _c, _o, _p, _of = run(_nE)
+    check(f"the one-input floor's edge ({_v} sat, estimate over the "
+          f"ceiling): '{_w}'", _c == F.EXIT_REFUSED
+          and ("forward", "refused:fee_out_of_band") in _nE.kinds
+          and _status_of(_of) == _w)
+check("NON-VACUITY: exactly the floor signs at the floor rate",
+      run(Net(fee=1, utxos=_outs([_flr])))[0] == 0)
+# MONEY STILL CONFIRMING IS NOT SHORT. `short` reads "it has stopped
+# growing" on the phone, and the Pi does not start a `short` deposit again
+# until its confirmed total grows -- which a payment going from one
+# confirmation to two does not do. A whole payment one block short of
+# min_conf beside a small settled output was `short`, and sat there.
+for _why, _vals, _extra in (
+        ("5,000 settled and 300,000 at one confirmation",
+         [(5000, 6), (300000, 1)], ()),
+        ("5,000 settled and 300,000 in the mempool",
+         [(5000, 6), (300000, 0)], ()),
+        ("two hundred settled dust outputs and 100,000 at one confirmation",
+         [(546, 9)] * 200 + [(100000, 1)], ("--feerate-floor", "5"))):
+    _nU = Net(fee=5, utxos=_outs(_vals))
+    _c, _o, _p, _of = run(_nU, *_extra)
+    check(f"{_why}: refused, nothing signed, and the word is 'seen' (the Pi "
+          "asks again), not 'short'", _c == F.EXIT_REFUSED and _p is None
+          and any(k.startswith("refused:") for s, k in _nU.kinds)
+          and _status_of(_of) == "seen")
+check("NON-VACUITY: one block later the same payment signs",
+      run(Net(fee=5, utxos=_outs([(5000, 6), (300000, 2)])))[0] == 0)
+check("...and 5,000 sat alone, nothing confirming, is still 'short'",
+      _status_of(run(Net(fee=5, utxos=_outs([(5000, 6)])))[3]) == "short")
 _nm = Net(memo="=:XMR.XMR:" + _OTHER + ":0/1/0")
 _c, _o, _p, _of = run(_nm)
 check("a refusal that is not about the fee (memo_unbound) writes NO status "
@@ -1449,6 +1544,32 @@ check("NON-VACUITY: 150,000 sat back beside the same input, on a day the "
       "cheaper blocks", _c == F.EXIT_REFUSED
       and ("forward", "refused:fee_out_of_band") in _n7c.kinds
       and _n7c.submits == [] and _status_of(_of7c) == "delayed")
+# (f3) A REPLACEMENT TODAY'S FEE WILL NOT CARRY IS `delayed`, never
+# `short`: the forward it would replace stands in the mempool. 15,000 sat
+# went out at 11 sat/vB and sat four hours; at an estimate of 30 the
+# replacement's floor (12) puts its fee over a fifth, and the one-input
+# floor at 12 is over 15,000 -- the fresh-forward test said `short`,
+# "under what was quoted, stopped growing", about money that went out.
+_n7d = Net(utxos=_outs([15000]), fee=11, submit=_ACCEPTED, seen=_SEEN0)
+_c, _o, _p7d, _of7d = run(_n7d, broadcast=True)
+_pl7d = json.load(open(_of7d))
+_pl7d["ts"] = int(time.time()) - 4 * 3600
+with open(_of7d, "w") as _fh:
+    json.dump(_pl7d, _fh)
+_n7e = Net(utxos=[], fee=30, submit=_ACCEPTED, seen=_SEEN0,
+           spends=[{"txid": _p7d["txid"], "height": 0,
+                    "hex": _n7d.submits[0]["raw_hex"],
+                    "inputs": [{"tx_hash": _outs([15000])[0]["tx_hash"],
+                                "vout": 0, "value": 15000}],
+                    "server": "s.onion"}])
+_c, _o, _p, _ = _reconcile(_n7e, _of7d)
+check("a replacement refused on today's fee (the original still in the "
+      "mempool): nothing sent, the original's plan stands, and the word is "
+      "'delayed', not 'short'", _c == F.EXIT_REFUSED
+      and ("forward", "reconcile_bumped") in _n7e.kinds
+      and any(k.startswith("refused:fee") for s, k in _n7e.kinds)
+      and _n7e.submits == [] and _p["txid"] == _p7d["txid"]
+      and _status_of(_of7d) == "delayed")
 # (g) a spend of the address that is NOT ours: the run fails, nothing signed.
 _p8, _of8, _hx8 = _first_send()
 _n8 = Net(utxos=[], spends=[_listed(_p8, _hx8),

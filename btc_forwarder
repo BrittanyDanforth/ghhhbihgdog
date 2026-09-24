@@ -342,6 +342,23 @@ def fee_band(rate, floor, ceiling):
     return rate
 
 
+#: What spending one more P2WPKH input adds to a transaction, in vbytes,
+#: rounded up.
+INPUT_MARGINAL_VB = btx.INPUT_BASE + -(-btx.WITNESS_P2WPKH_MAX // 4)
+
+
+def dust_line(rate):
+    """The value at or under which select_inputs leaves an output (not a
+    `must` one) behind at `rate`: twice what spending it costs."""
+    return 2 * INPUT_MARGINAL_VB * rate
+
+
+def dust_from(value):
+    """The lowest whole rate at which an output of `value` is dust: from
+    there up, select_inputs leaves it behind."""
+    return -(-int(value) // dust_line(1))
+
+
 def select_inputs(utxos, min_conf, rate, exclude=()):
     """The outputs the forward spends, and why the rest are left.
 
@@ -367,8 +384,7 @@ def select_inputs(utxos, min_conf, rate, exclude=()):
     for and is refused. Settlement is still required: a `must` output the
     server now shows shallow (a reorg) is not spent.
     Returns (chosen, skipped_dust, unsettled)."""
-    marginal_vb = btx.INPUT_BASE + -(-btx.WITNESS_P2WPKH_MAX // 4)
-    floor = 2 * marginal_vb * rate
+    floor = dust_line(rate)
     excluded = {(str(t).lower(), int(v)) for t, v in exclude}
     chosen, dust, unsettled = [], 0, 0
     for u in utxos:
@@ -392,22 +408,111 @@ def size_the_fee(n_inputs, op_return_limit, rate):
     return bound, btx.fee_for(bound, rate)
 
 
+def send_refusal(settled_sat, fee_sat, min_send_sat):
+    """None when a forward of `settled_sat` paying `fee_sat` passes both
+    fee guards, else the (kind, message) amount_to_send refuses it with.
+    Pure -- a Refused logs to the chain as it is built -- so it can be
+    asked of rates nobody is going to pay (forwards_at)."""
+    if fee_sat > settled_sat * MAX_FEE_FRACTION:
+        return ("fee_eats_deposit",
+                "the network fee would take more than "
+                f"{int(MAX_FEE_FRACTION * 100)}% of what settled; wait "
+                "for cheaper blocks rather than burn the deposit")
+    send = settled_sat - fee_sat
+    if send < min_send_sat:
+        return ("below_minimum",
+                f"after the fee this forward would carry {send} sat "
+                f"and the smallest forward that ThorChain does not "
+                f"treat as dust is {min_send_sat} sat; at least "
+                f"{min_send_sat + fee_sat} sat must settle first")
+    return None
+
+
 def amount_to_send(settled_sat, fee_sat, min_send_sat):
     """What reaches ThorChain: everything settled minus the fee, or a
     refusal that names the number needed."""
-    if fee_sat > settled_sat * MAX_FEE_FRACTION:
-        raise Refused("fee_eats_deposit",
-                      "the network fee would take more than "
-                      f"{int(MAX_FEE_FRACTION * 100)}% of what settled; wait "
-                      "for cheaper blocks rather than burn the deposit")
-    send = settled_sat - fee_sat
-    if send < min_send_sat:
-        raise Refused("below_minimum",
-                      f"after the fee this forward would carry {send} sat "
-                      f"and the smallest forward that ThorChain does not "
-                      f"treat as dust is {min_send_sat} sat; at least "
-                      f"{min_send_sat + fee_sat} sat must settle first")
-    return send
+    why = send_refusal(settled_sat, fee_sat, min_send_sat)
+    if why is not None:
+        raise Refused(*why)
+    return settled_sat - fee_sat
+
+
+def forwards_at(utxos, min_conf, rate, exclude, op_return_limit,
+                min_send_sat):
+    """Whether a forward at `rate` passes every fee-shaped guard main()
+    applies: select_inputs chooses something, and the fee size_the_fee
+    puts on it passes send_refusal. The fee's jitter is left out: main()
+    draws it inside the room those two guards leave, so it never turns a
+    pass into a refusal."""
+    chosen, _, _ = select_inputs(utxos, min_conf, rate, exclude=exclude)
+    if not chosen:
+        return False
+    _, fee = size_the_fee(len(chosen), op_return_limit, rate)
+    return send_refusal(sum(u["value"] for u in chosen), fee,
+                        min_send_sat) is None
+
+
+def forwards_in_band(utxos, min_conf, floor, ceiling, exclude,
+                     op_return_limit, min_send_sat):
+    """Whether ANY whole rate in [floor, ceiling] carries a forward of
+    these outputs (forwards_at).
+
+    NOT ONLY THE FLOOR: a higher rate can pass where the floor fails. At
+    the floor, outputs worth more than twice their input cost are spent,
+    and a hundred of them can take more than a fifth in fee; a rate or two
+    higher they are dust, left behind, and the real payment beside them
+    forwards alone. EXACT AND CHEAP: what select_inputs chooses changes
+    only at the rates an output turns to dust (dust_from), and between two
+    such rates the fee only grows -- so the lowest rate of each stretch is
+    the one to ask: the floor, and each output's dust_from inside the
+    band. And once what a rate chooses is under the one-input floor at
+    that rate, no higher rate can pass (it chooses no more; its floor is
+    no lower), which bounds the asks by the money, not by how many
+    outputs someone parked on the address."""
+    rates = {floor} | {r for r in (dust_from(u["value"]) for u in utxos
+                                   if not u.get("must"))
+                       if floor < r <= ceiling}
+    for r in sorted(rates):
+        if forwards_at(utxos, min_conf, r, exclude, op_return_limit,
+                       min_send_sat):
+            return True
+        chosen, _, _ = select_inputs(utxos, min_conf, r, exclude=exclude)
+        if sum(u["value"] for u in chosen) < btx.forward_floor_sat(
+                op_return_limit, r, min_send_sat):
+            return False
+    return False
+
+
+def fee_word(utxos, min_conf, floor, ceiling, exclude, op_return_limit,
+             min_send_sat, replacing=False):
+    """The status word a fee-shaped refusal (DELAY_KINDS) leaves for the Pi.
+
+    `delayed`: some rate this pair allows carries a forward of what has
+    settled -- not always a cheaper one (forwards_in_band) -- and the Pi
+    tries again by itself. `seen`: nothing settled can, but it could once
+    what is still confirming has settled -- money a block or two from
+    spendable is on its way, not short, and the Pi asks again (`arriving`).
+    `short`: at no rate this pair allows, even with every output on the
+    address settled, is there a forward; no waiting changes that, and the
+    Pi stops until MORE money settles. Decided over the money a forward
+    would spend at each rate -- never the look's settled_sat, which counts
+    the outpoints `exclude` names and outputs that are dust.
+
+    A REPLACEMENT (`replacing`) is always `delayed`: the forward it would
+    replace stands in the mempool, so there is nothing to be short of --
+    the floor was raised to what a node holding the original will take in
+    its place, and a refusal there means only "not at today's price", the
+    word bump_over_ceiling already says."""
+    if replacing:
+        return STATUS_DELAYED
+    band = (floor, ceiling, exclude, op_return_limit, min_send_sat)
+    if forwards_in_band(utxos, min_conf, *band):
+        return STATUS_DELAYED
+    whole = [dict(u, confirmations=max(int(u["confirmations"]),
+                                       int(min_conf), 1)) for u in utxos]
+    if forwards_in_band(whole, min_conf, *band):
+        return watch.STATE_SEEN
+    return STATUS_SHORT
 
 
 def quote_payload(send_sat, dest_xmr):
@@ -913,11 +1018,11 @@ STATUS_SHORT = "short"
 STATUS_RETURNED = "returned"
 STATUS_WORDS = (watch.STATE_NOT_SEEN, watch.STATE_SEEN, STATUS_DELAYED,
                 STATUS_SHORT, STATUS_RETURNED)
-#: The refusals that are about TODAY'S FEE, not about the deposit: with
-#: cheaper blocks the same deposit forwards. Each becomes `delayed` (or
-#: `short`, when even the floor rate could not carry it) rather than a
-#: refusal with no word, which the Pi read as "did not go through" and
-#: stopped trying (STAGE5_PLAN.md 3.2).
+#: The refusals that are about TODAY'S FEE, not about the deposit. Each
+#: becomes a word (fee_word: `delayed`, `seen` while money is still
+#: confirming, or `short` when no rate this pair allows could ever carry
+#: it) rather than a refusal with no word, which the Pi read as "did not go
+#: through" and stopped trying (STAGE5_PLAN.md 3.2).
 DELAY_KINDS = ("no_fee_estimate", "bad_fee_estimate", "fee_out_of_band",
                "fee_eats_deposit", "nothing_economic", "below_minimum")
 
@@ -2507,31 +2612,22 @@ def main(argv=None):
         send_sat = amount_to_send(settled_sat, fee_sat, args.min_send_sat)
     except Refused as e:
         # A REFUSAL ABOUT TODAY'S FEE IS A WORD, NOT A DEAD END (STAGE5_PLAN.md
-        # 3.2). `delayed`: with cheaper blocks this same deposit forwards,
-        # and the Pi tries again by itself. `short`: even at the floor rate
-        # this pair allows, what settled cannot carry a forward -- under
-        # what was quoted -- and no waiting changes that. Decided on the
-        # one-input floor at the FLOOR rate, the same arithmetic the vault
-        # accepts a deposit by.
-        # OVER THE MONEY A FORWARD AT THAT RATE WOULD SPEND, not the look's
-        # settled_sat: that total also counts the outpoints `exclude` names
-        # (a forward of ours the network lists has spent them, whatever a
-        # server says) and outputs that are dust even at the floor rate,
-        # and neither is money any forward carries. A 5,000 sat refund
-        # beside a listed forward's 200,000 sat input read as 205,000 and
-        # was `delayed` -- "nothing to do", a wake per retry, for ever --
-        # where the same 5,000 sat alone was `short`. The same selection
-        # the forward makes, at the floor rate: at any rate this pair
-        # allows, the dust line is no lower and the fee no smaller.
+        # 3.2): `delayed`, `seen` or `short`, decided by fee_word over every
+        # rate this pair allows and over the money a forward at each rate
+        # would spend. Three earlier forms of this line were each wrong in
+        # a way a real address reaches: the look's settled_sat counted
+        # dust and the outpoints a listed forward of ours already spent
+        # (`delayed` for money no forward carries); the chosen sum against
+        # the ONE-INPUT floor let a hundred small outputs read `delayed`
+        # while their hundred-input fee ate more than a fifth at every
+        # rate; and both said `short` -- "stopped growing", after which
+        # the Pi never starts it again by itself -- about a whole payment
+        # one confirmation short of min_conf.
         if e.kind in DELAY_KINDS:
-            _cheapest, _, _ = select_inputs(picture["utxos"], args.min_conf,
-                                            args.feerate_floor,
-                                            exclude=exclude)
-            hopeless = sum(u["value"] for u in _cheapest) \
-                < btx.forward_floor_sat(args.op_return_max_bytes,
-                                        args.feerate_floor, args.min_send_sat)
-            write_status(args.outfile,
-                         STATUS_SHORT if hopeless else STATUS_DELAYED)
+            write_status(args.outfile, fee_word(
+                picture["utxos"], args.min_conf, args.feerate_floor,
+                args.feerate_ceiling, exclude, args.op_return_max_bytes,
+                args.min_send_sat, replacing=(why == "bumped")))
         raise
 
     # 3. the quote, for exactly that amount, to exactly this destination
