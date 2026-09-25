@@ -4750,6 +4750,14 @@ try:
         check(f"sweep/wallet: the mixing wallet {_why} is the mixing wallet",
               A.fee_wallet_mismatch(_k_kf, A.fee_sweep_config(_k_kf),
                                     _wallets({_FEE_EP})) == "wallet_is_mixing")
+    # AS THE SIGNER READS IT: GhostSpiral and airgap_tx_signer take the
+    # name through Path, which drops a trailing "/"; os.path.split read
+    # `mix.keys/` as a directory and gave `mix.keys.keys`.
+    import gs_common as _gsc_sk
+    check("sweep/wallet: `mix.keys/` names the keys file the signer opens, "
+          "`mix.keys`",
+          _gsc_sk.signing_keys_file(str(_wf_dir / "mix.keys") + "/")
+          == os.path.realpath(str(_wf_dir / "mix")) + ".keys")
     check("sweep/wallet: an index that is a bool is no answer (True == 1)",
           A.fee_wallet_mismatch(_FS_KEY, _cfg, _wallets(
               {_FEE_EP}, index={"major": True, "minor": 1}))

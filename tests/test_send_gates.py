@@ -899,13 +899,13 @@ check("e2e: a wallet that will NOT store stops the run before any quote is "
       and "would not write" in _err_ns)
 check("e2e: ...and before it has minted anything, saying so",
       _err_ns is not None
-      and "Nothing has been minted, published or spent" in _err_ns)
+      and "No account has been minted and no swap quoted" in _err_ns)
 _posted_n1, _err_n1 = _drive_split(3, store_ok=1)
 check("e2e: a wallet that stores before the mint and not after it stops "
       "before any quote is posted, saying what going on would cost",
       _posted_n1 == [] and _err_n1 is not None
       and "two swaps paying one address" in _err_n1
-      and "Nothing has been published and nothing spent" in _err_n1)
+      and "No swap has been quoted" in _err_n1)
 
 # MANUAL MODE MUST LIST EVERY ENTRY ADDRESS. It prints a thor_swap_preparer
 # command for the operator to run by hand; printing only the first --dests

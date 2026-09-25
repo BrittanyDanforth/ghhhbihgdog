@@ -1098,13 +1098,13 @@ def thornode_btc_height(thornode_url, proxy_url):
     return h
 
 
-def thornode_inbound_height(thornode_url, proxy_url, txid, fallback=None):
+def thornode_inbound_height(thornode_url, proxy_url, txid):
     """The BTC block height at which ThorChain observed our inbound `txid`
     -- once THORChain has FINALISED it, its validators agreeing the
     transaction exists -- asked on its own circuit of the THORNode the
-    operator named. None when it is not finalised, when the answer is about
-    another transaction, when it names no height (and `fallback`, the
-    height a server listed it at, is none either), or when nobody answered.
+    operator named. None when it is not finalised, when an answer is about
+    another transaction or chain, when ThorChain gives no height, or when
+    nobody answered.
 
     A WITNESS THAT IS NOT AN ELECTRUM SERVER (the residual of the stage 3
     review, C4a): a forward listed only by the server that accepted it,
@@ -1115,8 +1115,20 @@ def thornode_inbound_height(thornode_url, proxy_url, txid, fallback=None):
     commits to every input and output (not to the witnesses, which segwit
     keeps apart), so a finalised inbound under our txid IS our forward.
 
+    TWO QUESTIONS, because no one answer carries both (the review of this
+    function, read in THORNode's source): /thorchain/tx/status/<hash> says
+    whether the inbound is finalised, and fills its
+    inbound_confirmation_counted.external_observed_height only WHILE
+    confirmations are still being counted -- never once it is finalised.
+    The height is the observed transaction's own, from /thorchain/tx/<hash>
+    (observed_tx.external_observed_height). The first version took the
+    status's height, which a finalised inbound never has, and fell back to
+    the height the ACCEPTING server listed it at: the one server whose word
+    this exists to replace, recorded as ThorChain's. No height from
+    ThorChain, no witness.
+
     Rests on the THORNode being who it says (https or an .onion,
-    watch.thornode_url_ok) and on its answer being ThorChain's -- what the
+    watch.thornode_url_ok) and on its answers being ThorChain's -- what the
     inbound cross-check already rests on -- not on anything secret. A
     THORNode that says "finalised" falsely costs what a lying witness costs
     anywhere here: the kept bytes are dropped and `forwarded` is said early.
@@ -1124,13 +1136,14 @@ def thornode_inbound_height(thornode_url, proxy_url, txid, fallback=None):
     later reconciliation finds it unlisted with its inputs unspent and
     re-signs it. Asked only when the Electrum servers could not settle the
     listing, so a forward the servers vouch for puts no txid to a THORNode.
-    A txid that is not 64 hex characters is not put into the URL at all."""
+    A txid that is not 64 hex characters is not put into a URL at all."""
     if not _TXID_RE.match(str(txid or "").lower()):
         return None
+    _t = str(txid).lower()
+    _base = thornode_url.rstrip("/")
     proxies = isolated_proxy(proxy_url, "forward:txstatus")
     try:
-        st = safe_get(f"{thornode_url.rstrip('/')}/thorchain/tx/status/"
-                      f"{str(txid).upper()}", proxies)
+        st = safe_get(f"{_base}/thorchain/tx/status/{_t.upper()}", proxies)
     except Exception as e:                                   # noqa: BLE001
         integrity_log("forward", f"txstatus_fetch_fail:{type(e).__name__}")
         return None
@@ -1138,7 +1151,7 @@ def thornode_inbound_height(thornode_url, proxy_url, txid, fallback=None):
         return None
     tx = st.get("tx")
     if not isinstance(tx, dict) \
-            or str(tx.get("id") or "").lower() != str(txid).lower() \
+            or str(tx.get("id") or "").lower() != _t \
             or tx.get("chain") != _THOR_BTC_CHAIN:
         return None
     stages = st.get("stages")
@@ -1147,10 +1160,18 @@ def thornode_inbound_height(thornode_url, proxy_url, txid, fallback=None):
     fin = stages.get("inbound_finalised")
     if not (isinstance(fin, dict) and fin.get("completed") is True):
         return None
-    cc = stages.get("inbound_confirmation_counted")
-    h = cc.get("external_observed_height") if isinstance(cc, dict) else None
-    if isinstance(h, bool) or not isinstance(h, int) or h <= 0:
-        h = fallback
+    try:
+        ob = safe_get(f"{_base}/thorchain/tx/{_t.upper()}", proxies)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("forward", f"txobserved_fetch_fail:{type(e).__name__}")
+        return None
+    ob = ob.get("observed_tx") if isinstance(ob, dict) else None
+    otx = ob.get("tx") if isinstance(ob, dict) else None
+    if not isinstance(otx, dict) \
+            or str(otx.get("id") or "").lower() != _t \
+            or otx.get("chain") != _THOR_BTC_CHAIN:
+        return None
+    h = ob.get("external_observed_height")
     if isinstance(h, bool) or not isinstance(h, int) or h <= 0:
         return None
     return h
@@ -2503,6 +2524,14 @@ def _own_inputs(spends, plans, signed=()):
 #: from their own bytes, _own_inputs, not from what funded them); these
 #: ride on top, and a budgeted read cannot carry hundreds.
 KEEP_EXTRA_MAX = 20
+#: How many reconciliations running a hand move may stay UNDECIDED (no
+#: server finished the lookup of its inputs) before it is read as what it
+#: is not shown not to be: the foreign_spend alarm. Public and plannable,
+#: like every bound here: it bounds how long a seed holder who can make
+#: every server fail the lookup holds the alarm off -- a few runs, not for
+#: good. An honest move whose lookup fails this many times running raises
+#: an alarm its operator knows to be their own.
+HAND_UNDECIDED_MAX = 3
 
 
 def _witnessed(args, plan, spends, address, servers):
@@ -2593,11 +2622,7 @@ def _witnessed(args, plan, spends, address, servers):
     # server at all (thornode_inbound_height says what it rests on). Its
     # height is the one recorded; the listing is taken as listed.
     if args.thornode and not shutdown_requested():
-        _hh = hit.get("height")
-        _th = thornode_inbound_height(
-            args.thornode, args.tor_proxy, txid,
-            fallback=(_hh if isinstance(_hh, int)
-                      and not isinstance(_hh, bool) and _hh > 0 else None))
+        _th = thornode_inbound_height(args.thornode, args.tor_proxy, txid)
         if _th is not None:
             hit["server"], hit["height"] = "thornode", _th
             integrity_log("forward", "listed_thornode_witnessed")
@@ -2900,8 +2925,13 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         o for _p0 in [plan] + chain for o in _pair_list(
             _p0.get("returned_dust") if isinstance(_p0, dict) else None)})
     # Hand moves nobody could finish asking about (below): decided after
-    # every other spend has been examined.
+    # every other spend has been examined -- and counted, on the plan, so
+    # that none stays undecided for more than HAND_UNDECIDED_MAX runs.
     _undecided = []
+    _und_raw = plan.get("hand_undecided")
+    _und_counts = {str(k).lower(): v for k, v in (
+        _und_raw.items() if isinstance(_und_raw, dict) else ())
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0}
     for s in spends:
         if s["txid"] in ours:
             continue
@@ -2951,19 +2981,22 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
         # checked to be its txid's). Paying this address, it is an extra
         # like the others, worth what it pays. Paying another address, it is
         # not this deposit's money -- the operator's wallet may move several
-        # addresses at once -- and it is recorded (`hand_inputs_elsewhere`)
-        # so no later run asks again. One of this address's transactions
-        # that was not read (past bcast.INPUT_SOURCE_MAX) counts as more.
-        # NO SERVER COMPLETING THE ASK LEAVES THE MOVE UNDECIDED unless what
-        # is known already puts it over the line: it is set aside and the
-        # rest of the spends are still examined -- a foreign spend among
-        # them is still the alarm (the review of the first version, which
-        # stopped at the first undecided move and never looked at the
-        # rest) -- and then the run fails with nothing signed, and the next
-        # run asks again. What it rests on: the seed, the txid hash, and
-        # the history servers' word that a transaction is NOT this
-        # address's (input_sources states it) -- the trust the whole
-        # reconciliation already places in their history.
+        # addresses at once. Read from checked bytes, that is recorded
+        # (`hand_inputs_elsewhere`) so no later run asks again; known only
+        # because this run's server does not list the funding, it holds for
+        # this run and is asked again the next. One of this address's
+        # transactions that was not read (past bcast.INPUT_SOURCE_MAX)
+        # counts as more. NO SERVER COMPLETING THE ASK LEAVES THE MOVE
+        # UNDECIDED unless what is known already puts it over the line: it
+        # is set aside and the rest of the spends are still examined -- a
+        # foreign spend among them is still the alarm (the review of the
+        # first version, which stopped at the first undecided move and
+        # never looked at the rest) -- and then the run fails with nothing
+        # signed, and the next run asks again: HAND_UNDECIDED_MAX times, and
+        # then it is the alarm. What it rests on: the seed, the txid hash,
+        # and the history servers' word that a transaction is NOT this
+        # address's, for one run (input_sources states it) -- the trust the
+        # whole reconciliation already places in their history.
         _all = _spend_outpoints(s)
         _hand = bool(_kept_ops and _all is not None and _all & _kept_ops)
         _off, _else_new, _unknown = {}, set(), set()
@@ -2989,6 +3022,13 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                 else:
                     for _o in _ask:
                         _sv = _src.get(_o)
+                        if _sv == "unlisted":
+                            # Another address's by this run's server's word
+                            # alone: not this deposit's money this run, and
+                            # NOT recorded -- a record is never asked again,
+                            # and one lagging or lying answer would stand for
+                            # good (the review of this change).
+                            continue
                         if _sv is False:
                             _else_new.add(_o)
                         elif isinstance(_sv, int) \
@@ -3024,8 +3064,21 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
             if _over:
                 _hand = False
             elif _failed:
-                _undecided.append(s["txid"])
-                continue
+                _n_und = _und_counts.get(str(s["txid"]).lower(), 0) + 1
+                if _n_und < HAND_UNDECIDED_MAX:
+                    _undecided.append((str(s["txid"]).lower(), _n_und))
+                    continue
+                # UNDECIDED IS NOT A PLACE TO LIVE (the review of this
+                # change): a seed holder can make every server fail the
+                # lookup -- a listed transaction no server will hand over,
+                # one too big to fetch in time -- and "undecided" on every
+                # run was an alarm that never came. After a few runs it is
+                # what it is not shown not to be.
+                integrity_log("forward", "hand_move_undecided_limit")
+                print(f"  reconcile: the move {s['txid']} could not be "
+                      f"decided in {HAND_UNDECIDED_MAX} reconciliations "
+                      f"running: it is not shown to be the operator's hand.")
+                _hand = False
             elif _extra_ins:
                 integrity_log("forward", "kept_moved_with_dust")
         if _hand:
@@ -3091,6 +3144,14 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
                 else:
                     plan.pop("returned_kept", None)
                 _dirty = True
+            # ...AND NO LONGER UNDECIDED, if a run before this one left it so.
+            _und_p = plan.get("hand_undecided")
+            if isinstance(_und_p, dict) \
+                    and str(s["txid"]).lower() in _und_p:
+                _und_p.pop(str(s["txid"]).lower(), None)
+                if not _und_p:
+                    plan.pop("hand_undecided", None)
+                _dirty = True
             if _dirty:
                 write_plan(args.outfile, plan)
             _moved_ins |= _ins_all
@@ -3114,13 +3175,23 @@ def reconcile(args, plan, picture, address, index, servers, dest_xmr):
     # the alarm, so this is not one either -- nothing is signed, and the next
     # run asks again.
     if _undecided:
+        # COUNTED ON THE PLAN, so the next run knows how long this has been.
+        _und_w = dict(_und_counts)
+        _und_w.update({t: n for t, n in _undecided})
+        plan["hand_undecided"] = _und_w
+        try:
+            write_plan(args.outfile, plan)
+        except OSError:
+            integrity_log("forward", "plan_unwritten")
         integrity_log("forward", "hand_move_undecided")
         print(f"[!] the kept outputs were moved by {len(_undecided)} "
-              f"spend(s) this tool did not sign (txid {_undecided[0]}"
+              f"spend(s) this tool did not sign (txid {_undecided[0][0]}"
               f"{', ...' if len(_undecided) > 1 else ''}), beside inputs "
               "whose source no server could read. Nothing is signed; the "
-              "next reconciliation asks again. A move of the kept outputs "
-              "in a transaction of its own is decided at once.")
+              "next reconciliation asks again -- and after "
+              f"{HAND_UNDECIDED_MAX} undecided runs, takes the move as not "
+              "the operator's. A move of the kept outputs in a transaction "
+              "of its own is decided at once.")
         raise SystemExit(EXIT_FAILED)
     # A PLAN FOR EVERY FORWARD OF OURS ADOPTED ABOVE. A reconciliation's
     # fresh forward (a refund, a second payment, a re-sign, a bump) that

@@ -3758,11 +3758,12 @@ def signing_keys_file(path) -> str:
     p = str(path or "").strip()
     if not p:
         return ""
-    p = os.path.expanduser(p)
-    _dir, _name = os.path.split(p)
-    if _name.endswith(".keys"):
-        p = os.path.join(_dir, _name[:-len(".keys")])
-    return os.path.realpath(p) + ".keys"
+    # Path, as they use it: it drops a trailing "/", so `w.keys/` is
+    # `w.keys` here as it is there (os.path.split read it as a directory).
+    pp = Path(p).expanduser()
+    if pp.name.endswith(".keys") and pp.name != ".keys":
+        pp = pp.with_name(pp.name[:-len(".keys")])
+    return os.path.realpath(str(pp)) + ".keys"
 
 
 def signing_files(path) -> set:

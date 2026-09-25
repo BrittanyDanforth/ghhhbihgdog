@@ -450,11 +450,11 @@ check("a wallet that will not store stops the run BEFORE it mints anything "
       f"({_s0.outcome[:80]})",
       _s0.outcome.startswith("SystemExit") and _s0.posts == 0
       and _s0.rounds == [] and _s0.minted == [])
-check("...saying so, and that nothing was minted, published or spent -- a "
-      "wallet asked only after minting left the accounts behind on every "
+check("...saying so, and that no account was minted and no swap quoted -- "
+      "a wallet asked only after minting left the accounts behind on every "
       "attempt, each one against the vault's ceiling",
       "would not write anything" in _s0.exit_text
-      and "Nothing has been minted, published or spent" in _s0.exit_text)
+      and "No account has been minted and no swap quoted" in _s0.exit_text)
 check("...after asking three times, not once",
       _s0.store_calls == 3)
 check("...and the chain says which stage stopped",
@@ -466,9 +466,11 @@ check("a wallet that stores before the mint and not after it stops BEFORE "
       _s1.outcome.startswith("SystemExit") and _s1.posts == 0
       and _s1.rounds == [] and bool(_s1.minted))
 check("...saying what going on would cost -- the entry forgotten and minted "
-      "again, two swaps paying one address -- and that nothing moved",
+      "again, two swaps paying one address -- and that no swap was quoted "
+      "(not 'nothing spent': with --joinmarket the Bitcoin mix has run)",
       "two swaps paying one address" in _s1.exit_text
-      and "Nothing has been published and nothing spent" in _s1.exit_text)
+      and "No swap has been quoted" in _s1.exit_text
+      and "nothing spent" not in _s1.exit_text)
 
 # AFTER THE SWAP A SEND-MODE RUN WAIVES (AGENTS.md rule 7; the review of the
 # store). It stopped there and said "run again", and a re-run mints a NEW
@@ -534,6 +536,24 @@ check("...saying the money is still on the receive wallet's address and to "
       "run again with the same one",
       "Nothing has been relayed" in _rv2.exit_text
       and "same --receive-wallet" in _rv2.exit_text)
+# THE PROBE BEFORE THE MINT, where the mint is real (the review of the
+# store): the send-mode fakes above mint nothing in create_subs, so
+# "minted == []" held there whether or not the wallet was asked first.
+_rv0 = Run(peel=False, receive=True, stores_ok=0).go()
+check("a receive-mode run whose wallet will not store stops with NOTHING "
+      f"minted -- the real create_subs never ran ({len(_rv0.minted)} minted)",
+      _rv0.outcome.startswith("SystemExit") and _rv0.minted == []
+      and _rv0.rounds == [])
+# ...AND ITS SECOND REFUSAL IS ABOUT WHAT A RECEIVE RUN HAS: mix accounts,
+# not an entry and a swap it never had.
+_rv1 = Run(peel=False, receive=True, stores_ok=1).go()
+check("a receive-mode run that stores before the mint and not after it "
+      "stops before any relay, speaking of the mix accounts and the next "
+      "client -- not of an entry or a swap",
+      _rv1.outcome.startswith("SystemExit") and _rv1.rounds == []
+      and bool(_rv1.minted)
+      and "mix accounts" in _rv1.exit_text
+      and "swap" not in _rv1.exit_text and "entry" not in _rv1.exit_text)
 
 
 # ===========================================================================
@@ -570,14 +590,12 @@ check(f"the undistributed balance is still on the wallet, on ONE carrier "
 # NOT A THRESHOLD ON A RANDOM DRAW: "most of the run" (over half the
 # entry) was false in 8 of 300 driven runs -- the peel amounts are drawn --
 # and a check that is a coin proves nothing. What holds on every draw:
-# nothing was created or lost (every atomic unit is on the wallet, gone to
-# the exit, or paid as a fee), and what the carrier holds funds the peel
-# that did not run, so it is more than that peel's fee.
-_ntx = sum(len(txs) for _l, txs in part.rounds)
-check("...and it is exactly what the rounds did not pay out -- nothing "
-      "created or lost -- and more than a fee, so not rounding dust",
-      sum(part.bal.values()) + part.left_wallet + FEE * _ntx == ENTRY_ATOMIC
-      and sum(_left.values()) > FEE)
+# what the carrier holds funds the peel that did not run, so it is more
+# than that peel's fee.
+# (Conservation is the fake's own arithmetic, so it is not claimed here.)
+check("...and it is more than a fee -- it funds the peel that did not run "
+      "-- so it is not rounding dust",
+      sum(_left.values()) > FEE)
 check("...the exit did NOT sweep it to --exit-to",
       all((t["account_index"], t["src_index"]) not in _left
           for t in part.exits))

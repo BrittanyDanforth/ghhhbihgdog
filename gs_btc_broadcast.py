@@ -606,12 +606,18 @@ def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
     address is concerned, for every outpoint the transaction's own bytes
     spend less `skip` (those the caller already knows):
 
-        int    its previous output PAYS the address: that output's value;
-        False  it does not -- its previous transaction is not in the
-               address's history, so none of its outputs pays the
-               address, or it is and that output pays something else;
-        None   its previous transaction is in the history and was not
-               read: past `limit`, or an output it does not have.
+        int         its previous output PAYS the address: that output's
+                    value, read from bytes checked against the txid;
+        False       it does not: its previous transaction is in the
+                    address's history, was read, and that output pays
+                    something else -- from the same checked bytes;
+        "unlisted"  its previous transaction is not in the address's
+                    history, so none of its outputs pays the address -- on
+                    this server's word alone, which is why it is a value
+                    of its own (the review of this change): the caller
+                    must not record it as a fact of the chain;
+        None        its previous transaction is in the history and was not
+                    read: past `limit`, or an output it does not have.
 
     Read-only, over Tor on the address's broadcast circuit, in ONE session:
     the address's history, then the previous transactions it lists. Any
@@ -642,10 +648,18 @@ def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
     so no server can make that input pay somewhere it does not. "Not in
     the history" is the server's word that the transaction never touched
     the address, and a server that leaves one out can make an input of
-    this address read as another's. That is the trust the reconciliation
-    already places in the history -- a server that leaves a spend out
-    hides it from the reconciliation altogether -- and no more; the
-    servers are the operator's own, pinned (OPSEC_SETUP.md)."""
+    this address read as another's for that run. That is the trust the
+    reconciliation already places in the history -- a server that leaves a
+    spend out hides it from the reconciliation altogether -- and no more;
+    the servers are the operator's own, pinned (OPSEC_SETUP.md).
+
+    AND ON EVERY LISTED TRANSACTION BEING FETCHABLE. One that no server
+    will hand over -- past MAX_TX_BYTES, which a miner can include though
+    no node relays it, or too slow to fetch inside the session's deadline
+    -- fails every session, and this raises. Its author chose that; the
+    caller counts how many runs a move has stayed undecided and stops
+    counting it as undecided after a few (btc_forwarder,
+    HAND_UNDECIDED_MAX)."""
     spk = btx.address_script(address, network).data
     try:
         tx = Transaction.parse(bytes.fromhex(str(raw_hex or "")))
@@ -687,7 +701,7 @@ def input_sources(raw_hex, address, servers, proxy_url, *, network="main",
         out = {}
         for t, v in ask:
             if t not in listed:
-                out[(t, v)] = False
+                out[(t, v)] = "unlisted"
                 continue
             ptx = got.get(t)
             if ptx is None or not 0 <= v < len(ptx.vout):

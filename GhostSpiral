@@ -8868,8 +8868,10 @@ def persist_minted(rpc_primary, stage: str, refusal: str, *,
 
 
 def _store_at_exit(rpc_primary) -> None:
-    """atexit, after a waived store (persist_minted): ask once more, however
-    the run ended, and say which it was. Never raises."""
+    """atexit, after a waived store (persist_minted): ask once more when the
+    process exits -- normally, by sys.exit or on an uncaught exception, not
+    on a SIGKILL or a power cut, which run nothing -- and say which it was.
+    Never raises."""
     try:
         store_wallet(rpc_primary)
         _ok = True
@@ -8894,27 +8896,45 @@ def _store_at_exit(rpc_primary) -> None:
         pass
 
 
+#: Said wherever a refusal says the Monero side has not started: true
+#: with --joinmarket too, where the Bitcoin mix HAS run before this (the
+#: review of the store: "nothing spent" was printed after it).
+_JM_NOTE = ("(With --joinmarket, the Bitcoin mix has run; its coins are "
+            "where it left them.)")
+
+
 def persist_before_mint(rpc_primary) -> None:
     """persist_minted before create_subs: does this wallet store at all?"""
     persist_minted(rpc_primary, "stage3",
-                   "Nothing has been minted, published or spent: every "
+                   "No account has been minted and no swap quoted: every "
                    "account this run creates has to be on disk before "
                    "money is paid into it, and this wallet cannot put "
-                   "anything there. Check that the wallet file's disk "
-                   "is writable, then run again.",
+                   "anything there. " + _JM_NOTE + " Check that the "
+                   "wallet file's disk is writable, then run again.",
                    what="anything")
 
 
-def persist_entry_set(rpc_primary) -> None:
-    """persist_minted after the mix accounts and the entry set, before the
-    swap is quoted: nothing is published yet, so it refuses."""
+def persist_entry_set(rpc_primary, receive_mode: bool) -> None:
+    """persist_minted after the mix accounts (and, sending, the entry set),
+    before the swap is quoted or anything relays: nothing irreversible has
+    happened, so it refuses -- in words true of the mode it is in (the
+    review of the store: a receive-mode run was told about an entry and a
+    swap it does not have)."""
     persist_minted(rpc_primary, "stage3",
-                   "Going on, a power cut before it did would lose them "
-                   "-- the entry among them -- and a later run would "
-                   "create the same entry again: two swaps paying one "
-                   "address. Nothing has been published and nothing "
-                   "spent. Check that the wallet file's disk is "
-                   "writable, then run again.")
+                   ("Going on, a power cut before it did would lose the "
+                    "mix accounts, and whatever mints next -- on the vault, "
+                    "another client's deposit or mix -- would be handed the "
+                    "same ones, with this run's money on them by then. "
+                    "Nothing has been relayed: the money is still on the "
+                    "receive wallet's address. Check that the wallet "
+                    "file's disk is writable, then run again with the same "
+                    "--receive-wallet." if receive_mode else
+                    "Going on, a power cut before it did would lose them "
+                    "-- the entry among them -- and a later run would "
+                    "create the same entry again: two swaps paying one "
+                    "address. No swap has been quoted. " + _JM_NOTE +
+                    " Check that the wallet file's disk is writable, then "
+                    "run again."))
 
 
 def persist_before_relay(rpc_primary, receive_mode: bool) -> bool:
@@ -9112,7 +9132,7 @@ def main():
         # THEM. See persist_minted: a wallet that forgot the entry after a
         # power cut would mint it again for the next run, and two swaps would
         # pay one address.
-        persist_entry_set(rpc_primary)
+        persist_entry_set(rpc_primary, receive_mode)
 
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)

@@ -2948,10 +2948,12 @@ by the acceptor alone that no other server confirms is acted on as
 listed but never taken as proof — the bytes stay kept and are pushed
 once more to the others, and the phone hears `sent`, not `forwarded`.
 When the servers cannot settle a listing, the pair's THORNode is asked
-whether ThorChain has finalised our transaction as an inbound. That
-witness is not an Electrum server at all, and it rests on the THORNode
-being who it says, as the inbound cross-check does. If it has, the listing
-is taken, at ThorChain's height (`listed_thornode_witnessed`). A THORNode
+whether ThorChain has finalised our transaction as an inbound, and at
+what Bitcoin height ThorChain observed it. That witness is not an
+Electrum server at all, and it rests on the THORNode being who it says, as
+the inbound cross-check does. If it has, the listing is taken, at
+ThorChain's height (`listed_thornode_witnessed`); with no height from
+ThorChain it is not taken. A THORNode
 is asked about a txid only then, never about one a server vouches for.
 Without a THORNode, or before ThorChain has finalised it, a mined forward
 stays `sent` for as long as no other server answers. A server list whose
@@ -3001,19 +3003,24 @@ every input, including ones the history's window did not, because a flood
 of dust pushed their funding out of the window. A kept output they name is
 kept money. Any other input is looked up. If its funding transaction is not
 in the address's history, it paid another address (your wallet moving
-several at once): not this deposit's money, recorded as such
-(`hand_inputs_elsewhere`), and it costs no lookup however many there are.
-If the funding transaction is in the history, it is fetched and checked
-against its txid. Paying this address, the input counts against the same
-allowance. At most 16 are fetched for one move, and one past that counts
-as over the allowance. An input a forward of the vault's signed for is
-over the allowance at once. What this rests on is the txid hash, and the
-history server's word that a transaction is not this address's. That is
-the trust the whole reconciliation already places in the history: a server
-that leaves a spend out hides it altogether. If no server completes the
-lookup, the move is undecided (`hand_move_undecided`): the other spends
-are still examined, so a foreign one among them is still the alarm, and
-then the run fails, nothing is signed, and the next run asks again.
+several at once): not this deposit's money, and it costs no lookup however
+many there are. That is the server's word alone, so it holds for that run
+and is asked again the next. If the funding transaction is in the history,
+it is fetched and checked against its txid. Paying another address, it is
+recorded as such (`hand_inputs_elsewhere`) and not asked again. Paying
+this address, the input counts against the same allowance. At most 16 are
+fetched for one move, and one past that counts as over the allowance. An
+input a forward of the vault's signed for is over the allowance at once.
+What this rests on is the txid hash, and the history server's word, for
+one run, that a transaction is not this address's. That is the trust the
+whole reconciliation already places in the history: a server that leaves a
+spend out hides it altogether. If no server completes the lookup, the move
+is undecided (`hand_move_undecided`): the other spends are still examined,
+so a foreign one among them is still the alarm, and then the run fails,
+nothing is signed, and the next run asks again. A seed holder can cause
+that on purpose (a listed transaction no server will hand over), so it
+lasts three runs at most: the third undecided run takes the move as not
+yours, and raises the alarm (`hand_move_undecided_limit`).
 Moving the kept outputs in a transaction of their own avoids all of
 this), or re-pair with a
 higher bound and let the next window's tap send it on. The mark follows
